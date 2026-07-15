@@ -2549,8 +2549,14 @@ mod tests {
         let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
         let result = handle_revoke_review_assignment(&home, &args, &sender);
 
-        assert_eq!(result["ok"], true, "authorized revoke must succeed: {result}");
-        assert_eq!(result["revoked"], true, "the live record must be retired: {result}");
+        assert_eq!(
+            result["ok"], true,
+            "authorized revoke must succeed: {result}"
+        );
+        assert_eq!(
+            result["revoked"], true,
+            "the live record must be retired: {result}"
+        );
         assert!(
             get(&home, "o/r", "feat/x", "reviewer").is_none(),
             "record must be gone after revoke"
@@ -2663,7 +2669,10 @@ mod tests {
 
         // Retrying A's now-stale assignment_id must be a no-op — B stays untouched.
         let retry_a = handle_revoke_review_assignment(&home, &revoke_a_args, &sender);
-        assert_eq!(retry_a["ok"], true, "stale retry must still be ok: {retry_a}");
+        assert_eq!(
+            retry_a["ok"], true,
+            "stale retry must still be ok: {retry_a}"
+        );
         let still_there = get(&home, "o/r", "feat/x", "reviewer").expect("B must survive");
         assert_eq!(
             still_there.assignment_id, rec_b.assignment_id,
@@ -2684,7 +2693,10 @@ mod tests {
         let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
         let result = handle_revoke_review_assignment(&home, &args, &None);
 
-        assert_eq!(result["ok"], true, "operator-direct revoke must succeed: {result}");
+        assert_eq!(
+            result["ok"], true,
+            "operator-direct revoke must succeed: {result}"
+        );
         assert_eq!(result["revoked"], true, "{result}");
         assert!(
             get(&home, "o/r", "feat/x", "reviewer").is_none(),

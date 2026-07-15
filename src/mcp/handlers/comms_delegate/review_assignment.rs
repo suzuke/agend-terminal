@@ -355,12 +355,13 @@ pub(crate) fn handle_revoke_review_assignment(
     // Strict store-wide lookup: missing / unreadable-corrupt / duplicated /
     // terminal all fail this lookup — treated uniformly as "already absent"
     // (idempotent success), matching the tool's documented retry contract.
-    let record =
-        match crate::daemon::assignment_authority::lookup_by_assignment_id_strict(home, assignment_id)
-        {
-            Ok(r) => r,
-            Err(_) => return json!({"ok": true, "already_absent": true}),
-        };
+    let record = match crate::daemon::assignment_authority::lookup_by_assignment_id_strict(
+        home,
+        assignment_id,
+    ) {
+        Ok(r) => r,
+        Err(_) => return json!({"ok": true, "already_absent": true}),
+    };
 
     // Authorization: operator-direct (sender=None) has full authority. A named
     // sender must be the SOLE CURRENT orchestrator of the team owning the
