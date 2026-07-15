@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (30 tools)
+# AgEnD MCP Tools Reference (31 tools)
 
 ## Action-based Tools
 
@@ -161,6 +161,10 @@ Release the daemon-managed worktree and clear binding. Only removes worktrees wi
 ### `binding_state`
 Report structured daemon-side bind state for an agent. Non-destructive introspection.
 - **instance**: instance to inspect
+
+### `revoke_review_assignment`
+Revoke a specific reviewer assignment by exact `assignment_id`. Authorization: team orchestrator or operator. Idempotent — repeated calls with a stale/missing assignment_id return success. After successful revoke, merge readiness is recomputed.
+- **assignment_id**: UUID of the assignment to revoke (exact CAS identity)
 
 ## Daemon Operations
 

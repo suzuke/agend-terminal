@@ -244,7 +244,7 @@ fn base_dir(home: &Path) -> PathBuf {
 /// One directory per `(repo,branch)`. Sanitized parts stay for operator
 /// readability; the [`key_hash`] suffix guarantees injectivity (a lossy sanitize
 /// can otherwise collapse distinct keys to the same name — the #1969 lesson).
-fn branch_dir(home: &Path, repo: &str, branch: &str) -> PathBuf {
+pub(crate) fn branch_dir(home: &Path, repo: &str, branch: &str) -> PathBuf {
     base_dir(home).join(format!(
         "{}--{}--{}",
         sanitize_component(repo),
@@ -675,18 +675,20 @@ pub(crate) fn probe_branch_authority(home: &Path, repo: &str, branch: &str) -> B
     }
 }
 
-/// The record for one `(repo,branch,target)`, if any.
-// t-…-17: a public single-record accessor. Production reconcile/drain/dispatch read
-// the whole branch via `list_active`; this point-lookup is exercised by the store
-// unit tests and reserved for a future single-assignment query — no production caller
-// yet (slice-4 wires list/persist/enqueue/repair/terminal/revoke, not point-get).
 #[allow(dead_code)]
 pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option<ActiveAssignment> {
     read_record(&record_file(home, repo, branch, target))
         .ok()
         .flatten()
 }
-
+pub(crate) fn get_strict(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+) -> anyhow::Result<Option<ActiveAssignment>> {
+    read_record(&record_file(home, repo, branch, target))
+}
 /// Strict store-wide lookup for a receipt's generation token. Missing,
 /// unreadable/corrupt, duplicated, terminal, revoked, and superseded assignments
 /// all fail closed. Unlike the lossy reconcile scans, one corrupt row aborts the

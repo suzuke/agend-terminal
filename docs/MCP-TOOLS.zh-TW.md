@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（30 個工具）
+# AgEnD MCP Tools Reference — 工具參考（31 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -161,6 +161,10 @@
 ### `binding_state`
 回報某個 agent 在 daemon 端的結構化 bind 狀態。非破壞性的內省查詢。
 - **instance**: 要檢視的 instance
+
+### `revoke_review_assignment`
+依精確的 `assignment_id` 撤銷特定的 reviewer 指派。授權對象：team orchestrator 或 operator。具冪等性——用過期或不存在的 assignment_id 重複呼叫仍會回傳成功。撤銷成功後會重新計算 merge readiness。
+- **assignment_id**: 要撤銷的指派 UUID（精確的 CAS 身分）
 
 ## Daemon 操作（Daemon Operations）
 

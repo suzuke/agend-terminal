@@ -18,7 +18,9 @@ use super::{
 mod comms_delegate;
 pub(crate) use comms_delegate::handle_delegate_task;
 // #6: re-export so ci/review_workspace_tests can drive bind rejection tests.
-#[cfg(test)]
+// #2782 slice 1: unconditional (not cfg(test)) — the `revoke_review_assignment`
+// MCP tool dispatch adapter (`handlers::dispatch::dispatch_revoke_review_assignment`)
+// calls `review_assignment::handle_revoke_review_assignment` in production too.
 pub(crate) use comms_delegate::review_assignment;
 // p0c_tests (cfg test child) pin `super::dispatch_should_skip_auto_bind`.
 #[cfg(test)]

@@ -420,6 +420,16 @@ pub(crate) fn def_binding_state() -> Value {
         }, "required": ["instance"]}})
 }
 
+/// #2782 slice 1: orchestrator-authorized exact review-assignment revoke — the
+/// complement of the `send`/`delegate_task` `review_assignment` marker dispatch
+/// that creates an assignment via `dispatch_review_assignment_via_store`.
+pub(crate) fn def_revoke_review_assignment() -> Value {
+    json!({"name": "revoke_review_assignment", "description": "Revoke a specific reviewer assignment by exact assignment_id. Authorization: team orchestrator or operator. Idempotent — repeated calls with a stale/missing assignment_id return success. After successful revoke, merge readiness is recomputed.",
+        "inputSchema": {"type": "object", "properties": {
+            "assignment_id": {"type": "string", "description": "UUID of the assignment to revoke (exact CAS identity)"}
+        }, "required": ["assignment_id"]}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,7 +718,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            30,
+            31,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -718,7 +728,8 @@ mod tests {
              (#2548 Wave1-PR2, mode folded into list_instances, force_release_worktree merged \
              into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
              + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
-             + set_model (#2744 PR-A, typed fleet model intent) = 30. \
+             + set_model (#2744 PR-A, typed fleet model intent) = 30; \
+             + revoke_review_assignment (#2782 slice 1) = 31. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -1177,6 +1188,8 @@ mod tests {
             // ── config ── (#2548: watchdog moved to CLI, mode retired, no longer coordination tools)
             ("config", "action", "mcp/handlers/dispatch.rs get/list"),
             ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key"),
+            // ── revoke_review_assignment (#2782 slice 1) ──
+            ("revoke_review_assignment", "assignment_id", "mcp/handlers/comms_delegate/review_assignment.rs handle_revoke_review_assignment — lookup_by_assignment_id_strict + retire_if_id_matches CAS target"),
         ];
 
         // Intentionally-deferred passthrough: advertised by design, Phase-2
@@ -1212,6 +1225,7 @@ mod tests {
             "create_instance",
             "restart_instance",
             "config",
+            "revoke_review_assignment",
         ];
 
         // Simple query/display/control tools — not directive-bearing, so their

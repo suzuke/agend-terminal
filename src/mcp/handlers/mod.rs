@@ -7,7 +7,8 @@ mod comms;
 #[cfg(test)]
 pub(crate) use comms::build_report_text;
 // #6: re-export so ci/review_workspace_tests can reach the validation function.
-#[cfg(test)]
+// #2782 slice 1: unconditional — `dispatch::dispatch_revoke_review_assignment`
+// calls `review_assignment::handle_revoke_review_assignment` in production.
 pub(crate) use comms::review_assignment;
 pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
