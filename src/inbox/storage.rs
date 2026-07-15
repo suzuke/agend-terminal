@@ -661,68 +661,90 @@ pub fn supersede_by_nonce(
     nonce: &str,
     successor: &str,
 ) -> NonceSupersedeOutcome {
+    supersede_by_nonce_inner(home, target, nonce, successor).unwrap_or_default()
+}
+
+/// Strict variant of [`supersede_by_nonce`]: every persistence error (read,
+/// write, fsync, rename) propagates as `Err` so the caller can fail closed
+/// when durable supersede is a precondition for further mutations.
+pub fn supersede_by_nonce_strict(
+    home: &Path,
+    target: &str,
+    nonce: &str,
+    successor: &str,
+) -> anyhow::Result<NonceSupersedeOutcome> {
+    supersede_by_nonce_inner(home, target, nonce, successor)
+}
+
+fn supersede_by_nonce_inner(
+    home: &Path,
+    target: &str,
+    nonce: &str,
+    successor: &str,
+) -> anyhow::Result<NonceSupersedeOutcome> {
     let path = inbox_path_resolved(home, target);
     if !path.exists() {
-        return NonceSupersedeOutcome::default();
+        return Ok(NonceSupersedeOutcome::default());
     }
-    with_inbox_lock(home, target, |path| -> NonceSupersedeOutcome {
-        let mut outcome = NonceSupersedeOutcome::default();
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let mut changed = false;
-        let mut lines: Vec<String> = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                lines.push(line.to_string());
-                continue;
-            }
-            // Cheap screen: a row that can't contain the nonce is preserved verbatim.
-            if !line.contains(nonce) {
-                lines.push(line.to_string());
-                continue;
-            }
-            if let Ok(mut msg) = serde_json::from_str::<InboxMessage>(line) {
-                if msg.delivery_nonce.as_deref() == Some(nonce) {
-                    outcome.found = true;
-                    if msg.read_at.is_some() {
-                        outcome.was_read = true;
-                    }
-                    // Only retract a still-live row; an already-read/superseded
-                    // row is already non-actionable and is left byte-identical.
-                    if msg.read_at.is_none() && msg.superseded_by.is_none() {
-                        msg.superseded_by = Some(successor.to_string());
-                        changed = true;
-                    }
+    let inner = with_inbox_lock(
+        home,
+        target,
+        |path| -> anyhow::Result<NonceSupersedeOutcome> {
+            let mut outcome = NonceSupersedeOutcome::default();
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read inbox {}: {e}", path.display()))?;
+            let mut changed = false;
+            let mut lines: Vec<String> = Vec::new();
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    lines.push(line.to_string());
+                    continue;
                 }
-                lines.push(serde_json::to_string(&msg).unwrap_or_else(|_| line.to_string()));
-            } else {
-                // Forward-schema / torn line: preserve verbatim (never drop).
-                lines.push(line.to_string());
+                if !line.contains(nonce) {
+                    lines.push(line.to_string());
+                    continue;
+                }
+                if let Ok(mut msg) = serde_json::from_str::<InboxMessage>(line) {
+                    if msg.delivery_nonce.as_deref() == Some(nonce) {
+                        outcome.found = true;
+                        if msg.read_at.is_some() {
+                            outcome.was_read = true;
+                        }
+                        if msg.read_at.is_none() && msg.superseded_by.is_none() {
+                            msg.superseded_by = Some(successor.to_string());
+                            changed = true;
+                        }
+                    }
+                    lines.push(serde_json::to_string(&msg).unwrap_or_else(|_| line.to_string()));
+                } else {
+                    lines.push(line.to_string());
+                }
             }
-        }
-        if changed {
-            let tmp = path.with_extension("jsonl.tmp");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)
-            {
+            if changed {
+                let tmp = path.with_extension("jsonl.tmp");
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .map_err(|e| anyhow::anyhow!("open tmp {}: {e}", tmp.display()))?;
                 use std::io::Write;
-                let write_ok = (|| -> std::io::Result<()> {
-                    for l in &lines {
-                        writeln!(f, "{l}")?;
-                    }
-                    f.sync_all()
-                })()
-                .is_ok();
-                if write_ok && std::fs::rename(&tmp, path).is_ok() {
-                    crate::store::fsync_parent_dir(path); // durable rename
+                for l in &lines {
+                    writeln!(f, "{l}")
+                        .map_err(|e| anyhow::anyhow!("write tmp {}: {e}", tmp.display()))?;
                 }
+                f.sync_all()
+                    .map_err(|e| anyhow::anyhow!("fsync tmp {}: {e}", tmp.display()))?;
+                std::fs::rename(&tmp, path).map_err(|e| {
+                    anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), path.display())
+                })?;
+                crate::store::fsync_parent_dir_checked(path)
+                    .map_err(|e| anyhow::anyhow!("fsync parent {}: {e}", path.display()))?;
             }
-        }
-        outcome
-    })
-    .unwrap_or_default()
+            Ok(outcome)
+        },
+    )?;
+    inner
 }
 
 /// Drain unread messages: mark them with `read_at` and write back.

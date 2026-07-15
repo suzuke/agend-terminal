@@ -405,6 +405,19 @@ fn remove_if_assignment_matches(path: &Path, expect: uuid::Uuid) -> bool {
     }
 }
 
+/// Strict variant of [`remove_if_assignment_matches`]: propagates `remove_file`
+/// errors so the caller can fail closed when durable delete confirmation matters.
+fn remove_if_assignment_matches_strict(path: &Path, expect: uuid::Uuid) -> anyhow::Result<bool> {
+    match read_record(path) {
+        Ok(Some(r)) if r.assignment_id == expect => {
+            std::fs::remove_file(path)
+                .map_err(|e| anyhow::anyhow!("remove assignment {}: {e}", path.display()))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 // ─────────────────────────── time helpers (clock-injected) ───────────────────────────
 
 fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -484,7 +497,31 @@ fn build_delivery_message(record: &ActiveAssignment, now: &str) -> crate::inbox:
 
 /// A durable revocation notice — enqueued only when the retracted row had already
 /// been READ (I21), so the reviewer learns a seen assignment was pulled.
-fn build_revocation_notice(record: &ActiveAssignment, now: &str) -> crate::inbox::InboxMessage {
+fn revocation_nonce_present(home: &Path, target: &str, nonce: &str) -> bool {
+    let path = crate::inbox::storage::inbox_path_resolved(home, target);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.contains(nonce))
+        .any(|l| {
+            serde_json::from_str::<crate::inbox::InboxMessage>(l)
+                .ok()
+                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
+                .is_some()
+        })
+}
+
+fn revocation_nonce(assignment_id: uuid::Uuid) -> String {
+    format!("revoked-{assignment_id}")
+}
+
+fn build_revocation_notice(
+    record: &ActiveAssignment,
+    now: &str,
+    nonce: &str,
+) -> crate::inbox::InboxMessage {
     crate::inbox::InboxMessage {
         from: record.sender.clone(),
         text: format!(
@@ -496,6 +533,7 @@ fn build_revocation_notice(record: &ActiveAssignment, now: &str) -> crate::inbox
         task_id: Some(record.task_id.clone()),
         correlation_id: Some(record.task_id.clone()),
         pr_number: Some(record.pr_number),
+        delivery_nonce: Some(nonce.to_string()),
         ..Default::default()
     }
 }
@@ -795,11 +833,14 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
             // for the retired assignment (I21). Clock-injected via the new record's
             // `created_at` (persist takes no separate `now`).
             if outcome.was_read {
-                crate::inbox::storage::enqueue(
-                    home,
-                    &record.target,
-                    build_revocation_notice(&old, &record.created_at),
-                )?;
+                let nonce = revocation_nonce(old.assignment_id);
+                if !revocation_nonce_present(home, &record.target, &nonce) {
+                    crate::inbox::storage::enqueue(
+                        home,
+                        &record.target,
+                        build_revocation_notice(&old, &record.created_at, &nonce),
+                    )?;
+                }
             }
         }
     }
@@ -936,6 +977,65 @@ pub(crate) fn revoke(
     revoke_under_lock(home, repo, branch, target, now)
 }
 
+/// P0: CAS-retire an assignment ONLY if its on-disk `assignment_id` still equals
+/// `expected_id`. Used by the reconciler to retire obsolete assignments whose
+/// PrState subject has advanced past the assignment's snapshot. The CAS guard
+/// prevents a stale retire from removing a replacement assignment that arrived
+/// between the lock-free `list_active` scan and this locked mutation.
+///
+/// Ordering invariant: the stale inbox row (and any revocation notice) must be
+/// durably superseded BEFORE the authority record is deleted. A persistence
+/// failure at any point preserves the authority — fail closed. Retry after
+/// interruption converges: supersede is idempotent on an already-superseded
+/// row, so re-running after a crash between supersede and delete is safe.
+pub(crate) fn retire_if_id_matches(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    expected_id: uuid::Uuid,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    let record = match read_record(&path) {
+        Ok(Some(r)) if r.assignment_id == expected_id => r,
+        _ => return Ok(false), // absent, corrupt, or replaced — no-op
+    };
+
+    // Step 1: durably supersede the stale inbox row. If this fails the
+    // authority stays intact — the reviewer may still pick it up, which is
+    // strictly better than a dangling actionable row with no authority.
+    let successor = format!("retired-{}", expected_id);
+    let outcome = crate::inbox::storage::supersede_by_nonce_strict(
+        home,
+        target,
+        &record.delivery_nonce,
+        &successor,
+    )?;
+
+    // Step 2: if the reviewer had already read the assignment, enqueue a
+    // deterministic revocation notice so they learn it was retracted.
+    // Stable nonce + any-state dedup: if a prior attempt already enqueued
+    // the notice (but delete failed), the nonce is already present and we
+    // skip the duplicate append.
+    if outcome.was_read {
+        let nonce = revocation_nonce(expected_id);
+        if !revocation_nonce_present(home, target, &nonce) {
+            crate::inbox::storage::enqueue(
+                home,
+                target,
+                build_revocation_notice(&record, now, &nonce),
+            )?;
+        }
+    }
+
+    // Step 3: NOW safe to delete the authority — the stale inbox state has
+    // been durably superseded (or was already non-actionable).
+    let removed = remove_if_assignment_matches_strict(&path, expected_id)?;
+    Ok(removed)
+}
+
 /// The revoke body WITHOUT acquiring the branch lock — the caller MUST already
 /// hold it. Shared by [`revoke`] (which locks) and [`transfer`] (which revokes
 /// the old target and persists the new one under ONE lock so a same-process
@@ -966,7 +1066,11 @@ fn revoke_under_lock(
     // A row the reviewer had already READ is not retracted by the supersede alone
     // (it is already non-actionable) — surface an explicit revocation notice (I21).
     if outcome.was_read {
-        crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
+        crate::inbox::storage::enqueue(
+            home,
+            target,
+            build_revocation_notice(&record, now, &revocation_nonce(record.assignment_id)),
+        )?;
     }
     Ok(removed)
 }
