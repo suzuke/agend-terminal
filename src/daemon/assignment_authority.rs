@@ -2495,4 +2495,201 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #2782 slice 1: orchestrator-authorized exact review-assignment revoke ──
+    //
+    // Exercises the MCP `revoke_review_assignment` handler
+    // (`crate::mcp::handlers::review_assignment::handle_revoke_review_assignment`)
+    // directly — the RED-first tests for the new tool. `lookup_by_assignment_id_strict`
+    // + `retire_if_id_matches` + `redrive_reserved` are the store primitives it wires
+    // together; the tests here pin the handler's authorization + idempotency contract.
+
+    use crate::identity::Sender;
+    use crate::mcp::handlers::review_assignment::handle_revoke_review_assignment;
+
+    /// Seed a minimal fleet.yaml with ONE team so `resolve_team_by_source_repo`
+    /// can authorize the handler's orchestrator check. Mirrors the pattern in
+    /// `mcp::handlers::comms_delegate::tests::review_assignment_marker_tests::seed_fleet`.
+    fn seed_team_fleet(home: &Path, orchestrator: &str, source_repo: &str) {
+        let yaml = format!(
+            "instances:\n  {orchestrator}:\n    backend: claude\n    id: 11111111-1111-4111-8111-111111111111\n\
+             teams:\n  t-revoke:\n    orchestrator: {orchestrator}\n    members:\n      - {orchestrator}\n    source_repo: {source_repo}\n"
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    /// t40: the team's SOLE CURRENT orchestrator revokes by exact `assignment_id` ⇒
+    /// success, the record is gone via `get`, and `redrive_reserved` leaves no
+    /// reserved assignment behind (merge readiness recomputed). A `PrState` carrying
+    /// a PRE-EXISTING reserved entry for this same reviewer/pr_number is seeded first
+    /// so the post-revoke re-derivation is a meaningful assertion (not vacuously
+    /// empty because nothing was ever reserved).
+    #[test]
+    fn t40_revoke_by_assignment_id_authorized_orchestrator() {
+        let home = tmp_home("t40-authorized");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        let mut state = crate::daemon::pr_state::new_for_branch(
+            "o/r",
+            "feat/x",
+            "a".repeat(40).as_str(),
+            ReviewClass::Dual,
+        );
+        state.pr_number = 42;
+        state.reserved_assignments = vec![crate::daemon::pr_state::ReservedAssignment {
+            target: "reviewer".to_string(),
+            review_author: ReviewAuthor::External("octocat".into()),
+            assignment_id: rec.assignment_id,
+        }];
+        crate::daemon::pr_state::save(&home, &state).unwrap();
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &sender);
+
+        assert_eq!(result["ok"], true, "authorized revoke must succeed: {result}");
+        assert_eq!(result["revoked"], true, "the live record must be retired: {result}");
+        assert!(
+            get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "record must be gone after revoke"
+        );
+        let reloaded = crate::daemon::pr_state::load(&home, "o/r", "feat/x")
+            .expect("pr_state must still exist after redrive");
+        assert!(
+            reloaded.reserved_assignments.is_empty(),
+            "redrive_reserved must clear the reserved entry after the assignment is revoked: {reloaded:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t41: a sender that is NOT the team's orchestrator ⇒ denied, and the
+    /// assignment must still be present (no partial mutation on rejection).
+    #[test]
+    fn t41_revoke_by_assignment_id_unauthorized_agent_denied() {
+        let home = tmp_home("t41-unauthorized");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        let sender = Some(Sender::new("intruder").unwrap());
+        let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &sender);
+
+        assert_eq!(
+            result["code"], "revoke_assignment_not_authorized",
+            "non-orchestrator sender must be denied: {result}"
+        );
+        assert!(
+            get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "the assignment must survive an unauthorized revoke attempt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t42: revoking the SAME `assignment_id` a second time (after it already
+    /// succeeded) is a safe idempotent no-op — no panic, no error.
+    #[test]
+    fn t42_revoke_by_assignment_id_idempotent_retry() {
+        let home = tmp_home("t42-idempotent");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+
+        let first = handle_revoke_review_assignment(&home, &args, &sender);
+        assert_eq!(first["ok"], true, "first revoke must succeed: {first}");
+
+        let second = handle_revoke_review_assignment(&home, &args, &sender);
+        assert_eq!(
+            second["ok"], true,
+            "second revoke of the same assignment_id must still be ok: {second}"
+        );
+        assert!(
+            second["already_absent"] == true || second["revoked"] == false,
+            "second revoke must report either already_absent or revoked:false: {second}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t43: revoking assignment A (reviewer-1) on a branch must NOT touch a
+    /// co-resident assignment B (reviewer-2) on the SAME (repo,branch).
+    #[test]
+    fn t43_revoke_does_not_affect_other_assignment() {
+        let home = tmp_home("t43-isolation");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec_a = mk_record("o/r", "feat/x", "reviewer-1", 42, "2026-07-15T00:00:00Z");
+        let rec_b = mk_record("o/r", "feat/x", "reviewer-2", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec_a).unwrap();
+        persist(&home, &rec_b).unwrap();
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let args = serde_json::json!({"assignment_id": rec_a.assignment_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &sender);
+
+        assert_eq!(result["ok"], true, "revoking A must succeed: {result}");
+        assert!(
+            get(&home, "o/r", "feat/x", "reviewer-1").is_none(),
+            "A must be gone"
+        );
+        assert!(
+            get(&home, "o/r", "feat/x", "reviewer-2").is_some(),
+            "B must be untouched by A's revoke"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t44: a STALE `assignment_id` (from an already-revoked generation) must NOT
+    /// retire a NEW assignment persisted afterward for the SAME target — the CAS
+    /// on `assignment_id` inside `retire_if_id_matches` protects against this.
+    #[test]
+    fn t44_revoke_stale_generation_safe() {
+        let home = tmp_home("t44-stale-gen");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec_a = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec_a).unwrap();
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let revoke_a_args = serde_json::json!({"assignment_id": rec_a.assignment_id.to_string()});
+        let revoke_a = handle_revoke_review_assignment(&home, &revoke_a_args, &sender);
+        assert_eq!(revoke_a["ok"], true, "revoking A must succeed: {revoke_a}");
+
+        // A fresh generation B replaces A for the same (repo,branch,target).
+        let rec_b = mk_record("o/r", "feat/x", "reviewer", 43, "2026-07-15T00:05:00Z");
+        persist(&home, &rec_b).unwrap();
+
+        // Retrying A's now-stale assignment_id must be a no-op — B stays untouched.
+        let retry_a = handle_revoke_review_assignment(&home, &revoke_a_args, &sender);
+        assert_eq!(retry_a["ok"], true, "stale retry must still be ok: {retry_a}");
+        let still_there = get(&home, "o/r", "feat/x", "reviewer").expect("B must survive");
+        assert_eq!(
+            still_there.assignment_id, rec_b.assignment_id,
+            "B (the new generation) must be untouched by a stale A revoke retry"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t45: operator-direct (no sender identity) has full revoke authority —
+    /// mirrors t40 with `sender: None`.
+    #[test]
+    fn t45_revoke_by_operator_no_sender_allowed() {
+        let home = tmp_home("t45-operator");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &None);
+
+        assert_eq!(result["ok"], true, "operator-direct revoke must succeed: {result}");
+        assert_eq!(result["revoked"], true, "{result}");
+        assert!(
+            get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "record must be gone after operator revoke"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
