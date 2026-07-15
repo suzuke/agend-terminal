@@ -62,6 +62,58 @@ fn record_terminal_emitted(home: &Path, key: &str) {
     );
 }
 
+/// Settle a feature-branch CI watch on terminal PR state.
+/// Returns `true` if settlement is terminal (removed, absent, mismatch,
+/// protected) — pr_state may be removed. Returns `false` if retryable
+/// (lock/read/parse/remove failure) — pr_state should be retained.
+fn settle_feature_watch(home: &Path, repo: &str, branch: &str, terminal_head: &str) -> bool {
+    if crate::agent_ops::is_protected_ref(branch) {
+        return true;
+    }
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
+    let fname = crate::daemon::ci_watch::watch_filename(repo, branch);
+    let watch_path = ci_dir.join(&fname);
+    if !watch_path.exists() {
+        return true;
+    }
+    let lock_path = watch_path.with_extension("lock");
+    let Ok(_guard) = crate::store::acquire_file_lock(&lock_path) else {
+        return false;
+    };
+    let content = match std::fs::read_to_string(&watch_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let watch: crate::daemon::ci_watch::WatchState = match serde_json::from_str(&content) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    let watch_head = watch.head_sha.as_deref().unwrap_or("");
+    if watch.repo != repo
+        || watch.branch != branch
+        || watch_head.is_empty()
+        || watch_head != terminal_head
+        || watch.target_head_sha.is_some()
+    {
+        return true;
+    }
+    let subs: Vec<String> = watch
+        .subscribers
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.instance.clone())
+        .collect();
+    crate::daemon::ci_watch::remove_watch_json_only(
+        home,
+        &watch_path,
+        &subs.join(","),
+        repo,
+        branch,
+        "pr_terminal_cas_settlement",
+    )
+}
+
 /// Per-tick scanner: walks `<home>/pr-state/*.json`, emits any newly-
 /// eligible `[pr-ready-for-merge]` events (debounced via
 /// `ready_emitted_for_sha`), and sweeps terminal-state files.
@@ -636,17 +688,28 @@ pub fn scan_and_emit_with(
                 }
             },
         };
+        // Run watch settlement BEFORE pr_state removal so a retryable
+        // settlement failure retains pr_state as the retry source.
+        let watch_settle_ok =
+            if let Some((ref t_repo, ref t_branch, ref terminal_head)) = deferred_watch_settle {
+                settle_feature_watch(home, t_repo, t_branch, terminal_head)
+            } else {
+                true
+            };
         match result {
-            Ok(Some(ScanAction::Remove)) if terminal_recorded => {
-                // The durable terminal marker is already recorded above (or there was
-                // none to record), so removing the pr_state file here can never lose
-                // it (crash-safe ordering).
+            Ok(Some(ScanAction::Remove)) if terminal_recorded && watch_settle_ok => {
                 let _ = remove(home, &repo, &branch);
             }
+            Ok(Some(ScanAction::Remove)) if terminal_recorded => {
+                // Watch settlement had a retryable failure — retain pr_state
+                // so the next scan re-observes the terminal and retries.
+                tracing::info!(
+                    repo = %repo, branch = %branch,
+                    "pr_state retained: watch settlement retryable failure"
+                );
+            }
             Ok(Some(ScanAction::Remove)) => {
-                // record_terminal FAILED — SKIP the remove (B3 fail closed). The
-                // pr_state file is retained as the retry source; the next scan
-                // re-observes the terminal and record_terminal (idempotent) retries.
+                // record_terminal FAILED — SKIP the remove (B3 fail closed).
             }
             Err(e) => {
                 tracing::warn!(
@@ -693,52 +756,6 @@ pub fn scan_and_emit_with(
                 &format!("{repo}@{branch}"),
                 "pr_merge_blocked",
             );
-        }
-        // Post-flock CI-watch CAS settlement: remove the feature-branch watch
-        // only when repo+branch+head_sha all match the terminal state.
-        // This is the deterministic settlement path for watches that the
-        // poller's check_pr_terminal cannot reach (branch deleted after merge).
-        if let Some((t_repo, t_branch, terminal_head)) = deferred_watch_settle {
-            if !crate::agent_ops::is_protected_ref(&t_branch) {
-                let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-                let fname = crate::daemon::ci_watch::watch_filename(&t_repo, &t_branch);
-                let watch_path = ci_dir.join(&fname);
-                if watch_path.exists() {
-                    let lock_path = watch_path.with_extension("lock");
-                    if let Ok(_guard) = crate::store::acquire_file_lock(&lock_path) {
-                        if let Ok(content) = std::fs::read_to_string(&watch_path) {
-                            if let Ok(watch) = serde_json::from_str::<
-                                crate::daemon::ci_watch::WatchState,
-                            >(&content)
-                            {
-                                let watch_head = watch.head_sha.as_deref().unwrap_or("");
-                                if watch.repo == t_repo
-                                    && watch.branch == t_branch
-                                    && !watch_head.is_empty()
-                                    && watch_head == terminal_head
-                                    && watch.target_head_sha.is_none()
-                                {
-                                    let subs: Vec<String> = watch
-                                        .subscribers
-                                        .as_deref()
-                                        .unwrap_or(&[])
-                                        .iter()
-                                        .map(|s| s.instance.clone())
-                                        .collect();
-                                    crate::daemon::ci_watch::remove_watch_json_only(
-                                        home,
-                                        &watch_path,
-                                        &subs.join(","),
-                                        &t_repo,
-                                        &t_branch,
-                                        "pr_terminal_cas_settlement",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
         let _ = registry; // reserved for future gh-poll author lookup hook
     }

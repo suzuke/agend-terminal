@@ -402,11 +402,21 @@ pub(crate) fn flush_watch_state(
         Some(c) => c,
         None => return, // file deleted by concurrent unwatch — respect deletion
     };
-    // Generation CAS: if the disk generation_id differs from the pre-poll
-    // snapshot (a new watch was created after settlement), skip the merge
-    // to prevent cross-generation overwrite. Missing generation_id on disk
-    // (legacy watch not yet seeded) also skips — fail closed.
-    if let Some(expected) = expected_generation {
+    // Generation CAS: the expected_generation MUST match the disk
+    // generation_id. Missing expected (None) is fail-closed: a poller
+    // that doesn't carry a generation_id (legacy snapshot) must not
+    // mutate — it may be from a prior generation.
+    let expected = match expected_generation {
+        Some(e) if !e.is_empty() => e,
+        _ => {
+            tracing::info!(
+                path = %watch_path.display(),
+                "flush_watch_state: no expected_generation — fail-closed, skipping flush"
+            );
+            return;
+        }
+    };
+    {
         let disk_gen = merged.generation_id.as_deref().unwrap_or("");
         if disk_gen != expected {
             tracing::info!(
@@ -516,9 +526,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let watch_path = dir.join("test.json");
 
+        let gen = "test-gen-flush";
         let initial = super::super::watch_state::WatchState {
             repo: "o/r".into(),
             branch: "feat".into(),
+            generation_id: Some(gen.to_string()),
             subscribers: Some(vec![
                 super::super::watch_state::Subscriber {
                     instance: "A".into(),
@@ -544,7 +556,7 @@ mod tests {
         }]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale, None);
+        flush_watch_state(&watch_path, &stale, Some(gen));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
@@ -690,13 +702,14 @@ mod tests {
         let stale = super::super::watch_state::WatchState {
             repo: "o/r".into(),
             branch: "feat".into(),
+            generation_id: Some("gen-deleted".to_string()),
             last_run_id: Some(99),
             ..Default::default()
         };
 
         // File does not exist (concurrent unwatch deleted it).
         assert!(!watch_path.exists());
-        flush_watch_state(&watch_path, &stale, None);
+        flush_watch_state(&watch_path, &stale, Some("gen-deleted"));
         assert!(
             !watch_path.exists(),
             "flush must not resurrect a deleted watch file"
@@ -717,6 +730,7 @@ mod tests {
             expires_at: Some("2026-01-01T00:00:00Z".into()),
             task_id: Some("t-old".into()),
             required_checks: None,
+            generation_id: Some("gen-meta".to_string()),
             ..Default::default()
         };
         std::fs::write(&watch_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
@@ -726,14 +740,14 @@ mod tests {
         stale.last_run_id = Some(42);
         stale.head_sha = Some("abc".into());
 
-        // Concurrent `ci watch` updates metadata on disk.
+        // Concurrent `ci watch` updates metadata on disk (same generation).
         let mut updated = initial;
         updated.expires_at = Some("2026-06-01T00:00:00Z".into());
         updated.task_id = Some("t-new".into());
         updated.required_checks = Some(vec!["build".into()]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&updated).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale, None);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();

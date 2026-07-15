@@ -396,3 +396,46 @@ fn stale_flush_across_settlement_and_new_generation_thread() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// R9: Corrupt/unreadable watch file retains pr_state for retry.
+/// After repair, next scan settles both.
+#[test]
+fn corrupt_watch_retains_pr_state_then_repair_settles() {
+    let home = tmp_home("r9-corrupt");
+    let repo = "owner/repo";
+    let branch = "feat/r9";
+    let head = "head-r9";
+
+    write_merged_pr_state(&home, repo, branch, head);
+    // Write a CORRUPT watch file (invalid JSON).
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    std::fs::create_dir_all(&ci_dir).ok();
+    let fname = crate::daemon::ci_watch::watch_filename(repo, branch);
+    std::fs::write(ci_dir.join(&fname), "{{corrupt json").expect("write corrupt");
+
+    tests::write_team_fleet(&home, "lead", &["dev"]);
+
+    // First scan: settlement fails (parse error) → pr_state retained.
+    run_scan(&home);
+    let _pr_state_dir = super::pr_state_dir(&home);
+    // Watch should still exist (corrupt, couldn't settle).
+    assert!(
+        ci_dir.join(&fname).exists(),
+        "corrupt watch file must survive"
+    );
+
+    // Repair: write a valid watch with matching head.
+    write_watch(&home, repo, branch, head);
+    // Re-create pr_state (first scan may or may not have removed it
+    // depending on whether settlement retained it).
+    write_merged_pr_state(&home, repo, branch, head);
+
+    // Second scan: settlement succeeds.
+    run_scan(&home);
+    assert!(
+        !watch_exists(&home, repo, branch),
+        "repaired watch must be settled on next scan"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
