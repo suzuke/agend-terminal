@@ -1920,3 +1920,8 @@ mod tests;
 #[allow(clippy::unwrap_used)]
 #[path = "cold_pr_tests.rs"]
 mod cold_pr_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "watch_settlement_tests.rs"]
+mod watch_settlement_tests;

@@ -71,6 +71,43 @@ pub fn remove_watch(
     );
 }
 
+/// Remove only the `.json` watch file, leaving the `.lock` sidecar intact.
+///
+/// Called under a held per-watch flock so the `.lock` inode must NOT be
+/// unlinked while the guard holds it (doing so lets a concurrent re-create
+/// obtain a different inode, and a stale flush from the old guard can
+/// corrupt the new generation). The `.lock` is cleaned up after guard drop
+/// by the orphan sweep in `gc_stale_watches`.
+/// Returns true if the file was removed (or already absent).
+pub(crate) fn remove_watch_json_only(
+    home: &Path,
+    watch_path: &Path,
+    subscriber_label: &str,
+    repo: &str,
+    branch: &str,
+    reason: &str,
+) -> bool {
+    match std::fs::remove_file(watch_path) {
+        Ok(()) => {
+            crate::event_log::log(
+                home,
+                "ci_watch_removed",
+                subscriber_label,
+                &format!("repo={repo} branch={branch} reason={reason} lock_preserved=true"),
+            );
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(
+                path = %watch_path.display(), error = %e,
+                "remove_watch_json_only: deletion failed — retryable"
+            );
+            false
+        }
+    }
+}
+
 /// #1488: scrub a deleted instance out of every CI watch. For each watch file:
 /// drop `instance` from the `subscribers` list (and the legacy single
 /// `instance` field), and clear `next_after_ci` if it pointed at the deleted
@@ -340,7 +377,16 @@ pub(super) fn update_watch_state_with_notify(
 /// Merge-safe: starts from the on-disk state (preserving all
 /// control-plane fields) and only applies poll-owned deltas from
 /// the in-memory snapshot.
-pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::WatchState) {
+///
+/// `expected_generation`: the generation_id the poller read at poll start.
+/// If the on-disk generation_id differs (a new watch was created after this
+/// poll's watch was settled), the flush is skipped to prevent cross-generation
+/// overwrite. `None` skips the CAS (test seams only).
+pub(crate) fn flush_watch_state(
+    watch_path: &Path,
+    state: &super::watch_state::WatchState,
+    expected_generation: Option<&str>,
+) {
     let lock_path = watch_path.with_extension("lock");
     let _lock = match crate::store::acquire_file_lock(&lock_path) {
         Ok(l) => l,
@@ -356,6 +402,36 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
         Some(c) => c,
         None => return, // file deleted by concurrent unwatch — respect deletion
     };
+    // Generation CAS: the expected_generation MUST match the disk
+    // generation_id. Missing expected (None) is fail-closed: a poller
+    // that doesn't carry a generation_id (legacy snapshot) must not
+    // mutate — it may be from a prior generation.
+    let expected = match expected_generation {
+        Some(e) if !e.is_empty() => e,
+        _ => {
+            tracing::info!(
+                path = %watch_path.display(),
+                "flush_watch_state: no expected_generation — fail-closed, skipping flush"
+            );
+            return;
+        }
+    };
+    {
+        let disk_gen = merged.generation_id.as_deref().unwrap_or("");
+        if disk_gen.is_empty() {
+            // Legacy watch on disk without generation_id: seed it from the
+            // poller's in-memory value (which was seeded at poll start).
+            merged.generation_id = Some(expected.to_string());
+        } else if disk_gen != expected {
+            tracing::info!(
+                path = %watch_path.display(),
+                expected = %expected,
+                disk = %disk_gen,
+                "flush_watch_state: generation CAS mismatch — skipping stale flush"
+            );
+            return;
+        }
+    }
     // Apply only poll-owned fields from in-memory state.
     merged.last_run_id = state.last_run_id;
     merged.head_sha = state.head_sha.clone();
@@ -454,9 +530,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let watch_path = dir.join("test.json");
 
+        let gen = "test-gen-flush";
         let initial = super::super::watch_state::WatchState {
             repo: "o/r".into(),
             branch: "feat".into(),
+            generation_id: Some(gen.to_string()),
             subscribers: Some(vec![
                 super::super::watch_state::Subscriber {
                     instance: "A".into(),
@@ -482,7 +560,7 @@ mod tests {
         }]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some(gen));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
@@ -628,13 +706,14 @@ mod tests {
         let stale = super::super::watch_state::WatchState {
             repo: "o/r".into(),
             branch: "feat".into(),
+            generation_id: Some("gen-deleted".to_string()),
             last_run_id: Some(99),
             ..Default::default()
         };
 
         // File does not exist (concurrent unwatch deleted it).
         assert!(!watch_path.exists());
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-deleted"));
         assert!(
             !watch_path.exists(),
             "flush must not resurrect a deleted watch file"
@@ -655,6 +734,7 @@ mod tests {
             expires_at: Some("2026-01-01T00:00:00Z".into()),
             task_id: Some("t-old".into()),
             required_checks: None,
+            generation_id: Some("gen-meta".to_string()),
             ..Default::default()
         };
         std::fs::write(&watch_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
@@ -664,14 +744,14 @@ mod tests {
         stale.last_run_id = Some(42);
         stale.head_sha = Some("abc".into());
 
-        // Concurrent `ci watch` updates metadata on disk.
+        // Concurrent `ci watch` updates metadata on disk (same generation).
         let mut updated = initial;
         updated.expires_at = Some("2026-06-01T00:00:00Z".into());
         updated.task_id = Some("t-new".into());
         updated.required_checks = Some(vec!["build".into()]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&updated).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();

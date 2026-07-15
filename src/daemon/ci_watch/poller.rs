@@ -1493,6 +1493,12 @@ async fn ci_check_repo(
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
+    // Seed generation_id for legacy watches missing it. This is the
+    // durable-before-polling seeding: the generation is persisted on the
+    // first flush so subsequent polls carry it for CAS.
+    if state.generation_id.is_none() {
+        state.generation_id = Some(uuid::Uuid::new_v4().to_string());
+    }
     let snapshot = state.clone();
     let repo = state.repo.clone();
     let branch = state.branch.clone();
@@ -1525,7 +1531,7 @@ async fn ci_check_repo(
         Ok(Some(pr)) => pr,
         Ok(None) => {
             if state != snapshot {
-                flush_watch_state(watch_path, &state);
+                flush_watch_state(watch_path, &state, snapshot.generation_id.as_deref());
             }
             // #1750 A2: do NOT refresh `expires_at` here. `Ok(None)` means the
             // poll found NO runs for the branch — a deleted/merged-away branch or
@@ -1538,7 +1544,7 @@ async fn ci_check_repo(
         }
         Err(e) => {
             if state != snapshot {
-                flush_watch_state(watch_path, &state);
+                flush_watch_state(watch_path, &state, snapshot.generation_id.as_deref());
             }
             return Err(e);
         }
@@ -1629,7 +1635,7 @@ async fn ci_check_repo(
             state.last_notified_by_workflow = cursors;
         }
         if state != snapshot {
-            flush_watch_state(watch_path, &state);
+            flush_watch_state(watch_path, &state, snapshot.generation_id.as_deref());
         }
         if activity {
             refresh_expires_at(watch_path);
@@ -1652,7 +1658,7 @@ async fn ci_check_repo(
         return Ok(());
     }
     if state != snapshot {
-        flush_watch_state(watch_path, &state);
+        flush_watch_state(watch_path, &state, snapshot.generation_id.as_deref());
     }
     refresh_expires_at(watch_path);
     Ok(())

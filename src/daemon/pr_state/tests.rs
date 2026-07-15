@@ -44,7 +44,7 @@ fn stamp_fresh_ancestry(s: &mut PrState) {
     s.freshness_error = false;
 }
 
-fn new_state(head: &str, class: ReviewClass) -> PrState {
+pub(super) fn new_state(head: &str, class: ReviewClass) -> PrState {
     PrState {
         repo: "owner/repo".to_string(),
         pr_number: 100,
@@ -2975,7 +2975,7 @@ fn t20_1017_replay_age_threshold_is_fixed_1h() {
 }
 
 /// #2059-#3: write a fleet.yaml team so `find_team_for` resolves.
-fn write_team_fleet(home: &std::path::Path, orch: &str, members: &[&str]) {
+pub(super) fn write_team_fleet(home: &std::path::Path, orch: &str, members: &[&str]) {
     let mut y = String::from("instances:\n");
     for m in members {
         y.push_str(&format!("  {m}:\n    backend: claude\n"));
