@@ -602,6 +602,38 @@ fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &st
         )
 }
 
+pub(crate) fn extract_github_repo_for_intent(url: &str) -> Option<String> {
+    extract_github_repo(url)
+}
+
+/// Return the PR number of a merged PR whose head matches the local branch tip.
+/// Used by cleanup intent sweep to independently verify PR generation.
+pub(crate) fn merged_pr_number(repo: &Path, base: &str, branch: &str) -> Option<u64> {
+    let remote_url = crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]).ok()?;
+    let gh_repo = extract_github_repo(&remote_url)?;
+    let local_sha = crate::git_helpers::git_cmd(repo, &["rev-parse", branch]).ok()?;
+    let prs = crate::scm::make_scm_provider(&gh_repo, None)
+        .pr_list(
+            &gh_repo,
+            &crate::scm::ListFilter {
+                state: Some("merged"),
+                head: Some(branch.to_string()),
+                base: Some(base.to_string()),
+                ..Default::default()
+            },
+            &["headRefOid", "number"],
+            None,
+        )
+        .ok()?;
+    prs.iter()
+        .find(|pr| {
+            pr.head_ref_oid
+                .as_deref()
+                .is_some_and(|oid| local_sha_matches_merged_head(repo, &local_sha, oid))
+        })
+        .map(|pr| pr.number)
+}
+
 /// Extract "owner/repo" from a GitHub remote URL.
 fn extract_github_repo(url: &str) -> Option<String> {
     // Handles: https://github.com/owner/repo.git, git@github.com:owner/repo.git

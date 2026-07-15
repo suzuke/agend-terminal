@@ -27,6 +27,7 @@ mod bugreport;
 mod capture;
 mod channel;
 mod claim_verifier;
+mod cleanup_intents;
 mod cli;
 mod config_integrity;
 mod connect;

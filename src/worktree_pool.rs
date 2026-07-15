@@ -200,6 +200,8 @@ pub struct ReleaseOutcome {
     pub(crate) stale_fingerprint: bool,
     /// Exact S2 absent-arm metadata cleanup, surfaced only by the force
     /// handler after the transaction; ordinary release responses skip it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_persist_error: Option<String>,
     #[serde(skip)]
     pub(crate) git_metadata_pruned: usize,
     #[serde(skip)]
@@ -277,10 +279,59 @@ fn cleanup_merged_branch(
     source_repo: &Path,
     branch: &str,
     dry_run: bool,
+    authority_proven_head: Option<&str>,
 ) -> (bool, Option<String>) {
     // Never delete protected branches.
     if crate::agent_ops::is_protected_ref(branch) {
         return (false, Some(format!("branch '{branch}' is protected")));
+    }
+
+    // Authority-proven review lease → immediate delete with expected-head CAS.
+    // The branch never merges into default (review scaffolding), so the normal
+    // merged/squash path cannot reap it. An authority-proven lease with a
+    // matching expected-head is monotonic proof the branch is disposable.
+    if let Some(expected) = authority_proven_head {
+        match crate::git_helpers::git_cmd(source_repo, &["rev-parse", branch]) {
+            Ok(actual) if actual.trim() == expected => {
+                if dry_run {
+                    return (
+                        false,
+                        Some(format!(
+                            "dry-run: would delete authority-proven review branch '{branch}' \
+                             (head={expected})"
+                        )),
+                    );
+                }
+                let del = crate::git_helpers::git_bypass(source_repo, &["branch", "-D", branch]);
+                return match del {
+                    Ok(o) if o.status.success() => (true, None),
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        (false, Some(format!("git branch -D failed: {stderr}")))
+                    }
+                    Err(e) => (false, Some(format!("git branch -D failed: {e}"))),
+                };
+            }
+            Ok(actual) => {
+                return (
+                    false,
+                    Some(format!(
+                        "authority-proven review branch '{branch}': expected head {expected} \
+                         but actual tip is {} — preserved (fail-closed)",
+                        actual.trim()
+                    )),
+                );
+            }
+            Err(_) => {
+                return (
+                    false,
+                    Some(format!(
+                        "authority-proven review branch '{branch}': cannot read branch tip \
+                         — preserved (fail-closed)"
+                    )),
+                );
+            }
+        }
     }
 
     // #t-7 (#1824 follow-up): a `git fetch --prune` MUTATES the source repo's
@@ -551,21 +602,99 @@ fn record_binding_removal(out: &mut ReleaseOutcome, removal: crate::binding::Bin
 }
 
 fn resolve_branch_cleanup(
+    home: &Path,
     binding: &serde_json::Value,
     managed_verified: bool,
     worktree_absent: bool,
     dry_run: bool,
+    was_dirty: bool,
     out: &mut ReleaseOutcome,
 ) {
     let branch = binding["branch"].as_str().unwrap_or("");
     let sr_str = binding["source_repo"].as_str().unwrap_or("");
+    let task_id = binding["task_id"].as_str().unwrap_or("");
     if !managed_verified && !worktree_absent {
         out.branch_cleanup_skipped_reason =
             Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
     } else if !branch.is_empty() && !sr_str.is_empty() {
-        let (deleted, skip_reason) = cleanup_merged_branch(Path::new(sr_str), branch, dry_run);
+        // Authority-proven review lease: lease_kind + review_assignment_id + expected_head
+        // all present → eligible for immediate delete with expected-head CAS.
+        // Dirty work → never auto-delete regardless of provenance.
+        let authority_proven_head = if was_dirty {
+            None
+        } else {
+            binding
+                .get("lease_kind")
+                .and_then(|v| v.as_str())
+                .filter(|&k| k == "review")
+                .and(
+                    binding
+                        .get("review_assignment_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty()),
+                )
+                .and(
+                    binding
+                        .get("expected_head")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty()),
+                )
+        };
+        if was_dirty
+            && binding
+                .get("lease_kind")
+                .and_then(|v| v.as_str())
+                .is_some_and(|k| k == "review")
+        {
+            out.branch_cleanup_skipped_reason = Some(format!(
+                "authority-proven review lease on '{branch}' had dirty work — branch preserved"
+            ));
+            return;
+        }
+        let (deleted, skip_reason) =
+            cleanup_merged_branch(Path::new(sr_str), branch, dry_run, authority_proven_head);
         out.branch_deleted = deleted;
-        out.branch_cleanup_skipped_reason = skip_reason;
+        out.branch_cleanup_skipped_reason = skip_reason.clone();
+        // Cleanup intent: clean feature branch released pre-merge → persist
+        // intent so it can be settled on pr-merged event or periodic sweep.
+        // Dirty branches get no intent (preserved permanently).
+        if !deleted && !was_dirty && !dry_run {
+            if let Some(tip) =
+                crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            {
+                let scm_slug = crate::git_helpers::git_cmd(
+                    Path::new(sr_str),
+                    &["remote", "get-url", "origin"],
+                )
+                .ok()
+                .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
+                // Derive PR number from task metadata for generation identity.
+                let pr_number = if !task_id.is_empty() {
+                    crate::tasks::load_routed(home, task_id)
+                        .ok()
+                        .and_then(|rt| rt.task.metadata.get("pr_number").and_then(|v| v.as_u64()))
+                } else {
+                    None
+                };
+                if let Err(e) = crate::cleanup_intents::persist_intent(
+                    home,
+                    sr_str,
+                    branch,
+                    &tip,
+                    task_id,
+                    scm_slug.as_deref(),
+                    pr_number,
+                ) {
+                    tracing::warn!(
+                        %branch, error = %e,
+                        "cleanup intent persistence failed — branch may leak"
+                    );
+                    out.intent_persist_error = Some(e);
+                }
+            }
+        }
     } else if branch.is_empty() {
         out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());
     } else {
@@ -580,6 +709,7 @@ struct LockedRelease {
     finish_full_release: bool,
     managed_verified: bool,
     worktree_absent: bool,
+    was_dirty: bool,
 }
 
 fn idempotent_absent() -> ReleaseOutcome {
@@ -623,6 +753,7 @@ fn release_known_locked(
     let wt_path_str = binding["worktree"].as_str().unwrap_or("");
     let mut managed_verified = false;
     let mut worktree_absent = false;
+    let mut was_dirty = false;
 
     if !wt_path_str.is_empty() {
         let wt_path = Path::new(wt_path_str);
@@ -649,6 +780,7 @@ fn release_known_locked(
                     finish_full_release: false,
                     managed_verified,
                     worktree_absent,
+                    was_dirty,
                 };
             } else {
                 managed_verified = true;
@@ -670,6 +802,7 @@ fn release_known_locked(
                     home, agent, wt_path, branch, None,
                 );
                 notices.extend(collected);
+                was_dirty = matches!(preservation, crate::worktree::WipPreservation::Preserved);
                 if let Some(reason) = preservation.blocked_reason() {
                     // reviewer4 #2672 fix — FAIL-CLOSED: there IS uncommitted WIP
                     // but it could not be snapshotted (e.g. a contended
@@ -689,6 +822,7 @@ fn release_known_locked(
                         finish_full_release: false,
                         managed_verified,
                         worktree_absent,
+                        was_dirty,
                     };
                 }
             }
@@ -725,6 +859,7 @@ fn release_known_locked(
                         finish_full_release: false,
                         managed_verified,
                         worktree_absent,
+                        was_dirty,
                     };
                 }
                 WorktreeRemoval::Failed(err) => {
@@ -770,6 +905,7 @@ fn release_known_locked(
         finish_full_release,
         managed_verified,
         worktree_absent,
+        was_dirty,
     }
 }
 
@@ -848,10 +984,12 @@ fn release_full_guarded(
     }
     if locked.finish_full_release {
         resolve_branch_cleanup(
+            home,
             &current,
             locked.managed_verified,
             locked.worktree_absent,
             dry_run,
+            locked.was_dirty,
             &mut locked.out,
         );
         crate::event_log::log(

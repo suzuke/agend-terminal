@@ -568,10 +568,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             let mut bound_fingerprint = None;
             if bind {
-                // #2533: optional caller-supplied task_id — attributes this self-claim
-                // to a task (§3.19.1 reviewer checkout is the common case) so `bind_full`
-                // treats it as in-dispatch instead of warning. Absent → "" (unattributed,
-                // pre-#2533 behavior unchanged).
+                // #2533: optional task_id attributes self-claim to a task (in-dispatch).
                 let task_id = args["task_id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -609,6 +606,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         branch,
                     );
                 }
+                crate::binding::try_augment_review_lease(
+                    home,
+                    instance_name,
+                    task_id,
+                    branch,
+                    &source_canonical,
+                );
                 bound_fingerprint =
                     match crate::binding::snapshot_guarded_binding(home, instance_name) {
                         Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
@@ -639,16 +643,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 crate::worktree_pool::release_test_seam::hit(
                     crate::worktree_pool::ReleaseTestPhase::CheckoutBoundBeforeCommit,
                 );
-                // #2158 GR1 (operator-approved): a self-claimed `repo action=checkout
-                // bind=true` no longer SILENTLY arms a ci_watch — neither here (this
-                // inline arm is removed) NOR via the shared dispatch_hook path
-                // (`bind_self` self-claims pass `arm_ci_watch=false`). The silent
-                // auto-arm was part of the #2158 incident blast: a transient sub-agent
-                // (sharing the primary's identity) self-claiming a worktree also armed a
-                // watch the operator never asked for. The daemon DISPATCH path passes
-                // `arm_ci_watch=true` and STILL arms for normal delegation. A
-                // self-claiming agent that wants CI notifications arms it explicitly via
-                // `ci action=watch`.
+                // #2158 GR1: self-claim checkout does NOT auto-arm ci_watch
+                // (dispatch path arms via arm_ci_watch=true; self-claim uses
+                // `ci action=watch` explicitly).
                 resp["bound"] = json!(true);
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);

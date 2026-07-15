@@ -50,7 +50,7 @@ fn cleanup_merged_branch_uses_true_default_not_main_worktree_git() {
 
     // Observation-only dry-run: never mutates refs, so it is safe to assert
     // the decision text without deleting anything.
-    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/merged", true);
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/merged", true, None);
     assert!(
         !deleted,
         "dry-run must never delete (deleted should be false): {reason:?}"
@@ -178,7 +178,7 @@ fn cleanup_merged_branch_keeps_remote_gone_branch_with_unpushed_commits_worktree
     // itself runs `fetch --prune` on the non-dry-run path, so is_gone will be true.
     git(&remote, &["branch", "-D", "feat/unpushed"]);
 
-    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/unpushed", false);
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/unpushed", false, None);
     assert!(
         !deleted,
         "must NOT delete a remote-gone branch carrying unpushed local commits \
@@ -254,7 +254,7 @@ fn cleanup_merged_branch_still_deletes_aged_squash_merged_remote_gone_branch_wor
     git(&repo, &["push", "origin", "main"]);
     git(&remote, &["branch", "-D", "feat/squashed"]);
 
-    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/squashed", false);
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/squashed", false, None);
     assert!(
         deleted,
         "a genuinely squash-merged, aged, remote-gone branch must still be \
