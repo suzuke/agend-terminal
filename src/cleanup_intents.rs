@@ -111,45 +111,56 @@ pub(crate) fn settle_intent(
             intent.repo
         )));
     }
-    match crate::git_helpers::git_cmd(source_repo, &["rev-parse", "--verify", branch]) {
-        Ok(actual) if actual.trim() == intent.expected_head => {
-            let del = crate::git_helpers::git_bypass(source_repo, &["branch", "-D", branch]);
-            match del {
-                Ok(o) if o.status.success() => {
-                    let _ = std::fs::remove_file(&path);
-                    Some(SettleOutcome::Deleted)
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    Some(SettleOutcome::DeleteFailed(format!(
-                        "git branch -D failed: {stderr}"
-                    )))
-                }
-                Err(e) => Some(SettleOutcome::DeleteFailed(format!(
-                    "git branch -D failed: {e}"
-                ))),
-            }
+    // Typed branch-existence check: show-ref --verify --quiet returns
+    // exit 0 = present, exit 1 = absent, spawn error = preserve for retry.
+    let full_ref = format!("refs/heads/{branch}");
+    match crate::git_helpers::git_bypass(
+        source_repo,
+        &["show-ref", "--verify", "--quiet", &full_ref],
+    ) {
+        Err(e) => {
+            return Some(SettleOutcome::GitError(format!(
+                "cleanup intent for '{branch}': git spawn error ({e}) — intent preserved for retry"
+            )));
         }
-        Ok(actual) => Some(SettleOutcome::HeadDrift(format!(
+        Ok(o) if !o.status.success() => {
+            let _ = std::fs::remove_file(&path);
+            return Some(SettleOutcome::BranchAbsent);
+        }
+        Ok(_) => {}
+    }
+    // Branch exists — get tip SHA for CAS.
+    let tip = match crate::git_helpers::git_cmd(source_repo, &["rev-parse", branch]) {
+        Ok(t) => t,
+        Err(e) => {
+            return Some(SettleOutcome::GitError(format!(
+                "cleanup intent for '{branch}': rev-parse error ({e}) — intent preserved for retry"
+            )));
+        }
+    };
+    if tip.trim() != intent.expected_head {
+        return Some(SettleOutcome::HeadDrift(format!(
             "cleanup intent for '{branch}': expected head {} but actual tip is {} \
              — preserved (fail-closed)",
             intent.expected_head,
-            actual.trim()
-        ))),
-        Err(e) => {
-            let stderr = e.to_string();
-            if stderr.contains("not a valid object name")
-                || stderr.contains("unknown revision")
-                || stderr.contains("bad revision")
-            {
-                let _ = std::fs::remove_file(&path);
-                Some(SettleOutcome::BranchAbsent)
-            } else {
-                Some(SettleOutcome::GitError(format!(
-                    "cleanup intent for '{branch}': git error ({stderr}) — intent preserved for retry"
-                )))
-            }
+            tip.trim()
+        )));
+    }
+    let del = crate::git_helpers::git_bypass(source_repo, &["branch", "-D", branch]);
+    match del {
+        Ok(o) if o.status.success() => {
+            let _ = std::fs::remove_file(&path);
+            Some(SettleOutcome::Deleted)
         }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Some(SettleOutcome::DeleteFailed(format!(
+                "git branch -D failed: {stderr}"
+            )))
+        }
+        Err(e) => Some(SettleOutcome::DeleteFailed(format!(
+            "git branch -D failed: {e}"
+        ))),
     }
 }
 
@@ -182,6 +193,57 @@ pub(crate) fn settle_by_scm_slug(
         }
     }
     None
+}
+
+/// Durable retry consumer: scan all intents, check merge status via
+/// `pr_merge_status` for each, and settle those confirmed merged. Called
+/// from the periodic sweep to ensure intents are settled even if the
+/// original CI watch was removed before settlement succeeded.
+pub(crate) fn sweep_settle_merged(home: &Path) {
+    let dir = intents_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&p) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let intent: CleanupIntent = match serde_json::from_str(&content) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let repo_path = Path::new(&intent.repo);
+        if !repo_path.is_dir() {
+            continue;
+        }
+        let default = crate::git_helpers::default_branch(repo_path);
+        let pr_status = crate::branch_sweep::pr_merge_status(repo_path, &default, &intent.branch);
+        let merged = matches!(pr_status, crate::branch_sweep::PrMergeStatus::Merged);
+        if !merged {
+            continue;
+        }
+        match settle_intent(home, &intent.repo, &intent.branch, true, intent.pr_number) {
+            Some(SettleOutcome::Deleted) => {
+                tracing::info!(
+                    branch = %intent.branch,
+                    "cleanup intent settled by sweep retry"
+                );
+            }
+            Some(SettleOutcome::DeleteFailed(reason)) | Some(SettleOutcome::GitError(reason)) => {
+                tracing::warn!(
+                    branch = %intent.branch, %reason,
+                    "cleanup intent sweep retry failed — will retry next tick"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn intent_repos(home: &Path) -> Vec<String> {
@@ -454,6 +516,37 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn real_missing_branch_clears_intent() {
+        let home = tmp_dir("missing-branch");
+        let repo = tmp_repo("missing-branch-repo");
+        let rs = repo.display().to_string();
+        // Intent for a branch that never existed in this repo
+        persist_intent(
+            &home,
+            &rs,
+            "feat/definitely-missing-branch",
+            "abc123",
+            "t-miss",
+            None,
+            None,
+        )
+        .expect("persist");
+
+        let outcome = settle_intent(&home, &rs, "feat/definitely-missing-branch", true, None);
+        assert!(
+            matches!(outcome, Some(SettleOutcome::BranchAbsent)),
+            "real missing branch must be BranchAbsent (not GitError): {outcome:?}"
+        );
+        assert!(
+            !has_intent(&home, &rs, "feat/definitely-missing-branch"),
+            "intent must be cleared for confirmed absent branch"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

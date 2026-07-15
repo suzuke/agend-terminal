@@ -200,6 +200,8 @@ pub struct ReleaseOutcome {
     pub(crate) stale_fingerprint: bool,
     /// Exact S2 absent-arm metadata cleanup, surfaced only by the force
     /// handler after the transaction; ordinary release responses skip it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_persist_error: Option<String>,
     #[serde(skip)]
     pub(crate) git_metadata_pruned: usize,
     #[serde(skip)]
@@ -668,6 +670,14 @@ fn resolve_branch_cleanup(
                 )
                 .ok()
                 .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
+                // Derive PR number from task metadata for generation identity.
+                let pr_number = if !task_id.is_empty() {
+                    crate::tasks::load_routed(home, task_id)
+                        .ok()
+                        .and_then(|rt| rt.task.metadata.get("pr_number").and_then(|v| v.as_u64()))
+                } else {
+                    None
+                };
                 if let Err(e) = crate::cleanup_intents::persist_intent(
                     home,
                     sr_str,
@@ -675,12 +685,13 @@ fn resolve_branch_cleanup(
                     &tip,
                     task_id,
                     scm_slug.as_deref(),
-                    None,
+                    pr_number,
                 ) {
                     tracing::warn!(
                         %branch, error = %e,
                         "cleanup intent persistence failed — branch may leak"
                     );
+                    out.intent_persist_error = Some(e);
                 }
             }
         }

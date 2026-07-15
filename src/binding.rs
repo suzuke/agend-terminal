@@ -542,6 +542,15 @@ pub(crate) fn try_augment_review_lease(
     if !assignment.is_receipt_capable() {
         return;
     }
+    if assignment.task_id != task_id {
+        return;
+    }
+    let current_id = crate::fleet::resolve_uuid(home, agent);
+    if let (Some(assign_id), Some(cur_id)) = (&assignment.target_instance_id, &current_id) {
+        if assign_id != cur_id {
+            return;
+        }
+    }
     let Some(reviewed_head) = assignment
         .reviewed_head
         .as_deref()
