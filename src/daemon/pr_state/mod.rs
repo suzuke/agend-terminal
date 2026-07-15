@@ -1906,3 +1906,8 @@ pub fn format_ready_body(state: &PrState) -> String {
 #[allow(clippy::unwrap_used)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "cold_pr_tests.rs"]
+mod cold_pr_tests;
