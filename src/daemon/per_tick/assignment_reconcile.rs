@@ -1372,4 +1372,79 @@ mod tests {
         assert!(wakes2.is_empty(), "no stale wake after authority removed");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// D6: delete failure after revocation notice enqueue must not duplicate
+    /// the notice on retry. The stable nonce + any-state dedup ensures
+    /// exactly one notice even across a failed delete + successful retry.
+    #[cfg(unix)]
+    #[test]
+    fn d6_delete_failure_retry_no_duplicate_notice() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("d6-delete-fail");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        mark_row_read(
+            &home,
+            "reviewer",
+            &rec.delivery_nonce,
+            "2026-07-13T00:00:30Z",
+        );
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        // Make the authority record's parent dir read-only so the delete
+        // fails AFTER the notice is enqueued (supersede succeeds because
+        // it writes to the inbox dir, not the authority dir).
+        // Find the branch dir by scanning reviewer-assignments/.
+        let ra_base = home.join("reviewer-assignments");
+        let record_dir = std::fs::read_dir(&ra_base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .expect("branch dir must exist after persist");
+        let original_perms = std::fs::metadata(&record_dir).unwrap().permissions();
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // First attempt: notice enqueued, delete fails, authority preserved.
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        std::fs::set_permissions(&record_dir, original_perms.clone()).unwrap();
+
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "authority must survive delete failure"
+        );
+        let inbox_content =
+            std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
+        let notice_count = inbox_content
+            .lines()
+            .filter(|l| l.contains("review-assignment-revoked"))
+            .count();
+        assert_eq!(notice_count, 1, "exactly one notice after first attempt");
+
+        // Second attempt (retry): notice dedup, delete now succeeds.
+        reconcile_all_collect(&home, "2026-07-13T00:02:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "authority deleted on retry"
+        );
+        let inbox_content2 =
+            std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
+        let notice_count2 = inbox_content2
+            .lines()
+            .filter(|l| l.contains("review-assignment-revoked"))
+            .count();
+        assert_eq!(
+            notice_count2, 1,
+            "still exactly one notice after retry (dedup by stable nonce)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

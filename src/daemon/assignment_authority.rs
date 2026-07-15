@@ -497,7 +497,15 @@ fn build_delivery_message(record: &ActiveAssignment, now: &str) -> crate::inbox:
 
 /// A durable revocation notice — enqueued only when the retracted row had already
 /// been READ (I21), so the reviewer learns a seen assignment was pulled.
-fn build_revocation_notice(record: &ActiveAssignment, now: &str) -> crate::inbox::InboxMessage {
+fn revocation_nonce(assignment_id: uuid::Uuid) -> String {
+    format!("revoked-{assignment_id}")
+}
+
+fn build_revocation_notice(
+    record: &ActiveAssignment,
+    now: &str,
+    nonce: &str,
+) -> crate::inbox::InboxMessage {
     crate::inbox::InboxMessage {
         from: record.sender.clone(),
         text: format!(
@@ -509,6 +517,7 @@ fn build_revocation_notice(record: &ActiveAssignment, now: &str) -> crate::inbox
         task_id: Some(record.task_id.clone()),
         correlation_id: Some(record.task_id.clone()),
         pr_number: Some(record.pr_number),
+        delivery_nonce: Some(nonce.to_string()),
         ..Default::default()
     }
 }
@@ -811,7 +820,11 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                 crate::inbox::storage::enqueue(
                     home,
                     &record.target,
-                    build_revocation_notice(&old, &record.created_at),
+                    build_revocation_notice(
+                        &old,
+                        &record.created_at,
+                        &revocation_nonce(old.assignment_id),
+                    ),
                 )?;
             }
         }
@@ -988,8 +1001,18 @@ pub(crate) fn retire_if_id_matches(
 
     // Step 2: if the reviewer had already read the assignment, enqueue a
     // deterministic revocation notice so they learn it was retracted.
+    // Stable nonce + any-state dedup: if a prior attempt already enqueued
+    // the notice (but delete failed), the nonce is already present and we
+    // skip the duplicate append.
     if outcome.was_read {
-        crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
+        let nonce = revocation_nonce(expected_id);
+        if !crate::inbox::storage::nonce_present_any_state(home, target, &nonce) {
+            crate::inbox::storage::enqueue(
+                home,
+                target,
+                build_revocation_notice(&record, now, &nonce),
+            )?;
+        }
     }
 
     // Step 3: NOW safe to delete the authority — the stale inbox state has
@@ -1028,7 +1051,11 @@ fn revoke_under_lock(
     // A row the reviewer had already READ is not retracted by the supersede alone
     // (it is already non-actionable) — surface an explicit revocation notice (I21).
     if outcome.was_read {
-        crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
+        crate::inbox::storage::enqueue(
+            home,
+            target,
+            build_revocation_notice(&record, now, &revocation_nonce(record.assignment_id)),
+        )?;
     }
     Ok(removed)
 }
