@@ -518,6 +518,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             "last_polled_at": watch["last_polled_at"].as_i64(),
             "last_terminal_seen_at": watch["last_terminal_seen_at"].as_str(),
             "head_sha": watch["head_sha"].as_str(),
+            "target_head_sha": watch["target_head_sha"].as_str(),
             "expires_at": watch["expires_at"].as_str(),
             // #813: surface cached mergeable state so callers can
             // distinguish "CI running" silence from "CONFLICTING
