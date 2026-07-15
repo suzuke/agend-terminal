@@ -638,6 +638,74 @@ fn discharge_of_ci_ready_resolves_only_callers_handoff_track_35896_11() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #35896-11 P0 overlap: an old classless row can outlive the track it was
+/// emitted with. Discharging that stale row must not resolve a newer protected
+/// episode that reused the same target+correlation key.
+#[test]
+fn discharge_of_legacy_ci_ready_does_not_resolve_new_protected_episode() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-ci-ready-legacy-overlap");
+    let target = "discharge-ciready-overlap-target-35896";
+    let corr = "o/r@main";
+
+    // Legacy row: no episode/class identity, as persisted before protected
+    // settlement was introduced.
+    crate::inbox::enqueue(
+        &home,
+        target,
+        crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-ciready-legacy-overlap".into()),
+            from: "system:ci-watch".into(),
+            text: format!("[ci-ready-for-action] {corr}: legacy handoff"),
+            kind: Some("ci-ready-for-action".into()),
+            correlation_id: Some(corr.into()),
+            timestamp: "2026-07-06T00:00:00Z".into(),
+            ..Default::default()
+        },
+    )
+    .expect("test setup: enqueue legacy ci-ready must succeed");
+
+    // A newer protected delivery reused the same target+correlation key and
+    // owns the live track. The legacy row has no identity that can settle it.
+    assert!(crate::daemon::ci_handoff_track::record_with_identity(
+        &home,
+        target,
+        corr,
+        "2026-07-06T01:00:00Z",
+        Some("HEAD"),
+        None,
+        Some("episode-new"),
+        Some(crate::inbox::CiHandoffClass::Protected),
+    ));
+
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({
+            "message_id": "m-ciready-legacy-overlap",
+            "reason": "legacy row handled out of band"
+        }),
+        target,
+    );
+    assert_eq!(r["discharged"], true, "legacy discharge must succeed: {r}");
+    assert_eq!(
+        r["handoff_resolved"], 0,
+        "legacy row must not resolve the newer protected episode: {r}"
+    );
+    let tracks = crate::daemon::ci_handoff_track::list(&home);
+    assert_eq!(
+        tracks.len(),
+        1,
+        "new protected track must remain live: {tracks:?}"
+    );
+    assert_eq!(
+        tracks[0].1.ci_handoff_episode.as_deref(),
+        Some("episode-new"),
+        "the newer protected episode must survive legacy discharge"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #35896-11 ② negative: discharging a NON-ci-ready message (an ordinary
 /// channel obligation) must never touch ci_handoff_track — the kind gate keeps
 /// the watchdog wire scoped to genuine handoffs.

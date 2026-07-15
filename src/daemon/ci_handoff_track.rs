@@ -589,6 +589,42 @@ pub(crate) fn resolve_for_target_correlation_reason(
     resolved
 }
 
+/// Resolve an explicit-discharge legacy handoff without inferring identity
+/// for a newer protected episode that reuses the same target/correlation key.
+/// Feature and classless tracks retain the pre-episode discharge behavior;
+/// protected tracks must use [`resolve_protected_episode`] instead.
+pub(crate) fn resolve_legacy_for_target_correlation_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == agent
+            && track.correlation == correlation
+            && track.ci_handoff_class != Some(crate::inbox::CiHandoffClass::Protected)
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#1888-track-resolved",
+                agent = %track.target,
+                correlation = %track.correlation,
+                reason,
+                "legacy ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
 /// Resolve one protected handoff only when every durable identity component
 /// matches. Legacy/classless/episode-less tracks are deliberately ignored.
 pub(crate) fn resolve_protected_episode(
