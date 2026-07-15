@@ -1003,39 +1003,66 @@ fn validate_plan_ack_under_lock(
             }
         }
     }
-    // Ack vector: each element must be a unique non-empty string that is NOT
-    // the current owner. Malformed/duplicate/self elements are rejected
-    // without normalization.
-    let owner_name = fresh.owner.as_ref().map(|o| o.0.as_str());
-    let ack_arr = fresh.metadata.get("plan_acks").and_then(|v| v.as_array());
-    let mut unique_valid: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    if let Some(arr) = ack_arr {
-        for elem in arr {
-            let s = match elem.as_str() {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    return Err(format!(
-                        "plan_acks contains a non-string or empty element — \
-                         refusing in_progress (task {task_id})"
-                    ))
-                }
-            };
-            if owner_name == Some(s) {
-                return Err(format!(
-                    "plan_acks contains the current owner '{s}' — \
-                     self-ack is not valid (task {task_id})"
-                ));
-            }
-            unique_valid.insert(s);
-        }
-    }
-    if (unique_valid.len() as u64) < required {
+    let valid_count = validate_ack_vector_strict(
+        fresh.metadata.get("plan_acks"),
+        fresh.owner.as_ref().map(|o| o.0.as_str()),
+        task_id,
+    )?;
+    if valid_count < required {
         return Err(format!(
-            "plan-ack pending: {}/{required} valid unique acks (task {task_id})",
-            unique_valid.len()
+            "plan-ack pending: {valid_count}/{required} valid unique acks (task {task_id})",
         ));
     }
     Ok(())
+}
+
+/// Strict ack-vector validator shared by [`validate_plan_ack_under_lock`] and
+/// the [`handle_ack_plan`] fresh-state revalidation. Returns the count of
+/// valid unique acks or an error. Rejects: non-array (when present),
+/// non-string elements, empty strings, duplicates, and owner/self entries.
+/// Absent vector is zero valid acks (not an error).
+fn validate_ack_vector_strict(
+    plan_acks: Option<&serde_json::Value>,
+    owner_name: Option<&str>,
+    task_id: &str,
+) -> Result<u64, String> {
+    let arr = match plan_acks {
+        None => return Ok(0),
+        Some(v) => match v.as_array() {
+            Some(a) => a,
+            None => {
+                return Err(format!(
+                    "plan_acks is present but not an array — \
+                     refusing (task {task_id})"
+                ))
+            }
+        },
+    };
+    let mut seen = std::collections::HashSet::new();
+    for elem in arr {
+        let s = match elem.as_str() {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Err(format!(
+                    "plan_acks contains a non-string or empty element — \
+                     refusing (task {task_id})"
+                ))
+            }
+        };
+        if owner_name == Some(s) {
+            return Err(format!(
+                "plan_acks contains the current owner '{s}' — \
+                 self-ack is not valid (task {task_id})"
+            ));
+        }
+        if !seen.insert(s) {
+            return Err(format!(
+                "plan_acks contains duplicate entry '{s}' — \
+                 refusing (task {task_id})"
+            ));
+        }
+    }
+    Ok(seen.len() as u64)
 }
 
 fn update_batch_precondition(
@@ -2048,6 +2075,12 @@ fn handle_ack_plan(
         if !rec.metadata.contains_key("plan") {
             return Err("task has no plan set".to_string());
         }
+        // Strict validation of the existing ack vector before appending.
+        // Reuses the shared validator so ack_plan refuses to build on a
+        // corrupt vector (non-array, non-string, empty, duplicate, or
+        // owner entry) rather than silently filter_mapping past it.
+        let owner_name = rec.owner.as_ref().map(|o| o.0.as_str());
+        validate_ack_vector_strict(rec.metadata.get("plan_acks"), owner_name, &tid.0)?;
         let mut fresh_acks: Vec<String> = rec
             .metadata
             .get("plan_acks")

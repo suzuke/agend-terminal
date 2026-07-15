@@ -2659,3 +2659,80 @@ fn p0_invalid_ack_vector_blocks_in_progress() {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+/// P0 r4 RED: duplicate ack entry with required=1 must fail. Before the fix,
+/// HashSet silently deduplicates so `["alice", "alice"]` counted as 1 unique
+/// ack and passed the `>= required` gate.
+#[test]
+fn p0_duplicate_ack_with_required_1_fails() {
+    let home = tmp_home("p0-dup-ack-r1");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let emitter = crate::task_events::InstanceName::from("system");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!(["alice", "alice"]),
+        },
+    );
+    let r = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        r.get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.contains("duplicate")),
+        "duplicate ack vector must fail even when count meets required=1: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 r4 RED: ack_plan over a pre-existing malformed ack vector must fail
+/// instead of filter_mapping past non-string elements.
+#[test]
+fn p0_ack_plan_rejects_malformed_preexisting_vector() {
+    let home = tmp_home("p0-ackplan-malformed");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let emitter = crate::task_events::InstanceName::from("system");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!([42, "valid-acker"]),
+        },
+    );
+    let r = handle(
+        &home,
+        "new-acker",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "ack_plan must refuse to append over a malformed pre-existing vector: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
