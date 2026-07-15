@@ -961,6 +961,110 @@ fn handle_done(
 /// Pure decision logic over the supplied `state` (no `api::call` — #1629-safe to
 /// run under the lock) and a directly-testable seam.
 #[allow(clippy::too_many_arguments)]
+fn validate_plan_ack_under_lock(
+    fresh: &crate::task_events::TaskRecord,
+    task_id: &str,
+) -> Result<(), String> {
+    let required_val = fresh.metadata.get("plan_ack_required");
+    let required = match required_val {
+        None => return Ok(()),
+        Some(v) => match v.as_u64() {
+            Some(0) => return Ok(()),
+            Some(n) => n,
+            None => {
+                return Err(format!(
+                    "plan_ack_required is malformed (not a valid integer) — \
+                     refusing in_progress fail-closed (task {task_id})"
+                ))
+            }
+        },
+    };
+    // Plan shape: must be a meaningful value (trimmed non-empty string, or
+    // non-empty array/object). Null, blank, empty containers, and bare
+    // scalars (numbers, booleans) are not plans.
+    match fresh.metadata.get("plan") {
+        None => {
+            return Err(format!(
+                "plan_ack_required={required} but no plan is set (task {task_id})"
+            ))
+        }
+        Some(v) => {
+            let meaningful = match v {
+                serde_json::Value::String(s) => !s.trim().is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(o) => !o.is_empty(),
+                _ => false,
+            };
+            if !meaningful {
+                return Err(format!(
+                    "plan content is empty or not a meaningful value — \
+                     refusing in_progress (task {task_id})"
+                ));
+            }
+        }
+    }
+    let valid_count = validate_ack_vector_strict(
+        fresh.metadata.get("plan_acks"),
+        fresh.owner.as_ref().map(|o| o.0.as_str()),
+        task_id,
+    )?;
+    if valid_count < required {
+        return Err(format!(
+            "plan-ack pending: {valid_count}/{required} valid unique acks (task {task_id})",
+        ));
+    }
+    Ok(())
+}
+
+/// Strict ack-vector validator shared by [`validate_plan_ack_under_lock`] and
+/// the [`handle_ack_plan`] fresh-state revalidation. Returns the count of
+/// valid unique acks or an error. Rejects: non-array (when present),
+/// non-string elements, empty strings, duplicates, and owner/self entries.
+/// Absent vector is zero valid acks (not an error).
+fn validate_ack_vector_strict(
+    plan_acks: Option<&serde_json::Value>,
+    owner_name: Option<&str>,
+    task_id: &str,
+) -> Result<u64, String> {
+    let arr = match plan_acks {
+        None => return Ok(0),
+        Some(v) => match v.as_array() {
+            Some(a) => a,
+            None => {
+                return Err(format!(
+                    "plan_acks is present but not an array — \
+                     refusing (task {task_id})"
+                ))
+            }
+        },
+    };
+    let mut seen = std::collections::HashSet::new();
+    for elem in arr {
+        let s = match elem.as_str() {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Err(format!(
+                    "plan_acks contains a non-string or empty element — \
+                     refusing (task {task_id})"
+                ))
+            }
+        };
+        if owner_name == Some(s) {
+            return Err(format!(
+                "plan_acks contains the current owner '{s}' — \
+                 self-ack is not valid (task {task_id})"
+            ));
+        }
+        if !seen.insert(s) {
+            return Err(format!(
+                "plan_acks contains duplicate entry '{s}' — \
+                 refusing (task {task_id})"
+            ));
+        }
+    }
+    Ok(seen.len() as u64)
+}
+
 fn update_batch_precondition(
     state: &crate::task_events::TaskBoardState,
     home: &Path,
@@ -1007,6 +1111,12 @@ fn update_batch_precondition(
         return Err(format!(
             "task '{upd_id}' owner changed since read; event attribution would be stale (retry)"
         ));
+    }
+    // (4) Plan-ack fresh gate: validate plan shape, ack vector integrity, and
+    //     count UNDER THE LOCK. The out-of-lock check (handle_update lines
+    //     1153-1176) is a fast-reject; this is the authoritative chokepoint.
+    if target_status == Some(crate::task_events::TaskStatus::InProgress) {
+        validate_plan_ack_under_lock(fresh, upd_id)?;
     }
     Ok(())
 }
@@ -1383,6 +1493,8 @@ fn handle_update(
         // each may self-IPC or take other locks — runs AFTER the flock drops,
         // #1629). The fingerprint match guarantees the `board` local still names the
         // appended board, so the cascade + read-back below use it safely.
+        #[cfg(test)]
+        super::fire_before_mutation_commit_hook_for_test();
         let checked = routed.with_revalidated_board(home, |board| {
             crate::task_events::append_batch_checked_at(board, &emitter, pending_events, |state| {
                 update_batch_precondition(
@@ -1792,8 +1904,18 @@ fn metadata_write_outcome(
             if !is_gov_author {
                 return deny_counter("only the task creator (created_by) may raise it");
             }
-            if matches!(record.status, TaskStatus::Backlog | TaskStatus::Open) {
-                return deny_counter("may only be raised after the assignee has claimed the task");
+            match record.status {
+                TaskStatus::Claimed => {}
+                TaskStatus::Backlog | TaskStatus::Open => {
+                    return deny_counter(
+                        "may only be raised after the assignee has claimed the task",
+                    );
+                }
+                _ => {
+                    return deny_counter(
+                        "may not be raised after work has started (in_progress or later)",
+                    );
+                }
             }
             let current = record
                 .metadata
@@ -1910,30 +2032,11 @@ fn handle_ack_plan(
             "code": "plan_not_set",
         });
     }
-    let acks: Vec<String> = record
-        .metadata
-        .get("plan_acks")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    if acks.iter().any(|a| a == instance_name) {
-        // Idempotent: already acked by this caller — no-op success, no new event.
-        return serde_json::json!({
-            "id": id, "event": "ack_plan", "acked": acks.len(), "already_acked": true,
-        });
-    }
-    // #2760 R2 (root+independent REJECT of a542517b): the `acks` list read above is
-    // an OUT-OF-LOCK snapshot — used only for the fast idempotent already-acked
-    // response. The AUTHORITATIVE ack is built as a UNION from the FRESH under-lock
-    // `plan_acks` (`with_revalidated_computed`). A route-only revalidation
-    // (board/incarnation) cannot see CONTENT staleness, so two acks that both read
-    // the pre-lock list would last-write-wins and silently LOSE one. Building the
-    // union (and re-checking self-ack / plan-present) against the committed state no
-    // concurrent writer can change closes that lost-update TOCTOU.
+    // No out-of-lock fast-path: all ack_plan calls go through the under-lock
+    // strict validation so a corrupt vector (non-string, duplicate, self-ack)
+    // is never bypassed by a filter_map/already_acked early return.
+    // The under-lock path handles idempotency (returns Ok(Vec::new()) when
+    // the caller is already present in a VALID vector).
     let caller = instance_name.to_string();
     let tid = crate::task_events::TaskId(id.to_string());
     let ack_emitter = emitter.clone();
@@ -1953,6 +2056,12 @@ fn handle_ack_plan(
         if !rec.metadata.contains_key("plan") {
             return Err("task has no plan set".to_string());
         }
+        // Strict validation of the existing ack vector before appending.
+        // Reuses the shared validator so ack_plan refuses to build on a
+        // corrupt vector (non-array, non-string, empty, duplicate, or
+        // owner entry) rather than silently filter_mapping past it.
+        let owner_name = rec.owner.as_ref().map(|o| o.0.as_str());
+        validate_ack_vector_strict(rec.metadata.get("plan_acks"), owner_name, &tid.0)?;
         let mut fresh_acks: Vec<String> = rec
             .metadata
             .get("plan_acks")

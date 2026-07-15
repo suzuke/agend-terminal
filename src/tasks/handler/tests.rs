@@ -2321,3 +2321,462 @@ fn metadata_set_refused_when_owner_drifts_via_release_claim_under_lock_2760_r2()
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── P0 plan-ack fresh gate (task t-…-46776-13, decision d-…-8) ──
+// Deterministic RED tests for six adversarial cases. Each test MUST FAIL against
+// current code and PASS after the P0 GREEN fix lands. The gate validates plan
+// shape, ack vector integrity, and fresh ownership UNDER the append lock at the
+// InProgress transition, closing the out-of-lock TOCTOU gap.
+
+/// P0 RED 1 — Plan-reset TOCTOU: acks are cleared between the out-of-lock
+/// plan_ack check and the under-lock commit. The stale snapshot sees acks≥required
+/// but fresh state has acks=0. Must refuse in_progress.
+#[test]
+fn p0_plan_reset_toctou_blocks_in_progress() {
+    let home = tmp_home("p0-toctou");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    handle(
+        &home,
+        "reviewer-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert_eq!(gov_plan_acks_len(&home, &id), 1, "precondition: 1 ack");
+    // Hook: clear plan_acks in the out-of-lock window (simulates a concurrent
+    // plan change that resets acks, landing before the update lock).
+    let home_h = home.clone();
+    let id_h = id.clone();
+    crate::tasks::set_before_mutation_commit_hook_for_test(move || {
+        let emitter = crate::task_events::InstanceName::from("lead");
+        let _ = crate::task_events::append(
+            &home_h,
+            &emitter,
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(id_h),
+                by: emitter.clone(),
+                key: "plan_acks".to_string(),
+                value: serde_json::json!([]),
+            },
+        );
+    });
+    let r = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "plan-reset TOCTOU must block in_progress (pre-fix: stale snapshot passes, \
+         fresh state has 0 acks): {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 RED 2 — Malformed plan_ack_required fails closed: if the stored value is
+/// not a valid u64 (e.g. a string "2"), the InProgress gate must refuse rather
+/// than defaulting to 0 and bypassing the gate.
+#[test]
+fn p0_malformed_required_fails_closed() {
+    let home = tmp_home("p0-malformed");
+    // Create a task without plan_ack_required, then inject a malformed value.
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "malformed gate task",
+            "assignee": "worker",
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Inject a malformed plan_ack_required via raw event (bypasses handler validation).
+    let emitter = crate::task_events::InstanceName::from("lead");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_ack_required".to_string(),
+            value: serde_json::json!("2"),
+        },
+    );
+    // Set plan and ack so the count check would pass if required were parsed as 0.
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let r = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "malformed plan_ack_required (string '2') must fail closed, not silently \
+         default to 0 and bypass the gate: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 RED 3 — Late raise denied: after work has started (in_progress), the
+/// GOV_AUTHOR must not be allowed to raise plan_ack_required.
+#[test]
+fn p0_late_raise_denied_after_in_progress() {
+    let home = tmp_home("p0-late-raise");
+    let id = gov_seed_in_progress(&home);
+    let raise = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan_ack_required", "metadata_value": 2
+        }),
+    );
+    assert_eq!(
+        raise["code"], "plan_ack_required_protected",
+        "GOV_AUTHOR must not raise plan_ack_required after in_progress: {raise}"
+    );
+    assert_eq!(
+        gov_plan_ack_required(&home, &id),
+        1,
+        "plan_ack_required must remain 1 after rejected late raise"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 RED 4 — Blank/empty plan blocks in_progress: a plan that is blank (""),
+/// empty array ([]), or empty object ({}) is not a meaningful plan. The
+/// InProgress gate must reject even when ack count ≥ required.
+#[test]
+fn p0_blank_plan_blocks_in_progress() {
+    for (label, plan_value) in [
+        ("blank string", serde_json::json!("")),
+        ("empty array", serde_json::json!([])),
+        ("empty object", serde_json::json!({})),
+    ] {
+        let home = tmp_home(&format!("p0-blank-{label}"));
+        let id = gov_seed_claimed(&home, 1);
+        handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": plan_value
+            }),
+        );
+        handle(
+            &home,
+            "reviewer-a",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert_eq!(gov_plan_acks_len(&home, &id), 1, "precondition: 1 ack");
+        let r = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert!(
+            r.get("error").and_then(|v| v.as_str()).is_some(),
+            "plan '{label}' must block in_progress — a meaningless plan is not a plan: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// P0 RED 5 — Ack-then-owner-reassignment laundering: reviewer acks the plan,
+/// then gets reassigned as owner. The ack vector now contains the owner's own
+/// identity — a self-ack laundered via the reassignment. Must refuse in_progress.
+#[test]
+fn p0_ack_owner_reassignment_laundering() {
+    let home = tmp_home("p0-laundering");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    handle(
+        &home,
+        "reviewer-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        1,
+        "precondition: 1 ack from reviewer-a"
+    );
+    // Reassign ownership from "worker" to "reviewer-a" (the acker).
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "assignee": "reviewer-a"}),
+    );
+    let rec = read_task_record(&home, &id).expect("record");
+    assert_eq!(
+        rec.owner.as_ref().map(|o| o.0.as_str()),
+        Some("reviewer-a"),
+        "precondition: owner is now reviewer-a"
+    );
+    let r = handle(
+        &home,
+        "reviewer-a",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "laundered self-ack must block in_progress — ack vector contains the \
+         current owner's identity: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 RED 6 — Invalid ack vector blocks in_progress: the ack vector contains
+/// duplicates, non-string elements, or the owner's own identity. The gate must
+/// validate each element, not just count.
+#[test]
+fn p0_invalid_ack_vector_blocks_in_progress() {
+    // Sub-case A: duplicate acks (count=2 but unique=1, required=2).
+    {
+        let home = tmp_home("p0-dup-ack");
+        let id = gov_seed_claimed(&home, 2);
+        handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "the plan"
+            }),
+        );
+        // Inject a duplicate ack vector via raw event.
+        let emitter = crate::task_events::InstanceName::from("system");
+        let _ = crate::task_events::append(
+            &home,
+            &emitter,
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: emitter.clone(),
+                key: "plan_acks".to_string(),
+                value: serde_json::json!(["rev-a", "rev-a"]),
+            },
+        );
+        let r = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert!(
+            r.get("error").and_then(|v| v.as_str()).is_some(),
+            "duplicate ack vector [rev-a, rev-a] must not satisfy required=2: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+    // Sub-case B: non-string element in ack vector.
+    {
+        let home = tmp_home("p0-nonstr-ack");
+        let id = gov_seed_claimed(&home, 1);
+        handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "the plan"
+            }),
+        );
+        let emitter = crate::task_events::InstanceName::from("system");
+        let _ = crate::task_events::append(
+            &home,
+            &emitter,
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: emitter.clone(),
+                key: "plan_acks".to_string(),
+                value: serde_json::json!([42]),
+            },
+        );
+        let r = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert!(
+            r.get("error").and_then(|v| v.as_str()).is_some(),
+            "non-string ack element [42] must not count toward plan_ack_required: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+    // Sub-case C: self-ack (owner's identity in ack vector via raw injection).
+    {
+        let home = tmp_home("p0-self-ack");
+        let id = gov_seed_claimed(&home, 1);
+        handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "the plan"
+            }),
+        );
+        let emitter = crate::task_events::InstanceName::from("system");
+        let _ = crate::task_events::append(
+            &home,
+            &emitter,
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: emitter.clone(),
+                key: "plan_acks".to_string(),
+                value: serde_json::json!(["worker"]),
+            },
+        );
+        let r = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert!(
+            r.get("error").and_then(|v| v.as_str()).is_some(),
+            "self-ack [worker] must not satisfy plan_ack_required: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// P0 r4 RED: duplicate ack entry with required=1 must fail. Before the fix,
+/// HashSet silently deduplicates so `["alice", "alice"]` counted as 1 unique
+/// ack and passed the `>= required` gate.
+#[test]
+fn p0_duplicate_ack_with_required_1_fails() {
+    let home = tmp_home("p0-dup-ack-r1");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let emitter = crate::task_events::InstanceName::from("system");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!(["alice", "alice"]),
+        },
+    );
+    let r = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        r.get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.contains("duplicate")),
+        "duplicate ack vector must fail even when count meets required=1: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 r4 RED: ack_plan over a pre-existing malformed ack vector must fail
+/// instead of filter_mapping past non-string elements.
+#[test]
+fn p0_ack_plan_rejects_malformed_preexisting_vector() {
+    let home = tmp_home("p0-ackplan-malformed");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let emitter = crate::task_events::InstanceName::from("system");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!([42, "valid-acker"]),
+        },
+    );
+    let r = handle(
+        &home,
+        "new-acker",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "ack_plan must refuse to append over a malformed pre-existing vector: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0 r5 RED: ack_plan with a corrupt vector that ALSO contains the caller
+/// must reject, not return already_acked success. Before the fix, the
+/// out-of-lock fast-path used filter_map to skip non-strings, found the
+/// caller in the filtered list, and returned already_acked: true without
+/// ever running strict validation.
+#[test]
+fn p0_ack_plan_corrupt_vector_containing_caller_rejects() {
+    let home = tmp_home("p0-ackplan-corrupt-caller");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let emitter = crate::task_events::InstanceName::from("system");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!([42, "new-acker"]),
+        },
+    );
+    let r = handle(
+        &home,
+        "new-acker",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "ack_plan must reject corrupt vector even when caller is present (no already_acked bypass): {r}"
+    );
+    assert!(
+        r.get("already_acked").is_none(),
+        "must not return already_acked on a corrupt vector: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
