@@ -1738,6 +1738,23 @@ async fn check_and_remove_terminal_pr(
     if merged {
         crate::status_summary::auto_close_merged_tasks(ctx.home, ctx.branch);
         crate::daemon::auto_release::auto_release_for_merged_branch(ctx.home, ctx.repo, ctx.branch);
+        // Settle any cleanup intent for this branch (CAS-checked delete).
+        if let Some((deleted, reason)) =
+            crate::cleanup_intents::settle_intent(ctx.home, ctx.repo, ctx.branch)
+        {
+            if deleted {
+                tracing::info!(
+                    repo = ctx.repo,
+                    branch = ctx.branch,
+                    "cleanup intent settled: branch deleted on pr-merged"
+                );
+            } else if !reason.is_empty() {
+                tracing::info!(
+                    repo = ctx.repo, branch = ctx.branch, %reason,
+                    "cleanup intent settlement skipped"
+                );
+            }
+        }
     }
     Ok(true)
 }

@@ -4391,7 +4391,7 @@ fn pr_merge_status_unknown_without_github_remote_keeps_branch_red7() {
 
     // And the release-path cleanup KEEPS the branch (never deletes on a
     // gh-unavailable young unmerged branch), surfacing the fail-closed reason.
-    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/red7", false);
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/red7", false, None);
     assert!(
         !deleted,
         "a gh-unavailable young unmerged branch must be KEPT, never deleted"
@@ -4761,5 +4761,270 @@ fn r6_dirty_recovery_ref_integrity_under_concurrent_release() {
     );
 
     std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// RED matrix tests for authority-proven review lease branch cleanup (Slice 2)
+// ---------------------------------------------------------------------------
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    crate::git_helpers::git_ok(repo, &["rev-parse", "--verify", branch])
+}
+
+fn branch_tip(repo: &Path, branch: &str) -> String {
+    crate::git_helpers::git_cmd(repo, &["rev-parse", branch])
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn make_review_branch(repo: &Path, name: &str) -> String {
+    git_in(repo, &["checkout", "-b", name]);
+    std::fs::write(repo.join("review-scaffold.txt"), "scaffold").ok();
+    git_in(repo, &["add", "."]);
+    git_in(
+        repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "scaffold",
+        ],
+    );
+    let tip = branch_tip(repo, name);
+    git_in(repo, &["checkout", "main"]);
+    tip
+}
+
+fn binding_with_lease(
+    branch: &str,
+    source_repo: &str,
+    lease_kind: Option<&str>,
+    assignment_id: Option<&str>,
+    expected_head: Option<&str>,
+) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "version": 1,
+        "agent": "test-agent",
+        "task_id": "T-1",
+        "branch": branch,
+        "issued_at": "2026-07-15T00:00:00Z",
+        "source_repo": source_repo,
+    });
+    if let Some(k) = lease_kind {
+        b["lease_kind"] = serde_json::json!(k);
+    }
+    if let Some(id) = assignment_id {
+        b["review_assignment_id"] = serde_json::json!(id);
+    }
+    if let Some(h) = expected_head {
+        b["expected_head"] = serde_json::json!(h);
+    }
+    b
+}
+
+/// RED #2: a branch named `review/*` but WITHOUT authority-proven provenance
+/// (no lease_kind in binding) must NOT be deleted by the authority-proven path.
+/// It falls through to the normal merged/squash check, which keeps it (review
+/// branches never merge into main).
+#[test]
+fn forged_review_prefix_without_provenance_preserved() {
+    let home = tmp_home("forged-prefix-home");
+    let repo = tmp_repo("forged-prefix");
+    let _tip = make_review_branch(&repo, "review/forged-1234");
+    assert!(branch_exists(&repo, "review/forged-1234"), "precondition");
+
+    let binding = binding_with_lease(
+        "review/forged-1234",
+        &repo.display().to_string(),
+        None, // NO lease_kind
+        None,
+        None,
+    );
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    assert!(
+        !out.branch_deleted,
+        "forged review/* prefix without authority provenance must NOT be deleted"
+    );
+    assert!(
+        branch_exists(&repo, "review/forged-1234"),
+        "branch must survive"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED #3: an authority-proven clean review lease (lease_kind + assignment_id +
+/// expected_head all present, worktree clean) must be deleted immediately via
+/// expected-head CAS.
+#[test]
+fn authority_proven_clean_review_deleted_immediately() {
+    let home = tmp_home("auth-review-del-home");
+    let repo = tmp_repo("auth-review-del");
+    let tip = make_review_branch(&repo, "review/auth-1234");
+    assert!(branch_exists(&repo, "review/auth-1234"), "precondition");
+
+    let binding = binding_with_lease(
+        "review/auth-1234",
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-uuid-001"),
+        Some(&tip),
+    );
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    assert!(
+        out.branch_deleted,
+        "authority-proven clean review lease must be deleted: skip_reason={:?}",
+        out.branch_cleanup_skipped_reason,
+    );
+    assert!(
+        !branch_exists(&repo, "review/auth-1234"),
+        "branch must be gone after authority-proven delete"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED #4: an authority-proven review lease on a DIRTY worktree must preserve
+/// the branch — dirty work was stashed but the branch ref should stay for
+/// manual recovery.
+#[test]
+fn dirty_review_preserved_no_delete() {
+    let home = tmp_home("dirty-review-home");
+    let repo = tmp_repo("dirty-review");
+    let tip = make_review_branch(&repo, "review/dirty-1234");
+    assert!(branch_exists(&repo, "review/dirty-1234"), "precondition");
+
+    let binding = binding_with_lease(
+        "review/dirty-1234",
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-uuid-002"),
+        Some(&tip),
+    );
+
+    let mut out = ReleaseOutcome::default();
+    // was_dirty = true
+    resolve_branch_cleanup(&home, &binding, true, false, false, true, &mut out);
+
+    assert!(!out.branch_deleted, "dirty review must NOT be deleted");
+    assert!(
+        branch_exists(&repo, "review/dirty-1234"),
+        "branch must survive dirty release"
+    );
+    let reason = out.branch_cleanup_skipped_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("dirty"),
+        "skip reason must mention dirty: {reason}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED unpushed: a clean authority-proven review branch where the reviewer
+/// committed additional work (head != expected_head) must be preserved — the
+/// CAS mechanism inherently protects against losing unpushed commits because
+/// head drift fails the CAS check.
+#[test]
+fn clean_but_unpushed_review_commits_preserved() {
+    let home = tmp_home("unpushed-review-home");
+    let repo = tmp_repo("unpushed-review");
+    let original_tip = make_review_branch(&repo, "review/unpushed-1234");
+    assert!(branch_exists(&repo, "review/unpushed-1234"), "precondition");
+
+    // Reviewer adds an ADDITIONAL commit (unpushed work)
+    git_in(&repo, &["checkout", "review/unpushed-1234"]);
+    std::fs::write(repo.join("reviewer-notes.txt"), "review findings").ok();
+    git_in(&repo, &["add", "."]);
+    git_in(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "review notes",
+        ],
+    );
+    let new_tip = branch_tip(&repo, "review/unpushed-1234");
+    assert_ne!(original_tip, new_tip, "reviewer committed new work");
+    git_in(&repo, &["checkout", "main"]);
+
+    // Binding records the ORIGINAL expected_head from the assignment
+    let binding = binding_with_lease(
+        "review/unpushed-1234",
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-uuid-unpushed"),
+        Some(&original_tip), // original head, not the new one
+    );
+
+    let mut out = ReleaseOutcome::default();
+    // was_dirty = false (committed, not dirty)
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    assert!(
+        !out.branch_deleted,
+        "clean-but-unpushed review must NOT be deleted — CAS protects unpushed commits"
+    );
+    assert!(
+        branch_exists(&repo, "review/unpushed-1234"),
+        "branch with unpushed commits must survive"
+    );
+    let reason = out.branch_cleanup_skipped_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("fail-closed"),
+        "skip reason must mention fail-closed for head drift: {reason}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED #6: authority-proven review lease with HEAD drift (expected_head !=
+/// actual tip) must fail-closed and preserve the branch.
+#[test]
+fn expected_head_drift_fail_closed() {
+    let home = tmp_home("head-drift-home");
+    let repo = tmp_repo("head-drift");
+    let _tip = make_review_branch(&repo, "review/drift-1234");
+    assert!(branch_exists(&repo, "review/drift-1234"), "precondition");
+
+    let binding = binding_with_lease(
+        "review/drift-1234",
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-uuid-003"),
+        Some("0000000000000000000000000000000000000000"), // wrong head
+    );
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    assert!(
+        !out.branch_deleted,
+        "head-drifted review must NOT be deleted"
+    );
+    assert!(
+        branch_exists(&repo, "review/drift-1234"),
+        "branch must survive head drift"
+    );
+    let reason = out.branch_cleanup_skipped_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("fail-closed"),
+        "skip reason must mention fail-closed: {reason}"
+    );
+
     std::fs::remove_dir_all(&repo).ok();
 }

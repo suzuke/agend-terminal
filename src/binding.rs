@@ -454,6 +454,54 @@ pub fn bind_full(
     Ok(())
 }
 
+/// Augment an existing binding with typed review-lease provenance.
+///
+/// Called by the dispatch infrastructure AFTER `bind_full` when a
+/// review-assignment is authority-proven (typed assignment + task + reviewer
+/// target). The fields are added to binding.json under the same locks and
+/// re-signed, so the HMAC covers them — an agent cannot forge these fields.
+///
+/// **Authority chain**: dispatch_auto_bind_lease → review assignment validated
+/// by the daemon → bind_full (creates binding) → this function (annotates with
+/// typed lease_kind + assignment_id + expected_head). The HMAC signature
+/// prevents an agent from adding/modifying these fields itself.
+pub(crate) fn augment_binding_with_lease(
+    home: &Path,
+    agent: &str,
+    lease_kind: &str,
+    review_assignment_id: &str,
+    expected_head: &str,
+) -> Result<(), String> {
+    let _agent_lock = acquire_agent_mutation_lock(home, agent)?;
+    let _binding_lock = acquire_binding_file_lock(home, agent)?;
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    let path = dir.join("binding.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read binding for lease augment: {e}"))?;
+    let mut binding: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("parse binding for lease augment: {e}"))?;
+    binding["lease_kind"] = serde_json::json!(lease_kind);
+    binding["review_assignment_id"] = serde_json::json!(review_assignment_id);
+    binding["expected_head"] = serde_json::json!(expected_head);
+    let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
+    crate::store::atomic_write(&path, body.as_bytes())
+        .map_err(|e| format!("write binding for lease augment: {e}"))?;
+    match agentic_git_core::integrity_core::sign_binding(home, body.as_bytes()) {
+        Ok(tag) => {
+            if let Err(e) = crate::store::atomic_write(&binding_sig_path(&dir), tag.as_bytes()) {
+                tracing::warn!(%agent, error = %e,
+                    "lease augment sig write failed — shim fails closed (deny) until re-bind");
+            }
+        }
+        Err(e) => tracing::warn!(%agent, error = %e,
+            "lease augment HMAC sign failed — shim fails closed (deny) until re-bind"),
+    }
+    if let Ok(mut map) = binding_index().write() {
+        map.insert(index_key(home, agent), binding);
+    }
+    Ok(())
+}
+
 /// #2158 GR1: surface an OUT-OF-DISPATCH binding CREATE/CHANGE (no task_id) to the
 /// operator — the realistic accidental-sub-agent / first-bind-hijack vector that
 /// guard-b can't prevent. Dedup is per `(agent, branch)` via a runtime-dir sidecar
@@ -698,6 +746,12 @@ pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
 pub fn all_managed_repos(home: &Path) -> Vec<std::path::PathBuf> {
     let mut repos = bound_source_repos(home);
     for path in read_managed_repo_registry(home) {
+        if !repos.contains(&path) {
+            repos.push(path);
+        }
+    }
+    for repo_str in crate::cleanup_intents::intent_repos(home) {
+        let path = std::path::PathBuf::from(repo_str);
         if !repos.contains(&path) {
             repos.push(path);
         }
