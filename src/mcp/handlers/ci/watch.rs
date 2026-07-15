@@ -126,8 +126,17 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 "last_notified_head_sha": null,
                 "expires_at": (chrono::Utc::now() + chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS)).to_rfc3339(),
                 "last_terminal_seen_at": null,
+                "generation_id": uuid::Uuid::new_v4().to_string(),
             })
         });
+    // Seed legacy watches missing generation_id.
+    if watch
+        .get("generation_id")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        watch["generation_id"] = json!(uuid::Uuid::new_v4().to_string());
+    }
 
     // Migrate legacy schema (single `instance` field, no `subscribers`
     // array) into the canonical multi-subscriber form. Subsequent reads

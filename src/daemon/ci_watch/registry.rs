@@ -378,13 +378,14 @@ pub(super) fn update_watch_state_with_notify(
 /// control-plane fields) and only applies poll-owned deltas from
 /// the in-memory snapshot.
 ///
-/// `expected_head`: the head_sha the poller read at poll start. If the
-/// on-disk head differs (a new generation was created after the old watch
-/// was settled), the flush is skipped to prevent cross-generation overwrite.
-pub(super) fn flush_watch_state(
+/// `expected_generation`: the generation_id the poller read at poll start.
+/// If the on-disk generation_id differs (a new watch was created after this
+/// poll's watch was settled), the flush is skipped to prevent cross-generation
+/// overwrite. `None` skips the CAS (test seams only).
+pub(crate) fn flush_watch_state(
     watch_path: &Path,
     state: &super::watch_state::WatchState,
-    expected_head: Option<&str>,
+    expected_generation: Option<&str>,
 ) {
     let lock_path = watch_path.with_extension("lock");
     let _lock = match crate::store::acquire_file_lock(&lock_path) {
@@ -401,16 +402,17 @@ pub(super) fn flush_watch_state(
         Some(c) => c,
         None => return, // file deleted by concurrent unwatch — respect deletion
     };
-    // Generation CAS: if the disk head changed since the poll started (a new
-    // generation was created after this poll's watch was settled), skip the
-    // merge to prevent cross-generation overwrite.
-    if let Some(expected) = expected_head {
-        let disk_head = merged.head_sha.as_deref().unwrap_or("");
-        if disk_head != expected {
+    // Generation CAS: if the disk generation_id differs from the pre-poll
+    // snapshot (a new watch was created after settlement), skip the merge
+    // to prevent cross-generation overwrite. Missing generation_id on disk
+    // (legacy watch not yet seeded) also skips — fail closed.
+    if let Some(expected) = expected_generation {
+        let disk_gen = merged.generation_id.as_deref().unwrap_or("");
+        if disk_gen != expected {
             tracing::info!(
                 path = %watch_path.display(),
                 expected = %expected,
-                disk = %disk_head,
+                disk = %disk_gen,
                 "flush_watch_state: generation CAS mismatch — skipping stale flush"
             );
             return;

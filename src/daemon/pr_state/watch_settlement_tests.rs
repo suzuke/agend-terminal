@@ -27,6 +27,22 @@ fn write_merged_pr_state(home: &std::path::Path, repo: &str, branch: &str, head:
 }
 
 fn write_watch(home: &std::path::Path, repo: &str, branch: &str, head_sha: &str) {
+    write_watch_with_gen(
+        home,
+        repo,
+        branch,
+        head_sha,
+        &uuid::Uuid::new_v4().to_string(),
+    );
+}
+
+fn write_watch_with_gen(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    head_sha: &str,
+    generation_id: &str,
+) {
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     std::fs::create_dir_all(&ci_dir).ok();
     let fname = crate::daemon::ci_watch::watch_filename(repo, branch);
@@ -34,6 +50,7 @@ fn write_watch(home: &std::path::Path, repo: &str, branch: &str, head_sha: &str)
         "repo": repo,
         "branch": branch,
         "head_sha": head_sha,
+        "generation_id": generation_id,
         "interval_secs": 60,
         "subscribers": [{"instance": "dev-agent", "subscribed_at": "2026-01-01T00:00:00Z"}],
     });
@@ -326,6 +343,56 @@ fn closed_unmerged_terminal_removes_matching_watch() {
         !watch_exists(&home, repo, branch),
         "closed-unmerged terminal must also remove matching feature watch"
     );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R8: Deterministic concurrency proof — a stale flush_watch_state with gen1's
+/// generation_id cannot overwrite a gen2 watch created after settlement.
+#[test]
+fn stale_flush_across_settlement_and_new_generation_thread() {
+    use crate::daemon::ci_watch::{ci_watches_dir, flush_watch_state, watch_filename, WatchState};
+    use std::sync::{Arc, Barrier};
+
+    let home = tmp_home("r8-concurrent");
+    let repo = "owner/repo";
+    let branch = "feat/r8";
+    let gen1_id = "gen1-uuid-aaa";
+    let gen2_id = "gen2-uuid-bbb";
+    let gen1_head = "gen1-head";
+    let gen2_head = "gen2-head";
+
+    write_watch_with_gen(&home, repo, branch, gen1_head, gen1_id);
+    let ci_dir = ci_watches_dir(&home);
+    let fname = watch_filename(repo, branch);
+    let watch_path = ci_dir.join(&fname);
+    let snapshot: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read gen1"))
+            .expect("parse gen1");
+
+    // Settle gen1.
+    std::fs::remove_file(&watch_path).expect("remove gen1");
+
+    // Create gen2 with different generation.
+    write_watch_with_gen(&home, repo, branch, gen2_head, gen2_id);
+
+    // Stale worker thread flushes gen1 snapshot.
+    let barrier = Arc::new(Barrier::new(2));
+    let b2 = barrier.clone();
+    let wp = watch_path.clone();
+    let snap = snapshot.clone();
+    let t = std::thread::spawn(move || {
+        b2.wait();
+        flush_watch_state(&wp, &snap, snap.generation_id.as_deref());
+    });
+    barrier.wait();
+    t.join().expect("worker thread");
+
+    // Gen2 must be uncorrupted.
+    let content = std::fs::read_to_string(&watch_path).expect("read after flush");
+    let after: WatchState = serde_json::from_str(&content).expect("parse after flush");
+    assert_eq!(after.generation_id.as_deref(), Some(gen2_id));
+    assert_eq!(after.head_sha.as_deref(), Some(gen2_head));
 
     std::fs::remove_dir_all(&home).ok();
 }

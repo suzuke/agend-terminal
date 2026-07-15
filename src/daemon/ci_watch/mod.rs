@@ -78,6 +78,8 @@ pub use sweep::{gc_stale_watches, startup_sweep};
 pub(crate) use sweep::classify_subscribed_watch_expiry;
 pub use watcher::check_ci_watches;
 
+#[cfg(test)]
+pub(crate) use registry::flush_watch_state;
 pub(crate) use registry::parse_subscribers;
 #[allow(unused_imports)]
 pub(crate) use watch_state::WatchState;

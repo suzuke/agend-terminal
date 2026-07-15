@@ -40,6 +40,15 @@ pub struct WatchState {
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
 
+    /// Immutable generation identity. Set once at watch creation; never
+    /// mutated by poll flushes. Used by `flush_watch_state` to CAS against
+    /// the pre-poll snapshot — a stale flush that acquired the lock after
+    /// settlement + new-generation creation sees a different generation_id
+    /// and skips the write. Legacy watches without this field are seeded on
+    /// first flush (fail-closed: a missing generation_id skips the flush).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
