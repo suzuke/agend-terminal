@@ -833,15 +833,14 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
             // for the retired assignment (I21). Clock-injected via the new record's
             // `created_at` (persist takes no separate `now`).
             if outcome.was_read {
-                crate::inbox::storage::enqueue(
-                    home,
-                    &record.target,
-                    build_revocation_notice(
-                        &old,
-                        &record.created_at,
-                        &revocation_nonce(old.assignment_id),
-                    ),
-                )?;
+                let nonce = revocation_nonce(old.assignment_id);
+                if !revocation_nonce_present(home, &record.target, &nonce) {
+                    crate::inbox::storage::enqueue(
+                        home,
+                        &record.target,
+                        build_revocation_notice(&old, &record.created_at, &nonce),
+                    )?;
+                }
             }
         }
     }

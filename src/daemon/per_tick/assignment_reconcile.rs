@@ -1447,4 +1447,87 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// D7: persist replacement with pre-existing stable revocation notice
+    /// must not duplicate the notice. Seeds: old authority + already-enqueued
+    /// revocation notice (simulating a prior persist that enqueued but whose
+    /// atomic_write_json failed). A new persist replacement must see the
+    /// existing nonce and skip the duplicate enqueue.
+    #[test]
+    fn d7_persist_replacement_dedup_revocation_notice() {
+        let home = tmp_home("d7-persist-dedup");
+        let instance_id = crate::types::InstanceId::new();
+        let head = "a".repeat(40);
+        let old = store::ActiveAssignment::new_pending_typed(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            instance_id,
+            7,
+            &head,
+            crate::review_receipt::ReviewSlot::Primary,
+            "lead",
+            "t-rev-1",
+            ReviewClass::Dual,
+            ReviewAuthor::External("octocat".into()),
+            "Please review PR",
+            None,
+            None,
+            "2026-07-13T00:00:00Z",
+        );
+        let old_id = old.assignment_id;
+        store::persist(&home, &old).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        mark_row_read(
+            &home,
+            "reviewer",
+            &old.delivery_nonce,
+            "2026-07-13T00:00:30Z",
+        );
+
+        // Seed: a revocation notice with stable nonce already present
+        // (simulating a prior persist that enqueued but failed to write).
+        let nonce = format!("revoked-{old_id}");
+        let notice = crate::inbox::InboxMessage {
+            text: "Reviewer assignment revoked.".to_string(),
+            kind: Some("review-assignment-revoked".to_string()),
+            timestamp: "2026-07-13T00:01:00Z".to_string(),
+            delivery_nonce: Some(nonce.clone()),
+            ..Default::default()
+        };
+        crate::inbox::storage::enqueue(&home, "reviewer", notice).unwrap();
+
+        // Now persist a replacement — should NOT duplicate the notice.
+        let new_head = "b".repeat(40);
+        let replacement = store::ActiveAssignment::new_pending_typed(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            instance_id,
+            7,
+            &new_head,
+            crate::review_receipt::ReviewSlot::Primary,
+            "lead",
+            "t-rev-2",
+            ReviewClass::Dual,
+            ReviewAuthor::External("octocat".into()),
+            "Please review PR v2",
+            None,
+            None,
+            "2026-07-13T00:02:00Z",
+        );
+        store::persist(&home, &replacement).unwrap();
+
+        let inbox =
+            std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
+        let notice_count = inbox
+            .lines()
+            .filter(|l| l.contains("review-assignment-revoked"))
+            .count();
+        assert_eq!(
+            notice_count, 1,
+            "persist replacement must not duplicate revocation notice (stable nonce dedup)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
