@@ -6,6 +6,7 @@ use std::sync::Arc;
 struct ColdPrMock {
     pr_number: u64,
     head_sha: String,
+    head_ref: String,
     author: String,
 }
 
@@ -17,6 +18,7 @@ impl ScmProvider for ColdPrMock {
         Ok(PrSummary {
             number: self.pr_number,
             head_ref_oid: Some(self.head_sha.clone()),
+            head_ref: Some(self.head_ref.clone()),
             author_login: Some(self.author.clone()),
             ..Default::default()
         })
@@ -102,6 +104,7 @@ fn cold_pr_creates_pending_pr_state() {
     let _guard = scm::set_test_scm_provider(Arc::new(ColdPrMock {
         pr_number: 42,
         head_sha: head.clone(),
+        head_ref: "feat/x".into(),
         author: "dev".into(),
     }));
 
@@ -132,6 +135,7 @@ fn cold_pr_wrong_head_fails_closed() {
     let _guard = scm::set_test_scm_provider(Arc::new(ColdPrMock {
         pr_number: 42,
         head_sha: "b".repeat(40),
+        head_ref: "feat/x".into(),
         author: "dev".into(),
     }));
 
@@ -214,6 +218,7 @@ fn cold_pr_ensure_idempotent() {
     let _guard = scm::set_test_scm_provider(Arc::new(ColdPrMock {
         pr_number: 7,
         head_sha: head.clone(),
+        head_ref: "feat/x".into(),
         author: "dev".into(),
     }));
 
@@ -222,5 +227,71 @@ fn cold_pr_ensure_idempotent() {
 
     assert_eq!(s1.head_sha, s2.head_sha);
     assert_eq!(s1.pr_number, s2.pr_number);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2800 T6: correct PR/SHA but wrong branch → SCM branch mismatch → fails closed.
+/// Regression: a real PR with matching head_sha but different head_ref must not
+/// create a mis-keyed pr-state file.
+#[test]
+fn cold_pr_wrong_branch_fails_closed() {
+    let home = tmp_home("t6-wrong-branch");
+    let head = "e".repeat(40);
+
+    struct WrongBranchMock(String);
+    impl ScmProvider for WrongBranchMock {
+        fn pr_view(&self, _r: &str, _p: u64, _f: &[&str]) -> anyhow::Result<PrSummary> {
+            Ok(PrSummary {
+                number: 50,
+                head_ref_oid: Some(self.0.clone()),
+                head_ref: Some("other/branch".into()),
+                author_login: Some("dev".into()),
+                ..Default::default()
+            })
+        }
+        fn pr_checks(&self, _r: &str, _p: u64) -> anyhow::Result<Vec<scm::CheckState>> {
+            unimplemented!()
+        }
+        fn pr_list(
+            &self,
+            _r: &str,
+            _f: &scm::ListFilter,
+            _fl: &[&str],
+            _c: Option<&Path>,
+        ) -> anyhow::Result<Vec<PrSummary>> {
+            unimplemented!()
+        }
+        fn pr_merge(
+            &self,
+            _r: &str,
+            _p: u64,
+            _o: &scm::MergeOpts,
+        ) -> anyhow::Result<scm::MergeOutcome> {
+            unimplemented!()
+        }
+        fn issue_view(&self, _r: &str, _n: u64, _f: &[&str]) -> anyhow::Result<scm::IssueSummary> {
+            unimplemented!()
+        }
+        fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<scm::CompareResult> {
+            unimplemented!()
+        }
+    }
+
+    let _guard = scm::set_test_scm_provider(Arc::new(WrongBranchMock(head.clone())));
+
+    let result = ensure_from_scm(&home, "o/r", "feat/x", 50, &head, ReviewClass::Dual);
+
+    assert!(result.is_err(), "branch mismatch must fail closed");
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("SCM branch mismatch"),
+        "error must mention branch mismatch"
+    );
+    assert!(
+        load(&home, "o/r", "feat/x").is_none(),
+        "no pr-state file created on branch mismatch"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -947,6 +947,15 @@ pub fn ensure_from_scm(
             "SCM head mismatch for PR #{pr_number}: expected {expected_head}, SCM reports {scm_head}"
         );
     }
+    let scm_branch = pr
+        .head_ref
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("SCM returned no headRefName for PR #{pr_number}"))?;
+    if scm_branch != branch {
+        anyhow::bail!(
+            "SCM branch mismatch for PR #{pr_number}: expected {branch}, SCM reports {scm_branch}"
+        );
+    }
 
     // Phase 3: CAS-create with Pending CI.
     let state = with_pr_state_or_create(
