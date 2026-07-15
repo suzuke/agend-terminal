@@ -683,10 +683,10 @@ pub(crate) fn binding_scan_all(home: &Path) -> Vec<(String, serde_json::Value)> 
 /// #1782 gap). Returns raw paths (slug resolution is the caller's job) to keep
 /// this module free of the git/scm dependency.
 mod managed_repos;
-pub use managed_repos::{all_managed_repos, bound_source_repos};
-pub(crate) use managed_repos::register_managed_repo;
 #[cfg(test)]
 pub(crate) use managed_repos::read_managed_repo_registry;
+pub(crate) use managed_repos::register_managed_repo;
+pub use managed_repos::{all_managed_repos, bound_source_repos};
 
 /// Read the current binding for an agent.
 /// Hot path: returns from in-memory index (read lock). Cold path
