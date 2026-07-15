@@ -2867,14 +2867,14 @@ fn update_missing_assignee_unchanged() {
     let home = tmp_home("ap-t5");
     let r = handle(
         &home,
-        "op",
+        "dev-agent",
         &serde_json::json!({"action": "create", "title": "t5", "assignee": "dev-agent"}),
     );
     let id = r["id"].as_str().expect("id");
     let r = handle(
         &home,
-        "op",
-        &serde_json::json!({"action": "update", "id": id, "title": "updated"}),
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "description": "updated"}),
     );
     assert!(r.get("error").is_none(), "update must succeed: {r}");
     let tasks = crate::tasks::list_all(&home);
@@ -2892,7 +2892,7 @@ fn update_blank_assignee_clears() {
     let home = tmp_home("ap-t6");
     let r = handle(
         &home,
-        "op",
+        "dev-agent",
         &serde_json::json!({"action": "create", "title": "t6", "assignee": "dev-agent"}),
     );
     let id = r["id"].as_str().expect("id");
@@ -2903,7 +2903,7 @@ fn update_blank_assignee_clears() {
     );
     let r = handle(
         &home,
-        "op",
+        "dev-agent",
         &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
     );
     assert!(r.get("error").is_none(), "update clear must succeed: {r}");
@@ -2921,7 +2921,7 @@ fn update_set_assignee_trims() {
     let home = tmp_home("ap-t7");
     let r = handle(
         &home,
-        "op",
+        "old",
         &serde_json::json!({"action": "create", "title": "t7", "assignee": "old"}),
     );
     let id = r["id"].as_str().expect("id");
@@ -2932,7 +2932,7 @@ fn update_set_assignee_trims() {
     );
     let r = handle(
         &home,
-        "op",
+        "old",
         &serde_json::json!({"action": "update", "id": id, "assignee": " new "}),
     );
     assert!(r.get("error").is_none(), "update must succeed: {r}");
