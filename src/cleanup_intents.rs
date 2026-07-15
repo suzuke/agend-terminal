@@ -89,6 +89,7 @@ pub(crate) fn settle_intent(home: &Path, repo: &str, branch: &str) -> Option<(bo
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn settle_all_intents(home: &Path) -> Vec<(String, bool, String)> {
     let dir = intents_dir(home);
     let entries = match std::fs::read_dir(&dir) {
@@ -137,6 +138,7 @@ pub(crate) fn intent_repos(home: &Path) -> Vec<String> {
     repos.into_iter().collect()
 }
 
+#[allow(dead_code)]
 pub(crate) fn has_intent(home: &Path, repo: &str, branch: &str) -> bool {
     let key = intent_key(repo, branch);
     intents_dir(home).join(format!("{key}.json")).exists()
@@ -202,7 +204,7 @@ mod tests {
 
     fn branch_tip(repo: &Path, branch: &str) -> String {
         crate::git_helpers::git_cmd(repo, &["rev-parse", branch])
-            .unwrap()
+            .expect("rev-parse")
             .trim()
             .to_string()
     }
@@ -239,8 +241,7 @@ mod tests {
         assert!(has_intent(&home, &repo_str, "feat/settle-test"));
 
         let result = settle_intent(&home, &repo_str, "feat/settle-test");
-        assert!(result.is_some());
-        let (deleted, _reason) = result.unwrap();
+        let (deleted, _reason) = result.expect("settle must return a result");
         assert!(deleted, "branch must be deleted on CAS match");
         assert!(
             !branch_exists(&repo, "feat/settle-test"),
@@ -287,8 +288,7 @@ mod tests {
         );
 
         let result = settle_intent(&home, &repo_str, "feat/drift-test");
-        assert!(result.is_some());
-        let (deleted, reason) = result.unwrap();
+        let (deleted, reason) = result.expect("settle must return a result");
         assert!(!deleted, "head-drifted branch must NOT be deleted");
         assert!(
             branch_exists(&repo, "feat/drift-test"),

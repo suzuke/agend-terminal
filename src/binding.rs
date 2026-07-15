@@ -465,6 +465,7 @@ pub fn bind_full(
 /// by the daemon → bind_full (creates binding) → this function (annotates with
 /// typed lease_kind + assignment_id + expected_head). The HMAC signature
 /// prevents an agent from adding/modifying these fields itself.
+#[allow(dead_code)]
 pub(crate) fn augment_binding_with_lease(
     home: &Path,
     agent: &str,
