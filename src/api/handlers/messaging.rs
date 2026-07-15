@@ -273,6 +273,8 @@ fn build_message(
         worktree_binding_required: params["worktree_binding_required"].as_bool(),
         pr_number: None,
         terminal: params["terminal"].as_bool(),
+        ci_handoff_episode: None,
+        ci_handoff_class: None,
         delivery_nonce: params["delivery_nonce"].as_str().map(String::from),
         review_assignment: None,
     }

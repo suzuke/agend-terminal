@@ -1443,6 +1443,8 @@ fn enqueue_reply_ledger_lead_escalation(
         worktree_binding_required: None,
         pr_number: None,
         terminal: None,
+        ci_handoff_episode: None,
+        ci_handoff_class: None,
         delivery_nonce: None,
         review_assignment: None,
     };

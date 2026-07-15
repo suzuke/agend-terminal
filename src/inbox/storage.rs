@@ -3,6 +3,14 @@ use std::path::{Path, PathBuf};
 
 use super::message::{InboxMessage, MessageStatus};
 
+mod ci_handoff;
+pub(crate) use ci_handoff::{
+    protected_handoff_row_state, protected_settlement_identity, ProtectedHandoffRowState,
+};
+
+mod message_query;
+pub use message_query::{find_message, get_thread};
+
 // ── #inbox-gc retention bounds (decision d-20260607081209372642-1, part b) ──
 //
 // Root cause of the unbounded-looking inbox files: read (drained) messages were
@@ -783,153 +791,166 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     }
 
     // Phase 1 (locked): run a byte-capped drain.
-    // Returns (messages_to_return, newly_delivered_subset).
-    let (to_return, newly_delivered_msgs) = match with_inbox_lock(home, name, |path| {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return (Vec::new(), Vec::new()),
-        };
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut all_messages: Vec<InboxMessage> = Vec::new();
-        // CR-2026-06-14: forward-schema rows we can't parse but must NOT delete
-        // on rewrite — preserved as raw lines and re-emitted verbatim.
-        let mut preserved_forward: Vec<String> = Vec::new();
-        let mut batch: Vec<InboxMessage> = Vec::new(); // returned this drain
-        let mut newly_delivered: Vec<InboxMessage> = Vec::new(); // #2299: just delivered (now `delivering`)
-        let mut budget_used = 0usize;
-        let mut budget_closed = false; // (d): once closed, remaining stay unread
-        let mut changed = false;
-
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            // AUDIT3-005: parse-or-preserve — a forward-schema row (newer daemon) AND
-            // an unparseable line (torn enqueue / corruption) are preserved verbatim
-            // (re-emitted below), never silently dropped on the rewrite.
-            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
-                continue;
+    // Returns (messages_to_return, newly_delivered_subset, settlement intents).
+    let (to_return, newly_delivered_msgs, settlement_intents) =
+        match with_inbox_lock(home, name, |path| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return (Vec::new(), Vec::new(), Vec::new()),
             };
-            if msg.read_at.is_none() {
-                if msg.superseded_by.is_some() {
-                    // superseded obligations are retired (marked read) but never
-                    // returned — unchanged from the pre-#1940 behavior. Covers an
-                    // in-flight `delivering` row too (a newer message obsoleted it).
-                    msg.read_at = Some(now.clone());
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut all_messages: Vec<InboxMessage> = Vec::new();
+            // CR-2026-06-14: forward-schema rows we can't parse but must NOT delete
+            // on rewrite — preserved as raw lines and re-emitted verbatim.
+            let mut preserved_forward: Vec<String> = Vec::new();
+            let mut batch: Vec<InboxMessage> = Vec::new(); // returned this drain
+            let mut newly_delivered: Vec<InboxMessage> = Vec::new(); // #2299: just delivered (now `delivering`)
+            let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
+            let mut budget_used = 0usize;
+            let mut budget_closed = false; // (d): once closed, remaining stay unread
+            let mut changed = false;
+
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // AUDIT3-005: parse-or-preserve — a forward-schema row (newer daemon) AND
+                // an unparseable line (torn enqueue / corruption) are preserved verbatim
+                // (re-emitted below), never silently dropped on the rewrite.
+                let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
+                    continue;
+                };
+                if msg.read_at.is_none() {
+                    if msg.superseded_by.is_some() {
+                        // superseded obligations are retired (marked read) but never
+                        // returned — unchanged from the pre-#1940 behavior. Covers an
+                        // in-flight `delivering` row too (a newer message obsoleted it).
+                        if msg.delivering_at.is_some() {
+                            if let Some(identity) = protected_settlement_identity(&msg, name) {
+                                settlement_intents.push(identity);
+                            }
+                            msg.delivering_at = None;
+                        }
+                        msg.read_at = Some(now.clone());
+                        changed = true;
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    if msg.delivering_at.is_some() {
+                        // #2299 (A) implicit ack: a PRIOR `delivering` batch the agent
+                        // already received. Its re-drain confirms consumption → mark
+                        // PROCESSED (read_at), never return again (no double-deliver).
+                        // A turn that died instead never reaches here; the reclaim-TTL
+                        // sweep resets it to unread for re-delivery.
+                        if let Some(identity) = protected_settlement_identity(&msg, name) {
+                            settlement_intents.push(identity);
+                        }
+                        msg.read_at = Some(now.clone());
+                        msg.delivering_at = None;
+                        changed = true;
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    if budget_closed {
+                        // (d): budget already hit — leave this (and the rest) UNREAD.
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    let sz = serde_json::to_string(&msg)
+                        .map(|s| s.len())
+                        .unwrap_or(line.len());
+                    // Always take ≥1 message (progress); otherwise only while the
+                    // running batch stays under budget. A message is never split.
+                    if !batch.is_empty() && budget_used + sz > DRAIN_BATCH_BUDGET_BYTES {
+                        budget_closed = true;
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    budget_used += sz;
+                    if auto_ack_on_drain_kind(&msg) {
+                        // Fire-and-forget notifications have no blocked sender and no
+                        // required reply. Return them to the agent once, but settle them
+                        // immediately so daemon restarts cannot resurrect completed
+                        // PR/CI/status chatter through the delivering reclaim path.
+                        msg.read_at = Some(now.clone());
+                    } else {
+                        // #2299: unread → DELIVERING (not processed). read_at stays None
+                        // until the agent acks (explicit `inbox ack` / implicit next-drain)
+                        // or the reclaim-TTL resets it. A turn dying after this drain leaves
+                        // the row `delivering` → reclaimed → re-delivered (no silent loss).
+                        msg.delivering_at = Some(now.clone());
+                    }
                     changed = true;
+                    // #1888: a `ci-ready-for-action` handoff just transitioned to
+                    // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
+                    // this trace PROVED the read-state coupling; Phase-2 the watchdog
+                    // scans the `ci_handoff_track` sidecar instead, so this no longer
+                    // blinds anything — the trace stays as the delivery-vs-resolution
+                    // timeline marker. Unchanged in effect.
+                    if msg.kind.as_deref() == Some("ci-ready-for-action") {
+                        let age_at_read_secs = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+                            .ok()
+                            .map(|t| {
+                                chrono::Utc::now()
+                                    .signed_duration_since(t.with_timezone(&chrono::Utc))
+                                    .num_seconds()
+                            })
+                            .unwrap_or(-1);
+                        // info!-level so it lands in the production daemon.log (default
+                        // filter is `agend_terminal=info`); rare — only a
+                        // ci-ready-for-action message transitioning to delivering on a drain.
+                        tracing::info!(
+                            tag = "#1888-ciready-read",
+                            agent = %name,
+                            correlation = msg.correlation_id.as_deref().unwrap_or("<none>"),
+                            age_at_read_secs,
+                            "ci-ready-for-action handoff marked delivering on drain"
+                        );
+                    }
+                    batch.push(msg.clone());
+                    newly_delivered.push(msg.clone());
                     all_messages.push(msg);
-                    continue;
-                }
-                if msg.delivering_at.is_some() {
-                    // #2299 (A) implicit ack: a PRIOR `delivering` batch the agent
-                    // already received. Its re-drain confirms consumption → mark
-                    // PROCESSED (read_at), never return again (no double-deliver).
-                    // A turn that died instead never reaches here; the reclaim-TTL
-                    // sweep resets it to unread for re-delivery.
-                    msg.read_at = Some(now.clone());
-                    changed = true;
-                    all_messages.push(msg);
-                    continue;
-                }
-                if budget_closed {
-                    // (d): budget already hit — leave this (and the rest) UNREAD.
-                    all_messages.push(msg);
-                    continue;
-                }
-                let sz = serde_json::to_string(&msg)
-                    .map(|s| s.len())
-                    .unwrap_or(line.len());
-                // Always take ≥1 message (progress); otherwise only while the
-                // running batch stays under budget. A message is never split.
-                if !batch.is_empty() && budget_used + sz > DRAIN_BATCH_BUDGET_BYTES {
-                    budget_closed = true;
-                    all_messages.push(msg);
-                    continue;
-                }
-                budget_used += sz;
-                if auto_ack_on_drain_kind(&msg) {
-                    // Fire-and-forget notifications have no blocked sender and no
-                    // required reply. Return them to the agent once, but settle them
-                    // immediately so daemon restarts cannot resurrect completed
-                    // PR/CI/status chatter through the delivering reclaim path.
-                    msg.read_at = Some(now.clone());
                 } else {
-                    // #2299: unread → DELIVERING (not processed). read_at stays None
-                    // until the agent acks (explicit `inbox ack` / implicit next-drain)
-                    // or the reclaim-TTL resets it. A turn dying after this drain leaves
-                    // the row `delivering` → reclaimed → re-delivered (no silent loss).
-                    msg.delivering_at = Some(now.clone());
+                    all_messages.push(msg);
                 }
-                changed = true;
-                // #1888: a `ci-ready-for-action` handoff just transitioned to
-                // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
-                // this trace PROVED the read-state coupling; Phase-2 the watchdog
-                // scans the `ci_handoff_track` sidecar instead, so this no longer
-                // blinds anything — the trace stays as the delivery-vs-resolution
-                // timeline marker. Unchanged in effect.
-                if msg.kind.as_deref() == Some("ci-ready-for-action") {
-                    let age_at_read_secs = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-                        .ok()
-                        .map(|t| {
-                            chrono::Utc::now()
-                                .signed_duration_since(t.with_timezone(&chrono::Utc))
-                                .num_seconds()
-                        })
-                        .unwrap_or(-1);
-                    // info!-level so it lands in the production daemon.log (default
-                    // filter is `agend_terminal=info`); rare — only a
-                    // ci-ready-for-action message transitioning to delivering on a drain.
-                    tracing::info!(
-                        tag = "#1888-ciready-read",
-                        agent = %name,
-                        correlation = msg.correlation_id.as_deref().unwrap_or("<none>"),
-                        age_at_read_secs,
-                        "ci-ready-for-action handoff marked delivering on drain"
-                    );
-                }
-                batch.push(msg.clone());
-                newly_delivered.push(msg.clone());
-                all_messages.push(msg);
-            } else {
-                all_messages.push(msg);
             }
-        }
 
-        if changed {
-            let write_tmp = path.with_extension("jsonl.tmp");
-            let result = (|| -> anyhow::Result<()> {
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&write_tmp)?;
-                for m in &all_messages {
-                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+            if changed {
+                let write_tmp = path.with_extension("jsonl.tmp");
+                let result = (|| -> anyhow::Result<()> {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&write_tmp)?;
+                    for m in &all_messages {
+                        writeln!(f, "{}", serde_json::to_string(m)?)?;
+                    }
+                    // CR-2026-06-14: re-emit preserved forward-schema rows verbatim so
+                    // a downgrade never destroys a message a newer daemon wrote.
+                    for raw in &preserved_forward {
+                        writeln!(f, "{raw}")?;
+                    }
+                    f.sync_all()?;
+                    std::fs::rename(&write_tmp, path)?;
+                    crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "inbox drain write-back failed");
+                    settlement_intents.clear();
                 }
-                // CR-2026-06-14: re-emit preserved forward-schema rows verbatim so
-                // a downgrade never destroys a message a newer daemon wrote.
-                for raw in &preserved_forward {
-                    writeln!(f, "{raw}")?;
-                }
-                f.sync_all()?;
-                std::fs::rename(&write_tmp, path)?;
-                crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
-                Ok(())
-            })();
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "inbox drain write-back failed");
             }
-        }
 
-        (batch, newly_delivered)
-    }) {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!(error = %e, "inbox drain lock failed");
-            return Vec::new();
-        }
-    };
+            (batch, newly_delivered, settlement_intents)
+        }) {
+            Ok(triple) => triple,
+            Err(e) => {
+                tracing::warn!(error = %e, "inbox drain lock failed");
+                return Vec::new();
+            }
+        };
 
     // Phase 2 (unlocked): side effects only for messages newly read THIS drain
     // (empty on a snapshot re-serve — those already ran on the original drain).
@@ -937,6 +958,16 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         if let Some(ref id) = msg.id {
             crate::daemon::notification_dedup::global().mark_consumed(name, id);
         }
+    }
+
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "ack_protected",
+        );
     }
 
     if let Some(channel_msg) = newly_delivered_msgs
@@ -1010,15 +1041,16 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     if !path.exists() {
         return 0;
     }
-    with_inbox_lock(home, name, |path| {
+    let (acked, settlement_intents) = with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return 0,
+            Err(_) => return (0, Vec::new()),
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut acked = 0usize;
+        let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         let mut changed = false;
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -1031,7 +1063,11 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             // Only an in-flight `delivering` row is ackable. Match on id when given.
             let is_target = msg_id.is_none_or(|id| msg.id.as_deref() == Some(id));
             if is_target && msg.read_at.is_none() && msg.delivering_at.is_some() {
+                if let Some(identity) = protected_settlement_identity(&msg, name) {
+                    settlement_intents.push(identity);
+                }
                 msg.read_at = Some(now.clone());
+                msg.delivering_at = None;
                 acked += 1;
                 changed = true;
             }
@@ -1058,15 +1094,25 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox ack write-back failed");
-                return 0;
+                return (0, Vec::new());
             }
         }
-        acked
+        (acked, settlement_intents)
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox ack lock failed");
-        0
-    })
+        (0, Vec::new())
+    });
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "ack_protected",
+        );
+    }
+    acked
 }
 
 /// #2622 PR-2: settle the single row `msg_id` to `read` regardless of its
@@ -1081,15 +1127,16 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
     if !path.exists() {
         return false;
     }
-    with_inbox_lock(home, name, |path| {
+    let (settled, settlement_intents) = with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(_) => return (false, Vec::new()),
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut settled = false;
+        let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -1099,6 +1146,12 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
                 continue;
             };
             if msg.id.as_deref() == Some(msg_id) && msg.read_at.is_none() {
+                if msg.delivering_at.is_some() {
+                    if let Some(identity) = protected_settlement_identity(&msg, name) {
+                        settlement_intents.push(identity);
+                    }
+                    msg.delivering_at = None;
+                }
                 msg.read_at = Some(now.clone());
                 settled = true;
             }
@@ -1125,15 +1178,25 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox settle_read_by_id write-back failed");
-                return false;
+                return (false, Vec::new());
             }
         }
-        settled
+        (settled, settlement_intents)
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox settle_read_by_id lock failed");
-        false
-    })
+        (false, Vec::new())
+    });
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "discharge",
+        );
+    }
+    settled
 }
 
 /// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
@@ -1182,15 +1245,16 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
     if !path.exists() {
         return 0;
     }
-    with_inbox_lock(home, name, |path| {
+    let (acked, settlement_intents) = with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return 0,
+            Err(_) => return (0, Vec::new()),
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut acked = 0usize;
+        let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         let mut changed = false;
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -1206,7 +1270,11 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
                 .as_deref()
                 .is_some_and(|tid| tid == correlation_id);
             if task_matches && msg.read_at.is_none() && msg.delivering_at.is_some() {
+                if let Some(identity) = protected_settlement_identity(&msg, name) {
+                    settlement_intents.push(identity);
+                }
                 msg.read_at = Some(now.clone());
+                msg.delivering_at = None;
                 acked += 1;
                 changed = true;
             }
@@ -1233,7 +1301,7 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox ack_by_correlation write-back failed");
-                return 0;
+                return (0, Vec::new());
             }
         }
         if acked > 0 {
@@ -1244,12 +1312,22 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
                 "send+ack_inbox: settled delivering rows by correlation_id"
             );
         }
-        acked
+        (acked, settlement_intents)
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox ack_by_correlation lock failed");
-        0
-    })
+        (0, Vec::new())
+    });
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "ack_protected",
+        );
+    }
+    acked
 }
 
 /// One bounded line in a [`ClearCompactResult`] — a COMPACT projection of an
@@ -2293,72 +2371,6 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
     MessageStatus::NotFound
 }
 
-/// Get all messages in a thread, ordered by timestamp.
-/// If `instance` is Some, only scan that agent's inbox; otherwise scan all.
-pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<InboxMessage> {
-    let mut msgs = Vec::new();
-
-    if let Some(inst) = instance {
-        // Direct path lookup — skip directory scan entirely.
-        let path = inbox_path_resolved(home, inst);
-        collect_thread_messages(&path, thread_id, &mut msgs);
-    } else {
-        for path in inbox_files(home) {
-            collect_thread_messages(&path, thread_id, &mut msgs);
-        }
-        // CR-2026-06-14: a migrated inbox is present under TWO directory entries —
-        // `<name>.jsonl` and `<uuid>.jsonl` — holding the SAME messages, so the
-        // cross-inbox scan double-counts every thread message. The two entries are
-        // a symlink on Unix but a real `fs::copy` duplicate on Windows
-        // (`inbox_path_resolved` migration), so a symlink-type skip only fixes
-        // Unix. Dedup by message `id` instead — portable across both: message ids
-        // are globally unique (`ensure_msg_id`), so the same id appearing in both
-        // files is the migration duplicate, while a thread legitimately spanning
-        // several agents' inboxes carries distinct ids and is preserved. Id-less
-        // (legacy, pre-`ensure_msg_id`) rows are kept as-is (can't dedup safely).
-        let mut seen_ids = std::collections::HashSet::new();
-        msgs.retain(|m| match &m.id {
-            Some(id) => seen_ids.insert(id.clone()),
-            None => true,
-        });
-    }
-
-    msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    msgs
-}
-
-fn collect_thread_messages(path: &Path, thread_id: &str, out: &mut Vec<InboxMessage>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        if !line.contains(thread_id) {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
-            if msg.thread_id.as_deref() == Some(thread_id) {
-                out.push(msg);
-            }
-        }
-    }
-}
-
-/// Look up a message by ID across all inbox files. Returns the message if found.
-pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
-    // CR-2026-06-14: an unreadable file is skipped (yields no messages) so one
-    // bad file can't hide a message living in a LATER inbox.
-    for path in inbox_files(home) {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        for msg in parse_inbox_messages(&content) {
-            if msg.id.as_deref() == Some(msg_id) {
-                return Some(msg);
-            }
-        }
-    }
-    None
-}
-
 /// #982 B-narrow: scan `agent_name`'s inbox for a delivered blocking
 /// dispatch (`kind ∈ {query, task}`) that shares the given `correlation_id`.
 /// Used by `api::handlers::messaging` to override codex ack-absorption when an
@@ -2419,60 +2431,6 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
     false
 }
 
-/// Test-only: force one row's `delivering_at` to an explicit rfc3339 timestamp so
-/// a test can age a `delivering` row past [`RECLAIM_TTL_SECS`] deterministically
-/// (no wall-clock sleep) and then exercise the real [`reclaim_stale_delivering`]
-/// path. Rewrites via raw JSON so forward-schema fields survive.
-///
-/// Placed here (below the production fns) so its `#[cfg(test)]` attribute never
-/// becomes the first one in the file — the #1617 source-scan invariant test
-/// slices production up to the first `#[cfg(test)]`, so a test helper above
-/// `reclaim_stale_delivering` would truncate its scan region.
-#[cfg(test)]
-pub(crate) fn set_row_delivering_at_for_test(
-    home: &Path,
-    name: &str,
-    msg_id: &str,
-    ts_rfc3339: &str,
-) {
-    let path = inbox_path_resolved(home, name);
-    // Fail loudly, never silently no-op: a read failure, wrong id/inbox, or a
-    // setup regression that ages ZERO rows would leave the parent freshly
-    // delivering — reclaim would skip it and a positive poll-reminder test could
-    // pass WITHOUT exercising aged reclaim (false GREEN). #2730 reviewer boundary.
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            panic!("set_row_delivering_at_for_test: cannot read {name}'s inbox at {path:?}: {e}")
-        }
-    };
-    let mut out = String::new();
-    let mut aged = 0usize;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(mut v) => {
-                if v.get("id").and_then(|x| x.as_str()) == Some(msg_id) {
-                    v["delivering_at"] = serde_json::Value::String(ts_rfc3339.to_string());
-                    aged += 1;
-                }
-                out.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| line.to_string()));
-            }
-            Err(_) => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    assert_eq!(
-        aged, 1,
-        "set_row_delivering_at_for_test: expected exactly one row with id={msg_id} in {name}'s inbox, aged {aged} — the aging seam would silently no-op and could produce a false GREEN"
-    );
-    if let Err(e) = std::fs::write(&path, out) {
-        panic!("set_row_delivering_at_for_test: cannot write {name}'s inbox at {path:?}: {e}");
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;
@@ -2492,3 +2450,10 @@ mod perf_r3_bench;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod p6_discharge_consume;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod test_helpers;
+
+#[cfg(test)]
+pub(crate) use test_helpers::set_row_delivering_at_for_test;

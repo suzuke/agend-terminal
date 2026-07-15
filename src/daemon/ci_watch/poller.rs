@@ -2146,6 +2146,9 @@ fn persist_watch_state(
     outcome: &NotifyOutcome,
     state: &mut WatchState,
 ) {
+    // Row-first CI handoffs must not advance the notified stamp when durable
+    // enqueue (or the paired track write) fails; the next poll must retry.
+    let mut ci_ready_delivery_failed = false;
     if outcome.new_notified_sha.is_some() {
         // t-ci-ready-robust-fallback-design (PR-1, option C): the actionable
         // `[ci-ready-for-action]` is a CHAIN signal — it routes to `next_after_ci`
@@ -2210,8 +2213,14 @@ fn persist_watch_state(
                 } else {
                     let pr_number = pr_state.as_ref().map(|s| s.pr_number);
                     let task_id = state.task_id.as_deref();
+                    let handoff_class = if crate::agent_ops::is_protected_ref(ctx.branch) {
+                        crate::inbox::CiHandoffClass::Protected
+                    } else {
+                        crate::inbox::CiHandoffClass::Feature
+                    };
                     for next in targets {
-                        let msg = make_ci_ready_for_action_msg(
+                        let episode = crate::daemon::ci_handoff_track::new_episode();
+                        let mut msg = make_ci_ready_for_action_msg(
                             ctx.repo,
                             ctx.branch,
                             &repo_branch_key,
@@ -2219,30 +2228,50 @@ fn persist_watch_state(
                             pr_number,
                             task_id,
                         );
-                        persist_or_log!(
-                            crate::inbox::enqueue_with_idle_hint(ctx.home, &next, msg),
-                            "ci_watch_chain",
-                            &next
-                        );
-                        // #1888 phase-2: track the handoff until RESOLUTION (report /
-                        // PR terminal / target claims the branch), decoupled from the
-                        // inbox read-state the watchdog used to scan (any drain marked
-                        // it read within seconds and blinded the re-nudge).
-                        crate::daemon::ci_handoff_track::record(
-                            ctx.home,
-                            &next,
-                            &repo_branch_key,
-                            &chrono::Utc::now().to_rfc3339(),
-                            // #2008: anchor the track to the head it was recorded for
-                            // so a later head move can invalidate it (head-aware
-                            // resolve).
-                            Some(&pr.current_sha),
-                            // #2412-follow-up: a standard `kind=report` carries
-                            // `correlation_id=t-...`, not `repo@branch` — record
-                            // this dispatch's task id too so
-                            // `resolve_by_correlation` can match either key.
-                            task_id,
-                        );
+                        msg.ci_handoff_episode = Some(episode.clone());
+                        msg.ci_handoff_class = Some(handoff_class);
+                        // #1888 phase-2: track the handoff only after the durable
+                        // inbox row exists. A failed enqueue must not create a
+                        // ghost track or advance the notified stamp.
+                        match crate::inbox::enqueue_with_idle_hint(ctx.home, &next, msg) {
+                            Ok(()) => {
+                                let recorded =
+                                    crate::daemon::ci_handoff_track::record_with_identity(
+                                        ctx.home,
+                                        &next,
+                                        &repo_branch_key,
+                                        &chrono::Utc::now().to_rfc3339(),
+                                        // #2008: anchor the track to the head it was recorded for
+                                        // so a later head move can invalidate it (head-aware
+                                        // resolve).
+                                        Some(&pr.current_sha),
+                                        // #2412-follow-up: a standard `kind=report` carries
+                                        // `correlation_id=t-...`, not `repo@branch` — record
+                                        // this dispatch's task id too so
+                                        // `resolve_by_correlation` can match either key.
+                                        task_id,
+                                        Some(&episode),
+                                        Some(handoff_class),
+                                    );
+                                if !recorded {
+                                    ci_ready_delivery_failed = true;
+                                    tracing::error!(
+                                        target = %next,
+                                        correlation = %repo_branch_key,
+                                        "ci-watch chain track write failed after enqueue"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                ci_ready_delivery_failed = true;
+                                tracing::error!(
+                                    error = %e,
+                                    op = "ci_watch_chain",
+                                    target = %next,
+                                    "ci-ready handoff enqueue failed"
+                                );
+                            }
+                        }
                     }
                 }
             } else if state.subscriber_names().is_empty() {
@@ -2280,34 +2309,36 @@ fn persist_watch_state(
         );
     }
 
-    state.last_run_id = Some(outcome.max_notified_id);
-    if !pr.current_sha.is_empty() {
-        state.head_sha = Some(pr.current_sha.clone());
-    }
-    if let Some(sha) = &outcome.new_notified_sha {
-        state.last_notified_head_sha = Some(sha.clone());
-    }
-    if let Some(c) = &outcome.new_notified_conclusion {
-        state.last_notified_conclusion = Some(c.clone());
-    }
-    if let Some(a) = outcome.new_notified_run_attempt {
-        state.last_notified_run_attempt = Some(a);
-    }
-    if let Some(c) = &outcome.new_notified_run_conclusion {
-        state.last_notified_run_conclusion = Some(c.clone());
-    }
-    if let Some(s) = &outcome.new_stale_emitted_sha {
-        state.last_stale_emitted_sha = Some(s.clone());
-    }
-    state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
-    // AUDIT2-009: record the per-workflow cursors for ALL latest-per-workflow
-    // terminal runs at the current head (not just the notified representative), so
-    // an unnotified sibling workflow never re-triggers a stable-state notification
-    // next poll. Only overwrite when there ARE current-head terminal runs — a
-    // stale-only emit preserves the existing map.
-    let cursors = compute_workflow_cursors(&pr.runs, &pr.current_sha);
-    if !cursors.is_empty() {
-        state.last_notified_by_workflow = cursors;
+    if !ci_ready_delivery_failed {
+        state.last_run_id = Some(outcome.max_notified_id);
+        if !pr.current_sha.is_empty() {
+            state.head_sha = Some(pr.current_sha.clone());
+        }
+        if let Some(sha) = &outcome.new_notified_sha {
+            state.last_notified_head_sha = Some(sha.clone());
+        }
+        if let Some(c) = &outcome.new_notified_conclusion {
+            state.last_notified_conclusion = Some(c.clone());
+        }
+        if let Some(a) = outcome.new_notified_run_attempt {
+            state.last_notified_run_attempt = Some(a);
+        }
+        if let Some(c) = &outcome.new_notified_run_conclusion {
+            state.last_notified_run_conclusion = Some(c.clone());
+        }
+        if let Some(s) = &outcome.new_stale_emitted_sha {
+            state.last_stale_emitted_sha = Some(s.clone());
+        }
+        state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+        // AUDIT2-009: record the per-workflow cursors for ALL latest-per-workflow
+        // terminal runs at the current head (not just the notified representative), so
+        // an unnotified sibling workflow never re-triggers a stable-state notification
+        // next poll. Only overwrite when there ARE current-head terminal runs — a
+        // stale-only emit preserves the existing map.
+        let cursors = compute_workflow_cursors(&pr.runs, &pr.current_sha);
+        if !cursors.is_empty() {
+            state.last_notified_by_workflow = cursors;
+        }
     }
 }
 

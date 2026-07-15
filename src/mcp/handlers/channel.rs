@@ -341,16 +341,43 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
     // discharged message names. An explicit gesture (not an inbox read) →
     // #1888's stuck-reviewer escalation is preserved for handoffs never acted on.
     let handoff_resolved = if row.kind.as_deref() == Some("ci-ready-for-action") {
-        row.correlation_id
-            .as_deref()
-            .map(|corr| {
-                crate::daemon::ci_handoff_track::resolve_for_target_correlation(
+        match (
+            row.correlation_id.as_deref(),
+            row.ci_handoff_episode.as_deref(),
+            row.ci_handoff_class,
+        ) {
+            (Some(corr), Some(episode), Some(crate::inbox::CiHandoffClass::Protected)) => {
+                crate::daemon::ci_handoff_track::resolve_protected_episode(
                     home,
                     instance_name,
                     corr,
+                    episode,
+                    "discharge",
                 )
-            })
-            .unwrap_or(0)
+            }
+            // Feature handoffs retain the legacy explicit-discharge path; the
+            // protected resolver must never infer identity from classless rows.
+            (Some(corr), _, Some(crate::inbox::CiHandoffClass::Feature)) => {
+                crate::daemon::ci_handoff_track::resolve_legacy_for_target_correlation_reason(
+                    home,
+                    instance_name,
+                    corr,
+                    "discharge",
+                )
+            }
+            // Classless/episode-less rows predate protected handoff identity.
+            // Preserve their explicit-discharge compatibility path while
+            // keeping protected ACK/reconciliation fail-closed on identity.
+            (Some(corr), _, _) => {
+                crate::daemon::ci_handoff_track::resolve_legacy_for_target_correlation_reason(
+                    home,
+                    instance_name,
+                    corr,
+                    "discharge",
+                )
+            }
+            _ => 0,
+        }
     } else {
         0
     };

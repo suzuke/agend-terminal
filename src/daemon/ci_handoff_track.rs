@@ -55,6 +55,10 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// Backstop lifetime: a track never resolved within this window is swept
 /// (with a WARN) so the re-nudge cannot run forever.
 pub(crate) const TRACK_MAX_AGE: chrono::Duration = chrono::Duration::hours(24);
+/// Grace after a handoff was recorded before a processed inbox row may be used
+/// as crash-recovery evidence. This leaves the normal explicit resolver first
+/// chance and avoids racing a just-written row/track pair.
+pub(crate) const TRACK_RECONCILE_GRACE: chrono::Duration = chrono::Duration::seconds(30);
 
 /// One pending CI handoff awaiting pickup-resolution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -65,6 +69,14 @@ pub(crate) struct CiHandoffTrack {
     /// `owner/repo@branch` — the same key the handoff message carries as its
     /// `correlation_id` and that reviewer reports / pr_state events use.
     pub correlation: String,
+    /// Opaque identity shared with the durable ci-ready inbox row. Missing on
+    /// legacy tracks; protected settlement must fail closed in that case.
+    #[serde(default)]
+    pub ci_handoff_episode: Option<String>,
+    /// Protected/feature class shared with the inbox row. Missing on legacy
+    /// tracks; callers must not infer it from a branch string.
+    #[serde(default)]
+    pub ci_handoff_class: Option<crate::inbox::CiHandoffClass>,
     /// RFC3339 — when the handoff was enqueued (the re-nudge age anchor).
     pub sent_at: String,
     /// #2008: the branch head (`pr.current_sha`) at record time. `#[serde(default)]`
@@ -218,8 +230,37 @@ fn remove_if_unchanged(
     }
 }
 
+/// Episode-aware delete guard for protected settlement. Matching the durable
+/// episode as well as `sent_at` prevents an old ACK from deleting a re-recorded
+/// track when both writes happen within the same timestamp tick.
+fn remove_if_episode_unchanged(
+    home: &Path,
+    path: &Path,
+    target: &str,
+    correlation: &str,
+    expect_sent_at: &str,
+    expect_episode: &str,
+) -> bool {
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_for(home, target, correlation)) else {
+        return false;
+    };
+    let current = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    match current {
+        Some(t)
+            if t.sent_at == expect_sent_at
+                && t.ci_handoff_episode.as_deref() == Some(expect_episode) =>
+        {
+            std::fs::remove_file(path).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Record (or refresh — a NEW CI pass on the same branch restarts the age
 /// anchor) the pending handoff for `(target, correlation)`.
+#[allow(dead_code)]
 pub(crate) fn record(
     home: &Path,
     target: &str,
@@ -228,10 +269,38 @@ pub(crate) fn record(
     head_sha: Option<&str>,
     task_id: Option<&str>,
 ) {
+    let _ = record_with_identity(
+        home,
+        target,
+        correlation,
+        sent_at,
+        head_sha,
+        task_id,
+        None,
+        None,
+    );
+}
+
+/// Record a track with the durable row identity. Returns `true` only after the
+/// JSON track is atomically persisted; callers can keep the CI notification
+/// cursor retryable if this write fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_with_identity(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    sent_at: &str,
+    head_sha: Option<&str>,
+    task_id: Option<&str>,
+    ci_handoff_episode: Option<&str>,
+    ci_handoff_class: Option<crate::inbox::CiHandoffClass>,
+) -> bool {
     let track = CiHandoffTrack {
         schema_version: SCHEMA_VERSION,
         target: target.to_string(),
         correlation: correlation.to_string(),
+        ci_handoff_episode: ci_handoff_episode.map(String::from),
+        ci_handoff_class,
         sent_at: sent_at.to_string(),
         head_sha: head_sha.map(String::from),
         task_id: task_id.map(String::from),
@@ -243,7 +312,7 @@ pub(crate) fn record(
     let path = file_for(home, target, correlation);
     if let Err(e) = std::fs::create_dir_all(dir(home)) {
         tracing::warn!(%target, %correlation, error = %e, "#1888: ci-handoff track dir create failed");
-        return;
+        return false;
     }
     // #1963: take the per-key lock so this write is atomic w.r.t. a concurrent
     // resolve/sweep of the same key (delete-if-unchanged) — the resolution can't
@@ -252,7 +321,7 @@ pub(crate) fn record(
     let _lock = crate::store::acquire_file_lock(&lock_for(home, target, correlation)).ok();
     if let Err(e) = atomic_write_track(&path, &track) {
         tracing::warn!(%target, %correlation, error = %e, "#1888: ci-handoff track write failed");
-        return;
+        return false;
     }
     tracing::info!(
         tag = "#1888-track-recorded",
@@ -260,6 +329,14 @@ pub(crate) fn record(
         %correlation,
         "ci-handoff track recorded (re-nudge until resolution, not until read)"
     );
+    true
+}
+
+/// Mint an opaque per-delivery episode token. It is deliberately independent
+/// of target/correlation so a re-record of the same branch cannot be settled by
+/// an old row or delayed ACK.
+pub(crate) fn new_episode() -> String {
+    format!("ci-episode-{}", uuid::Uuid::new_v4())
 }
 
 /// #35896-11 ⑥: persist the watchdog throttle timestamp(s) on an EXISTING track so
@@ -476,6 +553,17 @@ pub(crate) fn resolve_delegated(
 /// handoff" eviction: only the unwatching agent's own ci-ready obligation for
 /// this exact repo@branch is cleared, leaving any co-subscriber's track intact.
 pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlation: &str) -> usize {
+    resolve_for_target_correlation_reason(home, agent, correlation, "unwatch")
+}
+
+/// Target/correlation resolver with an explicit audit reason for non-watch
+/// callers (for example a feature-branch channel discharge).
+pub(crate) fn resolve_for_target_correlation_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
         if track.target == agent
@@ -493,8 +581,136 @@ pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlati
                 tag = "#1888-track-resolved",
                 agent = %track.target,
                 correlation = %track.correlation,
-                reason = "unwatch_dismiss",
+                reason,
                 "ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// Resolve an explicit-discharge legacy handoff without inferring identity
+/// for a newer protected episode that reuses the same target/correlation key.
+/// Feature and classless tracks retain the pre-episode discharge behavior;
+/// protected tracks must use [`resolve_protected_episode`] instead.
+pub(crate) fn resolve_legacy_for_target_correlation_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == agent
+            && track.correlation == correlation
+            && track.ci_handoff_class != Some(crate::inbox::CiHandoffClass::Protected)
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#1888-track-resolved",
+                agent = %track.target,
+                correlation = %track.correlation,
+                reason,
+                "legacy ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// Resolve one protected handoff only when every durable identity component
+/// matches. Legacy/classless/episode-less tracks are deliberately ignored.
+pub(crate) fn resolve_protected_episode(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    reason: &str,
+) -> usize {
+    if episode.is_empty() {
+        return 0;
+    }
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == target
+            && track.correlation == correlation
+            && track.ci_handoff_episode.as_deref() == Some(episode)
+            && track.ci_handoff_class == Some(crate::inbox::CiHandoffClass::Protected)
+            && remove_if_episode_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+                episode,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#35896-11-track-resolved",
+                agent = %target,
+                %correlation,
+                %episode,
+                reason,
+                "protected ci-handoff episode resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// Reconcile a crash after the inbox row was durably marked processed but
+/// before the sidecar delete completed. The inbox probe is exact and runs
+/// under its own lock; this function never deletes a missing or ambiguous row.
+pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Utc>) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.ci_handoff_class != Some(crate::inbox::CiHandoffClass::Protected) {
+            continue;
+        }
+        let Some(episode) = track.ci_handoff_episode.as_deref() else {
+            continue;
+        };
+        let Ok(sent_at) = chrono::DateTime::parse_from_rfc3339(&track.sent_at) else {
+            continue;
+        };
+        if now.signed_duration_since(sent_at.with_timezone(&chrono::Utc)) < TRACK_RECONCILE_GRACE {
+            continue;
+        }
+        if !matches!(
+            crate::inbox::storage::protected_handoff_row_state(
+                home,
+                &track.target,
+                &track.correlation,
+                episode,
+            ),
+            crate::inbox::storage::ProtectedHandoffRowState::Processed
+        ) {
+            continue;
+        }
+        if remove_if_episode_unchanged(
+            home,
+            &path,
+            &track.target,
+            &track.correlation,
+            &track.sent_at,
+            episode,
+        ) {
+            resolved += 1;
+            tracing::info!(
+                tag = "#35896-11-track-reconciled",
+                agent = %track.target,
+                correlation = %track.correlation,
+                %episode,
+                reason = "ack_reconciled",
+                "processed protected ci-handoff episode reconciled"
             );
         }
     }
@@ -1376,6 +1592,8 @@ mod tests {
             sent_at: "2026-06-10T00:00:00Z".into(),
             head_sha: None,
             task_id: None,
+            ci_handoff_episode: None,
+            ci_handoff_class: None,
             last_renudged_at: None,
             last_escalated_at: None,
         };
@@ -1494,6 +1712,287 @@ mod tests {
         let remaining = list(&home);
         assert_eq!(remaining.len(), 1, "b2's track is untouched");
         assert!(remaining.iter().all(|(_, t)| t.correlation == "o/r@b2"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── task167 RED-first R1-R15: protected-main episode settlement ────────
+    fn protected_message(
+        agent: &str,
+        correlation: &str,
+        episode: &str,
+    ) -> crate::inbox::InboxMessage {
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:ci",
+            "ci-ready-for-action",
+            format!("[ci-ready-for-action] {correlation}"),
+        )
+        .with_correlation_id(correlation.to_string());
+        msg.ci_handoff_episode = Some(episode.to_string());
+        msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Protected);
+        msg.text = format!("{agent}:{correlation}");
+        msg
+    }
+    fn seed_protected(home: &Path, agent: &str, correlation: &str, episode: &str) {
+        crate::inbox::enqueue(home, agent, protected_message(agent, correlation, episode)).unwrap();
+        assert!(record_with_identity(
+            home,
+            agent,
+            correlation,
+            "2026-06-10T00:00:00Z",
+            Some("HEAD"),
+            None,
+            Some(episode),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+    }
+
+    #[test]
+    fn r1_episode_and_class_round_trip() {
+        let home = tmp_home("r1-identity");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let track = &list(&home)[0].1;
+        assert_eq!(track.ci_handoff_episode.as_deref(), Some("ep-1"));
+        assert_eq!(
+            track.ci_handoff_class,
+            Some(crate::inbox::CiHandoffClass::Protected)
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r2_resolver_requires_exact_episode() {
+        let home = tmp_home("r2-exact");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-old", "ack_protected"),
+            0
+        );
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"),
+            1
+        );
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r3_old_ack_after_rerecord_preserves_new_episode() {
+        let home = tmp_home("r3-rerecord");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("old"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T01:00:00Z",
+            None,
+            None,
+            Some("new"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "old", "ack_protected"),
+            0
+        );
+        assert_eq!(list(&home)[0].1.ci_handoff_episode.as_deref(), Some("new"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r4_target_isolation() {
+        let home = tmp_home("r4-target");
+        seed_protected(&home, "a", "o/r@main", "ep-a");
+        seed_protected(&home, "b", "o/r@main", "ep-b");
+        assert_eq!(
+            resolve_protected_episode(&home, "a", "o/r@main", "ep-a", "ack_protected"),
+            1
+        );
+        assert_eq!(list(&home)[0].1.target, "b");
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r5_cross_repo_correlation_isolation() {
+        let home = tmp_home("r5-repo");
+        seed_protected(&home, "reviewer", "one/r@main", "ep-1");
+        seed_protected(&home, "reviewer", "two/r@main", "ep-2");
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "one/r@main", "ep-1", "ack_protected"),
+            1
+        );
+        assert_eq!(list(&home)[0].1.correlation, "two/r@main");
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r6_legacy_classless_track_fails_closed() {
+        let home = tmp_home("r6-legacy");
+        record(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"),
+            0
+        );
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r7_feature_class_fails_closed_for_protected_settlement() {
+        let home = tmp_home("r7-feature");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@feature",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Feature)
+        ));
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@feature", "ep-1", "ack_protected"),
+            0
+        );
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r8_explicit_single_ack_settles_exact_protected_track() {
+        let home = tmp_home("r8-single");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r9_explicit_batch_ack_settles_all_exact_rows() {
+        let home = tmp_home("r9-batch");
+        seed_protected(&home, "reviewer", "o/r@a", "ep-a");
+        seed_protected(&home, "reviewer", "o/r@b", "ep-b");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 2);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r10_implicit_next_drain_ack_settles_prior_batch() {
+        let home = tmp_home("r10-implicit");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::drain(&home, "reviewer");
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r11_new_delivery_does_not_resolve_track() {
+        let home = tmp_home("r11-new-delivery");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        assert_eq!(crate::inbox::drain(&home, "reviewer").len(), 1);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r12_reconciler_resolves_processed_row_after_grace() {
+        let home = tmp_home("r12-reconcile");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::ack(&home, "reviewer", None);
+        // Recreate the sidecar to model a crash after row processing but before
+        // the resolver's delete completed.
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r13_reconciler_missing_row_fails_closed() {
+        let home = tmp_home("r13-missing");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r14_reconciler_ambiguous_rows_fails_closed() {
+        let home = tmp_home("r14-ambiguous");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        let mut duplicate = protected_message("reviewer", "o/r@main", "ep-1");
+        duplicate.id = Some("duplicate".into());
+        crate::inbox::enqueue(&home, "reviewer", duplicate).unwrap();
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::ack(&home, "reviewer", None);
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r15_repeated_ack_and_resolution_are_idempotent() {
+        let home = tmp_home("r15-idempotent");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 1);
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 0);
+        assert!(list(&home).is_empty());
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"),
+            0
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

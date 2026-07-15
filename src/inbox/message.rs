@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
 
+/// Durable identity for a CI handoff. `Protected` is used for exact-head
+/// protected-ref watches; `Feature` preserves the ordinary feature-branch
+/// notification path. Missing values on legacy rows are intentionally not
+/// inferred by settlement code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiHandoffClass {
+    Protected,
+    Feature,
+}
+
 /// Type-safe notification source — replaces raw string conventions.
 pub enum NotifySource<'a> {
     /// Message from a channel user (Telegram, Discord, etc.).
@@ -171,6 +182,14 @@ pub struct InboxMessage {
     /// Legacy assignment rows omit it and cannot later authorize a receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_assignment: Option<crate::review_receipt::ReviewAssignmentEnvelope>,
+    /// Durable CI-handoff episode token. It is minted before a ci-ready row is
+    /// enqueued and copied byte-for-byte to the handoff track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_handoff_episode: Option<String>,
+    /// Durable CI-handoff class. Legacy rows omit this and settlement fails
+    /// closed rather than guessing protected-vs-feature semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_handoff_class: Option<CiHandoffClass>,
 }
 
 /// Reply-to correlation context for a quoted bot message (resolved from the
