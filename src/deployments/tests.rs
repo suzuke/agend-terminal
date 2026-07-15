@@ -260,6 +260,63 @@ templates:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A template `skills:` that is NOT a YAML sequence (e.g. a bare scalar
+/// `skills: code-review`) must reject the instance at deployment time
+/// rather than fall through to `None` (install every skill).
+#[test]
+fn deploy_rejects_non_sequence_skills() {
+    let home = tmp_home("skills_non_seq_reject");
+    let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        skills: code-review
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+    let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+    // Deployment itself succeeds — only the invalid instance is skipped.
+    let _ = deploy(&home, "caller", &args);
+
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(
+        !reloaded.instances.contains_key("dev-lead"),
+        "instance with non-sequence `skills` must be skipped, not deployed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A template `skills:` sequence containing a non-string member
+/// (e.g. `skills: [42]` or `skills: [valid, 42]`) must reject the
+/// instance rather than silently dropping invalid entries.
+#[test]
+fn deploy_rejects_non_string_skills_member() {
+    let home = tmp_home("skills_non_str_reject");
+    let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        skills:
+          - a
+          - 42
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+    let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+    let _ = deploy(&home, "caller", &args);
+
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(
+        !reloaded.instances.contains_key("dev-lead"),
+        "instance with non-string `skills` member must be skipped, not deployed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2104 (cheerc): template deployment must carry the template instance's
 /// operator-controlled override fields — `github_login` AND `repo` — into the
 /// deployed instance. Both were hardcoded `None` at the same site

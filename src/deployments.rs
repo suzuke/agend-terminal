@@ -192,18 +192,53 @@ fn create_instance_entries(
             })
             .filter(|m| !m.is_empty());
         // Sprint 61 follow-up: per-instance skills allowlist from a template stanza.
-        // Mirrors `args` extraction, but does NOT `.filter(|v| !v.is_empty())` —
+        // Unlike `args` extraction this does NOT `.filter(|v| !v.is_empty())` —
         // `skills: []` (explicit opt-out of all skills) is a meaningful value per
         // `InstanceConfig::skills` docstring, and filtering it would silently flip
         // opt-out → install-all. `None` (field absent) means install every skill.
-        let template_skills = inst_val
-            .get("skills")
-            .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>()
-            });
+        //
+        // Presence-with-invalid-type must fail closed: a non-sequence value
+        // (e.g. scalar `skills: code-review`) or a sequence with non-string
+        // members (e.g. `skills: [42]`) is rejected at deployment time rather
+        // than silently resolving to `None` or a partial list. Only absent
+        // (None), empty `[]`, and valid string sequences pass through.
+        let template_skills = match inst_val.get("skills") {
+            None => None,
+            Some(skills_val) => {
+                let seq = match skills_val.as_sequence() {
+                    Some(s) => s,
+                    None => {
+                        tracing::warn!(
+                            deploy_name = %params.deploy_name,
+                            inst = %inst_name,
+                            "skipping template instance: `skills` must be a YAML sequence (list)"
+                        );
+                        continue;
+                    }
+                };
+                let mut skills = Vec::with_capacity(seq.len());
+                let mut invalid = false;
+                for x in seq {
+                    match x.as_str() {
+                        Some(s) => skills.push(s.to_string()),
+                        None => {
+                            tracing::warn!(
+                                deploy_name = %params.deploy_name,
+                                inst = %inst_name,
+                                value = ?x,
+                                "skipping template instance: every `skills` entry must be a string"
+                            );
+                            invalid = true;
+                            break;
+                        }
+                    }
+                }
+                if invalid {
+                    continue;
+                }
+                Some(skills)
+            }
+        };
         let source_repo = inst_val
             .get("source_repo")
             .and_then(|v| v.as_str())
