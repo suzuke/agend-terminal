@@ -365,6 +365,17 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
                     "discharge",
                 )
             }
+            // Classless/episode-less rows predate protected handoff identity.
+            // Preserve their explicit-discharge compatibility path while
+            // keeping protected ACK/reconciliation fail-closed on identity.
+            (Some(corr), _, _) => {
+                crate::daemon::ci_handoff_track::resolve_for_target_correlation_reason(
+                    home,
+                    instance_name,
+                    corr,
+                    "discharge",
+                )
+            }
             _ => 0,
         }
     } else {
