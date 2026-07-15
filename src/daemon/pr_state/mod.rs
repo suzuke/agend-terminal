@@ -911,6 +911,67 @@ where
     crate::store::with_json_state_or_create(&data_path, default_fn, mutate)
 }
 
+/// #2800: ensure a PrState exists for a cold PR whose CI has not yet
+/// reached terminal. Two-phase: (1) check local file; (2) if missing,
+/// confirm PR identity against the SCM provider, then CAS-create with
+/// `CiState::Pending`. The pr-state/file lock is NOT held across the
+/// network call — the provider query runs unlocked, and
+/// `with_pr_state_or_create` does the CAS afterwards. On a concurrent
+/// creator the CAS converges: if the file already exists with matching
+/// identity, the caller gets the existing state; a mismatch fails closed.
+pub fn ensure_from_scm(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    expected_head: &str,
+    review_class: ReviewClass,
+) -> anyhow::Result<PrState> {
+    // Phase 1: fast path — file already exists. Return it as-is and let
+    // the caller do the identity check (preserves existing error codes).
+    if let Some(existing) = load(home, repo, branch) {
+        return Ok(existing);
+    }
+
+    // Phase 2: no local file — confirm identity against SCM provider.
+    let provider = crate::scm::make_scm_provider(repo, None);
+    let pr = provider
+        .pr_view(repo, pr_number, &["number", "headRefOid", "headRefName"])
+        .map_err(|e| anyhow::anyhow!("SCM pr_view failed for PR #{pr_number}: {e}"))?;
+    let scm_head = pr
+        .head_ref_oid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("SCM returned no headRefOid for PR #{pr_number}"))?;
+    if !scm_head.eq_ignore_ascii_case(expected_head) {
+        anyhow::bail!(
+            "SCM head mismatch for PR #{pr_number}: expected {expected_head}, SCM reports {scm_head}"
+        );
+    }
+
+    // Phase 3: CAS-create with Pending CI.
+    let state = with_pr_state_or_create(
+        home,
+        repo,
+        branch,
+        || {
+            let mut s = new_for_branch(repo, branch, expected_head, review_class);
+            s.pr_number = pr_number;
+            s.pr_author = pr.author_login.unwrap_or_default();
+            s
+        },
+        |s| s.clone(),
+    )?;
+    if state.head_sha != expected_head || state.pr_number != pr_number {
+        anyhow::bail!(
+            "concurrent pr-state creator wrote mismatching identity \
+             (head={}, pr={}); expected head={expected_head}, pr={pr_number}",
+            state.head_sha,
+            state.pr_number
+        );
+    }
+    Ok(state)
+}
+
 /// Remove the per-PR file. Used by the per-tick scanner after a
 /// terminal state (Merged / ClosedUnmerged) is observed and the
 /// `[pr-merged]` / `[pr-closed-unmerged]` events have been emitted.
