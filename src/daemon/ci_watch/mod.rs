@@ -64,6 +64,7 @@ pub use provider::{
     BitbucketCiProvider, CiPollResult, CiProvider, CiRun, GitHubCiProvider, GitLabCiProvider,
     MergeableState, PrState,
 };
+pub(crate) use registry::remove_watch_json_only;
 #[allow(unused_imports)]
 pub use registry::{
     ci_watches_dir, cleanup_watches_for_instance, has_instance_anywhere, reassign_next_after_ci,

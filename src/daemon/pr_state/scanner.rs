@@ -175,6 +175,10 @@ pub fn scan_and_emit_with(
             .as_deref()
             .is_some_and(|k| terminal_already_emitted(home, k));
         let mut emitted_terminal = false;
+        // Deferred CI-watch CAS settlement: (repo, branch, terminal_head).
+        // Captured inside the locked MergeState match on ANY terminal path
+        // (first emit AND replay-suppressed) so restart re-scan can settle.
+        let mut deferred_watch_settle: Option<(String, String, String)> = None;
         let result = with_pr_state(home, &repo, &branch, |state| {
             let mut dirty = false;
 
@@ -387,7 +391,17 @@ pub fn scan_and_emit_with(
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
                         emitted_terminal = true; // [C1] record in ledger post-flock
                         dirty = true;
+                        deferred_watch_settle = Some((
+                            state.repo.clone(),
+                            state.branch.clone(),
+                            state.head_sha.clone(),
+                        ));
                     } else {
+                        deferred_watch_settle = Some((
+                            state.repo.clone(),
+                            state.branch.clone(),
+                            state.head_sha.clone(),
+                        ));
                         tracing::debug!(
                             repo = %state.repo,
                             branch = %state.branch,
@@ -669,6 +683,52 @@ pub fn scan_and_emit_with(
                 &format!("{repo}@{branch}"),
                 "pr_merge_blocked",
             );
+        }
+        // Post-flock CI-watch CAS settlement: remove the feature-branch watch
+        // only when repo+branch+head_sha all match the terminal state.
+        // This is the deterministic settlement path for watches that the
+        // poller's check_pr_terminal cannot reach (branch deleted after merge).
+        if let Some((t_repo, t_branch, terminal_head)) = deferred_watch_settle {
+            if !crate::agent_ops::is_protected_ref(&t_branch) {
+                let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
+                let fname = crate::daemon::ci_watch::watch_filename(&t_repo, &t_branch);
+                let watch_path = ci_dir.join(&fname);
+                if watch_path.exists() {
+                    let lock_path = watch_path.with_extension("lock");
+                    if let Ok(_guard) = crate::store::acquire_file_lock(&lock_path) {
+                        if let Ok(content) = std::fs::read_to_string(&watch_path) {
+                            if let Ok(watch) = serde_json::from_str::<
+                                crate::daemon::ci_watch::WatchState,
+                            >(&content)
+                            {
+                                let watch_head = watch.head_sha.as_deref().unwrap_or("");
+                                if watch.repo == t_repo
+                                    && watch.branch == t_branch
+                                    && !watch_head.is_empty()
+                                    && watch_head == terminal_head
+                                    && watch.target_head_sha.is_none()
+                                {
+                                    let subs: Vec<String> = watch
+                                        .subscribers
+                                        .as_deref()
+                                        .unwrap_or(&[])
+                                        .iter()
+                                        .map(|s| s.instance.clone())
+                                        .collect();
+                                    crate::daemon::ci_watch::remove_watch_json_only(
+                                        home,
+                                        &watch_path,
+                                        &subs.join(","),
+                                        &t_repo,
+                                        &t_branch,
+                                        "pr_terminal_cas_settlement",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         let _ = registry; // reserved for future gh-poll author lookup hook
     }

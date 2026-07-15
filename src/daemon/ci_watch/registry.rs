@@ -71,6 +71,30 @@ pub fn remove_watch(
     );
 }
 
+/// Remove only the `.json` watch file, leaving the `.lock` sidecar intact.
+///
+/// Called under a held per-watch flock so the `.lock` inode must NOT be
+/// unlinked while the guard holds it (doing so lets a concurrent re-create
+/// obtain a different inode, and a stale flush from the old guard can
+/// corrupt the new generation). The `.lock` is cleaned up after guard drop
+/// by the orphan sweep in `gc_stale_watches`.
+pub(crate) fn remove_watch_json_only(
+    home: &Path,
+    watch_path: &Path,
+    subscriber_label: &str,
+    repo: &str,
+    branch: &str,
+    reason: &str,
+) {
+    let _ = std::fs::remove_file(watch_path);
+    crate::event_log::log(
+        home,
+        "ci_watch_removed",
+        subscriber_label,
+        &format!("repo={repo} branch={branch} reason={reason} lock_preserved=true"),
+    );
+}
+
 /// #1488: scrub a deleted instance out of every CI watch. For each watch file:
 /// drop `instance` from the `subscribers` list (and the legacy single
 /// `instance` field), and clear `next_after_ci` if it pointed at the deleted
