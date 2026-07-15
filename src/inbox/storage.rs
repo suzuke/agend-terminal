@@ -3,6 +3,11 @@ use std::path::{Path, PathBuf};
 
 use super::message::{InboxMessage, MessageStatus};
 
+mod ci_handoff;
+pub(crate) use ci_handoff::{
+    protected_handoff_row_state, protected_settlement_identity, ProtectedHandoffRowState,
+};
+
 // ── #inbox-gc retention bounds (decision d-20260607081209372642-1, part b) ──
 //
 // Root cause of the unbounded-looking inbox files: read (drained) messages were
@@ -270,72 +275,6 @@ fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> an
     let lock_path = path.with_extension("jsonl.lock");
     let _lock = crate::store::acquire_file_lock(&lock_path)?;
     Ok(f(&path))
-}
-
-/// Exact row state used by the CI-handoff crash reconciler. Missing and
-/// ambiguous evidence are distinct from a processed row and both fail closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProtectedHandoffRowState {
-    Missing,
-    Pending,
-    Processed,
-    Ambiguous,
-}
-
-/// Probe one target inbox under its flock for exactly one protected ci-ready
-/// row carrying the requested correlation + episode. The lock is released
-/// before the caller attempts to delete the separate handoff track.
-pub(crate) fn protected_handoff_row_state(
-    home: &Path,
-    target: &str,
-    correlation: &str,
-    episode: &str,
-) -> ProtectedHandoffRowState {
-    let Ok(state) = with_inbox_lock(home, target, |path| {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return ProtectedHandoffRowState::Missing;
-        };
-        let mut matches = 0usize;
-        let mut processed = false;
-        for msg in parse_inbox_messages(&content) {
-            if msg.kind.as_deref() != Some("ci-ready-for-action")
-                || msg.correlation_id.as_deref() != Some(correlation)
-                || msg.ci_handoff_episode.as_deref() != Some(episode)
-                || msg.ci_handoff_class != Some(super::message::CiHandoffClass::Protected)
-            {
-                continue;
-            }
-            matches += 1;
-            processed = msg.read_at.is_some() && msg.delivering_at.is_none();
-        }
-        match (matches, processed) {
-            (0, _) => ProtectedHandoffRowState::Missing,
-            (1, true) => ProtectedHandoffRowState::Processed,
-            (1, false) => ProtectedHandoffRowState::Pending,
-            (_, _) => ProtectedHandoffRowState::Ambiguous,
-        }
-    }) else {
-        return ProtectedHandoffRowState::Missing;
-    };
-    state
-}
-
-/// Return the exact protected CI-handoff identity carried by a row. Settlement
-/// callers invoke the resolver only after their inbox lock is released.
-fn protected_settlement_identity(
-    msg: &InboxMessage,
-    target: &str,
-) -> Option<(String, String, String)> {
-    if msg.kind.as_deref() != Some("ci-ready-for-action")
-        || msg.ci_handoff_class != Some(super::message::CiHandoffClass::Protected)
-    {
-        return None;
-    }
-    Some((
-        target.to_string(),
-        msg.correlation_id.clone()?,
-        msg.ci_handoff_episode.clone()?,
-    ))
 }
 
 /// Parse an inbox JSONL body into successfully-deserialized [`InboxMessage`]s,
@@ -2555,60 +2494,6 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
     false
 }
 
-/// Test-only: force one row's `delivering_at` to an explicit rfc3339 timestamp so
-/// a test can age a `delivering` row past [`RECLAIM_TTL_SECS`] deterministically
-/// (no wall-clock sleep) and then exercise the real [`reclaim_stale_delivering`]
-/// path. Rewrites via raw JSON so forward-schema fields survive.
-///
-/// Placed here (below the production fns) so its `#[cfg(test)]` attribute never
-/// becomes the first one in the file — the #1617 source-scan invariant test
-/// slices production up to the first `#[cfg(test)]`, so a test helper above
-/// `reclaim_stale_delivering` would truncate its scan region.
-#[cfg(test)]
-pub(crate) fn set_row_delivering_at_for_test(
-    home: &Path,
-    name: &str,
-    msg_id: &str,
-    ts_rfc3339: &str,
-) {
-    let path = inbox_path_resolved(home, name);
-    // Fail loudly, never silently no-op: a read failure, wrong id/inbox, or a
-    // setup regression that ages ZERO rows would leave the parent freshly
-    // delivering — reclaim would skip it and a positive poll-reminder test could
-    // pass WITHOUT exercising aged reclaim (false GREEN). #2730 reviewer boundary.
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            panic!("set_row_delivering_at_for_test: cannot read {name}'s inbox at {path:?}: {e}")
-        }
-    };
-    let mut out = String::new();
-    let mut aged = 0usize;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(mut v) => {
-                if v.get("id").and_then(|x| x.as_str()) == Some(msg_id) {
-                    v["delivering_at"] = serde_json::Value::String(ts_rfc3339.to_string());
-                    aged += 1;
-                }
-                out.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| line.to_string()));
-            }
-            Err(_) => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    assert_eq!(
-        aged, 1,
-        "set_row_delivering_at_for_test: expected exactly one row with id={msg_id} in {name}'s inbox, aged {aged} — the aging seam would silently no-op and could produce a false GREEN"
-    );
-    if let Err(e) = std::fs::write(&path, out) {
-        panic!("set_row_delivering_at_for_test: cannot write {name}'s inbox at {path:?}: {e}");
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;
@@ -2628,3 +2513,10 @@ mod perf_r3_bench;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod p6_discharge_consume;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod test_helpers;
+
+#[cfg(test)]
+pub(crate) use test_helpers::set_row_delivering_at_for_test;
