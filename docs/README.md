@@ -89,6 +89,7 @@ maintained in English only.
 <details>
 <summary><strong>Architecture deep-dives</strong></summary>
 
+- [Architecture-14 Convergence Ledger](architecture/ARCHITECTURE-14-LEDGER.md) — authoritative invariants, evidence, status, and completion gates for the 14-item architecture program
 - [Architecture Groups](ARCHITECTURE-GROUPS.md) — subsystem grouping of the source tree
 - [Architecture Quick Start](ARCHITECTURE-QUICK-START.md) — orientation for new contributors
 - [Daemon Lock Ordering](DAEMON-LOCK-ORDERING.md) — lock acquisition order and deadlock avoidance
