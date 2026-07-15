@@ -418,7 +418,11 @@ pub(crate) fn flush_watch_state(
     };
     {
         let disk_gen = merged.generation_id.as_deref().unwrap_or("");
-        if disk_gen != expected {
+        if disk_gen.is_empty() {
+            // Legacy watch on disk without generation_id: seed it from the
+            // poller's in-memory value (which was seeded at poll start).
+            merged.generation_id = Some(expected.to_string());
+        } else if disk_gen != expected {
             tracing::info!(
                 path = %watch_path.display(),
                 expected = %expected,

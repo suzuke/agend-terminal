@@ -1493,6 +1493,12 @@ async fn ci_check_repo(
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
+    // Seed generation_id for legacy watches missing it. This is the
+    // durable-before-polling seeding: the generation is persisted on the
+    // first flush so subsequent polls carry it for CAS.
+    if state.generation_id.is_none() {
+        state.generation_id = Some(uuid::Uuid::new_v4().to_string());
+    }
     let snapshot = state.clone();
     let repo = state.repo.clone();
     let branch = state.branch.clone();

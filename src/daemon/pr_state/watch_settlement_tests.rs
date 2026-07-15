@@ -415,26 +415,27 @@ fn corrupt_watch_retains_pr_state_then_repair_settles() {
 
     tests::write_team_fleet(&home, "lead", &["dev"]);
 
-    // First scan: settlement fails (parse error) → pr_state retained.
+    // First scan: settlement fails (parse error) → pr_state RETAINED.
     run_scan(&home);
-    let _pr_state_dir = super::pr_state_dir(&home);
-    // Watch should still exist (corrupt, couldn't settle).
     assert!(
         ci_dir.join(&fname).exists(),
-        "corrupt watch file must survive"
+        "corrupt watch file must survive scan 1"
+    );
+    // Assert pr_state was retained (retryable failure → not removed).
+    assert!(
+        super::load(&home, repo, branch).is_some(),
+        "pr_state must be retained when watch settlement fails (retryable)"
     );
 
-    // Repair: write a valid watch with matching head.
+    // Repair: write a valid watch with matching head. Do NOT re-create
+    // pr_state — it was retained from scan 1.
     write_watch(&home, repo, branch, head);
-    // Re-create pr_state (first scan may or may not have removed it
-    // depending on whether settlement retained it).
-    write_merged_pr_state(&home, repo, branch, head);
 
-    // Second scan: settlement succeeds.
+    // Second scan: settlement succeeds → both watch and pr_state removed.
     run_scan(&home);
     assert!(
         !watch_exists(&home, repo, branch),
-        "repaired watch must be settled on next scan"
+        "repaired watch must be settled on scan 2"
     );
 
     std::fs::remove_dir_all(&home).ok();
