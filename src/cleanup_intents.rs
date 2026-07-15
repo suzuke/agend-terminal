@@ -615,7 +615,11 @@ mod tests {
     fn persist_failure_is_surfaced() {
         // Persist to an unwritable path
         let result = persist_intent(
-            Path::new("/nonexistent/root/agend-test"),
+            Path::new(if cfg!(windows) {
+                r"\\?\Z:\nonexistent\root\agend-test"
+            } else {
+                "/nonexistent/root/agend-test"
+            }),
             "/repo",
             "feat/x",
             "abc",
