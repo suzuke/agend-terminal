@@ -382,6 +382,7 @@ pub fn bind_full(
     }
     if !src_str.is_empty() {
         binding["source_repo"] = json!(src_str);
+        register_managed_repo(home, &src_str);
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())
@@ -689,6 +690,52 @@ pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     repos
+}
+
+/// #2800-lifecycle: union of live bindings + durable managed-repo registry.
+/// Closes the last-binding-released repo-discovery hole: after every binding
+/// for a repo is released, the repo stays discoverable for sweep/janitor.
+pub fn all_managed_repos(home: &Path) -> Vec<std::path::PathBuf> {
+    let mut repos = bound_source_repos(home);
+    for path in read_managed_repo_registry(home) {
+        if !repos.contains(&path) {
+            repos.push(path);
+        }
+    }
+    repos
+}
+
+fn managed_repo_registry_path(home: &Path) -> std::path::PathBuf {
+    home.join("managed-repos.jsonl")
+}
+
+fn register_managed_repo(home: &Path, source_repo: &str) {
+    if source_repo.is_empty() {
+        return;
+    }
+    let path = managed_repo_registry_path(home);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == source_repo) {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{source_repo}");
+    }
+}
+
+fn read_managed_repo_registry(home: &Path) -> Vec<std::path::PathBuf> {
+    let path = managed_repo_registry_path(home);
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| std::path::PathBuf::from(l.trim()))
+        .collect()
 }
 
 // #t-…81457-1: the worktree-occupancy equivalent of `bound_source_repos`
@@ -2449,6 +2496,60 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Lifecycle #1: after the last binding for a repo is released, the repo is
+    /// still discoverable via the durable managed-repo registry — closes the
+    /// last-binding repo-discovery hole. RED without register_managed_repo.
+    #[test]
+    fn last_binding_gone_repo_still_discovered() {
+        let home = tmp_home("last-binding-discovery");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("canonical-repo");
+        std::fs::create_dir_all(&src).unwrap();
+
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("bind ok");
+        // The repo is seeded into the registry on bind.
+        assert!(
+            all_managed_repos(&home).contains(&src),
+            "repo must be discoverable while bound"
+        );
+
+        // Simulate last-binding release: remove the binding.json.
+        let binding_path = crate::paths::runtime_dir(&home)
+            .join("agentA")
+            .join("binding.json");
+        std::fs::remove_file(&binding_path).ok();
+
+        // Live bindings now empty, but the registry keeps the repo discoverable.
+        assert!(
+            bound_source_repos(&home).is_empty(),
+            "no live bindings after release"
+        );
+        assert!(
+            all_managed_repos(&home).contains(&src),
+            "repo must STILL be discovered after the last binding is released"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Lifecycle #2: registry dedups — binding the same repo twice records it once.
+    #[test]
+    fn managed_repo_registry_dedups() {
+        let home = tmp_home("registry-dedup");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("repo");
+        std::fs::create_dir_all(&src).unwrap();
+
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("bind1");
+        bind_full(&home, "agentB", "", "feat/y", &wt, &src, false).expect("bind2");
+
+        let registry = read_managed_repo_registry(&home);
+        let count = registry.iter().filter(|p| **p == src).count();
+        assert_eq!(count, 1, "repo recorded exactly once in registry");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 #[cfg(test)]

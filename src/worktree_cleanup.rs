@@ -405,7 +405,7 @@ pub fn sweep_from_registry(
         return Vec::new();
     }
 
-    let repos: HashSet<PathBuf> = crate::binding::bound_source_repos(home)
+    let repos: HashSet<PathBuf> = crate::binding::all_managed_repos(home)
         .into_iter()
         .collect();
     let mut active_dirs: Vec<PathBuf> = configs.values().flatten().cloned().collect();
