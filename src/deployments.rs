@@ -191,6 +191,54 @@ fn create_instance_entries(
                 out
             })
             .filter(|m| !m.is_empty());
+        // Sprint 61 follow-up: per-instance skills allowlist from a template stanza.
+        // Unlike `args` extraction this does NOT `.filter(|v| !v.is_empty())` —
+        // `skills: []` (explicit opt-out of all skills) is a meaningful value per
+        // `InstanceConfig::skills` docstring, and filtering it would silently flip
+        // opt-out → install-all. `None` (field absent) means install every skill.
+        //
+        // Presence-with-invalid-type must fail closed: a non-sequence value
+        // (e.g. scalar `skills: code-review`) or a sequence with non-string
+        // members (e.g. `skills: [42]`) is rejected at deployment time rather
+        // than silently resolving to `None` or a partial list. Only absent
+        // (None), empty `[]`, and valid string sequences pass through.
+        let template_skills = match inst_val.get("skills") {
+            None => None,
+            Some(skills_val) => {
+                let seq = match skills_val.as_sequence() {
+                    Some(s) => s,
+                    None => {
+                        tracing::warn!(
+                            deploy_name = %params.deploy_name,
+                            inst = %inst_name,
+                            "skipping template instance: `skills` must be a YAML sequence (list)"
+                        );
+                        continue;
+                    }
+                };
+                let mut skills = Vec::with_capacity(seq.len());
+                let mut invalid = false;
+                for x in seq {
+                    match x.as_str() {
+                        Some(s) => skills.push(s.to_string()),
+                        None => {
+                            tracing::warn!(
+                                deploy_name = %params.deploy_name,
+                                inst = %inst_name,
+                                value = ?x,
+                                "skipping template instance: every `skills` entry must be a string"
+                            );
+                            invalid = true;
+                            break;
+                        }
+                    }
+                }
+                if invalid {
+                    continue;
+                }
+                Some(skills)
+            }
+        };
         let source_repo = inst_val
             .get("source_repo")
             .and_then(|v| v.as_str())
@@ -216,6 +264,7 @@ fn create_instance_entries(
                 instructions: yaml_str(inst_val, "instructions"),
                 source_repo,
                 skills_path: yaml_str(inst_val, "skills_path"),
+                skills: template_skills,
                 // #2104 (cheerc): both operator-controlled override fields were
                 // hardcoded None here → templates that set them were silently
                 // dropped. `repo` = explicit owner/name override (else daemon

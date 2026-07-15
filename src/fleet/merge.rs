@@ -69,6 +69,20 @@ pub fn merge_instance_into_existing(
             .map(|args| Value::Sequence(args.iter().map(|s| Value::String(s.clone())).collect())),
     )?;
 
+    // Sprint 61 follow-up: `skills` is the same Sequence shape as `args` but
+    // with different empty-vec semantics — `Some(vec![])` is a meaningful opt-out
+    // that MUST round-trip (NOT filtered to `None` like `args` would be safe to
+    // do). `merge_typed_field` already preserves Some-ness, so no special-casing
+    // here; the filter happens at the extraction site in deployments.rs.
+    merge_typed_field(
+        name,
+        existing,
+        "skills",
+        config.skills.as_ref().map(|skills| {
+            Value::Sequence(skills.iter().map(|s| Value::String(s.clone())).collect())
+        }),
+    )?;
+
     merge_typed_field(
         name,
         existing,
@@ -176,6 +190,15 @@ pub(super) fn build_instance_mapping(config: &InstanceYamlEntry) -> serde_yaml_n
             .map(|s| serde_yaml_ng::Value::String(s.clone()))
             .collect();
         inst.insert("args".into(), serde_yaml_ng::Value::Sequence(seq));
+    }
+    if let Some(ref skills) = config.skills {
+        // Same Sequence shape as `args`. Some(vec![]) round-trips as an empty
+        // YAML sequence (`skills: []`) — the explicit opt-out is preserved.
+        let seq: Vec<serde_yaml_ng::Value> = skills
+            .iter()
+            .map(|s| serde_yaml_ng::Value::String(s.clone()))
+            .collect();
+        inst.insert("skills".into(), serde_yaml_ng::Value::Sequence(seq));
     }
     if let Some(ref env_map) = config.env {
         let mut env_yaml = serde_yaml_ng::Mapping::new();

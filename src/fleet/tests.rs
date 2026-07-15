@@ -1627,6 +1627,60 @@ fn add_instance_to_yaml_round_trips_skills_path() {
 }
 
 #[test]
+fn add_instance_to_yaml_round_trips_skills_allowlist() {
+    let dir = std::env::temp_dir().join(format!("agend-fleet-sk-rt-{}", std::process::id()));
+    fs::create_dir_all(&dir).ok();
+    let entry = InstanceYamlEntry {
+        backend: Some("claude".to_string()),
+        skills: Some(vec!["code-review".to_string(), "refactor".to_string()]),
+        ..Default::default()
+    };
+    add_instance_to_yaml(&dir, "sk-agent", &entry).expect("add");
+    let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
+    assert!(
+        content.contains("skills:\n    - code-review\n    - refactor\n"),
+        "skills allowlist must round-trip as a YAML sequence: {content}"
+    );
+    let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+    let resolved = config.instances.get("sk-agent").expect("get");
+    assert_eq!(
+        resolved.skills,
+        Some(vec!["code-review".to_string(), "refactor".to_string()]),
+        "skills allowlist must round-trip via serde into InstanceConfig.skills"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn add_instance_to_yaml_preserves_empty_skills_allowlist_opt_out() {
+    // `skills: []` is an explicit opt-out (install NO skills). It MUST round-trip
+    // as `skills: []`, NOT be collapsed to `None` (which means install ALL).
+    // This is the divergence from `args` (where `.filter(|v| !v.is_empty())`
+    // safely drops empty vecs); for `skills` the empty vec is semantically meaningful.
+    let dir = std::env::temp_dir().join(format!("agend-fleet-sk-empty-{}", std::process::id()));
+    fs::create_dir_all(&dir).ok();
+    let entry = InstanceYamlEntry {
+        backend: Some("claude".to_string()),
+        skills: Some(vec![]),
+        ..Default::default()
+    };
+    add_instance_to_yaml(&dir, "sk-optout", &entry).expect("add");
+    let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
+    assert!(
+        content.contains("skills: []"),
+        "empty skills opt-out must round-trip as `skills: []`, not be dropped to None: {content}"
+    );
+    let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+    let resolved = config.instances.get("sk-optout").expect("get");
+    assert_eq!(
+        resolved.skills,
+        Some(vec![]),
+        "Some(vec![]) must survive round-trip — None would silently opt IN"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn topic_binding_mode_round_trips_through_fleet_yaml() {
     let dir = std::env::temp_dir().join(format!("agend-fleet-tb-rt-{}", std::process::id()));
     write_fleet(&dir, "instances: {}\n");
