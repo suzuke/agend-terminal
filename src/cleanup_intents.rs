@@ -82,8 +82,12 @@ pub(crate) fn settle_intent(
 ) -> Option<SettleOutcome> {
     let key = intent_key(repo, branch);
     let path = intents_dir(home).join(format!("{key}.json"));
-    let content = std::fs::read_to_string(&path).ok()?;
-    let intent: CleanupIntent = serde_json::from_str(&content).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
+    let Ok(intent) = serde_json::from_str::<CleanupIntent>(&content) else {
+        return None;
+    };
 
     if intent.repo != repo || intent.branch != branch {
         return None;
