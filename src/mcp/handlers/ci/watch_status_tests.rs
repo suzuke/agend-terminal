@@ -22,8 +22,7 @@ fn exact_head_status_exposes_target_head_sha() {
     std::fs::create_dir_all(&home).unwrap();
 
     let pinned_sha = "a".repeat(40);
-    let filename =
-        crate::daemon::ci_watch::watch_filename_exact_head("o/r", "main", &pinned_sha);
+    let filename = crate::daemon::ci_watch::watch_filename_exact_head("o/r", "main", &pinned_sha);
     write_sidecar(
         &home,
         &filename,
@@ -102,8 +101,7 @@ fn exact_head_status_head_sha_remains_null_before_poll() {
     std::fs::create_dir_all(&home).unwrap();
 
     let pinned_sha = "b".repeat(40);
-    let filename =
-        crate::daemon::ci_watch::watch_filename_exact_head("o/r", "main", &pinned_sha);
+    let filename = crate::daemon::ci_watch::watch_filename_exact_head("o/r", "main", &pinned_sha);
     write_sidecar(
         &home,
         &filename,
