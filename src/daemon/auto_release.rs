@@ -2475,4 +2475,26 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// Regression: malformed event record on a project board must cause
+    /// strict replay to fail, making all_branch_tasks_done return false.
+    /// Before the fix, lenient replay_at silently skipped corrupt records,
+    /// hiding pending tasks and permitting unsafe release.
+    #[test]
+    fn malformed_board_record_fails_closed() {
+        let home = tmp_home("malformed-record");
+        // Done task on default board — would allow release if project board is ignored
+        seed_task(&home, "t-done", "dev-6", "feat/m", true);
+        // Create a project board with a malformed event record
+        let board = crate::task_events::board_root(&home, "Hack_agend-terminal");
+        std::fs::create_dir_all(&board).unwrap();
+        let log = board.join("task_events.jsonl");
+        std::fs::write(&log, "not valid json\n").unwrap();
+        assert!(
+            !all_branch_tasks_done(&home, "owner/repo", "feat/m"),
+            "malformed event record on project board must fail closed — \
+             strict replay rejects corrupt records"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

@@ -764,11 +764,12 @@ pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> 
     let mut seen_ids = std::collections::HashSet::new();
     for project in enumerate_projects(home)? {
         let board = board_root(home, &project);
-        let state =
-            crate::task_events::replay_at(&board).map_err(|e| TaskRouteError::Unreadable {
+        let state = crate::task_events::replay_strict_at(&board).map_err(|e| {
+            TaskRouteError::Unreadable {
                 path: board.clone(),
-                cause: format!("board replay failed: {e}"),
-            })?;
+                cause: format!("strict board replay failed: {e:?}"),
+            }
+        })?;
         for record in state.tasks.values() {
             let task = super::record_to_task(record);
             if !seen_ids.insert(task.id.clone()) {
