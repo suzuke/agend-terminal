@@ -12,13 +12,15 @@ fn intent_key(repo: &str, branch: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CleanupIntent {
     pub repo: String,
     pub branch: String,
     pub expected_head: String,
     pub task_id: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scm_slug: Option<String>,
 }
 
 pub(crate) fn persist_intent(
@@ -27,6 +29,7 @@ pub(crate) fn persist_intent(
     branch: &str,
     expected_head: &str,
     task_id: &str,
+    scm_slug: Option<&str>,
 ) {
     let dir = intents_dir(home);
     if std::fs::create_dir_all(&dir).is_err() {
@@ -38,6 +41,7 @@ pub(crate) fn persist_intent(
         expected_head: expected_head.to_string(),
         task_id: task_id.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        scm_slug: scm_slug.map(String::from),
     };
     let key = intent_key(repo, branch);
     let path = dir.join(format!("{key}.json"));
@@ -46,7 +50,21 @@ pub(crate) fn persist_intent(
     }
 }
 
-pub(crate) fn settle_intent(home: &Path, repo: &str, branch: &str) -> Option<(bool, String)> {
+/// Settle a cleanup intent: delete the branch with expected-head CAS.
+///
+/// `merged` is the authoritative terminal signal — only `true` authorizes
+/// deletion. A restart loading pending intents MUST pass `merged=false`
+/// (intents survive, never self-authorize). The CI poller passes `true`
+/// after confirming PR-merged status.
+///
+/// Intent file is removed ONLY after successful delete or proven branch
+/// absence — transient failures keep the intent durable for retry.
+pub(crate) fn settle_intent(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    merged: bool,
+) -> Option<(bool, String)> {
     let key = intent_key(repo, branch);
     let path = intents_dir(home).join(format!("{key}.json"));
     let content = std::fs::read_to_string(&path).ok()?;
@@ -56,13 +74,22 @@ pub(crate) fn settle_intent(home: &Path, repo: &str, branch: &str) -> Option<(bo
         return None;
     }
 
+    if !merged {
+        return Some((
+            false,
+            format!("cleanup intent for '{branch}': not yet merged — intent preserved (pending)"),
+        ));
+    }
+
     let source_repo = Path::new(&intent.repo);
     match crate::git_helpers::git_cmd(source_repo, &["rev-parse", branch]) {
         Ok(actual) if actual.trim() == intent.expected_head => {
             let del = crate::git_helpers::git_bypass(source_repo, &["branch", "-D", branch]);
-            let _ = std::fs::remove_file(&path);
             match del {
-                Ok(o) if o.status.success() => Some((true, String::new())),
+                Ok(o) if o.status.success() => {
+                    let _ = std::fs::remove_file(&path);
+                    Some((true, String::new()))
+                }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
                     Some((false, format!("git branch -D failed: {stderr}")))
@@ -74,7 +101,7 @@ pub(crate) fn settle_intent(home: &Path, repo: &str, branch: &str) -> Option<(bo
             false,
             format!(
                 "cleanup intent for '{branch}': expected head {} but actual tip is {} \
-                     — preserved (fail-closed)",
+                 — preserved (fail-closed)",
                 intent.expected_head,
                 actual.trim()
             ),
@@ -89,20 +116,22 @@ pub(crate) fn settle_intent(home: &Path, repo: &str, branch: &str) -> Option<(bo
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn settle_all_intents(home: &Path) -> Vec<(String, bool, String)> {
+/// Settle intents matching an SCM slug. The CI poller knows the slug but not
+/// the local canonical path; this scans all intents for a slug match.
+pub(crate) fn settle_by_scm_slug(
+    home: &Path,
+    scm_slug: &str,
+    branch: &str,
+    merged: bool,
+) -> Option<(bool, String)> {
     let dir = intents_dir(home);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut results = Vec::new();
+    let entries = std::fs::read_dir(&dir).ok()?;
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
+        let content = match std::fs::read_to_string(&p) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -110,11 +139,11 @@ pub(crate) fn settle_all_intents(home: &Path) -> Vec<(String, bool, String)> {
             Ok(i) => i,
             Err(_) => continue,
         };
-        if let Some((deleted, reason)) = settle_intent(home, &intent.repo, &intent.branch) {
-            results.push((intent.branch, deleted, reason));
+        if intent.branch == branch && intent.scm_slug.as_deref().is_some_and(|s| s == scm_slug) {
+            return settle_intent(home, &intent.repo, branch, merged);
         }
     }
-    results
+    None
 }
 
 pub(crate) fn intent_repos(home: &Path) -> Vec<String> {
@@ -213,16 +242,12 @@ mod tests {
         crate::git_helpers::git_ok(repo, &["rev-parse", "--verify", branch])
     }
 
-    #[test]
-    fn persist_and_settle_exact_head_deletes_branch() {
-        let home = tmp_dir("settle-ok");
-        let repo = tmp_repo("settle-ok-repo");
-
-        git_in(&repo, &["checkout", "-b", "feat/settle-test"]);
+    fn make_branch(repo: &Path, name: &str) -> String {
+        git_in(repo, &["checkout", "-b", name]);
         std::fs::write(repo.join("f.txt"), "content").ok();
-        git_in(&repo, &["add", "."]);
+        git_in(repo, &["add", "."]);
         git_in(
-            &repo,
+            repo,
             &[
                 "-c",
                 "user.name=t",
@@ -233,23 +258,56 @@ mod tests {
                 "work",
             ],
         );
-        let tip = branch_tip(&repo, "feat/settle-test");
-        git_in(&repo, &["checkout", "main"]);
+        let tip = branch_tip(repo, name);
+        git_in(repo, &["checkout", "main"]);
+        tip
+    }
+
+    #[test]
+    fn settle_merged_exact_head_deletes_branch() {
+        let home = tmp_dir("settle-ok");
+        let repo = tmp_repo("settle-ok-repo");
+        let tip = make_branch(&repo, "feat/settle-test");
 
         let repo_str = repo.display().to_string();
-        persist_intent(&home, &repo_str, "feat/settle-test", &tip, "t-123");
+        persist_intent(&home, &repo_str, "feat/settle-test", &tip, "t-123", None);
         assert!(has_intent(&home, &repo_str, "feat/settle-test"));
 
-        let result = settle_intent(&home, &repo_str, "feat/settle-test");
-        let (deleted, _reason) = result.expect("settle must return a result");
-        assert!(deleted, "branch must be deleted on CAS match");
+        // merged=true authorizes deletion
+        let (deleted, _) =
+            settle_intent(&home, &repo_str, "feat/settle-test", true).expect("settle result");
+        assert!(deleted, "branch must be deleted on CAS match + merged");
+        assert!(!branch_exists(&repo, "feat/settle-test"));
+        assert!(!has_intent(&home, &repo_str, "feat/settle-test"));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn settle_not_merged_preserves_branch_and_intent() {
+        let home = tmp_dir("settle-pending");
+        let repo = tmp_repo("settle-pending-repo");
+        let tip = make_branch(&repo, "feat/pending-test");
+
+        let repo_str = repo.display().to_string();
+        persist_intent(&home, &repo_str, "feat/pending-test", &tip, "t-456", None);
+
+        // merged=false → branch AND intent preserved
+        let (deleted, reason) =
+            settle_intent(&home, &repo_str, "feat/pending-test", false).expect("settle result");
+        assert!(!deleted, "not-merged must NOT delete");
         assert!(
-            !branch_exists(&repo, "feat/settle-test"),
-            "branch must be gone"
+            branch_exists(&repo, "feat/pending-test"),
+            "branch must survive"
         );
         assert!(
-            !has_intent(&home, &repo_str, "feat/settle-test"),
-            "intent must be removed"
+            has_intent(&home, &repo_str, "feat/pending-test"),
+            "intent must survive"
+        );
+        assert!(
+            reason.contains("not yet merged"),
+            "reason must mention pending: {reason}"
         );
 
         std::fs::remove_dir_all(&home).ok();
@@ -257,26 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn settle_head_drift_preserves_branch() {
+    fn settle_head_drift_preserves_branch_and_intent() {
         let home = tmp_dir("settle-drift");
         let repo = tmp_repo("settle-drift-repo");
-
-        git_in(&repo, &["checkout", "-b", "feat/drift-test"]);
-        std::fs::write(repo.join("f.txt"), "content").ok();
-        git_in(&repo, &["add", "."]);
-        git_in(
-            &repo,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-m",
-                "work",
-            ],
-        );
-        git_in(&repo, &["checkout", "main"]);
+        let _tip = make_branch(&repo, "feat/drift-test");
 
         let repo_str = repo.display().to_string();
         persist_intent(
@@ -284,73 +326,89 @@ mod tests {
             &repo_str,
             "feat/drift-test",
             "0000000000000000000000000000000000000000",
-            "t-456",
+            "t-789",
+            None,
         );
 
-        let result = settle_intent(&home, &repo_str, "feat/drift-test");
-        let (deleted, reason) = result.expect("settle must return a result");
-        assert!(!deleted, "head-drifted branch must NOT be deleted");
+        // merged=true but head drifted → fail-closed, intent kept for retry
+        let (deleted, reason) =
+            settle_intent(&home, &repo_str, "feat/drift-test", true).expect("settle result");
+        assert!(!deleted, "head-drifted must NOT delete");
+        assert!(branch_exists(&repo, "feat/drift-test"));
+        assert!(reason.contains("fail-closed"), "reason: {reason}");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// RED #5: restart before merge keeps branch+intent; merged event settles.
+    #[test]
+    fn restart_preserves_then_merged_settles() {
+        let home = tmp_dir("restart-settle");
+        let repo = tmp_repo("restart-settle-repo");
+        let tip = make_branch(&repo, "feat/restart-test");
+
+        let repo_str = repo.display().to_string();
+        persist_intent(
+            &home,
+            &repo_str,
+            "feat/restart-test",
+            &tip,
+            "t-restart",
+            None,
+        );
+
+        // Simulate restart: settle with merged=false (no terminal authority)
+        let (deleted, _) =
+            settle_intent(&home, &repo_str, "feat/restart-test", false).expect("restart settle");
+        assert!(!deleted, "restart must NOT delete");
         assert!(
-            branch_exists(&repo, "feat/drift-test"),
-            "branch must survive"
+            branch_exists(&repo, "feat/restart-test"),
+            "branch survives restart"
         );
         assert!(
-            reason.contains("fail-closed"),
-            "reason must mention fail-closed: {reason}"
+            has_intent(&home, &repo_str, "feat/restart-test"),
+            "intent survives restart"
+        );
+
+        // Later: PR merges → settle with merged=true
+        let (deleted, _) =
+            settle_intent(&home, &repo_str, "feat/restart-test", true).expect("merged settle");
+        assert!(deleted, "merged event must delete");
+        assert!(
+            !branch_exists(&repo, "feat/restart-test"),
+            "branch gone after merge"
+        );
+        assert!(
+            !has_intent(&home, &repo_str, "feat/restart-test"),
+            "intent gone after merge"
         );
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
-    /// RED #5: clean feature pre-merge → intent survives restart, settles exact-head
     #[test]
-    fn intent_survives_simulated_restart_and_settles() {
-        let home = tmp_dir("restart-settle");
-        let repo = tmp_repo("restart-settle-repo");
-
-        git_in(&repo, &["checkout", "-b", "feat/restart-test"]);
-        std::fs::write(repo.join("f.txt"), "work").ok();
-        git_in(&repo, &["add", "."]);
-        git_in(
-            &repo,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-m",
-                "work",
-            ],
-        );
-        let tip = branch_tip(&repo, "feat/restart-test");
-        git_in(&repo, &["checkout", "main"]);
+    fn settle_by_slug_matches_scm_identity() {
+        let home = tmp_dir("slug-settle");
+        let repo = tmp_repo("slug-settle-repo");
+        let tip = make_branch(&repo, "feat/slug-test");
 
         let repo_str = repo.display().to_string();
-        persist_intent(&home, &repo_str, "feat/restart-test", &tip, "t-789");
-
-        // "Restart": re-read from disk (the intent is durable)
-        assert!(has_intent(&home, &repo_str, "feat/restart-test"));
-
-        // Intent repos discoverable
-        let repos = intent_repos(&home);
-        assert!(
-            repos.contains(&repo_str),
-            "intent repo must be discoverable: {repos:?}"
+        persist_intent(
+            &home,
+            &repo_str,
+            "feat/slug-test",
+            &tip,
+            "t-slug",
+            Some("owner/repo"),
         );
 
-        // Settle via settle_all (simulates sweep after restart)
-        let results = settle_all_intents(&home);
-        assert_eq!(results.len(), 1, "one intent settled: {results:?}");
-        let (branch, deleted, _) = &results[0];
-        assert_eq!(branch, "feat/restart-test");
-        assert!(deleted, "branch must be deleted on settlement");
-        assert!(!branch_exists(&repo, "feat/restart-test"), "branch gone");
-        assert!(
-            !has_intent(&home, &repo_str, "feat/restart-test"),
-            "intent cleared"
-        );
+        // Settle via SCM slug (as CI poller would)
+        let (deleted, _) =
+            settle_by_scm_slug(&home, "owner/repo", "feat/slug-test", true).expect("slug settle");
+        assert!(deleted, "slug-matched intent must settle");
+        assert!(!branch_exists(&repo, "feat/slug-test"));
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -359,9 +417,9 @@ mod tests {
     #[test]
     fn intent_repos_contributes_to_discovery() {
         let home = tmp_dir("intent-repos");
-        persist_intent(&home, "/path/to/repo-a", "feat/a", "abc123", "t-1");
-        persist_intent(&home, "/path/to/repo-b", "feat/b", "def456", "t-2");
-        persist_intent(&home, "/path/to/repo-a", "feat/c", "ghi789", "t-3");
+        persist_intent(&home, "/path/to/repo-a", "feat/a", "abc123", "t-1", None);
+        persist_intent(&home, "/path/to/repo-b", "feat/b", "def456", "t-2", None);
+        persist_intent(&home, "/path/to/repo-a", "feat/c", "ghi789", "t-3", None);
 
         let repos = intent_repos(&home);
         assert!(repos.contains(&"/path/to/repo-a".to_string()));

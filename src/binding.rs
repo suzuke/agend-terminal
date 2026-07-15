@@ -465,7 +465,6 @@ pub fn bind_full(
 /// by the daemon → bind_full (creates binding) → this function (annotates with
 /// typed lease_kind + assignment_id + expected_head). The HMAC signature
 /// prevents an agent from adding/modifying these fields itself.
-#[allow(dead_code)]
 pub(crate) fn augment_binding_with_lease(
     home: &Path,
     agent: &str,
@@ -501,6 +500,60 @@ pub(crate) fn augment_binding_with_lease(
         map.insert(index_key(home, agent), binding);
     }
     Ok(())
+}
+
+/// Post-bind hook: if the agent has an active typed review assignment, augment
+/// the binding with the assignment's lease provenance (lease_kind +
+/// assignment_id + reviewed_head).
+///
+/// Called from `handle_checkout_repo` after a successful `bind_full`. The
+/// authority source is the daemon's own assignment store — not caller-provided
+/// or inferred from branch prefix.
+pub(crate) fn try_augment_review_lease(home: &Path, agent: &str, branch: &str) {
+    let assignments =
+        match crate::daemon::assignment_authority::legacy_active_assignments_strict(home) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+    let matching = assignments.iter().find(|a| a.target == agent);
+    if let Some(assignment) = matching {
+        let reviewed_head = match &assignment.reviewed_head {
+            Some(h) if !h.is_empty() => h.as_str(),
+            _ => return,
+        };
+        // Use the checkout branch tip as expected_head for the CAS check.
+        // The reviewed_head is the PR head the assignment targets, which is
+        // the upstream reference; the checkout branch tip is what the
+        // reviewer will be working on locally.
+        let branch_tip = crate::git_helpers::git_cmd(
+            Path::new(
+                snapshot_guarded_binding(home, agent)
+                    .ok()
+                    .and_then(|g| match g {
+                        GuardedBinding::Known { value, .. } => {
+                            value["source_repo"].as_str().map(|s| s.to_string())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+            &["rev-parse", branch],
+        )
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| reviewed_head.to_string());
+
+        if let Err(e) = augment_binding_with_lease(
+            home,
+            agent,
+            "review",
+            &assignment.assignment_id.to_string(),
+            &branch_tip,
+        ) {
+            tracing::warn!(%agent, error = %e, "review lease augmentation failed — review branch preserved on release");
+        }
+    }
 }
 
 /// #2158 GR1: surface an OUT-OF-DISPATCH binding CREATE/CHANGE (no task_id) to the

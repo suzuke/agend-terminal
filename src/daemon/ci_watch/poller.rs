@@ -1739,8 +1739,9 @@ async fn check_and_remove_terminal_pr(
         crate::status_summary::auto_close_merged_tasks(ctx.home, ctx.branch);
         crate::daemon::auto_release::auto_release_for_merged_branch(ctx.home, ctx.repo, ctx.branch);
         // Settle any cleanup intent for this branch (CAS-checked delete).
+        // The poller has the SCM slug (ctx.repo), not the canonical local path.
         if let Some((deleted, reason)) =
-            crate::cleanup_intents::settle_intent(ctx.home, ctx.repo, ctx.branch)
+            crate::cleanup_intents::settle_by_scm_slug(ctx.home, ctx.repo, ctx.branch, true)
         {
             if deleted {
                 tracing::info!(

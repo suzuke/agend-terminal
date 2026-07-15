@@ -662,7 +662,20 @@ fn resolve_branch_cleanup(
                     .ok()
                     .map(|s| s.trim().to_string())
             {
-                crate::cleanup_intents::persist_intent(home, sr_str, branch, &tip, task_id);
+                let scm_slug = crate::git_helpers::git_cmd(
+                    Path::new(sr_str),
+                    &["remote", "get-url", "origin"],
+                )
+                .ok()
+                .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
+                crate::cleanup_intents::persist_intent(
+                    home,
+                    sr_str,
+                    branch,
+                    &tip,
+                    task_id,
+                    scm_slug.as_deref(),
+                );
             }
         }
     } else if branch.is_empty() {

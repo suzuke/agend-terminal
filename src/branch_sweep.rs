@@ -602,6 +602,10 @@ fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &st
         )
 }
 
+pub(crate) fn extract_github_repo_for_intent(url: &str) -> Option<String> {
+    extract_github_repo(url)
+}
+
 /// Extract "owner/repo" from a GitHub remote URL.
 fn extract_github_repo(url: &str) -> Option<String> {
     // Handles: https://github.com/owner/repo.git, git@github.com:owner/repo.git

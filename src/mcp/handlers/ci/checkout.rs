@@ -609,6 +609,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         branch,
                     );
                 }
+                // Post-bind: augment with review-lease provenance if the agent
+                // has an active typed review assignment (authority from the
+                // daemon's assignment store, not caller-provided).
+                crate::binding::try_augment_review_lease(home, instance_name, branch);
                 bound_fingerprint =
                     match crate::binding::snapshot_guarded_binding(home, instance_name) {
                         Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
