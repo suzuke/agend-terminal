@@ -151,6 +151,24 @@ pub fn is_daemon_managed(worktree_path: &Path) -> bool {
 
 /// Outcome of a hard release — emitted by `release_full` and serialized
 /// directly into the `release_worktree` MCP tool response.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReleaseProvenance {
+    Manual,
+    Auto,
+    Delete,
+}
+
+impl std::fmt::Display for ReleaseProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+            Self::Delete => "delete",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct ReleaseOutcome {
     pub released: bool,
@@ -509,8 +527,27 @@ fn clear_binding_state(
     home: &Path,
     agent: &str,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
-) {
-    crate::binding::unbind_with_permit(home, agent, permit);
+) -> crate::binding::BindingRemoval {
+    crate::binding::unbind_with_permit(home, agent, permit)
+}
+
+fn record_binding_removal(out: &mut ReleaseOutcome, removal: crate::binding::BindingRemoval) {
+    match removal {
+        crate::binding::BindingRemoval::Removed => out.binding_removed = true,
+        crate::binding::BindingRemoval::Absent => {
+            if out.error.is_none() {
+                out.error = Some("binding disappeared before removal".to_string());
+            }
+        }
+        crate::binding::BindingRemoval::Failed(error) => {
+            if let Some(existing) = &mut out.error {
+                existing.push_str("; binding removal failed: ");
+                existing.push_str(&error);
+            } else {
+                out.error = Some(format!("binding removal failed: {error}"));
+            }
+        }
+    }
 }
 
 fn resolve_branch_cleanup(
@@ -679,8 +716,8 @@ fn release_known_locked(
                     // worktree-protection refusal must not also skip binding
                     // cleanup. (This arm is already the non-dry_run path; the
                     // dry_run classifier above mutates nothing.)
-                    clear_binding_state(home, agent, permit);
-                    out.binding_removed = true;
+                    let removal = clear_binding_state(home, agent, permit);
+                    record_binding_removal(&mut out, removal);
                     return LockedRelease {
                         out,
                         notices,
@@ -714,22 +751,23 @@ fn release_known_locked(
         ));
         out.released = true;
     } else {
-        clear_binding_state(home, agent, permit);
-        out.binding_removed = true;
+        let removal = clear_binding_state(home, agent, permit);
+        record_binding_removal(&mut out, removal);
         // #1465 guardrail: only report `released` when no cleanup step failed.
         // A `WorktreeRemoval::Failed` set `out.error` above — idempotent success
         // must NOT mask a real execution error as success (reviewer contract:
         // "binding present but cleanup failed → released:false + error").
-        if out.error.is_none() {
+        if out.error.is_none() && out.binding_removed {
             out.released = true;
         }
     }
 
+    let finish_full_release = out.released || dry_run;
     LockedRelease {
         out,
         notices,
         clear_refusal_marker,
-        finish_full_release: true,
+        finish_full_release,
         managed_verified,
         worktree_absent,
     }
@@ -741,6 +779,7 @@ fn release_full_guarded(
     dry_run: bool,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
+    provenance: ReleaseProvenance,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
@@ -820,7 +859,8 @@ fn release_full_guarded(
             "worktree_released_full",
             agent,
             &format!(
-                "wt_removed={} binding_removed={} error={}",
+                "operation={:?} provenance={provenance} wt_removed={} binding_removed={} error={}",
+                permit.operation,
                 locked.out.worktree_removed,
                 locked.out.binding_removed,
                 locked.out.error.as_deref().unwrap_or("")
@@ -841,10 +881,17 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
             return ReleaseOutcome {
                 error: Some(format!("release refused: {error}")),
                 ..ReleaseOutcome::default()
-            }
+            };
         }
     };
-    release_full_guarded(home, agent, dry_run, &permit, None)
+    release_full_guarded(
+        home,
+        agent,
+        dry_run,
+        &permit,
+        None,
+        ReleaseProvenance::Manual,
+    )
 }
 
 pub(crate) fn release_full_with_permit(
@@ -853,7 +900,17 @@ pub(crate) fn release_full_with_permit(
     dry_run: bool,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, permit, None)
+    release_full_with_permit_origin(home, agent, dry_run, permit, ReleaseProvenance::Manual)
+}
+
+pub(crate) fn release_full_with_permit_origin(
+    home: &Path,
+    agent: &str,
+    dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+    provenance: ReleaseProvenance,
+) -> ReleaseOutcome {
+    release_full_guarded(home, agent, dry_run, permit, None, provenance)
 }
 
 pub(crate) fn release_full_exact(
@@ -874,7 +931,14 @@ pub(crate) fn release_full_exact(
             }
         }
     };
-    release_full_guarded(home, agent, false, &permit, Some(expected))
+    release_full_guarded(
+        home,
+        agent,
+        false,
+        &permit,
+        Some(expected),
+        ReleaseProvenance::Auto,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1009,9 +1073,9 @@ fn release_bound_target_exact_impl(
             drop(branch_lock);
             return out;
         }
-        clear_binding_state(home, agent, permit);
-        out.binding_removed = true;
-        out.released = true;
+        let removal = clear_binding_state(home, agent, permit);
+        record_binding_removal(&mut out, removal);
+        out.released = out.error.is_none() && out.binding_removed;
         drop(_binding_lock);
         drop(_agent_lock);
         drop(branch_lock);
@@ -1057,21 +1121,21 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
             clear_marker = true;
-            clear_binding_state(home, agent, permit);
-            out.binding_removed = true;
-            out.released = true;
+            let removal = clear_binding_state(home, agent, permit);
+            record_binding_removal(&mut out, removal);
+            out.released = out.error.is_none() && out.binding_removed;
         }
         WorktreeRemoval::AlreadyAbsent => {
-            clear_binding_state(home, agent, permit);
-            out.binding_removed = true;
-            out.released = true;
+            let removal = clear_binding_state(home, agent, permit);
+            record_binding_removal(&mut out, removal);
+            out.released = out.error.is_none() && out.binding_removed;
         }
         WorktreeRemoval::Unmanaged(error) => out.error = Some(error),
         WorktreeRemoval::Failed(error) => {
             out.error = Some(error);
             if clear_binding_on_remove_failure {
-                clear_binding_state(home, agent, permit);
-                out.binding_removed = true;
+                let removal = clear_binding_state(home, agent, permit);
+                record_binding_removal(&mut out, removal);
             }
         }
     }
@@ -1167,7 +1231,7 @@ pub(crate) fn release_bound_target_exact_under_branch_lock(
             return ReleaseOutcome {
                 error: Some(format!("release refused: {error}")),
                 ..ReleaseOutcome::default()
-            }
+            };
         }
     };
     release_bound_target_exact_impl(

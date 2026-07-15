@@ -981,6 +981,103 @@ fn concurrent_release_actors_apply_one_transition_s1() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// S2 RED: manual and auto-release entry points must share lifecycle authority
+/// when they address the same existing home through distinct path aliases.
+/// `home/.` is the same directory as `home`, but its pre-fix display key was
+/// distinct, allowing the second actor to acquire a competing permit.
+#[test]
+fn aliased_manual_and_auto_release_share_one_lifecycle_transaction_s2() {
+    let home = tmp_home("s2-release-alias");
+    let repo = tmp_repo("s2-release-alias-repo");
+    lease_bound(&home, &repo, "agent-alias", "feat/alias");
+    let alias = home.join(".");
+    let expected = match crate::binding::snapshot_guarded_binding(&home, "agent-alias")
+        .expect("snapshot binding")
+    {
+        crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+        other => panic!("expected known binding, got {other:?}"),
+    };
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let home_for_manual = home.clone();
+    let manual = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                entered_tx.send(()).expect("signal manual snapshot");
+                resume_rx.recv().expect("wait for manual resume");
+            }
+        });
+        release_full(&home_for_manual, "agent-alias", false)
+    });
+
+    entered_rx.recv().expect("manual release reached snapshot");
+    let auto = release_full_exact(&alias, "agent-alias", &expected);
+    assert!(
+        auto.error
+            .as_deref()
+            .is_some_and(|error| error.contains("lifecycle transaction already in flight")),
+        "aliased auto-release must be refused while manual release owns the permit: {auto:?}"
+    );
+    assert!(!auto.released && !auto.binding_removed);
+
+    resume_tx.send(()).expect("resume manual release");
+    let manual = manual.join().expect("manual release thread");
+    assert!(
+        manual.released && manual.binding_removed,
+        "manual: {manual:?}"
+    );
+
+    let events = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+    assert_eq!(
+        events.matches("worktree_released_full").count(),
+        1,
+        "one aliased release transaction must emit one terminal event: {events}"
+    );
+    assert!(
+        events.contains("operation=Release provenance=manual"),
+        "terminal release event must preserve manual provenance: {events}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn unbind_reports_absent_and_failed_removal_truthfully() {
+    let absent_home = tmp_home("unbind-absent-outcome");
+    let absent_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &absent_home,
+        "agent-absent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    )
+    .expect("absent permit");
+    assert_eq!(
+        crate::binding::unbind_with_permit(&absent_home, "agent-absent", &absent_permit),
+        crate::binding::BindingRemoval::Absent
+    );
+    drop(absent_permit);
+    std::fs::remove_dir_all(&absent_home).ok();
+
+    let failed_home = tmp_home("unbind-failed-outcome");
+    let binding_path = crate::paths::runtime_dir(&failed_home)
+        .join("agent-failed")
+        .join("binding.json");
+    std::fs::create_dir_all(&binding_path).expect("binding path directory");
+    let failed_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &failed_home,
+        "agent-failed",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    )
+    .expect("failed permit");
+    assert!(matches!(
+        crate::binding::unbind_with_permit(&failed_home, "agent-failed", &failed_permit),
+        crate::binding::BindingRemoval::Failed(_)
+    ));
+    drop(failed_permit);
+    std::fs::remove_dir_all(&failed_home).ok();
+}
+
 /// S1 RED: reverse reconciliation is another lifecycle actor. The lifecycle
 /// permit ensures that when release holds the permit, reverse_reconcile is
 /// refused before any mutation — and vice versa.

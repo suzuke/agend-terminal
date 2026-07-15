@@ -22,6 +22,8 @@ pub(crate) use release_guard::{
 };
 mod signature;
 pub(crate) use signature::signature_valid;
+mod unbind;
+pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;
 #[allow(unused_imports)]
 pub use unbind_compat::unbind;
@@ -572,46 +574,6 @@ fn out_of_dispatch_notify_recipient(home: &Path, agent: &str) -> Option<String> 
 /// the same `binding.json.sig` name (it cannot import this — separate binary).
 fn binding_sig_path(dir: &Path) -> PathBuf {
     dir.join("binding.json.sig")
-}
-pub(crate) fn unbind_with_permit(
-    home: &Path,
-    agent: &str,
-    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
-) {
-    if !permit.authorizes(home, agent) {
-        tracing::warn!(agent, "unbind refused: invalid lifecycle permit");
-        return;
-    }
-    let dir = crate::paths::runtime_dir(home).join(agent);
-    // #2158 PR2 (ii): audit the release/clear side of binding-change detection with
-    // caller process context (read the prior branch before removal). Only logs when
-    // a binding actually existed (a no-op unbind stays silent).
-    if let Some(prev_branch) = std::fs::read_to_string(dir.join("binding.json"))
-        .ok()
-        .and_then(|c| parse_binding_guarded(&c))
-        .and_then(|v| v.get("branch").and_then(|b| b.as_str()).map(String::from))
-    {
-        crate::event_log::log(
-            home,
-            "binding_released",
-            agent,
-            &format!(
-                "prev_branch={prev_branch}; {}",
-                crate::event_log::caller_process_context()
-            ),
-        );
-    }
-    let _ = std::fs::remove_file(dir.join("binding.json"));
-    // #1651: drop the HMAC sidecar too, so a stale signature can't linger.
-    let _ = std::fs::remove_file(binding_sig_path(&dir));
-    // bug-audit Rank6: clear the out-of-dispatch notify latch so a release resets
-    // it — a later real re-claim of the same branch re-surfaces instead of being
-    // silently swallowed as "already notified". Scoped to release, so the
-    // per-(agent,branch) intra-cycle fire-once dedup is preserved.
-    let _ = std::fs::remove_file(dir.join(OUT_OF_DISPATCH_SIDECAR));
-    if let Ok(mut map) = binding_index().write() {
-        map.remove(&index_key(home, agent));
-    }
 }
 
 // #1688 (codex): there is intentionally NO startup "re-sign unsigned bindings"

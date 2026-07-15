@@ -288,7 +288,16 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // also clears the binding itself on success, so the unbind below is a
     // defensive idempotent no-op for the bound-agent case (still needed for the
     // never-bound / partial-state cases).
-    let _ = crate::worktree_pool::release_full_with_permit(home, name, false, &lifecycle_permit);
+    let release = crate::worktree_pool::release_full_with_permit_origin(
+        home,
+        name,
+        false,
+        &lifecycle_permit,
+        crate::worktree_pool::ReleaseProvenance::Delete,
+    );
+    if let Some(error) = release.error {
+        step_errors.push(format!("worktree release: {error}"));
+    }
     // release_full removes the leaf worktree `worktrees/<name>/<branch>/`; drop the
     // now-empty agent dir `worktrees/<name>/` too so the audit below reads clean.
     // #1907: a slash-containing branch (e.g. `feat/x`) nests intermediate dirs
@@ -305,7 +314,11 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // ran bind_self / repo checkout) without a prior release both leaked the
     // binding (blocking a same-name re-bind) AND tripped the residual audit below
     // → the whole teardown returned Err despite otherwise succeeding.
-    crate::binding::unbind_with_permit(home, name, &lifecycle_permit);
+    if let crate::binding::BindingRemoval::Failed(error) =
+        crate::binding::unbind_with_permit(home, name, &lifecycle_permit)
+    {
+        step_errors.push(format!("binding removal: {error}"));
+    }
     // #1907: `unbind` drops binding.json + its HMAC sidecar but leaves the now-empty
     // `runtime/<name>/` dir + its `.binding.json.lock` flock behind. Remove the whole
     // dir so teardown is fully clean (the residual audit below now checks it). Safe:

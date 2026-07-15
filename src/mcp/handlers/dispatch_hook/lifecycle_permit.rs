@@ -29,6 +29,17 @@ fn next_token() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Resolve the physical lifecycle-home identity when the path exists. Release
+/// entry points routinely receive equivalent lexical paths (and symlink
+/// aliases) for the same home; retaining a lexical fallback keeps the permit
+/// usable for pre-flight callers that are probing a not-yet-created home.
+fn lifecycle_home_key(home: &Path) -> String {
+    std::fs::canonicalize(home)
+        .unwrap_or_else(|_| home.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// Exclusive lifecycle authority for one `(home, agent)` pair.
 ///
 /// Non-Clone RAII guard: `Drop` removes the active-map entry exactly once.
@@ -63,7 +74,7 @@ impl LifecyclePermit {
         agent: &str,
         operation: LifecycleOperation,
     ) -> Result<Self, String> {
-        let key = (home.display().to_string(), agent.to_string());
+        let key = (lifecycle_home_key(home), agent.to_string());
         let token = next_token();
         let mut active = active_permits().lock();
         if active.contains_key(&key) {
@@ -80,7 +91,7 @@ impl LifecyclePermit {
     }
 
     pub(crate) fn authorizes(&self, home: &Path, agent: &str) -> bool {
-        let key = (home.display().to_string(), agent.to_string());
+        let key = (lifecycle_home_key(home), agent.to_string());
         active_permits().lock().get(&key) == Some(&self.token)
     }
 }
@@ -114,6 +125,6 @@ impl BindGuard {
 }
 
 pub(crate) fn is_active(home: &Path, agent: &str) -> bool {
-    let key = (home.display().to_string(), agent.to_string());
+    let key = (lifecycle_home_key(home), agent.to_string());
     active_permits().lock().contains_key(&key)
 }
