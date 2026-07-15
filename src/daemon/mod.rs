@@ -41,6 +41,9 @@ pub(crate) mod poll_reminder;
 pub(crate) mod pr_state;
 pub(crate) mod restart;
 pub(crate) mod retention;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod revoke_assignment_tests;
 pub(crate) mod router;
 /// #2413 Shadow Observer — local plane (claude hooks side-channel). Spike, flag-OFF.
 pub mod shadow;
