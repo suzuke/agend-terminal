@@ -3642,24 +3642,6 @@ fn task_done_cleans_post_lease_empty_init_commits() {
             .unwrap();
     }
 
-    // Write binding so tasks::handle("done") can locate the worktree.
-    let runtime = crate::paths::runtime_dir(&home).join("dev");
-    std::fs::create_dir_all(&runtime).ok();
-    std::fs::write(
-        runtime.join("binding.json"),
-        serde_json::to_string(&serde_json::json!({
-            "version": 1,
-            "agent": "dev",
-            "task_id": "T-1",
-            "branch": "feat/p789",
-            "worktree": worktree.display().to_string(),
-            "source_repo": worktree.display().to_string(),
-            "issued_at": "2026-01-01T00:00:00Z",
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
     // Confirm 3 empty inits sit between origin/main..HEAD pre-call.
     let pre_count = String::from_utf8(
         std::process::Command::new("git")
@@ -3682,6 +3664,25 @@ fn task_done_cleans_post_lease_empty_init_commits() {
         &serde_json::json!({"action": "create", "title": "p789 anchor"}),
     );
     let id = created["id"].as_str().expect("task id");
+
+    // Write binding so tasks::handle("done") can locate the worktree.
+    // task_id must match the completed task for the identity guard to permit cleanup.
+    let runtime = crate::paths::runtime_dir(&home).join("dev");
+    std::fs::create_dir_all(&runtime).ok();
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "agent": "dev",
+            "task_id": id,
+            "branch": "feat/p789",
+            "worktree": worktree.display().to_string(),
+            "source_repo": worktree.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     handle(
         &home,
         "dev",

@@ -750,6 +750,40 @@ pub(super) fn replay_all_boards(home: &Path) -> anyhow::Result<crate::task_event
     Ok(merged)
 }
 
+/// P0 cross-lease: strict cross-board task list for authority decisions
+/// (auto-release). Unlike `list_all_boards` (display-only, degrades to
+/// default on error), this function FAILS CLOSED:
+///   - enumeration error → Err (cannot guarantee all boards were scanned)
+///   - per-board replay error → Err (cannot guarantee task state is complete)
+///   - duplicate task id across boards → Err (ambiguous identity)
+///
+/// Returns ALL tasks across every project board. Callers that need
+/// branch-filtered subsets should filter the result.
+pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> {
+    let mut all = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for project in enumerate_projects(home)? {
+        let board = board_root(home, &project);
+        let state = crate::task_events::replay_strict_at(&board).map_err(|e| {
+            TaskRouteError::Unreadable {
+                path: board.clone(),
+                cause: format!("strict board replay failed: {e:?}"),
+            }
+        })?;
+        for record in state.tasks.values() {
+            let task = super::record_to_task(record);
+            if !seen_ids.insert(task.id.clone()) {
+                return Err(TaskRouteError::Unreadable {
+                    path: board,
+                    cause: format!("duplicate task id '{}' across boards", task.id),
+                });
+            }
+            all.push(task);
+        }
+    }
+    Ok(all)
+}
+
 // ── tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
