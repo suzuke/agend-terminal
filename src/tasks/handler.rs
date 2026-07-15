@@ -2032,30 +2032,11 @@ fn handle_ack_plan(
             "code": "plan_not_set",
         });
     }
-    let acks: Vec<String> = record
-        .metadata
-        .get("plan_acks")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    if acks.iter().any(|a| a == instance_name) {
-        // Idempotent: already acked by this caller — no-op success, no new event.
-        return serde_json::json!({
-            "id": id, "event": "ack_plan", "acked": acks.len(), "already_acked": true,
-        });
-    }
-    // #2760 R2 (root+independent REJECT of a542517b): the `acks` list read above is
-    // an OUT-OF-LOCK snapshot — used only for the fast idempotent already-acked
-    // response. The AUTHORITATIVE ack is built as a UNION from the FRESH under-lock
-    // `plan_acks` (`with_revalidated_computed`). A route-only revalidation
-    // (board/incarnation) cannot see CONTENT staleness, so two acks that both read
-    // the pre-lock list would last-write-wins and silently LOSE one. Building the
-    // union (and re-checking self-ack / plan-present) against the committed state no
-    // concurrent writer can change closes that lost-update TOCTOU.
+    // No out-of-lock fast-path: all ack_plan calls go through the under-lock
+    // strict validation so a corrupt vector (non-string, duplicate, self-ack)
+    // is never bypassed by a filter_map/already_acked early return.
+    // The under-lock path handles idempotency (returns Ok(Vec::new()) when
+    // the caller is already present in a VALID vector).
     let caller = instance_name.to_string();
     let tid = crate::task_events::TaskId(id.to_string());
     let ack_emitter = emitter.clone();

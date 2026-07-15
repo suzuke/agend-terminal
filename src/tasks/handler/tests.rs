@@ -2736,3 +2736,47 @@ fn p0_ack_plan_rejects_malformed_preexisting_vector() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// P0 r5 RED: ack_plan with a corrupt vector that ALSO contains the caller
+/// must reject, not return already_acked success. Before the fix, the
+/// out-of-lock fast-path used filter_map to skip non-strings, found the
+/// caller in the filtered list, and returned already_acked: true without
+/// ever running strict validation.
+#[test]
+fn p0_ack_plan_corrupt_vector_containing_caller_rejects() {
+    let home = tmp_home("p0-ackplan-corrupt-caller");
+    let id = gov_seed_claimed(&home, 1);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    let emitter = crate::task_events::InstanceName::from("system");
+    let _ = crate::task_events::append(
+        &home,
+        &emitter,
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!([42, "new-acker"]),
+        },
+    );
+    let r = handle(
+        &home,
+        "new-acker",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert!(
+        r.get("error").and_then(|v| v.as_str()).is_some(),
+        "ack_plan must reject corrupt vector even when caller is present (no already_acked bypass): {r}"
+    );
+    assert!(
+        r.get("already_acked").is_none(),
+        "must not return already_acked on a corrupt vector: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
