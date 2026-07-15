@@ -156,13 +156,6 @@ pub(crate) fn validate_review_assignment_marker(
     // head, wrong PR, or unresolved/mismatched review class all fail closed.
     let branch = args["branch"].as_str().unwrap_or_default();
     let pr_number = checks.pr_number.unwrap_or_default();
-    let state =
-        crate::review_receipt::load_pr_state_strict(home, &repo_slug, branch).map_err(|error| {
-            json!({
-                "error": format!("review_assignment exact subject rejected: {error}"),
-                "code": "review_assignment_subject_unavailable",
-            })
-        })?;
     let task_id = args["task_id"].as_str().unwrap_or_default();
     let task_review_class = crate::tasks::load_routed(home, task_id)
         .ok()
@@ -175,11 +168,33 @@ pub(crate) fn validate_review_assignment_marker(
                 .map(|value| ReviewClass::parse_fail_closed(Some(value)))
         })
         .unwrap_or(ReviewClass::Unresolved);
+    if matches!(task_review_class, ReviewClass::Unresolved) {
+        return Err(json!({
+            "error": "review_assignment requires a resolved review_class on the task",
+            "code": "review_assignment_subject_mismatch",
+        }));
+    }
+    // #2800: ensure a PrState exists even for a cold PR (CI still pending).
+    // Two-phase: local miss → SCM-confirm identity → CAS-create Pending.
+    // The pr-state/file lock is NOT held across the SCM network call.
+    let state = crate::daemon::pr_state::ensure_from_scm(
+        home,
+        &repo_slug,
+        branch,
+        pr_number,
+        reviewed_head,
+        task_review_class,
+    )
+    .map_err(|error| {
+        json!({
+            "error": format!("review_assignment exact subject rejected: {error}"),
+            "code": "review_assignment_subject_unavailable",
+        })
+    })?;
     if state.repo != repo_slug
         || state.branch != branch
         || state.pr_number != pr_number
         || state.head_sha != reviewed_head
-        || matches!(task_review_class, ReviewClass::Unresolved)
         || state.review_class != task_review_class
     {
         return Err(json!({
