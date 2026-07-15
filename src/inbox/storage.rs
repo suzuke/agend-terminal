@@ -8,6 +8,9 @@ pub(crate) use ci_handoff::{
     protected_handoff_row_state, protected_settlement_identity, ProtectedHandoffRowState,
 };
 
+mod message_query;
+pub use message_query::{find_message, get_thread};
+
 // ── #inbox-gc retention bounds (decision d-20260607081209372642-1, part b) ──
 //
 // Root cause of the unbounded-looking inbox files: read (drained) messages were
@@ -2366,72 +2369,6 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
         };
     }
     MessageStatus::NotFound
-}
-
-/// Get all messages in a thread, ordered by timestamp.
-/// If `instance` is Some, only scan that agent's inbox; otherwise scan all.
-pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<InboxMessage> {
-    let mut msgs = Vec::new();
-
-    if let Some(inst) = instance {
-        // Direct path lookup — skip directory scan entirely.
-        let path = inbox_path_resolved(home, inst);
-        collect_thread_messages(&path, thread_id, &mut msgs);
-    } else {
-        for path in inbox_files(home) {
-            collect_thread_messages(&path, thread_id, &mut msgs);
-        }
-        // CR-2026-06-14: a migrated inbox is present under TWO directory entries —
-        // `<name>.jsonl` and `<uuid>.jsonl` — holding the SAME messages, so the
-        // cross-inbox scan double-counts every thread message. The two entries are
-        // a symlink on Unix but a real `fs::copy` duplicate on Windows
-        // (`inbox_path_resolved` migration), so a symlink-type skip only fixes
-        // Unix. Dedup by message `id` instead — portable across both: message ids
-        // are globally unique (`ensure_msg_id`), so the same id appearing in both
-        // files is the migration duplicate, while a thread legitimately spanning
-        // several agents' inboxes carries distinct ids and is preserved. Id-less
-        // (legacy, pre-`ensure_msg_id`) rows are kept as-is (can't dedup safely).
-        let mut seen_ids = std::collections::HashSet::new();
-        msgs.retain(|m| match &m.id {
-            Some(id) => seen_ids.insert(id.clone()),
-            None => true,
-        });
-    }
-
-    msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    msgs
-}
-
-fn collect_thread_messages(path: &Path, thread_id: &str, out: &mut Vec<InboxMessage>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        if !line.contains(thread_id) {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
-            if msg.thread_id.as_deref() == Some(thread_id) {
-                out.push(msg);
-            }
-        }
-    }
-}
-
-/// Look up a message by ID across all inbox files. Returns the message if found.
-pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
-    // CR-2026-06-14: an unreadable file is skipped (yields no messages) so one
-    // bad file can't hide a message living in a LATER inbox.
-    for path in inbox_files(home) {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        for msg in parse_inbox_messages(&content) {
-            if msg.id.as_deref() == Some(msg_id) {
-                return Some(msg);
-            }
-        }
-    }
-    None
 }
 
 /// #982 B-narrow: scan `agent_name`'s inbox for a delivered blocking
