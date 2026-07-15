@@ -600,28 +600,6 @@ pub fn mark_ci_watch_superseded(
 }
 
 /// t-…-17 reviewer-assignment outbox: is there an ACTIONABLE inbox row for
-/// Does `target`'s inbox contain a row carrying `delivery_nonce == nonce` in
-/// ANY state (unread, read, delivering, superseded)? Used for idempotent
-/// notice dedup where the presence of the nonce — regardless of lifecycle
-/// state — means the notice was already enqueued and must not be appended
-/// again. Lock-free read: the caller holds a serializing lock.
-pub fn nonce_present_any_state(home: &Path, target: &str, nonce: &str) -> bool {
-    let path = inbox_path_resolved(home, target);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter(|l| l.contains(nonce))
-        .any(|l| {
-            serde_json::from_str::<InboxMessage>(l)
-                .ok()
-                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
-                .is_some()
-        })
-}
-
 /// `target` carrying `delivery_nonce == nonce`? "Actionable" = the same
 /// post-#2299 predicate `is_actionable` uses (`read_at.is_none() &&
 /// delivering_at.is_none() && superseded_by.is_none()`). Used by the durable

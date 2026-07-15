@@ -497,6 +497,22 @@ fn build_delivery_message(record: &ActiveAssignment, now: &str) -> crate::inbox:
 
 /// A durable revocation notice — enqueued only when the retracted row had already
 /// been READ (I21), so the reviewer learns a seen assignment was pulled.
+fn revocation_nonce_present(home: &Path, target: &str, nonce: &str) -> bool {
+    let path = crate::inbox::storage::inbox_path_resolved(home, target);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.contains(nonce))
+        .any(|l| {
+            serde_json::from_str::<crate::inbox::InboxMessage>(l)
+                .ok()
+                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
+                .is_some()
+        })
+}
+
 fn revocation_nonce(assignment_id: uuid::Uuid) -> String {
     format!("revoked-{assignment_id}")
 }
@@ -1006,7 +1022,7 @@ pub(crate) fn retire_if_id_matches(
     // skip the duplicate append.
     if outcome.was_read {
         let nonce = revocation_nonce(expected_id);
-        if !crate::inbox::storage::nonce_present_any_state(home, target, &nonce) {
+        if !revocation_nonce_present(home, target, &nonce) {
             crate::inbox::storage::enqueue(
                 home,
                 target,
