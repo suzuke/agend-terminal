@@ -434,7 +434,17 @@ pub fn scan_and_emit_with(
                                                  // (the sweeper applies the conservative close-grace).
                         release_after_unlock = Some((state.branch.clone(), "close_unmerged"));
                         dirty = true;
+                        deferred_watch_settle = Some((
+                            state.repo.clone(),
+                            state.branch.clone(),
+                            state.head_sha.clone(),
+                        ));
                     } else {
+                        deferred_watch_settle = Some((
+                            state.repo.clone(),
+                            state.branch.clone(),
+                            state.head_sha.clone(),
+                        ));
                         tracing::debug!(
                             repo = %state.repo,
                             branch = %state.branch,

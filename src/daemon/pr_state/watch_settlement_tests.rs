@@ -144,21 +144,43 @@ fn head_advanced_watch_preserved_by_cas_mismatch() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// R3: Protected-ref branch watch (main/master) is never removed by
-/// the scanner terminal path — only exact-head watches on protected
-/// refs are valid, and they use a different filename key.
+/// R3a: A regular-keyed watch on a protected ref (main) is preserved by
+/// the is_protected_ref guard, even when repo+branch+head all match.
 #[test]
-fn protected_main_watch_preserved_on_feature_terminal() {
-    let home = tmp_home("r3-protected");
+fn protected_ref_guard_preserves_main_watch() {
+    let home = tmp_home("r3a-protected");
     let repo = "owner/repo";
     let head = "main-head-abc";
 
-    // A feature PR merged into main; an exact-head main watch also exists.
-    write_merged_pr_state(&home, repo, "feat/r3", head);
+    // Synthesize a terminal state for "main" AND a regular-keyed main watch.
+    write_merged_pr_state(&home, repo, "main", head);
+    write_watch(&home, repo, "main", head);
+    assert!(watch_exists(&home, repo, "main"), "precondition");
+
+    tests::write_team_fleet(&home, "lead", &["dev"]);
+    run_scan(&home);
+
+    assert!(
+        watch_exists(&home, repo, "main"),
+        "regular main watch must be preserved by is_protected_ref guard"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R3b: Exact-head main watch (different filename key) is untouched by
+/// feature terminal settlement.
+#[test]
+fn exact_head_main_watch_isolated_from_feature_terminal() {
+    let home = tmp_home("r3b-exact");
+    let repo = "owner/repo";
+    let head = "main-head-abc";
+
+    write_merged_pr_state(&home, repo, "feat/r3b", head);
     write_exact_head_watch(&home, repo, "main", head, head);
     assert!(
         exact_head_watch_exists(&home, repo, "main", head),
-        "precondition: exact-head main watch exists"
+        "precondition"
     );
 
     tests::write_team_fleet(&home, "lead", &["dev"]);
@@ -166,7 +188,7 @@ fn protected_main_watch_preserved_on_feature_terminal() {
 
     assert!(
         exact_head_watch_exists(&home, repo, "main", head),
-        "exact-head main watch must NOT be removed by feature terminal settlement"
+        "exact-head main watch must NOT be removed by feature terminal"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -269,6 +291,40 @@ fn stale_flush_new_generation_no_cross_corruption() {
         watch["head_sha"].as_str(),
         Some(new_head),
         "gen2 watch content must be uncorrupted"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn write_closed_unmerged_pr_state(home: &std::path::Path, repo: &str, branch: &str, head: &str) {
+    let mut s = tests::new_state(head, ReviewClass::Single);
+    s.repo = repo.to_string();
+    s.branch = branch.to_string();
+    s.merge_state = MergeState::ClosedUnmerged {
+        closed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    s.pr_author = "dev".to_string();
+    save(home, &s).expect("save pr_state");
+}
+
+/// R7: ClosedUnmerged terminal also removes matching feature watch.
+#[test]
+fn closed_unmerged_terminal_removes_matching_watch() {
+    let home = tmp_home("r7-closed");
+    let repo = "owner/repo";
+    let branch = "feat/r7";
+    let head = "head-r7-closed";
+
+    write_closed_unmerged_pr_state(&home, repo, branch, head);
+    write_watch(&home, repo, branch, head);
+    assert!(watch_exists(&home, repo, branch), "precondition");
+
+    tests::write_team_fleet(&home, "lead", &["dev"]);
+    run_scan(&home);
+
+    assert!(
+        !watch_exists(&home, repo, branch),
+        "closed-unmerged terminal must also remove matching feature watch"
     );
 
     std::fs::remove_dir_all(&home).ok();

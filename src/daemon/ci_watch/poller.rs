@@ -1525,7 +1525,7 @@ async fn ci_check_repo(
         Ok(Some(pr)) => pr,
         Ok(None) => {
             if state != snapshot {
-                flush_watch_state(watch_path, &state);
+                flush_watch_state(watch_path, &state, snapshot.head_sha.as_deref());
             }
             // #1750 A2: do NOT refresh `expires_at` here. `Ok(None)` means the
             // poll found NO runs for the branch — a deleted/merged-away branch or
@@ -1538,7 +1538,7 @@ async fn ci_check_repo(
         }
         Err(e) => {
             if state != snapshot {
-                flush_watch_state(watch_path, &state);
+                flush_watch_state(watch_path, &state, snapshot.head_sha.as_deref());
             }
             return Err(e);
         }
@@ -1629,7 +1629,7 @@ async fn ci_check_repo(
             state.last_notified_by_workflow = cursors;
         }
         if state != snapshot {
-            flush_watch_state(watch_path, &state);
+            flush_watch_state(watch_path, &state, snapshot.head_sha.as_deref());
         }
         if activity {
             refresh_expires_at(watch_path);
@@ -1652,7 +1652,7 @@ async fn ci_check_repo(
         return Ok(());
     }
     if state != snapshot {
-        flush_watch_state(watch_path, &state);
+        flush_watch_state(watch_path, &state, snapshot.head_sha.as_deref());
     }
     refresh_expires_at(watch_path);
     Ok(())
