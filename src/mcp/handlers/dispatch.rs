@@ -28,7 +28,10 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{binding_state, channel, ci, comms, instance, restart, schedule, task, worktree};
+use super::{
+    binding_state, channel, ci, comms, instance, restart, review_assignment, schedule, task,
+    worktree,
+};
 
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
@@ -409,6 +412,13 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
+/// #2782 slice 1: orchestrator-authorized (or operator-direct) exact
+/// review-assignment revoke — the complement of the `review_assignment`
+/// marker dispatch wired in `comms_delegate::review_assignment`.
+pub(crate) fn dispatch_revoke_review_assignment(ctx: &HandlerCtx<'_>) -> Value {
+    review_assignment::handle_revoke_review_assignment(ctx.home, ctx.args, ctx.sender)
+}
+
 pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "get" => {
@@ -549,9 +559,10 @@ mod tests {
                 "bind_self",
                 "release_worktree",
                 "binding_state",
+                "revoke_review_assignment",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 30);
+        assert_eq!(crate::mcp::registry::all().len(), 31);
     }
 
     #[test]

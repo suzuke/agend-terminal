@@ -318,3 +318,101 @@ pub(super) fn dispatch_review_assignment_via_store(
     };
     track_delegate_success(&ctx, result)
 }
+
+/// #2782 slice 1: MCP `revoke_review_assignment` — revoke an active reviewer
+/// assignment by EXACT `assignment_id` (the complement of
+/// [`dispatch_review_assignment_via_store`]). `pub(crate)` (not `pub(super)`) so
+/// non-sibling test modules (`daemon::assignment_authority::tests`) can drive it
+/// directly via the crate-visible `mcp::handlers::review_assignment` re-export.
+///
+/// Authorization DIFFERS from dispatch: an ABSENT sender is operator-direct (full
+/// authority, no operator-allow needed because there is no fleet identity to
+/// check); a PRESENT sender must be the EXACT-CURRENT orchestrator of the team
+/// that owns the assignment's `repo` (same authority source as dispatch's marker
+/// gate, `crate::teams::resolve_team_by_source_repo`, but revoke additionally
+/// allows the operator path that dispatch never does).
+///
+/// Idempotent by design: a missing / already-revoked / terminal-generation
+/// `assignment_id` is `{"ok": true, "already_absent": true}`, never an error — a
+/// retried revoke (crash/timeout on the caller side) must never surface as a
+/// failure. After a successful retire, `redrive_reserved` recomputes merge
+/// readiness for the branch so a now-satisfied gate is not left stale.
+pub(crate) fn handle_revoke_review_assignment(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+) -> Value {
+    let Some(assignment_id) = args["assignment_id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    else {
+        return json!({
+            "error": "revoke_review_assignment requires `assignment_id` as a valid UUID",
+            "code": "revoke_assignment_invalid_id",
+        });
+    };
+
+    // Strict store-wide lookup: missing / unreadable-corrupt / duplicated /
+    // terminal all fail this lookup — treated uniformly as "already absent"
+    // (idempotent success), matching the tool's documented retry contract.
+    let record =
+        match crate::daemon::assignment_authority::lookup_by_assignment_id_strict(home, assignment_id)
+        {
+            Ok(r) => r,
+            Err(_) => return json!({"ok": true, "already_absent": true}),
+        };
+
+    // Authorization: operator-direct (sender=None) has full authority. A named
+    // sender must be the SOLE CURRENT orchestrator of the team owning the
+    // assignment's repo — an unresolvable/ambiguous team authority also fails
+    // closed as not-authorized (a named sender can never fall back to
+    // operator-equivalent trust just because the ACL is unclear).
+    if let Some(caller) = sender.as_ref() {
+        let authorized = match crate::teams::resolve_team_by_source_repo(home, &record.repo) {
+            Ok(team) => team.orchestrator.as_deref() == Some(caller.as_str()),
+            Err(_) => false,
+        };
+        if !authorized {
+            return json!({
+                "error": format!(
+                    "revoke_review_assignment rejected: sender `{}` is not the current \
+                     orchestrator of the team owning `{}` — only the owning team's \
+                     orchestrator or the operator (no sender) may revoke",
+                    caller.as_str(),
+                    record.repo
+                ),
+                "code": "revoke_assignment_not_authorized",
+            });
+        }
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let revoked = match crate::daemon::assignment_authority::retire_if_id_matches(
+        home,
+        &record.repo,
+        &record.branch,
+        &record.target,
+        assignment_id,
+        &now,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("revoke_review_assignment retire failed: {e}"),
+                "code": "revoke_assignment_retire_failed",
+            });
+        }
+    };
+    // Recompute merge readiness for the branch now that the assignment is gone.
+    crate::daemon::assignment_authority::redrive_reserved(home, &record.repo, &record.branch);
+
+    json!({
+        "ok": true,
+        "assignment_id": assignment_id.to_string(),
+        "target": record.target,
+        "repo": record.repo,
+        "branch": record.branch,
+        "revoked": revoked,
+    })
+}
