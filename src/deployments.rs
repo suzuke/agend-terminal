@@ -191,6 +191,19 @@ fn create_instance_entries(
                 out
             })
             .filter(|m| !m.is_empty());
+        // Sprint 61 follow-up: per-instance skills allowlist from a template stanza.
+        // Mirrors `args` extraction, but does NOT `.filter(|v| !v.is_empty())` —
+        // `skills: []` (explicit opt-out of all skills) is a meaningful value per
+        // `InstanceConfig::skills` docstring, and filtering it would silently flip
+        // opt-out → install-all. `None` (field absent) means install every skill.
+        let template_skills = inst_val
+            .get("skills")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            });
         let source_repo = inst_val
             .get("source_repo")
             .and_then(|v| v.as_str())
@@ -216,6 +229,7 @@ fn create_instance_entries(
                 instructions: yaml_str(inst_val, "instructions"),
                 source_repo,
                 skills_path: yaml_str(inst_val, "skills_path"),
+                skills: template_skills,
                 // #2104 (cheerc): both operator-controlled override fields were
                 // hardcoded None here → templates that set them were silently
                 // dropped. `repo` = explicit owner/name override (else daemon

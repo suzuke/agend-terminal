@@ -993,6 +993,14 @@ pub struct InstanceYamlEntry {
     pub topic_binding_mode: Option<String>,
     /// Custom skills path override.
     pub skills_path: Option<String>,
+    /// Sprint 61 follow-up: mirror of [`InstanceConfig::skills`] — per-instance
+    /// skills allowlist. Template deployments populate this from the template
+    /// stanza's `skills:` field; `Some(vec![])` is meaningful (explicit opt-out
+    /// of all skills — preserved, NOT filtered to empty like `args`), and
+    /// `None` means "install every skill in the source" (preserves the legacy
+    /// default). Round-trips through `merge.rs`'s `build_instance_mapping` /
+    /// `merge_instance_into_existing` as a YAML Sequence.
+    pub skills: Option<Vec<String>>,
     /// Mirror of [`InstanceConfig::created_by`] — the identified caller that
     /// ran `create_instance`, written at spawn time.
     pub created_by: Option<String>,

@@ -188,6 +188,78 @@ templates:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Sprint 61 follow-up: a template instance's `skills:` allowlist must flow
+/// through deployment into the live `instances:` block, so it reaches the
+/// per-instance skills install at spawn time. Before this PR, `build_command`'s
+/// sister extraction site in `create_instance_entries` read `skills_path` but
+/// not `skills` — a template `skills: [a, b]` was silently dropped to `None`
+/// (install-all), the inverse of the operator's intent.
+#[test]
+fn deploy_persists_skills_allowlist_into_fleet_yaml() {
+    let home = tmp_home("skills_allowlist_persist");
+    let yaml = r#"
+templates:
+  dev:
+    instances:
+      reviewer:
+        backend: claude
+        skills:
+          - code-review
+          - receiving-code-review
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+    let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+    let _ = deploy(&home, "caller", &args);
+
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(
+        reloaded
+            .instances
+            .get("dev-reviewer")
+            .and_then(|i| i.skills.clone()),
+        Some(vec![
+            "code-review".to_string(),
+            "receiving-code-review".to_string()
+        ]),
+        "template skills allowlist must persist into the deployed instance"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `skills: []` (explicit opt-out — install NO skills) in a template stanza
+/// must survive deployment as `Some(vec![])`, NOT collapse to `None` (which
+/// means install ALL skills). This is the divergence from `args` extraction
+/// (which `.filter(|v| !v.is_empty())` would drop to `None`); for `skills` the
+/// empty vec is semantically meaningful.
+#[test]
+fn deploy_preserves_empty_skills_allowlist_opt_out() {
+    let home = tmp_home("skills_optout_persist");
+    let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        skills: []
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+    let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+    let _ = deploy(&home, "caller", &args);
+
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(
+        reloaded
+            .instances
+            .get("dev-lead")
+            .and_then(|i| i.skills.clone()),
+        Some(vec![]),
+        "`skills: []` must persist as Some(vec![]); a drop to None would silently flip opt-out → install-all"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2104 (cheerc): template deployment must carry the template instance's
 /// operator-controlled override fields — `github_login` AND `repo` — into the
 /// deployed instance. Both were hardcoded `None` at the same site
