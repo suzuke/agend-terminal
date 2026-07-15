@@ -363,6 +363,7 @@ pub(crate) fn handle_revoke_review_assignment(
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
+            // stringly-allow: lookup_by_assignment_id_strict returns anyhow::Error with no typed variant; "not found"/"terminal" are idempotent-safe absence
             if msg.contains("not found") || msg.contains("terminal") {
                 return json!({"ok": true, "already_absent": true});
             }
