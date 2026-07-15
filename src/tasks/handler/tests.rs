@@ -2780,3 +2780,196 @@ fn p0_ack_plan_corrupt_vector_containing_caller_rejects() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Architecture-14 item 4: typed AssigneePatch RED tests (real-entry via handle)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_missing_assignee_is_unassigned() {
+    let home = tmp_home("ap-t1");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t1"}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert!(task.assignee.is_none(), "missing assignee → None");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_blank_assignee_is_unassigned() {
+    let home = tmp_home("ap-t2");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t2", "assignee": ""}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert!(
+        task.assignee.is_none(),
+        "blank assignee must be None, not Some('')"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_set_assignee_trims_whitespace() {
+    let home = tmp_home("ap-t3");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t3", "assignee": " agent "}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("agent"),
+        "must trim whitespace"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_non_string_assignee_errors() {
+    let home = tmp_home("ap-t4");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t4", "assignee": 42}),
+    );
+    assert!(
+        r.get("error").is_some(),
+        "non-string assignee must error: {r}"
+    );
+    assert!(
+        r["code"].as_str() == Some("invalid_assignee")
+            || r["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("invalid_assignee")),
+        "error must identify invalid_assignee: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_missing_assignee_unchanged() {
+    let home = tmp_home("ap-t5");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t5", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "update", "id": id, "title": "updated"}),
+    );
+    assert!(r.get("error").is_none(), "update must succeed: {r}");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("dev-agent"),
+        "assignee must be unchanged"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_blank_assignee_clears() {
+    let home = tmp_home("ap-t6");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t6", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
+    );
+    assert!(r.get("error").is_none(), "update clear must succeed: {r}");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert!(
+        task.assignee.is_none(),
+        "blank assignee update must clear to None"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_set_assignee_trims() {
+    let home = tmp_home("ap-t7");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t7", "assignee": "old"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "old",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "update", "id": id, "assignee": " new "}),
+    );
+    assert!(r.get("error").is_none(), "update must succeed: {r}");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("new"),
+        "must trim whitespace"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_non_string_assignee_errors() {
+    let home = tmp_home("ap-t8");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t8", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "update", "id": id, "assignee": true}),
+    );
+    assert!(
+        r.get("error").is_some(),
+        "non-string assignee must error: {r}"
+    );
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("dev-agent"),
+        "assignee must be unchanged on error"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
