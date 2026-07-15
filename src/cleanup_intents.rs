@@ -95,13 +95,22 @@ pub(crate) fn settle_intent(
         )));
     }
 
-    if let (Some(intent_pr), Some(event_pr)) = (intent.pr_number, event_pr_number) {
-        if intent_pr != event_pr {
+    // Generation identity: intent with pr_number requires a matching event
+    // pr_number. Missing event generation when intent has one → fail-closed.
+    match (intent.pr_number, event_pr_number) {
+        (Some(intent_pr), Some(event_pr)) if intent_pr != event_pr => {
             return Some(SettleOutcome::Pending(format!(
                 "cleanup intent for '{branch}': PR generation mismatch \
                  (intent=#{intent_pr}, event=#{event_pr}) — intent preserved"
             )));
         }
+        (Some(intent_pr), None) => {
+            return Some(SettleOutcome::Pending(format!(
+                "cleanup intent for '{branch}': intent carries PR #{intent_pr} \
+                 but terminal event has no generation — fail-closed"
+            )));
+        }
+        _ => {}
     }
 
     let source_repo = Path::new(&intent.repo);
@@ -111,8 +120,8 @@ pub(crate) fn settle_intent(
             intent.repo
         )));
     }
-    // Typed branch-existence check: show-ref --verify --quiet returns
-    // exit 0 = present, exit 1 = absent, spawn error = preserve for retry.
+    // Typed branch-existence check: show-ref --verify --quiet exit codes:
+    // 0 = present, 1 = absent (confirmed), any other = git error (preserve).
     let full_ref = format!("refs/heads/{branch}");
     match crate::git_helpers::git_bypass(
         source_repo,
@@ -123,11 +132,19 @@ pub(crate) fn settle_intent(
                 "cleanup intent for '{branch}': git spawn error ({e}) — intent preserved for retry"
             )));
         }
-        Ok(o) if !o.status.success() => {
-            let _ = std::fs::remove_file(&path);
-            return Some(SettleOutcome::BranchAbsent);
-        }
-        Ok(_) => {}
+        Ok(o) => match o.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                let _ = std::fs::remove_file(&path);
+                return Some(SettleOutcome::BranchAbsent);
+            }
+            other => {
+                return Some(SettleOutcome::GitError(format!(
+                    "cleanup intent for '{branch}': show-ref exit {} — intent preserved for retry",
+                    other.map_or("signal".to_string(), |c| c.to_string())
+                )));
+            }
+        },
     }
     // Branch exists — get tip SHA for CAS.
     let tip = match crate::git_helpers::git_cmd(source_repo, &["rev-parse", branch]) {
@@ -223,12 +240,14 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
             continue;
         }
         let default = crate::git_helpers::default_branch(repo_path);
-        let pr_status = crate::branch_sweep::pr_merge_status(repo_path, &default, &intent.branch);
-        let merged = matches!(pr_status, crate::branch_sweep::PrMergeStatus::Merged);
-        if !merged {
+        // Independently observe the merged PR number — never echo the
+        // intent's own pr_number as the event generation.
+        let observed_pr =
+            crate::branch_sweep::merged_pr_number(repo_path, &default, &intent.branch);
+        let Some(pr_num) = observed_pr else {
             continue;
-        }
-        match settle_intent(home, &intent.repo, &intent.branch, true, intent.pr_number) {
+        };
+        match settle_intent(home, &intent.repo, &intent.branch, true, Some(pr_num)) {
             Some(SettleOutcome::Deleted) => {
                 tracing::info!(
                     branch = %intent.branch,
@@ -544,6 +563,45 @@ mod tests {
             !has_intent(&home, &rs, "feat/definitely-missing-branch"),
             "intent must be cleared for confirmed absent branch"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn non_git_directory_preserves_intent_as_git_error() {
+        let home = tmp_dir("non-git-dir");
+        let non_git = tmp_dir("plain-dir-not-git");
+        let rs = non_git.display().to_string();
+        persist_intent(&home, &rs, "feat/x", "abc", "t-1", None, None).expect("persist");
+
+        let outcome = settle_intent(&home, &rs, "feat/x", true, None);
+        assert!(
+            matches!(outcome, Some(SettleOutcome::GitError(_))),
+            "non-git directory must be GitError (not BranchAbsent): {outcome:?}"
+        );
+        assert!(has_intent(&home, &rs, "feat/x"), "intent must survive");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&non_git).ok();
+    }
+
+    #[test]
+    fn missing_event_generation_fails_closed_when_intent_has_one() {
+        let home = tmp_dir("gen-failclosed");
+        let repo = tmp_repo("gen-failclosed-repo");
+        let tip = make_branch(&repo, "feat/gen-fc");
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, "feat/gen-fc", &tip, "t-fc", None, Some(42)).expect("persist");
+
+        // Merged event with NO pr_number → intent has #42 → fail-closed
+        let outcome = settle_intent(&home, &rs, "feat/gen-fc", true, None);
+        assert!(
+            matches!(outcome, Some(SettleOutcome::Pending(_))),
+            "missing event generation must fail-closed: {outcome:?}"
+        );
+        assert!(branch_exists(&repo, "feat/gen-fc"), "branch must survive");
+        assert!(has_intent(&home, &rs, "feat/gen-fc"), "intent must survive");
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();

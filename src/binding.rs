@@ -546,10 +546,9 @@ pub(crate) fn try_augment_review_lease(
         return;
     }
     let current_id = crate::fleet::resolve_uuid(home, agent);
-    if let (Some(assign_id), Some(cur_id)) = (&assignment.target_instance_id, &current_id) {
-        if assign_id != cur_id {
-            return;
-        }
+    match (&assignment.target_instance_id, &current_id) {
+        (Some(assign_id), Some(cur_id)) if assign_id == cur_id => {}
+        _ => return,
     }
     let Some(reviewed_head) = assignment
         .reviewed_head
