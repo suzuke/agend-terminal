@@ -2288,4 +2288,154 @@ mod tests {
         assert_eq!(queue_len(&home), 1, "unconfirmed intent RETAINED for retry");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    // ── cross-lease auto-release P0 RED tests ─────────────────────────
+    // Five adversarial cases proving the two bugs:
+    //   Bug A: handler.rs enqueues release for the owner's CURRENT binding
+    //          without checking binding.task_id == completed task id.
+    //   Bug B: all_branch_tasks_done uses list_all(home) which only reads
+    //          the default board; project-board tasks are invisible, and
+    //          zero matching tasks vacuously returns true.
+
+    /// Seed a task on a non-default project board (not the home/default board).
+    fn seed_task_on_board(
+        home: &Path,
+        project: &str,
+        id: &str,
+        owner: &str,
+        branch: &str,
+        done: bool,
+    ) {
+        use crate::task_events::{
+            append_at, board_root, DoneSource, InstanceName, TaskEvent, TaskId,
+        };
+        let board = board_root(home, project);
+        std::fs::create_dir_all(&board).unwrap();
+        append_at(
+            &board,
+            &InstanceName::from("test:lead"),
+            TaskEvent::Created {
+                task_id: TaskId(id.into()),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from(owner)),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some(branch.into()),
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        if done {
+            append_at(
+                &board,
+                &InstanceName::from(owner),
+                TaskEvent::Done {
+                    task_id: TaskId(id.into()),
+                    by: InstanceName::from(owner),
+                    source: DoneSource::OperatorManual {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                        result: Some("ok".into()),
+                    },
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// RED case 1 — Bug A: task done for t-old must NOT enqueue release for
+    /// the owner's CURRENT binding which points to a DIFFERENT task (t-new).
+    /// Live reproducer: root marks stale task done → handler reads owner's
+    /// current binding → enqueues release for the active WIP worktree.
+    #[test]
+    fn cross_lease_done_no_release_when_binding_task_mismatch() {
+        let home = tmp_home("cross-lease-mismatch");
+        let repo = itest_source_repo(&home, "owner/repo");
+        write_fleet(&home, "dev-1");
+        // dev-1 is actively working on t-new / feat/new
+        itest_lease(&home, &repo, "dev-1", "feat/new", "t-new", false);
+        // An OLD task (t-old / feat/old) also exists, owned by dev-1
+        seed_task(&home, "t-old", "dev-1", "feat/old", false);
+        // Root marks t-old done (the stale cleanup scenario)
+        task_done_via_handler(&home, "dev-1", "t-old");
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "Bug A: handler must NOT enqueue release when binding.task_id (t-new) != completed task (t-old)"
+        );
+        assert!(
+            bound(&home, "dev-1"),
+            "dev-1 must remain bound to t-new — the active WIP must not be touched"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RED case 2 — Bug B: an in-progress task on a non-default project board
+    /// with the same branch must block release. Currently list_all(home) misses it.
+    #[test]
+    fn project_board_in_progress_task_blocks_release() {
+        let home = tmp_home("proj-board-blocks");
+        let _repo = itest_source_repo(&home, "owner/repo");
+        // Task on project board (not default) — in-progress, branch feat/x
+        seed_task_on_board(&home, "Hack_agend-terminal", "t-proj", "dev-2", "feat/x", false);
+        // Bind dev-2 so the repo-scoping in all_branch_tasks_done can resolve
+        crate::binding::bind(&home, "dev-2", "t-proj", "feat/x");
+        assert!(
+            !all_branch_tasks_done(&home, "owner/repo", "feat/x"),
+            "Bug B: in-progress task on project board must block release (currently invisible to list_all)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RED case 3 — Bug B: a corrupt boards/ directory must cause fail-closed
+    /// (return false), not silently proceed with default-only view.
+    #[test]
+    fn board_enumeration_error_fails_closed() {
+        let home = tmp_home("board-enum-error");
+        // Seed a done task on the default board so current code would say "all done"
+        seed_task(&home, "t-default-done", "dev-3", "feat/e", true);
+        // Create boards/ as a FILE (not directory) → read_dir fails
+        let boards_path = home.join("boards");
+        std::fs::write(&boards_path, "corrupt").unwrap();
+        assert!(
+            !all_branch_tasks_done(&home, "owner/repo", "feat/e"),
+            "Bug B: unreadable boards/ must fail closed — cannot guarantee all boards were checked"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RED case 4 — Bug B: zero matching branch tasks must fail closed (return
+    /// false). Currently .all() on empty iterator vacuously returns true.
+    #[test]
+    fn zero_matching_branch_tasks_fails_closed() {
+        let home = tmp_home("zero-match");
+        // Seed a task with a DIFFERENT branch so the board isn't empty
+        seed_task(&home, "t-other", "dev-4", "feat/other", false);
+        assert!(
+            !all_branch_tasks_done(&home, "owner/repo", "feat/z"),
+            "Bug B: zero tasks matching branch must fail closed — no evidence of completion"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RED case 5 (control) — same task+lease terminal: a done task on the
+    /// default board with correct binding must still permit release (true).
+    /// This is the POSITIVE case that must survive the fix.
+    #[test]
+    fn same_lease_terminal_permits_release() {
+        let home = tmp_home("same-lease-ok");
+        let repo = itest_source_repo(&home, "owner/repo");
+        // Task is done, binding matches
+        itest_lease(&home, &repo, "dev-5", "feat/y", "t-done", true);
+        assert!(
+            all_branch_tasks_done(&home, "owner/repo", "feat/y"),
+            "same task+lease terminal must still permit release"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
