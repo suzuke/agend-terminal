@@ -2045,6 +2045,24 @@ fn deleted_guard_is_precise_real_crash_still_emits_rank4() {
     );
 }
 
+/// Slice-1 RED: a production PTY crash publication must carry the exact
+/// generation/core/deleted context that belongs to the reaped handle.  The
+/// legacy name-only event cannot prove ABA safety at the recovery sink.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn crash_publication_carries_exact_generation_context_slice1_red() {
+    let (handle, id) = make_crash_exit_handle(false);
+    let rx = run_pty_close_capturing_crash(handle, id);
+    let got = rx.try_recv().unwrap();
+    let crate::agent::AgentExitEvent::Crash(observation) = got else {
+        panic!("real crash must publish a Crash observation");
+    };
+    assert_eq!(observation.instance_id, id);
+    assert!(observation.generation.value() > 0);
+    assert!(std::sync::Arc::strong_count(&observation.core) >= 1);
+    assert!(!observation.deleted.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 struct ChunkReader {
     chunks: Vec<&'static [u8]>,
     next: usize,
