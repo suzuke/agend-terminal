@@ -5,7 +5,7 @@ use crate::types::InstanceId;
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 struct Fixture {
     home: PathBuf,
@@ -200,6 +200,48 @@ fn usage_limit_takeover_repeat_is_idempotent() {
     assert_eq!(first["phase"], "Prepared", "first: {first}");
     assert_eq!(second["phase"], "Prepared", "second: {second}");
     assert_eq!(second["idempotent"], true, "repeat: {second}");
+}
+
+#[test]
+#[serial]
+fn usage_limit_takeover_concurrent_barrier_requests_converge_one_prepared_identity() {
+    let f = fixture("concurrency-barrier");
+    let args = json!({"source": "worker-a", "episode_id": f.episode_id});
+    let barrier = Arc::new(Barrier::new(2));
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let runtime = f.runtime.clone();
+        let args = args.clone();
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            execute_tool_with_runtime("usage_limit_takeover", &args, "", runtime)
+        }));
+    }
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("takeover thread"))
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results.iter().all(|result| result["phase"] == "Prepared"),
+        "concurrent results: {results:?}"
+    );
+
+    let journal_path =
+        crate::paths::runtime_dir(&f.home).join("worker-a/usage_limit_takeover.json");
+    let journal_bytes = std::fs::read(&journal_path).expect("one prepared journal");
+    let journal: Value = serde_json::from_slice(&journal_bytes).expect("journal json");
+    assert_eq!(journal["phase"], "Prepared");
+    assert_eq!(journal["episode_id"], f.episode_id);
+    assert_eq!(journal["source"], "worker-a");
+    assert_eq!(journal["candidate"], "worker-b");
+    assert_eq!(journal["binding_issued_at"], "2026-07-16T05:00:00Z");
+    assert_eq!(journal["source_head"].as_str().map(str::len), Some(40));
+    assert!(
+        journal_path.is_file(),
+        "exactly one journal identity must remain"
+    );
 }
 
 #[test]
