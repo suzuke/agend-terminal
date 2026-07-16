@@ -632,3 +632,138 @@ fn full_delete_clears_binding_and_succeeds_1879() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Architecture-14 Slice 10A: pre-delete CleanupAdmission (issue #2764)
+// ---------------------------------------------------------------------------
+
+fn cleanup_admission_seed_canaries(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join(".codex")).unwrap();
+    std::fs::write(dir.join("arbitrary.txt"), b"USER DATA").unwrap();
+    std::fs::write(dir.join("AGENTS.md"), b"# agents\nuser-owned").unwrap();
+    std::fs::write(dir.join(".codex/config.toml"), b"key = 1\nuser-owned").unwrap();
+}
+
+fn cleanup_admission_canaries_intact(dir: &std::path::Path) -> bool {
+    std::fs::read(dir.join("arbitrary.txt")).ok().as_deref() == Some(b"USER DATA")
+        && std::fs::read(dir.join("AGENTS.md")).ok().as_deref() == Some(b"# agents\nuser-owned")
+        && std::fs::read(dir.join(".codex/config.toml"))
+            .ok()
+            .as_deref()
+            == Some(b"key = 1\nuser-owned")
+}
+
+#[test]
+fn full_delete_shared_sibling_default_preserves_all_bytes_2764_slice10a() {
+    let home = tmp_home("slice10a_sibling_default");
+    let sibling = crate::paths::workspace_dir(&home).join("sibling");
+    cleanup_admission_seed_canaries(&sibling);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  sibling:\n    backend: claude\n",
+            sibling.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        cleanup_admission_canaries_intact(&sibling),
+        "shared sibling default must remain byte-identical"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn full_delete_shared_external_preserves_all_bytes_2764_slice10a() {
+    let home = tmp_home("slice10a_external_home");
+    let shared = tmp_home("slice10a_external_shared");
+    cleanup_admission_seed_canaries(&shared);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {shared}\n  survivor:\n    backend: claude\n    working_directory: {shared}\n",
+            shared = shared.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        cleanup_admission_canaries_intact(&shared),
+        "shared external directory must not be backend-scrubbed"
+    );
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(shared).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn full_delete_symlink_alias_preserves_target_and_alias_2764_slice10a() {
+    let home = tmp_home("slice10a_symlink_alias");
+    let sibling = crate::paths::workspace_dir(&home).join("sibling");
+    let alias = crate::paths::workspace_dir(&home).join("victim-link");
+    cleanup_admission_seed_canaries(&sibling);
+    std::os::unix::fs::symlink(&sibling, &alias).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  sibling:\n    backend: claude\n",
+            alias.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        cleanup_admission_canaries_intact(&sibling),
+        "symlink alias must not remove or scrub its sibling target"
+    );
+    assert!(
+        std::fs::symlink_metadata(&alias)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false),
+        "shared symlink alias must remain untouched"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn full_delete_unshared_default_still_removes_tree_2764_slice10a() {
+    let home = tmp_home("slice10a_unshared_default");
+    let victim_dir = crate::paths::workspace_dir(&home).join("victim");
+    cleanup_admission_seed_canaries(&victim_dir);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    backend: claude\n",
+    )
+    .unwrap();
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        !victim_dir.exists(),
+        "an unshared exact default workspace must still be removed"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn full_delete_fleet_load_ambiguity_preserves_workspace_2764_slice10a() {
+    let home = tmp_home("slice10a_fleet_ambiguous");
+    let victim_dir = crate::paths::workspace_dir(&home).join("victim");
+    cleanup_admission_seed_canaries(&victim_dir);
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: [\n").unwrap();
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        cleanup_admission_canaries_intact(&victim_dir),
+        "unreadable fleet state must fail closed before workspace deletion"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
