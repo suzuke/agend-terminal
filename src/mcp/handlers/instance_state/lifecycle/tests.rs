@@ -667,7 +667,12 @@ fn full_delete_shared_sibling_default_preserves_all_bytes_2764_slice10a() {
     )
     .unwrap();
 
-    let _ = super::full_delete_instance(&home, "victim");
+    let result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        result.is_ok(),
+        "shared sibling teardown must succeed without mutating the survivor: {result:?}"
+    );
 
     assert!(
         cleanup_admission_canaries_intact(&sibling),
@@ -690,7 +695,12 @@ fn full_delete_shared_external_preserves_all_bytes_2764_slice10a() {
     )
     .unwrap();
 
-    let _ = super::full_delete_instance(&home, "victim");
+    let result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        result.is_ok(),
+        "shared external teardown must succeed without scrubbing the survivor: {result:?}"
+    );
 
     assert!(
         cleanup_admission_canaries_intact(&shared),
@@ -717,7 +727,12 @@ fn full_delete_symlink_alias_preserves_target_and_alias_2764_slice10a() {
     )
     .unwrap();
 
-    let _ = super::full_delete_instance(&home, "victim");
+    let result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        result.is_ok(),
+        "shared symlink teardown must succeed without mutating the target: {result:?}"
+    );
 
     assert!(
         cleanup_admission_canaries_intact(&sibling),
@@ -736,14 +751,23 @@ fn full_delete_symlink_alias_preserves_target_and_alias_2764_slice10a() {
 fn full_delete_unshared_default_still_removes_tree_2764_slice10a() {
     let home = tmp_home("slice10a_unshared_default");
     let victim_dir = crate::paths::workspace_dir(&home).join("victim");
-    cleanup_admission_seed_canaries(&victim_dir);
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::fs::write(victim_dir.join("arbitrary.txt"), b"USER DATA").unwrap();
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
-        "instances:\n  victim:\n    backend: claude\n",
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n",
+            victim_dir.display()
+        ),
     )
     .unwrap();
 
-    let _ = super::full_delete_instance(&home, "victim");
+    let result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        result.is_ok(),
+        "an unshared exact default teardown must succeed: {result:?}"
+    );
 
     assert!(
         !victim_dir.exists(),
@@ -759,7 +783,13 @@ fn full_delete_fleet_load_ambiguity_preserves_workspace_2764_slice10a() {
     cleanup_admission_seed_canaries(&victim_dir);
     std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: [\n").unwrap();
 
-    let _ = super::full_delete_instance(&home, "victim");
+    let result = super::full_delete_instance(&home, "victim");
+
+    let error = result.expect_err("malformed fleet state must fail closed loudly");
+    assert!(
+        error.contains("fleet.yaml removal"),
+        "malformed fleet failure should identify the fleet-store refusal: {error}"
+    );
 
     assert!(
         cleanup_admission_canaries_intact(&victim_dir),
