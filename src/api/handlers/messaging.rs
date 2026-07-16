@@ -580,7 +580,7 @@ pub(crate) fn track_dispatch(
             // a matching sidecar whose DELETE fails, leaving it to fire a
             // spurious idle nudge later — warns inside `mark_resolved` at the
             // actual failure point, where the dispatch_id is known.
-            let _ = crate::daemon::dispatch_idle::mark_resolved(home, corr);
+            let _ = crate::daemon::dispatch_idle::mark_resolved(home, corr, from);
             // #1888 phase-2: a report carrying the handoff's `repo@branch`
             // correlation (reviewer verdicts do) RESOLVES the ci-handoff track —
             // the re-nudge stops on this signal, not on inbox read. A task-id
@@ -618,7 +618,7 @@ pub(crate) fn track_dispatch(
         // FALSE idle nudge despite the reply arriving. Aligning the key is a
         // superset — behaviour is unchanged when `correlation_id` is set.
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
-            let _ = crate::daemon::dispatch_idle::refresh_issued_at(home, corr);
+            let _ = crate::daemon::dispatch_idle::refresh_issued_at(home, corr, from);
         }
     }
 }
@@ -650,7 +650,7 @@ fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox
     let task_id = &summary.task_id;
     // Any verdict → the reviewer responded → clear the dispatch sidecar (kills the
     // post-response stuck-nudge), regardless of VERIFIED vs REJECTED.
-    let _ = crate::daemon::dispatch_idle::mark_resolved(home, task_id);
+    let _ = crate::daemon::dispatch_idle::mark_resolved(home, task_id, reporter);
     // Only VERIFIED closes the review task. terminal=true synthesized internally.
     if matches!(
         summary.verdict,

@@ -52,20 +52,23 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
     );
 }
 
-/// Mark a dispatch as completed (matched by task_id or to-instance).
-pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
+/// Mark a dispatch as completed. When `reporter` is non-empty, only the
+/// entry whose `to` matches the reporter is removed (reporter-scoped
+/// settlement). When `reporter` is empty, all entries for the correlation
+/// are removed (task-terminal cleanup — intentionally task-wide).
+pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str) {
     let cid = match correlation_id {
         Some(c) if !c.is_empty() => c,
-        _ => return, // No correlation_id → can't match, let sweep continue tracking
+        _ => return,
     };
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-            // Remove the resolved dispatch entry outright (was: flip to "completed"
-            // and linger until the 30-day `gc_old_entries`). A completed dispatch
-            // needs no further warn/ask tracking, so dropping it caps accumulation
-            // at the source (the 651KB / 1649-completed bloat). Complementary to
-            // #1727: that stops `orphaned` nag; this removes the rows.
-            store.entries.retain(|e| e.task_id.as_deref() != Some(cid));
+            store.entries.retain(|e| {
+                if e.task_id.as_deref() != Some(cid) {
+                    return true;
+                }
+                !reporter.is_empty() && e.to != reporter
+            });
             Ok(())
         }),
         "dispatch_mark_completed"
