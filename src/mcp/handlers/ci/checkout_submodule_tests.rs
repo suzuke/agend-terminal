@@ -910,6 +910,72 @@ fn txn_sweep_empty_area_is_zero() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// The canonical per-target lock is a sibling file in `checkout_txn`, not a
+/// journal entry. The recovery entry point must ignore it without attempting
+/// to decode, audit, or remove it.
+#[test]
+#[tracing_test::traced_test]
+fn txn_sweep_ignores_canonical_path_lock_file() {
+    let home = tmp_home("sweep-path-lock");
+    let target = home.join("worktrees").join("agent-src");
+    let normalized = super::checkout_txn::normalize_target(&target);
+    let lock = super::checkout_txn::lock_path(&home, &normalized);
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    let callbacks = std::cell::Cell::new(0);
+
+    let n = recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| {
+            callbacks.set(callbacks.get() + 1);
+            Some(())
+        },
+        |_| {
+            callbacks.set(callbacks.get() + 1);
+            true
+        },
+        |_| callbacks.set(callbacks.get() + 1),
+    );
+    assert_eq!(n, 0);
+    assert_eq!(callbacks.get(), 0, "path lock is not a journal candidate");
+    assert!(
+        !logs_contain("journal unreadable"),
+        "canonical path locks must not be classified as unreadable journals"
+    );
+    assert!(lock.is_file(), "canonical lock must remain untouched");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A real journal directory whose `journal.json` cannot be read remains an
+/// unresolved recovery authority. The entry point must preserve it and avoid
+/// all destructive callbacks (fail closed).
+#[test]
+fn txn_sweep_unreadable_journal_directory_remains_fail_closed() {
+    let home = tmp_home("sweep-unreadable-journal");
+    let journal = super::checkout_txn::journal_path(&home, "m");
+    std::fs::create_dir_all(&journal).unwrap();
+    let callbacks = std::cell::Cell::new(0);
+
+    let n = recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| {
+            callbacks.set(callbacks.get() + 1);
+            Some(())
+        },
+        |_| {
+            callbacks.set(callbacks.get() + 1);
+            true
+        },
+        |_| callbacks.set(callbacks.get() + 1),
+    );
+    assert_eq!(n, 0);
+    assert_eq!(callbacks.get(), 0, "unreadable journal cannot be recovered");
+    assert!(journal.is_dir(), "unreadable journal evidence remains");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Due + real worktree + lock free ⇒ removed + cleared.
 #[test]
 fn txn_sweep_due_remove_ok_clears() {
