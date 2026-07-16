@@ -2798,10 +2798,10 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
 /// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
 /// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
 /// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
-/// true. Spawns a short-lived `true`; the caller owns cleanup of the registry.
-/// `unix`-gated: the `true` binary (and this PTY pattern) is unix-only, matching
-/// the sibling `true`-backed handle tests.
-#[cfg(all(test, unix))]
+/// true. Spawns a minimal test PTY child; the caller owns cleanup of the registry.
+/// Uses the platform's portable-pty command shape so cross-platform tests can
+/// construct the same minimal live handle.
+#[cfg(test)]
 pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -2811,9 +2811,16 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
             pixel_height: 0,
         })
         .expect("openpty");
+    #[cfg(not(target_os = "windows"))]
     let mut cmd = CommandBuilder::new("true");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = CommandBuilder::new("cmd");
+        c.args(["/c", "findstr", ".*"]);
+        c
+    };
     cmd.cwd(std::env::temp_dir());
-    let child = pair.slave.spawn_command(cmd).expect("spawn true");
+    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
     drop(pair.slave);
     let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));

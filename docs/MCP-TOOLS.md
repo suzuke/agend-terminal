@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (31 tools)
+# AgEnD MCP Tools Reference (32 tools)
 
 ## Action-based Tools
 
@@ -165,6 +165,11 @@ Report structured daemon-side bind state for an agent. Non-destructive introspec
 ### `revoke_review_assignment`
 Revoke a specific reviewer assignment by exact `assignment_id`. Authorization: team orchestrator or operator. Idempotent — repeated calls with a stale/missing assignment_id return success. After successful revoke, merge readiness is recomputed.
 - **assignment_id**: UUID of the assignment to revoke (exact CAS identity)
+
+### `usage_limit_takeover`
+Architecture-14 item 5 Slice 2A operator-only PREPARE seam. Validates the persisted `CandidateReady` episode and writes one durable `Prepared` journal; it does not execute takeover or mutate the source binding/task/process.
+- **instance**: source instance whose persisted usage-limit episode is being prepared
+- **episode_id**: exact persisted episode id; the candidate is derived from `CandidateReady` and cannot be supplied by the caller
 
 ## Daemon Operations
 

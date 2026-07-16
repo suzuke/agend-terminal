@@ -347,7 +347,7 @@ pub(crate) fn tool_allowed_for_role_action(
     tool_allowed_for_role(role_kind, tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 31] = [
+static ALL_TOOLS: [ToolEntry; 32] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -555,6 +555,12 @@ static ALL_TOOLS: [ToolEntry; 31] = [
         handler: super::handlers::dispatch::dispatch_revoke_review_assignment,
         class: ToolClass::SIDE_EFFECT,
     },
+    ToolEntry {
+        name: "usage_limit_takeover",
+        definition: super::tools::def_usage_limit_takeover,
+        handler: super::handlers::dispatch::dispatch_usage_limit_takeover,
+        class: ToolClass::SIDE_EFFECT,
+    },
 ];
 
 #[cfg(test)]
@@ -676,8 +682,8 @@ mod tests {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            31,
-            "registry baseline is 31 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27; #991 Phase 2: + bind_topic = 27->28; #2550 P1: + instance (folded read-only alias) = 28->29; #2744 PR-A: + set_model = 29->30; #2782 slice 1: + revoke_review_assignment = 30->31)"
+            32,
+            "registry baseline is 32 tools (+ usage_limit_takeover Architecture-14 item 5 Slice 2A)"
         );
         for role in [
             None,
@@ -689,7 +695,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 31 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 32 tools in registry order (default-all-open)"
             );
         }
     }

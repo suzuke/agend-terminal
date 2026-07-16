@@ -152,21 +152,23 @@ trait ControlEffects {
     }
 }
 
+pub(crate) fn candidate_is_eligible(input: &TickInput, candidate: &CandidateFacts) -> bool {
+    candidate.team == input.source_team
+        && candidate.role == input.source_role
+        && candidate.backend != input.source_backend
+        && candidate.live
+        && candidate.healthy
+        && candidate.idle
+        && !candidate.bound
+        && !candidate.has_active_task
+        && !candidate.current_usage_limit
+        && candidate.routing_compatible
+}
+
 pub(crate) fn choose_candidate(input: &TickInput, candidates: &[CandidateFacts]) -> Option<String> {
     candidates
         .iter()
-        .find(|candidate| {
-            candidate.team == input.source_team
-                && candidate.role == input.source_role
-                && candidate.backend != input.source_backend
-                && candidate.live
-                && candidate.healthy
-                && candidate.idle
-                && !candidate.bound
-                && !candidate.has_active_task
-                && !candidate.current_usage_limit
-                && candidate.routing_compatible
-        })
+        .find(|candidate| candidate_is_eligible(input, candidate))
         .map(|candidate| candidate.name.clone())
 }
 
@@ -335,7 +337,10 @@ struct FsEffects<'a> {
     episode: Option<Episode>,
 }
 
-fn acquire_binding_lock(home: &Path, source: &str) -> anyhow::Result<crate::store::FileFlockGuard> {
+pub(crate) fn acquire_binding_lock(
+    home: &Path,
+    source: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
     crate::store::acquire_file_lock(
         &crate::paths::runtime_dir(home)
             .join(source)
@@ -343,7 +348,7 @@ fn acquire_binding_lock(home: &Path, source: &str) -> anyhow::Result<crate::stor
     )
 }
 
-fn read_current_binding(home: &Path, source: &str) -> Option<serde_json::Value> {
+pub(crate) fn read_current_binding(home: &Path, source: &str) -> Option<serde_json::Value> {
     let content = std::fs::read_to_string(
         crate::paths::runtime_dir(home)
             .join(source)
@@ -532,7 +537,7 @@ fn correlation_from_disk(home: &Path, source: &str) -> Option<(Correlation, crat
     Some((correlation, task))
 }
 
-fn fleet_facts(
+pub(crate) fn fleet_facts(
     home: &Path,
     registry: &crate::agent::AgentRegistry,
     source: &str,

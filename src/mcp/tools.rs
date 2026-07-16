@@ -430,6 +430,14 @@ pub(crate) fn def_revoke_review_assignment() -> Value {
         }, "required": ["assignment_id"]}})
 }
 
+pub(crate) fn def_usage_limit_takeover() -> Value {
+    json!({"name": "usage_limit_takeover", "description": "Operator-only Architecture-14 item 5 Slice 2A seam. Validate a persisted CandidateReady usage-limit episode and durably PREPARE, without executing takeover or changing the source binding/task/process.",
+        "inputSchema": {"type": "object", "properties": {
+            "instance": {"type": "string", "description": "Source instance whose persisted usage-limit episode is being prepared."},
+            "episode_id": {"type": "string", "description": "Exact persisted usage-limit episode id; candidate is derived from CandidateReady and cannot be supplied by the caller."}
+        }, "required": ["instance", "episode_id"]}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,7 +726,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            31,
+            32,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -729,7 +737,7 @@ mod tests {
              into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
              + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
              + set_model (#2744 PR-A, typed fleet model intent) = 30; \
-             + revoke_review_assignment (#2782 slice 1) = 31. \
+             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -1190,6 +1198,9 @@ mod tests {
             ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key"),
             // ── revoke_review_assignment (#2782 slice 1) ──
             ("revoke_review_assignment", "assignment_id", "mcp/handlers/comms_delegate/review_assignment.rs handle_revoke_review_assignment — lookup_by_assignment_id_strict + retire_if_id_matches CAS target"),
+            // ── usage_limit_takeover (Architecture-14 item 5 Slice 2A) ──
+            ("usage_limit_takeover", "instance", "mcp/handlers/usage_limit_takeover.rs source-scoped lock and persisted binding validation"),
+            ("usage_limit_takeover", "episode_id", "mcp/handlers/usage_limit_takeover.rs persisted CandidateReady episode identity validation"),
         ];
 
         // Intentionally-deferred passthrough: advertised by design, Phase-2
@@ -1226,6 +1237,7 @@ mod tests {
             "restart_instance",
             "config",
             "revoke_review_assignment",
+            "usage_limit_takeover",
         ];
 
         // Simple query/display/control tools — not directive-bearing, so their

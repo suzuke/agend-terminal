@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（31 個工具）
+# AgEnD MCP Tools Reference — 工具參考（32 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -165,6 +165,11 @@
 ### `revoke_review_assignment`
 依精確的 `assignment_id` 撤銷特定的 reviewer 指派。授權對象：team orchestrator 或 operator。具冪等性——用過期或不存在的 assignment_id 重複呼叫仍會回傳成功。撤銷成功後會重新計算 merge readiness。
 - **assignment_id**: 要撤銷的指派 UUID（精確的 CAS 身分）
+
+### `usage_limit_takeover`
+Architecture-14 item 5 Slice 2A 的 operator-only PREPARE 介面。驗證持久化的 `CandidateReady` episode 並寫入單一 durable `Prepared` journal；不執行 takeover，也不修改 source binding、task 或 process。
+- **instance**: 要準備其 usage-limit episode 的 source instance
+- **episode_id**: 持久化 episode 的精確 id；candidate 從 `CandidateReady` 推導，呼叫端不可自行提供
 
 ## Daemon 操作（Daemon Operations）
 
