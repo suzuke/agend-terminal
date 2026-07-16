@@ -6,6 +6,27 @@ use super::checkout_txn::RollbackOutcome;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// #2755 structured redaction: replace absolute filesystem paths (and Windows
+/// drive paths) in an error string returned over the wire with `<path>`.
+pub(super) fn redact_paths(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?P<b>^|[^\w])(?P<p>[A-Za-z]:\\[\w.\\@~%+-]+|(?:/[\w.@~%+-]+){2,})")
+            .expect("valid redaction regex")
+    });
+    re.replace_all(s, "${b}<path>").into_owned()
+}
+
+/// #1447: resolve the checkout source repo from `repository_path` — the
+/// cross-tool standard name used by bind_self / team update. Returns `None`
+/// when absent or empty.
+pub(crate) fn checkout_source(args: &Value) -> Option<&str> {
+    args.get("repository_path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(all(test, unix))]
 use std::cell::RefCell;
 
@@ -20,7 +41,7 @@ use std::cell::RefCell;
 /// guarantees coverage of all current and future return paths.
 pub(super) fn log_checkout_outcome(home: &Path, args: &Value, instance_name: &str, result: &Value) {
     let branch = args["branch"].as_str().unwrap_or("HEAD");
-    let source = super::checkout::checkout_source(args).unwrap_or("");
+    let source = checkout_source(args).unwrap_or("");
     let ok = result.get("error").is_none();
     let mut msg = format!("branch={branch} source={source} ok={ok}");
     if let Some(err) = result.get("error").and_then(Value::as_str) {

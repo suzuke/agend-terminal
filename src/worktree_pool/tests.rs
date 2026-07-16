@@ -4847,7 +4847,7 @@ fn binding_with_disposable_review(
 }
 
 fn seed_disposable_task(home: &Path, task_id: &str, branch: &str, terminal: bool) {
-    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
 
     let emitter = InstanceName::from("disposable-review-pool-test");
     let id = TaskId::from(task_id);
@@ -4872,20 +4872,27 @@ fn seed_disposable_task(home: &Path, task_id: &str, branch: &str, terminal: bool
     )
     .unwrap();
     if terminal {
-        crate::task_events::append(
-            home,
-            &emitter,
-            TaskEvent::Done {
-                task_id: id,
-                by: emitter.clone(),
-                source: DoneSource::OperatorManual {
-                    authored_at: "2026-07-16T00:00:00Z".to_string(),
-                    result: None,
-                },
-            },
-        )
-        .unwrap();
+        finish_disposable_task(home, task_id);
     }
+}
+
+fn finish_disposable_task(home: &Path, task_id: &str) {
+    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+
+    let emitter = InstanceName::from("disposable-review-pool-test");
+    crate::task_events::append(
+        home,
+        &emitter,
+        TaskEvent::Done {
+            task_id: TaskId::from(task_id),
+            by: emitter.clone(),
+            source: DoneSource::OperatorManual {
+                authored_at: "2026-07-16T00:00:00Z".to_string(),
+                result: None,
+            },
+        },
+    )
+    .unwrap();
 }
 
 /// RED #2: a branch named `review/*` but WITHOUT authority-proven provenance
@@ -5164,19 +5171,11 @@ fn disposable_review_active_task_kept_then_terminal_task_deletes() {
     );
     assert!(branch_exists(&repo, branch));
 
-    seed_disposable_task(&home, "T-disposable-active-terminal-done", branch, true);
+    // Transition the SAME task from active to terminal; a different terminal
+    // task id must not authorize deletion of this branch.
+    finish_disposable_task(&home, task_id);
     let mut terminal = ReleaseOutcome::default();
-    let mut terminal_binding = binding.clone();
-    terminal_binding["task_id"] = serde_json::json!("T-disposable-active-terminal-done");
-    resolve_branch_cleanup(
-        &home,
-        &terminal_binding,
-        true,
-        false,
-        false,
-        false,
-        &mut terminal,
-    );
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut terminal);
     assert!(
         terminal.branch_deleted,
         "terminal disposable review must delete: {:?}",
@@ -5212,6 +5211,28 @@ fn disposable_review_missing_corrupt_or_drifted_state_is_kept() {
         &mut missing_out,
     );
     assert!(!missing_out.branch_deleted);
+    assert!(branch_exists(&repo, branch));
+
+    let mismatch_task = "T-disposable-branch-mismatch";
+    seed_disposable_task(
+        &home,
+        mismatch_task,
+        "review/another-disposable-branch",
+        true,
+    );
+    let mut mismatch = missing_task.clone();
+    mismatch["task_id"] = serde_json::json!(mismatch_task);
+    let mut mismatch_out = ReleaseOutcome::default();
+    resolve_branch_cleanup(
+        &home,
+        &mismatch,
+        true,
+        false,
+        false,
+        false,
+        &mut mismatch_out,
+    );
+    assert!(!mismatch_out.branch_deleted);
     assert!(branch_exists(&repo, branch));
 
     let mut corrupt = missing_task.clone();

@@ -637,6 +637,55 @@ fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bo
     }
 }
 
+fn disposable_review_provisioned_head(
+    binding: &serde_json::Value,
+) -> Result<Option<&str>, &'static str> {
+    let has_disposable_field = binding.get("checkout_purpose").is_some()
+        || binding.get("provenance").is_some()
+        || binding.get("provisioned_head").is_some();
+    if !has_disposable_field {
+        return Ok(None);
+    }
+    if binding.get("checkout_purpose").and_then(|v| v.as_str()) != Some("disposable_review")
+        || binding.get("provenance").and_then(|v| v.as_str()) != Some("DaemonProvisionedReview")
+    {
+        return Err("invalid disposable review provenance");
+    }
+    let head = binding
+        .get("provisioned_head")
+        .and_then(|v| v.as_str())
+        .filter(|head| {
+            (head.len() == 40 || head.len() == 64) && head.chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .ok_or("missing or invalid disposable review provisioned_head")?;
+    Ok(Some(head))
+}
+
+fn disposable_review_task_terminal(home: &Path, task_id: &str, branch: &str) -> Option<bool> {
+    if task_id.is_empty() {
+        return None;
+    }
+    match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => {
+            // A terminal task is authoritative only for the branch it owns;
+            // a mismatched branch is contradictory evidence and must preserve
+            // the disposable review branch fail-closed.
+            if routed.task.branch.as_deref() != Some(branch) {
+                return None;
+            }
+            Some(matches!(
+                routed.task.status,
+                crate::task_events::TaskStatus::Done
+                    | crate::task_events::TaskStatus::Cancelled
+                    | crate::task_events::TaskStatus::Verified
+            ))
+        }
+        Err(crate::tasks::TaskRouteError::NotFound)
+        | Err(crate::tasks::TaskRouteError::Unreadable { .. })
+        | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
+    }
+}
+
 fn resolve_branch_cleanup(
     home: &Path,
     binding: &serde_json::Value,
@@ -649,12 +698,23 @@ fn resolve_branch_cleanup(
     let branch = binding["branch"].as_str().unwrap_or("");
     let sr_str = binding["source_repo"].as_str().unwrap_or("");
     let task_id = binding["task_id"].as_str().unwrap_or("");
+    let disposable_head = match disposable_review_provisioned_head(binding) {
+        Ok(head) => head,
+        Err(reason) => {
+            out.branch_cleanup_skipped_reason = Some(format!(
+                "disposable review provenance {reason} — preserved (fail-closed)"
+            ));
+            return;
+        }
+    };
     if !managed_verified && !worktree_absent {
         out.branch_cleanup_skipped_reason =
             Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
     } else if !branch.is_empty() && !sr_str.is_empty() {
         // Authority-proven review lease: lease_kind + review_assignment_id + expected_head
-        // all present → eligible for immediate delete with expected-head CAS.
+        // all present → eligible for immediate delete with expected-head CAS. A
+        // daemon-provisioned disposable review uses the same strict lifecycle
+        // classifier, but its provenance is independent of assignment_authority.
         // Dirty work → never auto-delete regardless of provenance.
         let authority_proven_head = if was_dirty {
             None
@@ -676,20 +736,26 @@ fn resolve_branch_cleanup(
                         .filter(|s| !s.is_empty()),
                 )
         };
+        let review_head = disposable_head.or(authority_proven_head);
         if was_dirty
-            && binding
-                .get("lease_kind")
-                .and_then(|v| v.as_str())
-                .is_some_and(|k| k == "review")
+            && (disposable_head.is_some()
+                || binding
+                    .get("lease_kind")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|k| k == "review"))
         {
             out.branch_cleanup_skipped_reason = Some(format!(
                 "authority-proven review lease on '{branch}' had dirty work — branch preserved"
             ));
             return;
         }
-        if let Some(expected) = authority_proven_head {
+        if let Some(expected) = review_head {
             let default = crate::git_helpers::default_branch(Path::new(sr_str));
-            let task_active = task_active_for_branch(home, task_id, branch);
+            let task_active = if disposable_head.is_some() {
+                disposable_review_task_terminal(home, task_id, branch).map(|terminal| !terminal)
+            } else {
+                task_active_for_branch(home, task_id, branch)
+            };
             let open_pr =
                 match crate::branch_sweep::open_pr_status(Path::new(sr_str), &default, branch) {
                     crate::branch_sweep::OpenPrStatus::Open => Some(true),
@@ -700,16 +766,17 @@ fn resolve_branch_cleanup(
                 crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
                     .ok()
                     .map(|tip| tip.trim() != expected);
+            let active_holder = crate::worktree_cleanup::branch_has_other_active_binding(
+                home,
+                Path::new(sr_str),
+                branch,
+                binding["worktree"].as_str(),
+            );
             let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
                 &crate::worktree::disposition::BranchLifecycleInput {
                     provenance: crate::worktree::disposition::BranchProvenance::ManagedReview,
                     terminal: true,
-                    active_holder: crate::worktree_cleanup::branch_has_other_active_binding(
-                        home,
-                        Path::new(sr_str),
-                        branch,
-                        binding["worktree"].as_str(),
-                    ),
+                    active_holder,
                     task_active,
                     open_pr,
                     unique_unpreserved_work,
@@ -737,8 +804,17 @@ fn resolve_branch_cleanup(
                 }
             }
         }
-        let (deleted, skip_reason) =
-            cleanup_merged_branch(Path::new(sr_str), branch, dry_run, authority_proven_head);
+        let (deleted, skip_reason) = cleanup_merged_branch(
+            Path::new(sr_str),
+            branch,
+            dry_run,
+            // A daemon-provisioned disposable review has the same strict
+            // expected-head CAS as an assignment-authority review lease. Once
+            // its lifecycle gates pass, pass that provenance head through to
+            // the deletion primitive so the branch is reaped without a PR
+            // merge signal (review scaffolding is intentionally unmerged).
+            review_head,
+        );
         out.branch_deleted = deleted;
         out.branch_cleanup_skipped_reason = skip_reason.clone();
         // Cleanup intent: clean feature branch released pre-merge → persist

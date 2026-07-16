@@ -6,34 +6,9 @@ use std::path::Path;
 // keep this handler under the LOC ceiling (call sites below are unchanged).
 use super::checkout_helpers::{rollback_response, sync_marker_contents, validate_expected_head};
 
-/// #2755 structured redaction: replace absolute filesystem paths (and Windows
-/// drive paths) in an error string RETURNED over the wire with `<path>`. The
-/// structured `code`/`stage`/`branch` stay actionable for the caller, but raw
-/// paths / git stderr — which leak the local layout, usernames, or submodule
-/// URLs — are stripped. The FULL, un-redacted detail is still recorded in the
-/// daemon event-log (`log_checkout_outcome`), so operators keep debuggability.
-pub(super) fn redact_paths(s: &str) -> String {
-    use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        // A Windows drive path (`C:\…`), OR a POSIX path of ≥2 segments starting
-        // at a non-word boundary — the `≥2` + boundary avoid mangling "and/or"
-        // and a URL's "//host". Rust's regex has no lookbehind, so the leading
-        // boundary char is captured (`b`) and restored in the replacement.
-        regex::Regex::new(r"(?P<b>^|[^\w])(?P<p>[A-Za-z]:\\[\w.\\@~%+-]+|(?:/[\w.@~%+-]+){2,})")
-            .expect("valid redaction regex")
-    });
-    re.replace_all(s, "${b}<path>").into_owned()
-}
-
-/// #1447: resolve the checkout source repo from `repository_path` — the
-/// cross-tool standard name used by bind_self / team update. Returns `None`
-/// when absent or empty.
-pub(crate) fn checkout_source(args: &Value) -> Option<&str> {
-    args.get("repository_path")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-}
+use super::checkout_disposable::CheckoutPurpose;
+pub(crate) use super::checkout_helpers::checkout_source;
+pub(super) use super::checkout_helpers::redact_paths;
 
 pub(crate) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let result = handle_checkout_repo_inner(home, args, instance_name);
@@ -50,12 +25,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     if !validate_branch(branch) {
         return json!({"error": format!("invalid branch name '{branch}'")});
     }
-    // #778 Option 1: optional atomic provision + bind. When `bind:true`,
-    // tail-ops mirror `bind_self → dispatch_auto_bind_lease` (marker +
-    // binding.json + ci_watches arm) directly on the just-provisioned
-    // worktree. Default `false` preserves existing back-compat callers
-    // (review pool, operator triage) that materialize a detached-HEAD
-    // inspection worktree without claiming it.
+    // #778: bind:true atomically claims the provisioned worktree; false keeps inspection-only behavior.
     let bind = args["bind"].as_bool().unwrap_or(false);
     if bind && instance_name.is_empty() {
         return json!({
@@ -63,6 +33,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             "code": "needs_identity"
         });
     }
+    let checkout_purpose = match super::checkout_disposable::parse(args, bind) {
+        Ok(purpose) => purpose,
+        Err(error) => return error,
+    };
     // The bind transaction owns the per-agent lifecycle authority before any
     // provisioning preflight. Keep this permit through branch locking,
     // bind_full, commit, and exact rollback so checkout cannot race release or
@@ -89,20 +63,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             return e;
         }
     }
-    // Windows-safe path mangling: also collapse `\` (path separator) and
-    // `:` (drive letter) so a source like `C:\Users\runner\...` doesn't
-    // produce a worktree path with mid-name colons (rejected by NTFS).
-    // Pre-existing tests didn't exercise Windows-built happy-path until
-    // #778's new bind:true coverage.
+    // Windows-safe path mangling collapses separators and drive-letter colons.
     let worktree_dir = home.join("worktrees").join(format!(
         "{}-{}",
         instance_name,
         source.replace(['/', '\\', ':'], "_").replace('~', "")
     ));
-    // #2158 PR1: resolve + validate the source repo path fail-closed (absolute or
-    // known agent name only; canonicalize; reject system dirs). Extracted to
-    // `source_resolve` — keeps this oversized handler under the file_size ceiling
-    // (t-61 split debt) and isolates the security-sensitive resolution for review.
+    // #2158: source resolution is fail-closed and isolated in `source_resolve`.
     let (source_path, source_canonical) =
         match super::source_resolve::resolve_checkout_source_path(home, source) {
             Ok(pair) => pair,
@@ -110,6 +77,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         };
     if let Some(e) = validate_expected_head(args, &source_path, branch) {
         return e;
+    }
+    if checkout_purpose == Some(CheckoutPurpose::DisposableReview) {
+        if let Err(error) =
+            super::checkout_disposable::preflight_branch(Path::new(&source_path), branch)
+        {
+            return error;
+        }
     }
     let expected_ref = super::checkout_helpers::expected_creation_ref(args, &source_path, branch);
     std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
@@ -142,6 +116,14 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             Ok((created, fetched)) => {
                 auto_created_branch = created;
                 fetch_attempted = fetched;
+                if checkout_purpose == Some(CheckoutPurpose::DisposableReview) && !created {
+                    return json!({
+                        "error": format!("disposable review branch '{branch}' was not created by this checkout"),
+                        "code": "disposable_review_requires_new_branch",
+                        "auto_created_branch": false,
+                        "branch": branch,
+                    });
+                }
             }
             Err(err) => {
                 let mut e = json!({
@@ -573,7 +555,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     .as_str()
                     .filter(|s| !s.is_empty())
                     .unwrap_or("");
-                if let Err(e) = crate::binding::bind_full(
+                let provenance =
+                    checkout_purpose.map(|purpose| {
+                        purpose.provenance(args["expected_head"].as_str().expect(
+                            "disposable_review validates expected_head before provisioning",
+                        ))
+                    });
+                if let Err(e) = crate::binding::bind_full_with_provenance(
                     home,
                     instance_name,
                     task_id,
@@ -581,6 +569,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     &worktree_dir,
                     &source_canonical,
                     true, // #2158 GR1: agent self-claim (repo checkout bind:true) → notify operator
+                    provenance,
                 ) {
                     // #1310: rollback worktree on binding failure to prevent orphans
                     tracing::warn!(
@@ -598,6 +587,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         remove_worktree,
                         || {},
                     );
+                    if matches!(outcome, super::checkout_txn::RollbackOutcome::Removed)
+                        && auto_created_branch
+                    {
+                        super::checkout_disposable::rollback_auto_created_branch(
+                            Path::new(&source_path),
+                            branch,
+                            args["expected_head"].as_str().unwrap_or(""),
+                        );
+                    }
                     return rollback_response(
                         outcome,
                         &format!("bind_full failed: {}", redact_paths(&e.to_string())),
@@ -606,13 +604,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         branch,
                     );
                 }
-                crate::binding::try_augment_review_lease(
-                    home,
-                    instance_name,
-                    task_id,
-                    branch,
-                    &source_canonical,
-                );
+                if checkout_purpose.is_none() {
+                    crate::binding::try_augment_review_lease(
+                        home,
+                        instance_name,
+                        task_id,
+                        branch,
+                        &source_canonical,
+                    );
+                }
                 bound_fingerprint =
                     match crate::binding::snapshot_guarded_binding(home, instance_name) {
                         Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
@@ -650,6 +650,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
+                if checkout_purpose == Some(CheckoutPurpose::DisposableReview) {
+                    resp["checkout_purpose"] = json!("disposable_review");
+                }
             }
             // #2755 Committed: the durable linearization point. Success is returned
             // ONLY after this journal write lands; a store::atomic_write failure
