@@ -88,14 +88,22 @@ pub(super) fn handle_crash_observation(
     let self_orch = crate::teams::self_orch_status(home, crashed_name);
     let is_self_orch = self_orch == crate::teams::SelfOrchStatus::Yes;
 
-    let (
-        should_respawn,
-        delay,
-        should_notify,
-        fire_self_orch_p0,
-        fire_terminal_p0,
-        escalation_snapshot,
-    ) = {
+    enum RegistryOutcome {
+        Deleted,
+        Missing,
+        Healthy {
+            should_respawn: bool,
+            delay: std::time::Duration,
+            should_notify: bool,
+            fire_self_orch_p0: bool,
+            fire_terminal_p0: bool,
+            escalation_snapshot: crate::health::PersistedEscalation,
+        },
+    }
+
+    // Snapshot health and the deleted/missing outcome while holding the
+    // registry guard. Ledger settlement happens after this guard drops.
+    let registry_outcome = {
         let reg = agent::lock_registry(&ctx.registry);
         match reg.get(&instance_id) {
             Some(handle) => {
@@ -118,44 +126,79 @@ pub(super) fn handle_crash_observation(
                         agent = %crashed_name,
                         "exit is an intentional delete (deleted flag set) — skipping crash-respawn"
                     );
-                    ledger.discard(key);
-                    return;
+                    RegistryOutcome::Deleted
+                } else {
+                    let mut core = handle.core.lock();
+                    // #1701: decide the self-orch P0 BEFORE record_crash (which may
+                    // itself stamp the crash cooldown on its recent>=2 path) — the
+                    // accessor reads+stamps the crash-class cooldown (#1744-H3:
+                    // distinct from the hung cooldown), and for a self-orchestrator we
+                    // use ONLY this gate, never the generic recent>=2 one. The `&&`
+                    // short-circuits for non-orchestrators, so their cooldown is
+                    // untouched.
+                    let fire_p0 = is_self_orch && core.health.self_orch_crash_should_notify();
+                    let (respawn, delay, notify) = core.health.record_crash();
+                    // #1744-H4: a terminal Failed (max-retries) self-orchestrator crash
+                    // is a PERMANENT leaderless death. record_crash returns notify=true
+                    // ("don't respawn, do notify"), but fire_p0 is cooldown-gated and
+                    // the generic notify branch below is `!is_self_orch` — so without
+                    // this it pages NEITHER. Fire a once-off, cooldown-EXEMPT terminal
+                    // P0, fail-closed (Yes|Unknown fire, No skip), latched via the
+                    // PERSISTED `failed_escalated` so a restart (which rehydrates the
+                    // crash budget but not `state`) doesn't re-page the same death.
+                    let fire_terminal =
+                        should_fire_terminal_p0(respawn, self_orch, core.health.failed_escalated);
+                    if fire_terminal {
+                        core.health.failed_escalated = true;
+                    }
+                    // #1744-H2: snapshot the (just-mutated) escalation state under the
+                    // lock; persisted lock-free below so the crash budget + cooldown
+                    // (+ #1744-H4 failed_escalated) survive a daemon restart.
+                    let snap = core.health.escalation_snapshot();
+                    RegistryOutcome::Healthy {
+                        should_respawn: respawn,
+                        delay,
+                        should_notify: notify,
+                        fire_self_orch_p0: fire_p0,
+                        fire_terminal_p0: fire_terminal,
+                        escalation_snapshot: snap,
+                    }
                 }
-                let mut core = handle.core.lock();
-                // #1701: decide the self-orch P0 BEFORE record_crash (which may
-                // itself stamp the crash cooldown on its recent>=2 path) — the
-                // accessor reads+stamps the crash-class cooldown (#1744-H3:
-                // distinct from the hung cooldown), and for a self-orchestrator we
-                // use ONLY this gate, never the generic recent>=2 one. The `&&`
-                // short-circuits for non-orchestrators, so their cooldown is
-                // untouched.
-                let fire_p0 = is_self_orch && core.health.self_orch_crash_should_notify();
-                let (respawn, delay, notify) = core.health.record_crash();
-                // #1744-H4: a terminal Failed (max-retries) self-orchestrator crash
-                // is a PERMANENT leaderless death. record_crash returns notify=true
-                // ("don't respawn, do notify"), but fire_p0 is cooldown-gated and
-                // the generic notify branch below is `!is_self_orch` — so without
-                // this it pages NEITHER. Fire a once-off, cooldown-EXEMPT terminal
-                // P0, fail-closed (Yes|Unknown fire, No skip), latched via the
-                // PERSISTED `failed_escalated` so a restart (which rehydrates the
-                // crash budget but not `state`) doesn't re-page the same death.
-                let fire_terminal =
-                    should_fire_terminal_p0(respawn, self_orch, core.health.failed_escalated);
-                if fire_terminal {
-                    core.health.failed_escalated = true;
-                }
-                // #1744-H2: snapshot the (just-mutated) escalation state under the
-                // lock; persisted lock-free below so the crash budget + cooldown
-                // (+ #1744-H4 failed_escalated) survive a daemon restart.
-                let snap = core.health.escalation_snapshot();
-                (respawn, delay, notify, fire_p0, fire_terminal, snap)
             }
             None => {
                 tracing::warn!(agent = %crashed_name, "not in registry, skipping");
-                ledger.discard(key);
-                return;
+                RegistryOutcome::Missing
             }
         }
+    };
+
+    let (
+        should_respawn,
+        delay,
+        should_notify,
+        fire_self_orch_p0,
+        fire_terminal_p0,
+        escalation_snapshot,
+    ) = match registry_outcome {
+        RegistryOutcome::Deleted | RegistryOutcome::Missing => {
+            ledger.discard(key);
+            return;
+        }
+        RegistryOutcome::Healthy {
+            should_respawn,
+            delay,
+            should_notify,
+            fire_self_orch_p0,
+            fire_terminal_p0,
+            escalation_snapshot,
+        } => (
+            should_respawn,
+            delay,
+            should_notify,
+            fire_self_orch_p0,
+            fire_terminal_p0,
+            escalation_snapshot,
+        ),
     };
 
     // #1744-H2: persist the crash budget + crash cooldown (lock released above).

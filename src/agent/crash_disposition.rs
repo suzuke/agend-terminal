@@ -140,10 +140,7 @@ impl ClaimToken {
 }
 
 struct Entry {
-    /// `None` is a compact tombstone.  The disposition remains queryable and
-    /// the owner `current` map still rejects late publication, while the old
-    /// generation's Core/deleted Arcs are released once it is superseded.
-    observation: Option<CrashObservation>,
+    observation: CrashObservation,
     disposition: Disposition,
     claimant: Option<Claimant>,
 }
@@ -195,12 +192,12 @@ impl CrashDispositionLedger {
         }
         let key = observation.key();
         if let Some(entry) = inner.entries.get(&key) {
-            return entry.observation.is_some() && entry.disposition != Disposition::Discarded;
+            return entry.disposition != Disposition::Discarded;
         }
         inner.entries.insert(
             key,
             Entry {
-                observation: Some(observation),
+                observation,
                 disposition: Disposition::Pending,
                 claimant: None,
             },
@@ -208,8 +205,9 @@ impl CrashDispositionLedger {
         true
     }
 
-    /// Register a newly installed handle generation and atomically discard all
-    /// older non-terminal records for that instance.
+    /// Register a newly installed handle generation and remove all superseded
+    /// records that are not currently executing.  The current-generation map
+    /// remains the late-publication fence after the old entry is removed.
     pub(crate) fn register_generation(&self, instance_id: InstanceId, generation: SpawnGeneration) {
         let mut inner = self.inner.lock();
         if inner
@@ -220,20 +218,11 @@ impl CrashDispositionLedger {
             return;
         }
         inner.current.insert(instance_id, generation);
-        for (key, entry) in &mut inner.entries {
-            if key.instance_id == instance_id
+        inner.entries.retain(|key, entry| {
+            !(key.instance_id == instance_id
                 && key.generation != generation
-                && entry.disposition != Disposition::Executing
-            {
-                if !matches!(
-                    entry.disposition,
-                    Disposition::Live | Disposition::Failed | Disposition::Discarded
-                ) {
-                    entry.disposition = Disposition::Discarded;
-                }
-                entry.observation = None;
-            }
-        }
+                && entry.disposition != Disposition::Executing)
+        });
     }
 
     pub(crate) fn claim(&self, key: DispositionKey, claimant: Claimant) -> Option<ClaimToken> {
@@ -246,10 +235,8 @@ impl CrashDispositionLedger {
         if entry.disposition != Disposition::Pending {
             return None;
         }
-        let observation = entry.observation.as_ref()?;
-        if !observation.valid(current) {
+        if !entry.observation.valid(current) {
             entry.disposition = Disposition::Discarded;
-            entry.observation = None;
             return None;
         }
         entry.disposition = Disposition::Claimed;
@@ -274,12 +261,8 @@ impl CrashDispositionLedger {
         if entry.disposition != Disposition::Ready {
             return false;
         }
-        let Some(observation) = entry.observation.as_ref() else {
-            return false;
-        };
-        if !observation.valid(current) {
+        if !entry.observation.valid(current) {
             entry.disposition = Disposition::Discarded;
-            entry.observation = None;
             return false;
         }
         entry.disposition = Disposition::Executing;
@@ -306,7 +289,6 @@ impl CrashDispositionLedger {
             return false;
         }
         entry.disposition = Disposition::Discarded;
-        entry.observation = None;
         true
     }
 
@@ -326,11 +308,8 @@ impl CrashDispositionLedger {
             .lock()
             .entries
             .values()
-            .filter_map(|entry| {
-                (entry.disposition == Disposition::Pending)
-                    .then(|| entry.observation.clone())
-                    .flatten()
-            })
+            .filter(|entry| entry.disposition == Disposition::Pending)
+            .map(|entry| entry.observation.clone())
             .collect()
     }
 
@@ -347,12 +326,14 @@ impl CrashDispositionLedger {
         if matches!(to, Disposition::Live | Disposition::Failed)
             && current != Some(token.key.generation)
         {
-            // An older worker may finish after a replacement generation was
-            // installed.  Keep its terminal tombstone, but release the heavy
-            // old observation now that no further execution is possible.
-            entry.observation = None;
+            inner.entries.remove(&token.key);
         }
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.inner.lock().entries.len()
     }
 }
 
@@ -405,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_discards_old_pending_before_execution() {
+    fn replacement_removes_old_pending_before_execution() {
         let ledger = CrashDispositionLedger::new();
         let id = InstanceId::new();
         let deleted = Arc::new(AtomicBool::new(false));
@@ -416,7 +397,7 @@ mod tests {
         assert!(ledger.mark_ready(token));
 
         ledger.register_generation(id, SpawnGeneration::new(2));
-        assert_eq!(ledger.disposition(old.key()), Some(Disposition::Discarded));
+        assert_eq!(ledger.disposition(old.key()), None);
         assert!(!ledger.begin_execute(token));
         assert!(ledger.pending().is_empty());
     }
@@ -594,7 +575,55 @@ mod tests {
                 instance_id: id,
                 generation: SpawnGeneration::new(12)
             }),
-            Some(Disposition::Failed)
+            None
         );
+        assert_eq!(ledger.entry_count(), 0);
+    }
+
+    #[test]
+    fn superseded_generations_are_removed_and_count_stays_bounded() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+
+        for value in 20..=83 {
+            let generation = SpawnGeneration::new(value);
+            let obs = observation(id, generation, &deleted, None);
+            ledger.register_generation(id, generation);
+            assert!(ledger.publish(obs.clone()));
+            let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+            assert!(ledger.mark_ready(token));
+            assert!(ledger.discard(obs.key()));
+            assert!(
+                ledger.entry_count() <= 1,
+                "superseded entries must be removed, count={}",
+                ledger.entry_count()
+            );
+        }
+
+        let late = observation(id, SpawnGeneration::new(20), &deleted, None);
+        assert!(!ledger.publish(late));
+        assert!(ledger.entry_count() <= 1);
+    }
+
+    #[test]
+    fn superseded_executing_entry_is_removed_after_terminal_settlement() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let old = observation(id, SpawnGeneration::new(84), &deleted, None);
+        let weak_core = Arc::downgrade(&old.core);
+        ledger.register_generation(id, old.generation);
+        assert!(ledger.publish(old.clone()));
+        let token = ledger.claim(old.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+        assert!(ledger.begin_execute(token));
+        ledger.register_generation(id, SpawnGeneration::new(85));
+        assert_eq!(ledger.entry_count(), 1, "Executing remains owned");
+        assert!(ledger.mark_live(token));
+        drop(old);
+        assert_eq!(ledger.entry_count(), 0);
+        assert!(weak_core.upgrade().is_none());
+        assert_eq!(ledger.disposition(token.key()), None);
     }
 }
