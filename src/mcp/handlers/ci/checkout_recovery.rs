@@ -4,7 +4,8 @@
 //! module is the boot + per-tick recovery DRIVER (`recover_pending_sweep[_prod]`).
 
 use super::checkout_txn::{
-    load_typed, quarantine_corrupt, try_acquire_path_lock, txn_root, Journal, JournalLoad, Phase,
+    is_canonical_path_lock_name, load_typed, quarantine_corrupt, try_acquire_path_lock, txn_root,
+    Journal, JournalLoad, Phase,
 };
 use std::path::Path;
 
@@ -39,9 +40,15 @@ pub(crate) fn recover_pending_sweep<G>(
         let Some(mangled) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        // (1) Unlocked read for path + nonce. Sibling `<key>.lock` files load as Absent
-        // (skipped); a corrupt record is QUARANTINED (retained as intervention authority —
-        // #2755 R3), NOT cleared; an unreadable record fails closed (#2755 R4).
+        // `lock_path` creates a sibling `wtpath-*.lock` file in `txn_root`.
+        // It is a live coordination primitive, not a journal directory; skip
+        // it before `load_typed` would misclassify the file as unreadable.
+        if is_canonical_path_lock_name(&mangled) {
+            continue;
+        }
+        // (1) Unlocked read for path + nonce. A corrupt record is QUARANTINED
+        // (retained as intervention authority — #2755 R3), NOT cleared; an
+        // unreadable record fails closed (#2755 R4).
         let seen = match load_typed(home, &mangled) {
             JournalLoad::Loaded(j) => j,
             JournalLoad::Unreadable => {
