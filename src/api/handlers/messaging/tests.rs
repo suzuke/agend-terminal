@@ -3466,3 +3466,86 @@ fn red_validated_review_bridge_settlement_is_reporter_scoped() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── Empty-reporter fail-closed regression tests ──
+
+#[test]
+fn empty_reporter_mark_completed_leaves_rows_intact() {
+    let home = tmp_home("empty-reporter-dt");
+    crate::dispatch_tracking::track_dispatch(
+        &home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some("t-empty".into()),
+            from: "lead".into(),
+            to: "dev".into(),
+            delegated_at: "2026-07-16T00:00:00Z".into(),
+            status: "pending".into(),
+            ..Default::default()
+        },
+    );
+    crate::dispatch_tracking::mark_completed(&home, Some("t-empty"), "");
+    let store = crate::dispatch_tracking::take_pending_dispatchers_to(&home, "dev");
+    assert!(
+        !store.is_empty(),
+        "empty reporter must NOT remove any dispatch_tracking row"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn empty_reporter_mark_resolved_leaves_sidecar_intact() {
+    let home = tmp_home("empty-reporter-idle");
+    let id = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "dev",
+        Some("t-empty"),
+        "task",
+        600,
+    )
+    .expect("seed");
+    let resolved = crate::daemon::dispatch_idle::mark_resolved(&home, "t-empty", "");
+    assert!(resolved.is_none(), "empty reporter must return None");
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    assert!(
+        pending.iter().any(|p| p.dispatch_id == id),
+        "empty reporter must NOT delete the sidecar"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn empty_reporter_refresh_issued_at_leaves_sidecar_unchanged() {
+    let home = tmp_home("empty-reporter-refresh");
+    let id = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "dev",
+        Some("t-empty"),
+        "task",
+        600,
+    )
+    .expect("seed");
+    let before = crate::daemon::dispatch_idle::list_pending(&home);
+    let original = before
+        .iter()
+        .find(|p| p.dispatch_id == id)
+        .unwrap()
+        .issued_at
+        .clone();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let refreshed = crate::daemon::dispatch_idle::refresh_issued_at(&home, "t-empty", "");
+    assert!(refreshed.is_none(), "empty reporter must return None");
+    let after = crate::daemon::dispatch_idle::list_pending(&home);
+    let current = after
+        .iter()
+        .find(|p| p.dispatch_id == id)
+        .unwrap()
+        .issued_at
+        .clone();
+    assert_eq!(
+        original, current,
+        "empty reporter must NOT refresh issued_at"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
