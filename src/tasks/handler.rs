@@ -66,6 +66,50 @@ fn id_arg(args: &Value) -> Option<&str> {
         .or_else(|| args["task_id"].as_str().filter(|s| !s.is_empty()))
 }
 
+enum AssigneePatch {
+    Unchanged,
+    Clear,
+    Set(String),
+}
+
+fn parse_assignee_for_create(args: &Value) -> Result<Option<String>, Value> {
+    let field = args.get("assignee");
+    match field {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(serde_json::json!({
+            "error": "assignee must be a string",
+            "code": "invalid_assignee",
+        })),
+    }
+}
+
+fn parse_assignee_for_update(args: &Value) -> Result<AssigneePatch, Value> {
+    let field = args.get("assignee");
+    match field {
+        None | Some(Value::Null) => Ok(AssigneePatch::Unchanged),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(AssigneePatch::Clear)
+            } else {
+                Ok(AssigneePatch::Set(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(serde_json::json!({
+            "error": "assignee must be a string",
+            "code": "invalid_assignee",
+        })),
+    }
+}
+
 fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &Value) -> Value {
     let title = match args["title"].as_str() {
         Some(t) => t,
@@ -98,7 +142,10 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     // legacy two-segment form (see src/daemon/task_sweep.rs).
     let pid = std::process::id();
     let id = format!("t-{ts}-{pid}-{seq}");
-    let assignee = args["assignee"].as_str().map(String::from);
+    let assignee = match parse_assignee_for_create(args) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let routed_to = if let Some(ref name) = assignee {
         match crate::teams::resolve_team_orchestrator(home, name) {
             Ok(Some(orch)) => Some(orch),
@@ -1133,15 +1180,17 @@ fn handle_update(
     };
     let new_status = args["status"].as_str().map(String::from);
     let new_priority = args["priority"].as_str();
-    let new_assignee = args["assignee"].as_str().map(String::from);
+    let assignee_patch = match parse_assignee_for_update(args) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     // Resolve team routing for new assignee (validates team exists / not degraded).
-    let _new_routed_to = if let Some(ref name) = new_assignee {
-        match crate::teams::resolve_team_orchestrator(home, name) {
+    let _new_routed_to = match &assignee_patch {
+        AssigneePatch::Set(name) => match crate::teams::resolve_team_orchestrator(home, name) {
             Ok(orch) => orch,
             Err(e) => return serde_json::json!({"error": e}),
-        }
-    } else {
-        None
+        },
+        _ => None,
     };
     let caller = instance_name.to_string();
     // #2760: resolve the task's authoritative board ONCE via the strict route
@@ -1423,21 +1472,31 @@ fn handle_update(
             tags,
         });
     }
-    // Assignee change without status transition: queue
-    // OwnerAssigned. Distinct from Claimed (status stays put).
-    if let Some(ref new_owner) = new_assignee {
-        let routed_to = match crate::teams::resolve_team_orchestrator(home, new_owner) {
-            Ok(orch) => orch,
-            Err(e) => return serde_json::json!({"error": e}),
-        };
-        pending_events.push(crate::task_events::TaskEvent::OwnerAssigned {
-            task_id: crate::task_events::TaskId(id.clone()),
-            by: crate::task_events::InstanceName::from(caller.as_str()),
-            owner: Some(crate::task_events::InstanceName(new_owner.clone())),
-            routed_to: routed_to
-                .as_ref()
-                .map(|s| crate::task_events::InstanceName(s.clone())),
-        });
+    // Assignee change without status transition: queue OwnerAssigned.
+    match &assignee_patch {
+        AssigneePatch::Set(new_owner) => {
+            let routed_to = match crate::teams::resolve_team_orchestrator(home, new_owner) {
+                Ok(orch) => orch,
+                Err(e) => return serde_json::json!({"error": e}),
+            };
+            pending_events.push(crate::task_events::TaskEvent::OwnerAssigned {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: crate::task_events::InstanceName::from(caller.as_str()),
+                owner: Some(crate::task_events::InstanceName(new_owner.clone())),
+                routed_to: routed_to
+                    .as_ref()
+                    .map(|s| crate::task_events::InstanceName(s.clone())),
+            });
+        }
+        AssigneePatch::Clear => {
+            pending_events.push(crate::task_events::TaskEvent::OwnerAssigned {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: crate::task_events::InstanceName::from(caller.as_str()),
+                owner: None,
+                routed_to: None,
+            });
+        }
+        AssigneePatch::Unchanged => {}
     }
     // F2: result backfill via the additive `ResultSet` event. A present-but-
     // non-string `result` fails loud (was: silently ignored → false "unchanged").
@@ -1551,15 +1610,22 @@ fn handle_update(
         // Mirrors the done/cancelled cleanup hook above; runs only after the append
         // committed. (The orphan path — OwnerAssigned with owner=None — calls the
         // same helper with None in orphan_tasks_for_owner, which clears the sidecar.)
-        if let Some(ref new_owner) = new_assignee {
-            let _ =
-                crate::daemon::dispatch_idle::reassign_pending_for_task(home, &id, Some(new_owner));
-            // #1923 G1/G3: re-point the SAME task's ci-watch handoff (next_after_ci)
-            // + dispatch-tracking `to` to the new owner — sibling calls at the same
-            // OwnerAssigned emit site, so a reassigned review hands off / is tracked
-            // against the reviewer who now owns the task, not the stale original.
-            let _ = crate::daemon::ci_watch::reassign_next_after_ci(home, &id, Some(new_owner));
-            crate::dispatch_tracking::reassign_to(home, &id, Some(new_owner));
+        match &assignee_patch {
+            AssigneePatch::Set(new_owner) => {
+                let _ = crate::daemon::dispatch_idle::reassign_pending_for_task(
+                    home,
+                    &id,
+                    Some(new_owner),
+                );
+                let _ = crate::daemon::ci_watch::reassign_next_after_ci(home, &id, Some(new_owner));
+                crate::dispatch_tracking::reassign_to(home, &id, Some(new_owner));
+            }
+            AssigneePatch::Clear => {
+                let _ = crate::daemon::dispatch_idle::reassign_pending_for_task(home, &id, None);
+                let _ = crate::daemon::ci_watch::reassign_next_after_ci(home, &id, None);
+                crate::dispatch_tracking::reassign_to(home, &id, None);
+            }
+            AssigneePatch::Unchanged => {}
         }
     }
     // #807 Item 1: see create arm note.

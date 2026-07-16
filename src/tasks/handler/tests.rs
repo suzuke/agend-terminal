@@ -2780,3 +2780,393 @@ fn p0_ack_plan_corrupt_vector_containing_caller_rejects() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Architecture-14 item 4: typed AssigneePatch RED tests (real-entry via handle)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_missing_assignee_is_unassigned() {
+    let home = tmp_home("ap-t1");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t1"}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert!(task.assignee.is_none(), "missing assignee → None");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_blank_assignee_is_unassigned() {
+    let home = tmp_home("ap-t2");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t2", "assignee": ""}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert!(
+        task.assignee.is_none(),
+        "blank assignee must be None, not Some('')"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_set_assignee_trims_whitespace() {
+    let home = tmp_home("ap-t3");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t3", "assignee": " agent "}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("agent"),
+        "must trim whitespace"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_non_string_assignee_errors() {
+    let home = tmp_home("ap-t4");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t4", "assignee": 42}),
+    );
+    assert!(
+        r.get("error").is_some(),
+        "non-string assignee must error: {r}"
+    );
+    assert!(
+        r["code"].as_str() == Some("invalid_assignee")
+            || r["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("invalid_assignee")),
+        "error must identify invalid_assignee: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_missing_assignee_unchanged() {
+    let home = tmp_home("ap-t5");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t5", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "description": "updated"}),
+    );
+    assert!(r.get("error").is_none(), "update must succeed: {r}");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("dev-agent"),
+        "assignee must be unchanged"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_blank_assignee_clears() {
+    let home = tmp_home("ap-t6");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t6", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
+    );
+    assert!(r.get("error").is_none(), "update clear must succeed: {r}");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert!(
+        task.assignee.is_none(),
+        "blank assignee update must clear to None"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_set_assignee_trims() {
+    let home = tmp_home("ap-t7");
+    let r = handle(
+        &home,
+        "old",
+        &serde_json::json!({"action": "create", "title": "t7", "assignee": "old"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "old",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    let r = handle(
+        &home,
+        "old",
+        &serde_json::json!({"action": "update", "id": id, "assignee": " new "}),
+    );
+    assert!(r.get("error").is_none(), "update must succeed: {r}");
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("new"),
+        "must trim whitespace"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_non_string_assignee_errors() {
+    let home = tmp_home("ap-t8");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t8", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "update", "id": id, "assignee": true}),
+    );
+    assert!(
+        r.get("error").is_some(),
+        "non-string assignee must error: {r}"
+    );
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("dev-agent"),
+        "assignee must be unchanged on error"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// T9: Clear settles all three sidecars (dispatch-idle, next_after_ci,
+/// dispatch-tracking) with None after commit.
+#[test]
+fn update_clear_settles_three_sidecars() {
+    let home = tmp_home("ap-t9");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t9", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Seed all three sidecars.
+    // 1. dispatch-idle
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "dev-agent",
+        Some(id),
+        "task",
+        600,
+    );
+    assert!(
+        crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "precondition: dispatch-idle sidecar exists"
+    );
+    // 2. ci-watch with task_id + next_after_ci
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch_fname = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/t9");
+    std::fs::write(
+        ci_dir.join(&watch_fname),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "repo": "owner/repo", "branch": "feat/t9", "interval_secs": 60,
+            "task_id": id, "next_after_ci": ["dev-agent"],
+            "subscribers": [{"instance": "lead"}],
+        }))
+        .expect("json"),
+    )
+    .expect("write watch");
+    // 3. dispatch-tracking
+    crate::dispatch_tracking::track_dispatch(
+        &home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some(id.to_string()),
+            from: "lead".to_string(),
+            to: "dev-agent".to_string(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".to_string(),
+        },
+    );
+    assert!(
+        crate::dispatch_tracking::active_target_names(&home).contains(&"dev-agent".to_string()),
+        "precondition: dispatch-tracking sidecar exists"
+    );
+    // Clear assignee.
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
+    );
+    assert!(r.get("error").is_none(), "clear must succeed: {r}");
+    // After commit, all three sidecars cleared.
+    assert!(
+        !crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "dispatch-idle sidecar must be cleared"
+    );
+    // ci-watch: next_after_ci must be reassigned to None
+    let watch_content = std::fs::read_to_string(ci_dir.join(&watch_fname)).unwrap_or_default();
+    let watch: serde_json::Value = serde_json::from_str(&watch_content).unwrap_or_default();
+    assert!(
+        watch.get("next_after_ci").is_none()
+            || watch["next_after_ci"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+        "ci-watch next_after_ci must be cleared: {watch}"
+    );
+    // dispatch-tracking: dev-agent no longer active target
+    assert!(
+        !crate::dispatch_tracking::active_target_names(&home).contains(&"dev-agent".to_string()),
+        "dispatch-tracking must clear dev-agent"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// T10: Combined status=done + assignee="" attributes done event to the
+/// pre-commit owner and clears sidecars post-commit.
+#[test]
+fn combined_status_done_and_clear_attributes_to_old_owner() {
+    let home = tmp_home("ap-t10");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t10", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Combined: status=done + clear assignee in one update.
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "status": "done", "assignee": "", "result": "completed"}),
+    );
+    assert!(
+        r.get("error").is_none(),
+        "combined update must succeed: {r}"
+    );
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.status,
+        crate::task_events::TaskStatus::Done,
+        "status must be done"
+    );
+    assert!(task.assignee.is_none(), "assignee must be cleared");
+    // Inspect persisted envelopes: Done event must be attributed to the
+    // pre-commit owner (dev-agent), not the post-clear None.
+    let envelopes = crate::task_events::envelopes_for_task_at(&home, id).expect("envelopes");
+    let done_event = envelopes
+        .iter()
+        .find(|e| matches!(&e.event, crate::task_events::TaskEvent::Done { .. }))
+        .expect("Done event must exist");
+    match &done_event.event {
+        crate::task_events::TaskEvent::Done { by, .. } => {
+            assert_eq!(
+                by.0, "dev-agent",
+                "Done.by must be the pre-commit owner, not cleared"
+            );
+        }
+        _ => panic!("expected Done"),
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// T11: ACL failure produces no sidecar mutation.
+#[test]
+fn update_acl_failure_no_sidecar_mutation() {
+    let home = tmp_home("ap-t11");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t11", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Seed sidecar for dev-agent via record_dispatch.
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "dev-agent",
+        Some(id),
+        "task",
+        600,
+    );
+    assert!(
+        crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "precondition"
+    );
+    // Unauthorized caller tries to clear assignee.
+    let r = handle(
+        &home,
+        "intruder",
+        &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
+    );
+    assert!(
+        r.get("error").is_some(),
+        "unauthorized update must fail: {r}"
+    );
+    // Sidecar must be unchanged.
+    assert!(
+        crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "dispatch-idle sidecar must survive ACL failure"
+    );
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("dev-agent"),
+        "assignee unchanged after ACL failure"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
