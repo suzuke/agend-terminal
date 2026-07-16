@@ -18,7 +18,7 @@ fn parse_managed_marker(wt: &Path) -> Option<(String, String, String)> {
 }
 
 fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Value {
-    let Some((marker_agent, _marker_branch, _marker_repo)) = parse_managed_marker(canonical) else {
+    let Some((marker_agent, marker_branch, marker_repo)) = parse_managed_marker(canonical) else {
         return json!({
             "error": "managed worktree marker unreadable or missing agent — refusing (fail-closed)",
             "code": "managed_marker_invalid",
@@ -27,6 +27,8 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
     let fingerprint = match crate::binding::snapshot_guarded_binding(home, &marker_agent) {
         Ok(crate::binding::GuardedBinding::Known { value, fingerprint }) => {
             let bound_wt = value["worktree"].as_str().unwrap_or("");
+            let bound_branch = value["branch"].as_str().unwrap_or("");
+            let bound_source = value["source_repo"].as_str().unwrap_or("");
             if bound_wt != canonical.to_str().unwrap_or("") {
                 return json!({
                     "error": format!(
@@ -35,6 +37,24 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
                         marker_agent, bound_wt, canonical.display()
                     ),
                     "code": "managed_release_path_mismatch",
+                });
+            }
+            if !marker_branch.is_empty() && bound_branch != marker_branch {
+                return json!({
+                    "error": format!(
+                        "marker branch '{}' does not match binding branch '{}' — refusing",
+                        marker_branch, bound_branch
+                    ),
+                    "code": "managed_release_branch_mismatch",
+                });
+            }
+            if !marker_repo.is_empty() && !bound_source.is_empty() && bound_source != marker_repo {
+                return json!({
+                    "error": format!(
+                        "marker source_repo '{}' does not match binding source_repo '{}' — refusing",
+                        marker_repo, bound_source
+                    ),
+                    "code": "managed_release_source_mismatch",
                 });
             }
             fingerprint

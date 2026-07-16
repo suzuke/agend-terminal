@@ -3070,6 +3070,7 @@ fn rewatch_clears_tombstone_optout_1991() {
 // Arch-14 item 10: repo release canonical delegation (real dispatch entry)
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn managed_wt_fixture(
     tag: &str,
 ) -> (
@@ -3094,6 +3095,7 @@ fn managed_wt_fixture(
     (base, home, repo, wt)
 }
 
+#[cfg(unix)]
 fn git_init(repo: &std::path::Path) {
     std::process::Command::new("git")
         .args(["init", "-b", "main"])
@@ -3118,6 +3120,7 @@ fn git_init(repo: &std::path::Path) {
         .ok();
 }
 
+#[cfg(unix)]
 fn seed_managed_marker(
     wt: &std::path::Path,
     repo: &std::path::Path,
@@ -3136,6 +3139,7 @@ fn seed_managed_marker(
     crate::binding::bind_full(home, agent, "", branch, wt, repo, false).expect("bind");
 }
 
+#[cfg(unix)]
 fn dispatch_repo_release(home: &std::path::Path, caller: &str, path: &str) -> serde_json::Value {
     let args = serde_json::json!({"action": "release", "path": path});
     let sender: Option<crate::identity::Sender> = if caller.is_empty() {
