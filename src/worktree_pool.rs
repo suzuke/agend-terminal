@@ -601,6 +601,34 @@ fn record_binding_removal(out: &mut ReleaseOutcome, removal: crate::binding::Bin
     }
 }
 
+fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bool> {
+    if task_id.is_empty() {
+        return Some(false);
+    }
+    match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => {
+            let active = !matches!(
+                routed.task.status,
+                crate::task_events::TaskStatus::Done
+                    | crate::task_events::TaskStatus::Cancelled
+                    | crate::task_events::TaskStatus::Verified
+            );
+            // A live task with no branch metadata is still an unresolved
+            // holder for this binding; preserve rather than guessing.
+            let branch_matches = routed
+                .task
+                .branch
+                .as_deref()
+                .map(|task_branch| task_branch == branch)
+                .unwrap_or(true);
+            Some(active && branch_matches)
+        }
+        Err(crate::tasks::TaskRouteError::NotFound) => Some(false),
+        Err(crate::tasks::TaskRouteError::Unreadable { .. })
+        | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
+    }
+}
+
 fn resolve_branch_cleanup(
     home: &Path,
     binding: &serde_json::Value,
@@ -650,6 +678,56 @@ fn resolve_branch_cleanup(
                 "authority-proven review lease on '{branch}' had dirty work — branch preserved"
             ));
             return;
+        }
+        if let Some(expected) = authority_proven_head {
+            let default = crate::git_helpers::default_branch(Path::new(sr_str));
+            let task_active = task_active_for_branch(home, task_id, branch);
+            let open_pr =
+                match crate::branch_sweep::open_pr_status(Path::new(sr_str), &default, branch) {
+                    crate::branch_sweep::OpenPrStatus::Open => Some(true),
+                    crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
+                    crate::branch_sweep::OpenPrStatus::Unknown => None,
+                };
+            let unique_unpreserved_work =
+                crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
+                    .ok()
+                    .map(|tip| tip.trim() != expected);
+            let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
+                &crate::worktree::disposition::BranchLifecycleInput {
+                    provenance: crate::worktree::disposition::BranchProvenance::ManagedReview,
+                    terminal: true,
+                    active_holder: crate::worktree_cleanup::branch_has_other_active_binding(
+                        home,
+                        Path::new(sr_str),
+                        branch,
+                        binding["worktree"].as_str(),
+                    ),
+                    task_active,
+                    open_pr,
+                    unique_unpreserved_work,
+                },
+            );
+            if !matches!(
+                lifecycle,
+                crate::worktree::disposition::BranchLifecycleDisposition::Delete
+            ) {
+                out.branch_cleanup_skipped_reason = Some(format!(
+                    "authority-proven review branch '{branch}' lifecycle evidence is not terminal — preserved (fail-closed)"
+                ));
+                return;
+            }
+            if !dry_run {
+                if let Err(error) = crate::branch_sweep::prepare_branch_recovery(
+                    Some(home),
+                    Path::new(sr_str),
+                    branch,
+                    expected,
+                    "authority-proven review release",
+                ) {
+                    out.branch_cleanup_skipped_reason = Some(error);
+                    return;
+                }
+            }
         }
         let (deleted, skip_reason) =
             cleanup_merged_branch(Path::new(sr_str), branch, dry_run, authority_proven_head);

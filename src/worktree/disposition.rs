@@ -101,6 +101,70 @@ pub(crate) enum BranchDisposition {
     DeleteBranch,
 }
 
+/// Provenance of a branch that a lifecycle path is considering for removal.
+/// Naming alone is never sufficient provenance: callers must resolve one of
+/// these variants from the binding/task/SCM evidence they own, otherwise the
+/// classifier fails closed with [`BranchLifecycleDisposition::Keep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchProvenance {
+    /// A review checkout carrying an authority-proven lease identity.
+    ManagedReview,
+    /// A normal branch whose tip is reachable from the default branch.
+    Merged,
+    /// A normal branch whose changes are proven squash-merged.
+    SquashMerged,
+    /// A terminal reviewer-checkout residue (for example an aged, unbound
+    /// `review/*` checkout). This is distinct from a forged name: callers
+    /// still need all the terminal/occupancy/task/PR gates below.
+    ReviewerResidue,
+    /// Evidence was missing or contradictory.
+    Unknown,
+}
+
+/// Typed branch-ref lifecycle decision shared by release and cleanup paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchLifecycleDisposition {
+    Keep,
+    Delete,
+}
+
+/// Resolved evidence for the branch lifecycle decision. `None` on any
+/// safety-critical dimension means that the caller could not prove the safe
+/// answer; the classifier intentionally treats that as `Keep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BranchLifecycleInput {
+    pub provenance: BranchProvenance,
+    pub terminal: bool,
+    pub active_holder: Option<bool>,
+    pub task_active: Option<bool>,
+    pub open_pr: Option<bool>,
+    pub unique_unpreserved_work: Option<bool>,
+}
+
+/// Decide whether a branch ref may be deleted after its worktree/lease
+/// lifecycle has reached a terminal boundary. This is deliberately pure so
+/// release and cleanup cannot grow subtly different ad-hoc branch-name rules.
+/// Every unresolved or negative-preservation signal keeps the branch.
+pub(crate) fn branch_lifecycle_disposition(
+    input: &BranchLifecycleInput,
+) -> BranchLifecycleDisposition {
+    if !input.terminal
+        || input.active_holder != Some(false)
+        || input.task_active != Some(false)
+        || input.open_pr != Some(false)
+        || input.unique_unpreserved_work != Some(false)
+    {
+        return BranchLifecycleDisposition::Keep;
+    }
+    match input.provenance {
+        BranchProvenance::ManagedReview
+        | BranchProvenance::Merged
+        | BranchProvenance::SquashMerged
+        | BranchProvenance::ReviewerResidue => BranchLifecycleDisposition::Delete,
+        BranchProvenance::Unknown => BranchLifecycleDisposition::Keep,
+    }
+}
+
 /// Pre-computed, caller-gathered signals for [`terminal_disposition`]. Ambiguity
 /// is preserved as `Option::None` on the dimensions where the DECISION (not the
 /// I/O) owns the fail-direction, so the classifier can route it to `Keep`.
@@ -458,5 +522,56 @@ mod tests {
             branch_disposition(BranchSignal::ProvablyInDefault),
             BranchDisposition::DeleteBranch
         );
+    }
+
+    fn branch_input(provenance: BranchProvenance) -> BranchLifecycleInput {
+        BranchLifecycleInput {
+            provenance,
+            terminal: true,
+            active_holder: Some(false),
+            task_active: Some(false),
+            open_pr: Some(false),
+            unique_unpreserved_work: Some(false),
+        }
+    }
+
+    #[test]
+    fn branch_lifecycle_deletes_only_proven_terminal_dispositions() {
+        for provenance in [
+            BranchProvenance::ManagedReview,
+            BranchProvenance::Merged,
+            BranchProvenance::SquashMerged,
+            BranchProvenance::ReviewerResidue,
+        ] {
+            assert_eq!(
+                branch_lifecycle_disposition(&branch_input(provenance)),
+                BranchLifecycleDisposition::Delete,
+                "terminal proven branch should be deletable: {provenance:?}"
+            );
+        }
+        assert_eq!(
+            branch_lifecycle_disposition(&branch_input(BranchProvenance::Unknown)),
+            BranchLifecycleDisposition::Keep
+        );
+    }
+
+    #[test]
+    fn branch_lifecycle_fails_closed_for_active_open_or_unknown_work() {
+        for mutate in [
+            |i: &mut BranchLifecycleInput| i.active_holder = Some(true),
+            |i: &mut BranchLifecycleInput| i.task_active = Some(true),
+            |i: &mut BranchLifecycleInput| i.open_pr = Some(true),
+            |i: &mut BranchLifecycleInput| i.unique_unpreserved_work = Some(true),
+            |i: &mut BranchLifecycleInput| i.open_pr = None,
+            |i: &mut BranchLifecycleInput| i.task_active = None,
+        ] {
+            let mut input = branch_input(BranchProvenance::ReviewerResidue);
+            mutate(&mut input);
+            assert_eq!(
+                branch_lifecycle_disposition(&input),
+                BranchLifecycleDisposition::Keep,
+                "unsafe or unknown branch evidence must keep the ref"
+            );
+        }
     }
 }

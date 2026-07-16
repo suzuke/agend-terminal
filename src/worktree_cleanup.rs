@@ -622,7 +622,7 @@ pub fn sweep_from_registry(
         // PR-D6: sweep is always live now (gated by AUTO_CLEANUP only), so the
         // helpers' still-supported `dry_run` param is passed `false` here.
         prune_stale_worktrees(repo, false);
-        let pruned = prune_orphaned_branches(repo, false);
+        let pruned = prune_orphaned_branches_with_home(Some(home), repo, false);
         for (branch, reason) in pruned {
             removed.push((branch, "(no worktree)".to_string(), reason));
         }
@@ -825,6 +825,40 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
     result
 }
 
+pub(crate) fn branch_has_active_binding(home: &Path, repo: &Path, branch: &str) -> Option<bool> {
+    branch_has_other_active_binding(home, repo, branch, None)
+}
+
+pub(crate) fn branch_has_other_active_binding(
+    home: &Path,
+    repo: &Path,
+    branch: &str,
+    excluded_worktree: Option<&str>,
+) -> Option<bool> {
+    let canonical_repo = std::fs::canonicalize(repo).ok()?;
+    for (_, binding) in crate::binding::binding_scan_all(home) {
+        if excluded_worktree
+            .zip(binding["worktree"].as_str())
+            .is_some_and(|(excluded, bound)| excluded == bound)
+        {
+            continue;
+        }
+        let Some(bound_branch) = binding["branch"].as_str() else {
+            continue;
+        };
+        let Some(source) = binding["source_repo"].as_str() else {
+            continue;
+        };
+        let Ok(source) = std::fs::canonicalize(source) else {
+            return None;
+        };
+        if bound_branch == branch && source == canonical_repo {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// Run `git worktree prune` then delete local branches whose remote tracking
 /// ref is gone, that are merged into main, or that are squash-merge orphans
 /// (#1750-B3). Skips branches checked out in any worktree.
@@ -833,7 +867,16 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
 /// worktree-occupancy skip) but skips the actual `git branch -D` — eligible
 /// branches are still returned (with their real reason: `"merged"` or
 /// `"squash-merged"`) so the caller can log/audit the candidate list.
+#[allow(dead_code)]
 fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'static str)> {
+    prune_orphaned_branches_with_home(None, repo_root, dry_run)
+}
+
+fn prune_orphaned_branches_with_home(
+    home: Option<&Path>,
+    repo_root: &Path,
+    dry_run: bool,
+) -> Vec<(String, &'static str)> {
     let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
     // PR-B rider (dev2 #2695 seat2): fail-CLOSED occupancy. If the worktree list
@@ -891,13 +934,63 @@ fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'st
         // so the merged/squash paths never reap them — a TTL is their only live
         // terminal path (H1 in the RCA).
         let scaffold = !merged && !squash && is_stale_review_scaffold(repo_root, branch);
+        let provenance = if merged {
+            crate::worktree::disposition::BranchProvenance::Merged
+        } else if squash {
+            crate::worktree::disposition::BranchProvenance::SquashMerged
+        } else if scaffold {
+            crate::worktree::disposition::BranchProvenance::ReviewerResidue
+        } else {
+            crate::worktree::disposition::BranchProvenance::Unknown
+        };
+        let task_active = match home {
+            Some(h) => crate::branch_sweep::branch_has_active_task(h, branch),
+            None => Some(false),
+        };
+        let binding_active = match home {
+            Some(h) => branch_has_active_binding(h, repo_root, branch),
+            None => Some(false),
+        };
+        let active_holder = match (wt_branches.contains(branch), binding_active) {
+            (true, _) | (_, Some(true)) => Some(true),
+            (false, Some(false)) => Some(false),
+            _ => None,
+        };
+        let open_pr = if merged || squash || scaffold {
+            match crate::branch_sweep::open_pr_status(repo_root, &default, branch) {
+                crate::branch_sweep::OpenPrStatus::Open => Some(true),
+                crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
+                crate::branch_sweep::OpenPrStatus::Unknown => None,
+            }
+        } else {
+            // Unknown provenance is already a KEEP decision; avoid an
+            // unnecessary network probe for branches that cannot be deleted.
+            Some(false)
+        };
+        let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
+            &crate::worktree::disposition::BranchLifecycleInput {
+                provenance,
+                terminal: merged || squash || scaffold,
+                active_holder,
+                task_active,
+                open_pr,
+                // Reviewer residue is snapshotted into a recovery ref before
+                // deletion below; merged/squash work is already in `default`.
+                unique_unpreserved_work: Some(false),
+            },
+        );
         // PR-D·D3: the reap decision (L4) delegates to `branch_disposition` via
         // `branch_reap_delete`. `merged || squash` = ProvablyInDefault → delete;
         // `scaffold` is the explicit external-arm override (a NotMerged branch the
         // classifier keeps, aged past its TTL). Phase-2 does not compute remote-gone
         // (CR-2026-06-14 dropped it as a trigger) → remote_gone=false. Byte-identical
         // to the prior `!merged && !squash && !scaffold` continue-gate.
-        if !branch_reap_delete(merged || squash, false, scaffold) {
+        if !branch_reap_delete(merged || squash, false, scaffold)
+            || !matches!(
+                lifecycle,
+                crate::worktree::disposition::BranchLifecycleDisposition::Delete
+            )
+        {
             continue;
         }
         // The scaffolding path never merged, so its commits survive only in the
@@ -908,6 +1001,23 @@ fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'st
         } else {
             None
         };
+        if scaffold && !dry_run {
+            if let Some(tip) = scaffold_tip.as_deref() {
+                if crate::branch_sweep::prepare_branch_recovery(
+                    home,
+                    repo_root,
+                    branch,
+                    tip,
+                    "review-scaffold-ttl",
+                )
+                .is_err()
+                {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
         let ok = dry_run || crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
         if ok {
             let reason = if merged {

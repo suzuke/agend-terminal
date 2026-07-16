@@ -3,23 +3,24 @@
 //! Operator-triggered hygiene sweep that categorizes local branches
 //! into 4 buckets (`clean_merged`, `squash_merged`, `stale_idle`,
 //! `active_unknown`) and offers a dry-run + confirm-subset workflow
-//! to delete the safe ones. Mirrors the `tasks::sweep_impl` pattern
+//! to delete only the proven-safe ones. Mirrors the `tasks::sweep_impl` pattern
 //! from #806 — same `dry-run + confirm_ids + system identity +
 //! audit_reason` shape — but operates on local git refs instead of
 //! the task board.
 //!
-//! No GitHub API dependency. Everything is local `git for-each-ref` /
-//! `git cherry` / `git branch -D` subprocess. Cache layer (in-memory
-//! `HashMap` per sweep) dedups repeated cherry calls when branches
+//! Local Git provides the primary evidence; a configured GitHub remote is
+//! queried only for the apply-time open-PR preservation gate. Cache layer
+//! (in-memory `HashMap` per sweep) dedups repeated cherry calls when branches
 //! share ancestry.
 //!
 //! Safety stack (mirrors #806 + force-delete-specific layers):
 //! - `system:branch_sweep` identity (allow-list at tasks.rs:485)
 //! - dry-run default; apply requires explicit `apply=true`
-//! - `confirm_ids` MUST be subset of `candidate_ids` from prior dry-run
+//! - `confirm_ids` MUST be a subset of the current dry-run inventory; only
+//!   proven terminal IDs can pass the apply classifier
 //! - `audit_reason` required, non-empty
-//! - `active_unknown` bucket skipped unless operator explicitly picks
-//!   those IDs (the bucket itself surfaces in dry-run for visibility)
+//! - `active_unknown` bucket is always preserved, even when an operator
+//!   includes its ID in `confirm_ids`; it remains visible for follow-up
 //! - `event_log.jsonl` records `branch=<name> source=<sha>` so an
 //!   operator can `git branch <name> <sha>` to restore
 
@@ -119,10 +120,9 @@ impl Categories {
         v
     }
 
-    /// Total IDs including the explicit-opt-in `active_unknown`
-    /// bucket. Used to validate confirm_ids subset — operator CAN
-    /// pick active_unknown IDs, they just don't show up in the
-    /// default `deletable_ids`.
+    /// Total IDs including the non-deletable `active_unknown` bucket. The
+    /// handler uses this inventory to reject stale IDs while keeping unknown
+    /// branches visible; the lifecycle classifier still preserves them.
     pub fn all_ids(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .clean_merged
@@ -452,7 +452,15 @@ fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
     };
     stdout
         .lines()
-        .map(|l| l.trim_start_matches('*').trim())
+        .map(|line| {
+            line.trim_start_matches(|ch| {
+                // `git branch` prefixes the current checkout with `*`; the
+                // fleet-managed git shim additionally uses `+` for a branch held by
+                // another worktree. Both prefixes still identify the branch name.
+                ch == '*' || ch == '+'
+            })
+            .trim()
+        })
         .any(|line| line == branch)
 }
 
@@ -512,6 +520,56 @@ pub(crate) enum PrMergeStatus {
     Merged,
     NotMerged,
     Unknown,
+}
+
+/// Tri-state open-PR probe used by branch lifecycle retirement. A repository
+/// without a GitHub remote has no open-PR surface to query (`NotOpen`), while
+/// a GitHub/SCM lookup failure is `Unknown` and must fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenPrStatus {
+    Open,
+    NotOpen,
+    Unknown,
+}
+
+/// Resolve whether `branch` still has an open PR. The lifecycle classifier
+/// owns the fail direction; this helper only gathers the SCM evidence.
+pub(crate) fn open_pr_status(repo: &Path, base: &str, branch: &str) -> OpenPrStatus {
+    let remote_url = match crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]) {
+        Ok(url) => url,
+        Err(crate::git_helpers::GitError::NonZero { stderr, .. })
+            if stderr.contains("No such remote") =>
+        {
+            // No remote is a deterministic local-fixture/no-PR state, not a
+            // transient SCM outage.
+            return OpenPrStatus::NotOpen;
+        }
+        Err(_) => return OpenPrStatus::Unknown,
+    };
+    let Some(gh_repo) = extract_github_repo(&remote_url) else {
+        // A configured non-GitHub remote is an unresolved SCM surface, not
+        // evidence that the branch has no open review. Keep the lifecycle
+        // decision fail-closed until a provider can answer it.
+        return OpenPrStatus::Unknown;
+    };
+    let Ok(prs) = crate::scm::make_scm_provider(&gh_repo, None).pr_list(
+        &gh_repo,
+        &crate::scm::ListFilter {
+            state: Some("open"),
+            head: Some(branch.to_string()),
+            base: Some(base.to_string()),
+            ..Default::default()
+        },
+        &["number"],
+        None,
+    ) else {
+        return OpenPrStatus::Unknown;
+    };
+    if prs.is_empty() {
+        OpenPrStatus::NotOpen
+    } else {
+        OpenPrStatus::Open
+    }
 }
 
 /// GitHub API based detection: query whether a merged PR exists for this
@@ -752,9 +810,32 @@ pub(crate) fn scan(
 /// success is observable in the event log.
 ///
 /// Dead-code allow lifts at C3 when the MCP handler wires the call.
+#[allow(dead_code)]
 pub(crate) fn emit_delete_batch(
     home: &Path,
     repo: &Path,
+    categories: &Categories,
+    confirm_ids: &std::collections::HashSet<String>,
+    audit_reason: &str,
+) -> Result<usize, String> {
+    emit_delete_batch_with_context(
+        Some(home),
+        repo,
+        "main",
+        categories,
+        confirm_ids,
+        audit_reason,
+    )
+}
+
+/// Apply a branch-sweep confirmation with lifecycle evidence. The legacy
+/// wrapper above keeps the existing unit-test seam; production MCP callers
+/// pass the explicit base and home so active holders, tasks, and PR state are
+/// checked before any branch mutation.
+pub(crate) fn emit_delete_batch_with_context(
+    home: Option<&Path>,
+    repo: &Path,
+    base: &str,
     categories: &Categories,
     confirm_ids: &std::collections::HashSet<String>,
     audit_reason: &str,
@@ -802,6 +883,81 @@ pub(crate) fn emit_delete_batch(
         let Some(cand) = name_to_candidate.get(name.as_str()) else {
             continue;
         };
+        let is_reviewer = categories.reviewer_checkout.iter().any(|c| c.name == *name);
+        let provenance = if is_reviewer {
+            crate::worktree::disposition::BranchProvenance::ReviewerResidue
+        } else if categories.clean_merged.iter().any(|c| c.name == *name) {
+            crate::worktree::disposition::BranchProvenance::Merged
+        } else if categories.squash_merged.iter().any(|c| c.name == *name) {
+            crate::worktree::disposition::BranchProvenance::SquashMerged
+        } else {
+            // `active_unknown` has no terminal provenance and therefore
+            // remains fail-closed in the shared classifier.
+            crate::worktree::disposition::BranchProvenance::Unknown
+        };
+        let binding_active =
+            home.and_then(|h| crate::worktree_cleanup::branch_has_active_binding(h, repo, name));
+        let active_holder = match (branch_is_checked_out(repo, name), binding_active) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        };
+        let task_active = home.and_then(|h| branch_has_active_task(h, name));
+        let terminal = !matches!(
+            provenance,
+            crate::worktree::disposition::BranchProvenance::Unknown
+        );
+        let open_pr = if terminal {
+            match open_pr_status(repo, base, name) {
+                OpenPrStatus::Open => Some(true),
+                OpenPrStatus::NotOpen => Some(false),
+                OpenPrStatus::Unknown => None,
+            }
+        } else {
+            // Unknown provenance is already a KEEP decision; do not probe an
+            // external SCM surface for a branch that cannot be deleted.
+            Some(false)
+        };
+        // Reviewer residue is only deleted after a recovery ref is prepared
+        // below; all other proven terminal categories are already preserved
+        // by their merge/squash provenance.
+        let unique_unpreserved_work = Some(false);
+        let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
+            &crate::worktree::disposition::BranchLifecycleInput {
+                provenance,
+                terminal,
+                active_holder,
+                task_active,
+                open_pr,
+                unique_unpreserved_work,
+            },
+        );
+        if !matches!(
+            lifecycle,
+            crate::worktree::disposition::BranchLifecycleDisposition::Delete
+        ) {
+            crate::event_log::log(
+                home.unwrap_or(repo),
+                "branch_sweep_apply_skipped",
+                "system:branch_sweep",
+                &format!(
+                    "branch={name} reason=branch lifecycle evidence not terminal or provenance unknown; preserved"
+                ),
+            );
+            continue;
+        }
+        let recovery_ref = if is_reviewer {
+            Some(prepare_branch_recovery(
+                home,
+                repo,
+                name,
+                &cand.tip_sha,
+                audit_reason,
+            )?)
+        } else {
+            None
+        };
+        let _ = recovery_ref;
         // W1.2: git_cmd's GitError preserves the two distinct failure logs this
         // site emits — NonZero carries the trimmed stderr, Spawn carries the io error.
         match crate::git_helpers::git_cmd(repo, &["branch", "-D", name]) {
@@ -809,7 +965,7 @@ pub(crate) fn emit_delete_batch(
                 deleted += 1;
                 let category = category_of(name);
                 crate::event_log::log(
-                    home,
+                    home.unwrap_or(repo),
                     "branch_sweep_apply",
                     "system:branch_sweep",
                     &format!(
@@ -821,7 +977,7 @@ pub(crate) fn emit_delete_batch(
             }
             Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
                 crate::event_log::log(
-                    home,
+                    home.unwrap_or(repo),
                     "branch_sweep_apply_failed",
                     "system:branch_sweep",
                     &format!("branch={name} stderr={stderr}"),
@@ -829,7 +985,7 @@ pub(crate) fn emit_delete_batch(
             }
             Err(crate::git_helpers::GitError::Spawn(e)) => {
                 crate::event_log::log(
-                    home,
+                    home.unwrap_or(repo),
                     "branch_sweep_apply_failed",
                     "system:branch_sweep",
                     &format!("branch={name} spawn_error={e}"),
@@ -838,6 +994,90 @@ pub(crate) fn emit_delete_batch(
         }
     }
     Ok(deleted)
+}
+
+fn branch_is_checked_out(repo: &Path, branch: &str) -> Option<bool> {
+    let out = crate::git_helpers::git_cmd(repo, &["worktree", "list", "--porcelain"]).ok()?;
+    let mut live_worktree = false;
+    let mut prunable = false;
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            live_worktree = Path::new(path.trim()).exists();
+            prunable = false;
+            continue;
+        }
+        if line.starts_with("prunable ") {
+            prunable = true;
+            live_worktree = false;
+            continue;
+        }
+        if line
+            .strip_prefix("branch refs/heads/")
+            .is_some_and(|name| name.trim() == branch)
+            && live_worktree
+            && !prunable
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> Option<bool> {
+    let tasks = crate::tasks::list_all_strict(home).ok()?;
+    Some(tasks.iter().any(|task| {
+        task.branch.as_deref() == Some(branch)
+            && !matches!(
+                task.status,
+                crate::task_events::TaskStatus::Done
+                    | crate::task_events::TaskStatus::Cancelled
+                    | crate::task_events::TaskStatus::Verified
+            )
+    }))
+}
+
+/// Create a durable recovery ref for a reviewer residue before deleting its
+/// branch. The source SHA is the CAS identity; the returned ref is the
+/// operator-visible recovery/audit identity.
+pub(crate) fn prepare_branch_recovery(
+    home: Option<&Path>,
+    repo: &Path,
+    branch: &str,
+    tip_sha: &str,
+    reason: &str,
+) -> Result<String, String> {
+    if tip_sha.is_empty() {
+        return Err(format!("branch '{branch}' has no source SHA; preserved"));
+    }
+    let safe_branch: String = branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let identity = format!(
+        "refs/agend/recovery/branch/{safe_branch}/{}-{}",
+        &tip_sha[..tip_sha.len().min(12)],
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    let out = crate::git_helpers::git_bypass(repo, &["update-ref", &identity, tip_sha])
+        .map_err(|e| format!("prepare recovery ref for '{branch}' failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "prepare recovery ref for '{branch}' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if let Some(home) = home {
+        crate::event_log::log(
+            home,
+            "branch_cleanup_prepared",
+            "system:branch_lifecycle",
+            &format!(
+                "repo={} branch={branch} source_sha={tip_sha} recovery_ref={identity} reason={reason}",
+                repo.display()
+            ),
+        );
+    }
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -1529,7 +1769,7 @@ mod tests {
         let repo = setup_repo("orphan_wt_reg");
         let home = repo.parent().unwrap().to_path_buf();
         create_branch_with_commit(&repo, "feat-orphan", "feat: orphan");
-        git_run(
+        let _merge = git_run(
             &repo,
             &["merge", "--no-ff", "-m", "merge feat-orphan", "feat-orphan"],
         );
@@ -1623,6 +1863,53 @@ mod tests {
         assert!(
             log.contains("post-#817 test apply"),
             "event-log must carry the audit_reason"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn branch_recovery_ref_records_source_sha_and_audit_identity() {
+        let repo = setup_repo("branch_recovery_metadata");
+        let home = repo.parent().unwrap().to_path_buf();
+        git_run(&repo, &["checkout", "-b", "review/123"]);
+        std::fs::write(repo.join("residue.txt"), "review residue\n").expect("write");
+        git_run(&repo, &["add", "residue.txt"]);
+        git_run(&repo, &["commit", "-m", "review residue"]);
+        let tip = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        git_run(&repo, &["checkout", "main"]);
+
+        let recovery_ref = prepare_branch_recovery(
+            Some(&home),
+            &repo,
+            "review/123",
+            &tip,
+            "recovery metadata test",
+        )
+        .expect("recovery ref must be created");
+        let resolved =
+            String::from_utf8_lossy(&git_run(&repo, &["rev-parse", &recovery_ref]).stdout)
+                .trim()
+                .to_string();
+        assert_eq!(resolved, tip, "recovery ref must preserve the source SHA");
+        assert!(
+            recovery_ref.starts_with("refs/agend/recovery/branch/review_123/"),
+            "recovery identity must include the sanitized branch: {recovery_ref}"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("branch_cleanup_prepared"),
+            "audit event missing: {log}"
+        );
+        assert!(
+            log.contains(&format!("source_sha={tip}")),
+            "source SHA missing: {log}"
+        );
+        assert!(
+            log.contains(&format!("recovery_ref={recovery_ref}")),
+            "recovery identity missing: {log}"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
@@ -1770,14 +2057,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_sweep_handler_active_unknown_requires_explicit_opt_in() {
-        // GREEN: a branch in `active_unknown` (recent, unmerged, not
-        // squash-applied) is NOT in `candidate_ids` (deletable_ids
-        // excludes active_unknown). Handler's dry-run surfaces it
-        // separately so the operator can SEE it. Operator can still
-        // delete it by passing its name in confirm_ids — handler's
-        // subset check uses all_ids (which DOES include
-        // active_unknown). Locks the explicit-opt-in contract.
+    fn test_branch_sweep_handler_active_unknown_remains_fail_closed() {
+        // A branch in `active_unknown` (recent, unmerged, not
+        // squash-applied) is NOT in `candidate_ids` and remains visible in
+        // the dry-run response. Even an explicit confirm cannot delete it:
+        // unknown provenance is a lifecycle KEEP decision.
         let repo = setup_repo("active_unknown_opt_in");
         let home = repo.parent().unwrap().to_path_buf();
         let agent = "test-agent";
@@ -1813,7 +2097,7 @@ mod tests {
             .collect();
         assert!(
             !candidate_ids.contains(&"wip-active"),
-            "wip-active must NOT be in candidate_ids (active_unknown opt-in), got: {candidate_ids:?}"
+            "wip-active must NOT be in candidate_ids (active_unknown is non-deletable), got: {candidate_ids:?}"
         );
         let active_unknown: Vec<&str> = r["categories"]["active_unknown"]
             .as_array()
@@ -1826,21 +2110,25 @@ mod tests {
             "wip-active must appear in active_unknown bucket for visibility, got: {active_unknown:?}"
         );
 
-        // Apply with wip-active in confirm_ids → handler accepts
-        // (subset check uses all_ids, NOT deletable_ids).
+        // Apply with wip-active in confirm_ids → handler reports no deletion
+        // and preserves the branch, despite the name being in all_ids.
         let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
             &home,
             &serde_json::json!({
                 "instance": agent,
                 "apply": true,
                 "confirm_ids": ["wip-active"],
-                "audit_reason": "explicit opt-in for active_unknown",
+                "audit_reason": "verify active_unknown remains preserved",
             }),
             agent,
         );
-        assert_eq!(
-            r["applied"], 1,
-            "explicit confirm_ids opt-in must delete active_unknown branch: {r}"
+        assert_eq!(r["applied"], 0, "active_unknown must remain preserved: {r}");
+        assert!(
+            enumerate_branches(&repo)
+                .expect("branches")
+                .iter()
+                .any(|candidate| candidate.name == "wip-active"),
+            "active_unknown branch must remain after explicit confirmation"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
