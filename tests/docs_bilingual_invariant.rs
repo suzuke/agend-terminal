@@ -87,11 +87,125 @@ fn canonical_location(path: &Path) -> bool {
     }
 }
 
+fn markdown_link_targets(content: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut in_fence = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if let Some((label, target)) = trimmed.split_once("]:") {
+            if label.starts_with('[') {
+                let target = clean_link_target(target);
+                if !target.is_empty() {
+                    targets.push(target.to_string());
+                }
+            }
+        }
+
+        let mut cursor = 0;
+        while let Some(marker) = line[cursor..].find("](") {
+            let start = cursor + marker + 2;
+            let mut depth = 1;
+            let mut escaped = false;
+            let mut end = None;
+
+            for (offset, character) in line[start..].char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match character {
+                    '\\' => escaped = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(start + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(end) = end else {
+                break;
+            };
+            let target = clean_link_target(&line[start..end]);
+            if !target.is_empty() {
+                targets.push(target.to_string());
+            }
+            cursor = end + 1;
+        }
+    }
+
+    targets
+}
+
+fn clean_link_target(target: &str) -> &str {
+    let target = target.trim();
+    if let Some(target) = target.strip_prefix('<') {
+        return target.split_once('>').map_or(target, |(target, _)| target);
+    }
+    target.split_whitespace().next().unwrap_or(target)
+}
+
+fn target_has_scheme(target: &str) -> bool {
+    target.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme.chars().enumerate().all(|(index, character)| {
+                character.is_ascii_alphabetic()
+                    || (index > 0
+                        && (character.is_ascii_digit() || matches!(character, '+' | '-' | '.')))
+            })
+    })
+}
+
+fn resolved_local_target(root: &Path, document: &Path, target: &str) -> Option<PathBuf> {
+    let target = clean_link_target(target);
+    if target.starts_with("//") || target_has_scheme(target) {
+        return None;
+    }
+
+    let path = target.split(['#', '?']).next().unwrap_or_default();
+    let relative = if path.is_empty() {
+        document.to_path_buf()
+    } else {
+        document.parent().unwrap_or(Path::new("")).join(path)
+    };
+    Some(root.join(relative))
+}
+
+fn normalized_link_target(target: &str) -> String {
+    let target = clean_link_target(target);
+    if target.starts_with("//") || target_has_scheme(target) {
+        return target.to_string();
+    }
+
+    let (path, has_fragment) = target
+        .split_once('#')
+        .map_or((target, false), |(path, _)| (path, true));
+    let mut normalized = path.replace(".zh-TW.md", ".md");
+    if has_fragment {
+        normalized.push('#');
+    }
+    normalized
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DocumentShape {
     heading_levels: Vec<usize>,
     fence_languages: Vec<String>,
     table_rows: usize,
+    link_targets: Vec<String>,
     release_keys: Vec<String>,
     env_keys: BTreeSet<String>,
 }
@@ -154,6 +268,10 @@ fn document_shape(content: &str) -> DocumentShape {
         heading_levels,
         fence_languages,
         table_rows,
+        link_targets: markdown_link_targets(content)
+            .iter()
+            .map(|target| normalized_link_target(target))
+            .collect(),
         release_keys,
         env_keys,
     }
@@ -191,6 +309,7 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
         }
 
         let content = fs::read_to_string(root.join(path)).expect("read Markdown");
+        let link_targets = markdown_link_targets(&content);
         if content.trim().len() < 100 {
             errors.push(format!(
                 "documentation is unexpectedly empty: {}",
@@ -208,19 +327,34 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
             ));
         }
 
-        let sibling_name = if is_chinese(path) {
-            english.file_name()
-        } else {
-            chinese.file_name()
-        }
-        .and_then(|name| name.to_str())
-        .expect("UTF-8 sibling filename");
-        if !content.contains(sibling_name) {
+        let sibling = if is_chinese(path) { &english } else { &chinese };
+        let sibling_name = sibling
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 sibling filename");
+        let sibling_target =
+            fs::canonicalize(root.join(sibling)).expect("bilingual sibling exists");
+        if !link_targets.iter().any(|target| {
+            resolved_local_target(&root, path, target)
+                .and_then(|target| fs::canonicalize(target).ok())
+                .is_some_and(|target| target == sibling_target)
+        }) {
             errors.push(format!(
                 "{} does not link to sibling {}",
                 path.display(),
                 sibling_name
             ));
+        }
+        for target in &link_targets {
+            if let Some(resolved) = resolved_local_target(&root, path, target) {
+                if !resolved.exists() {
+                    errors.push(format!(
+                        "broken local link in {}: {}",
+                        path.display(),
+                        target
+                    ));
+                }
+            }
         }
 
         if !is_chinese(path) {
@@ -249,6 +383,13 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
                     english_shape.table_rows,
                     chinese.display(),
                     chinese_shape.table_rows
+                ));
+            }
+            if english_shape.link_targets != chinese_shape.link_targets {
+                errors.push(format!(
+                    "link-target structure differs: {} vs {}",
+                    path.display(),
+                    chinese.display()
                 ));
             }
             if english_shape.release_keys != chinese_shape.release_keys {

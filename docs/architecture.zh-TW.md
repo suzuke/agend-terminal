@@ -224,7 +224,7 @@ Release → crates.io publish（見 RELEASING.md）。
 | Task event log：在 lock 之下 append 並 re-replay（`append_checked`），對未知的未來 event 採 fail-closed | task_events.rs:1034,1538 | TOCTOU 造成 board 損毀 / 靜默丟失 event |
 | Boot grace（180s）在 restart 後抑制 notification watchdog | per_tick/mod.rs:118 | restart 時爆出一連串假警報（handler 收斂進度記錄於 Architecture-14 台帳） |
 | Per-tick handler 順序須與 pre-extraction 的呼叫順序一致 | daemon/mod.rs:577-579 | 細微的反應重新排序 |
-| `spawn` 處須附帶 fire-and-forget 理由，或保存 JoinHandle | protocol §10.4、Phase-5b invariant test | 關閉時留下 orphan task |
+| `spawn` 處須附帶 fire-and-forget 理由，或保存 JoinHandle | protocol §12.5、Phase-5b invariant test | 關閉時留下 orphan task |
 
 ## 5. 橫切（cross-cutting）模式
 

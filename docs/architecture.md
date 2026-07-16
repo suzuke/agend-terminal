@@ -229,7 +229,7 @@ The load-bearing disciplines, each runtime- or CI-enforced:
 | Task event log: append under lock with re-replay (`append_checked`), fail-closed on unknown future events | task_events.rs:1034,1538 | TOCTOU board corruption / silent event drops |
 | Boot grace (180s) suppresses notification watchdogs after restart | per_tick/mod.rs:118 | restart burst of false alerts (handler convergence is tracked in the Architecture-14 ledger) |
 | Per-tick handler order matches pre-extraction call order | daemon/mod.rs:577-579 | subtle reaction reordering |
-| `spawn` sites carry fire-and-forget rationale or store JoinHandle | protocol §10.4, Phase-5b invariant test | orphan tasks on shutdown |
+| `spawn` sites carry fire-and-forget rationale or store JoinHandle | protocol §12.5, Phase-5b invariant test | orphan tasks on shutdown |
 
 ## 5. Cross-cutting patterns
 
