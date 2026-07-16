@@ -797,3 +797,63 @@ fn full_delete_fleet_load_ambiguity_preserves_workspace_2764_slice10a() {
     );
     std::fs::remove_dir_all(home).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn full_delete_candidate_canonicalization_ambiguity_preserves_and_errors_2764_slice10a() {
+    let home = tmp_home("slice10a_candidate_ambiguous");
+    let victim_dir = crate::paths::workspace_dir(&home).join("victim");
+    cleanup_admission_seed_canaries(&victim_dir);
+    let ambiguous_candidate = victim_dir.join("ambiguous");
+    std::os::unix::fs::symlink(victim_dir.join("missing-target"), &ambiguous_candidate).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n",
+            ambiguous_candidate.display()
+        ),
+    )
+    .unwrap();
+
+    let error = super::full_delete_instance(&home, "victim")
+        .expect_err("an unresolved candidate path must fail closed loudly");
+
+    assert!(
+        error.contains("candidate") && error.contains("cannot canonicalize"),
+        "candidate ambiguity should identify the admission refusal: {error}"
+    );
+    assert!(
+        cleanup_admission_canaries_intact(&victim_dir),
+        "candidate canonicalization ambiguity must preserve all victim bytes"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn full_delete_survivor_canonicalization_ambiguity_preserves_and_errors_2764_slice10a() {
+    let home = tmp_home("slice10a_survivor_ambiguous");
+    let victim_dir = crate::paths::workspace_dir(&home).join("victim");
+    cleanup_admission_seed_canaries(&victim_dir);
+    let missing_survivor = home.join("missing-survivor");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            missing_survivor.display()
+        ),
+    )
+    .unwrap();
+
+    let error = super::full_delete_instance(&home, "victim")
+        .expect_err("an unresolved survivor path must fail closed loudly");
+
+    assert!(
+        error.contains("survivor 'survivor'") && error.contains("ambiguous"),
+        "survivor ambiguity should identify the admission refusal: {error}"
+    );
+    assert!(
+        cleanup_admission_canaries_intact(&victim_dir),
+        "survivor canonicalization ambiguity must preserve all victim bytes"
+    );
+    std::fs::remove_dir_all(home).ok();
+}

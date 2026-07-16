@@ -681,6 +681,16 @@ pub(crate) fn cleanup_working_dir_admitted(
             );
             None
         }
+        cleanup_admission::CleanupAdmission::NoOp { reason } => {
+            tracing::debug!(
+                name,
+                dir = %working_dir.display(),
+                %reason,
+                "pre-delete cleanup admission found no working directory to mutate"
+            );
+            None
+        }
+        cleanup_admission::CleanupAdmission::Refuse { reason } => Some(reason.clone()),
         cleanup_admission::CleanupAdmission::RemoveOwned { canonical }
         | cleanup_admission::CleanupAdmission::ScrubExclusive { canonical } => {
             match dunce::canonicalize(working_dir) {

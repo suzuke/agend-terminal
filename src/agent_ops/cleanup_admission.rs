@@ -14,6 +14,8 @@ pub(crate) enum CleanupAdmission {
     RemoveOwned { canonical: PathBuf },
     ScrubExclusive { canonical: PathBuf },
     Preserve { reason: String },
+    NoOp { reason: String },
+    Refuse { reason: String },
 }
 
 fn has_dotdot(path: &Path) -> bool {
@@ -23,6 +25,14 @@ fn has_dotdot(path: &Path) -> bool {
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {
     a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+fn path_entry_present(candidate: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(candidate) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn raw_working_directory(snapshot: &FleetConfig, home: &Path, name: &str) -> Option<PathBuf> {
@@ -42,18 +52,39 @@ pub(crate) fn derive(
     victim: &str,
     candidate: &Path,
 ) -> CleanupAdmission {
+    let candidate_present = match path_entry_present(candidate) {
+        Ok(present) => present,
+        Err(error) => {
+            return CleanupAdmission::Refuse {
+                reason: format!(
+                    "candidate {} cannot inspect metadata: {error}",
+                    candidate.display()
+                ),
+            };
+        }
+    };
     let Some(snapshot) = snapshot else {
-        return CleanupAdmission::Preserve {
+        if !candidate_present {
+            return CleanupAdmission::NoOp {
+                reason: "fleet snapshot unavailable but candidate is already absent".to_string(),
+            };
+        }
+        return CleanupAdmission::Refuse {
             reason: "fleet snapshot unavailable — cleanup ownership is unproven".to_string(),
         };
     };
     if !snapshot.instances.contains_key(victim) {
-        return CleanupAdmission::Preserve {
+        if !candidate_present {
+            return CleanupAdmission::NoOp {
+                reason: format!("victim '{victim}' is absent and candidate is already absent"),
+            };
+        }
+        return CleanupAdmission::Refuse {
             reason: format!("victim '{victim}' is absent from the fleet snapshot"),
         };
     }
     if candidate.as_os_str().is_empty() || has_dotdot(candidate) {
-        return CleanupAdmission::Preserve {
+        return CleanupAdmission::Refuse {
             reason: format!(
                 "candidate {} is empty or contains '..'",
                 candidate.display()
@@ -63,7 +94,12 @@ pub(crate) fn derive(
     let candidate_canonical = match dunce::canonicalize(candidate) {
         Ok(path) => path,
         Err(error) => {
-            return CleanupAdmission::Preserve {
+            if error.kind() == std::io::ErrorKind::NotFound && !candidate_present {
+                return CleanupAdmission::NoOp {
+                    reason: format!("candidate {} is already absent", candidate.display()),
+                };
+            }
+            return CleanupAdmission::Refuse {
                 reason: format!(
                     "candidate {} cannot canonicalize: {error}",
                     candidate.display()
@@ -77,12 +113,12 @@ pub(crate) fn derive(
             continue;
         }
         let Some(survivor_path) = raw_working_directory(snapshot, home, name) else {
-            return CleanupAdmission::Preserve {
+            return CleanupAdmission::Refuse {
                 reason: format!("survivor '{name}' has no resolvable working directory"),
             };
         };
         if has_dotdot(&survivor_path) {
-            return CleanupAdmission::Preserve {
+            return CleanupAdmission::Refuse {
                 reason: format!("survivor '{name}' working directory contains '..'"),
             };
         }
@@ -97,7 +133,7 @@ pub(crate) fn derive(
             }
             Ok(_) => {}
             Err(error) => {
-                return CleanupAdmission::Preserve {
+                return CleanupAdmission::Refuse {
                     reason: format!(
                         "survivor '{name}' working directory {} is ambiguous: {error}",
                         survivor_path.display()
@@ -116,7 +152,7 @@ pub(crate) fn derive(
             };
         }
         Err(error) => {
-            return CleanupAdmission::Preserve {
+            return CleanupAdmission::Refuse {
                 reason: format!("workspace root cannot canonicalize: {error}"),
             };
         }
@@ -128,7 +164,7 @@ pub(crate) fn derive(
         };
     }
     if candidate_canonical.starts_with(&workspace_canonical) {
-        return CleanupAdmission::Preserve {
+        return CleanupAdmission::Refuse {
             reason: format!(
                 "candidate {} is under workspace root but is not victim default {}",
                 candidate_canonical.display(),
