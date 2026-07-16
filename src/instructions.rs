@@ -254,7 +254,7 @@ pub(crate) fn build_instructions_body(
     content.push_str("- `ci` — actions: `watch` / `unwatch` / `status` (CI monitoring)\n");
     content.push_str("- `health` — actions: `report` / `clear` (instance health state)\n\n");
     content.push_str(
-        "Reply obligation depends on `request_kind`:\n\
+        "Reply obligation depends on the received message's `kind` (set from the sender's `request_kind`):\n\
          - `query` — requires reply (other instance is waiting)\n\
          - `task` — may require reply after work (see Fleet Protocol §4 ack absorption)\n\
          - `report` / `update` — do NOT reply unless you have new information to add\n\n\
@@ -262,7 +262,7 @@ pub(crate) fn build_instructions_body(
          Pure ack messages (\"收到\", \"OK\", \"👍\") do not need a response — ACK absorption (§4) handles this automatically.\n\
          When sending request_kind=report, include `parent_id` (the message you're replying to) \
          and `correlation_id` (the task board ID) for correlation tracking.\n\
-         If you receive a `send` with request_kind=task while already working on an active review \
+         If you receive a `send` with inbound `kind=task` while already working on an active review \
          or task, respond with a structured BUSY message:\n\
          ```\n\
          BUSY\n\
@@ -293,7 +293,7 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "- Reviewer evidence (#1666 §3.3): a VERIFIED or REJECTED verdict MUST carry an `### Evidence` block — `ran: <cmd> → <result>` (e.g. cargo test / clippy / `gh pr checks`) and/or `cited: path:line — quote`. The daemon HARD-rejects an evidence-less VERIFIED/REJECTED back to you. UNVERIFIED = 'claimed but unproven' (evidence-exempt) — use it when you cannot run/cite.\n",
     );
-    content.push_str("- **Worktree mandatory** (§12.4): always work in a git worktree, never the main repo working tree. For a dispatched task the daemon ALREADY auto-binds the assignee — find it via `binding_state({instance: \"<self>\"})` and `cd` in; do NOT run your own `git worktree add`. Use normal git inside the bound worktree and never bypass a shim deny. For a fresh self-provisioned task prefer `repo({action: \"checkout\", repository_path: \"<repo>\", branch: \"<branch>\", bind: true, task_id: \"<task-id>\"})`; reserve `bind_self` for recovery/re-binding.\n");
+    content.push_str("- **Worktree mandatory** (§12.4): always work in a git worktree, never the main repo working tree. For a branch-carrying dispatched task with binding enabled (non-empty `branch`, without `bind:false`), the daemon auto-binds the assignee; branchless and `bind:false` dispatches do not. Confirm with `binding_state({instance: \"<self>\"})` and `cd` into the reported worktree; do NOT run your own `git worktree add`. Use normal git inside the bound worktree and never bypass a shim deny. For a fresh self-provisioned task prefer `repo({action: \"checkout\", repository_path: \"<repo>\", branch: \"<branch>\", bind: true, task_id: \"<task-id>\"})`; reserve `bind_self` for recovery/re-binding.\n");
     content.push_str("- **Spawn site rationale** (§12.5): every `tokio::spawn` / `thread::spawn` site MUST carry `// fire-and-forget: <reason>` comment OR explicitly store JoinHandle for graceful join. Tests exempt; trait-method spawns inherit caller rationale. Phase 5b invariant test enforces.\n");
 
     // Response channel discipline — match reply mechanism to input source.
@@ -322,7 +322,7 @@ pub(crate) fn build_instructions_body(
     content.push_str("- The header always includes `size=`; the full body is in your inbox, not in the terminal. Call the MCP tool `inbox` to fetch full content.\n");
     content.push_str("- If the header contains `attachments=[path1,path2,...]`, the message includes media files. Call `inbox` for full metadata, then use your file-reading tools to inspect the files.\n");
     content.push_str("- If the header contains `attachments=[...]` of telegram media types, call `download_attachment` with the relevant `file_id` to retrieve the bytes locally before processing.\n");
-    content.push_str("- ACK obligation depends on `request_kind`: `query` requires reply via `send` (request_kind=report); `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
+    content.push_str("- ACK obligation depends on inbound `kind`: `query` requires reply via `send` (request_kind=report); `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
 
     // #1769: daemon AUTO-inject marker. The daemon nudges a stuck agent by
     // injecting a resume keystroke (e.g. "continue") straight into the PTY —
