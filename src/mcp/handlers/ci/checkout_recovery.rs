@@ -8,6 +8,11 @@ use super::checkout_txn::{
 };
 use std::path::Path;
 
+fn is_canonical_path_lock_name(name: &str) -> bool {
+    name.strip_prefix("wtpath-")
+        .is_some_and(|suffix| suffix.ends_with(".lock"))
+}
+
 /// Drive recovery of CRASHED (orphaned) checkout-transaction journals — the ONE shared
 /// callable for boot-repair AND a periodic tick (no dedicated worker; the caller sets
 /// cadence). Race-safe against a concurrent live checkout:
@@ -39,9 +44,15 @@ pub(crate) fn recover_pending_sweep<G>(
         let Some(mangled) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        // (1) Unlocked read for path + nonce. Sibling `<key>.lock` files load as Absent
-        // (skipped); a corrupt record is QUARANTINED (retained as intervention authority —
-        // #2755 R3), NOT cleared; an unreadable record fails closed (#2755 R4).
+        // `lock_path` creates a sibling `wtpath-*.lock` file in `txn_root`.
+        // It is a live coordination primitive, not a journal directory; skip
+        // it before `load_typed` would misclassify the file as unreadable.
+        if is_canonical_path_lock_name(&mangled) {
+            continue;
+        }
+        // (1) Unlocked read for path + nonce. A corrupt record is QUARANTINED
+        // (retained as intervention authority — #2755 R3), NOT cleared; an
+        // unreadable record fails closed (#2755 R4).
         let seen = match load_typed(home, &mangled) {
             JournalLoad::Loaded(j) => j,
             JournalLoad::Unreadable => {
