@@ -118,6 +118,7 @@ pub(super) fn handle_crash_observation(
                         agent = %crashed_name,
                         "exit is an intentional delete (deleted flag set) — skipping crash-respawn"
                     );
+                    ledger.discard(key);
                     return;
                 }
                 let mut core = handle.core.lock();
@@ -151,6 +152,7 @@ pub(super) fn handle_crash_observation(
             }
             None => {
                 tracing::warn!(agent = %crashed_name, "not in registry, skipping");
+                ledger.discard(key);
                 return;
             }
         }

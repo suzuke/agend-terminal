@@ -140,7 +140,10 @@ impl ClaimToken {
 }
 
 struct Entry {
-    observation: CrashObservation,
+    /// `None` is a compact tombstone.  The disposition remains queryable and
+    /// the owner `current` map still rejects late publication, while the old
+    /// generation's Core/deleted Arcs are released once it is superseded.
+    observation: Option<CrashObservation>,
     disposition: Disposition,
     claimant: Option<Claimant>,
 }
@@ -192,12 +195,12 @@ impl CrashDispositionLedger {
         }
         let key = observation.key();
         if let Some(entry) = inner.entries.get(&key) {
-            return entry.disposition != Disposition::Discarded;
+            return entry.observation.is_some() && entry.disposition != Disposition::Discarded;
         }
         inner.entries.insert(
             key,
             Entry {
-                observation,
+                observation: Some(observation),
                 disposition: Disposition::Pending,
                 claimant: None,
             },
@@ -220,15 +223,15 @@ impl CrashDispositionLedger {
         for (key, entry) in &mut inner.entries {
             if key.instance_id == instance_id
                 && key.generation != generation
-                && !matches!(
-                    entry.disposition,
-                    Disposition::Executing
-                        | Disposition::Live
-                        | Disposition::Failed
-                        | Disposition::Discarded
-                )
+                && entry.disposition != Disposition::Executing
             {
-                entry.disposition = Disposition::Discarded;
+                if !matches!(
+                    entry.disposition,
+                    Disposition::Live | Disposition::Failed | Disposition::Discarded
+                ) {
+                    entry.disposition = Disposition::Discarded;
+                }
+                entry.observation = None;
             }
         }
     }
@@ -237,11 +240,16 @@ impl CrashDispositionLedger {
         let mut inner = self.inner.lock();
         let current = inner.current.get(&key.instance_id).copied();
         let entry = inner.entries.get_mut(&key)?;
-        if !entry.observation.valid(current) {
-            entry.disposition = Disposition::Discarded;
+        // State eligibility is checked before source validity.  An already
+        // Executing record remains owned and must never be rewritten to
+        // Discarded by a late delete/replacement observation.
+        if entry.disposition != Disposition::Pending {
             return None;
         }
-        if entry.disposition != Disposition::Pending {
+        let observation = entry.observation.as_ref()?;
+        if !observation.valid(current) {
+            entry.disposition = Disposition::Discarded;
+            entry.observation = None;
             return None;
         }
         entry.disposition = Disposition::Claimed;
@@ -261,11 +269,17 @@ impl CrashDispositionLedger {
         let Some(entry) = inner.entries.get_mut(&token.key) else {
             return false;
         };
-        if !entry.observation.valid(current) {
-            entry.disposition = Disposition::Discarded;
+        // Only Ready can enter execution.  In particular, a copied token or a
+        // late invalidation must not rewrite an already Executing record.
+        if entry.disposition != Disposition::Ready {
             return false;
         }
-        if entry.disposition != Disposition::Ready {
+        let Some(observation) = entry.observation.as_ref() else {
+            return false;
+        };
+        if !observation.valid(current) {
+            entry.disposition = Disposition::Discarded;
+            entry.observation = None;
             return false;
         }
         entry.disposition = Disposition::Executing;
@@ -285,13 +299,14 @@ impl CrashDispositionLedger {
         let Some(entry) = inner.entries.get_mut(&key) else {
             return false;
         };
-        if matches!(
+        if !matches!(
             entry.disposition,
-            Disposition::Live | Disposition::Failed | Disposition::Discarded
+            Disposition::Pending | Disposition::Claimed | Disposition::Ready
         ) {
             return false;
         }
         entry.disposition = Disposition::Discarded;
+        entry.observation = None;
         true
     }
 
@@ -311,13 +326,17 @@ impl CrashDispositionLedger {
             .lock()
             .entries
             .values()
-            .filter(|entry| entry.disposition == Disposition::Pending)
-            .map(|entry| entry.observation.clone())
+            .filter_map(|entry| {
+                (entry.disposition == Disposition::Pending)
+                    .then(|| entry.observation.clone())
+                    .flatten()
+            })
             .collect()
     }
 
     fn transition(&self, token: ClaimToken, from: Disposition, to: Disposition) -> bool {
         let mut inner = self.inner.lock();
+        let current = inner.current.get(&token.key.instance_id).copied();
         let Some(entry) = inner.entries.get_mut(&token.key) else {
             return false;
         };
@@ -325,6 +344,14 @@ impl CrashDispositionLedger {
             return false;
         }
         entry.disposition = to;
+        if matches!(to, Disposition::Live | Disposition::Failed)
+            && current != Some(token.key.generation)
+        {
+            // An older worker may finish after a replacement generation was
+            // installed.  Keep its terminal tombstone, but release the heavy
+            // old observation now that no further execution is possible.
+            entry.observation = None;
+        }
         true
     }
 }
@@ -403,9 +430,10 @@ mod tests {
         let obs = observation(id, SpawnGeneration::new(3), &deleted, Some(&shutdown));
         ledger.register_generation(id, obs.generation);
         assert!(ledger.publish(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
         deleted.store(true, Ordering::SeqCst);
-        let token = ledger.claim(obs.key(), Claimant::Crash);
-        assert!(token.is_none());
+        assert!(!ledger.begin_execute(token));
         assert_eq!(ledger.disposition(obs.key()), Some(Disposition::Discarded));
 
         let id2 = InstanceId::new();
@@ -509,7 +537,8 @@ mod tests {
         assert!(ledger.mark_ready(begin_token));
         assert!(ledger.begin_execute(begin_token));
         deleted_begin.store(true, Ordering::SeqCst);
-        assert!(!ledger.begin_execute(begin_token));
+        let copied_begin_token = begin_token;
+        assert!(!ledger.begin_execute(copied_begin_token));
         assert!(!ledger.begin_execute(begin_token));
         assert_eq!(
             ledger.disposition(begin_obs.key()),
