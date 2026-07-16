@@ -837,3 +837,244 @@ fn checkout_expected_head_reuse_worktree_mismatch_refuses_without_sync() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Architecture-14 item 10 — daemon-provisioned disposable review provenance
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(unix)]
+fn seed_terminal_task(home: &Path, task_id: &str, branch: &str, terminal: bool) {
+    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+
+    let emitter = InstanceName::from("disposable-review-test");
+    let id = TaskId::from(task_id);
+    crate::task_events::append(
+        home,
+        &emitter,
+        TaskEvent::Created {
+            task_id: id.clone(),
+            title: "disposable review".to_string(),
+            description: String::new(),
+            priority: "normal".to_string(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some(branch.to_string()),
+            bind: Some(true),
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        },
+    )
+    .expect("create task");
+    if terminal {
+        crate::task_events::append(
+            home,
+            &emitter,
+            TaskEvent::Done {
+                task_id: id,
+                by: emitter.clone(),
+                source: DoneSource::OperatorManual {
+                    authored_at: "2026-07-16T00:00:00Z".to_string(),
+                    result: None,
+                },
+            },
+        )
+        .expect("finish task");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes() {
+    let home = tmp_home("disposable-review-fresh");
+    let parent = tmp_home("disposable-review-fresh-src");
+    let source = setup_source_repo(&parent, "seed");
+    let expected = get_sha(&source, "main");
+    seed_origin_view(&source, "review/disposable-fresh", &expected);
+    seed_terminal_task(
+        &home,
+        "task-disposable-fresh",
+        "review/disposable-fresh",
+        true,
+    );
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "review/disposable-fresh",
+            "bind": true,
+            "task_id": "task-disposable-fresh",
+            "expected_head": &expected,
+            "from_ref": "main",
+            "checkout_purpose": "disposable_review",
+        }),
+        "disposable-review-agent",
+    );
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(true), "{resp}");
+    let binding =
+        crate::binding::read(&home, "disposable-review-agent").expect("disposable review binding");
+    assert_eq!(
+        binding["checkout_purpose"].as_str(),
+        Some("disposable_review")
+    );
+    assert_eq!(
+        binding["provenance"].as_str(),
+        Some("DaemonProvisionedReview")
+    );
+    assert_eq!(
+        binding["provisioned_head"].as_str(),
+        Some(expected.as_str())
+    );
+
+    let released = crate::mcp::handlers::worktree::handle_release_worktree(
+        &home,
+        &json!({"instance": "disposable-review-agent"}),
+        &None,
+    );
+    assert_eq!(released["released"].as_bool(), Some(true), "{released}");
+    assert!(!crate::git_helpers::git_ok(
+        &source,
+        &["rev-parse", "--verify", "review/disposable-fresh"],
+    ));
+    assert!(crate::binding::read(&home, "disposable-review-agent").is_none());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_disposable_review_rejects_preexisting_branch_without_mutation() {
+    let home = tmp_home("disposable-review-existing");
+    let parent = tmp_home("disposable-review-existing-src");
+    let source = setup_source_repo(&parent, "review/disposable-existing");
+    let expected = get_sha(&source, "review/disposable-existing");
+    seed_terminal_task(
+        &home,
+        "task-disposable-existing",
+        "review/disposable-existing",
+        true,
+    );
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "review/disposable-existing",
+            "bind": true,
+            "task_id": "task-disposable-existing",
+            "expected_head": &expected,
+            "checkout_purpose": "disposable_review",
+        }),
+        "disposable-existing-agent",
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("disposable_review_requires_new_branch"),
+        "{resp}"
+    );
+    assert!(crate::binding::read(&home, "disposable-existing-agent").is_none());
+    assert!(
+        !derived_worktree(&home, "disposable-existing-agent", &source).exists(),
+        "pre-existing disposable-review branch must not provision a worktree"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_disposable_review_requires_bind_task_and_expected_head() {
+    let home = tmp_home("disposable-review-args");
+    let parent = tmp_home("disposable-review-args-src");
+    let source = setup_source_repo(&parent, "review/disposable-args");
+    let expected = get_sha(&source, "review/disposable-args");
+
+    for (tag, args, code) in [
+        (
+            "no-bind",
+            json!({
+                "repository_path": source.display().to_string(),
+                "branch": "review/disposable-args",
+                "task_id": "task-disposable-args",
+                "expected_head": &expected,
+                "checkout_purpose": "disposable_review",
+            }),
+            "disposable_review_requires_bind",
+        ),
+        (
+            "no-task",
+            json!({
+                "repository_path": source.display().to_string(),
+                "branch": "review/disposable-args",
+                "bind": true,
+                "expected_head": &expected,
+                "checkout_purpose": "disposable_review",
+            }),
+            "disposable_review_requires_task_id",
+        ),
+        (
+            "no-head",
+            json!({
+                "repository_path": source.display().to_string(),
+                "branch": "review/disposable-args",
+                "bind": true,
+                "task_id": "task-disposable-args",
+                "checkout_purpose": "disposable_review",
+            }),
+            "disposable_review_requires_expected_head",
+        ),
+    ] {
+        let resp = super::handle_checkout_repo(&home, &args, &format!("disposable-{tag}"));
+        if crate::binding::read(&home, &format!("disposable-{tag}")).is_some() {
+            let _ = crate::mcp::handlers::worktree::handle_release_worktree(
+                &home,
+                &json!({"instance": format!("disposable-{tag}")}),
+                &None,
+            );
+        }
+        assert_eq!(resp["code"].as_str(), Some(code), "{tag}: {resp}");
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_disposable_review_binding_failure_rolls_back_worktree() {
+    let home = tmp_home("disposable-review-atomic");
+    let parent = tmp_home("disposable-review-atomic-src");
+    let source = setup_source_repo(&parent, "review/disposable-atomic");
+    let expected = get_sha(&source, "review/disposable-atomic");
+    let agent = "disposable-atomic-agent";
+    let binding_path = crate::paths::binding_path(&home, agent);
+    crate::store::fail_next_atomic_write_for_test(&binding_path);
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "review/disposable-atomic",
+            "bind": true,
+            "task_id": "task-disposable-atomic",
+            "expected_head": &expected,
+            "checkout_purpose": "disposable_review",
+        }),
+        agent,
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "forced binding failure must fail: {resp}"
+    );
+    assert!(crate::binding::read(&home, agent).is_none());
+    assert!(!derived_worktree(&home, agent, &source).exists());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
