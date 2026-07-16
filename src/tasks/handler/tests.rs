@@ -2973,3 +2973,137 @@ fn update_non_string_assignee_errors() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// T9: Clear settles all three sidecars (dispatch-idle, next_after_ci,
+/// dispatch-tracking) with None after commit.
+#[test]
+fn update_clear_settles_three_sidecars() {
+    let home = tmp_home("ap-t9");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t9", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Seed a dispatch-idle pending entry via record_dispatch.
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "dev-agent",
+        Some(id),
+        "task",
+        600,
+    );
+    assert!(
+        crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "precondition: dispatch-idle sidecar exists"
+    );
+    // Clear assignee.
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
+    );
+    assert!(r.get("error").is_none(), "clear must succeed: {r}");
+    // After commit, sidecars cleared.
+    assert!(
+        !crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "dispatch-idle sidecar must be cleared after assignee clear"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// T10: Combined status=done + assignee="" attributes done event to the
+/// pre-commit owner and clears sidecars post-commit.
+#[test]
+fn combined_status_done_and_clear_attributes_to_old_owner() {
+    let home = tmp_home("ap-t10");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t10", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Combined: status=done + clear assignee in one update.
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": id, "status": "done", "assignee": "", "result": "completed"}),
+    );
+    assert!(
+        r.get("error").is_none(),
+        "combined update must succeed: {r}"
+    );
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.status,
+        crate::task_events::TaskStatus::Done,
+        "status must be done"
+    );
+    assert!(task.assignee.is_none(), "assignee must be cleared");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// T11: ACL failure produces no sidecar mutation.
+#[test]
+fn update_acl_failure_no_sidecar_mutation() {
+    let home = tmp_home("ap-t11");
+    let r = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "create", "title": "t11", "assignee": "dev-agent"}),
+    );
+    let id = r["id"].as_str().expect("id");
+    let _ = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Seed sidecar for dev-agent via record_dispatch.
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "dev-agent",
+        Some(id),
+        "task",
+        600,
+    );
+    assert!(
+        crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "precondition"
+    );
+    // Unauthorized caller tries to clear assignee.
+    let r = handle(
+        &home,
+        "intruder",
+        &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
+    );
+    assert!(
+        r.get("error").is_some(),
+        "unauthorized update must fail: {r}"
+    );
+    // Sidecar must be unchanged.
+    assert!(
+        crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
+        "dispatch-idle sidecar must survive ACL failure"
+    );
+    let tasks = crate::tasks::list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("dev-agent"),
+        "assignee unchanged after ACL failure"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
