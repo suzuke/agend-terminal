@@ -25,6 +25,7 @@ mod restart;
 mod schedule;
 mod send_envelope;
 mod task;
+mod usage_limit_takeover;
 #[cfg(test)]
 mod usage_limit_takeover_tests;
 mod worktree;
@@ -35,6 +36,14 @@ mod worktree;
 #[cfg(test)]
 pub(crate) fn worktree_test_release(home: &std::path::Path, args: &Value) -> Value {
     worktree::handle_release_worktree(home, args, &None)
+}
+
+/// Shared test guard for handlers that exercise the real dispatch path. Those
+/// tests swap the process-wide `AGEND_HOME` used by `crate::home_dir()`.
+#[cfg(test)]
+pub(crate) fn fleet_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    static GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    GUARD.lock()
 }
 
 use crate::agent_ops::save_metadata;

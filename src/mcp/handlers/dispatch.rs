@@ -30,7 +30,7 @@ use std::path::Path;
 
 use super::{
     binding_state, channel, ci, comms, instance, restart, review_assignment, schedule, task,
-    worktree,
+    usage_limit_takeover, worktree,
 };
 
 /// Shared per-call context — every common parameter `handle_tool`
@@ -308,6 +308,9 @@ pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
 // ---------------------------------------------------------------------
 
 adapter!(dispatch_task, hai, task::handle_task);
+pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
+    usage_limit_takeover::handle_usage_limit_takeover(ctx)
+}
 
 action_adapter!(dispatch_ci, "ci", [
     "watch"   => ci::handle_watch_ci,   hai;
@@ -560,9 +563,10 @@ mod tests {
                 "release_worktree",
                 "binding_state",
                 "revoke_review_assignment",
+                "usage_limit_takeover",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 31);
+        assert_eq!(crate::mcp::registry::all().len(), 32);
     }
 
     #[test]

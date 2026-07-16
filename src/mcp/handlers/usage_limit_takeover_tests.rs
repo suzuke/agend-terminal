@@ -12,6 +12,7 @@ struct Fixture {
     runtime: RuntimeContext,
     episode_id: String,
     worktree: PathBuf,
+    _env_guard: parking_lot::MutexGuard<'static, ()>,
     _source: String,
 }
 
@@ -41,6 +42,7 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 
 fn fixture(tag: &str) -> Fixture {
+    let env_guard = super::fleet_test_guard();
     let home = std::env::temp_dir().join(format!(
         "agend-usage-limit-takeover-{tag}-{}",
         uuid::Uuid::new_v4()
@@ -119,7 +121,11 @@ fn fixture(tag: &str) -> Fixture {
                     "binding_issued_at": "2026-07-16T05:00:00Z",
                     "branch": "feat/slice-1",
                     "state": "CandidateReady",
-                    "proposal": {"candidate": "worker-b"}
+                    "proposal": {
+                        "candidate": "worker-b",
+                        "executable": false,
+                        "requires": "operator_takeover_slice_2"
+                    }
                 })
                 .to_string(),
             },
@@ -149,10 +155,9 @@ fn fixture(tag: &str) -> Fixture {
     .expect("episode");
 
     let candidate = crate::agent::mk_test_handle("worker-b", InstanceId::new());
-    let registry = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([(
-        candidate.id,
-        candidate,
-    )])));
+    let registry = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+        (candidate.id, candidate),
+    ])));
     let runtime = RuntimeContext {
         registry,
         externals: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -166,6 +171,7 @@ fn fixture(tag: &str) -> Fixture {
         runtime,
         episode_id,
         worktree,
+        _env_guard: env_guard,
         _source: "worker-a".into(),
     }
 }
@@ -227,7 +233,6 @@ fn usage_limit_takeover_concurrent_barrier_requests_converge_one_prepared_identi
         results.iter().all(|result| result["phase"] == "Prepared"),
         "concurrent results: {results:?}"
     );
-
     let journal_path =
         crate::paths::runtime_dir(&f.home).join("worker-a/usage_limit_takeover.json");
     let journal_bytes = std::fs::read(&journal_path).expect("one prepared journal");
@@ -241,6 +246,30 @@ fn usage_limit_takeover_concurrent_barrier_requests_converge_one_prepared_identi
     assert!(
         journal_path.is_file(),
         "exactly one journal identity must remain"
+    );
+}
+
+#[test]
+#[serial]
+fn usage_limit_takeover_conflicting_existing_journal_fails_closed() {
+    let f = fixture("conflict");
+    let args = json!({"source": "worker-a", "episode_id": f.episode_id});
+    let first = call(&f, args.clone());
+    assert_eq!(first["phase"], "Prepared", "first: {first}");
+    let journal = crate::paths::runtime_dir(&f.home).join("worker-a/usage_limit_takeover.json");
+    let mut persisted: Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal json");
+    persisted["candidate"] = json!("worker-c");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec_pretty(&persisted).expect("journal write"),
+    )
+    .expect("journal");
+    let second = call(&f, args);
+    assert_eq!(
+        code(&second),
+        "conflicting_preparation",
+        "unexpected result: {second}"
     );
 }
 
@@ -264,11 +293,15 @@ fn usage_limit_takeover_refuses_dirty_source_without_journal() {
 fn usage_limit_takeover_refuses_generation_mismatch() {
     let f = fixture("generation");
     let binding_path = crate::paths::runtime_dir(&f.home).join("worker-a/binding.json");
-    let mut binding: Value = serde_json::from_slice(&std::fs::read(&binding_path).expect("binding"))
-        .expect("binding json");
+    let mut binding: Value =
+        serde_json::from_slice(&std::fs::read(&binding_path).expect("binding"))
+            .expect("binding json");
     binding["issued_at"] = json!("2026-07-16T06:00:00Z");
-    std::fs::write(&binding_path, serde_json::to_vec_pretty(&binding).expect("binding write"))
-        .expect("binding");
+    std::fs::write(
+        &binding_path,
+        serde_json::to_vec_pretty(&binding).expect("binding write"),
+    )
+    .expect("binding");
     let result = call(
         &f,
         json!({"source": "worker-a", "episode_id": f.episode_id}),
@@ -285,16 +318,46 @@ fn usage_limit_takeover_refuses_generation_mismatch() {
 fn usage_limit_takeover_refuses_candidate_mismatch() {
     let f = fixture("candidate");
     let episode_path = crate::paths::runtime_dir(&f.home).join("worker-a/usage_limit_episode.json");
-    let mut episode: Value = serde_json::from_slice(&std::fs::read(&episode_path).expect("episode"))
-        .expect("episode json");
+    let mut episode: Value =
+        serde_json::from_slice(&std::fs::read(&episode_path).expect("episode"))
+            .expect("episode json");
     episode["candidate"] = json!("worker-c");
-    std::fs::write(&episode_path, serde_json::to_vec_pretty(&episode).expect("episode write"))
-        .expect("episode");
+    std::fs::write(
+        &episode_path,
+        serde_json::to_vec_pretty(&episode).expect("episode write"),
+    )
+    .expect("episode");
     let result = call(
         &f,
         json!({"source": "worker-a", "episode_id": f.episode_id}),
     );
-    assert_eq!(code(&result), "candidate_ineligible", "unexpected result: {result}");
+    assert_eq!(
+        code(&result),
+        "candidate_mismatch",
+        "unexpected result: {result}"
+    );
+}
+
+#[test]
+#[serial]
+fn usage_limit_takeover_refuses_currently_ineligible_candidate() {
+    let f = fixture("ineligible");
+    let registry = f.runtime.registry.lock();
+    let handle = registry.values().next().expect("candidate");
+    handle.published_state.store(
+        crate::state::AgentState::UsageLimit as u8,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    drop(registry);
+    let result = call(
+        &f,
+        json!({"source": "worker-a", "episode_id": f.episode_id}),
+    );
+    assert_eq!(
+        code(&result),
+        "candidate_ineligible",
+        "unexpected result: {result}"
+    );
 }
 
 #[test]
@@ -307,7 +370,11 @@ fn usage_limit_takeover_refuses_journal_write_failure_without_partial() {
         &f,
         json!({"source": "worker-a", "episode_id": f.episode_id}),
     );
-    assert_eq!(code(&result), "journal_write_failed", "unexpected result: {result}");
+    assert_eq!(
+        code(&result),
+        "journal_write_failed",
+        "unexpected result: {result}"
+    );
     assert!(journal.is_dir(), "failed write must not replace collision");
 }
 
@@ -321,5 +388,9 @@ fn usage_limit_takeover_is_operator_only() {
         "worker-a",
         f.runtime.clone(),
     );
-    assert_eq!(code(&result), "operator_only", "unexpected result: {result}");
+    assert_eq!(
+        code(&result),
+        "operator_only",
+        "unexpected result: {result}"
+    );
 }

@@ -233,8 +233,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::sync::Arc;
 
 fn fleet_test_guard() -> MutexGuard<'static, ()> {
-    static GUARD: Mutex<()> = Mutex::new(());
-    GUARD.lock()
+    super::fleet_test_guard()
 }
 
 struct Recorder {
