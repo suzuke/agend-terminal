@@ -268,8 +268,14 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
         }
 
         if !is_chinese(path) && path.parent() == Some(Path::new("docs")) {
-            let english_name = path.file_name().and_then(|name| name.to_str()).unwrap();
-            let chinese_name = chinese.file_name().and_then(|name| name.to_str()).unwrap();
+            let english_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("tracked Markdown path must have a UTF-8 file name");
+            let chinese_name = chinese
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("paired Markdown path must have a UTF-8 file name");
             if english_name != "README.md" && !english_index.contains(english_name) {
                 errors.push(format!("docs/README.md does not index {english_name}"));
             }
