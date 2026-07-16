@@ -1,4 +1,4 @@
-# Fleet Development Protocol v1.2 (Condensed)
+# Fleet Development Protocol v1.2.1 (Safety Errata)
 
 **Status:** ACTIVE — all fleet agents must follow this protocol.
 
@@ -16,25 +16,32 @@ This document has two layers:
 - Every ~10 new rules OR every protocol-touching sprint, do a consolidation pass: merge overlapping rules, retire superseded ones (move the trail to Appendix A), and confirm the normative layer still reads in one sitting.
 - If a normative section can no longer be understood without its appendix entry, the rule wording is incomplete — fix the wording, don't lean on the appendix.
 
+**Operational precedence.** Within this protocol:
+
+1. A daemon hard gate and the live MCP input schema define what the running system can execute.
+2. A specific, explicitly scoped exception overrides a general rule only when it names the rule being relaxed and records the authorization.
+3. Normative `MUST` / `NEVER` rules override examples, rationale, historical notes, and soft conventions.
+4. If an example conflicts with the live schema or another normative rule, stop and report the mismatch; do not guess, bypass, or combine the two recipes.
+
 ## §0. KISS Principle
 
-Every PR must answer: **"What real problem does this solve?"** and **"Would deletion break anyone?"** Changes lacking a concrete failure mode = `KISS-VIOLATION — UNVERIFIED`.
+Every PR must answer: **"What real problem does this solve?"** and **"Would deletion break anyone?"** An evidenced absence of a concrete failure mode is `KISS-VIOLATION — REJECTED`; use `UNVERIFIED` only when the concern is claimed but cannot be proven (§3.3).
 
 ## §1. Task Board (Single Source of Truth)
 
 Use daemon `task` tool, NOT per-agent local task lists.
 
-**Lifecycle**: `create` → `claim` → `in_progress` → `verified` → `done`
+**Primary lifecycle**: `create` (`open`) → `claim` (`claimed`) → `in_progress` → `in_review` / `verified` → `done`. Use `blocked` for a declared dependency and `cancelled` only when the task is intentionally abandoned.
 
 **Rules**:
-- Orchestrator creates tasks; Implementer/Reviewer update status
+- Orchestrator creates dispatched tasks; an agent handling a direct operator request may create and claim its own task
 - `depends_on` must be set when dependency exists
-- `task done` must include `--result`
+- `task({action:"done", id:"<task-id>", result:"<evidence-backed outcome>"})` must include a non-empty `result`
 
 ## §2. Decisions Panel
 
-Use `decision(action: post)` to freeze scope definitions or ground truth changes.
-- `tags` must include track + PR number
+Use `decision({action: "post", ...})` to freeze scope definitions or ground truth changes.
+- `tags` must include the track plus the most specific available artifact ID (`task`, `issue`, or `PR`); add the PR tag once a PR exists
 - `scope: fleet` for cross-track; `scope: project` for track-specific
 - `supersedes` links corrections to original decision
 
@@ -49,7 +56,7 @@ Orchestrator posts scope decision + creates task.
 3. **Freshness boundary** — stale if changed after {sha}
 
 ### 3.3 Verdict
-`VERIFIED` / `REJECTED` / `UNVERIFIED` — **start the report with the verdict word** (§3.12 convention; the daemon keys on it).
+`VERIFIED` / `REJECTED` / `UNVERIFIED` — **start the report with the verdict word** (the daemon's §3.3 evidence gate keys on the leading token).
 
 Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`, `commands`, `files`.
 
@@ -59,9 +66,9 @@ Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`,
 
 `UNVERIFIED` is redefined as **"claimed but unproven"** — the evidence-exempt verdict. Use it when you assert a concern you could not run-or-cite (so the gate never forces fabricated evidence).
 
-The daemon HARD-gates this at report time: a `VERIFIED`/`REJECTED` with **no recognizable evidence token** (a `cargo`/`gh`/`clippy`/`grep` command line, or a `path:line` cite) is rejected back to the reviewer. The gate is deliberately **lenient** — it accepts any one recognized token and rejects only on total absence; it does NOT enforce a fixed format. (The §3.21 risk-tier review DEPTH remains lead/reviewer judgment — not daemon-enforced.)
+The daemon HARD-gates this at report time: a `VERIFIED`/`REJECTED` with **no recognizable evidence token** is rejected back to the reviewer. The canonical form is a structured `ran:` / `cited:` entry inside `### Evidence`; command tokens (`cargo`, `gh`, `clippy`, `grep`, `rg`) and a `path:line` cite are compatibility fallbacks. The gate is deliberately **lenient** — it checks evidence presence, not semantic sufficiency. Review depth remains lead/reviewer judgment under §3.21.
 
-**Comments and prose are claims, not evidence (#2018).** Every factual assertion in a code comment, doc, or PR body is a claim to VERIFY against the code, never evidence in itself. Reachability / scope / "cannot happen" / "single chokepoint" claims must be proven from the actual guards and match arms in the source — author and reviewer alike. (2026-06-11 surfaced four in one day: a compaction-loss rationale that named dead code, a "single chokepoint" that several call sites bypassed, an "agy is a hook backend" that emitted zero events, and an "EXDEV" fallback on a same-directory rename.)
+**Comments and prose are claims, not evidence.** Every factual assertion in a code comment, doc, or PR body is a claim to VERIFY against the code, never evidence in itself. Reachability / scope / "cannot happen" / "single chokepoint" claims must be proven from the actual guards and match arms in the source — author and reviewer alike. `↳ 緣由 A-§3.3`
 
 ### 3.3.1 CI Verification Gate (Sprint 61)
 Before approving merge, orchestrator/reviewer MUST independently verify CI:
@@ -89,20 +96,26 @@ gh run view <run-id> --log-failed
 
 `↳ 緣由 A-§3.3.1`
 
-### 3.4 Re-review (r2) Dispatch
-Must enumerate r1 findings with status: fixed / deferred / withdrawn. Missing → reviewer falls back to `full_review`.
+### 3.4 Re-review (r1+) Dispatch
+Every re-review dispatch must enumerate all findings from the previous round with status: fixed / deferred / withdrawn. Missing or incomplete mapping → reviewer repeats the complete original scope (`full_review`) rather than reviewing only the claimed fixes.
 
 ### 3.5 Multi-reviewer
 - Default: single primary reviewer
 - Dual reviewer only when: high-risk shared behavior, repeated reject loop, primary requests, operator mandates
+- **Adversarial review** maps to `review_class=dual` and additionally requires at least one reviewer to challenge authority boundaries, silent-failure paths, or runtime-state invariants rather than only reading the happy path
 - Verdict severity: `REJECTED > UNVERIFIED > VERIFIED` — worst wins
+
+**Merge-authority matrix:**
+- Orchestrator merge: satisfy the task's `review_class` (`single` or `dual`) plus CI and verdict-mirror gates.
+- Author/implementer self-merge: dual VERIFIED plus CI and verdict mirror.
+- Operator docs-only self-merge: the explicit §3.6 exception; it does not relax CI.
 
 ### 3.6 LOW Docs-only Exception
 All conditions must hold for single-reviewer or operator self-merge:
-1. Only `docs/FLEET-DEV-PROTOCOL-*.md` or `REVIEWER-CONTRACT-*.md` edits
+1. Only fleet-protocol / reviewer-contract docs, matching protocol regression tests, or the fleet-protocol template strings in `src/instructions.rs`
 2. Diff ≤ 50 LOC
-3. No `src/` behavior change (`src/instructions.rs` template strings exempt)
-4. No new rule affecting mid-scope+ PRs
+3. No runtime behavior change outside those template strings
+4. No new or materially relaxed rule affecting normal/high-risk work
 
 ### 3.7 Cross-backend Claims
 Must have per-backend test evidence, OR mark as `unverified cross-backend claim` + backlog task.
@@ -123,7 +136,7 @@ Additional: wire-format invariant tests (pin shape); production-path-coupled (no
 ### 3.10 Test-first
 Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - Every fix PR MUST include an empirical reproduction test case. Reviewers MUST verify the presence and validity of this test.
-- Reviewer verifies: `git checkout <test-sha>` fails → `HEAD` passes
+- Reviewer verifies RED and GREEN in daemon-managed named worktrees materialized from the test and implementation commits; never detach or checkout a SHA in-place (§3.19.1).
 - Exemptions: docs-only, pure refactor, test-only, dep bump, EMERGENCY, pure deletion, empirical-revert
 
 ### 3.11 Deferred-defense
@@ -133,9 +146,9 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - (d) Removing defensive code → 4-perspective counter-example challenge; 0 compelling = safe to delete
 
 ### 3.12 Verdict Externalization (was §3.5.13)
-Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green + verdict mirror posted — all three required before merge.
+Fleet-internal verdict MUST mirror to the PR through the active SCM provider (`gh pr comment` on GitHub). Apply the §3.5 merge-authority matrix: author/implementer self-merge requires dual VERIFIED; orchestrator merge uses the task's review class; the §3.6 operator docs-only exception remains explicit. CI green + the required verdict mirror are always required.
 
-**Canonical merge step: `repo action=merge pr=<N>`** (the MCP `repo` tool → `handle_merge_repo`, `src/mcp/handlers/ci/mod.rs`). It issues the **byte-identical** merge a raw `gh` call would (`gh pr merge <N> --repo R --admin --squash --delete-branch`, pinned by `scm::tests::pr_merge_args_match_existing_gh_call`) but wraps it in three safety nets the raw command lacks:
+**Canonical merge step: `repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`** (the MCP `repo` tool → `handle_merge_repo`, `src/mcp/handlers/ci/mod.rs`). It issues the **byte-identical** merge a raw `gh` call would (`gh pr merge <N> --repo R --admin --squash --delete-branch`, pinned by `scm::tests::pr_merge_args_match_existing_gh_call`) but wraps it in three safety nets the raw command lacks:
 1. **Safe repo-resolution (#1619)** — resolves the target `owner/repo` via `resolve_repo_or_error`; a detection miss ERRORS instead of silently merging against a hardcoded/maintainer repo.
 2. **CI fail-closed gate** — runs `pr checks` (via `ScmProvider`) first; ANY non-`SUCCESS`/`SKIPPED` check OR an undeterminable result REFUSES the merge. Bypass only with `force=true` + a non-empty `force_reason` (audit-logged to `fleet_events.jsonl`).
 3. **`verify_merge_landed` (#1467)** — `gh pr merge` exit-0 is necessary but NOT sufficient (merge-queue / eventual-consistency can exit-0 without landing); it re-`view`s the PR and reports `merged:false, pending:true` rather than a false success, so the caller re-queries instead of blindly re-merging.
@@ -169,7 +182,7 @@ Recovery, in order:
 - (b) Verify PR is mergeable: `gh pr view <N> --json mergeable,statusCheckRollup`
 - (c) Re-arm: `gh pr merge <N> --auto --squash --delete-branch` (idempotent — re-arming when already armed is a no-op)
 - (d) Last resort — manual fallback: `gh pr merge <N> --squash --delete-branch` (synchronous; may hit base-modified race; retry 3s later if it does)
-- Notify lead via `send(kind=update)` if escape-hatch invoked, with case (a)/(b)/(c)/(d) identifier.
+- Notify lead via `send({instance:"<lead>", request_kind:"update", message:"<case (a)/(b)/(c)/(d)>"})` if the escape hatch is invoked.
 
 `↳ 緣由 / 活化史 A-§3.12.1`
 
@@ -182,16 +195,18 @@ Must include e2e integration test exercising the production hook path.
 ### 3.15 Daemon-core Cushion Rule
 PRs touching daemon core / channel / supervisor / state.rs must include stress test + lock-ordering analysis before dispatch. "不急 ship" principle — correctness over velocity for infrastructure changes.
 
-### 3.16 Phase 1 Discussion Discipline (Sprint 62)
-**Pre-impl source-code spike is mandatory.** Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Spike outputs:
+### 3.16 Fleet / Max-Ceremony Discussion Discipline
+This section applies when §3.21 selects FLEET or the high-risk override. In that path, a pre-impl source-code spike is mandatory. Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Spike outputs:
 - Confirm or refute lead's initial site count
 - Surface bonus emission sites lead missed
 - Distinguish "near-bug" from "asserts-on-bug-signature" (issue body counts often conflate)
 - Identify pre-existing helpers / deps that change scope estimate
 
-**Three-party substantive consensus required**: reviewer must offer at least one design challenge AND dev must offer at least one impl concern before consensus is recorded. Triple ACK without substance = rubber-stamp = `RUBBER-STAMP — UNVERIFIED`.
+**Three-party substantive consensus required**: reviewer must offer at least one design challenge AND dev must offer at least one impl concern before consensus is recorded. An evidenced triple ACK without substance is `RUBBER-STAMP — REJECTED`; use `UNVERIFIED` only when the concern cannot be proven.
 
 **Issue body counts are estimates, not contracts.** When issue body says "N sites / N tests need updating," dev spike re-counts. Actual surface may be narrower OR wider than the initial estimate.
+
+`↳ 緣由 A-§3.16`
 
 ### 3.17 Static-Review Limits + Runtime Validation Required
 Static / structural review is INSUFFICIENT for the following surfaces:
@@ -201,7 +216,7 @@ Static / structural review is INSUFFICIENT for the following surfaces:
 - **Daemon refresh / lifecycle behavior** (in-memory state vs persisted state divergence)
 - **Cross-platform binary semantics** (e.g., rustup-init `--version` exits 0 for any binary at the proxy path)
 
-For these surfaces, a `VERIFIED` verdict requires runtime evidence — typically the PR's own CI run on multiple platforms. Pure code-diff inspection does not suffice. Reviewer must explicitly note "runtime-validated via PR-CI run X" in their verdict report. If the PR's own CI doesn't exercise the affected path, request an empirical reproduction step.
+For these surfaces, a final `VERIFIED` verdict requires runtime evidence — typically the PR's own CI run on multiple platforms. The reviewer may begin static review immediately (§12.2), but must withhold final VERIFIED until the runtime evidence exists. Pure code-diff inspection does not suffice. Reviewer must explicitly note "runtime-validated via PR-CI run X" in their verdict report. If the PR's own CI doesn't exercise the affected path, request an empirical reproduction step.
 
 **Generalizable invariant**: exit code 0 is not a strong identity contract for tool checks. Output shape is. `<tool> --version | grep -qE "^<tool> [0-9]"` is the correct content-validating idiom.
 
@@ -214,12 +229,12 @@ When reviewer's claim contradicts dev's claim (e.g. reviewer "stale wording rema
 Lead replies to both with the empirical evidence. Reviewer/dev should self-correct rather than escalate to operator.
 
 ### 3.19 Reviewer Workspace Discipline
-Reviewers MUST inspect PRs from their own daemon-bound worktree. Specifically:
+Reviewers MUST inspect PRs without mutating the canonical source repo. Read-only provider inspection needs no checkout; any full-tree inspection MUST use the reviewer's own daemon-bound worktree. Specifically:
 
 - **Never `cd` into the canonical source repo** to inspect a PR. The canonical is the operator's working tree; reviewer activity must not leave detached HEAD or stale refs there.
 - **Never create refs in canonical** (`git checkout -b tmp_pr_review`, `git checkout <sha>`, `git fetch origin pr/N/head:pr_head`, etc.). These leave `pr*_head` / `tmp*` / `review/*` branches behind that pollute `git branch --list` and confuse later operator commands.
-- **Use `gh pr diff <N>` or `gh pr view <N> --json files`** to read PR contents without checkout. If a full tree inspection is needed, `repo action=checkout` MCP tool provisions a fresh daemon-managed worktree at the PR's HEAD; releasing it (`release_worktree`) does not touch canonical.
-- **If canonical state is observed dirty post-review** (detached HEAD, stale `tmp*` / `pr*_head` branches), the reviewer's verdict is REJECTED until the canonical is cleaned (operator action OR `repo action=cleanup_merged_branches` with the `reviewer_checkout` category once L3 lands).
+- **Use `gh pr diff <N>` or `gh pr view <N> --json files`** to read PR contents without checkout. If a full tree inspection is needed, `repo({action:"checkout", repository_path:"<canonical>", branch:"<review-branch>", from_ref:"<PR-head>", bind:true, task_id:"<task-id>"})` provisions a daemon-managed named worktree; `release_worktree({instance:"<self>"})` returns it without touching canonical.
+- **If canonical state is observed dirty post-review** (detached HEAD, stale `tmp*` / `pr*_head` branches), pause the review and report an operational blocker. Do not turn unrelated workspace hygiene into a PR verdict. Operator cleanup uses a dry-run `repo({action:"cleanup_merged_branches", base:"main"})`, then applies selected candidate IDs with an audit reason.
 
 Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from agent callers when cwd=canonical (PR-B). L3 sweeper cleans the residue and auto-switches detached canonical HEAD back to main at daemon boot (PR-C).
 
@@ -232,7 +247,7 @@ Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from
 When the `agend-git` shim denies an agent action, the deny is a protocol signal, not a transient error. Re-running the same command with `AGEND_GIT_BYPASS=1` is forbidden.
 
 - **WRONG**: shim denies → set `AGEND_GIT_BYPASS=1` → retry. The bypass succeeds at the git level but skips the protocol gate that the deny was enforcing; whatever the gate was protecting (canonical hygiene, lease invariants, reviewer workspace boundary) is now violated silently.
-- **RIGHT**: abort the operation. Send `kind=query` to lead/orchestrator naming the denied command + the shim's reason string, and ask for the correct routing.
+- **RIGHT**: abort the operation. Send `send({instance:"<lead>", request_kind:"query", message:"<denied command + reason>"})` and ask for the correct routing.
 
 Reasoning:
 
@@ -250,10 +265,10 @@ Even in the agent's own daemon-bound worktree, `git checkout <sha>` is the wrong
 
 Right path, by inspection depth:
 
-- **Full tree** (`cargo test` replay, runtime validation, multi-file inspection): `repo action=checkout source=<canonical> branch=<PR-branch> bind=true`. The daemon provisions a fresh worktree at the named branch, binds it to the caller, and `release_worktree` returns cleanly with no residue.
+- **Full tree** (`cargo test` replay, runtime validation, multi-file inspection): `repo({action:"checkout", repository_path:"<canonical>", branch:"<review-branch>", from_ref:"<PR-head>", bind:true, task_id:"<task-id>"})`. The daemon provisions a named worktree, binds it to the caller, and `release_worktree({instance:"<self>"})` returns cleanly with no residue.
 - **Read-only** (diff inspection, file listing): `gh pr diff <N>` or `gh pr view <N> --json files`. No working-tree mutation at all.
 
-If `repo action=checkout` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send `kind=query` to lead with the failure mode; lead routes via `release_worktree(force:true)` (#2548: absorbed the former standalone `force_release_worktree` tool) or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
+If `repo({action:"checkout", ...})` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send a `request_kind:"query"` message to lead with the failure mode; an authorized recovery may use `release_worktree({instance:"<target>", force:true, branch:"<branch>"})` or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
 
 **Relationship to §3.19.** §3.19 says *what reviewers must not do in canonical*. §3.19.1 says *what every agent must do when the protocol gate fires* — abort and ask, not bypass and retry.
 
@@ -264,7 +279,7 @@ If `repo action=checkout` fails (lease already held, branch unknown, worktree qu
 **Reviewers MUST NOT** do in-place `git checkout` of an impl branch into the agent's base workspace dir. The base workspace is daemon-bound to a specific branch (typically `main` or a long-lived review-housekeeping branch); checking out an impl branch in-place pollutes the base with stale-branch state that bleeds into future sessions.
 
 Use one of:
-- **(a) Dedicated review worktree**: `git worktree add -b review/<N>-r0 <path> origin/<impl-branch>` — read-only review in a fresh worktree separate from the agent base. Release with `release_worktree` when done.
+- **(a) Dedicated review worktree**: provision a daemon-managed named worktree with `repo({action:"checkout", repository_path:"<canonical>", branch:"review/<N>-r0", from_ref:"origin/<impl-branch>", bind:true, task_id:"<task-id>"})`. Release it with `release_worktree({instance:"<self>"})` when done.
 - **(b) GH-only review** (preferred for diff-only inspection): `gh pr diff <N>` + `gh pr view <N> --json files,reviews,statusCheckRollup`. No local checkout, no cleanup needed.
 
 **NEVER** in-place `git checkout` of an impl branch in the agent's base workspace dir.
@@ -280,7 +295,7 @@ Locating a source file (e.g. the `agend-git` shim source `agend-git.rs`) with a 
 Find source from a **fixed point**, not the filesystem root:
 - Inside your bound worktree/repo: `git ls-files | rg <name>` or `rg --files | rg <name>` (index-scoped, fast).
 - Need the repo root: `git rev-parse --show-toplevel` — never `find /` for a marker file.
-- Path you don't know: read `binding_state` for your worktree path, or ask lead via `kind=query`. Never scan the whole disk.
+- Path you don't know: read `binding_state({instance:"<self>"})` for your worktree path, or ask lead via `request_kind:"query"`. Never scan the whole disk.
 
 Do not hardcode machine-specific absolute paths in shared artifacts (the protocol is cross-machine); resolve via `git`.
 
@@ -294,11 +309,11 @@ Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERI
 
 Before dispatching r0 on a race-class PR, lead AND dev MUST answer in writing: *"Does this change have a race condition, and can I write a deterministic test that reproduces it without timing dependence?"* The answer goes in the spike report (or the dispatch message if no spike preceded).
 
-Race class includes — but is not limited to — `tokio::spawn` / `thread::spawn` sites, multi-process startup ordering, `Drop`-vs-`enqueue` lifecycle, lock-ordering across modules, signal-handler-vs-main-loop coordination, daemon-vs-bridge handshake gates. If the answer is "no deterministic test possible," the PR escalates reviewer RED-protocol scrutiny per SOP 3 and SOP 2 post-merge smoke becomes the primary empirical signal.
+Race class includes — but is not limited to — `tokio::spawn` / `thread::spawn` sites, multi-process startup ordering, `Drop`-vs-`enqueue` lifecycle, lock-ordering across modules, signal-handler-vs-main-loop coordination, daemon-vs-bridge handshake gates. If the answer is "no deterministic test possible," stop before implementation and record a waiver decision with the attempted deterministic designs, alternative empirical evidence, operator authorization, and mandatory SOP 2 smoke. Without that waiver, §3.10 and SOP 1 block merge.
 
 **SOP 2 — Post-merge operator smoke sanity check (NOT a merge gate).**
 
-Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (reviewer RED-protocol) are both satisfied. SOP 2 is a **post-merge sanity check**, not a pre-merge gate.
+Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (reviewer RED-protocol) are both satisfied, unless the explicit no-deterministic-test waiver above replaces both with its recorded alternative evidence. SOP 2 is a **post-merge sanity check**, not a normal pre-merge gate; under a waiver it becomes mandatory immediately after merge.
 
 **Post-merge smoke procedure**:
 
@@ -312,30 +327,26 @@ Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (rev
 - **SOP 3** (reviewer RED-protocol execution on the test surface) — the audit gate. Reviewer must independently observe the RED→GREEN transition.
 - SOP 2 post-merge smoke is supplementary empirical coverage, not a gate.
 
-If SOP 1 honestly says "no deterministic test possible" (rare — usually achievable with `tokio::test` + paused time, channel-based synchronization, or trait-injected clocks), SOP 3 still applies and merge proceeds. SOP 2 post-merge smoke then carries proportionally more weight as the only remaining empirical signal — the PR description should call this out so the operator runs the smoke promptly post-merge.
+"No deterministic test possible" is rare — usually a deterministic design exists with `tokio::test` + paused time, channel-based synchronization, or trait-injected clocks. A waiver must define what SOP 3 executes instead (for example a bounded stress harness plus production-entry trace) and must never claim a RED→GREEN observation that did not occur.
 
 **SOP 3 — Reviewer RED-protocol for race-class PRs.**
 
 For race-class PRs, the reviewer MUST execute the RED→GREEN protocol (not skim it):
 
-```
-# Reviewer's bound worktree (NOT canonical — §3.19):
-git checkout <pre-fix-base>     # revert commit OR last known good
-# Confirm RED: the new tests compile-fail, fail at runtime,
-# or fail with the expected error signature.
-git checkout <fix-head>
-# Confirm GREEN: tests pass without flakiness on three back-to-back runs.
-```
+1. Materialize the pre-fix commit as a daemon-managed named worktree/branch (for example `review/<N>-red`) via `repo({action:"checkout", ...})`; never checkout the SHA in-place.
+2. Confirm RED: the new tests compile-fail, fail at runtime, or fail with the expected error signature.
+3. Release the RED worktree, then inspect the fix in a separate daemon-managed named worktree/branch (for example `review/<N>-green`).
+4. Confirm GREEN without flakiness on three back-to-back runs.
 
-The verdict body MUST explicitly state the protocol execution: "Checked out pre-fix base `<sha>` in this worktree. Verified target tests absent/failing there [by source grep / by cargo test exit code]. Reapplied fix HEAD; tests pass 3/3 runs."
+The verdict body MUST explicitly state both immutable SHAs, named worktrees, commands, the RED signature, and the GREEN 3/3 result.
 
-Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — UNVERIFIED` per §3.16 substantive-consensus requirement. The PR returns to dev for explicit reviewer RED-protocol execution before re-dispatch.
+Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — REJECTED` with evidence per §3.3. The PR returns to dev for explicit reviewer RED-protocol execution before re-dispatch.
 
 **Relationship to §3.19.1.** §3.19.1 says *what every agent must do when a protocol gate fires*. §3.20 says *what lead, dev, and reviewer must do BEFORE the gate could fire* on race-class PRs — a sanctioned discipline addition, not a replacement for any existing rule. Race-class triage at r0 dispatch is cheaper than the ship-then-revert cycle empirically observed on #881.
 
 ### 3.21 Proportional Ceremony — right-size process to task risk
 
-Match fleet ceremony to where a task's risk actually lives. Decided by **lead judgment**, NOT a daemon classifier — a rubric nobody follows is compliance-theater (false confidence, blame-shift). #1656 shipped review-tiering as pure judgment and it caught real defects. Record each dispatch's ceremony call via `decision(action: post)` — the decision log IS the classifier (zero new code). `↳ 緣由 #1656/#1659/#1660 dialectic`
+Match fleet ceremony to where a task's risk actually lives. Decided by **lead judgment**, NOT a daemon classifier — a rubric nobody follows is compliance-theater (false confidence, blame-shift). #1656 shipped review-tiering as pure judgment and it caught real defects. Record each dispatch's ceremony call via `decision({action: "post", ...})` — the decision log IS the classifier (zero new code). `↳ 緣由 #1656/#1659/#1660 dialectic`
 
 **Three INDEPENDENT axes — decide separately, never collapse into one "trivial/non-trivial" flag.** A task can be single-agent + light-review + spike-REQUIRED (e.g. #1658).
 
@@ -356,7 +367,7 @@ Match fleet ceremony to where a task's risk actually lives. Decided by **lead ju
 When §3.21-B selects a spike (premise-risk) **OR** the work carries an operator-decision fork (a choice only the operator/lead may settle), the spike and the impl MUST be **separate dispatches** — never one combined task.
 
 - **Spike is ANALYSIS-only** (no production code). It delivers a **decision-manifest**: each premise check stated as confirmed-or-refuted with code evidence, and each operator-decision fork teed up with concrete options + a recommendation.
-- **Impl is dispatched only AFTER the forks are resolved**, and `depends_on` the spike (and the decision that settled each fork). Impl scope is derived from the manifest, not assumed up front.
+- **Impl is dispatched only AFTER the forks are resolved**, with `depends_on` containing the spike task ID. Decision IDs belong in the implementation task's scope source / description, not in the task-dependency list. Impl scope is derived from the manifest, not assumed up front.
 - **No batch approval.** Do NOT pre-approve spike + impl as one unit: the impl's real scope is unknown until the spike resolves the premise and the forks, so approving impl in advance approves an unknown.
 
 **Reinforcement-only** (lead judgment, like §3.21) — enforced at dispatch, NOT a daemon hard-gate. The mechanizable candidate is chokepoint=dispatch / signal="does this impl have a resolved decision-manifest?", but per KISS this stays a convention until a real gate is justified (restrict footguns, not capable ops).
@@ -381,27 +392,25 @@ When push claim references a function name, daemon verifies existence via syn-li
 Instance names with routing semantics (`general`, `lead`, `dev`, `reviewer`) emit warning on create. Not a hard reject.
 
 ### 4.5 Cross-team ACK Absorption Exception (Sprint 61, #612)
-One-shot backends (Codex) skip PTY injection for `kind=update` and `kind=report` messages to avoid wasting turns. However, **cross-team messages are NEVER silently absorbed** — they always inject to PTY regardless of backend or message kind. Team membership is checked at delivery time; agents not in any team are treated as cross-team (safe default). Absorbed messages are audit-logged as `ack_absorbed` events.
+For one-shot Codex backends, same-team `update` and `report` messages are persisted to the inbox without waking the receiver when the receiver is not an orchestrator and the message is not a correlated response to a blocker the receiver already drained. Cross-team messages, messages to an orchestrator, and correlated blocker responses still inject into the PTY. ACK absorption suppresses an unnecessary wake; it never drops the message.
 
 ## §5. Async Pipeline
 
-Impl pushes PR then immediately starts next task. Reviewer issues verdict then immediately takes next review. dev-lead maintains pending list; dual-VERIFIED + CI green (independently verified via `gh pr checks`) → self-merge.
+Impl pushes PR then immediately starts next task. Reviewer issues verdict then immediately takes next review. dev-lead maintains the pending list; the task's required `review_class` must be satisfied by VERIFIED verdicts and CI must be green (independently verified via `gh pr checks`) before an authorized merge.
 
 **Key rules**:
 - Impl push must include scope statement (follows spec / deviated because)
 - Orchestrator pre-dispatch verification: cross-check dev's claim against actual artifact before forwarding to reviewer
-- dev-lead uses `schedule(action: create)` for auto-poll (30min fallback)
-- **Post-dispatch verification (Sprint 62)**: after `send(kind: task)` returns success (no error), if receiver does not reply within ~5min, dispatcher MUST verify via fallback path:
-  - `inbox(instance: <receiver>)` — confirms unread queued message (offline agents only; active agents receive PTY direct injection and inbox stays empty)
-  - `describe_instance(name: <receiver>)` — confirms agent_state active (PTY delivery already arrived)
-  - `binding_state(agent: <receiver>)` — confirms task lifecycle started (binding metadata present)
-  - If all three show no progress, suspect lease conflict / stale binding / dispatch path block — investigate (`release_worktree(force:true)` if needed; #2548 absorbed the former standalone `force_release_worktree` tool) before re-dispatching
+- dev-lead may use a one-shot `schedule({action: "create", ...})` as a 30-minute check-in fallback; it must not become a repeated polling loop
+- **Review class before branch dispatch**: create every PR-producing branch task with `task({action: "create", ..., review_class: "single" | "dual"})`. The existing task's `metadata.review_class` is authoritative; adding `review_class` only to a later `send` cannot repair an unspecified task and the daemon fails closed.
+- **Post-dispatch verification (Sprint 62)**: dispatch with `send({instance: "<receiver>", request_kind: "task", task_id: "<task-id>", branch: "<branch>", message: "<brief>"})`. A successful response confirms the target accepted delivery routing but does not expose a message-level receipt. If the receiver does not reply within ~5 min, combine liveness from `list_instances({instance: "<receiver>"})`, visible activity from `pane_snapshot({instance: "<receiver>"})`, branch state from `binding_state({instance: "<receiver>"})`, and the eventual report. None of these signals alone proves that the task was understood.
+  - If the signals show no progress, diagnose the lease or dispatch path before re-dispatching. The receiver or its authorized team orchestrator may use `release_worktree({instance: "<receiver>"})`; forced release additionally requires the known branch: `release_worktree({instance: "<receiver>", force: true, branch: "<branch>"})`.
 - **Pane-claim is not delivery**: agent writing a response in its own pane is NOT a `send`. Every reply / verdict / report must be triggered via the MCP `send` tool. Receivers do not see pane content. Verify via §6 channel discipline.
-- **Post-PR-merge close-loop reporting**: each PR `kind=report` MUST include a "lessons learned" section noting process wins, scope shifts, unexpected discoveries. Captures process-maturity signals for protocol evolution.
+- **Post-PR-merge close-loop reporting**: each PR `request_kind: "report"` MUST include a "lessons learned" section noting process wins, scope shifts, unexpected discoveries. Captures process-maturity signals for protocol evolution.
 - Takeover requires 4 criteria independently verified (heartbeat stale ≥1h, last_input frozen, idle state, zero activity)
-- Merge must atomically include `git worktree remove` + `git branch -D`
+- Worktree release and branch deletion are separate state transitions: a clean, pushed/handed-off worktree may be released before merge so the agent can take another task; the daemon preserves the unmerged branch and cleanup intent. Delete the branch only after §10's preservation proof. A pending/queued merge is not deletion proof.
 - Post-merge: orchestrator verifies main CI green before reporting task completion upstream. Failed main CI = immediate P0 (revert or hotfix).
-- Orchestrator owns `ci(action: watch)` for own-orchestrated branches
+- Orchestrator owns `ci({action: "watch", repository: "<owner/repo>", branch: "<branch>", task_id: "<task-id>"})` for own-orchestrated branches
 - Stuck-agent timeout: see §9 timeout staircase
 
 ## §6. Communication
@@ -417,7 +426,7 @@ Use `send` for all inter-agent messaging:
 
 **Routing**: `instance` (single) or `instances` / `team` / `tags` (broadcast)
 
-**Dispatch milestone updates** — when you accept a `task` dispatch, send `kind=update` to the dispatcher at each of these milestones without being asked:
+**Dispatch milestone updates** — for PR-producing implementation work, send `request_kind: "update"` to the dispatcher at each of these milestones without being asked:
 
 1. **r0 ready** — PR opened (or work artifact handed off), with verbatim links / heads.
 2. **CI all-green** — every CI gate the PR runs has reported success. The `[ci-pass]` watch broadcast does NOT substitute — confirm via your own update so the dispatcher's loop closer fires regardless of their channel state.
@@ -425,30 +434,33 @@ Use `send` for all inter-agent messaging:
 
 Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher relies on these as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
 
+For analysis, spike, review, or operational tasks that do not produce a PR, report the requested artifact/result and mark the PR-specific milestones not applicable; do not invent a PR lifecycle.
+
 - Pure ack → do not reply (ACK absorption §4 handles this automatically)
 - Response channel must match source channel
-- **Router-layer channel discipline (Sprint 52)**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
-- **Inbox vs PTY delivery (Sprint 62)**: active agents receive messages via PTY direct injection (not queued in `inbox`). `inbox(instance: X)` returning empty does NOT mean X received nothing — only means X has no unread queue. Verify delivery via `describe_instance` (active state = PTY received) or `pane_snapshot` rather than inbox alone. Inbox queue only fills for offline agents or undeliverable messages.
+- **Response-channel discipline**: `[user:NAME via telegram]` → `reply`; `[from:AGENT_NAME]` → `send`; no prefix (operator typed directly in the TUI) → direct text. Do not assume direct text is universally mirrored.
+- **Inbox vs PTY delivery (Sprint 62)**: messages are durably enqueued; eligible messages may also inject into the active PTY. An empty pending-inbox drain is not delivery proof because the message may already have been drained or injected. Use the dispatch result, later task/report state, `list_instances({instance: "<receiver>"})`, and `pane_snapshot({instance: "<receiver>"})` as complementary signals; see §4.5 for absorption exceptions.
 - **Daemon auto-inject marker `[AGEND-AUTO]` (#1769)**: the daemon resumes a stuck agent by injecting a keystroke (e.g. `continue`) straight into the PTY, which otherwise looks identical to the operator typing it — a bare injected `continue` was once mistaken by an orchestrator for an operator command and a task dispatched from it. Such nudges now carry an `[AGEND-AUTO kind=...]` prefix (sibling of `[AGEND-MSG]`). **Rule:** treat an `[AGEND-AUTO]` line as a low-priority RESUME signal — continue in-progress work — and **never** as an operator command or a basis to dispatch a task / make a decision. Inbox/operator-relay messages keep their own `[AGEND-MSG]`/`[from:]` headers and are unaffected.
 
 ## §7. CI
 
-Use `ci(action: watch)` for ongoing monitoring, not manual polling. Exception: merge-gate final verification requires one-shot `gh pr checks <PR#>` per §3.3.1. Clean up worktree + branch after merge.
+Use `ci({action: "watch", repository: "<owner/repo>", branch: "<branch>", task_id: "<task-id>"})` for ongoing monitoring, not manual polling. Exception: merge-gate final verification requires one-shot `gh pr checks <PR#>` per §3.3.1. A clean, pushed/handed-off worktree may be released earlier; branch deletion still requires §10 preservation proof.
 
 **No manual orchestrator polling**. Orchestrators (lead, general,
 operator-in-the-loop) MUST NOT manually poll PR / CI state via
 `gh pr view`, `gh run list`, repeated `cargo test`, or equivalent.
 Rely on:
 
-1. The dispatchee's `kind=update` milestones (§6) — r0 ready, CI
+1. The dispatchee's `request_kind: "update"` milestones (§6) — r0 ready, CI
    all-green, reviewer verdict.
-2. `ci(action: watch)` fan-out — `[ci-pass]` / `[ci-fail]` /
+2. `ci({action: "watch", ...})` fan-out — `[ci-pass]` / `[ci-fail]` /
    `[ci-watch-stalled]` arrive automatically.
 
-Manual polling masks broken dispatch communication and burns cache /
+Repeated polling loops mask broken dispatch communication and burn cache /
 rate-limit budget unnecessarily. If a milestone is missing past a
 reasonable window, the correct response is to message the dispatchee
-asking why, not to poll. Polling is also a smell that the dispatch
+asking why, not to start a polling loop. Explicit one-shot checks required
+by a merge gate or exact-head post-merge verification are allowed. Polling is also a smell that the dispatch
 brief itself didn't enumerate the expected milestones — fix the
 dispatch, not the symptom.
 
@@ -477,8 +489,8 @@ it appears in a session — it is operator-actionable guidance, not a
 log line. Suggested phrasing: "CI watch responded: <setup_warning>".
 Subsequent occurrences within the same session may be deduplicated.
 
-**Health surface (Sprint 54 P0-5)**. The `ci(action: watch)` response
-and the new `ci(action: status)` aggregator both carry `rate_limit_active`,
+**Health surface (Sprint 54 P0-5)**. The `ci({action: "watch", ...})` response
+and the `ci({action: "status"})` aggregator both carry `rate_limit_active`,
 `rate_limit_until`, and `next_poll_eta` so agents can tell whether CI
 polling is healthy without reading watch files. The daemon also
 fans out two inbox event kinds when polling stalls behind a rate-limit
@@ -510,8 +522,8 @@ Stale `rustup-init` binaries can masquerade as `cargo` / `rustc` / `rustfmt` whe
 
 Cross-platform test failures observed multiple times in 2026-05-13/14 sessions. Mandatory idioms:
 
-- **Time arithmetic**: never `Instant::now() - Duration` (Windows monotonic clock anchors to system uptime → underflow on fresh VM). Use `Instant::add` (saturating) or DI inject `now: Instant` for tests.
-- **Regex hot-path**: never per-call `Regex::new` in fed loop. Use `LazyLock<Vec<Regex>>` (or `OnceLock`). Performance ratio: ~100× speedup, prevents Windows runner test timeout from cumulative `min_hold` budget.
+- **Time arithmetic**: never use unchecked `Instant::now() - Duration` or `Instant + Duration` with untrusted durations; either can panic when the result is outside the representable range. Use `checked_sub` / `checked_add`, or inject `now: Instant` for tests.
+- **Regex hot-path**: never per-call `Regex::new` in a hot loop. Use `LazyLock<Vec<Regex>>` (or `OnceLock`). Performance ratio: ~100× speedup, prevents Windows runner test timeout from cumulative `min_hold` budget.
 - **PTY EOF semantics**: never assume EOF behavior matches across cmd.exe/bash/ConPTY. Shell-backend tests need `#[cfg_attr(windows, ignore = "tracking #N")]` if EOF semantic divergence is the bug not the SUT.
 - **Path mangling**: sanitize both `/` (Unix path) AND `\` + `:` (Windows drive letter) when constructing worktree paths from source paths.
 
@@ -520,13 +532,13 @@ Cross-platform test failures observed multiple times in 2026-05-13/14 sessions. 
 When a CI workflow run **wedges** — a job stays `in_progress` past 2× typical platform completion time and `gh run cancel <run-id>` returns success but the job status doesn't transition — push an **empty commit** to the PR branch to trigger a fresh workflow run. This is a sanctioned recovery technique, not a workaround.
 
 ```
-repo action=checkout source=<canonical> branch=<PR-branch> bind=true
+repo({action: "checkout", repository_path: "<canonical>", branch: "<PR-branch>", bind: true, task_id: "<task-id>"})
 cd <bound-worktree>
 git commit --allow-empty -m "ci: nudge wedged runner (PR #N wedged Nhr)"
 git push origin <PR-branch>
 ```
 
-The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (it eventually GH-Actions-times-out at 6 hours without affecting merge). Reviewer's prior VERIFIED verdict still applies — the SHA advance is byte-identical content, so `reviewed_head` SHA-staleness gate (§4.2) accepts a re-stamp once CI completes; merge gates on the fresh CI result.
+The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (it eventually GH-Actions-times-out at 6 hours without affecting merge). The prior verdict is stale because HEAD changed. Before re-stamping, prove content identity with equal tree OIDs (`git rev-parse <old-head>^{tree}` and `git rev-parse <new-head>^{tree}`) or an empty `git diff <old-head>..<new-head>`; then send a new verdict for the new `reviewed_head`. Merge gates on the fresh CI result.
 
 **When to apply** — all three conditions must hold:
 
@@ -551,16 +563,17 @@ Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml o
 ## §9. Waiting & Timeout
 
 - `set_waiting_on` to declare blockers (auto-clears after 120s inactivity)
-- Use `schedule(action: create)` for check-ins (cross-backend)
+- Use `schedule({action: "create", ...})` for check-ins (cross-backend)
 
 **Timeout staircase** (single source of truth):
 
 | Elapsed since dispatch | Action |
 |---|---|
-| < 20 min | Normal. `describe_instance` — fresh heartbeat = agent active. |
+| < 20 min | Normal. `list_instances({instance: "<agent>"})` — fresh heartbeat means the process is active, not that the task is complete. |
 | 20 min, heartbeat fresh | Agent working. Extend wait. |
 | 20 min, heartbeat stale (>120s) | Ping via `send` with direct question. |
-| 20 min, no response to ping | `restart_instance mode=fresh` and re-dispatch. |
+| 25 min, no response after the ping | Inspect task, pane, binding, and dirty state. A fresh restart of the same agent is allowed only after durable handoff state is current and no uncommitted work would be lost. |
+| ≥ 1 h | Reassignment/takeover requires all four independent criteria: stale heartbeat, frozen last input, idle/error state, and zero task activity. |
 
 **Backend modifiers**:
 - kiro-cli: 1-2h longer wait (context compaction self-heals); escalate to operator rather than `interrupt`
@@ -569,56 +582,48 @@ Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml o
 ### Supervisor Notify
 Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/AuthError/PermissionPrompt) → notifies orchestrator. 60s debounce per agent.
 
-### 9.1 Context-Full Self-Restart (Sprint 63, empirically validated 2026-06-15)
+### 9.1 Context-Full Self-Restart
 
 When an agent (especially a lead/orchestrator) detects its own context approaching full (~80-85%; the pane footer shows `N% context used`), it restarts **itself** — the daemon performs the kill+respawn; no second agent is required to trigger it.
 
-- **`mode="fresh"`, never `resume`** — `resume` reloads the full prior context, giving zero relief. Only `restart_instance(instance=<self>, mode="fresh")` starts clean.
+- **`mode="fresh"`, never `resume`** — `resume` reloads the prior context. Only `restart_instance({instance: "<self>", mode: "fresh", reason: "context-full self-restart"})` starts clean.
 - **Procedure**:
   1. Land all live state on durable stores **before** restarting — update `SESSION-HANDOFF.md` to current (handoff entry point, in-flight PRs, merge procedure, member status, pending dispatches, decisions), post any open `decision`s, ensure work is on the `task` board. Nothing may depend on in-memory context.
-  2. **Self-schedule a kick** so the fresh instance auto-resumes (a fresh boot otherwise sits idle indefinitely — nothing starts it). Before restarting:
-     `schedule(action="create", instance=<self>, run_at=<now + ~90s, ISO 8601>, message="resume: read SESSION-HANDOFF.md + MEMORY.md and continue", label="self-restart-kick")`.
-     The schedule is daemon-side and keyed by instance name, so it survives the restart; the one-shot fires ~90s after respawn and wakes the fresh self to continue. (Delete it after resuming, or let the one-shot auto-complete.)
+  2. Ensure the bound worktree is clean or the in-progress changes are committed. The daemon may refuse a dirty-worktree restart; do not force it without operator authorization.
   3. Pick a lull — never mid-merge or mid-step of an irreversible action.
-  4. Call `restart_instance(instance=<self>, mode="fresh", reason="context-full self-restart")`.
-  5. The daemon cleanly kills the process (`delete: child exited cleanly`) and respawns it fresh (Ctx 0.0%). On boot the SessionStart hook auto-loads `MEMORY.md`; the fresh self reads `SESSION-HANDOFF.md` and continues.
-- **The one caveat (and its mitigation)**: the self-restart call's response never returns (the caller's process is gone), so no external party confirms the fresh instance booted. Mitigation: handoff + `MEMORY.md` auto-load make the fresh self self-sufficient. A peer (e.g. `general`) is **optional** for a post-restart liveness confirm but is **no longer required to trigger** the restart — this supersedes the earlier "ask general to fresh-restart you" convention (delegation is now confirm-only, not the trigger path).
-
-**Empirical basis**: validated 2026-06-15 — an agent called `restart_instance(self, mode="fresh")`; daemon logs showed the tool call → `delete: child exited cleanly` → fresh respawn at Ctx 0.0% with no prior-context memory. A second agent is not part of the mechanism. Also validated 2026-06-15 — the fresh instance sat idle ~80s doing nothing, then the self-scheduled one-shot kick fired (`schedule_trigger`) and it resumed, with zero peer involvement.
+  4. Call the fresh restart. The daemon emits one `[AGEND-RESUME]` bootstrap trigger after respawn; do not create a redundant scheduled kick.
+  5. On `[AGEND-RESUME]`, rebuild state from the authoritative task board and `list_instances`, drain the inbox, then use `SESSION-HANDOFF.md` as a stale-tolerant hint and continue pending work.
+- The restart call may not return because the calling process is replaced. A peer may perform a liveness check, but is not required to trigger the restart.
 
 ## §10. Git Workflow
 
 - Never commit directly to main; always use worktree + branch
-- Branch naming: `feat/`, `fix/`, `docs/`
-- Clean up immediately after merge
-- **Never** `git worktree add <path> main` — locks main, breaks operator builds. Always use `-b <new-branch>`. Recovery: `cd <worktree> && git switch -c <dedicated-branch>`
-- **Dispatched work: the daemon already auto-binds your worktree — `cd` in, do NOT self-provision.** Every `send(kind: task, branch: X)` auto-binds the assignee to a daemon-managed worktree at dispatch (find it via `binding_state(agent: <self>)` → `worktree`). Do NOT run your own `git worktree add` / `AGEND_GIT_BYPASS=1 git worktree add` for dispatched tasks — that double-provisions and the stray op detaches the operator's canonical HEAD (#2234). **Enforced (#2234 fix B):** the `agend-git` shim DENIES an agent's `AGEND_GIT_BYPASS` `worktree add` / positional `checkout|switch <ref>` when cwd is canonical-rooted (the source repo or any worktree of it). Use normal git inside the bound worktree (the shim routes it correctly — no bypass needed). Genuinely need to provision yourself? Use `bind_self {repository_path, branch}` (daemon-tracked), or for a one-shot escape set `AGEND_GIT_ALLOW_CANONICAL_MUTATE=1`. A shim deny is a protocol signal — ask, don't escalate to bypass (§3.19.1).
-- **Generic `bind_self` (Sprint 54 P1-7)**: any agent (lead, dev, reviewer, …) may proactively claim a worktree via `bind_self {repository_path, branch}` without going through the dispatch hook. Inherits every dispatch invariant — Phase 1 trailers, P0-1.5 cross-agent registry, P0-1.6 actual-HEAD verification, P0-X release_worktree as sole exit, source_repo persistence, auto watch_ci. Use case: lead orchestrator escalating to Path A IMPL on a hot branch. Pair with `release_worktree` to unbind. `main`/`master` rejected with E4.5; cross-agent branch conflicts return `code: cross_agent_conflict`.
-- **`AGEND_GIT_BYPASS` pushes do NOT auto-watch CI (known limitation).** A bypass push goes straight through the `agend-git` shim (execs real git) and never reaches the dispatch_hook that arms `watch_ci` — so **no `[ci-ready]` fires for that branch**, even when CI is green. After a bypass push that opens or updates a PR, arm the watch manually with `ci(action: watch)` (or rely on lead's manual `gh pr checks` as a fallback). Normal daemon-bound pushes auto-watch per the `bind_self`/dispatch invariants above. (#1750 A1 made a *failed* arm on the normal path visible; the deeper fix — re-enabling the push hook so bypass is rarely needed — is gated on the #1751 broad shim-footgun fix.)
+- Use a descriptive conventional prefix such as `feat/`, `fix/`, `docs/`, `refactor/`, `test/`, `review/`, or `chore/`
+- Release a clean, pushed/handed-off worktree when changing tasks; delete its branch only after preservation proof below
+- **Worktree lifecycle is daemon-owned.** For dispatched work, `send({instance: "<assignee>", request_kind: "task", task_id: "<task-id>", branch: "<branch>", message: "<brief>"})` binds the assignee—not the dispatcher—to a daemon-managed worktree. Find it with `binding_state({instance: "<self>"})`, `cd` into it, and use normal git there. Do not run raw `git worktree add`, do not switch the canonical repo, and do not use a bypass to escape a shim deny.
+- **Provision/re-bind**: prefer `repo({action: "checkout", repository_path: "<canonical>", branch: "<branch>", from_ref: "<base>", bind: true, task_id: "<task-id>"})` for a fresh task. Use `bind_self({repository_path: "<canonical>", branch: "<branch>", task_id: "<task-id>"})` only to re-bind a recovered worktree, resolve the source repo from fleet metadata, or reclaim the same branch after release. Protected branches are rejected and cross-agent conflicts must be resolved through the owner/lead. Pair the binding with `release_worktree({instance: "<self>"})`.
+- Normal bound pushes participate in daemon lifecycle/CI integration. If an operator-authorized exceptional push bypasses that integration, explicitly arm `ci({action: "watch", repository: "<owner/repo>", branch: "<branch>", task_id: "<task-id>"})`; see §13.
 
 ### release_worktree branch-cleanup scope
 
-`release_worktree` auto-cleanup ONLY operates on branches that satisfy ALL of:
-1. The worktree was daemon-managed (`.agend-managed` marker verified)
-2. The branch is confirmed merged into main OR remote tracking ref is gone (squash-merge)
-3. Protected refs (main/master) are NEVER touched
+Releasing a daemon-managed worktree and deleting its local branch are distinct:
 
-User-checkout branches, operator-created worktrees without `.agend-managed` marker, and any branch where the marker cannot be verified are NEVER deleted.
+1. A clean worktree whose commits are pushed or durably handed off may be released before merge. The daemon retains an unmerged branch and records cleanup intent.
+2. Local branch deletion requires one of: the branch is an ancestor of main; the provider proves that a PR for the matching head was merged; or structural squash proof passes together with the 24-hour age floor.
+3. A missing remote tracking ref alone is never deletion proof: local-only commits may still need preservation.
+4. Protected refs (`main`/`master`) are never touched.
+
+Automatic lifecycle cleanup applies only to daemon-managed worktrees with a verified `.agend-managed` marker. User/operator-created worktrees and any unverifiable marker are preserved.
 
 ### release_worktree parameter form
 
-Use `release_worktree(agent: <self>)`. The `path: ...` form is NOT a recognized schema — daemon silently no-ops on unknown params. Verify cleanup with `binding_state(agent: <self>)` returning `bound: false`.
+Use `release_worktree({instance: "<self>"})`. Forced recovery additionally requires the known branch: `release_worktree({instance: "<self>", force: true, branch: "<branch>"})`. A missing required `instance` hard-rejects; extra unknown keys may warn and be ignored, so never treat them as cleanup. Verify success with `binding_state({instance: "<self>"})` returning `bound: false`.
 
-### 10.6 Lead Pre-Dispatch Release (Sprint 62)
+### 10.6 Dispatch Binding Ownership
 
-Every `send(kind: task, branch: <X>)` triggers daemon auto-bind for the **dispatcher** (lead) to branch X, then dispatches the task to the assignee. If lead is already bound to a previous dispatch branch, the new dispatch may fail with `lease_failed` OR succeed but leave the previous binding stale.
+A task send with `branch` auto-binds the **assignee**. It does not bind or move the dispatcher. Therefore the dispatcher must not release its own worktree as generic pre-dispatch hygiene.
 
-Normalize: lead MUST `release_worktree(agent: <self>)` BEFORE every `send(kind: task)`. This:
-1. Clears stale lead bindings from prior dispatches
-2. Ensures the new auto-bind doesn't conflict
-3. Prevents dev's subsequent claim from hitting "branch already checked out" errors
-
-Lead role does not need a worktree for orchestration work — release immediately after each dispatch is correct hygiene.
+If the assignee is already bound to a different branch, resolve that binding before dispatch: ask the assignee to commit/hand off and call `release_worktree({instance: "<assignee>"})`, or have an authorized orchestrator use the forced form with the exact branch. Never release another agent's worktree speculatively; an active dirty binding may contain unreported work.
 
 ### 10.7 Bare `init` Commits on a Worktree Branch — Source & Handling (#1462)
 
@@ -666,13 +671,13 @@ the empty `init` commits out of the push range
   your branch. Do not open an RCA over it. ⚠ This exact mistake has recurred:
   **two separate devs hand-`rebase`d these off as "daemon pollution", one burning a
   whole RCA spike**, for zero benefit. Let the push handle the pile.
-- **⚠ One real exception — `AGEND_GIT_BYPASS=1 git push`**: a bypass push skips the
+- **⚠ One real exception — an operator-authorized `AGEND_GIT_BYPASS=1 git push`**: a bypass push skips the
   shim ENTIRELY (`src/bin/agend-git.rs:256`), so `cleanup_init_pile_pre_push` does
   NOT run and the pile would be pushed as-is. (Note `--no-verify` does NOT cause
   this — the cleanup is shim code in the push arm, not a git pre-push hook, so it
-  runs regardless of `--no-verify`.) If you must bypass-push a branch carrying the
-  pile, a manual cleanup before that single push is legitimate; otherwise prefer a
-  normal push and leave it alone.
+  runs regardless of `--no-verify`.) If §13 authorizes that exact push and the branch
+  carries the pile, a manual cleanup before the single push is legitimate; otherwise
+  prefer a normal push and leave it alone.
 - **TODO (root fix, not in this PR)**: isolate the `agend-git` BIN tests so their
   `git commit --allow-empty` fixtures cannot leak through the shim onto the real
   branch (e.g. run them under bypass / an unbound env). Code fix, cosmetic, low
@@ -681,8 +686,9 @@ the empty `init` commits out of the push range
 **Acceptance / §3.10 verifiability**: these commits are NOT to be amend-rewritten
 or force-pushed away (per §10 hard rule). Reviewers look past them via
 `git log --no-merges --grep`. An anchor RED commit may sit between `init` commits
-and the impl GREEN commit — verify §3.10 by `git checkout <anchor-sha>` (cargo test
-fails) → `git checkout <impl-sha>` (cargo test passes), ignoring the `init` noise.
+and the impl GREEN commit. Verify §3.10 by materializing each immutable ref in a
+daemon-managed named worktree as described in §3.10/§3.20, observing RED at the
+anchor and GREEN at the implementation ref, and ignoring the cosmetic `init` noise.
 
 ### 10.8 Backend TUI Render Duplication (#1464)
 
@@ -723,16 +729,17 @@ Use `$AGEND_INSTANCE_NAME` for the instance and your resolved backend/model. Ski
 
 | Need | Use | NOT this |
 |---|---|---|
-| Track work | `task(action: create/list/claim/done)` | local task lists |
-| Record decisions | `decision(action: post)` | Markdown files |
-| Assign work | `send(kind: task)` + `task(action: create)` | only one |
-| Report results | `send(kind: report)` | free-text |
-| CI monitoring | `ci(action: watch)` | manual `gh run list` loops |
+| Track work | `task({action: "create" / "claim" / "update" / "done", ...})` | local task lists |
+| Record decisions | `decision({action: "post", ...})` | Markdown-only decisions |
+| Assign work | create task, then `send({request_kind: "task", task_id: "...", ...})` | only one |
+| Report results | `send({request_kind: "report", parent_id: "...", correlation_id: "...", ...})` | pane text |
+| CI monitoring | `ci({action: "watch", repository: "...", branch: "...", task_id: "..."})` | manual polling loops |
 | CI merge gate | `gh pr checks <PR#>` | trusting dev self-report |
-| Wait state | `set_waiting_on` | prose |
-| Health check | `describe_instance` | guessing |
-| Schedule | `schedule(action: create)` | backend-specific tools |
-| Timeout | `restart_instance mode=fresh` | waiting forever |
+| Wait state | `set_waiting_on({condition: "..."})` | prose |
+| Instance health | `list_instances({instance: "..."})` | guessing |
+| Clear blocked health | `health({action: "clear", instance: "..."})` | stale local notes |
+| Schedule | `schedule({action: "create", ...})` | backend-specific tools |
+| Timeout | §9 staircase, then `restart_instance({instance: "...", mode: "fresh", ...})` | immediate destructive restart |
 
 **Daemon-state error format (Sprint 54 #488 hotfix)**. Tools that
 depend on daemon-resident state — `reply`,
@@ -751,11 +758,11 @@ Daemon binary refresh (recompile + restart, or hot-reload via `mcp_registry_watc
 - **CI watch state** — fixed by #786, but pre-#786 watches may be missing
 - **Instance registry vs team metadata sync** — fixed by #785 (better-error surfaces desync); team membership outlives instance restart, may reference wiped instances
 - **Source_repo on team** — historically wiped by `teams.json` migration on refresh (was #781 root cause); persisted as of #781 but verify with `grep source_repo fleet.yaml` if behavior unexpected
-- **Active bindings** — in-memory `bind_in_flight` flag may be lost; check `binding_state(agent)` and `release_worktree(force:true)` (#2548: absorbed the former standalone `force_release_worktree` tool) if dangling
+- **Active bindings** — in-memory `bind_in_flight` flag may be lost; check `binding_state({instance: "<agent>"})`. If a binding is proven dangling, use normal `release_worktree({instance: "<agent>"})`; guarded force recovery requires `force: true` plus the exact `branch`.
 
 **Operator workflow**: `mcp_registry_watcher` notification = restart-needed signal. Run `agend-terminal stop && cargo build --release && agend-terminal start` to pick up new binary. Subsequent agent dispatches benefit from fresh code.
 
-**Agent workflow**: do NOT assume state survives daemon refresh. Re-verify via `team list`, `ci action=status`, `binding_state` after any refresh notification.
+**Agent workflow**: do NOT assume state survives daemon refresh. Re-verify via `team({action: "list"})`, `ci({action: "status"})`, and `binding_state({instance: "<self>"})` after any refresh notification.
 
 ## §12. Workflow Efficiency
 
@@ -768,14 +775,16 @@ Start review on PR push. `reviewed_head` is a snapshot; subsequent commits reset
 ### 12.3 Task Close
 `in_progress` → `verified` (reviewer) → merge (CI green per §3.3.1) → post-merge main CI green → `done`.
 
-**Post-merge verification**: After squash-merge, orchestrator MUST verify main branch CI passes:
+**Post-merge verification**: After squash-merge, capture the immutable merge SHA and have the target team orchestrator/operator register an exact-head protected-branch watch:
+
 ```
-gh run list -b main --limit 1
+ci({action: "watch", repository: "<owner/repo>", branch: "main", head_sha: "<full-merge-sha>", task_id: "<task-id>", next_after_ci: "<orchestrator>"})
 ```
-or wait for ci_watch [ci-pass] on main. Only declare task `done` after main CI is confirmed green. If main CI fails post-merge, immediately investigate and fix (revert if necessary).
+
+Only the matching exact-head success closes the task; a newer unrelated main run is not evidence for this merge. Protected exact-head watches are currently GitHub-only; on another provider, obtain provider-native evidence pinned to the merge SHA or report the close gate UNVERIFIED. If that exact SHA fails, immediately investigate and fix (revert if necessary).
 
 ### 12.4 Worktree Mandatory
-Impl/reviewer must work in a worktree, never the canonical working tree. For dispatched tasks the daemon **already auto-binds** one — find it via `binding_state(agent: <self>)`, `cd` in, and use **normal git** (no bypass; the shim routes it). Do NOT self-provision: the `agend-git` shim DENIES an agent's `AGEND_GIT_BYPASS git worktree add` in a canonical-rooted repo (#2234 — a stray provision detaches the operator's canonical HEAD). Only the `nextest` line needs `AGEND_GIT_BYPASS=1` (its internal git). Provision deliberately via `bind_self {repository_path, branch}`; **never** `git worktree add <path> main`. Full rule + escape hatch: §10.4.
+Impl/reviewer must work in a worktree, never the canonical working tree. For dispatched tasks the daemon **already auto-binds the assignee** — find it via `binding_state({instance: "<self>"})`, `cd` in, and use normal git. Do not self-provision with raw git; provision deliberately through `repo({action: "checkout", repository_path: "<canonical>", branch: "<branch>", from_ref: "<base>", bind: true, task_id: "<task-id>"})` or the recovery-oriented `bind_self` form in §10. Agents never turn a shim deny into permission to bypass. Full rule + exceptions: §12.4 and §13.
 
 ### 12.5 Spawn Site Rationale
 Every spawn must have `// fire-and-forget: <reason>` OR store JoinHandle. Test-only exempt.
@@ -784,7 +793,7 @@ Every spawn must have `// fire-and-forget: <reason>` OR store JoinHandle. Test-o
 When multiple PRs ship in the same wave (same dispatch/task_id):
 1. Merge sequentially: A → rebase B on new main → re-verify CI → merge B → ...
 2. Never parallel merge — later PRs have stale base
-3. After each merge, remaining PRs must rebase and re-run CI before merge
+3. After each merge, remaining PRs must rebase and re-run CI before merge. The rebase changes `reviewed_head`, so the prior verdict is stale: re-review the new head, or, if the tree is byte-identical, publish a new re-stamp citing equal tree OIDs/empty diff.
 
 This constraint is communicated in the dispatch message text (there is no daemon-enforced param — the removed `send.sequencing` passthrough had no consumer). Recipients MUST merge one at a time and verify CI between each merge.
 
@@ -800,7 +809,7 @@ A PR that resolves a tracked issue MUST carry a closing keyword (`Closes #N` / `
 
 ## §13. `AGEND_GIT_BYPASS=1` Usage
 
-**TL;DR:** emergency override only. Default is bare `git`. Bypass when shim explicitly denies AND the operation is on the required-bypass list below.
+**TL;DR:** agents use normal git inside their daemon-managed worktree and never bypass a shim denial. Bypass is reserved for daemon internals and explicitly operator-authorized repair/bootstrapping exceptions.
 
 ### 13.1 When you should NOT use bypass
 
@@ -810,24 +819,20 @@ Inside your bound worktree, all routine git ops pass through the shim cleanly. R
 git status / diff / log / show
 git add / commit / fetch
 git push origin <your-branch>     # any branch except main
-git checkout <existing-branch>    # within current repo
-git reset --hard <ref>            # within your worktree
 ```
 
-Don't preemptively prefix `AGEND_GIT_BYPASS=1`. Try bare git, read the deny message if it fires, then decide.
+Do not preemptively prefix `AGEND_GIT_BYPASS=1`. If the shim denies an action, stop and follow the daemon-managed remediation or ask the lead/operator; the denial is not permission to retry beneath the guard.
 
-### 13.2 When bypass is required
+### 13.2 Authorized bypass scopes
 
-Operations on the lifecycle/safety surface the daemon manages directly:
+The allowed scopes are narrow:
 
-- `git worktree add` / `remove` / `move` — worktree pool is daemon-owned (Phase 3 lease, P0-X release)
-- `git checkout main` from an agent worktree — cross-branch deny in the shim matrix
-- Operator manual cleanup of orphan worktree or orphan binding (no MCP tool yet for some edge cases)
-- Daemon's own internal git command — bypass is set by the daemon to prevent self-recursion through its own shim
+- Daemon-internal git helpers set bypass to avoid recursion through their own shim.
+- An operator may authorize a one-command repair after daemon-managed release/recovery routes have been exhausted. Record the command, reason, affected repo/branch, and result.
+- §13.5 permits a fix for a bug that blocks its own normal delivery, but only with explicit operator authorization and the PR disclosure defined there.
+- A repository-owned test wrapper may set bypass internally for a tool whose own nested git probes would otherwise recurse (for example a configured `nextest` wrapper). Agents do not add the prefix ad hoc.
 
-If your op isn't on this list and you reach for bypass, you're probably solving the wrong problem.
-
-Note: `git push origin main` is **workflow-prohibited** (PR + CI gates required), but the current shim matrix does not deny it directly. The protection comes from review process, not from the shim. Don't push to main even though `git push origin main` would not trip a shim deny today.
+Raw worktree lifecycle, switching protected branches, and pushing to main are not agent bypass scopes. Use `repo`, `bind_self`, `release_worktree`, and the PR/merge workflow.
 
 ### 13.3 Why bypass is costly
 
@@ -838,29 +843,30 @@ Skipping the shim skips the safety net:
 - **Git registry can drift** — `git worktree add` outside the daemon's pool leaves untracked entries; subsequent leases may collide
 - **Phase 5 hotspot warning skipped** — concurrent edits to flagged files don't surface on the dispatch path
 
-These are not catastrophic individually. They erode the invariants the shim was built to maintain.
+Any one of these can invalidate review or strand operator state; treat bypass as an audited exception, not convenience.
 
 ### 13.4 Default workflow
 
 1. Run bare `git <command>`.
 2. If the shim denies, read the deny message — it names the specific reason and suggests a remediation.
-3. If the remediation is "use bypass," set `AGEND_GIT_BYPASS=1 AGEND_GIT_BYPASS_AGENT=<your-name>` for that one command.
-4. If the remediation is something else (e.g., "use the task board to get a worktree assignment"), follow it.
+3. Follow a daemon-managed remediation (`repo`, `bind_self`, `release_worktree`) when offered.
+4. If the only proposed remediation is bypass, an agent pauses and requests lead/operator direction. Only the operator or an explicitly authorized procedure may approve the exact one-command scope.
 
-`AGEND_GIT_BYPASS_UNTIL=<epoch>` exists for time-windowed bypass during multi-step operator interventions; per-command env is preferred for normal use.
+`AGEND_GIT_BYPASS_UNTIL=<epoch>` is for audited, time-bounded operator interventions; it is not an agent convenience flag.
 
 ### 13.5 Bug-Blocks-Its-Own-Fix Exception (Sprint 62)
 
-When fixing a daemon binding bug (or any bug whose existence prevents the bypass-free workflow itself), the fix PR may legitimately require one-shot `AGEND_GIT_BYPASS=1` for `git add` / `git commit` / `git push` of THIS PR — because the very bug being fixed blocks the bypass-free path.
+When fixing a daemon binding bug (or another bug whose existence prevents the bypass-free workflow itself), the fix PR may use a one-command bypass only after normal daemon-managed recovery is shown unable to deliver the fix and the operator authorizes the exact scope.
 
 **Acceptance criteria for this exception**:
 1. PR body MUST include a `## Bypass scope rationale` section explicitly framing the loop:
    - The bug being fixed
    - Why fix removes the future need for bypass
    - One-shot scope limited to this single PR
-2. Bypass commits land in branch history (per §10.7); squash-merge cleans final main
-3. After this PR merges + daemon binary updates, all subsequent PRs revert to ZERO BYPASS workflow
-4. Operator authorization required if scope expands beyond commit/push (e.g. into worktree manipulation)
+2. Record operator authorization and each bypassed command/result in the task or decision log
+3. Bypass commits remain reviewable in branch history; squash-merge may condense final main
+4. After the PR merges and the daemon updates, all subsequent work returns to the zero-bypass workflow
+5. Worktree manipulation and protected-branch mutation remain forbidden; this exception cannot authorize them implicitly
 
 `↳ 緣由 A-§13.5`
 
@@ -869,6 +875,9 @@ When fixing a daemon binding bug (or any bug whose existence prevents the bypass
 ## Appendix A — Rationale & Incident Log
 
 The *why* and *when* behind normative rules. Incident narratives, activation histories, and empirical motivations relocated here from the rule text; referenced from the normative layer via `↳ 緣由 A-§X`. Reading this is optional unless you are questioning or revising a rule.
+
+### A-§3.3 — Evidence Is External to the Claim
+Several reviews accepted comments or PR prose as proof of reachability and scope, then source inspection showed dead paths, bypassing call sites, or missing events. The rule requires evidence from executable behavior or cited source rather than restating the author's claim.
 
 ### A-§3.3.1 — CI Verification Gate
 Sprint 61 incident — ci_watch emitted false [ci-pass] on partial completion, leading to merge of failing code.
