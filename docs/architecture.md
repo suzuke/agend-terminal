@@ -5,13 +5,10 @@
 > Current-state structural map, synthesized from the #2050 architecture pass
 > and revalidated for its named structural anchors against `main` @ `1d83b423`
 > on 2026-07-16. Survey-era LOC figures remain sizing hints rather than
-> invariants. [REFACTOR-PLAN.md](REFACTOR-PLAN.md) is the historical phased
-> plan derived from the original survey; current convergence status lives in
-> [architecture/ARCHITECTURE-14-LEDGER.md](architecture/ARCHITECTURE-14-LEDGER.md).
->
-> Newcomers: read [ARCHITECTURE-QUICK-START.md](ARCHITECTURE-QUICK-START.md)
-> first. The original rewrite-era design doc is archived at
-> [archived/architecture-design-doc-2026-05.md](archived/architecture-design-doc-2026-05.md).
+> invariants. Current convergence status lives in
+> [ARCHITECTURE-14-LEDGER.md](ARCHITECTURE-14-LEDGER.md). Historical surveys,
+> plans, and the rewrite-era design remain retrievable through the immutable
+> history snapshot documented in [the docs index](README.md#historical-records).
 > Lock discipline lives in [DAEMON-LOCK-ORDERING.md](DAEMON-LOCK-ORDERING.md)
 > and is summarized (not duplicated) here.
 
@@ -30,6 +27,29 @@ Four binaries: `agend-terminal` (daemon + TUI + CLI), `agend-mcp-bridge`
 (per-agent stdio↔TCP MCP relay), `agend-git` (PATH-shim `git` policy gate),
 and vendored `agentic-git` (flag-gated shim alternative; see fleet
 `use_agentic_git_shim`).
+
+### 1.1 Operational boundary and reading path
+
+AgEnD is a single-operator developer tool. Its trust boundary is the local
+user account and `$AGEND_HOME` (normally `~/.agend`, with the legacy
+`~/.agend-terminal` fallback); it is not a multi-tenant service. Unexpected
+daemon crashes are supervised by the installed launchd, systemd, or Task
+Scheduler service rather than by an in-process self-supervisor.
+
+For a first code-reading pass, follow these stable entry points:
+
+- fleet schema: `src/fleet/`
+- app mode: `src/main.rs` → `src/app/mod.rs`
+- headless daemon: `src/daemon/mod.rs`
+- agent spawn: `src/agent/mod.rs` + `src/bootstrap/agent_resolve.rs`
+- MCP dispatch: `src/mcp/handlers/mod.rs` → `src/mcp/handlers/dispatch.rs`
+- state classification: `src/state/`, `src/backend_profile.rs`, and
+  `src/behavioral.rs`
+- TUI rendering: `src/render/` + `src/app/`
+
+Development and fleet-process invariants are normative in
+[FLEET-DEV-PROTOCOL.md](FLEET-DEV-PROTOCOL.md); this architecture map explains
+the implementation shape but does not override that protocol.
 
 ## 2. Subsystem map
 
@@ -207,9 +227,9 @@ The load-bearing disciplines, each runtime- or CI-enforced:
 | Fleet allowlist parsing is fail-closed: one malformed entry fails the list → downstream auth denies all | fleet load / `is_authorized_recipient` | silent partial authorization |
 | binding.json single-writer + HMAC sidecar | binding.rs | shim trusts forged bindings |
 | Task event log: append under lock with re-replay (`append_checked`), fail-closed on unknown future events | task_events.rs:1034,1538 | TOCTOU board corruption / silent event drops |
-| Boot grace (180s) suppresses notification watchdogs after restart | per_tick/mod.rs:118 | restart burst of false alerts (hand-wired per handler — see REFACTOR-PLAN W2) |
+| Boot grace (180s) suppresses notification watchdogs after restart | per_tick/mod.rs:118 | restart burst of false alerts (handler convergence is tracked in the Architecture-14 ledger) |
 | Per-tick handler order matches pre-extraction call order | daemon/mod.rs:577-579 | subtle reaction reordering |
-| `spawn` sites carry fire-and-forget rationale or store JoinHandle | protocol §10.4, Phase-5b invariant test | orphan tasks on shutdown |
+| `spawn` sites carry fire-and-forget rationale or store JoinHandle | protocol §12.5, Phase-5b invariant test | orphan tasks on shutdown |
 
 ## 5. Cross-cutting patterns
 
@@ -228,8 +248,9 @@ The load-bearing disciplines, each runtime- or CI-enforced:
 
 ## 6. Known architectural tensions
 
-These are the deliberate or accreted dual-paths. Each is a REFACTOR-PLAN
-entry; none is free to "just clean up" without the listed care.
+These are the deliberate or accreted dual-paths. Their current disposition is
+tracked in the [Architecture-14 ledger](ARCHITECTURE-14-LEDGER.md); none is
+free to "just clean up" without the listed care.
 
 1. **Two periodic-work mechanisms** (§2.1): ✅ RESOLVED by W1.1 (#2065). The 12
    inline supervisor `maybe_scan` trackers are now `PerTickHandler`s in the one
@@ -287,5 +308,5 @@ fixup-dev, fixup-dev-2 and fixup-reviewer against `main` @ `65d9ad82`,
 plus the 2026-06-10 production-readiness audit, then structurally revalidated
 at `main@1d83b423` on 2026-07-16. Line numbers drift; the
 named anchors (function names, invariant test names, issue numbers) are
-the stable references. Update this map when a REFACTOR-PLAN wave lands,
+the stable references. Update this map when an Architecture-14 outcome lands,
 not on every PR.

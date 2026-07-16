@@ -1,6 +1,6 @@
 //! Sprint 23 P0 — F6 heartbeat coordination via lock-around-pair.
 //!
-//! Closes Sprint 20 DAEMON.md §1 F6 (High, race): supervisor + main loop
+//! Closes the race documented in `docs/DAEMON-LOCK-ORDERING.md`: supervisor + main loop
 //! tick both read agent metadata independently; an MCP heartbeat write
 //! interleaved between the supervisor's two reads (`last_heartbeat` then
 //! `waiting_on_since`) produced inconsistent observations — supervisor saw

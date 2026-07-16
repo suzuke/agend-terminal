@@ -617,7 +617,7 @@ fn handle_session(
     // Restore no-timeout for authenticated sessions (on the read fd it was
     // armed on above — CR-2026-06-14).
     let _ = reader.get_ref().set_read_timeout(None);
-    // Telemetry only — see MCP-DAEMON-PROXY-CONTRACT §peer-PID-telemetry.
+    // Telemetry only — see the bridge contract in docs/MCP-TOOLS.md.
     if let Some(pid) = peer_pid {
         tracing::debug!(peer_pid = pid, "API session peer PID");
     }

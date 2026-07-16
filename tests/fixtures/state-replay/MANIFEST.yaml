@@ -159,7 +159,7 @@ fixtures:
   # outside its workspace-write sandbox. Neither observed transition
   # sequence contains AgentState::PermissionPrompt: each backend's
   # permission pattern fails to match the actual dialog wording. Gap is
-  # tracked in docs/archived/FOLLOWUP-permission-pattern-gaps.md; treat these as
+  # tracked in CAPTURE-RECIPES.md; treat these as
   # regression anchors per Stage 2a convention.
 
   - file: claude-perm.raw
@@ -281,7 +281,7 @@ fixtures:
   # final-screen tool banners / session summaries), yet none of the
   # observed transition sequences contain AgentState::ToolUse. Each
   # fixture therefore documents a *pattern coverage gap*, tracked in
-  # docs/archived/FOLLOWUP-tooluse-pattern-gaps.md. Treat these as regression
+  # CAPTURE-RECIPES.md. Treat these as regression
   # anchors: if a future pattern change starts firing ToolUse on one
   # of these fixtures the transitions array will diverge and this
   # test will flag it for manual review.
@@ -435,7 +435,7 @@ fixtures:
   # capture_kind, provenance, schema_version). The existing 13 entries
   # above remain on implicit schema_version 1 and are unaffected.
   #
-  # See docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.2 for field semantics
+  # See CAPTURE-RECIPES.md for field semantics
   # and §F685-CORPUS.3 for the initial corpus rationale.
 
   - file: f685-f9-positive-savedfile.raw

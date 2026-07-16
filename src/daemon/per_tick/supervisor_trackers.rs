@@ -1,4 +1,4 @@
-//! W1.1 (#2050 REFACTOR-PLAN, survey 01-R2): the 12 periodic trackers that
+//! Architecture-14 W1.1 (#2050, survey 01-R2): the 12 periodic trackers that
 //! historically ran inline in the supervisor thread's `run_loop`
 //! (`supervisor.rs:266`, lines 384–395) wrapped as [`PerTickHandler`]s so the
 //! daemon has ONE periodic-work pipeline (`build_default_handlers`) instead of

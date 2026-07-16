@@ -8,7 +8,7 @@
 //!   3. cheap lsof/process liveness (`api_in_flight`, productive-silence, child-alive)
 //!      — the BACKSTOP that decays a phantom-stuck state.
 //!
-//! The hard problem (§4 of docs/archived/SHADOW-OBSERVER-ARCH-2413.md): hook delivery is best-effort,
+//! The hard problem (see `docs/BACKEND-CAPABILITY-MATRIX.md`): hook delivery is best-effort,
 //! so a closing event (`Stop`/`PostToolUse`) can DROP — leaving an episode/tool span
 //! open forever and the agent stuck reporting `Active`/`ToolUse` while it's idle. Time
 //! alone never flips state; only liveness that CONTRADICTS an open span reconciles it.
@@ -24,7 +24,7 @@
 // ObservedState::coarse) is now consumed by the Phase-B per-tick driver
 // (`per_tick::shadow_observe` → `shadow::observe`) + the §5 correction telemetry +
 // the additive list_instances surface — so the Phase-A blanket `#![allow(dead_code)]`
-// is gone (driver landed, docs/archived/SHADOW-OBSERVER-ARCH-2413.md §6 step 3/5).
+// is gone (the driver landed; see `docs/BACKEND-CAPABILITY-MATRIX.md`).
 
 use super::evidence::{Authority, Confidence, Evidence, EvidenceKind};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ const RECONCILE_SILENCE_MS: u64 = 8_000;
 /// have dropped. Past this, a screen-Idle + sustained silence reconciles to Idle **even
 /// if `api_in_flight` is still true** — the lsof signal is a proven-unreliable idle
 /// *blocker* (lingering / CDN-shared sockets stay ESTABLISHED long after a turn ends, see
-/// docs/archived/SHADOW-OBSERVER-QUANT-2413.md), so it is WEAK-POSITIVE-ONLY and must never wedge an
+/// `docs/BACKEND-CAPABILITY-MATRIX.md`), so it is WEAK-POSITIVE-ONLY and must never wedge an
 /// ended turn at Active forever (#2433 r6).
 ///
 /// Staleness ALONE is not sufficient, because a long model-think is ALSO screen-idle +
@@ -120,7 +120,7 @@ pub struct ObservedStatus {
 
 /// Coarse screen signal the reducer consumes — the driver maps the 18-variant
 /// `crate::state::AgentState` into these buckets so the reducer doesn't couple to the
-/// whole enum. (See `docs/archived/SHADOW-OBSERVER-ARCH-2413.md` §7 for the AgentState→ScreenSignal map.)
+/// whole enum. See `docs/BACKEND-CAPABILITY-MATRIX.md` for the signal-authority map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenSignal {
     /// Prompt-ready / nothing rendering.
@@ -522,7 +522,7 @@ impl AgentRuntime {
         //      never reconcile it here (#2433 r6 round-3). A dropped `PostToolUse` is still
         //      caught by Path 1 once the socket dies (no-api is a clean contradiction).
         //      Empirically a *running* tool reads screen=Working (verified: `sleep 22`
-        //      held agent_state=`thinking` for its whole 23s — SHADOW-OBSERVER-QUANT-2413),
+        //      held agent_state=`thinking` for its whole 23s),
         //      so the screen==Idle precondition above already blocks reconcile for a live
         //      tool; (a) only guards the artificial screen==Idle + open-tool worst-case.
         //      DOCUMENTED RESIDUAL (the out-of-path limit, only an in-path proxy fully

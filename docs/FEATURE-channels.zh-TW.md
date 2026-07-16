@@ -368,6 +368,28 @@ channel:
 
 ---
 
+## Adapter 實作參考
+
+目前只有 Telegram 與 Discord 已實作。Slack、Lark 或其他平台的筆記只是設計
+構想，不是受支援設定，因此不屬於維護中的契約。
+
+| Adapter | Transport | Runtime owner | 重要邊界 |
+|---|---|---|---|
+| Telegram | `teloxide` long polling；不需要 public callback URL | `src/channel/telegram/`，使用獨立 thread 與 Tokio runtime | forum-topic routing、fail-closed user allowlist，以及 `fleet_binding` / `UxEventSink` 支援 |
+| Discord | Discord Gateway WebSocket + `twilight-http` REST | `src/channel/discord/`，由 `discord` Cargo feature 啟用 | live `MESSAGE_CREATE` ingress 與 outbound lifecycle；尚無 Telegram 等價的 fleet activity mirror |
+
+Telegram polling supervisor 會在 panic 或 disconnect 後 reconnect，並依
+`topic_id → instance_name` 路由。Discord 使用 Gateway heartbeat/resume 語意，
+而且需要 `MESSAGE_CONTENT` intent。兩個 adapter 都從設定的 token environment
+variable 驗證；user allowlist 為空時一律拒絕。
+
+穩定的 extension seam 是 `Channel` trait 加上
+`ChannelCapabilities`/`BindingRef`；新 adapter 在宣告為受支援之前，必須保留相同
+的 inbound authorization、durable-inbox routing、outbound binding lifecycle 與
+fail-closed default。
+
+---
+
 ## 原始碼指引
 
 - `src/channel/telegram/mod.rs`：Telegram channel 實作

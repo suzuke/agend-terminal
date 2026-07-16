@@ -2,275 +2,164 @@
 
 # Teams
 
-這份文件說明 team 的設計、如何建立/更新/刪除 team、以及它和
-`send team=...` 廣播路徑之間的關係。
+Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都有 members、optional（但強烈建議設定）的 orchestrator，並儲存在 `fleet.yaml` 中，而不是獨立的資料來源。
 
 ## 使用情境
 
-> **適用對象：** Operator 與 agent 皆適用。
+> **適用對象：** Operator 與 agent。
 
-**Operator 建立團隊。** Operator 在 `fleet.yaml` 中或透過 `team action=create` MCP 工具定義新團隊——例如建立一個包含 lead、dev、reviewer 的 "fixup" 團隊，並指定 lead 為 orchestrator。這決定了任務的路由方式以及由誰協調團隊工作。
+**Operator 設定 team。** Operator 在 `fleet.yaml` 或透過 `team action=create` MCP 工具定義新 team——例如建立一個由 lead、dev 與 reviewer 組成的「fixup」team，並指定 lead 為 orchestrator。這會建立 task routing 的結構，並明確指定由誰協調團隊工作。
 
-**Agent 團隊廣播。** Lead agent 需要通知團隊中的每個成員某項狀態變更。它不需要逐一發送訊息，而是使用 `send team=fixup` 一次廣播給所有成員。Daemon 會解析團隊成員名單，將訊息送到每個成員的 inbox。
+**Agent 對 team 廣播。** Lead agent 需要通知 team 的所有 member 某項狀態變更。它不必逐一發送訊息，而是使用 `send team=fixup` 一次廣播給所有 member。Daemon 解析 team membership，並將訊息送到每個 member 的 inbox。
 
-**基於 orchestrator 的任務路由。** 當任務指派給團隊名稱而非特定 agent 時，任務板會透過 `resolve_team_orchestrator` 將任務路由到該團隊的 orchestrator。如果 orchestrator 已被移除且團隊處於 degraded 狀態，路由會失敗——提醒 operator 需要指定新的 orchestrator。
+**以 orchestrator 為基礎的 task routing。** 當 task 被指派給 team name，而非特定 agent，task board 會透過 `resolve_team_orchestrator` 將它 route 給 team orchestrator。如果 orchestrator 已被移除、team 處於 degraded 狀態，routing 會失敗，提示 operator 指定新的 orchestrator。
 
-## 1. 設計初衷
+## 1. 設計理念
 
-- Team 是把 agents 組織成群組的方法。
-- 一個 team 對應一個名稱。
-- 一個 team 可以有多個 members。
-- 一個 team 必須有一個 orchestrator。
-- orchestrator 是該 team 的主要協調者。
-- team 的用途是結構化協作。
-- 它比單一 instance 更適合分工。
-- 它也讓廣播可以針對群組發送。
-- team 資料現在由 `fleet.yaml` 內的 `teams:` 保存。
-- `teams.json` 已經是舊橋接路徑。
-- runtime CRUD 直接寫 `fleet.yaml`。
-- 讀取也直接從 `fleet.yaml` 投影。
-- 因此 team 不是另一份平行真相。
-- 它只是 fleet 的一部分。
-- 若 team 狀態變怪，先看 `fleet.yaml`。
-- 若要看 runtime 差異，再看 list 的 stale_members。
+- Team 是一組具名 agent，並具有指定的 orchestrator。
+- Orchestrator 協調 team 內的工作。
+- Team 支援結構化協作、分工與針對性 broadcast。
+- Team data 位於 `fleet.yaml` 的 `teams:` key 下。
+- `teams.json` 是 legacy bridge path；runtime CRUD 會直接讀寫 `fleet.yaml`。
+- Team 狀態看起來不對時，先檢查 `fleet.yaml`。
 
 ## 2. 檔案與模組
 
-- `src/teams.rs` 是主要實作檔。
-- `src/fleet/mod.rs` 是實際存放層。
-- `src/mcp/handlers/task.rs` 不碰 team。
-- `src/mcp/handlers/dispatch.rs` 會把 `team` 參數送進 `send`。
-- `src/mcp/handlers/comms.rs` 會檢查 team 與 orchestrator。
-- `src/api/handlers/instance.rs` 會讀 team 資訊做提示。
-- `teams.rs` 內的 `Team` 是投影模型。
-- `TeamConfig` 才是 `fleet.yaml` 寫入型態。
-- `stale_members` 只在 list 投影時補上。
-- `find_team_for` 的 projection 不需要 stale_members。
-- `degraded` 會在 list 回傳裡附加。
-- 這是 operator 可見的警訊欄位。
-- 讀者不要把 `degraded` 當成持久欄位。
-- 它是 view 層訊號。
+- `src/teams.rs`——主要實作（projection model）。
+- `src/fleet/mod.rs`——實際 storage layer。
+- `src/mcp/handlers/dispatch.rs`——將 `team` parameter route 到 `send`。
+- `src/mcp/handlers/comms.rs`——檢查 team 與 orchestrator relationship。
+- `src/api/handlers/instance.rs`——讀取 team info 以注入 prompt。
+- `Team` 是 projection model；`TeamConfig` 是 `fleet.yaml` 的 write type。
+- `stale_members` 只會在 list projection 中填入。
+- `degraded` 是 view-layer signal，不是 persisted field。
 
-## 3. team 資料模型
+## 3. 資料模型
 
-- `name` 是 team 名稱。
-- `members` 是 team 成員清單。
-- `orchestrator` 是可選欄位，但語意上很重要。
-- `orchestrator` 若缺失，team 變 degraded。
-- `description` 是可選說明。
-- `created_at` 是 runtime 或 operator 建立時間。
-- `source_repo` 是 team 的來源 repo 路徑。
-- `project_id` 是可選的 project-board id override。
-- `accept_from` 是允許直接傳訊給 orchestrator 的外部 agent allowlist；空陣列代表拒絕跨 team direct send。
-- `stale_members` 是 list 投影用。
-- `stale_members` 的值來自 live registry 比對。
-- `stale_members` 空時不會輸出到 JSON。
-- 這維持 back-compat。
-- `find_team_for` 回傳完整 Team。
-- `list` 回傳 `{"teams": [...]}`。
-- `get_members` 只是抓 member 清單。
-- `resolve_team_orchestrator` 是 routing 用。
-- `is_orchestrator_of` 是 ACL 用。
+| 欄位 | 說明 |
+|------|------|
+| `name` | Team name |
+| `members` | Member instance name 清單 |
+| `orchestrator` | 選填；team 的 coordinator（應為 member） |
+| `description` | Optional description |
+| `created_at` | 建立時間戳 |
+| `source_repo` | Team 的 source repository path |
+| `project_id` | Optional 的 explicit project-board id override |
+| `accept_from` | 可直接傳訊給 orchestrator 的外部 agent name；空值會拒絕 cross-team direct send |
+| `stale_members` | 僅供 view；在 live registry 找不到的 member |
 
 ## 4. `team action=create`
 
-- `name` 是必要欄位。
-- `members` 是必要欄位。
-- `orchestrator` 可省略，但建議填。
-- `orchestrator` 必須是 members 的其中一個。
-- 如果 orchestrator 不在 members 內，create 會錯。
-- `repository_path` 可省略。
-- `project_id` 可覆寫 project-board slug 推導，而不改動 `repository_path`。
-- `accept_from` 可設定跨 team direct-send allowlist；預設空陣列是 fail-closed。
-- 省略時會產生 warning。
-- 那個 warning 會提醒你 dispatch binding 可能 fall through。
-- create 會先讀 fleet.yaml。
-- 若同名 team 已存在，create 會拒絕。
-- 若任何 member 已在其他 team，也會拒絕。
-- 這是 one-agent-one-team 約束。
-- create 成功後會把 team 寫進 `fleet.yaml`。
-- 成功回應是 `status=created`。
-- 回應也可能帶 `warnings`。
-- source_repo 缺失時的 warning 不阻擋建立。
-- 但 operator 應盡快補上。
+- `name` 與 `members` 必填。
+- `orchestrator` 選填但建議設定；必須是 member 之一。
+- `repository_path` 選填；省略時會警告 dispatch binding fallback。
+- `project_id` 可選擇性覆寫 project-board slug derivation，且不變更 `repository_path`。
+- `accept_from` 設定 cross-team direct-send allowlist；預設空 list 為 fail-closed。
+- 若同名 team 已存在則拒絕建立。
+- 強制執行 **one-agent-one-team** constraint：若任何 member 已屬於另一 team，便拒絕。
+- 成功時將 team 寫入 `fleet.yaml`，並回傳 `status=created`。
 
 ## 5. `team action=list`
 
-- list 會回傳所有 team。
-- list 的資料來源是 `fleet.yaml`。
-- list 會呼叫 `runtime::list_live_agents`。
-- 如果 live registry 讀不到，stale_members 會維持空。
-- list 會比對每個 member 是否在 live。
-- 不在 live 的 member 會進入 stale_members。
-- stale_members 會排序。
-- team 本體也會排序投影。
-- 這讓結果比較穩定。
-- list 也會加上 `degraded`。
-- `degraded=true` 代表 orchestrator 缺失。
-- 這是 operator 要看的重要訊號。
-- list 不是 mutating action。
-- list 也不會自動修復 team。
+- 回傳 `fleet.yaml` 中的所有 team。
+- 將 member 與 live agent registry 交叉比對。
+- 在 live registry 中找不到的 member 會出現在 `stale_members`（已排序）。
+- Orchestrator 缺漏時加入 `degraded=true`。
+- Pure read operation——不會修改 team。
 
 ## 6. `team action=update`
 
-- update 需要 `name`。
-- update 可加 `add`。
-- update 可加 `remove`。
-- update 可加 `orchestrator`。
-- update 可加 `repository_path`。
-- update 可改 `project_id`。
-- update 可改 `accept_from`。
-- `remove` 不能移除目前 orchestrator。
-- 若要換 orchestrator，要先指定新的 orchestrator。
-- 新 orchestrator 必須在更新後的 members 裡。
-- `add` 不能把 member 加進另一個 team。
-- 這個檢查遵守 one-agent-one-team。
-- `repository_path` 若沒給，會沿用舊值。
-- `project_id` 與 `accept_from` 未提供時也會沿用舊值。
-- update 成功後會寫回 `fleet.yaml`。
-- update 回傳 `status=updated`。
-- update 失敗時會回傳 error。
-- update 是 team 結構調整的主要工具。
+- 需要 `name`。
+- 支援 `add`（新 member）、`remove`（既有 member）、`orchestrator`、`repository_path`、`project_id` 與 `accept_from`。
+- 未先指定新 orchestrator，不得移除目前的 orchestrator。
+- 新 orchestrator 必須位於 update 後的 member list 中。
+- `add` 強制執行 one-agent-one-team（不能加入已屬於另一 team 的 member）。
+- 未明確變更時，保留 `repository_path`。
+- 未明確提供時，也保留 `project_id` 與 `accept_from`。
+- 成功時寫回 `fleet.yaml`。
 
 ## 7. `team action=delete`
 
-- delete 需要 `name`。
-- delete 會先 snapshot team 存在與 members。
-- 如果 team 不存在，直接回錯。
-- delete 不只是移除 yaml 節點。
-- delete 會 cascade 刪除每一個 member instance。
-- cascade 會呼叫 `full_delete_instance`。
-- 這會沿用 instance teardown 的標準流程。
-- 若某 member 刪除失敗，delete 會收集警告。
-- delete 會盡可能繼續清理其他 member。
-- 如果最後 team 變成空了，也算成功。
-- `remove_team_from_yaml` 的結果不一定只有一種成功路徑。
-- 只要 team 最後不在 fleet.yaml 就算完成目的。
-- delete 成功回應會包含 `members_cleaned`。
-- 如果有警告，回應會帶 `cascade_warnings`。
+- 需要 `name`。
+- 透過 `full_delete_instance` cascade delete 每一個 member instance。
+- 若個別 member delete 失敗，會收集 warning 並繼續清理。
+- 從 `fleet.yaml` 移除 team。
+- 回傳 `members_cleaned` 與所有 `cascade_warnings`。
 
-## 8. 成員刪除與自動降級
+## 8. Member 移除與自動降級
 
-- `remove_member_from_all` 會把 instance 從所有 team 移除。
-- 它也會處理 orchestrator 身分。
-- 如果移除後 team 沒成員了，team 直接刪掉。
-- 如果移除的是 orchestrator，但 team 還有其他成員，team 會 degraded。
-- degraded team 的 orchestrator 會變成 None。
-- degraded team 不會自動找新 orchestrator。
-- 這是 operator 要接手的部分。
-- 函式會對每個 degraded team 建 urgent task。
-- 任務標題會提示哪個 team 失去 orchestrator。
-- 這把問題從隱性降級轉成明顯待辦。
-- `remove_member_from_all` 是 teardown 的一部分。
-- 不是一般協作的常用入口。
-- 但它對刪除 instance 很重要。
+- `remove_member_from_all` 會從 instance 所屬的每個 team 移除它。
+- 若被移除的 member 是 orchestrator，且仍有其他 member，team 會變成 **degraded**（orchestrator 設為 None）。
+- 若被移除的 member 是最後一位 member，整個 team 會被刪除。
+- Degraded team 不會自動選出新 orchestrator——這需要 operator 介入。
+- 每個新 degraded team 都會建立一個 urgent task。
+- 此 function 是 instance teardown 的一部分，不是一般 collaboration 操作。
 
-## 9. 參考查詢
+## 9. Reference query
 
-- `find_team_for(home, member)` 會回傳 member 所屬 team。
-- 找不到就回 `None`。
-- `get_members(home, team_name)` 只回 members 清單。
-- `resolve_team_orchestrator(home, name)` 用於 assignee routing。
-- 若 name 是 team，會回 orchestrator。
-- 若 team degraded，會回 Err。
-- 若 name 不是 team，會回 Ok(None)。
-- `is_orchestrator_of(home, caller, member)` 用於 ACL。
-- 它會檢查 caller 是否是 member 所屬 team 的 orchestrator。
-- 這些 helper 很常被 task board 讀到。
-- 也會被 comms / dispatch 路徑讀到。
-- 它們是讀模型，不是 mutation。
-- 建文件時要區分這兩類。
+- `find_team_for(home, member)`——回傳 member 所屬的 team。
+- `get_members(home, team_name)`——回傳 member list。
+- `resolve_team_orchestrator(home, name)`——解析供 routing 使用的 orchestrator；degraded team 會回傳 error。
+- `is_orchestrator_of(home, caller, member)`——ACL check。
+- 這些 helper 公開 read model，不會改變 team state。
 
 ## 10. 與 `send team=...` 的關係
 
-- `send` tool 支援 `team` 參數。
-- `team=fixup` 代表廣播給整個 team。
-- 這不是發給 team 名稱本身。
-- 實際上會散發到 team 的成員。
-- `send` 也支援 `instances`、`tags`、`instance`。
-- team 廣播是其中一種路由方式。
-- 只要 team 成員集合變動，廣播目標也會變。
-- 這表示 `team list` 的 stale_members 很實用。
-- stale_members 幫你看哪些人會收不到廣播。
-- team 廣播與 orchestrator routing 是兩件事。
-- orchestrator 用於 task 路由與 ACL。
-- team 廣播用於訊息分發。
-- 兩者常一起出現，但語意不同。
+- `send` 支援 `team` parameter 進行 broadcast delivery。
+- `team=fixup` 會廣播給 fixup team 的所有 member。
+- 每當 member list 變更，broadcast target 也隨之變更。
+- `stale_members` 有助於識別不會收到 broadcast 的 member。
+- Team broadcast（message delivery）與 orchestrator routing（task/ACL routing）是兩種不同操作，但經常一起出現。
 
 ## 11. 與 task board 的關係
 
-- task assignee 可以是一個 team name。
-- 如果 assignee 是 team，task 會路由到 orchestrator。
-- 這個 route 由 `resolve_team_orchestrator` 決定。
-- 如果 team degraded，task 不能 route。
-- 因此 team 健康會影響 task 生命週期。
-- `team delete` 也會牽動 task orphan cleanup。
-- 某些刪除後會產生 urgent task。
-- 這是團隊治理的訊號。
-- task board 可以幫你追 team 的工作。
-- team list 可以幫你追 task board 的可達性。
+- Task 的 `assignee` 可以是 team name。
+- 指派給 team 時，task 會透過 `resolve_team_orchestrator` route 給 orchestrator。
+- Degraded team 無法 route task。
+- `team delete` 可能觸發 task orphan cleanup 與 urgent task 建立。
 
 ## 12. 與 instance lifecycle 的關係
 
-- 刪 instance 時會呼叫 `remove_member_from_all`。
-- 這會把 instance 從所有 team 中拿掉。
-- 如果 instance 是 orchestrator，team 會 degraded。
-- 如果 instance 是唯一成員，team 會消失。
-- 這是 instance teardown 的一環。
-- 因此 team 並不是孤立資料結構。
-- 它會跟 instance 生滅一起變動。
-- 這也是為什麼 list 要顯示 stale_members。
-- 這讓 operator 看到名單落差。
+- Delete instance 會呼叫 `remove_member_from_all`。
+- 若 instance 原本是 orchestrator，其 team 會 degrade。
+- 若 instance 是唯一 member，其 team 會被刪除。
+- `team list` 的 `stale_members` 會顯示 member roster 與 live registry 之間的差異。
 
 ## 13. 行為約束
 
-- team 名稱應該穩定。
-- member 名單應該避免重複。
-- orchestrator 應該總是屬於 members。
-- source_repo 最好不要缺。
-- repository path 的 slug 推導可能有歧義時，`project_id` 應與預期 task board 對齊。
-- `accept_from` 應維持最小集合；空陣列會刻意拒絕跨 team direct send 到 orchestrator。
-- 如果缺了，dispatch 自動 bind 會掉到較弱的 fallback。
-- update 不應讓 team 掉到無法路由的狀態。
-- delete 不應默默跳過整個 team。
-- delete 的 cascade 失敗要可見。
-- list 的 stale_members 應該維持排序。
-- degraded 狀態要讓 operator 一眼看懂。
+- Team name 應保持穩定。
+- Member list 不得含有重複項目。
+- Orchestrator 必須永遠是 member。
+- 應設定 `source_repo`；若未設定，dispatch auto-bind 會退回較弱的路徑。
+- 當 repository-path slug derivation 有歧義時，應讓 `project_id` 與預期 task board 保持一致。
+- `accept_from` 應保持最小範圍；空 list 會刻意拒絕對 orchestrator 的 cross-team direct send。
+- `update` 不應讓 team 留在無法 routing 的狀態。
+- `delete` cascade failure 必須可見。
+- `stale_members` 輸出必須排序。
+- `degraded` status 必須讓 operator 一眼可辨。
 
-## 14. 常見操作流程
+## 14. 典型工作流程
 
-- 新團隊：先 create。
-- 建議一開始就指定 orchestrator。
-- 若要調整成員，使用 update。
-- 若要重定向協調者，先確保新 orchestrator 仍在成員中。
-- 若要移除成員，注意不要移除最後的 orchestrator。
-- 若要解散團隊，使用 delete。
-- 若只是確認誰是誰的 orchestrator，用 find_team_for。
-- 若要看整體健康，用 team list。
-- 若要把訊息丟給整團，使用 send team=...。
-- 若要清掉失聯成員，先看 stale_members。
+1. 以 `team action=create` 建立 team（從一開始就指定 orchestrator）。
+2. 以 `team action=update` 調整 member。
+3. 要更換 orchestrator，請確保新 orchestrator 仍在 member list 中。
+4. 要解散 team，使用 `team action=delete`。
+5. 要檢查 health，使用 `team action=list` 並查看 `stale_members` / `degraded`。
+6. 要廣播訊息，使用 `send team=...`。
+7. 要找出誰協調誰，使用 `find_team_for`。
 
-## 15. 實作檢查點
+## 15. 實作檢查清單
 
-- `fleet.yaml` 是唯一寫入點。
-- `list` 只是投影，不要變成寫路徑。
-- `source_repo` 缺失應該可被 warning 看見。
-- `degraded` 不應被當作持久欄位。
-- `stale_members` 不應直接寫進 fleet.yaml。
-- delete 的 cascade 要保留錯誤彙整。
-- 更新 orchestrator 時要先檢查 post-mutation members。
-- one-agent-one-team 是重要 invariant。
-- broadcast 與 routing 不可混為一談。
-- 任何新欄位都要確認 projection 與存放一致。
+- `fleet.yaml` 是唯一 write target。
+- `list` 是 projection——不能成為 write path。
+- 缺少 `source_repo` 時應顯示 warning。
+- `degraded` 不得持久化。
+- `stale_members` 不得寫入 `fleet.yaml`。
+- `delete` cascade 必須保留 error aggregation。
+- Orchestrator update 必須針對 mutation 後的 member 驗證。
+- One-agent-one-team 是關鍵 invariant。
+- 不得混淆 broadcast 與 routing。
 
-## 16. 小結
+## 16. 總結
 
-- Team 是協作分群的基本單位。
-- 它的真相在 `fleet.yaml`。
-- `team create/delete/list/update` 是主要治理工具。
-- `send team=...` 是主要廣播入口。
-- orchestrator 是 team 的核心協調點。
-- degraded team 不是壞掉的資料，而是需要 operator 處理的狀態。
-- stale_members 是可觀測性欄位。
-- 如果 team 行為異常，先看 fleet，再看 live registry。
-- 這個模組的設計目標是讓 team 成為清楚、可查、可恢復的協作結構。
+Team 是協作分組的基本單位，其唯一真相來源為 `fleet.yaml`。CRUD operation 為 `team create/delete/list/update`；broadcast 則透過 `send team=...`。Orchestrator 是 team 的協調點。Degraded team 不是損壞的資料，而是需要 operator 注意的狀態。`stale_members` 是 observability field。Team 行為不如預期時，先檢查 fleet，再檢查 live registry。

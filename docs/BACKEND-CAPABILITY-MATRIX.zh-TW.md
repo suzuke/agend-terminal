@@ -21,7 +21,7 @@ Hook/Stream 修正套到 `snapshot.json` 與選定的 dispatch decider。health/
 路徑保留 raw view。下表若同時列兩種訊號，不代表 hook 會改寫
 `core.state.current`。
 
-[#2413](https://github.com/suzuke/agend-terminal/issues/2413)（「Out-of-path API-activity probe to fix false-idle blind spot in pattern-based agent_state」）才是**改善未來的 roadmap**：這是一項持續進行中的實證研究（Shadow Observer，見 `docs/SHADOW-OBSERVER-QUANT-AGY-2413.md` 及其 claude/codex 對照版本，位於 `docs/archived/` 下），目的是逐 backend 量測「除了原始 PTY pattern 比對之外，加上更多 structured 訊號能不能補上 false-idle 的盲點」。當本文說某個 backend 是「PTY heuristic」時，#2413 那邊的工作可能正在量化評估該 backend 能不能升級——本文不涉及那份 roadmap 或其研究結論，只記錄今天的實況。想了解那份改善工作目前進度如何，請直接讀 #2413 本身的文檔。
+[#2413](https://github.com/suzuke/agend-terminal/issues/2413)（「Out-of-path API-activity probe to fix false-idle blind spot in pattern-based agent_state」）才是**改善未來的 roadmap**：這是一項持續進行中的實證研究，用來逐 backend 量測「除了原始 PTY pattern 比對之外，加上 structured 訊號能不能補上 false-idle 的盲點」。當本文說某個 backend 是「PTY heuristic」時，#2413 可能正在量化它能否升級；本文只記錄已上線行為。歷史量測報告仍可依[固定的 history snapshot](README.zh-TW.md#歷史紀錄)還原。
 
 ## 訊號權威性階梯（參考用）
 
@@ -40,6 +40,36 @@ Hook/Stream 修正套到 `snapshot.json` 與選定的 dispatch decider。health/
 | **Shell** / **Raw(String)** | 無——完全沒有偵測 pattern；`agent_state` spawn 時就硬鎖 `Idle` | 不適用 | Bulk；文字仍會真的寫入並送出（不是真的 no-op），只是沒有 backend 專屬客製化 | 不支援——`args_for()` 回空，Resume 與 Fresh 產生的 spawn args 完全一樣 | 無——這個 backend 完全跳過 MCP config | Utility 層級；CHANGELOG 查無事故記錄（**未查證**這代表「從沒出過包」還是「沒人記錄」） |
 
 ---
+
+## CLI harness 與 model provider override
+
+Backend 偵測分成兩條獨立軸線：
+
+1. **CLI harness**：擁有 PTY/tool loop，從 `PATH` 偵測；以及
+2. **model provider**：透過該 harness 設定的 hosted 或 local token endpoint。
+
+只有 compatible harness、provider configuration 與可用 credential 同時存在時，
+provider 才算可用。Installer artifact 只是提示，不能證明 availability。
+
+| Provider | Harness | `base_url` | `env_key` | `wire_api` | Probe |
+|---|---|---|---|---|---|
+| Fugu / Sakana | `codex` | `https://api.sakana.ai/v1` | `SAKANA_API_KEY` | `responses` | `/models` |
+
+Fugu 使用隔離的 `CODEX_HOME`（`~/.agend-fugu-codex`）及 `fleet.yaml` 中每個
+instance 的 `env.CODEX_HOME`，因此 provisioning 不會修改 operator 的全域
+`~/.codex`。Endpoint probe 是 optional、cached、fail-open：probe 失敗會回報
+`unknown`，不會判定 provider 不存在，startup 也不依賴即時網路呼叫。
+
+`kiro-cli`（AWS signed-auth shape）與 `agy`（Google service-account/OAuth
+shape）刻意維持 fixed-provider backend，而不是 bearer `base_url` override。
+
+可用下列命令檢查解析後的邊界：
+
+```sh
+agend-terminal doctor providers
+agend-terminal doctor providers --format json
+agend-terminal doctor providers --probe
+```
 
 ## ClaudeCode
 

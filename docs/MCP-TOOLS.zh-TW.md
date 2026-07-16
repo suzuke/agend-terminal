@@ -240,3 +240,63 @@ Drain 或管理 caller 的 durable inbox。
 - Unix `agend-terminal app` mode 會先 preflight，再以相同 PID 原地 re-exec。成功回覆 prepared 後，連線會在 re-exec 時中斷。
 - Windows app mode 維持 fail-closed；請退出後重新啟動。
 - Shared gate 最多允許一個 restart in flight；同時到達的另一個請求可重試。
+
+## Bridge 與 daemon proxy 契約
+
+Daemon 是 tool registry、authorization、task state 與 side effect 的唯一權威。
+`agend-mcp-bridge` 是 near-zero-state relay；它沒有本地 tool implementation，
+也沒有 filesystem fallback。
+
+```text
+MCP client
+  │ stdin/stdout: newline-delimited JSON-RPC
+  ▼
+agend-mcp-bridge
+  │ authenticated loopback TCP: newline-delimited JSON
+  ▼
+AgEnD daemon (`/mcp` dispatcher)
+```
+
+### Framing 與 authentication
+
+Stdio 與 TCP 都以每行一個 JSON object 傳輸，不支援 `Content-Length` framing。
+Bridge 在本地處理 `initialize`、`ping` 與 JSON-RPC notification；完成 active run
+directory discovery、建立 persistent loopback connection，並以 daemon cookie 加上
+bridge PID 驗證後，才 proxy `tools/list` 與 `tools/call`。
+
+| Boundary | Timeout | 用途 |
+|---|---:|---|
+| Daemon，authentication 前 | 5 秒 | 限制 idle 或 partial authentication attempt |
+| Bridge，等待 daemon response | 120 秒 | 限制卡住的 proxy request |
+| Daemon，authentication 後 | 無 session read timeout | 允許長時間 idle 的 MCP session |
+| Daemon tool execution | 5 / 30 / 60 秒 | fast、default、slow execution band |
+
+Daemon 約每兩秒檢查一次已驗證的 bridge PID，PID 死亡或 TCP EOF 時關閉 session。
+
+### Request identity、retry 與 execution timeout
+
+每個 proxied request 都會取得 UUIDv4 `request_id`。遇到可重試的 transport
+failure 時，最多 reconnect/retry 一次，且沿用同一個 ID；daemon deduplication
+使 side effect 保持 exactly-once。Startup discovery 每 100 ms 重試一次、最多
+30 秒。Application error 會立即回傳，不會當成 transport failure。
+
+Read-only 或 idempotent operation 超過自己的 5/30/60 秒 band 時，會回傳可重試
+timeout。Side-effecting operation 則在背景繼續並回傳 `accepted_in_progress`；caller
+必須觀察 task、inbox 或 status surface，不得重送。Bridge 的 120 秒 timeout 只是
+transport backstop。
+
+Bridge 只保留 connection，以及一筆 500 ms 內相同且成功的 `tools/call` 結果，
+用來吸收緊接而來的 duplicate；failed call 不會寫入該 cache。
+
+### Fail-closed 行為與 source ownership
+
+- startup 時 daemon unavailable：重試 30 秒，之後回傳可見的 JSON-RPC error；
+- request 中途斷線：以相同 ID reconnect 並 retry 一次；
+- retry 仍失敗或 daemon application error：回傳可見 error；
+- bridge exit：daemon 關閉 authenticated session；
+- 沒有 daemon：不存在本地或 filesystem execution path。
+
+實作 owner 是 `src/bin/agend-mcp-bridge.rs`（framing、connection、identity、retry）、
+`src/api/mod.rs`（authentication 與 peer-PID monitoring）、
+`src/api/handlers/mcp_proxy.rs`（dispatch 與 timeout band），以及
+`src/mcp/registry.rs`（authoritative registry 與 execution class）。

@@ -379,6 +379,29 @@ If the problem persists, check whether multiple daemon instances are running at 
 
 ---
 
+## Adapter Implementation Reference
+
+Only Telegram and Discord are implemented. Notes for Slack, Lark, or other
+platforms are design ideas, not supported configuration, and therefore do not
+belong in the maintained contract.
+
+| Adapter | Transport | Runtime owner | Important boundary |
+|---|---|---|---|
+| Telegram | `teloxide` long polling; no public callback URL | `src/channel/telegram/` with a dedicated thread and Tokio runtime | forum-topic routing, fail-closed user allowlist, and `fleet_binding` / `UxEventSink` support |
+| Discord | Discord Gateway WebSocket + `twilight-http` REST | `src/channel/discord/`, enabled by the `discord` Cargo feature | live `MESSAGE_CREATE` ingress and outbound lifecycle; no Telegram-equivalent fleet activity mirror yet |
+
+Telegram's polling supervisor reconnects after panic or disconnect and routes
+`topic_id → instance_name`. Discord uses Gateway heartbeat/resume semantics and
+requires the `MESSAGE_CONTENT` intent. Both adapters authenticate from the
+configured token environment variable and reject an empty user allowlist.
+
+The stable extension seam is the `Channel` trait plus
+`ChannelCapabilities`/`BindingRef`; new adapters must preserve the same inbound
+authorization, durable-inbox routing, outbound binding lifecycle, and
+fail-closed defaults before they are advertised as supported.
+
+---
+
 ## Source Pointers
 
 - `src/channel/telegram/mod.rs`: Telegram channel implementation

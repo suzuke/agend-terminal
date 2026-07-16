@@ -193,7 +193,7 @@ Start the MCP stdio server for the current instance. Intended to be invoked by a
 AGEND_INSTANCE_NAME=<name> agend-mcp-bridge
 ```
 
-Running without `AGEND_INSTANCE_NAME` is allowed but enters standalone mode and emits a warning. Sprint 56 Track I (#531) retired the previous `agend-terminal mcp` subcommand; see the [Phase 1 RCA](archived/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md) for the migration history.
+Running without `AGEND_INSTANCE_NAME` is allowed but enters standalone mode and emits a warning. Sprint 56 Track I (#531) retired the previous `agend-terminal mcp` subcommand; the former Phase 1 RCA remains available through the [historical-record retrieval rule](README.md#historical-records).
 
 ### `capture`
 Capture backend output or promote a passive capture into the state-replay corpus.

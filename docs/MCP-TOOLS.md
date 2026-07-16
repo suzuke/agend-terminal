@@ -240,3 +240,69 @@ Request a graceful daemon restart. Parameters: none.
 - In Unix `agend-terminal app` mode, restart preflights and re-execs in place with the same PID. A successful preparation response is followed by the connection dropping during re-exec.
 - Windows app mode remains fail-closed; quit and relaunch instead.
 - A shared gate permits at most one restart in flight; a concurrent request is retryable.
+
+## Bridge and daemon-proxy contract
+
+The daemon is the only authority for the tool registry, authorization, task
+state, and side effects. `agend-mcp-bridge` is a near-zero-state relay; it has
+no local tool implementation or filesystem fallback.
+
+```text
+MCP client
+  │ stdin/stdout: newline-delimited JSON-RPC
+  ▼
+agend-mcp-bridge
+  │ authenticated loopback TCP: newline-delimited JSON
+  ▼
+AgEnD daemon (`/mcp` dispatcher)
+```
+
+### Framing and authentication
+
+Both stdio and TCP carry one JSON object per line. `Content-Length` framing is
+not supported. The bridge handles `initialize`, `ping`, and JSON-RPC
+notifications locally; it proxies `tools/list` and `tools/call` after discovering
+the active run directory, opening a persistent loopback connection, and
+authenticating with the daemon cookie plus its bridge PID.
+
+| Boundary | Timeout | Purpose |
+|---|---:|---|
+| Daemon, before authentication | 5 seconds | Bound idle or partial authentication attempts |
+| Bridge, waiting for a daemon response | 120 seconds | Bound a stalled proxy request |
+| Daemon, after authentication | No session read timeout | Permit long-lived idle MCP sessions |
+| Daemon tool execution | 5 / 30 / 60 seconds | Fast, default, and slow execution bands |
+
+The daemon checks the authenticated bridge PID approximately every two seconds
+and closes the session after PID death or TCP EOF.
+
+### Request identity, retry, and execution timeout
+
+Every proxied request gets a UUIDv4 `request_id`. A retryable transport failure
+causes at most one reconnect/retry with the same ID; daemon deduplication keeps
+the side effect exactly-once. Startup discovery retries every 100 ms for up to
+30 seconds. Application errors are returned immediately and are never treated
+as transport failures.
+
+Read-only or idempotent operations that exceed their 5/30/60-second band return
+a retryable timeout. A side-effecting operation continues in the background and
+returns `accepted_in_progress`; callers must observe the task, inbox, or status
+surface and must not resend it. The bridge's 120-second timeout is only a
+transport backstop.
+
+The bridge retains only its connection and one successful identical
+`tools/call` result for 500 ms to absorb an immediate duplicate. Failed calls
+never seed that cache.
+
+### Fail-closed behavior and source ownership
+
+- daemon unavailable at startup: retry for 30 seconds, then return a visible
+  JSON-RPC error;
+- connection loss during a request: reconnect and retry once with the same ID;
+- retry failure or daemon application error: return the visible error;
+- bridge exit: daemon closes the authenticated session;
+- no daemon: no local or filesystem execution path exists.
+
+The implementation owners are `src/bin/agend-mcp-bridge.rs` (framing,
+connection, identity, retry), `src/api/mod.rs` (authentication and peer-PID
+monitoring), `src/api/handlers/mcp_proxy.rs` (dispatch and timeout bands), and
+`src/mcp/registry.rs` (authoritative registry and execution classes).

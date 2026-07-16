@@ -191,7 +191,7 @@ pub(super) fn try_telegram_reply_no_cleanup_from(
         .map(|msg_id| (msg_id, ch.group_id))
 }
 
-/// Format the S2d provenance tag body per DESIGN-stage-b-ux.md §6.
+/// Format the fleet provenance tag documented in `docs/FEATURE-channels.md`.
 ///
 /// Shape: `⬅️ from {from} — DELEGATE\n   (brief: "{brief}")`.
 /// Truncates to stay within Telegram's 4096 char limit (~3500 + overhead).

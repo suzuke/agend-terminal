@@ -252,3 +252,75 @@ regenerable files (no commitment).
 - After upgrading a **service install**, re-run `agend-terminal service
   install` once so the unit/plist carries current settings, then restart
   the service (see `docs/RELEASING.md` and the service docs for details).
+
+---
+
+## 7. GitHub Actions is degraded
+
+Activate this procedure only when the same repository has at least two PRs
+with no workflow run ten minutes after push **and** GitHub Status reports
+Actions as degraded or unavailable.
+
+1. Freeze merges for affected PRs and record each branch plus immutable head
+   SHA. Local green never authorizes `--admin`, `--force`, or another gate
+   bypass.
+2. Run local diagnostics in each PR worktree:
+
+   ```bash
+   cargo test --all
+   cargo clippy --all-targets -- -D warnings
+   cargo fmt --check
+   ```
+
+3. Post the results as diagnostic evidence and state that hosted
+   cross-platform CI is still pending. Keep the PR open.
+4. After recovery, ensure Actions runs against the same PR head, re-arm the
+   branch `ci` watch if needed, and independently run `gh pr checks <PR#>`.
+5. Merge only after that command exits 0 and every required review gate also
+   holds. A later `main` run is not backfilled evidence for the PR; a changed
+   PR head invalidates the old review and diagnostics.
+
+The GitLab mirror may help diagnose a GitHub outage, but it does not replace
+the required checks configured on the GitHub PR head.
+
+---
+
+## 8. Start a context-isolated Claude instance
+
+Claude can inherit instructions or memory from three places:
+
+| Source | Scope | Default |
+|---|---|---|
+| `~/.claude/CLAUDE.md` | every local Claude session | loaded |
+| `~/.claude/projects/<pwd-slug>/memory/` | working-directory memory | loaded when present |
+| `<workspace>/CLAUDE.md` and `<workspace>/.claude/CLAUDE.md` | project | loaded when present |
+
+AgEnD already gives each instance a distinct workspace/worktree, so
+working-directory memory does not cross instance names. To disable both loading
+and writing auto-memory for one new instance, pass the supported per-instance
+environment map:
+
+```text
+create_instance(
+  name="clean-agent",
+  backend="claude",
+  env={"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1"}
+)
+```
+
+To exclude the global `CLAUDE.md` as well, create
+`$AGEND_HOME/workspace/clean-agent/.claude/settings.json` before the first
+launch:
+
+```json
+{
+  "autoMemoryEnabled": false,
+  "claudeMdExcludes": ["~/.claude/CLAUDE.md"]
+}
+```
+
+For security-sensitive default-behavior testing only, a throwaway per-instance
+`HOME` gives the strongest isolation, but it also removes access to existing
+Claude authentication, MCP settings, and themes. None of these options removes
+the fleet protocol injected by the daemon, disables workspace MCP servers, or
+deletes memory already stored on disk.

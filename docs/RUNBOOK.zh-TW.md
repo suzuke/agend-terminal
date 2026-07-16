@@ -179,3 +179,69 @@ grep "requeue FAILED" "$LOG"                     # disk class — a queued messa
 - **升級**：stop、install、start。由任何同一 major 版本的較舊版本寫下的狀態都讀得進來。
 - **降級**：要預期 tier-(b) 的摩擦——由較新版本寫下的 task event log 會**刻意把 board fail-close 掉**（見 §3）。那是保護機制在運作，不是 bug；回到較新版本就會把一切恢復。來自較新版本的 `fleet.yaml` 載入時會帶一則警告（未知欄位會被忽略——在信任其行為之前，先看那則 WARN）。
 - 升級**以 service 安裝**的部署後，重新跑一次 `agend-terminal service install`，讓 unit/plist 帶上當前設定，然後重啟 service（細節見 `docs/RELEASING.md` 和 service 相關文件）。
+
+---
+
+## 7. GitHub Actions 服務降級
+
+只有在同一個 repository 至少兩個 PR push 十分鐘後仍沒有 workflow run，**而且**
+GitHub Status 顯示 Actions degraded 或 unavailable 時，才啟動此流程。
+
+1. 凍結受影響 PR 的 merge，記錄每個 branch 與 immutable head SHA。Local green
+   永遠不授權 `--admin`、`--force` 或其他 gate bypass。
+2. 在每個 PR worktree 執行本地診斷：
+
+   ```bash
+   cargo test --all
+   cargo clippy --all-targets -- -D warnings
+   cargo fmt --check
+   ```
+
+3. 把結果當作 diagnostic evidence 留在 PR，並明確寫出 hosted cross-platform CI
+   仍在等待；保持 PR open。
+4. 服務恢復後，確認 Actions 對同一個 PR head 執行；必要時重新啟用 branch 的
+   `ci` watch，並獨立執行 `gh pr checks <PR#>`。
+5. 只有該命令 exit 0、而且所有 required review gate 也成立後才能 merge。後來的
+   `main` run 不能回填成該 PR 的 evidence；PR head 改變時，舊 review 與診斷失效。
+
+GitLab mirror 可協助診斷 GitHub outage，但不能取代 GitHub PR head 所設定的
+required checks。
+
+---
+
+## 8. 啟動不繼承 context 的 Claude instance
+
+Claude 可能從三個位置繼承 instruction 或 memory：
+
+| Source | Scope | Default |
+|---|---|---|
+| `~/.claude/CLAUDE.md` | 所有本機 Claude session | 載入 |
+| `~/.claude/projects/<pwd-slug>/memory/` | working-directory memory | 存在時載入 |
+| `<workspace>/CLAUDE.md` 與 `<workspace>/.claude/CLAUDE.md` | project | 存在時載入 |
+
+AgEnD 已經替每個 instance 提供不同 workspace/worktree，因此 working-directory
+memory 不會跨 instance name。若只想對一個新 instance 同時停用 auto-memory 的
+讀取與寫入，可使用受支援的 per-instance environment map：
+
+```text
+create_instance(
+  name="clean-agent",
+  backend="claude",
+  env={"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1"}
+)
+```
+
+若還要排除全域 `CLAUDE.md`，請在第一次 launch 前建立
+`$AGEND_HOME/workspace/clean-agent/.claude/settings.json`：
+
+```json
+{
+  "autoMemoryEnabled": false,
+  "claudeMdExcludes": ["~/.claude/CLAUDE.md"]
+}
+```
+
+只有 security-sensitive 的 default-behavior testing 才建議使用 throwaway
+per-instance `HOME`；它隔離最完整，但也會失去既有 Claude authentication、MCP
+settings 與 theme。上述選項都不會移除 daemon 注入的 fleet protocol、不會停用
+workspace MCP server，也不會刪除磁碟上已存在的 memory。

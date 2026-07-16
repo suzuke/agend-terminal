@@ -4,7 +4,7 @@
 //! cannot leak orphan PIDs, phantom registry entries, or stale Telegram
 //! bindings.
 //!
-//! Audit context: Sprint 20 Track B audit (DAEMON.md F1/F2/F3/F5) +
+//! Audit context: `docs/DAEMON-LOCK-ORDERING.md` +
 //! Sprint 20.5 Track A peer-pass cross-validation (Telegram binding leak in F3).
 //!
 //! Two surfaces:

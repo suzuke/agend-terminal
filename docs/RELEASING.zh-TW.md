@@ -111,3 +111,69 @@ cargo yank --version X.Y.Z --undo     # if yanked by mistake
 pin 必須在同一個做 bump 的 PR 裡一起更新（在 `ci.yml` 與 `release.yml` 裡
 grep `1.88`）。把一次 MSRV bump 當成 minor-version 事件，並在 changelog 點出。
 新地板仍應偏保守，不要對齊「最新 stable」。
+
+## Release smoke test（目標：30 分鐘）
+
+Tag 前，請針對精確的 release commit 或其 CI artifact 執行本節。
+
+### Preflight
+
+- [ ] 停止前一個 session 遺留的 daemon，並從 repository root 操作。
+- [ ] 執行 `cargo build --release`；確認 `agend-terminal doctor` exit 0。
+- [ ] 確認每個待測 backend 的 credential；測 Telegram 時設定
+  `AGEND_TELEGRAM_BOT_TOKEN`。
+
+### Backend matrix
+
+對每個已安裝 backend：spawn、送出 `echo hello`、執行一次 tool call（例如
+`list files in /tmp`）、正常退出，並確認沒有 orphan process。跳過的 backend
+必須記在 sign-off。
+
+| Backend | Ready evidence | 正常退出 | 額外檢查 |
+|---|---|---|---|
+| Claude Code (`claude`) | 30 秒內出現 `❯` 或 `bypass permissions` | `/exit` | `admin cleanup-branches` preview exit 0 且不刪除任何東西 |
+| Kiro CLI (`kiro-cli`) | 30 秒內出現 `Trust All Tools active` 或 `ask a question` | `/quit` | trust dialog 已 dismiss |
+| Codex (`codex`) | 20 秒內出現 `OpenAI Codex` 或 `›` | `exit` | trust-directory dialog 已 dismiss |
+| OpenCode (`opencode`) | 45 秒內出現 `Ask anything` 或 `tab agents` | `/exit` | alt-screen 內的 mouse wheel 留給 backend（#744） |
+| Agy (`agy`) | 20 秒內出現 `Antigravity CLI` 或 `Type your message` | `/exit` | `.agents/mcp_config.json` 載入 fleet MCP tools（#1547） |
+| Grok (`grok`) | 30 秒內出現 `Grok Build` 或 `❯` | `/exit` | project-trust dialog 已 dismiss |
+
+### Cross-cutting checks
+
+- [ ] `Ctrl+B n` / `Ctrl+B p` 切換 tab、`Ctrl+B o` 切換 pane，且
+  `Ctrl+B d` 可乾淨 detach。
+- [ ] 在一般、非 alt-screen pane 中，mouse wheel 可捲動 history。
+- [ ] Channel 啟用時，Telegram 訊息抵達正確 agent pane。
+- [ ] 一次 disposable `repo(action=checkout, bind=true)` 加上
+  `release_worktree` 後，`binding_state` 為 unbound 且無 dangling worktree。
+- [ ] 設定 `AGEND_CAPTURE_FIXTURES=1` 時，一次 backend run 會寫出 `.cap` 與
+  `.cap.meta.json`；完成後 unset。
+
+### Sign-off
+
+把下列內容貼進 release PR：
+
+```text
+Date: YYYY-MM-DD
+Operator: <name>
+agend-terminal version: <version>
+OS / arch: <value>
+
+Backend versions tested:
+- claude:
+- kiro-cli:
+- codex:
+- opencode:
+- agy:
+- grok:
+
+Backends skipped (reason):
+-
+
+Known deviations / failures:
+-
+
+Overall verdict: [ ] PASS  [ ] PASS with caveats  [ ] FAIL
+```
+
+六個 backend 全部通過時，在 PR 加上 `Real-backend smoke: ✓ all 6 backends`。

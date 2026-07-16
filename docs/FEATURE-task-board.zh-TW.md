@@ -2,387 +2,230 @@
 
 # Task Board
 
-這份文件說明共享任務板的設計目的、資料流、MCP 使用方式、以及
-哪些行為是有保證的，哪些只是 best-effort。
+Task board 是 fleet 共用的工作追蹤介面。它採用 event-sourced 模型：每次變更都會附加到 `task_events.jsonl`，目前狀態則透過 replay（fold）這些 event 重建。這使 board 具有完整 audit trail、狀態可重現，並為 sweep、health 與 dependency evaluation 提供基礎。
 
 ## 使用情境
 
-> **適用對象：** Agent 基礎設施——agent 透過 MCP tools 使用，operator 通常不直接操作。
+> **適用對象：** Agent infrastructure——agent 透過 MCP 工具使用；operator 通常不會直接操作。
 
-**任務分派與追蹤。** Lead agent 在任務板上建立一個任務，填入標題、優先級和指派對象，然後分派給 dev agent。Dev 在 inbox 中收到任務後，透過 `task action=claim` 認領並開始工作。工作過程中，dev 將任務狀態更新為 `in_progress`。完成後，dev 以 `done` 標記任務並附上結果摘要。整個生命週期以 append-only 事件記錄在 `task_events.jsonl` 中。
+**Task 派發與追蹤。** Lead agent 在 board 上建立 task，設定 title、priority 與 assignee，再派發給 dev agent。Dev 會在 inbox 收到 task、透過 `task action=claim` 認領並開始工作。隨工作推進，dev 將 task 狀態更新為 `in_progress`。完成後，dev 以結果摘要將 task 標記為 `done`。整個生命週期都會以 append-only event 記錄在 `task_events.jsonl`。
 
-**跨 agent 可見性。** Reviewer agent 查看任務板，找出已標記 `done` 且待驗證的任務。完成 PR 審查後，reviewer 將任務標記為 `verified`。同時，operator 可以隨時透過 TUI 觀察完整的任務板狀態，無需逐一查詢各個 agent。
+**跨 agent 可見性。** Reviewer agent 查看 task board，找出已標記為 `done`、可供驗證的 task。Review 關聯 PR 後，reviewer 將 task 標記為 `verified`。同時，operator 隨時都能透過 TUI 觀察完整 board 狀態，不必逐一查詢 agent。
 
-**任務板衛生。** 隨著時間推移，任務會堆積——有些 owner 已不在 fleet 中（ghost owners），有些截止日期已過。Operator 執行 `task action=health` 取得任務板健康快照，再使用 `task action=sweep` 的 dry-run 模式找出清理候選項，確認後才實際執行。
+**Board 衛生。** Task 會隨時間累積——有些 owner 已不在 fleet 中（ghost owner），有些則超過期限。Operator 執行 `task action=health` 取得 board health snapshot，再以 dry-run 模式執行 `task action=sweep`，先找出清理候選再套用變更。
 
-## 1. 設計初衷
+## 1. 設計理念
 
-- Task board 是整個 fleet 共用的工作清單。
-- lead 用它分派工作。
-- agent 用它認領工作。
-- reviewer 用它做驗收與收尾。
-- operator 可以直接觀察全局狀態。
-- 它的核心價值是「每個人看同一份狀態」。
-- 它不是個人待辦清單。
-- 它也不是單純的訊息信箱。
-- 它是可回放的狀態機。
-- 目前 canonical source 不是 `tasks.json`。
-- canonical source 是 `task_events.jsonl`。
-- `tasks.json` 是舊格式遷移來源。
-- 新的讀路徑透過 replay 折疊事件。
-- 這表示 board 的歷史是 append-only。
-- 也表示狀態可重建。
-- 這是審計與回溯的基礎。
-- 也是 task sweep 與 health 的共同基礎。
-- 任何新功能都應該沿用這個模型。
-- 如果要改 board 狀態，優先考慮事件，而不是直接改檔。
+- Task board 是所有 agent 共用的唯一真相來源。
+- Lead 用它派發工作；agent 認領並執行；reviewer 驗證。
+- Operator 可隨時觀察全域狀態。
+- 它是 append-only、可 replay 的 state machine，不是可直接修改的 JSON 檔。
+- `task_events.jsonl` 是 canonical source；`tasks.json` 是 legacy bridge。
+- 所有新 read 都透過 replay-fold；所有新 write 都透過 event append。
 
 ## 2. 檔案與模組
 
-- `src/task_events.rs` 負責事件格式與 replay。
-- `src/tasks/mod.rs` 負責 board surface 與舊資料橋接。
-- `src/mcp/handlers/task.rs` 只是把 MCP call 轉給 `tasks.rs`。
-- `task_events.jsonl` 是 canonical event log。
-- `task_events_archive/` 是歷史封存區。
-- `tasks.json` 是 legacy bridge 檔。
-- 讀者應把 `tasks.json` 視為過渡資料。
-- 寫入者應把 `task_events.jsonl` 視為真相。
-- `TaskBoardState` 是 replay fold 的輸出。
-- `TaskRecord` 是 board 的讀模型。
-- `TaskEvent` 是寫模型。
-- `TaskId` 與 `InstanceName` 都是 newtype。
-- 這是為了避免 ID 混用。
-- replay 對未知 variant 失敗。
-- replay 對高於支援版本的 envelope 失敗。
-- 這是 fail-closed。
-- append 路徑採用單調 seq。
-- seq 是每個 emitter 各自遞增。
-- 這讓同一 emitter 的事件可以排序。
-- 同時也保留跨 emitter 的折疊順序。
+- `src/task_events.rs`——event 格式定義與 replay 邏輯。
+- `src/tasks/mod.rs`——board 介面與 legacy data bridge。
+- `src/mcp/handlers/task.rs`——將請求委派給 `tasks` module 的薄 MCP handler。
+- `task_events.jsonl`——canonical event log。
+- `task_events_archive/`——歷史 archive 目錄。
+- `tasks.json`——legacy bridge 檔案（migration 期間唯讀）。
+- `TaskBoardState`——replay-fold 的輸出。
+- `TaskRecord`——來自 replay 的 canonical read model。
+- `TaskEvent`——write model。
+- `TaskId` 與 `InstanceName` 是 newtype，可避免混用 ID。
+- Replay 遇到未知 event variant 或不支援的 schema version 會失敗（fail-closed）。
+- Append 使用每個 emitter 單調遞增的 sequence number 排序。
 
 ## 3. 資料模型
 
-- `Task` 是 MCP/reader 用的公共結構。
-- `TaskRecord` 是 replay 的 canonical view。
-- `Task` 內的 `status` 是字串。
-- `TaskRecord` 內的 `status` 是 enum。
-- `Task` 保留前相容欄位。
-- `TaskRecord` 保留歷史欄位。
-- `TaskEvent::Created` 帶 title、description、priority。
-- `TaskEvent::Created` 可帶 owner。
-- `TaskEvent::Created` 可帶 due_at。
-- `TaskEvent::Created` 可帶 depends_on。
-- `TaskEvent::Created` 可帶 routed_to。
-- `TaskEvent::Created` 可帶 branch。
-- `TaskEvent::Created` 可帶 bind。
-- `TaskEvent::Created` 可帶 eta_secs。
-- `TaskEvent::Claimed` 會設定 owner。
-- `TaskEvent::InProgress` 會設定 owner。
-- `TaskEvent::Done` 會把狀態變 Done。
-- `TaskEvent::Cancelled` 會把狀態變 Cancelled。
-- `TaskEvent::Blocked` 會寫入 block_reason。
-- `TaskEvent::Unblocked` 會清掉 block_reason。
-- `TaskEvent::Released` 會清掉 owner 與 routed_to。
-- `TaskEvent::Reopened` 會保留 owner。
-- `TaskEvent::OwnerAssigned` 只改 owner/routed_to。
-- `TaskEvent::PriorityChanged` 只改 priority。
-- `TaskEvent::Verified` 會更新狀態但不 close。
-- `TaskEvent::Linked` 會追加 PR link。
-- `TaskEvent::TaskCloseProposed` 是審核提案事件。
-- 有些功能不新增 event variant,而是沿用既有 metadata 機制——例如 plan-ack gate(§10)用 `MetadataSet` 存 `plan_ack_required`/`plan_ack_reason`/`plan_acks`。
+- `Task` 是透過 MCP 公開的 structure（為相容性使用 string status）。
+- `TaskRecord` 是 replay 產生的 canonical view（使用 enum status）。
+- 主要 `TaskEvent` variant：
+  - `Created`——攜帶 title、description、priority，以及 optional owner/due_at/depends_on/routed_to/branch/bind/eta_secs。
+  - `Claimed`——設定 owner。
+  - `InProgress`——設定 owner 並標記工作已開始。
+  - `Done`——轉換至 Done status。
+  - `Cancelled`——轉換至 Cancelled status。
+  - `Blocked` / `Unblocked`——設定或清除 block reason。
+  - `Released`——清除 owner 與 routed_to。
+  - `Reopened`——重新開啟已完成 task（保留 owner）。
+  - `OwnerAssigned`——只變更 owner/routed_to。
+  - `PriorityChanged`——只變更 priority。
+  - `Verified`——記錄 reviewer 核准，但不關閉 task。
+  - `Linked`——附加 PR link。
+  - `TaskCloseProposed`——需要 review 的 close proposal。
+- 有些功能會組合既有 metadata，而不新增 variant——例如 plan-ack gate（§10）以 `MetadataSet` 儲存 `plan_ack_required`/`plan_ack_reason`/`plan_acks`。
 
 ## 4. 狀態語意
 
-- `backlog` 是已記錄但尚未進入可執行佇列。
-- `open` 是待認領。
-- `claimed` 是有人接手。
-- `in_progress` 是已開始執行。
-- `in_review` 是實作已送審。
-- `verified` 是 reviewer 已核准。
-- `done` 是完成。
-- `cancelled` 是取消。
-- `blocked` 是被阻擋。
+| Status | 意義 |
+|--------|------|
+| `backlog` | 已記錄，但尚不可執行 |
+| `open` | 等待認領 |
+| `claimed` | 已有人取得 ownership |
+| `in_progress` | 已開始執行 |
+| `in_review` | 實作正在等待 review |
+| `verified` | Reviewer 已核准 |
+| `done` | 已完成 |
+| `cancelled` | 已取消 |
+| `blocked` | 受外部因素或 dependency 阻擋 |
 
-### Dependency Evaluation
+### Dependency evaluation
 
-- `depends_on` 會影響 view 層的有效狀態。
-- 依賴未完成時，open 會視為 blocked。
-- 依賴完成後，blocked 會自動回 open。
-- claimed / done / cancelled 不會被依賴覆寫。
-- 這個依賴 eval 是 in-memory。
-- 它不會寫成 Blocked/Unblocked 事件。
-- 這樣可避免把 view 狀態誤寫進歷史。
-- circular dependency 會被視為 blocked。
-- 缺失的 dependency 也會視為未完成。
-- claim 會尊重依賴後的 view。
-- 這避免認領一個尚未解除依賴的 task。
-- `started_at` 只在第一次進入 in_progress 時寫入。
-- `updated_at` 會隨事件更新。
+- `depends_on` 會影響 view layer 的 effective status。
+- Dependency 尚未完成的 open task 會顯示為 blocked。
+- Dependency 完成後，task 會自動恢復為 open。
+- Claimed / done / cancelled task 永遠不會被 dependency 覆寫。
+- 此 evaluation 只存在記憶體內，不會發出 Blocked/Unblocked event。
+- 循環或缺漏的 dependency 視為未完成。
+- Claim 會尊重套用 dependency 後的 view（不能認領因 dependency 而 blocked 的 task）。
+- `started_at` 只會在第一次轉換成 in_progress 時設定一次。
 
 ## 5. `task action=create`
 
-- `title` 是必要欄位。
-- `description` 可選。
-- `priority` 可選。
-- 預設 priority 是 `normal`。
-- `assignee` 可選。
-- `depends_on` 可選。
-- `parent_id` 可選；child task 必須與 parent 位於同一個 project board。
-- `due_at` 可直接傳 RFC3339。
-- MCP action 不接受 `duration` 簡寫。
-- `branch` 會進入 record。
-- `bind` 可關閉自動 bind。
-- `eta_secs` 可啟用 stall watchdog。
-- `tags` 與 `project` 可選；未指定 `project` 時使用 caller 目前的 project board。
-- PR-producing task 可用 `review_class` 保存 `single`／`dual` review 門檻。
-- create 會先 append `Created` 事件。
-- 成功後回傳 `event=created`。
-- 回傳內的 `task.status` 會是 `open`。
-- 回傳也保留舊欄位 `status=created`。
-- 這是 back-compat alias。
-- create 後可直接被 list 看見。
-- create 不會自動 claim。
-- create 不會自動 start。
-- create 也不會自動 done。
+- `title` 必填；`description`、`priority`、`assignee`、`depends_on`、`parent_id`、`due_at`、`branch`、`bind`、`eta_secs`、`tags`、`project`、`plan_ack_required`、`plan_ack_reason` 與 `review_class` 選填。
+- 預設 priority 為 `normal`。
+- `due_at` 接受 RFC 3339。MCP action 不接受 duration 簡寫。
+- `project` 選擇 project board；否則使用 caller 目前的 project。由 `parent_id` 指定的 child 必須建立在 parent 的 project board 上。
+- `review_class` 儲存 PR-producing work 的 durable `single`/`dual` review threshold。
+- 附加 `Created` event，並回傳 `event=created`。
+- 不會自動 claim、start 或 complete。
 
 ## 6. `task action=list`
 
-- list 預設只列 actionable。
-- actionable 包含 `backlog`、`open`、`claimed`、`in_progress`、`in_review`、`blocked`。
-- 若 `include_history=true`，會列出歷史完成項目。
-- 若指定 `filter_status`，會尊重明確過濾。
-- 若指定 `filter_assignee`，會只看該 owner。
-- `filter_tag` 可依 tag 篩選；`status`、`assignee`、`tag` 是對應 `filter_*` 欄位的 alias。
-- `project=all` 或 `scope=fleet` 會聚合所有 project board；否則只看 caller 目前的 board。
-- 預設會截短過長的 description/result；`verbose=true` 保留全文，`fields=minimal` 只回 id/title/status/assignee/priority。
-- `limit` 會按 `updated_at` 由新到舊截斷。
-- 完成超過 14 天的項目在預設視圖會被壓掉。
-- `filtered_default` 會告知 caller 是否套用預設 trim。
-- 這讓 UI 不用自己猜是否少了項目。
-- list 的來源是 replay 之後再做 view 過濾。
-- 所以 list 看到的是 canonical fold 後的結果。
-- list 不會直接讀舊 `tasks.json`。
-- list 也不會修改 board。
-- list 是純讀操作。
+- 預設 view 只顯示 actionable task：backlog、open、claimed、in_progress、in_review、blocked。
+- `include_history=true` 會包含已完成項目。
+- `filter_status`、`filter_assignee` 與 `filter_tag` 可縮小結果；也接受 `status`、`assignee` 與 `tag` alias。
+- `project=all` 或 `scope=fleet` 會聚合所有 project board；否則使用 caller 目前的 board。
+- `verbose=true` 保留完整 free text，預設則可能截短過長的 description/result。`fields=minimal` 只回傳 id/title/status/assignee/priority。
+- `limit` 依 `updated_at` 截取（最新優先）。
+- 超過 14 天前完成的項目會從預設 view 移除。
+- Response 中的 `filtered_default` 表示是否套用了預設 trimming。
+- List 是 pure read，不會變更 board。
 
 ## 7. `task action=claim`
 
-- claim 需要 `id`。
-- claim 前會確認 instance 存在於 fleet.yaml。
-- claim 會先看 `list_all` 的 view。
-- 這表示它會尊重 dependency eval。
-- 若 task 不是 open，通常拒絕。
-- 例外是 self reclaim。
-- self reclaim 指的是本人再次 claim 自己已 claimed 的 task。
-- claim 會 append `Claimed` 事件。
-- 成功後回傳 `event=claimed`。
-- 回傳中的 `task.status` 會是 `claimed`。
-- claim 會把 owner 寫成呼叫者。
-- claim 不會保留原本 routed_to。
-- routed_to 會在 claim 時清掉。
-- 這反映 ownership 已移轉到具體 instance。
+- 需要 `id`。
+- 驗證 calling instance 存在於 fleet.yaml。
+- 尊重 dependency evaluation——因 dependency 而 blocked 的 task 不能被 claim。
+- 允許 self-reclaim（重新認領自己的 task）。
+- 附加 `Claimed` event，並將 caller 設為 owner。
+- 清除 `routed_to`，以反映 ownership 已移轉。
 
 ## 8. `task action=done`
 
-- done 需要 `id`（也接受 `task_id` alias）。
-- done 可帶 `result`。
-- `done_source` 是 provenance object；一般 caller 只能聲明 `OperatorManual`，PR merge 等 forensic variant 只信任 daemon system identity。
-- done 會先讀 replay record。
-- done 預設採 owner 作為 by。
-- 若沒有 owner，就用 caller。
-- `force=true` 會啟用 ghost-owner cleanup。
-- `force_reason` 在 force 模式下必填。
-- force 會記錄 event_log audit entry。
-- force 也會把 caller 與 reason 寫進事件 result。
-- 這樣 replay trail 也看得到審計原因。
-- done 會 append `Done` 事件。
-- 成功後回傳 `event=done`。
-- 回傳中的 `task.status` 會是 `done`。
-- done 後會嘗試清理 bound worktree 的 init commit。
-- 那是 best-effort。
-- 清理失敗不會阻塞 done 回應。
+- 需要 `id`（或 `task_id` alias）；`result` 選填。
+- `done_source` 是 provenance object。一般 caller 只能宣告 `OperatorManual`；只有 daemon system identity 能持久化 PR merge observation 等 forensic variant。
+- 以 task owner 作為 `by`（沒有 owner 時退回 caller）。
+- `force=true` 可清理 ghost owner，並要求 `force_reason`。
+- Force mode 會在 event log 記錄 audit entry。
+- 附加 `Done` event。
+- 完成後，會 best-effort 嘗試清理綁定 worktree 的 init commit。
 
 ## 9. `task action=update`
 
-- update 需要 `id`（也接受 `task_id` alias）。
-- update 可改 `status`。
-- update 可改 `priority`。
-- update 可改 `assignee`。
-- update 可改 `tags`。
-- update 可帶 `force`。
-- update 可帶 `force_reason`。
-- status transition 會對應 canonical event。
-- `open -> claimed` 會發 Claimed。
-- `open -> in_progress` 會發 InProgress。
-- `* -> done` 會發 Done。
-- `* -> cancelled` 會發 Cancelled。
-- `* -> blocked` 會發 Blocked。
-- `blocked -> open` 會發 Unblocked。
-- `claimed/in_progress -> open` 會發 Released。
-- `done -> open` 會發 Reopened。
-- priority change 會發 PriorityChanged。
-- assignee change 會發 OwnerAssigned。
-- 多個變更可合併在同一次 append_batch。
-- 這讓一個 update 呼叫可以原子落盤。
-- update 的 ACL 跟 done 一樣看 owner/orchestrator。
-- 若任務建立時帶 `plan_ack_required > 0`,`status: in_progress` 還會額外過 plan-ack gate(§10)。
+- 需要 `id`（或 `task_id`）；可變更 `status`、`priority`、`assignee` 與 `tags`。
+- Status transition 對應至 canonical event：
+  - open → claimed：`Claimed`
+  - open → in_progress：`InProgress`
+  - any → done：`Done`
+  - any → cancelled：`Cancelled`
+  - any → blocked：`Blocked`
+  - blocked → open：`Unblocked`
+  - claimed/in_progress → open：`Released`
+  - done → open：`Reopened`
+- 可在單次 `append_batch` 中批次處理多項變更，以原子方式持久化。
+- ACL rule 與 `done` 相同（owner / orchestrator）。
+- 若 task 建立時設定 `plan_ack_required > 0`，`status: in_progress` 還會通過 plan-ack gate（§10）。
 
 ### 其他 task action
 
-- `get` 依 `id`／`task_id` 回傳單一 task 的完整 record。
+- `get` 依 `id`/`task_id` 回傳單一 task 的完整 record。
 - `activity` 回傳 task 的 event history。
-- `metadata_set`／`metadata_get` 寫入或讀取具名 metadata；寫入遵守 task ACL。
-- `ack_plan` 冪等記錄非 assignee 的 plan acknowledgement，供 plan-ack gate 使用。
+- `metadata_set` 與 `metadata_get` 寫入／讀取具名 metadata value；mutation 遵循 task ACL。
+- `ack_plan` 記錄 plan-ack gate 使用、具 idempotency 的非 assignee acknowledgement。
 
 ## 10. Plan-Ack Gate（`#2249`）
 
-- 這是選擇性（opt-in）的事前對齊 gate。
-- 目的是讓 plan 被外部確認過,才能開始執行。
-- `task action=create`(以及 `send(kind=task)` 的 auto-create 路徑)新增 `plan_ack_required` 參數。
-- 預設值是 `0`,代表關閉。
-- 若 `plan_ack_required > 0`,必須同時提供非空的 `plan_ack_reason`。
-- 驗證方式比照 `second_reviewer_reason`。
-- 這個功能沒有新增 `TaskEvent` variant。
-- `plan_ack_required`/`plan_ack_reason` 是在 `Created` 之後,透過兩個 `MetadataSet` 事件寫入 `Task.metadata`。
-- assignee 透過既有的 `task action=metadata_set metadata_key=plan` 分享 plan。
-- 新增 `task action=ack_plan`,需要 `id`。
-- ack_plan 會冪等地把呼叫者加進 `metadata.plan_acks`。
-- assignee 不能 ack 自己的 plan,會回傳 `code: self_ack_forbidden`。
-- plan 還沒設定就 ack,會回傳 `code: plan_not_set`。
-- 同一個呼叫者重複 ack 不會重複計數,回傳 `already_acked: true`。
-- gate 本身只在單一個 chokepoint 生效:`task action=update status=in_progress`。
-- 若 `plan_ack_required > 0` 且已 ack 數量低於門檻,transition 會被拒絕。
-- 拒絕時回傳 `{code: "plan_ack_pending", required, acked}`。
-- 任務狀態不會前進。
-- `plan_ack_required` 為 `0`(預設/未設定)時,完全不會檢查。
-- 這與 #2249 之前的行為位元組相同(byte-identical)。
-- 不在此次範圍內:daemon 依 priority/tag 自動觸發、decision board 整合、protocol 條文修改。
-- 這些留給日後其他機制在這個 primitive 上疊加。
+這是一個 opt-in 的工作前對齊 gate：task 開始前，要求外部人員 ack 其 plan。
+
+- `task action=create`（以及 `send(kind=task)` 的 auto-create 路徑）接受 `plan_ack_required`（integer，預設 `0` = 關閉）與 `plan_ack_reason`（當 `plan_ack_required > 0` 時必須為非空值，其 validation shape 與 `second_reviewer_reason` 相同）。
+- 不新增 `TaskEvent` variant——`Created` 之後立即透過兩個 `MetadataSet` event，將 `plan_ack_required`/`plan_ack_reason` 寫入 `Task.metadata`。
+- Assignee 透過既有的 `task action=metadata_set metadata_key=plan` 分享 plan。
+- `task action=ack_plan`（需要 `id`）以 idempotent 方式將 caller 附加到 `metadata.plan_acks`：
+  - Task 自己的 assignee 永遠不能 ack 自己的 plan（`code: self_ack_forbidden`）。
+  - Plan 尚未設定就 ack 會被拒絕（`code: plan_not_set`）。
+  - 同一 caller 重複 ack 是 no-op（`already_acked: true`，不會重複計數）。
+- Gate 位於唯一經驗證的 live chokepoint：`task action=update status=in_progress`。若 `plan_ack_required > 0` 且 distinct ack 數低於 threshold，transition 會以 `{code: "plan_ack_pending", required, acked}` 拒絕，task status 不會前進。
+- `plan_ack_required == 0`（預設／缺省情況）會完全略過檢查——對所有未 opt in 的 task 而言，與 #2249 之前的行為 byte-identical。
+- 刻意排除的範圍：daemon 不會依 priority/tag 自動觸發、不整合 decision board、不變更 protocol clause——這是純 opt-in primitive，日後其他 automation 可在其上建構。
 
 ## 11. `task action=sweep`
 
-- sweep 是操作板清理工具。
-- 它不是自動常駐的強制行為。
-- 它支援 dry-run。
-- `apply=false` 是預設。
-- apply 前需要先有 `confirm_ids`。
-- apply 會依 dry-run 提供的候選執行取消。
-- sweep 主要處理陳舊任務分類。
-- 它也會處理 PR close 對應的 task 結案。
-- sweep 的實作會走 `scan_categories`。
-- sweep 的 apply 會批次 emit Cancelled。
-- sweep 會記錄 audit reason。
-- sweep 會把結果寫進 event_log。
-- 這讓 operator 可以先看 plan 再決定。
+- Board hygiene 工具，不是 always-on enforcer。
+- 預設為 dry-run（`apply=false`）。
+- `apply=true` 需要前一次 dry-run 取得的 `confirm_ids`。
+- 處理 stale task 與 linked PR 已關閉的 task。
+- Cancelled task 會連同 audit reason 以 batch 發出。
 
 ## 12. `task action=health`
 
-- health 是一張板的快照。
-- 它不是變更。
-- 它回傳 totals。
-- 它回傳 by_status。
-- 它回傳 ghost_owners。
-- 它回傳 stale_claims。
-- 它回傳 age aggregates。
-- 它回傳 recommendations。
-- ghost_owners 分 strict 和 soft。
-- strict 代表 owner 已不在 fleet 和 live。
-- soft 代表 owner 還在 fleet 但不在 live。
-- stale_claims 會找過期 due_at 的 claimed tasks。
-- age 統計只看 non-terminal。
-- recommendations 是 operator 的 next-step hint。
-- health 對 board hygiene 很重要。
-- 它也讓 operator 先看到風險再 sweep。
+- 回傳 read-only board snapshot：total、by_status breakdown、ghost_owners、stale_claims、age aggregate 與 recommendation。
+- Ghost owner 分為 **strict**（不在 fleet 或 live registry）與 **soft**（在 fleet，但不在 live registry）。
+- Stale claim：超過 `due_at` 的 claimed task。
+- Age statistic 只涵蓋 non-terminal task。
+- Recommendation 是面向 operator 的下一步提示。
 
-## 13. 事件記錄與遷移
+## 13. Event 記錄與 migration
 
-- canonical log 是 `task_events.jsonl`。
-- append 會先拿 lock 再寫。
-- append_batch 會一次 fsync 多個事件。
-- replay 會先 fold archive，再 fold hot log。
-- replay 是 strict reader。
-- replay 看到未知 event variant 會 abort。
-- replay 看到高版本 schema 會 abort。
-- 這是刻意 fail-closed。
-- `tasks.json` 只在 migration 中出現。
-- migration 會把 legacy tasks 轉成事件。
-- migration 成功後會把舊檔改名成 `.legacy_pre_v2`。
-- 這樣 operator 還能考古。
-- **不做單→多 project 回溯(#2117 P3 Gap1)。** 遷移過來的 legacy task 沒有 `project_id`,會落在 default board 並留在那裡。日後改用 per-project boards(#2125)不會回溯重歸這些舊任務——只有新建任務才會 per-project stamp。這個不對稱是接受的語意、不是缺口:舊任務沒有 auto-bucket 的訊號,而跨 board 查詢靠 full-board-scan fallback 仍正確。要把舊任務改 board,由 operator 顯式搬移。
-- board 的讀面已不依賴舊檔。
-- board 的寫面也不應回去改舊檔。
+- Append 在寫入前取得 lock；`append_batch` 以原子方式 fsync 多個 event。
+- Replay 先 fold archive，再 fold hot log。它是 strict reader——未知 variant 或較高版本 schema 會造成 abort（fail-closed）。
+- Legacy `tasks.json` 只在 migration 期間讀取；migration 會將舊 task 轉為 event，並把檔案重新命名為 `.legacy_pre_v2`。
+- **不做 single→multi-project backfill（#2117 P3 Gap1）。** Migrated legacy task 沒有 `project_id`，因此會落在 default board 並留在那裡。日後採用 per-project board（#2125）也不會回溯重新分類；只有新建立的 task 會帶有 per-project stamp。這種不對稱是已接受的語意，而不是缺口：legacy task 沒有可供自動分類的訊號，cross-board lookup 仍能透過 full-board-scan fallback 正確運作。要重新安置 legacy task，operator 必須明確移動它。
 
 ## 14. ACL 與權限
 
-- 未指派 task 可由任何人 mutating。
-- owner 可以改自己的 task。
-- owner 的 team orchestrator 也可以改。
-- team assignee 的 orchestrator 也可以改。
-- system identities 有 allow-list bypass。
-- `system:auto_orphan`、`system:task_sweep` 等屬於系統身分。
-- force 模式是歷史資料清理用途。
-- force 不是一般使用者的捷徑。
-- force 必須有 reason。
-- ACL 判斷是 replay snapshot 上的 view。
-- 這表示有很小的 TOCTOU 窗口。
-- 但 canonical truth 還是 event log。
-- 衝突最後會由 replay 後序事件決定。
+- 未指派的 task 可由任何 agent 變更。
+- Task owner 與其 team orchestrator 可進行變更。
+- System identity（`system:auto_orphan`、`system:task_sweep` 等）可 bypass ACL。
+- `force` mode 用於歷史資料清理，不是捷徑——必須提供理由。
+- ACL 依 replay snapshot 評估（存在小型 TOCTOU window；canonical truth 是 event log）。
 
-## 15. 與其他子系統的關係
+## 15. 與其他子系統的互動
 
-- `team` 模組會影響 assignee 解析。
-- `worktree` / `binding` 會影響 done 後清理。
-- `dispatch` 會建立 task 與 branch 的關聯。
-- `ci_watch` 可能把 PR 成果回寫成 Done。
-- `decision` 不直接管 task board。
-- `inbox` 會承載 task-related 通知。
-- `health` 會把 task board 當作 operator snapshot。
-- `task sweep` 常跟 `ci sweep` 一起看。
-- `release_worktree` 不會直接改 task board。
-- 但 release 後常會清理與 task 相關的檔案狀態。
+- **Teams**——影響 assignee resolution。
+- **Worktree / Binding**——`done` 會觸發 best-effort worktree cleanup。
+- **Dispatch**——建立 task-to-branch association。
+- **CI Watch**——PR merge 時可能將 task 標記為 done。
+- **Inbox**——承載 task-related notification。
+- **Health**——將 board 作為 operator snapshot。
+- **Sweep**——通常會與 CI sweep 一起 review。
 
-## 16. 操作範例
+## 16. 使用指南
 
-- 建立任務時先填 `title`。
-- 如果是追蹤性工作，填 `branch`。
-- 如果要估時，填 `eta_secs`。
-- 如果有依賴，就填 `depends_on`。
-- 如果任務屬於某人，填 `assignee`。
-- 如果要跨 team，先確認 team 已建立。
-- 如果要查全板，先跑 `task action=list`。
-- 如果只看自己，搭配 `filter_assignee`。
-- 如果要看卡住狀態，查 `task action=health`。
-- 如果要清理過期 claim，用 `task action=sweep`。
-- 如果要驗證 sweep 影響，先 dry-run 再 apply。
-- 如果要做歷史清理，才考慮 `force=true`。
-- 如果 reviewer 要接棒，通常看 `branch` 與 `task_id`。
-- 如果要回報結果，done 事件比純文字更可追溯。
+- 建立時一律提供 `title`。
+- 以 `branch` 追蹤分支、`eta_secs` 供 stall watchdog 使用、`depends_on` 控制順序、`assignee` 進行 routing。
+- 使用 `task action=list` 查看完整 board；加上 `filter_assignee` 可取得個人 view。
+- 使用 `task action=health` 檢查卡住或 orphaned 的 task。
+- 先以 dry-run 執行 `task action=sweep`，再 apply。
+- `force=true` 只保留給歷史資料清理。
+- 為維持可追溯性，優先使用 `done` event，不要只提供 plain-text result report。
 
-## 17. 實作檢查點
+## 17. 實作檢查清單
 
-- 任何新事件 variant 都要更新 replay fold。
-- 任何新狀態都要更新 list/health 投影。
-- 任何寫入都要考慮 append_batch 原子性。
-- 任何新增 action 都要更新 MCP schema。
-- 任何 ACL 變更都要補測試。
-- 任何 migration 都要保留 idempotency。
-- 任何 board 行為都不要默默吞掉錯誤。
-- 若要做 report-only 功能，優先做 read model。
-- 若要改 board 寫路徑，先看 task_events。
-- 若要修改 task UI，先確認 replay 仍能重建。
-- 若要新增 sweep 類規則，先檢查 health 是否也要反映。
-- 若要改 legacy `tasks.json`，要確認它是否仍是 bridge。
+- 任何新 event variant 都必須更新 replay fold。
+- 任何新 status 都必須更新 list/health projection。
+- 所有 write 都必須遵守 `append_batch` atomicity。
+- 新 action 必須更新 MCP schema。
+- ACL 變更必須包含測試。
+- Migration 必須維持 idempotent。
+- Board operation 絕不能靜默吞掉 error。
+- 新的 report-only feature 應使用 read model。
+- 新 write path 應透過 `task_events`。
+- 新 sweep rule 也應反映在 health 中。
 
 ## 18. 總結
 
-- Task board 是 fleet 的共享工作協議。
-- 它的語意靠事件維持，而不是靠單一 mutable 檔案。
-- `task create/list/get/claim/done/update/sweep/health/activity/metadata_set/metadata_get` 是主要使用面,另外還有選擇性的 `ack_plan` 事前對齊 gate（§10）。
-- 預設清單是 actionable。
-- 依賴是 view 層自動計算。
-- ACL 是 owner / orchestrator / system identity。
-- 批次 append 與 strict replay 是最重要的兩個 invariant。
-- 如果看到 board 狀態不對，先查事件，不要先改視圖。
-- 如果要擴充 board，先更新 event model。
-- 如果要 debug，先看 `task_events.jsonl` 與 replay。
-- 這就是這個模組的設計核心。
+Task board 是 fleet 共用的工作 protocol。其語意由 event 維護，而不是單一可變檔案。主要介面為 `task create/list/get/claim/done/update/sweep/health/activity/metadata_set/metadata_get`，另有 opt-in 的 `ack_plan` 工作前對齊 gate（§10）。預設 list 只顯示 actionable task。Dependency 在 view layer 評估。ACL 為 owner / orchestrator / system identity。Batch append 與 strict replay 是兩項最重要的 invariant。若狀態看起來不對，先檢查 event log，再碰 view。

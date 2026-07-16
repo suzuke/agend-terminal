@@ -16,7 +16,7 @@
 //!   `HealthTracker::check_hang`, classify against
 //!   `expected_hung_classification`, aggregate FP/FN counts.
 //!
-//! See `docs/F685-FIXTURE-CORPUS.md` §F685-CORPUS.4 for measurement
+//! See `tests/fixtures/state-replay/CAPTURE-RECIPES.md` for measurement
 //! methodology and §F685-CORPUS.6 for corpus growth protocol.
 
 // Only the env_gate helper is needed here — avoid pulling the full
@@ -151,7 +151,7 @@ fn corpus_count_report() {
     };
     // Tracing instead of println so test output isn't noisy by default —
     // run with `cargo test -- --nocapture` to surface. The actual report
-    // shape is documented in docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.4.
+    // shape is documented in tests/fixtures/state-replay/CAPTURE-RECIPES.md.
     eprintln!(
         "[F685 corpus report] v2_total={} | scenario: productive_marker_fire={} \
          productive_silence={} silent_stuck={} priority_oscillation={} \

@@ -440,7 +440,8 @@ fn connect_daemon(
     let mut rdr = BufReader::new(stream);
 
     // Cookie handshake — include PID for daemon-side telemetry observability.
-    // (Active peer-process invalidation deferred — see MCP-DAEMON-PROXY-CONTRACT §deferred.)
+    // Active peer-process invalidation is intentionally daemon-owned; see the
+    // bridge contract in docs/MCP-TOOLS.md.
     let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
     let pid = std::process::id();
     let mut w = writer.try_clone()?;
@@ -479,7 +480,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<String>, Box<dyn std
         // Gemini, OpenCode) send NDJSON over stdio. Content-Length (LSP-style)
         // fallback removed — it was an attack surface (drip-feed DoS via
         // blocking read_exact, negative Content-Length crash, OOM via large
-        // Content-Length). See docs/archived/MCP-FRAMING-PER-BACKEND.md.
+        // Content-Length). See the framing contract in docs/MCP-TOOLS.md.
         if trimmed.starts_with('{') {
             return Ok(Some(trimmed.to_string()));
         }

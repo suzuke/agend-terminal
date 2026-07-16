@@ -12,7 +12,7 @@
 //! (rollout file tail, `rollout.rs`); the reducer is unchanged — every plane just fills
 //! the buffer.
 //!
-//! Confirm-first verified (2026-06-24, `docs/archived/SHADOW-OBSERVER-OPENCODE-SPIKE.md`): the TUI
+//! Confirm-first verified (2026-06-24; see `docs/BACKEND-CAPABILITY-MATRIX.md`): the TUI
 //! embedded server is reachable on the injected port AND a second client can subscribe
 //! `/event` concurrently while the TUI runs; a real turn streams
 //! `session.status{busy} → … → session.idle` (native idle/working flags, not regex).
@@ -96,7 +96,7 @@ pub fn should_inject(backend: Option<&Backend>, enabled: bool) -> bool {
 /// (`--port N` taken → exit 1, no fallback — verified). That is a <0.01%/spawn, flag-ON
 /// opt-in race that SELF-HEALS: the daemon crash-respawns (Fresh) → a new port is
 /// allocated → succeeds (two consecutive races are negligible; the crash budget + #2438
-/// watchdog backstop). See `docs/archived/SHADOW-OBSERVER-OPENCODE-SPIKE.md`.
+/// watchdog backstop). See `docs/BACKEND-CAPABILITY-MATRIX.md`.
 pub fn alloc_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .ok()

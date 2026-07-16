@@ -243,7 +243,7 @@ fn check_task_sweep_github_login_mapping(
              `github_login` mapping. The sweep's authorship gate compares the GitHub PR \
              author against the agend instance name, so every merged PR with a `Closes \
              t-...` marker will be silently rejected (see \
-             docs/RCA-issue-496-task-sweep-no-auto-close-2026-05-08.md)."
+             docs/FEATURE-task-board.md)."
         ),
         fix_stanza: Some(
             "Add a `github_login` field to each instance in fleet.yaml that \

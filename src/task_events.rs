@@ -5,7 +5,7 @@
 //! [`append`]; PR1 ships only the storage substrate).
 //!
 //! ## Design references
-//! - `docs/archived/TASK-BOARD-AUTO-CLOSE-REDESIGN.md` (4-perspective synthesis)
+//! - `docs/FEATURE-task-board.md` (current operator and storage contract)
 //! - dev-reviewer-2 must-haves (newtype IDs, `deny_unknown_fields`,
 //!   monotonic seq, schema-version, forensic snapshots, replay aborts on
 //!   unknown variant, distinct `DoneSource` variants over `Option<...>`)

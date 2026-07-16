@@ -1,3 +1,5 @@
+[繁體中文](CLAUDE.zh-TW.md)
+
 # agend-terminal — Claude working notes
 
 ## Rust workflow

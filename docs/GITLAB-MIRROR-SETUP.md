@@ -2,7 +2,7 @@
 
 # GitLab Mirror Setup Guide
 
-Backup CI channel via GitLab for use when GitHub Actions is degraded. See also [CI-DOWN-SOP.md](CI-DOWN-SOP.md).
+Backup CI channel via GitLab for use when GitHub Actions is degraded. See also the [incident runbook](RUNBOOK.md).
 
 ## 1. Create GitLab Project
 
@@ -42,7 +42,7 @@ When GitHub Actions is degraded:
 1. Go to your GitLab project → **CI/CD → Pipelines**
 2. Find the pipeline for the branch you need to verify
 3. Check that `fmt`, `clippy`, and `test` jobs all pass
-4. Use the result as merge evidence in the [CI-DOWN-SOP](CI-DOWN-SOP.md) PR comment template
+4. Record the result as diagnostic evidence under the [incident runbook](RUNBOOK.md); it does not replace required GitHub checks
 
 ## 5. Optional: Report Status Back to GitHub
 

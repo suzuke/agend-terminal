@@ -2,7 +2,7 @@
 //!
 //! Given a command (`["agend-terminal", "app"]`), open it in the user's
 //! configured terminal emulator. Resolution rules live in
-//! `docs/archived/PLAN-tray-resident.md` §"OpenInTerminal per platform".
+//! `docs/FEATURE-service.md`.
 //!
 //! Construct via `Platform::new(terminal)` where `terminal` is the
 //! `terminal` field from `tray.toml` (`"default"` if unset).

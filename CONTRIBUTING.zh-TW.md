@@ -40,6 +40,33 @@ scripts/preflight.sh          # full matrix; --quick skips the Windows cross-che
 
 它執行與 CI `check` job 相同的 fmt/clippy 介面——`scripts/fmt-owned.sh --check`（owned `*.rs`，排除 `vendor/`）與 owned-target 的 `cargo clippy`——外加 `cargo test --tests --features tray`，以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。（注意：CI 是用 `nextest` 而非 `cargo test` 跑測試，且浮動的 stable toolchain 並非長期逐位元組一致——preflight 是強力的預先檢查，而非與 CI 逐位元組一致的保證。）Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
 
+### 跨平台 lint 模式
+
+Preflight 能抓出 compiler 可見的 drift；修改 platform-specific code 時，還要檢查
+下列反覆出現的模式：
+
+```bash
+scripts/clippy-all-platforms.sh --quick
+```
+
+- `#[allow(dead_code)]` 只能縮到單一 cfg-only symbol，並解釋該 cfg；不要在
+  module 層級隱藏 dead code。
+- 每個 production `tokio::spawn` / `thread::spawn` 都要有
+  `// fire-and-forget: <reason>` 註解，或保存 `JoinHandle`；
+  `spawn_rationale_audit` test 會強制。
+- 產生 launchd、systemd、PowerShell、JSON、XML template 時，依**目標格式**
+  escape，不要依開發機的 host shell。
+- Helper binary 名稱用 `std::env::consts::EXE_SUFFIX` 組合；不要 hardcode 或漏掉
+  `.exe`。
+- 把 `metadata().modified()` 當作會失敗的操作，且不要假設 filesystem timestamp
+  resolution 完全相同。
+- 用 `Path` component 或 canonical path 比較路徑，不要比較 hardcoded `/` 的字串。
+- 優先使用 deterministic channel/condition，不要用 timing sleep；不同平台的
+  scheduler 與 timer resolution 不同。
+
+Cross-check 能抓 cfg/type/lint failure，但 target link library、runtime template
+語意、path 行為與 timing 仍需要 focused test 加 hosted CI。
+
 ### 覆蓋率（選填，本地）
 
 `coverage` CI job（#686）會在 Ubuntu 上跑 `cargo-llvm-cov`，並把 lcov 報告上傳到 Codecov。要在本地量測：

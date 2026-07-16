@@ -41,6 +41,35 @@ scripts/preflight.sh          # full matrix; --quick skips the Windows cross-che
 
 It runs the same fmt/clippy surface CI's `check` job runs — `scripts/fmt-owned.sh --check` (owned `*.rs`, `vendor/` excluded) and the owned-target `cargo clippy` — plus `cargo test --tests --features tray` and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. (CI runs the tests via `nextest`, not `cargo test`, and a floating stable toolchain is not byte-exact over time — so preflight is a strong pre-check, not a byte-exact CI guarantee.) The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
 
+### Cross-platform lint patterns
+
+The preflight catches compiler-visible drift; review these recurring patterns
+when touching platform-specific code:
+
+```bash
+scripts/clippy-all-platforms.sh --quick
+```
+
+- Scope `#[allow(dead_code)]` to the one cfg-only symbol and explain the cfg.
+  Never hide dead code at module level.
+- Every production `tokio::spawn` / `thread::spawn` needs either a
+  `// fire-and-forget: <reason>` comment or a stored `JoinHandle`; the
+  `spawn_rationale_audit` test enforces this.
+- Escape generated launchd, systemd, PowerShell, JSON, and XML templates for
+  the **target format**, not the developer's host shell.
+- Compose helper binary names with `std::env::consts::EXE_SUFFIX`; never
+  hardcode or omit `.exe`.
+- Treat `metadata().modified()` as fallible and do not assume timestamp
+  resolution is identical across filesystems.
+- Compare paths as `Path` components or canonical paths, never as strings with
+  hardcoded `/` separators.
+- Prefer deterministic channels/conditions over timing sleeps; platform
+  schedulers and timer resolution differ.
+
+The cross-check can catch cfg/type/lint failures, but target link libraries,
+runtime template semantics, path behavior, and timing still need focused tests
+plus hosted CI.
+
 ### Coverage (optional, local)
 
 The `coverage` CI job (#686) runs `cargo-llvm-cov` on Ubuntu and uploads an lcov report to Codecov. To measure locally:

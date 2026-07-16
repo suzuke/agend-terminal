@@ -1,7 +1,7 @@
 //! #t-777-3: respawn-stuck watchdog — auto-recover an agent whose `Resume`
 //! spawn hung and never came up.
 //!
-//! ## The incident (RCA `workspace/fixup-dev-2/RESPAWN-WATCHDOG-RCA-777-3.md`)
+//! ## The incident (see `docs/RECOVERY-STAGES.md`)
 //! A broad `pkill` killed codex agents mid-session-write; the daemon then
 //! re-spawned them via the `Resume` path (`daemon/mod.rs:1850`
 //! `SpawnMode::Resume.downgraded_for` / app session-restore `app/session.rs:238`).

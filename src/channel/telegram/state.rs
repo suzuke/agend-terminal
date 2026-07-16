@@ -81,7 +81,7 @@ pub struct TelegramState {
     /// routing read `agent_state` directly instead of via the `LIST` RPC.
     pub registry: Option<AgentRegistry>,
     /// Resolved `fleet_binding` target for cross-instance fleet activity
-    /// rendering (Stage B-UX, `docs/archived/DESIGN-stage-b-ux.md` §3/§5). `None`
+    /// rendering (see `docs/FEATURE-channels.md`). `None`
     /// means no mirror is configured — [`TelegramChannel::apply_fleet_action`]
     /// returns early. Resolution happens in [`init_from_config`] from the
     /// config's `fleet_binding` block plus the on-disk topic registry

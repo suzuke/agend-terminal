@@ -251,7 +251,7 @@ pub(crate) fn spawn_group_bounded(
     })
 }
 
-/// W1.2 (#REFACTOR-PLAN): a structured failure from [`git_cmd`]. Distinguishes a
+/// Architecture-14 W1.2: a structured failure from [`git_cmd`]. Distinguishes a
 /// spawn/timeout failure (git never produced a status) from a non-zero exit (git
 /// ran and rejected). Carries the exit code + trimmed stderr so a caller that
 /// branched on `output.status.code()` / stderr keeps the same information —

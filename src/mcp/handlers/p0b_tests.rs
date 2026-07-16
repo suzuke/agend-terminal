@@ -2,8 +2,8 @@
 //!
 //! Located in this sibling module per Sprint 54 PR #517 / Sprint 55 PR
 //! #522/#526 cycle-10 file_size_invariant precedent. Covers 15 edge cases
-//! (10 dev RCA + 5 reviewer-added per design doc
-//! `docs/DESIGN-sprint55-p0b-unified-bind.md` §4). EC2/3/5/8/10/13/14
+//! (10 dev RCA + 5 reviewer-added; the current binding contract is
+//! `docs/FEATURE-worktree.md`). EC2/3/5/8/10/13/14
 //! are covered by existing `dispatch_hook::tests` (Sprint 53 prior-art);
 //! P0-B tests below focus on the deltas:
 //!   EC1   ci(watch) without binding → no_binding_no_repo
