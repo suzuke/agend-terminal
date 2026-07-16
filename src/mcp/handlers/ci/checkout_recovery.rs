@@ -4,14 +4,10 @@
 //! module is the boot + per-tick recovery DRIVER (`recover_pending_sweep[_prod]`).
 
 use super::checkout_txn::{
-    load_typed, quarantine_corrupt, try_acquire_path_lock, txn_root, Journal, JournalLoad, Phase,
+    is_canonical_path_lock_name, load_typed, quarantine_corrupt, try_acquire_path_lock, txn_root,
+    Journal, JournalLoad, Phase,
 };
 use std::path::Path;
-
-fn is_canonical_path_lock_name(name: &str) -> bool {
-    name.strip_prefix("wtpath-")
-        .is_some_and(|suffix| suffix.ends_with(".lock"))
-}
 
 /// Drive recovery of CRASHED (orphaned) checkout-transaction journals — the ONE shared
 /// callable for boot-repair AND a periodic tick (no dedicated worker; the caller sets

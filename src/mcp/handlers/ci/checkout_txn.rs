@@ -320,6 +320,22 @@ fn path_lock_key(normalized: &str) -> String {
     format!("wtpath-{:016x}", std::hash::Hasher::finish(&h))
 }
 
+/// Recognize only the exact lock-file namespace emitted by [`lock_path`].
+/// Other journal-key artifacts must continue through typed fail-closed
+/// handling rather than being silently classified as coordination locks.
+pub(crate) fn is_canonical_path_lock_name(name: &str) -> bool {
+    let Some(hex) = name
+        .strip_prefix("wtpath-")
+        .and_then(|suffix| suffix.strip_suffix(".lock"))
+    else {
+        return false;
+    };
+    hex.len() == 16
+        && hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The CANONICAL per-worktree-path lock file, keyed by the NORMALIZED target
 /// PATH (not the naming scheme). Kept outside the journal subdir so it is not
 /// swept with the journal. The single shared lock file for any op that mutates

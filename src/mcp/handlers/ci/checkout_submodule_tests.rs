@@ -947,6 +947,42 @@ fn txn_sweep_ignores_canonical_path_lock_file() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A lookalike lock name is not in the producer namespace. It must still pass
+/// through typed recovery handling and remain fail-closed as an unreadable
+/// journal artifact rather than being silently skipped.
+#[test]
+#[tracing_test::traced_test]
+fn txn_sweep_near_miss_path_lock_name_remains_fail_closed() {
+    let home = tmp_home("sweep-path-lock-near-miss");
+    let near_miss = "wtpath-not-a-canonical-lock.lock";
+    let artifact = super::checkout_txn::txn_root(&home).join(near_miss);
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"").unwrap();
+    let callbacks = std::cell::Cell::new(0);
+
+    let n = recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| {
+            callbacks.set(callbacks.get() + 1);
+            Some(())
+        },
+        |_| {
+            callbacks.set(callbacks.get() + 1);
+            true
+        },
+        |_| callbacks.set(callbacks.get() + 1),
+    );
+    assert_eq!(n, 0);
+    assert_eq!(callbacks.get(), 0, "near-miss remains fail-closed");
+    assert!(
+        logs_contain("journal unreadable") && logs_contain(near_miss),
+        "near-miss must be observed as an unreadable journal artifact"
+    );
+    assert!(artifact.is_file(), "near-miss evidence remains untouched");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A real journal directory whose `journal.json` cannot be read remains an
 /// unresolved recovery authority. The entry point must preserve it and avoid
 /// all destructive callbacks (fail closed).
