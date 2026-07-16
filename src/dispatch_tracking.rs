@@ -52,23 +52,42 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
     );
 }
 
-/// Mark a dispatch as completed (matched by task_id or to-instance).
-pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
+/// Reporter-scoped settlement: remove only the entry whose `to` matches
+/// `reporter`. Empty reporter matches nothing (fail-closed).
+pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str) {
     let cid = match correlation_id {
         Some(c) if !c.is_empty() => c,
-        _ => return, // No correlation_id → can't match, let sweep continue tracking
+        _ => return,
     };
+    if reporter.is_empty() {
+        return;
+    }
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-            // Remove the resolved dispatch entry outright (was: flip to "completed"
-            // and linger until the 30-day `gc_old_entries`). A completed dispatch
-            // needs no further warn/ask tracking, so dropping it caps accumulation
-            // at the source (the 651KB / 1649-completed bloat). Complementary to
-            // #1727: that stops `orphaned` nag; this removes the rows.
-            store.entries.retain(|e| e.task_id.as_deref() != Some(cid));
+            store
+                .entries
+                .retain(|e| e.task_id.as_deref() != Some(cid) || e.to != reporter);
             Ok(())
         }),
         "dispatch_mark_completed"
+    );
+}
+
+/// Task-wide cleanup: remove ALL entries for a task_id regardless of
+/// assignee. Used by `task_terminal_cleanup` when a task reaches a
+/// terminal state (done/cancelled).
+pub fn remove_all_for_task(home: &Path, task_id: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            store
+                .entries
+                .retain(|e| e.task_id.as_deref() != Some(task_id));
+            Ok(())
+        }),
+        "dispatch_remove_all_for_task"
     );
 }
 

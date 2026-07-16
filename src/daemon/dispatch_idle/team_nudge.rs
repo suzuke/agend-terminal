@@ -520,7 +520,7 @@ mod tests {
         let home = tmp_home("m2-e2e");
         let id = write_exceeded_sidecar(&home, "fixup-lead", "fixup-reviewer", "t-m2c", 700);
         let path = pending_path(&home, &id);
-        crate::daemon::dispatch_idle::mark_resolved(&home, "t-m2c");
+        crate::daemon::dispatch_idle::mark_resolved(&home, "t-m2c", "fixup-reviewer");
         assert!(!path.exists(), "mark_resolved deleted the sidecar");
         assert!(
             !stamp_nudge_sent(&home, &id),

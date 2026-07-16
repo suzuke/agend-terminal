@@ -676,26 +676,15 @@ pub(crate) fn has_pending_for_instance(home: &Path, instance_name: &str) -> bool
 /// single dispatcher can have multiple pending dispatches outstanding,
 /// each with a distinct correlation_id). Returns the resolved
 /// dispatch_id, or `None` if no matching pending entry exists.
-pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String> {
-    if correlation_id.is_empty() {
+pub(crate) fn mark_resolved(home: &Path, correlation_id: &str, reporter: &str) -> Option<String> {
+    if correlation_id.is_empty() || reporter.is_empty() {
         return None;
     }
-    // A report arriving = the dispatch is done, whether it was still `Pending` or
-    // had already timed out to `Exceeded` (idle nudge fired). Match BOTH so a LATE
-    // report on an Exceeded dispatch still deletes the sidecar.
-    //
-    // t-dispatchidle-clear-on-report: delete ALL sidecars with this
-    // `correlation_id`, not just the first. A re-dispatched task (the SAME task_id
-    // sent twice — e.g. an initial dispatch + a design re-confirm, both
-    // `task_id=t-…`) creates DUPLICATE sidecars via `record_dispatch`'s fresh
-    // `next_dispatch_id()`. The pre-fix `.find()` deleted only one duplicate; the
-    // survivor went `Exceeded` and nudged the delegate AFTER it had already
-    // reported (the clear-on-report noise). (`record_dispatch`'s new dedup stops
-    // NEW duplicates; this delete-all keeps the resolve correct regardless.)
     let mut first_deleted: Option<String> = None;
     for d in list_pending(home).into_iter().filter(|d| {
         matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
             && d.correlation_id.as_deref() == Some(correlation_id)
+            && d.target == reporter
     }) {
         // [M2] DELETE the sidecar (rather than flip to `Resolved` and leave the
         // file to accumulate — the pre-fix primary `pending-dispatches/` leak)
@@ -724,12 +713,18 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
 /// The sidecar stays live (future silence still fires), but the threshold
 /// clock restarts from now. Returns the refreshed dispatch_id, or `None`
 /// if no matching pending sidecar exists.
-pub(crate) fn refresh_issued_at(home: &Path, correlation_id: &str) -> Option<String> {
-    if correlation_id.is_empty() {
+pub(crate) fn refresh_issued_at(
+    home: &Path,
+    correlation_id: &str,
+    reporter: &str,
+) -> Option<String> {
+    if correlation_id.is_empty() || reporter.is_empty() {
         return None;
     }
     let matched = list_pending(home).into_iter().find(|d| {
-        d.status == DispatchStatus::Pending && d.correlation_id.as_deref() == Some(correlation_id)
+        d.status == DispatchStatus::Pending
+            && d.correlation_id.as_deref() == Some(correlation_id)
+            && d.target == reporter
     });
     let d = matched?;
     let id = d.dispatch_id.clone();
@@ -1097,7 +1092,7 @@ pub(crate) fn scan_and_emit(home: &Path) {
             // path below.
             if d.refresh_count < REFRESH_CAP {
                 if let Some(corr) = d.correlation_id.as_deref() {
-                    let _ = refresh_issued_at(home, corr);
+                    let _ = refresh_issued_at(home, corr, &d.target);
                 }
                 bump_refresh_count(home, &d.dispatch_id);
             } else if !d.long_running_escalated {
@@ -1641,7 +1636,7 @@ mod tests {
         // An unrelated sidecar that must survive.
         let other = write_pending_at(&home, "lead", "dev", Some("t-other"), "task", 600, now);
 
-        let resolved = mark_resolved(&home, "t-dup");
+        let resolved = mark_resolved(&home, "t-dup", "dev");
         assert!(resolved.is_some(), "must report a deletion");
 
         let pending = list_pending(&home);
@@ -2331,7 +2326,7 @@ mod tests {
         let now = chrono::Utc::now();
         let id_a = write_pending_at(&home, "lead", "dev-1", Some("t-aaa"), "task", 600, now);
         let id_b = write_pending_at(&home, "lead", "dev-2", Some("t-bbb"), "task", 600, now);
-        let resolved = mark_resolved(&home, "t-aaa");
+        let resolved = mark_resolved(&home, "t-aaa", "dev-1");
         assert_eq!(
             resolved.as_deref(),
             Some(id_a.as_str()),
@@ -2390,7 +2385,7 @@ mod tests {
         pd.status = DispatchStatus::Exceeded;
         std::fs::write(&path, serde_json::to_string_pretty(&pd).unwrap()).unwrap();
 
-        let resolved = mark_resolved(&home, "t-late");
+        let resolved = mark_resolved(&home, "t-late", "dev");
         assert_eq!(
             resolved.as_deref(),
             Some(id.as_str()),
@@ -2418,7 +2413,7 @@ mod tests {
             600,
             issued,
         );
-        let resolved = mark_resolved(&home, "t-suppress");
+        let resolved = mark_resolved(&home, "t-suppress", "beta");
         assert!(resolved.is_some(), "mark_resolved must locate sidecar");
         scan_and_emit(&home);
         let inbox = crate::inbox::drain(&home, "alpha");
@@ -3242,7 +3237,7 @@ mod tests {
         let issued = chrono::Utc::now() - chrono::Duration::seconds(550);
         write_pending_at(&home, "lead", "dev", Some("t-1047-a"), "task", 600, issued);
         // Dispatchee sends update → timer resets.
-        let refreshed = refresh_issued_at(&home, "t-1047-a");
+        let refreshed = refresh_issued_at(&home, "t-1047-a", "dev");
         assert!(refreshed.is_some(), "refresh must locate sidecar");
         // Now 600s hasn't elapsed from the refreshed issued_at.
         scan_and_emit(&home);
@@ -3285,7 +3280,7 @@ mod tests {
         let home = tmp_home("1047-report");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(550);
         write_pending_at(&home, "lead", "dev", Some("t-1047-c"), "task", 600, issued);
-        let resolved = mark_resolved(&home, "t-1047-c");
+        let resolved = mark_resolved(&home, "t-1047-c", "dev");
         assert!(resolved.is_some(), "report must resolve sidecar");
         let pending = list_pending(&home);
         assert!(

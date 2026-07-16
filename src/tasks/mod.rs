@@ -41,7 +41,7 @@ use std::path::Path;
 /// silently leak either store.
 pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, task_id);
-    crate::dispatch_tracking::mark_completed(home, Some(task_id), "");
+    crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
 
 pub use handler::handle;
