@@ -541,6 +541,8 @@ pub(crate) struct OpenPrSnapshot {
     open_branches: Option<std::collections::HashSet<String>>,
 }
 
+const OPEN_PR_SNAPSHOT_CAP: usize = 1000;
+
 impl OpenPrSnapshot {
     pub(crate) fn status_for(&self, branch: &str) -> OpenPrStatus {
         match &self.open_branches {
@@ -554,7 +556,7 @@ impl OpenPrSnapshot {
 /// Gather the repository's open-PR inventory once.  `headRefName` is the only
 /// field needed by the lifecycle gate; the explicit limit keeps this external
 /// call bounded even for a repository with a large review backlog.
-pub(crate) fn open_pr_snapshot(repo: &Path, base: &str) -> OpenPrSnapshot {
+pub(crate) fn open_pr_snapshot(repo: &Path, _base: &str) -> OpenPrSnapshot {
     let remote_url = match crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]) {
         Ok(url) => url,
         Err(crate::git_helpers::GitError::NonZero { stderr, .. })
@@ -573,8 +575,11 @@ pub(crate) fn open_pr_snapshot(repo: &Path, base: &str) -> OpenPrSnapshot {
         &gh_repo,
         &crate::scm::ListFilter {
             state: Some("open"),
-            base: Some(base.to_string()),
-            limit: Some(1000),
+            // Open PRs targeting any base protect the branch. Request one
+            // beyond the bounded inventory so truncation is distinguishable
+            // from a complete result and remains fail-closed.
+            base: None,
+            limit: Some((OPEN_PR_SNAPSHOT_CAP + 1) as u32),
             ..Default::default()
         },
         &["headRefName"],
@@ -582,6 +587,9 @@ pub(crate) fn open_pr_snapshot(repo: &Path, base: &str) -> OpenPrSnapshot {
     ) else {
         return OpenPrSnapshot::default();
     };
+    if prs.len() > OPEN_PR_SNAPSHOT_CAP {
+        return OpenPrSnapshot::default();
+    }
     let mut open_branches = std::collections::HashSet::new();
     for pr in prs {
         let Some(branch) = pr.head_ref else {
@@ -598,7 +606,7 @@ pub(crate) fn open_pr_snapshot(repo: &Path, base: &str) -> OpenPrSnapshot {
 
 /// Resolve whether `branch` still has an open PR. The lifecycle classifier
 /// owns the fail direction; this helper only gathers the SCM evidence.
-pub(crate) fn open_pr_status(repo: &Path, base: &str, branch: &str) -> OpenPrStatus {
+pub(crate) fn open_pr_status(repo: &Path, _base: &str, branch: &str) -> OpenPrStatus {
     let remote_url = match crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]) {
         Ok(url) => url,
         Err(crate::git_helpers::GitError::NonZero { stderr, .. })
@@ -621,7 +629,10 @@ pub(crate) fn open_pr_status(repo: &Path, base: &str, branch: &str) -> OpenPrSta
         &crate::scm::ListFilter {
             state: Some("open"),
             head: Some(branch.to_string()),
-            base: Some(base.to_string()),
+            // A branch remains protected by an open PR regardless of target
+            // base; do not narrow this apply-time probe to the repository's
+            // default branch.
+            base: None,
             ..Default::default()
         },
         &["number"],

@@ -746,18 +746,21 @@ pub(crate) fn branch_has_other_active_binding(
     let canonical_repo = std::fs::canonicalize(repo).ok()?;
     let bindings = binding_scan_all_strict(home).ok()?;
     for (_, binding) in bindings {
+        let bound_branch = binding["branch"]
+            .as_str()
+            .filter(|branch| !branch.is_empty())?;
+        let source = binding["source_repo"]
+            .as_str()
+            .filter(|source| !source.is_empty())?;
+        if excluded_worktree.is_some() && binding["worktree"].as_str().is_none_or(str::is_empty) {
+            return None;
+        }
         if excluded_worktree
             .zip(binding["worktree"].as_str())
             .is_some_and(|(excluded, bound)| excluded == bound)
         {
             continue;
         }
-        let Some(bound_branch) = binding["branch"].as_str() else {
-            continue;
-        };
-        let Some(source) = binding["source_repo"].as_str() else {
-            continue;
-        };
         let Ok(source) = std::fs::canonicalize(source) else {
             return None;
         };

@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+/// Read every binding with the identity fields required by destructive branch
+/// cleanup. A syntactically valid but incomplete binding is still ambiguous.
 pub(crate) fn binding_scan_all_strict(home: &Path) -> Result<Vec<(String, serde_json::Value)>, ()> {
     let runtime_dir = crate::paths::runtime_dir(home);
     let entries = match std::fs::read_dir(&runtime_dir) {
@@ -17,7 +19,18 @@ pub(crate) fn binding_scan_all_strict(home: &Path) -> Result<Vec<(String, serde_
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err(()),
         };
-        let value = serde_json::from_str(&content).map_err(|_| ())?;
+        let value: serde_json::Value = serde_json::from_str(&content).map_err(|_| ())?;
+        if value["branch"]
+            .as_str()
+            .filter(|branch| !branch.is_empty())
+            .is_none()
+            || value["source_repo"]
+                .as_str()
+                .filter(|source| !source.is_empty())
+                .is_none()
+        {
+            return Err(());
+        }
         bindings.push((agent_name, value));
     }
     Ok(bindings)
