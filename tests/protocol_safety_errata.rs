@@ -1,5 +1,8 @@
 use std::fs;
 
+const COMMS_HANDLER: &str = include_str!("../src/mcp/handlers/comms.rs");
+const DELEGATE_HANDLER: &str = include_str!("../src/mcp/handlers/comms_delegate/mod.rs");
+
 fn protocol() -> String {
     fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -57,7 +60,7 @@ fn protocol_post_merge_ci_is_pinned_to_the_merge_head() {
 }
 
 #[test]
-fn protocol_dispatch_distinguishes_routing_from_receipt() {
+fn protocol_dispatch_matches_the_per_path_response_contract() {
     let body = protocol();
 
     assert!(
@@ -65,8 +68,31 @@ fn protocol_dispatch_distinguishes_routing_from_receipt() {
         "protocol must not promise a message ID that send does not return"
     );
     assert!(
-        body.contains("`delivery_mode` is a routing outcome"),
-        "protocol must document the live delivery_mode response field"
+        COMMS_HANDLER.contains(r#"json!({"target": target, "delivery_mode": dm})"#),
+        "ordinary send must expose its routing mode"
+    );
+    assert!(
+        COMMS_HANDLER.contains("handle_delegate_task(home, &args, sender)"),
+        "request_kind=task must route through the task wrapper"
+    );
+    assert!(
+        DELEGATE_HANDLER.contains(r#"json!({"target": ctx.target})"#),
+        "the primary task wrapper response must not be mistaken for ordinary send"
+    );
+    for task_receipt_rule in [
+        "`delivery_mode` is optional routing metadata",
+        "primary task-dispatch wrapper may omit it",
+        "absence as normal",
+        "No message ID is returned",
+    ] {
+        assert!(
+            body.contains(task_receipt_rule),
+            "protocol must document the task-dispatch response boundary: {task_receipt_rule}"
+        );
+    }
+    assert!(
+        !body.contains("`delivery_mode` is a routing outcome"),
+        "protocol must not imply that every task dispatch returns delivery_mode"
     );
     assert!(
         body.contains("not proof that the receiver read, understood, or acknowledged"),
