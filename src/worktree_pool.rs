@@ -970,14 +970,16 @@ fn release_full_guarded(
         GuardedBinding::Known { .. } => return stale_release(),
     };
     let wt_path = current["worktree"].as_str().unwrap_or("");
-    let marker_path = Path::new(wt_path).join(MANAGED_MARKER);
-    if marker_path.exists() {
+    let wt_exists = !wt_path.is_empty() && Path::new(wt_path).exists();
+    if wt_exists {
+        let marker_path = Path::new(wt_path).join(MANAGED_MARKER);
         let marker_content = match std::fs::read_to_string(&marker_path) {
             Ok(c) => c,
             Err(_) => {
                 return ReleaseOutcome {
                     error: Some(
-                        "managed marker unreadable under lock — refusing (fail-closed)".into(),
+                        "managed marker absent or unreadable under lock — refusing (fail-closed)"
+                            .into(),
                     ),
                     ..ReleaseOutcome::default()
                 };
@@ -993,11 +995,12 @@ fn release_full_guarded(
         let mk_agent = mk_get("agent=");
         let mk_branch = mk_get("branch=");
         let mk_source = mk_get("source_repo=");
-        if mk_agent.is_empty() {
+        if mk_agent.is_empty() || mk_branch.is_empty() || mk_source.is_empty() {
             return ReleaseOutcome {
-                error: Some(
-                    "managed marker missing agent under lock — refusing (fail-closed)".into(),
-                ),
+                error: Some(format!(
+                    "managed marker has empty identity under lock (agent={mk_agent:?} \
+                     branch={mk_branch:?} source={mk_source:?}) — refusing (fail-closed)"
+                )),
                 ..ReleaseOutcome::default()
             };
         }
@@ -1010,7 +1013,7 @@ fn release_full_guarded(
             };
         }
         let bound_branch = current["branch"].as_str().unwrap_or("");
-        if !mk_branch.is_empty() && mk_branch != bound_branch {
+        if mk_branch != bound_branch {
             return ReleaseOutcome {
                 error: Some(format!(
                     "marker branch '{mk_branch}' does not match binding branch '{bound_branch}' — refusing"
@@ -1018,11 +1021,17 @@ fn release_full_guarded(
                 ..ReleaseOutcome::default()
             };
         }
-        let bound_source = current["source_repo"].as_str().unwrap_or("");
-        if !mk_source.is_empty() && !bound_source.is_empty() && mk_source != bound_source {
+        let bound_source = source_repo_from_binding(&current, Path::new(wt_path));
+        let mk_source_canonical =
+            std::fs::canonicalize(&mk_source).unwrap_or_else(|_| PathBuf::from(&mk_source));
+        let bound_source_canonical =
+            std::fs::canonicalize(&bound_source).unwrap_or_else(|_| bound_source.clone());
+        if mk_source_canonical != bound_source_canonical {
             return ReleaseOutcome {
                 error: Some(format!(
-                    "marker source_repo '{mk_source}' does not match binding source_repo '{bound_source}' — refusing"
+                    "marker source_repo '{}' does not match binding source_repo '{}' — refusing",
+                    mk_source,
+                    bound_source.display()
                 )),
                 ..ReleaseOutcome::default()
             };

@@ -3444,3 +3444,73 @@ fn repo_release_marker_rewritten_after_snapshot_refuses() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Marker DELETED after pre-read — under-lock re-read must refuse.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_deleted_after_snapshot_refuses() {
+    use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
+
+    let (base, home, repo, wt) = managed_wt_fixture("del");
+    seed_managed_marker(&wt, &repo, &home, "agent-del", "feat/test");
+
+    let wt_clone = wt.clone();
+    let _guard = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::AfterBindingSnapshot {
+            let _ = std::fs::remove_file(wt_clone.join(".agend-managed"));
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "agent-del", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "marker deleted after snapshot must be caught under lock: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is deleted"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-del").is_some(),
+        "binding must be preserved when marker is deleted"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker rewritten with BLANK branch/source after pre-read — must refuse.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_blanked_after_snapshot_refuses() {
+    use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
+
+    let (base, home, repo, wt) = managed_wt_fixture("blank");
+    seed_managed_marker(&wt, &repo, &home, "agent-blank", "feat/test");
+
+    let wt_clone = wt.clone();
+    let _guard = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::AfterBindingSnapshot {
+            std::fs::write(
+                wt_clone.join(".agend-managed"),
+                "agent=agent-blank\nbranch=\nsource_repo=\n",
+            )
+            .expect("blank marker in seam");
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "agent-blank", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "blanked marker after snapshot must be caught under lock: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is blanked"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-blank").is_some(),
+        "binding must be preserved when marker is blanked"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
