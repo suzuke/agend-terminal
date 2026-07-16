@@ -168,7 +168,7 @@
 
 ### `usage_limit_takeover`
 Architecture-14 item 5 Slice 2A 的 operator-only PREPARE 介面。驗證持久化的 `CandidateReady` episode 並寫入單一 durable `Prepared` journal；不執行 takeover，也不修改 source binding、task 或 process。
-- **source**: 要準備其 usage-limit episode 的 source instance
+- **instance**: 要準備其 usage-limit episode 的 source instance
 - **episode_id**: 持久化 episode 的精確 id；candidate 從 `CandidateReady` 推導，呼叫端不可自行提供
 
 ## Daemon 操作（Daemon Operations）

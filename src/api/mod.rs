@@ -1514,7 +1514,7 @@ mod tests {
                             "tool": "usage_limit_takeover",
                             "instance": instance,
                             "arguments": {
-                                "source": "worker-a",
+                                "instance": "worker-a",
                                 "episode_id": "forged"
                             }
                         }
@@ -1547,7 +1547,7 @@ mod tests {
                     "tool": "usage_limit_takeover",
                     "instance": "",
                     "arguments": {
-                        "source": "worker-a",
+                        "instance": "worker-a",
                         "episode_id": "forged"
                     }
                 }

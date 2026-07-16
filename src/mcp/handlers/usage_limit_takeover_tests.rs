@@ -190,7 +190,7 @@ fn usage_limit_takeover_prepares_through_real_mcp_entry() {
     let f = fixture("success");
     let result = call(
         &f,
-        json!({"source": "worker-a", "episode_id": f.episode_id}),
+        json!({"instance": "worker-a", "episode_id": f.episode_id}),
     );
     assert_eq!(result["phase"], "Prepared", "unexpected result: {result}");
     assert_eq!(result["candidate"], "worker-b");
@@ -200,7 +200,7 @@ fn usage_limit_takeover_prepares_through_real_mcp_entry() {
 #[serial]
 fn usage_limit_takeover_repeat_is_idempotent() {
     let f = fixture("repeat");
-    let args = json!({"source": "worker-a", "episode_id": f.episode_id});
+    let args = json!({"instance": "worker-a", "episode_id": f.episode_id});
     let first = call(&f, args.clone());
     let second = call(&f, args);
     assert_eq!(first["phase"], "Prepared", "first: {first}");
@@ -212,7 +212,7 @@ fn usage_limit_takeover_repeat_is_idempotent() {
 #[serial]
 fn usage_limit_takeover_concurrent_barrier_requests_converge_one_prepared_identity() {
     let f = fixture("concurrency-barrier");
-    let args = json!({"source": "worker-a", "episode_id": f.episode_id});
+    let args = json!({"instance": "worker-a", "episode_id": f.episode_id});
     let barrier = Arc::new(Barrier::new(2));
     let mut threads = Vec::new();
     for _ in 0..2 {
@@ -253,7 +253,7 @@ fn usage_limit_takeover_concurrent_barrier_requests_converge_one_prepared_identi
 #[serial]
 fn usage_limit_takeover_conflicting_existing_journal_fails_closed() {
     let f = fixture("conflict");
-    let args = json!({"source": "worker-a", "episode_id": f.episode_id});
+    let args = json!({"instance": "worker-a", "episode_id": f.episode_id});
     let first = call(&f, args.clone());
     assert_eq!(first["phase"], "Prepared", "first: {first}");
     let journal = crate::paths::runtime_dir(&f.home).join("worker-a/usage_limit_takeover.json");
@@ -280,7 +280,7 @@ fn usage_limit_takeover_refuses_dirty_source_without_journal() {
     std::fs::write(f.worktree.join("tracked.txt"), "dirty\n").expect("dirty");
     let result = call(
         &f,
-        json!({"source": "worker-a", "episode_id": f.episode_id}),
+        json!({"instance": "worker-a", "episode_id": f.episode_id}),
     );
     assert_eq!(code(&result), "source_dirty", "unexpected result: {result}");
     assert!(!crate::paths::runtime_dir(&f.home)
@@ -304,7 +304,7 @@ fn usage_limit_takeover_refuses_generation_mismatch() {
     .expect("binding");
     let result = call(
         &f,
-        json!({"source": "worker-a", "episode_id": f.episode_id}),
+        json!({"instance": "worker-a", "episode_id": f.episode_id}),
     );
     assert_eq!(
         code(&result),
@@ -329,7 +329,7 @@ fn usage_limit_takeover_refuses_candidate_mismatch() {
     .expect("episode");
     let result = call(
         &f,
-        json!({"source": "worker-a", "episode_id": f.episode_id}),
+        json!({"instance": "worker-a", "episode_id": f.episode_id}),
     );
     assert_eq!(
         code(&result),
@@ -351,7 +351,7 @@ fn usage_limit_takeover_refuses_currently_ineligible_candidate() {
     drop(registry);
     let result = call(
         &f,
-        json!({"source": "worker-a", "episode_id": f.episode_id}),
+        json!({"instance": "worker-a", "episode_id": f.episode_id}),
     );
     assert_eq!(
         code(&result),
@@ -368,7 +368,7 @@ fn usage_limit_takeover_refuses_journal_write_failure_without_partial() {
     std::fs::create_dir_all(&journal).expect("journal collision");
     let result = call(
         &f,
-        json!({"source": "worker-a", "episode_id": f.episode_id}),
+        json!({"instance": "worker-a", "episode_id": f.episode_id}),
     );
     assert_eq!(
         code(&result),
@@ -384,7 +384,7 @@ fn usage_limit_takeover_is_operator_only() {
     let f = fixture("operator-only");
     let result = execute_tool_with_runtime(
         "usage_limit_takeover",
-        &json!({"source": "worker-a", "episode_id": f.episode_id}),
+        &json!({"instance": "worker-a", "episode_id": f.episode_id}),
         "worker-a",
         f.runtime.clone(),
     );

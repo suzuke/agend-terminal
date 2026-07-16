@@ -168,7 +168,7 @@ Revoke a specific reviewer assignment by exact `assignment_id`. Authorization: t
 
 ### `usage_limit_takeover`
 Architecture-14 item 5 Slice 2A operator-only PREPARE seam. Validates the persisted `CandidateReady` episode and writes one durable `Prepared` journal; it does not execute takeover or mutate the source binding/task/process.
-- **source**: source instance whose persisted usage-limit episode is being prepared
+- **instance**: source instance whose persisted usage-limit episode is being prepared
 - **episode_id**: exact persisted episode id; the candidate is derived from `CandidateReady` and cannot be supplied by the caller
 
 ## Daemon Operations

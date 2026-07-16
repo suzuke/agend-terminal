@@ -807,7 +807,7 @@ mod tests {
             let params = json!({
                 "tool": "usage_limit_takeover",
                 "instance": instance,
-                "arguments": {"source": "worker-a", "episode_id": "forged"}
+                "arguments": {"instance": "worker-a", "episode_id": "forged"}
             });
             assert!(
                 !capability_allows_request(P::Agent, method::MCP_TOOL, &params),

@@ -371,8 +371,8 @@ pub(crate) fn handle_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
             "usage_limit_takeover requires daemon runtime",
         );
     };
-    let Some(source) = ctx.args.get("source").and_then(Value::as_str) else {
-        return refusal("missing_source", "source is required");
+    let Some(source) = ctx.args.get("instance").and_then(Value::as_str) else {
+        return refusal("missing_instance", "instance is required");
     };
     let Some(episode_id) = ctx.args.get("episode_id").and_then(Value::as_str) else {
         return refusal("missing_episode_id", "episode_id is required");
@@ -380,7 +380,7 @@ pub(crate) fn handle_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
     if source.is_empty() || episode_id.is_empty() {
         return refusal(
             "invalid_argument",
-            "source and episode_id must be non-empty",
+            "instance and episode_id must be non-empty",
         );
     }
     let _lock = match acquire_binding_lock(ctx.home, source) {

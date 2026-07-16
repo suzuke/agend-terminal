@@ -433,9 +433,9 @@ pub(crate) fn def_revoke_review_assignment() -> Value {
 pub(crate) fn def_usage_limit_takeover() -> Value {
     json!({"name": "usage_limit_takeover", "description": "Operator-only Architecture-14 item 5 Slice 2A seam. Validate a persisted CandidateReady usage-limit episode and durably PREPARE, without executing takeover or changing the source binding/task/process.",
         "inputSchema": {"type": "object", "properties": {
-            "source": {"type": "string", "description": "Source instance whose persisted usage-limit episode is being prepared."},
+            "instance": {"type": "string", "description": "Source instance whose persisted usage-limit episode is being prepared."},
             "episode_id": {"type": "string", "description": "Exact persisted usage-limit episode id; candidate is derived from CandidateReady and cannot be supplied by the caller."}
-        }, "required": ["source", "episode_id"]}})
+        }, "required": ["instance", "episode_id"]}})
 }
 
 #[cfg(test)]
@@ -1199,7 +1199,7 @@ mod tests {
             // ── revoke_review_assignment (#2782 slice 1) ──
             ("revoke_review_assignment", "assignment_id", "mcp/handlers/comms_delegate/review_assignment.rs handle_revoke_review_assignment — lookup_by_assignment_id_strict + retire_if_id_matches CAS target"),
             // ── usage_limit_takeover (Architecture-14 item 5 Slice 2A) ──
-            ("usage_limit_takeover", "source", "mcp/handlers/usage_limit_takeover.rs source-scoped lock and persisted binding validation"),
+            ("usage_limit_takeover", "instance", "mcp/handlers/usage_limit_takeover.rs source-scoped lock and persisted binding validation"),
             ("usage_limit_takeover", "episode_id", "mcp/handlers/usage_limit_takeover.rs persisted CandidateReady episode identity validation"),
         ];
 
