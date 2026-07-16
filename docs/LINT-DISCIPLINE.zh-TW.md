@@ -5,7 +5,9 @@
 **目的**：在 push 之前抓出那些反覆出現、在 Sprint 56–57 消耗了大量 fix-forward
 循環的跨平台 lint 問題，讓 CI matrix 的工作是「驗證」而不是「發現」。
 
-**搭配工具**：`scripts/clippy-all-platforms.sh`。本文件記錄的是這支腳本想要
+**主要 preflight**：`scripts/preflight.sh`。完整模式會跑與 CI 對齊的 owned
+fmt/clippy/test surface，再加上 Windows cross-check。若只針對 cfg-gated lint
+快速迭代，仍可使用較窄的 `scripts/clippy-all-platforms.sh`。本文件記錄這些腳本想要
 揭露的*模式*。只跑腳本而沒有內化這些模式，會讓你對腳本偵測不到的失敗
 模式視而不見（因為那些問題發生在 link/runtime 階段，而不是 lint 階段）。
 
@@ -16,8 +18,8 @@
 每次 push 牽涉到平台相關的程式碼之前都要執行：
 
 ```bash
-scripts/clippy-all-platforms.sh           # full matrix
-scripts/clippy-all-platforms.sh --quick   # host only (fast iteration)
+scripts/preflight.sh           # fmt + owned clippy + tests + Windows cross-check
+scripts/preflight.sh --quick   # 略過 Windows cross-check
 ```
 
 如果腳本回報某個 target `failed`，**先在本機修好**，不要倚賴 CI 去發現。
@@ -55,7 +57,7 @@ template 的測試 helper 以 `cfg(unix)` 設限，在 Windows runner 上 clippy
 ### 2. fire-and-forget spawn 理由
 
 **症狀**：clippy 不會直接強制這一點——但專案的 **Phase 5b invariant test**
-（`tests/spawn_rationale_invariant.rs`）會。每一處 `tokio::spawn` 和
+（`tests/spawn_rationale_audit.rs`）會。每一處 `tokio::spawn` 和
 `thread::spawn` 都必須帶有以下其中一項：
 
 - 在呼叫端加上 `// fire-and-forget: <reason>` 註解，或
@@ -66,15 +68,14 @@ task 完成（例如「logging is best-effort」、「background cache warmer，
 shutdown 透過 global cancellation token 等待」）。
 
 ```rust
+// fire-and-forget: telemetry is best-effort; daemon shutdown happens via the
+// global cancellation token observed inside the future, so no join is needed.
 tokio::spawn(async move {
-    // fire-and-forget: telemetry is best-effort; daemon shutdown
-    // happens via the global cancellation token observed inside the
-    // future, no join needed.
     emit_telemetry(...).await;
 });
 ```
 
-**參考**：`FLEET-DEV-PROTOCOL.md` §10.5。測試是豁免的（測試 helper
+**參考**：`FLEET-DEV-PROTOCOL.md` §12.5。測試是豁免的（測試 helper
 可以臨時 spawn）；trait method 沿用呼叫端的理由。
 
 ---
@@ -176,14 +177,12 @@ cfg-gated 區塊裡的型別錯誤）。它**不會**抓到：
 預期的工作流程是：
 
 1. 編輯程式碼。
-2. `cargo clippy --features tray --bin agend-terminal --tests -- -D warnings`
-   （僅 host，快速）。
-3. **`scripts/clippy-all-platforms.sh`** —— 抓出模式 1、4、5、6。
-4. `cargo test --features tray`（僅 host，快速）。
-5. `git push` → CI matrix 在全部 3 個平台上驗證 link + runtime。
-6. CI 綠燈 → merge。
+2. **`scripts/preflight.sh`**——執行 owned fmt/clippy/tests 與 Windows cross-check。
+3. 只有在專注迭代 cfg lint 時，才額外使用 `scripts/clippy-all-platforms.sh`。
+4. `git push` → CI matrix 在全部 3 個平台上驗證 link + runtime。
+5. CI 綠燈 → merge。
 
-如果你跳過第 3 步，模式 1、4、5、6 可能讓你陷入 fix-forward 循環——每個
+如果你跳過 preflight，模式 1、4、5、6 可能讓你陷入 fix-forward 循環——每個
 平台的每次循環都要耗費約 10–15 分鐘的牆鐘時間。本機腳本只要約 30 秒。
 
 ---

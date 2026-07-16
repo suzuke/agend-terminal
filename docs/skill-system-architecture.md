@@ -1,5 +1,10 @@
 # Skill System Architecture Report
 
+> **HISTORICAL SNAPSHOT — do not use as the current operator reference.** This
+> report describes commit `1598632` as of 2026-05-23, including the then-current
+> Gemini paths and source layout. For the live six-backend contract, see
+> [SKILLS.md](SKILLS.md) and [FEATURE-skills.md](FEATURE-skills.md).
+
 **Author**: fixup-dev  
 **Date**: 2026-05-23  
 **Codebase**: `agend-terminal` @ `1598632` (post-#1081 merge)  

@@ -1,5 +1,9 @@
 # Shadow Observer — Quantification (#2413 Phase D, agy)
 
+> **Historical measurement snapshot:** Results below describe a bounded soak at
+> the recorded revision. They are evidence, not a guarantee of current backend
+> behavior; repeat the measurement before using the numbers operationally.
+
 **Question:** does agy's Hook plane (turn-granular, `.agents/hooks.json`, Phase D
 #2448) make the fused `ObservedStatus` measurably cleaner than raw screen-scrape
 for agy agents — the agy analogue of `docs/archived/SHADOW-OBSERVER-QUANT-2413.md`

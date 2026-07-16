@@ -1,5 +1,9 @@
 # #1967 Phase-1 — Cross-backend ephemeral worker (architecture + build order)
 
+> **Historical staged design:** Phase 1 subsequently shipped, but this build-order
+> document remains a point-in-time design record. Current behavior is defined by
+> the source, tests, and current feature documentation.
+
 Status: spike VET PASS (2026-06-21). Design doc for the staged implementation.
 Scope of THIS epic = **Phase 1** only (ephemeral spawn/reap + telemetry sidecar +
 cost control). Phase 2 (declarative DAG engine) / Phase 3 (dynamic generation) stay

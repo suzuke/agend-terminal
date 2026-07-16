@@ -30,8 +30,8 @@ foundation for sweep, health, and dependency evaluation.
 ## 2. Files and Modules
 
 - `src/task_events.rs` — event format definition and replay logic.
-- `src/tasks.rs` — MCP board surface and legacy data bridging.
-- `src/mcp/handlers/task.rs` — thin MCP handler that delegates to `tasks.rs`.
+- `src/tasks/mod.rs` — board surface and legacy data bridging.
+- `src/mcp/handlers/task.rs` — thin MCP handler that delegates to the `tasks` module.
 - `task_events.jsonl` — canonical event log.
 - `task_events_archive/` — historical archive directory.
 - `tasks.json` — legacy bridge file (read-only during migration).
@@ -66,9 +66,11 @@ foundation for sweep, health, and dependency evaluation.
 
 | Status | Meaning |
 |--------|---------|
+| `backlog` | Recorded but not yet actionable |
 | `open` | Awaiting claim |
 | `claimed` | Someone has taken ownership |
 | `in_progress` | Execution has started |
+| `in_review` | Implementation is awaiting review |
 | `verified` | Reviewer approved |
 | `done` | Completed |
 | `cancelled` | Cancelled |
@@ -87,17 +89,21 @@ foundation for sweep, health, and dependency evaluation.
 
 ## 5. `task action=create`
 
-- `title` is required; `description`, `priority`, `assignee`, `depends_on`, `due_at`, `duration`, `branch`, `bind`, `eta_secs` are optional.
+- `title` is required; `description`, `priority`, `assignee`, `depends_on`, `parent_id`, `due_at`, `branch`, `bind`, `eta_secs`, `tags`, `project`, `plan_ack_required`, `plan_ack_reason`, and `review_class` are optional.
 - Default priority is `normal`.
-- `due_at` accepts RFC 3339; `duration` accepts `30m`, `1h`, `2d` shorthand.
+- `due_at` accepts RFC 3339. The MCP action does not accept duration shorthand.
+- `project` selects the project board; otherwise the caller's current project is used. A child named by `parent_id` must be created on its parent's project board.
+- `review_class` stores the durable `single`/`dual` review threshold for PR-producing work.
 - Appends a `Created` event and returns `event=created`.
 - Does not auto-claim, auto-start, or auto-complete.
 
 ## 6. `task action=list`
 
-- Default view shows only actionable tasks: open, claimed, in_progress, blocked.
+- Default view shows only actionable tasks: backlog, open, claimed, in_progress, in_review, blocked.
 - `include_history=true` includes completed items.
-- `filter_status` and `filter_assignee` narrow the results.
+- `filter_status`, `filter_assignee`, and `filter_tag` narrow the results; `status`, `assignee`, and `tag` are accepted aliases.
+- `project=all` or `scope=fleet` aggregates every project board; otherwise the caller's current board is used.
+- `verbose=true` keeps full free text, while the default may truncate long descriptions/results. `fields=minimal` returns only id/title/status/assignee/priority.
 - `limit` truncates by `updated_at` (newest first).
 - Items completed more than 14 days ago are trimmed from the default view.
 - `filtered_default` in the response indicates whether default trimming was applied.
@@ -114,7 +120,8 @@ foundation for sweep, health, and dependency evaluation.
 
 ## 8. `task action=done`
 
-- Requires `id`; optional `result` and `done_source`.
+- Requires `id` (or the `task_id` alias); `result` is optional.
+- `done_source` is a provenance object. Ordinary callers may attest only `OperatorManual`; daemon system identities alone may persist forensic variants such as PR-merge observations.
 - Uses the task owner as `by` (falls back to caller if no owner).
 - `force=true` enables ghost-owner cleanup and requires `force_reason`.
 - Force mode records an audit entry in the event log.
@@ -123,7 +130,7 @@ foundation for sweep, health, and dependency evaluation.
 
 ## 9. `task action=update`
 
-- Requires `id`; can change `status`, `priority`, `assignee`.
+- Requires `id` (or `task_id`); can change `status`, `priority`, `assignee`, and `tags`.
 - Status transitions map to canonical events:
   - open → claimed: `Claimed`
   - open → in_progress: `InProgress`
@@ -136,6 +143,13 @@ foundation for sweep, health, and dependency evaluation.
 - Multiple changes can be batched in a single `append_batch` for atomic persistence.
 - ACL rules match those of `done` (owner / orchestrator).
 - `status: in_progress` additionally passes through the plan-ack gate (§10) when the task was created with `plan_ack_required > 0`.
+
+### Other task actions
+
+- `get` returns one task's full record by `id`/`task_id`.
+- `activity` returns the task's event history.
+- `metadata_set` and `metadata_get` write/read a named metadata value; mutation follows the task ACL.
+- `ack_plan` records an idempotent non-assignee acknowledgement used by the plan-ack gate.
 
 ## 10. Plan-Ack Gate (`#2249`)
 
@@ -218,4 +232,4 @@ An opt-in pre-work alignment gate: require outside acks on a task's plan before 
 
 ## 18. Summary
 
-The task board is the fleet's shared work protocol. Its semantics are maintained through events, not a single mutable file. The primary surface is `task create/list/claim/done/update/sweep/health`, plus the opt-in `ack_plan` pre-work alignment gate (§10). Default listing is actionable-only. Dependencies are evaluated at the view layer. ACL is owner / orchestrator / system identity. Batch append and strict replay are the two most important invariants. When something looks wrong, check the event log before touching the view.
+The task board is the fleet's shared work protocol. Its semantics are maintained through events, not a single mutable file. The primary surface is `task create/list/get/claim/done/update/sweep/health/activity/metadata_set/metadata_get`, plus the opt-in `ack_plan` pre-work alignment gate (§10). Default listing is actionable-only. Dependencies are evaluated at the view layer. ACL is owner / orchestrator / system identity. Batch append and strict replay are the two most important invariants. When something looks wrong, check the event log before touching the view.

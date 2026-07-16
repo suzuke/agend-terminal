@@ -5,6 +5,8 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.10.0] — 2026-07-07
 
 311 commits since 0.9.0. Highlights, organized by theme (not an exhaustive commit list).
@@ -26,7 +28,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Changed
 
-- **MCP tool-surface consolidation (#2548)** — a multi-wave reduction of the MCP surface: dead tools removed (#2554); `replace_instance` retired into `restart_instance mode=fresh` (#2556); `set_display_name` / `set_description` merged into `set_metadata` (#2557); five tools moved to the CLI with a narrowed config (#2560); and `mode` folded into `list_instances` while `force_release_worktree` merged into `release_worktree(force:true)` (#2561) — taking the advertised surface to 37 tools.
+- **MCP tool-surface consolidation (#2548)** — a multi-wave reduction of the MCP surface: dead tools removed (#2554); `replace_instance` retired into `restart_instance mode=fresh` (#2556); `set_display_name` / `set_description` merged into `set_metadata` (#2557); five tools moved to the CLI with a narrowed config (#2560); and `mode` folded into `list_instances` while `force_release_worktree` merged into `release_worktree(force:true)` (#2561) — taking the advertised surface to 29 tools at the v0.10.0 tag.
 - **Notification-watchdog handler consolidation (#2549)** — poll-reminder + inbox-stuck + handoff-timeout merged into one handler (#2572), context-alert + context-handoff into `ContextThresholdsHandler` (#2577), and the four GC tick handlers folded into one `HourlyGcHandler` with per-sweep (not per-handler) panic isolation (#2568); `ProgressBackstop` / `Mirror` retired, cutting the handler count 40 → 37 (#2571).
 - **Binding / GC / agend-git convergence (#2550)** — a wide consolidation pass unifies `binding.json` path construction, scan-all reads, and `bind_self` read-back onto shared helpers (#2583–#2585); folds GC into a single fire-on-first driver (#2599, #2605); converges `cleanup_merged_branch`'s delete gate onto `is_squash_gc_eligible` (#2597); and extracts the `agend-git` classify predicate with protected-refs convergence (#2580).
 - **agend-git policy engine (#2379)** — git operations are classified deny / warn / info with conflicts routed to `fleet_events` (#2462), a fail-closed protected-ref push deny with a `policy.toml` override (#2468), and a push-shim deny for writes of `$AGEND_HOME` config/audit blobs (#2390).
@@ -645,6 +647,7 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...HEAD
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...v0.8.0

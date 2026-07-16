@@ -1,6 +1,19 @@
 # Hung-State Transition Audit
 
-Source-of-truth (primary) for `HealthState::Hung` and `HealthState::IdleLong`
+> **CURRENT-STATUS NOTE (`main@1d83b423`, 2026-07-16).** This file preserves
+> the #685 Phase-1 transition audit and its stable section anchors. The live
+> source is authoritative: state tracking moved from `src/state.rs` to
+> `src/state/mod.rs` + `src/state/patterns.rs` / `src/backend_profile.rs`;
+> Gemini is retired (Agy is its successor, and Grok is now supported); and the
+> old "warn only, no recovery consumer" conclusion is superseded. Current
+> `check_hang` wiring is in
+> `src/daemon/per_tick/hang_detection.rs`, followed in the same canonical
+> handler pipeline by the Stage-1-only recovery dispatcher. Dispatcher Stages
+> 2/3 were removed in #2549; see [RECOVERY-STAGES.md](RECOVERY-STAGES.md).
+> Historical Gemini patterns and hypotheses below remain provenance, not
+> guidance for current backend tuning.
+
+Contract baseline for `HealthState::Hung` and `HealthState::IdleLong`
 transition semantics in `src/health.rs`. Companion to inline structured
 comments at each mutation site and the `check_hang` function-level rustdoc.
 
@@ -468,18 +481,23 @@ reset mechanic.
 
 ## Consumer audit
 
-Per §Invariants 5c, the entire programmatic surface for Hung detection
-is:
+At the original `2f24376` audit baseline, §Invariants 5c recorded the surface
+below. Current consumers are listed first so the historical conclusion cannot
+be mistaken for live behavior:
 
-- **`check_hang -> bool`** — sole consumer at `rg "check_hang" src/daemon/mod.rs`,
-  a `tracing::warn!("hang detected")` with no automated recovery
-  action. (#685's headline finding; Phase 2 builds recovery here.)
-- **`health.state.display_name()` string** — serialized into JSON via
-  `rg "health_state" src/api/handlers/query.rs` and consumed as opaque
-  string in `rg "health_state" src/mcp/handlers/instance.rs`. No
-  pattern match on the enum variant.
+- **Current transition consumer**: `HangDetectionHandler::run` calls
+  `check_hang` and logs the transition; for qualifying self-orchestrators it
+  also persists Hung-entry/exit escalation anchors
+  (`src/daemon/per_tick/hang_detection.rs`).
+- **Current state consumer**: `RecoveryDispatcherHandler::run` reads
+  `core.health.state == Hung` on the same and later ticks. It can issue the
+  Stage-1 ESC only when `AGEND_AUTO_RECOVERY_STAGE1=1`; default shadow mode
+  logs the decision without PTY I/O. `RespawnWatchdogHandler` owns a separate
+  resume-spawn failure path and can enter `Paused`.
+- **Display projection**: `health.state.display_name()` is serialized for API,
+  MCP, snapshot, and UI consumers. Treat the string as a projection, not a
+  mutation authority.
 
-`grep -r "HealthState::Hung" src/ --include="*.rs"` outside `src/health.rs`
-and test code returns zero hits at HEAD `2f24376`. Phase 2 recovery work
-will add new consumers; this section is forward-locked as the
-"pre-recovery" baseline.
+The old grep result (zero `HealthState::Hung` consumers outside
+`src/health.rs` at `2f24376`) is retained only as the **pre-recovery baseline**;
+it is expected to be false on current source.

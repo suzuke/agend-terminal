@@ -64,18 +64,23 @@ lead agent 做出一個架構選擇，例如決定用 worktree 而不是直接 c
 | 參數 | 類型 | 必要 | 說明 |
 |------|------|------|------|
 | `title` | string | 是 | 決策標題 |
-| `content` | string | 是 | 決策內容和理由 |
-| `scope` | string | 是 | `"project"`（專案級）或 `"fleet"`（團隊級） |
+| `content` | string | 是 | 決策內容和理由（也接受 `text` alias） |
+| `scope` | string | 否 | `"project"`（預設）或 `"fleet"` |
 | `tags` | string[] | 否 | 分類標籤 |
 | `ttl_days` | number | 否 | 自動過期天數（預設 90 天） |
 | `supersedes` | string | 否 | 被取代的決策 ID |
+| `needs_answer` | bool | 否 | 建立 pending question，而非一般記錄 |
+| `options` | string[] 或 object[] | 否 | 建議答案；object 格式為 `{label, recommended}` |
+| `allow_free_text` | bool | 否 | 是否接受選項以外的答案（預設 false） |
+| `timeout_secs` | integer | 否 | pending question 經過指定秒數後自動回答 |
+| `timeout_default` | string | 條件式 | 設定 `timeout_secs` 時必填，除非可從 recommended option 推導 |
 
 回應包含自動產生的決策 ID：
 
 ```json
 {
   "id": "d-20260525040000000000-1",
-  "status": "created"
+  "status": "posted"
 }
 ```
 
@@ -103,6 +108,10 @@ lead agent 做出一個架構選擇，例如決定用 worktree 而不是直接 c
 | `archive` | bool | 否 | 設為 true 手動封存 |
 
 修改權限：只有原作者或其所屬團隊的 orchestrator 可以修改。
+
+### answer — 回答 pending question
+
+需要 `id` 與 `answer`。Question author 不能自問自答；由 operator 或另一個具名 caller 記錄答案。若 `allow_free_text=false` 且有 options，`answer` 必須精確符合其中一個 option label。第一個通過驗證的答案會在 decision lock 下勝出，daemon 並通知原作者。
 
 ---
 
@@ -420,7 +429,7 @@ Agent 可以在 `reply` 中設定自動決策：
 
 - `src/decisions.rs`：儲存與查詢實作
 - `src/store.rs`：共用的 JSON 持久化輔助工具
-- `src/mcp/handlers/decision.rs`：MCP handler 介面
+- `src/mcp/handlers/dispatch.rs`：MCP action adapter 與 handler routing
 - `src/mcp/tools.rs`：tool 註冊
 
 ---

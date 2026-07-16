@@ -1,5 +1,9 @@
 # Typed review-receipt cutover
 
+> **Historical cutover runbook:** This procedure documents a one-time migration
+> boundary and is retained for audit history. It is not the current reviewer
+> contract; use `FLEET-DEV-PROTOCOL.md` and current source for live rules.
+
 Task66 is a containment boundary, not the task68 append-only verdict ledger.
 After this release, only a server-validated `code_review` report tied to an
 exact active assignment can affect PR state, review bridging, auto-release, or

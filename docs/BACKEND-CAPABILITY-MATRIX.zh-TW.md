@@ -6,37 +6,53 @@
 
 **紀律**：本文每一格結論，要嘛有 `path:line` 程式碼依據（本 repo，`main` branch），要嘛明確標示**未查證**。沒有任何一格是用猜的。查不到依據的地方就老實寫出來——誠實的空白比一個聽起來合理但編造出來的結論更有價值。
 
+**重新核實**：`main@1d83b423`（2026-07-16）。`Backend::all()` 有六個
+first-class backend：ClaudeCode、KiroCli、Codex、OpenCode、Agy、Grok。
+Gemini 已退役；Shell 與 `Raw(String)` 仍是 `Backend::all()` 之外的 utility
+variant。
+
 ## 與 #2413 的分界
 
 本文檔記錄的是**現況**——每個 backend 今天在 production 裡實際依賴的 state 偵測訊號。這是一張快照，不是一份計畫。
+
+目前刻意並存兩種 view：`core.state.current` 永遠是 raw screen-heuristic
+baseline；default-on Shadow Observer 則可透過 `shadow::operated_state`，把高信心
+Hook/Stream 修正套到 `snapshot.json` 與選定的 dispatch decider。health/recovery
+路徑保留 raw view。下表若同時列兩種訊號，不代表 hook 會改寫
+`core.state.current`。
 
 [#2413](https://github.com/suzuke/agend-terminal/issues/2413)（「Out-of-path API-activity probe to fix false-idle blind spot in pattern-based agent_state」）才是**改善未來的 roadmap**：這是一項持續進行中的實證研究（Shadow Observer，見 `docs/SHADOW-OBSERVER-QUANT-AGY-2413.md` 及其 claude/codex 對照版本，位於 `docs/archived/` 下），目的是逐 backend 量測「除了原始 PTY pattern 比對之外，加上更多 structured 訊號能不能補上 false-idle 的盲點」。當本文說某個 backend 是「PTY heuristic」時，#2413 那邊的工作可能正在量化評估該 backend 能不能升級——本文不涉及那份 roadmap 或其研究結論，只記錄今天的實況。想了解那份改善工作目前進度如何，請直接讀 #2413 本身的文檔。
 
 ## 訊號權威性階梯（參考用）
 
-`src/daemon/shadow/evidence.rs:65-90` 把訊號權威性由高到低排列：**Hook**（`Confirmed` confidence）→ **Stream**（session log tail，例如 Kiro 的 jsonl）→ **Screen**（PTY pattern match）→ **ProcessHeuristic** → **Inferred**。下面各 backend 的小節說明的是它今天在 `agent_state` 上實際站在哪一階——不是它理論上能爬到哪一階。
+`src/daemon/shadow/evidence.rs` 把訊號權威性由高到低排列：**Hook**（`Confirmed` confidence）→ **Stream**（session log tail，例如 Kiro 的 jsonl）→ **Screen**（PTY pattern match）→ **ProcessHeuristic** → **Inferred**。下面各 backend 小節會區分 raw baseline 與今天真正接線的較高 authority observed correction。
 
 ## 總覽
 
 | Backend | Agent-state 訊號 | Context usage | Submit / inject | Resume | MCP | 脆弱點摘要 |
 |---|---|---|---|---|---|---|
-| **ClaudeCode** | Hook，`Confirmed` authority——唯一站上階梯頂端的 backend | StatusLine（僅限 fleet 自訂格式） | Bulk，`submit_key="\r"` | `--continue`，有 on-disk session 檢查把關 | 有——明確的 `--mcp-config` flag | 覆蓋最完整的 backend；但仍綁定特定 Claude Code 版本 |
+| **ClaudeCode** | Screen baseline + Hook/`Confirmed` observed correction；與 Agy 同處 observer 最高層 | StatusLine（僅限 fleet 自訂格式） | Bulk，`submit_key="\r"` | `--continue`，有 on-disk session 檢查把關 | 有——明確的 `--mcp-config` flag | 覆蓋最完整的 backend；但仍綁定特定 Claude Code 版本 |
 | **Codex** | 純 PTY/Screen heuristic——無 hook | Unavailable | Typed/paced（`typed_inject=true`，#1670） | 硬編在 spawn args 裡的 `resume --last`，未走通用的 `ResumeMode` 抽象 | 有——per-project `.codex/config.toml` | 最依賴 PTY 的 backend；根因脆弱點是 #1670 的 ratatui input widget |
-| **KiroCli** | PTY/Screen heuristic 主導 `agent_state`；另有一條 jsonl tail 但只是 Stream authority，從不 promote | StatusLine | Bulk，`submit_key="\r"`，固定 50ms pre-submit sleep | `--resume` | 有——自己的 auto-discovery（`.kiro/settings/mcp.json`） | 唯一需要 `redraw_after_resize` 的 backend；有數個 input-line 誤鎖 guard |
+| **KiroCli** | Screen baseline + observer gate 高信心時的 Stream-authority session-tail correction | StatusLine | Bulk，`submit_key="\r"`，固定 50ms pre-submit sleep | `--resume` | 有——自己的 auto-discovery（`.kiro/settings/mcp.json`） | 唯一需要 `redraw_after_resize` 的 backend；有數個 input-line 誤鎖 guard |
 | **OpenCode** | 純 PTY/Screen heuristic——無 hook | Unavailable（footer 有 token/cost 字串但沒被解析） | Typed/paced（`typed_inject=true`） | `--continue`；帶一個**未關閉**的 dummy-session-id 事故 | 有——`opencode.json` 的 `"mcp"` 欄位 | 未關閉：dummy-session wedge（罕見的「process 永不退出」變種能躲過偵測） |
-| **Agy** | 混合——真的有 hook，但只涵蓋 busy/idle 轉換；其餘更細的狀態（rate-limit、API error、git conflict、permission prompt……）全靠 PTY/Screen heuristic | Unavailable | Typed/paced，約 2ms/byte | `--continue`——程式碼註解說「operator-verified」，但查無自動化行為測試 | 有——標準 `mcpServers` schema，位於 `.agents/mcp_config.json` | 最新加入的 first-class backend（#987，Gemini 的繼任者）；hooks 曾經失效過，後來才修回來 |
+| **Agy** | Screen baseline + busy/idle Hook correction；更細狀態仍靠 screen heuristic | Unavailable | Typed/paced，約 2ms/byte | `--continue`——程式碼註解說「operator-verified」，但查無自動化行為測試 | 有——標準 `mcpServers` schema，位於 `.agents/mcp_config.json` | Gemini 的繼任者；hooks 曾經失效過，後來才修回來 |
+| **Grok** | PTY/Screen heuristic；沒有 lifecycle hook | Unavailable | Typed/paced | `--continue`，由 cwd-scoped on-disk session probe 把關 | 有——project `.grok/config.toml` | 最新的 first-class backend；#2707 false-idle 後以 Grok 0.2.93 重新校準 active/idle pattern |
 | **Shell** / **Raw(String)** | 無——完全沒有偵測 pattern；`agent_state` spawn 時就硬鎖 `Idle` | 不適用 | Bulk；文字仍會真的寫入並送出（不是真的 no-op），只是沒有 backend 專屬客製化 | 不支援——`args_for()` 回空，Resume 與 Fresh 產生的 spawn args 完全一樣 | 無——這個 backend 完全跳過 MCP config | Utility 層級；CHANGELOG 查無事故記錄（**未查證**這代表「從沒出過包」還是「沒人記錄」） |
 
 ---
 
 ## ClaudeCode
 
-**Agent-state 訊號**：Hook-based，`authority=Hook`、`confidence=Confirmed`——階梯最高階（`src/daemon/shadow/evidence.rs:65-90,92-109`）。`has_state_hooks()` 只列出 `ClaudeCode` 與 `Agy`（`src/backend.rs:55-76`）。
+**Agent-state 訊號**：raw state 仍是 PTY/Screen heuristic。Claude lifecycle
+hook 另外產生 `authority=Hook`、`confidence=Confirmed` evidence——observer
+階梯最高層（`src/daemon/shadow/evidence.rs`）。fresh、高信心且與 raw 不一致時，
+可修正 operated snapshot/dispatch view，但不改寫 `core.state.current`。
+`has_state_hooks()` 列出 Claude 與 Agy。
 未查證：初始 ready-gate（`ready_pattern: "bypass permissions|❯"`）是否曾經會參考 hook，還是跟其他所有 backend 的 ready-gate 一樣純靠 screen pattern——沒找到任何 hook-based ready 路徑，但這只是「沒找到」，不等於「確認為否」。
 
 **Context usage**：`ContextProvider::StatusLine`，靠 `CLAUDE_CONTEXT_PATTERN`（`src/backend_profile.rs:39-46,86-92`）——但這個 regex 只吃 fleet 自訂 statusline 格式（`Ctx Used: N%`）。原生 Claude Code 裝機顯示的是反向的「剩餘 %」字串，這個 pattern 刻意不吃——這是尚未實作的落差，不是 bug。
 
-**Submit / inject**：Bulk inject，`submit_key: "\r"`，`typed_inject: false`（繼承 `DEFAULTS`，`src/backend.rs:382-399`；測試陣列 `:1474-1486` 有 pin 住）——跟 Codex/OpenCode/Agy 用 paced typed inject 不同。沒有 pre-send confirm-first 閘門；取而代之的是事後、靠 hook 才會觸發的 delivery-verification watchdog（`src/daemon/inject_delivery.rs:1-20`，30 秒視窗）——實務上只有有 hook 的 backend 才會真的觸發，等於只對 Claude 生效。
+**Submit / inject**：Bulk inject，`submit_key: "\r"`，`typed_inject: false`（繼承 `DEFAULTS`，`src/backend.rs:382-399`；preset-default 測試有 pin 住）——跟 Codex/OpenCode/Agy/Grok 的 paced typed inject 不同。沒有 pre-send confirm-first 閘門；取而代之的是事後、靠 hook history 才會觸發的 delivery-verification watchdog（`src/daemon/inject_delivery.rs`，30 秒視窗）。Claude 或 Agy instance 一旦已有 hook-shadow evidence 就能 arm；純 heuristic backend 永遠不會 arm。
 
 **Resume**：`ResumeMode::ContinueInCwd { flag: "--continue" }`（`src/backend.rs:405`），靠讀取 `~/.claude/projects/<encoded-cwd>/*.jsonl` 的 on-disk session 偵測把關（`src/backend.rs:878+`）——查無可恢復 session 時自動降級成 Fresh。
 
@@ -64,7 +80,13 @@
 
 ## KiroCli
 
-**Agent-state 訊號**：PTY/Screen heuristic 是今天實際驅動 `agent_state` 的機制（`src/backend_profile.rs:220-273`，`kirocli_profile()`）。另外存在一條 `~/.kiro/sessions/cli/<uuid>.jsonl` 的唯讀 tail（`src/daemon/shadow/kiro.rs:1-23`，在 production 中確實有接上，見 `src/app/mod.rs:2774-2797`），但整個 Shadow Observer 系統明文寫著「additive only……從不驅動 `agent_state`」（`src/daemon/shadow/mod.rs:15-16`）——它站在 `Authority::Stream`，低於 `Authority::Hook`。Kiro 完全沒有 lifecycle hook。附帶說明：這條 jsonl 只在 tool-round/turn 結束時 flush（不是 prompt-submit 時），所以一個沒有呼叫任何 tool 的純思考回合，連 Stream-authority 的 shadow 都抓不到中途狀態。
+**Agent-state 訊號**：PTY/Screen heuristic 保持 raw baseline
+（`kirocli_profile()`）。另外一條 `~/.kiro/sessions/cli/<uuid>.jsonl` 唯讀 tail
+會產生 `Authority::Stream` evidence（`src/daemon/shadow/kiro.rs`）。shared observer
+gate 有 fresh、高信心修正時，該 Stream state 可驅動 operated snapshot/dispatch
+view，但不改寫 raw state。Kiro 沒有 lifecycle hook。附帶說明：jsonl 在
+tool-round/turn 結束時 flush，而非 prompt-submit；無 tool 的純思考回合無法在中途
+被這個 plane 捕捉。
 
 **Context usage**：StatusLine，可用——`KIRO_CONTEXT_PATTERN = r"◔\s*(\d+(?:\.\d+)?)\s*%"`（`src/backend_profile.rs:97`）。`:38-46` 的文件註解明確點名 Claude 與 Kiro 是僅有的兩個 `StatusLine` provider。
 
@@ -98,7 +120,11 @@
 
 ## Agy
 
-**Agent-state 訊號**：混合。真的有 lifecycle hook（`has_state_hooks()` 回傳 true，`src/backend.rs:74-76`），但只在 busy/idle 轉換時觸發（`PreInvocation`→`UserPromptSubmit`/`Stop`，`src/mcp_config.rs:470`）——已有實測證據確認它不帶任何 tool-call 顆粒度的訊號（task board 發現 `t-...93090-0`）。其餘所有更細的狀態（`Active`、`UsageLimit`、`RateLimit`、`ApiError`、`GitConflict`、`PermissionPrompt`）全靠純 PTY/Screen heuristic——8 個依序比對的 regex（`src/backend_profile.rs:129-213`）。
+**Agent-state 訊號**：混合。raw state 保持 PTY/Screen heuristic。lifecycle hook
+（`has_state_hooks() == true`）透過 `PreInvocation` / `Stop` 產生 busy/idle
+evidence；fresh、高信心結果可修正 operated snapshot/dispatch view。它沒有
+tool-call 顆粒度（task board 發現 `t-...93090-0`），因此 UsageLimit、RateLimit、
+ApiError、GitConflict、PermissionPrompt 等更細狀態仍由 screen 衍生。
 
 **Context usage**：Unavailable——`context_pattern: None`（`src/backend_profile.rs:209`），明確與 Codex/OpenCode 歸為同一組「no trustworthy passive context signal」（`src/backend_profile.rs:43-45`）。
 
@@ -106,9 +132,40 @@
 
 **Resume**：`ResumeMode::ContinueInCwd { flag: "--continue" }`（`src/backend.rs:613`）——程式碼註解寫著「operator-verified in issue body」，但查無自動化的 CLI 行為測試，只有針對 args 本身的單元測試 pin 住。
 
-**MCP**：有——標準的 `{command, args, env}` `mcpServers` schema，位於 `<workdir>/.agents/mcp_config.json`（`src/mcp_config.rs:391-436`，`mcp_server_entry` 在 `:86-99`）；`fleet_mcp_supported: true`（`src/backend.rs:641`，測試 `:1436`）。在 `src/backend.rs:1416-1421` 發現一則**過時的文件註解**，聲稱 Agy 的 MCP 支援是 `false`/不支援——這已經過時，且被兩行之後的實際斷言直接打臉。值得另外開一個 follow-up 清掉這則註解，跟本文件無關。
+**MCP**：有——標準 `{command, args, env}` `mcpServers` schema，位於 `<workdir>/.agents/mcp_config.json`（`src/mcp_config.rs::configure_agy`、`mcp_server_entry`）；Agy preset 與 regression test 都 pin 住 `fleet_mcp_supported: true`。`BackendPreset::fleet_mcp_supported` 附近仍有一段**過時 field doc comment**把 Agy 描述成不支援；live preset、writer 與 test 都直接反駁它。該 source-comment cleanup 與本 matrix 無關。
 
 **已知脆弱點**：#987（Agy 加入）、#995（workspace-trust dismiss + 一條已死的 `.antigravitycli/` MCP 寫入路徑）、#1547（把真正的 MCP 路徑修正為 `.agents/`）、#1580（Gemini 退役，Agy 是繼任者）、#1523 / #2413 Phase D（hooks 曾經失效，後來才修回來——見上方分界說明）、#2236（quota-wall pattern 順序）、#2409（一個暫時性的高流量 `ApiError` pattern）、#2524 P1b-r1/r2（缺一個 `GitConflict` pattern；`RateLimit` pattern 被標記為低信心/合成，尚未對照真實 Agy 輸出驗證）。
+
+---
+
+## Grok
+
+**Agent-state 訊號**：PTY/Screen heuristic，沒有 lifecycle hook。
+`has_state_hooks()` 不包含 Grok（`src/backend.rs:60-77`）。其 profile 刻意只保留
+少量、依序判斷的 pattern：project-trust `PermissionPrompt`、busy `Active`
+（`[stop]` / `Ctrl+c:cancel`），最後才是完成／prompt `Idle`
+（`src/backend_profile.rs:129-181`）。
+
+**Context usage**：Unavailable——`context_pattern: None`
+（`src/backend_profile.rs:182`）；目前沒有可信的被動 token 百分比 parser。
+
+**Submit / inject**：`typed_inject: true`，沿用預設 `submit_key: "\r"`；
+full-screen TUI 需要 paced injection（`src/backend.rs:658-667`）。第一次使用時的
+project trust modal 以一個 Enter dismiss，穩定的空 prompt marker 是 `❯`。
+
+**Resume**：`ResumeMode::ContinueInCwd { flag: "--continue" }`，但不做樂觀
+resume；`grok_session::has_resumable` 要求 encoded-cwd 目錄內確實存在 session
+子目錄（`src/backend.rs:668-678,978+`）。
+
+**MCP**：有。`configure_grok` 使用 Grok 原生
+`[mcp_servers.agend-terminal]` schema 寫入 project-local
+`.grok/config.toml`，不寫使用者全域的 `~/.grok` config
+（`src/mcp_config.rs:906-1025`）。
+
+**已知脆弱點**：原本的一次性校準把永久 footer chrome 當成 busy/idle 證據，
+造成系統性 false-idle；#2707 已用 Grok 0.2.93 live soak 重新校準。更細的
+rate-limit/auth 狀態仍沒有可靠 screen signature，因此刻意不分類。Grok 目前沿用
+generic F9 productivity markers，backend-specific marker coverage **尚未查證**。
 
 ---
 

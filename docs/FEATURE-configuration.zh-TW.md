@@ -22,7 +22,7 @@
 也就是說：
 
 - `fleet.yaml` 是 fleet 的主要人類可編輯來源。
-- `runtime-config.json` 是可熱更新的執行期數值。
+- `runtime-config.json` 保存可熱更新的 runtime tunables。
 - 各 backend 的 `mcp.json` / `settings.local.json` 是派生設定，不是主來源。
 - service manager artifact 也是派生設定，不是主來源。
 
@@ -32,7 +32,7 @@
 |---|---|---|---|
 | 進程環境 | `AGEND_HOME`, `AGEND_POINTER_ONLY_INJECT`, `AGEND_CAPTURE_FIXTURES` | 操作員 / 啟動器 | 啟動時讀取 |
 | Fleet 主設定 | `$AGEND_HOME/fleet.yaml` | 操作員 + daemon | 啟動 / 重新載入時 |
-| 執行期設定 | `$AGEND_HOME/runtime-config.json` | MCP `config` 工具 | 每個 daemon tick |
+| 執行期設定 | `$AGEND_HOME/runtime-config.json` | operator CLI／部分 TUI toggles | 每個 daemon tick |
 | MCP 派生設定 | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json` | daemon / 生成器 | backend 啟動前 |
 | 服務管理器 artifact | plist / unit / task xml | `service install` | OS 登入時 |
 | 診斷輸出 | `bugreport-*.txt`, `captures/*` | operator / capture 工具 | 需要時 |
@@ -237,25 +237,44 @@ daemon 會在每個 tick 重新載入一次，所以它是 live tunable 的。
 |---|---|---|
 | `dev_idle_threshold_secs` | `3600` | 單一 agent 的 idle 閾值 |
 | `fleet_idle_threshold_secs` | `1800` | 整體 fleet 的 idle 閾值 |
+| `fleet_idle_ack_ttl_secs` | `2700` | Fleet-idle acknowledgement 的最長存活時間 |
 | `hang_auto_recovery_enabled` | `false` | 是否啟用 hang auto-recovery |
+| `usage_limit_propagation_enabled` | `false` | 把 backend usage limit 傳播到相符 agents 與 dispatch gates |
+| `idle_watchdog_enabled` | `true` | Dev／fleet idle alerts 的 master switch |
+| `show_pane_state` | `true` | 在 pane title 顯示偵測到的狀態 |
+| `copy_on_select` | `true` | Mouse selection 放開時自動複製 |
+| `dim_unfocused_panes` | `true` | 淡化未 focus pane 的內容 |
+| `observed_badge` | `true` | 允許高信心 observed state 修正 raw pane badge |
+| `context_alert_pct` | `80.0` | Context 使用率 alert 閾值 |
+| `context_handoff_pct` | `85.0` | Context 使用率 handoff request 閾值 |
+| `context_handoff_escalate_pct` | `92.0` | Context 使用率 operator escalation 閾值 |
 
 ### 如何修改
 
-透過 MCP `config` 工具：
+MCP `config` 只有讀取能力：
 
 - `config get`
-- `config set`
 - `config list`
 
-也就是說，這不是一個通常要手改的檔案。
+請透過 operator CLI 寫入單一 key：
+
+```bash
+agend-terminal admin config-set <KEY> <VALUE>
+```
+
+部分顯示／selection key 也有 TUI `:set` toggle。其他 process 可能正在寫入時不要手動改檔：CLI／TUI 路徑會以跨 process lock 序列化 read-modify-write、原子寫入，並拒絕覆寫較新 schema 的檔案。
 
 ### 失敗語意
 
 - key 不存在 → error
 - 整數 / 布林 parse 失敗 → error
-- JSON 解析失敗 → 預設值
+- 一般 boolean 接受 `true` / `false` / `1` / `0`
+- `copy_on_select`、`dim_unfocused_panes`、`observed_badge` 也接受 `on` / `off`
+- context thresholds 必須為 finite、 大於 `5`、不超過 `100`，且符合 `alert < handoff < escalate`
+- startup 時檔案 corrupt、missing、future-schema 或 thresholds 無效 → 使用安全預設值（watchdogs enabled）
+- startup 後發生相同失敗 → 保留 last-known-good runtime config
 
-這意味著：runtime config 壞掉時，daemon 不會停；它會回到預設值。
+因此，執行中的檔案暫時損壞或消失，不會在 daemon 運行途中默默重設 live safety gates。
 
 ### 什麼時候適合用它
 
@@ -292,7 +311,7 @@ daemon 會在每個 tick 重新載入一次，所以它是 live tunable 的。
 
 - 它不會寫回磁碟。
 - 它不會自動跟 fleet.yaml 同步。
-- 如果你要長期保存，應該把需求落到正式設定檔或 MCP config。
+- 如果你要長期保存，應該把需求落到經 review 的設定來源或 runtime-config CLI 路徑。
 
 ## MCP config：各 backend 的派生設定
 
@@ -363,9 +382,9 @@ service 產物不是來源檔，而是由 install 命令根據目前 binary 與 
 
 ### `runtime-config.json` 壞掉
 
-- daemon 會回到 default values。
-- 不一定會立刻看到 crash。
-- 這類問題通常要看 log 或 `doctor` 的結果。
+- 第一次 startup load 時，daemon 使用 watchdogs enabled 的安全預設值。
+- 已載入有效設定後，daemon 會保留 last-known-good，而不是在運行中重設。
+- 每個 failure episode 只警告一次；行為異常時請檢查 log 或 `doctor`。
 
 ### `mcp` 設定檔壞掉
 
@@ -390,9 +409,9 @@ service 產物不是來源檔，而是由 install 命令根據目前 binary 與 
 
 ### 想調整 idle / watchdog 閾值
 
-1. 用 `config set` 改 `runtime-config.json`。
+1. 執行 `agend-terminal admin config-set <KEY> <VALUE>`。
 2. 等下一個 tick。
-3. 用 `doctor` 或看 event / log 驗證。
+3. 用 MCP `config get`／`config list`、`doctor` 或 event log 驗證。
 
 ### 想改某個 agent 的行為
 
@@ -414,7 +433,7 @@ service 產物不是來源檔，而是由 install 命令根據目前 binary 與 
 
 ### 把 runtime-config 當 fleet 配置
 
-錯。它只管 live threshold 類的數值。
+錯。它只管 live runtime tunables，不管 fleet 結構。
 
 ### 手改 daemon-managed 欄位後期待永久保留
 
@@ -427,7 +446,7 @@ service 產物不是來源檔，而是由 install 命令根據目前 binary 與 
 ## 對應原始碼
 
 - `src/main.rs`：`AGEND_HOME`、CLI default path、`Doctor` / `Service`
-- `src/fleet.rs`：`FleetConfig`、`InstanceYamlEntry`、欄位 merge 規則
+- `src/fleet/`：`FleetConfig`、`InstanceYamlEntry`、欄位 merge 規則
 - `src/runtime_config.rs`：runtime-config 讀寫與 tick reload
 - `src/daemon_config.rs`：process-wide runtime flags
 - `src/mcp_config.rs`：backend MCP config 生成

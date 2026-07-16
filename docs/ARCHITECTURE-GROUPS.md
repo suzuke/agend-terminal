@@ -1,5 +1,13 @@
 # Architecture Groups Audit — agend-terminal
 
+> **HISTORICAL SNAPSHOT — 2026-04-30 (`9061a1b`).** Module paths, LOC,
+> coverage percentages, backend counts, and health ratings below describe that
+> exact audit baseline. Many modules have since moved into directories and the
+> supported backend set is now Claude, Kiro, Codex, OpenCode, Agy, and Grok.
+> Use [architecture.md](architecture.md) for the current structural map; do not
+> turn the metrics below into current planning assumptions without rerunning the
+> audit.
+
 **Date**: 2026-04-30
 **Commit**: `9061a1b` (origin/main)
 **Coverage tool**: `cargo llvm-cov 0.8.5` — overall **73.1%** (28247/38667 lines)

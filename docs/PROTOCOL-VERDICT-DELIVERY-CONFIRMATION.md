@@ -1,5 +1,15 @@
 # Reviewer verdict-delivery confirmation protocol
 
+> **Status: SUPERSEDED — historical Sprint 60–62 process snapshot.** Do not use
+> the 60-minute threshold, manual `gh pr view` polling, or the optional
+> `[verdict-delivered]` marker as current gates. The authoritative workflow is
+> [`FLEET-DEV-PROTOCOL.md`](FLEET-DEV-PROTOCOL.md) §5, §6, and §9: reviewers send
+> a correlated `request_kind:"report"` with `parent_id`, `correlation_id`, and
+> `reviewed_head`; implementers send the required review-verdict milestone; and
+> a missing response follows the timeout staircase (liveness check, direct
+> query, then pane/task/binding inspection). The historical incident analysis
+> below is retained for provenance only.
+
 **Sprint 62 W1 PR-3 — process protocol, Sprint 62 W1 closeout PR.**
 Formalizes the lead-status-query recovery procedure for the verdict-
 delivery-miss failure mode observed ≥2 times in Sprint 60-61. Pairs

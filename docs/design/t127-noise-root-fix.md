@@ -1,5 +1,9 @@
 # t-127 Design Spike — review-verdict terminal auto-close + dispatch-stuck sidecar close (noise root-fix)
 
+> **Historical design snapshot:** This document preserves a pre-implementation
+> RCA at the SHA named below. It is not the current review or dispatch contract;
+> verify behavior against current source and the Fleet protocol.
+
 **Status:** SPIKE (analysis only — no production code yet). For lead dialectic (dual reviewer).
 **Freshness:** origin/main 946facb6. **Author:** fixup-dev-2.
 

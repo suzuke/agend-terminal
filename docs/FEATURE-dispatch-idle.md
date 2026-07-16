@@ -10,7 +10,7 @@
 
 **Active work acknowledgment.** A dev agent receives a complex task and starts working on it. Partway through, it sends a `kind=update` message to report progress. The daemon sees this activity and resets the idle timer, preventing a false alarm while the dev is clearly engaged.
 
-**Fixup team nudge.** In the fixup team, after the L1 notification goes to the lead, the L2 layer sends an additional `dispatch_idle_nudge` directly to the target dev agent. This two-pronged approach ensures both the dispatcher and the recipient are aware of the stalled task.
+**Team nudge.** For any configured team, after L1 notifies the dispatcher, L2 waits another 10 minutes and then sends one `dispatch_idle_nudge` to the target agent if the dispatch is still unresolved.
 
 ## Design Rationale
 
@@ -27,7 +27,7 @@ has not received a response."
 This is a two-layer (L1 + L2) system:
 
 - **L1 (cross-team safe)**: notifies the dispatcher only; contains no team names or team logic.
-- **L2 (team-specific)**: an additional nudge for the fixup team, notifying the target agent.
+- **L2 (generic per-team automation)**: after a second delay, notifies the target agent for any team dispatch.
 
 ---
 
@@ -55,7 +55,7 @@ received.
 
 ### Team Defaults
 
-For any team member, `kind=task` and `kind=query` dispatches automatically
+For any team member, `kind=task` dispatches automatically
 inherit a **30-minute** idle tracking window (`DEFAULT_DISPATCH_THRESHOLD_SECS`).
 No manual `expect_reply_within_secs` is needed; an explicit value still overrides
 it per-dispatch. Teamless (solo) dispatchers are not tracked. (#2031 raised the
@@ -85,19 +85,21 @@ The two notifications are SEQUENCED, not simultaneous:
 ### Sidecar Mechanism
 
 Each dispatch with `expect_reply_within_secs` creates a JSON sidecar file
-under `$AGEND_HOME/dispatch-pending/`.
+under `$AGEND_HOME/pending-dispatches/`.
 
 Sidecar contents:
 
 ```json
 {
-  "dispatch_id": "disp-1716616000000-1",
-  "dispatcher": "fixup-lead",
-  "target": "fixup-dev",
+  "dispatch_id": "disp-20260525050000000000-1",
+  "dispatcher": "lead",
+  "target": "dev",
   "correlation_id": "t-20260525-1",
+  "expected_kind": "task",
   "threshold_secs": 600,
-  "created_at": "2026-05-25T05:00:00Z",
+  "issued_at": "2026-05-25T05:00:00Z",
   "status": "pending",
+  "exceeded_at": null,
   "nudge_sent_at": null
 }
 ```
@@ -107,10 +109,10 @@ process-local atomic counter, ensuring uniqueness.
 
 ### L1: Timeout Detection and Notification
 
-The daemon scans `dispatch-pending/` every 60 seconds:
+The daemon scans `pending-dispatches/` about every 60 seconds:
 
 1. Read all `pending` sidecars.
-2. Calculate `elapsed = now - created_at`.
+2. Calculate `elapsed = now - issued_at`.
 3. If `elapsed > threshold_secs`:
    - Send a `dispatch_idle_threshold_exceeded` notification to the **dispatcher**.
    - Update sidecar status to `exceeded`.
@@ -119,9 +121,9 @@ The daemon scans `dispatch-pending/` every 60 seconds:
 The notification includes the dispatch ID, target agent, elapsed time, and
 correlation_id.
 
-### L2: Fixup Nudge
+### L2: Per-Team Nudge
 
-L2 is a team-specific supplement to L1, active only for the fixup team.
+L2 is a generic supplement to L1 for every configured team. Teamless dispatchers do not receive the automatic default or L2 nudge.
 
 After a sidecar transitions to `exceeded`, L2 sends an additional
 `dispatch_idle_nudge` notification to the **target agent** (the recipient),
@@ -132,7 +134,7 @@ Deduplication: each sidecar triggers at most one nudge (recorded in
 
 L2 isolation guarantees:
 - L1 code contains no team name strings (enforced by the `no_team_name_strings_in_l1` CI test).
-- L2 is loaded as an independent module (`fixup_nudge.rs`) and only activates when the dispatcher belongs to the fixup team.
+- L2 is loaded as the independent `team_nudge.rs` module and derives the dispatcher team at runtime.
 
 ### Tracking Dismissal
 
@@ -146,8 +148,8 @@ multiple agents simultaneously, with each sidecar tracked independently.
 ### Sidecar Refresh
 
 While a sidecar is `pending` and has not timed out, if the target agent sends a
-non-report message (e.g., `kind=update`), the daemon resets the sidecar's
-`created_at` timestamp (restarting the timer), avoiding false alarms when the
+non-report message (e.g., `kind=update`) with matching correlation, the daemon resets the sidecar's
+`issued_at` timestamp (restarting the timer), avoiding false alarms when the
 agent is clearly active.
 
 ---
@@ -235,7 +237,7 @@ processing, causing a missed or duplicate notification.
    → L1: send exceeded notification to lead
    → sidecar status → exceeded
 
-3. L2 scan (fixup team)
+3. L2 scan (dispatcher belongs to a team)
    → send nudge notification to dev
    → nudge_sent_at recorded
 
@@ -247,10 +249,9 @@ processing, causing a missed or duplicate notification.
 
 ## FAQ
 
-### Q: Can non-fixup teams use this?
+### Q: Can every team use this?
 
-Yes. L1 is cross-team safe — any agent can use `expect_reply_within_secs`.
-Only L2's nudge functionality is currently limited to the fixup team.
+Yes. L1 is cross-team safe, the 30-minute default applies to any team member's task dispatch, and L2 resolves the team dynamically. Teamless callers can still opt in explicitly to L1 with `expect_reply_within_secs`, but have no automatic L2 team nudge.
 
 ### Q: Will an agent be nudged if it's working but hasn't finished?
 

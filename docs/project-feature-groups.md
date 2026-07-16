@@ -1,5 +1,10 @@
 # agend-terminal Feature Group Classification Report
 
+> **Historical generated inventory:** Paths, LOC, and grouping below reflect the
+> recorded 2026-05-23 revision. For the current source map, use
+> [`ARCHITECTURE-QUICK-START.md`](ARCHITECTURE-QUICK-START.md) and
+> [`architecture.md`](architecture.md).
+
 > Generated: 2026-05-23 | Source: `main` branch (HEAD e822cc7+)
 > Total: ~144,365 LOC across ~200 `.rs` files
 

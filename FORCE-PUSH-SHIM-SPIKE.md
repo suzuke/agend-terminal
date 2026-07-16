@@ -1,5 +1,9 @@
 # Spike: agend-git shim force-push gap (t-…78445-1, #2673 follow-up)
 
+> **Historical snapshot:** This spike preserves the pre-fix investigation. It is
+> not the current push-policy contract; see
+> [`docs/GIT-BEHAVIOR.md`](docs/GIT-BEHAVIOR.md) and current source/tests.
+
 Spike-first (no production code except part (a) comment softening — done). DUAL-class
 (fleet-safety / data-loss-adjacent). All file:line in `src/bin/agend-git.rs` unless noted.
 

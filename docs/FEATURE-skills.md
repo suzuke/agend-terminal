@@ -8,7 +8,7 @@ The Skills system lets you install reusable skills (prompts, tool definitions, r
 
 > **Target audience:** Both operators and agents.
 
-**Operator installs a code review skill.** You find a community-maintained code review skill on GitHub. You run `agend-terminal skills add https://github.com/user/code-review-expert.git` once, and every agent in your fleet — regardless of whether it runs Claude, Gemini, or Kiro — can now invoke the skill. No per-backend configuration needed.
+**Operator installs a code review skill.** You find a community-maintained code review skill on GitHub. You run `agend-terminal skills add https://github.com/user/code-review-expert.git` once, and agents across Claude, Codex, OpenCode, Kiro, Antigravity, and Grok can invoke it. No per-backend configuration needed.
 
 **Agent loads skills at startup.** When the daemon spawns a dev agent, the skills system has already created symlinks in the agent's working directory. The agent's backend reads `SKILL.md` from its conventional path and gains the skill's capabilities — prompt templates, behavioral guidelines, or reference material — without any explicit loading step.
 
@@ -16,9 +16,9 @@ The Skills system lets you install reusable skills (prompts, tool definitions, r
 
 ## Design Philosophy
 
-Different AI backends (Claude, Codex, Gemini, OpenCode, Kiro) each have their own skill directory conventions (`.claude/skills/`, `.codex/skills/`, etc.). Manually maintaining identical skill files across every directory is tedious and error-prone.
+Different AI backends (Claude, Codex, OpenCode, Kiro, Antigravity, and Grok) each have their own skill directory conventions (`.claude/skills/`, `.codex/skills/`, etc.). Manually maintaining identical skill files across every directory is tedious and error-prone.
 
-The Skills system provides a single source directory `~/.agend-terminal/skills/` and automatically maps it to each backend's conventional path via symlinks. Install once, effective across all five backends.
+The Skills system provides a single source directory `$AGEND_HOME/skills/` and automatically maps it to each backend's conventional path via symlinks. Install once, effective across all six backends.
 
 ---
 
@@ -52,7 +52,7 @@ Skills take effect the next time an agent is launched.
 All skills are stored under a single directory:
 
 ```
-~/.agend-terminal/
+$AGEND_HOME/
 ├── skills/                    <- Unified skill source
 │   ├── skill-forge/
 │   │   ├── SKILL.md          <- Skill description file (required)
@@ -69,11 +69,12 @@ When the daemon starts an agent, it automatically creates symlinks in the agent'
 
 ```
 <agent-working-dir>/
-├── .claude/skills/   -> ~/.agend-terminal/skills/
-├── .codex/skills/    -> ~/.agend-terminal/skills/
-├── .gemini/skills/   -> ~/.agend-terminal/skills/
-├── .opencode/skills/ -> ~/.agend-terminal/skills/
-└── .kiro/skills/     -> ~/.agend-terminal/skills/
+├── .claude/skills/   -> $AGEND_HOME/skills/
+├── .codex/skills/    -> $AGEND_HOME/skills/
+├── .opencode/skills/ -> $AGEND_HOME/skills/
+├── .kiro/skills/     -> $AGEND_HOME/skills/
+├── .agents/skills/   -> $AGEND_HOME/skills/
+└── .grok/skills/     -> $AGEND_HOME/skills/
 ```
 
 Each backend reads `SKILL.md` from its own conventional path, all pointing to the same source.
@@ -215,7 +216,7 @@ The reviewer only sees `code-review-expert` and `skill-forge`; other skills are 
 ```yaml
 instances:
   eval-runner:
-    backend: gemini
+    backend: grok
     skills: []    # Empty array = no skills installed
 ```
 
@@ -224,7 +225,7 @@ instances:
 When a `skills` allowlist is specified:
 
 1. The system computes a SHA-256 digest of the allowlist
-2. Creates a filtered copy in `~/.agend-terminal/.skills-stage/<digest>/`
+2. Creates a filtered copy in `$AGEND_HOME/.skills-stage/<digest>/`
 3. The agent's symlinks point to the filtered stage directory instead of the unified source
 
 Stage directories are automatically cleaned up after 7 days. Identical allowlists reuse the same stage directory.

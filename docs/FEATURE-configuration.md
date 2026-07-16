@@ -21,7 +21,7 @@ The main rule is:
 In practice that means:
 
 - `fleet.yaml` is the primary human-editable fleet source.
-- `runtime-config.json` holds live, runtime-tunable numbers.
+- `runtime-config.json` holds live runtime tunables.
 - backend `mcp.json` or `settings.local.json` files are derived, not primary sources.
 - service-manager artifacts are also derived files.
 
@@ -31,7 +31,7 @@ In practice that means:
 |---|---|---|---|
 | Process environment | `AGEND_HOME`, `AGEND_POINTER_ONLY_INJECT`, `AGEND_CAPTURE_FIXTURES` | operator / launcher | startup |
 | Fleet source | `$AGEND_HOME/fleet.yaml` | operator + daemon | startup / reload |
-| Runtime config | `$AGEND_HOME/runtime-config.json` | MCP `config` tool | each daemon tick |
+| Runtime config | `$AGEND_HOME/runtime-config.json` | operator CLI / selected TUI toggles | each daemon tick |
 | Derived MCP config | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json` | daemon / generator | before backend launch |
 | Service artifact | plist / unit / task XML | `service install` | OS login |
 | Diagnostic output | `bugreport-*.txt`, `captures/*` | operator / capture tools | on demand |
@@ -235,26 +235,45 @@ The daemon reloads it every tick, which makes it suitable for live tuning.
 |---|---|---|
 | `dev_idle_threshold_secs` | `3600` | Idle threshold for a single agent |
 | `fleet_idle_threshold_secs` | `1800` | Idle threshold for the fleet as a whole |
+| `fleet_idle_ack_ttl_secs` | `2700` | Maximum lifetime of a fleet-idle acknowledgement |
 | `hang_auto_recovery_enabled` | `false` | Whether hang auto-recovery is enabled |
+| `usage_limit_propagation_enabled` | `false` | Propagate a backend usage limit across matching agents and dispatch gates |
+| `idle_watchdog_enabled` | `true` | Master switch for dev/fleet idle alerts |
+| `show_pane_state` | `true` | Show the detected state in pane titles |
+| `copy_on_select` | `true` | Copy a mouse selection when it is released |
+| `dim_unfocused_panes` | `true` | Dim non-focused pane contents |
+| `observed_badge` | `true` | Allow high-confidence observed state to correct the raw pane badge |
+| `context_alert_pct` | `80.0` | Context-use percentage for an alert |
+| `context_handoff_pct` | `85.0` | Context-use percentage for a handoff request |
+| `context_handoff_escalate_pct` | `92.0` | Context-use percentage for operator escalation |
 
 ### How to change it
 
-Use the MCP `config` tool:
+MCP configuration access is read-only:
 
 - `config get`
-- `config set`
 - `config list`
 
-This is not usually a file you edit by hand.
+Write one key through the operator CLI:
+
+```bash
+agend-terminal admin config-set <KEY> <VALUE>
+```
+
+Selected display/selection keys also have TUI `:set` toggles. Do not hand-edit the file while another process is writing it: the CLI/TUI path serializes the read-modify-write with a cross-process lock, writes atomically, and refuses to overwrite a file from a newer schema.
 
 ### Failure behavior
 
 - unknown key → error
 - integer parse failure → error
 - boolean parse failure → error
-- JSON parse failure → fall back to defaults
+- ordinary booleans accept `true` / `false` / `1` / `0`
+- `copy_on_select`, `dim_unfocused_panes`, and `observed_badge` also accept `on` / `off`
+- context thresholds must be finite, greater than `5`, no more than `100`, and ordered `alert < handoff < escalate`
+- corrupt, missing, future-schema, or invalid-threshold file at startup → safe defaults (watchdogs enabled)
+- the same failure after startup → keep the last-known-good runtime config
 
-That means a broken runtime config does not usually crash the daemon. It falls back to defaults.
+That means a transient broken or vanished file cannot silently reset live safety gates in the middle of a daemon run.
 
 ### When to use it
 
@@ -290,7 +309,7 @@ This is appropriate for startup-time feature flags or experiment toggles that sh
 
 - it is not persisted
 - it is not automatically synchronized with `fleet.yaml`
-- if you want a long-lived policy, use a real config file or the MCP config path
+- if you want a long-lived policy, use a reviewed config source or the runtime-config CLI path
 
 ## MCP config: derived settings for each backend
 
@@ -361,9 +380,9 @@ If the binary path changes, re-run `service install` so the artifact is regenera
 
 ### Broken `runtime-config.json`
 
-- the daemon falls back to default values
-- the problem may not be obvious immediately
-- inspect logs or `doctor` output if the behavior looks wrong
+- on the first startup load, the daemon uses safe defaults with watchdogs enabled
+- after a valid config has loaded, the daemon keeps that last-known-good value instead of resetting mid-run
+- the daemon warns once per failure episode; inspect logs or `doctor` if behavior looks wrong
 
 ### Broken MCP config
 
@@ -388,9 +407,9 @@ If the binary path changes, re-run `service install` so the artifact is regenera
 
 ### Adjusting idle / watchdog thresholds
 
-1. Change the runtime values with `config set`.
+1. Run `agend-terminal admin config-set <KEY> <VALUE>`.
 2. Wait for the next daemon tick.
-3. Verify with `doctor` or the event log.
+3. Verify with MCP `config get` / `config list`, `doctor`, or the event log.
 
 ### Changing an agent's behavior
 
@@ -425,7 +444,7 @@ Wrong. For many fields they mean opposite things.
 ## Source pointers
 
 - `src/main.rs`: `AGEND_HOME`, CLI defaults, `Doctor` and `Service`
-- `src/fleet.rs`: `FleetConfig`, `InstanceYamlEntry`, field merge rules
+- `src/fleet/`: `FleetConfig`, `InstanceYamlEntry`, field merge rules
 - `src/runtime_config.rs`: runtime-config read/write and tick reload
 - `src/daemon_config.rs`: process-wide runtime flags
 - `src/mcp_config.rs`: backend MCP config generation

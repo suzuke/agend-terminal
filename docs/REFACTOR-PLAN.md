@@ -1,5 +1,13 @@
 # Refactor Plan — #2050 Architecture Pass
 
+> **HISTORICAL / SUPERSEDED EXECUTION PLAN.** This plan was derived from
+> `main@65d9ad82` on 2026-06-12. Completed-wave annotations remain useful
+> provenance, but unchecked items and counts are not the current backlog. Use
+> [architecture.md](architecture.md) for current structure and
+> [architecture/ARCHITECTURE-14-LEDGER.md](architecture/ARCHITECTURE-14-LEDGER.md)
+> for the active convergence program. Revalidate any remaining proposal against
+> current source before implementation.
+
 > Phased plan derived from [architecture.md](architecture.md) §6 (tensions)
 > and the six subsystem surveys (`main` @ `65d9ad82`, 2026-06-12). Each item
 > is sized to be one reviewable PR an implementing agent can land

@@ -2,8 +2,10 @@
 
 # Environment Variables Reference
 
-A categorized reference for every `AGEND_*` environment variable read by the
-codebase, plus the honored external/standard variables and test-only fixtures.
+A categorized operator reference for the commonly supported `AGEND_*`
+environment variables, honored external/standard variables, and test-only
+fixtures. The code remains authoritative, and newly introduced internal seams
+may appear there before this guide is refreshed.
 
 Every entry was derived by reading the **actual read site** (`std::env::var` /
 `var_os` / `has_env`) and its default-resolution logic — not inferred from the
@@ -151,7 +153,9 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_HOOK_STATE_POC` | Lifecycle-hook state gate (#1523 epic / #2016 promotion). When on: (a) the MCP-config writer injects hook state-reporters into the agent's per-workspace `.claude/settings` (scope-respecting; user-global `~/.claude` untouched), and (b) for a **hook-instrumented (strong) backend**, a *fresh* hook-derived `AgentState` is **promoted to authoritative** in the daemon's per-tick snapshot — winning over the screen heuristic. | Off (no reporters injected; hook state never promoted; the screen heuristic drives everything — byte-identical). | Value-based: exactly `"1"` enables; else off. | `src/mcp_config.rs:193` (inject); `src/daemon/hook_shadow.rs:115` (`promotion_enabled`), `:148` (`authoritative_state`); `src/daemon/per_tick/snapshot.rs:51` (snapshot adopts it) | Internal feature gate, default-OFF. **Promotion is phased-v1, SNAPSHOT-scoped** (#2014): it drives snapshot consumers — `dispatch_idle`, the pane-state badge, `agent_state_of`/`snapshot.json` (the #1985 surface). A stale/unknown hook window, the flag off, or a non-hook backend ⇒ heuristic fallback (unchanged). Per-tick deciders that read the RAW screen heuristic directly — supervisor, hang detection, recovery dispatcher, idle/anti-stall watchdog, `conflict_notify`, `query`/`list` API — are **not** promoted in v1 (epic phase-2, post-soak). |
+| `AGEND_HOOK_STATE_POC` | Enables the legacy per-workspace Claude hook-event reporters. Their store still feeds the inject-delivery watchdog, ServerRateLimit hook override, and hook-event diagnostics. The former `authoritative_state` snapshot promotion was removed in #2413. | Off (legacy reporters are not injected). | Value-based: exactly `"1"` enables; else off. | `src/mcp_config.rs` (`hook_settings_json` / `hook_settings_with_base`); `src/daemon/hook_shadow.rs` | Legacy default-off data plane; do not confuse it with the default-on multi-backend Shadow Observer below. |
+| `AGEND_SHADOW_OBSERVER` | Master kill-switch for the multi-backend Shadow Observer. When enabled, Hook/Stream evidence is reduced into `observed_status`; high-confidence corrections may feed the operated-state consumers described below. | **On**. | Only literal `"0"` disables; unset or any other value enables. | `src/daemon/shadow/mod.rs` (`enabled`) | `=0` disables observer ticks, threads, spawn-env injection, and operated corrections. Health/hang/recovery deciders deliberately remain on raw state even while enabled. |
+| `AGEND_OBSERVED_DISPATCH` | Controls whether high-confidence Shadow Observer corrections can drive `operated_state` for snapshot/dispatch, poll-reminder, reclaim, and API injection consumers. | **On** when the Shadow Observer is enabled. | Only literal `"0"` disables; unset or any other value enables. | `src/daemon/shadow/mod.rs` (`operated_dispatch_enabled`, `operated_state`) | Independent rollback for behavioral correction; `AGEND_SHADOW_OBSERVER=0` also disables it. It never mutates the raw screen-derived state. |
 
 ---
 
@@ -159,7 +163,7 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_ENV_ISOLATION` | Gate for agent-backend env isolation (#1440 phased rollout). | Disabled. | `"1"` enables; else off. | `src/agent/mod.rs:179` | Default-off feature flag. When on, only allowlisted env is forwarded to backends (see [external env](#12-honored-external-env)). |
+| `AGEND_ENV_ISOLATION` | Gate for agent-backend env isolation (#1440 phased rollout). | Disabled. | `"1"` enables; else off. | `src/agent/mod.rs:179` | Default-off feature flag. When on, only allowlisted env is forwarded to backends (see [external env](#15-honored-external-env)). |
 | `AGEND_ALLOWED_ROOTS` | Extra allowed root directories for `working_directory` validation (appended to home, workspace, cwd). | No extra roots; only home + workspace + cwd allowed. | OS-path-separator list (`:` Unix, `;` Windows); empty segments skipped. | `src/api/mod.rs:156` | ⚠️ Controls path-traversal allowlist for agent working dirs. |
 | `AGEND_BIND_STRICT_MODE` | In dispatch_hook: when `source_repo` resolves to a stub (tier 4) and this is `"1"`, reject the stub fallback, forcing an explicit `source_repo` in fleet.yaml. | Strict mode off; stub fallback allowed. | `"1"` enables; else off. | `src/mcp/handlers/dispatch_hook/mod.rs:343` | Production safety gate. |
 
@@ -186,7 +190,7 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 | `AGEND_RETENTION_CUTOVER` | Kill-switch for the **pending-dispatch** retention sweep (deletes dispatch sidecars older than 14d). | **On** unless `=="0"`. | `"0"` disables; unset / anything else → enabled. | `src/daemon/retention/mod.rs:41` | Opt-**out**. #env-cleanup: decoupled — this is now pending-dispatch ONLY (decisions moved to its own flag below). `=="1"` ALSO still enables the decisions sweep as a legacy fallback (deprecated). |
 | `AGEND_RETENTION_DECISIONS_CUTOVER` | Opt-in gate for the **decisions** retention sweep (archives expired decisions). | **Off**. | `"1"` enables; else off. | `src/daemon/retention/decisions.rs` (`decisions_cutover_enabled`) | Opt-**in**. #env-cleanup decouple: own flag so `pending-OFF + decisions-ON` is reachable. Legacy `AGEND_RETENTION_CUTOVER=1` still enables it (deprecation window). |
 | `AGEND_FLEET_NO_AUTO_MIGRATE` | Disables automatic backfill/migration of missing instance IDs in `fleet.yaml` during load. | Auto-migration runs (backfills IDs and rewrites fleet.yaml). | `"1"` skips migration; else off. | `src/fleet/mod.rs:544` | Opt out of auto-rewrite. |
-| `AGEND_CAPTURE_FIXTURES` | Activates the PTY-capture fixture sink: raw PTY bytes written to `$AGEND_HOME/captures/<agent>/`. Boot path emits a privacy warning. | `NoOpCapture` (no capture, zero overhead). | `"1"` enables; else off. | `src/capture.rs:56`; `src/bootstrap/mod.rs:224` | ⚠️ Fixture-capture tool, readable on the real boot path. Captured bytes may contain **secrets/prompts** — review before committing. See also [test-only](#14-test-only-fixtures). |
+| `AGEND_CAPTURE_FIXTURES` | Activates the PTY-capture fixture sink: raw PTY bytes written to `$AGEND_HOME/captures/<agent>/`. Boot path emits a privacy warning. | `NoOpCapture` (no capture, zero overhead). | `"1"` enables; else off. | `src/capture.rs:56`; `src/bootstrap/mod.rs:224` | ⚠️ Fixture-capture tool, readable on the real boot path. Captured bytes may contain **secrets/prompts** — review before committing. See also [test-only](#14-test-only-fixtures--seams). |
 
 ---
 
@@ -269,10 +273,9 @@ allowlist at `src/agent/mod.rs:124`.
 
 ## 16. Appendix: `AGEND_*` identifiers that are NOT live env vars
 
-A `grep -rhoE 'AGEND_[A-Z0-9_]+' src/` surfaces identifiers that are **not**
-runtime environment variables, so this reference deliberately omits them from the
-tables above. Listed here so the inventory is provably complete (every grep hit
-is accounted for).
+A `grep -rhoE 'AGEND_[A-Z0-9_]+' src/` also surfaces identifiers that are **not**
+runtime environment variables. The examples below explain common false positives;
+they are not a completeness proof for the operator-facing tables above.
 
 **Demoted to fixed consts (`#env-cleanup`, single-user-dev YAGNI).** Once
 env-overridable, now hard-coded; the name survives only in an explanatory code

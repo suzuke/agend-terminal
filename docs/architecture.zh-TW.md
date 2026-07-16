@@ -2,10 +2,11 @@
 
 # AgEnD Terminal — 架構地圖
 
-> 當前狀態的結構地圖，整理自 #2050 架構盤點
-> （六份子系統調查，所有論述都已對照 `main` @ `65d9ad8` 驗證，
-> 2026-06-12）。搭配文件：[REFACTOR-PLAN.md](REFACTOR-PLAN.md)——由本地圖
-> 衍生出的分階段計畫。
+> 當前狀態的結構地圖，整理自 #2050 架構盤點，並於 2026-07-16 對照
+> `main` @ `1d83b423` 重新核實命名過的結構錨點。盤點時期的 LOC 數字只作
+> 規模提示，不是不變量。[REFACTOR-PLAN.md](REFACTOR-PLAN.md) 是原始盤點
+> 衍生的歷史分階段計畫；現行收斂進度請看
+> [architecture/ARCHITECTURE-14-LEDGER.md](architecture/ARCHITECTURE-14-LEDGER.md)。
 >
 > 新進人員：請先閱讀 [ARCHITECTURE-QUICK-START.md](ARCHITECTURE-QUICK-START.md)。
 > 重寫時期的原始設計文件已封存於
@@ -16,13 +17,14 @@
 ## 1. 這是什麼
 
 一個長時間運行的 daemon，將多個 AI coding agent
-（claude / codex / kiro / agy / opencode）以 PTY 子程序的形式加以 supervise，
+（claude / codex / kiro / agy / opencode / grok）以 PTY 子程序的形式加以 supervise，
 並提供：agent 之間的 MCP 通訊、fleet-as-code 配置、每個 agent 獨立的
 git-worktree 隔離、附帶自動重生（auto-respawn）的健康監控，以及 TUI +
 Telegram 遠端控制。核心價值在於 **multi-agent orchestration**；
 其餘一切都是為它服務。
 
-約 292K 行 Rust 程式碼，分布於 `src/` 下約 429 個檔案（整合測試另計）。
+重新核實基準下，`src/` 約 340K 行 Rust 程式碼、489 個受追蹤 Rust 檔案
+（整合測試另計）。
 四個 binary：`agend-terminal`（daemon + TUI + CLI）、`agend-mcp-bridge`
 （每個 agent 的 stdio↔TCP MCP 中繼）、`agend-git`（PATH-shim 的 `git`
 政策閘門），以及 vendored `agentic-git`（flag 閘控的 shim 替代方案；見
@@ -40,15 +42,15 @@ fleet `use_agentic_git_shim`）。
 | Module | LOC | 角色 |
 |---|---|---|
 | `daemon/supervisor.rs` | 5408 | 每個 agent 狀態的 OBSERVATION + 反應發送 + 錯誤復原（SRL/ApiError）。原本 12 個 inline slow-tracker 掃描已在 W1.1（#2065）移至 `PerTickHandler` |
-| `daemon/mod.rs` | 2764 | 進入點/初始化/關閉；從 `per_tick` re-export `build_default_handlers`（2026-07 時 35 個已註冊 handler） |
-| `daemon/per_tick/` | — | `PerTickHandler` trait + 35 個 handler 實作、panic-guarded dispatch、boot-grace / `CadenceGate` |
+| `daemon/mod.rs` | 2764 | 進入點/初始化/關閉；canonical handler builder 位於 `per_tick`（`1d83b423` 時 37 個已註冊 handler） |
+| `daemon/per_tick/` | — | `PerTickHandler` trait + 37 個已註冊 handler、panic-guarded dispatch、boot-grace / `CadenceGate` |
 | `daemon/crash_respawn.rs` | 568 | Crash→respawn 決策：health budget、escalation 持久化、respawn worker |
 | `health.rs` | 2385 | 每個 agent 的 hang/crash budget、blocked-reason、escalation 持久化+rehydrate |
 | `state/mod.rs` | 2176 | 每個 agent 的 `StateTracker`——screen-heuristic 狀態機（見 2.4） |
 
 週期性工作現在是單一 pipeline（W1.1 / #2065，見 §6.1）：daemon
-迴圈會 dispatch 全部已註冊的 `PerTickHandler`（2026-07 時
-`per_tick::build_default_handlers` 為 35 個；合併/拆分會變動——以
+迴圈會 dispatch 全部已註冊的 `PerTickHandler`（`1d83b423` 時
+`per_tick::build_default_handlers` 為 37 個；合併/拆分會變動——以
 completeness invariant 為準），每個 handler 都有 `catch_unwind` + 計時。
 原本在 supervisor `run_loop` 中 inline 執行的 12 個 tracker，已包裝成
 handler 並依其原本的相對順序附加；後續 wave 又合併了部分槽位（例如 #2549
@@ -58,7 +60,7 @@ handler 並依其原本的相對順序附加；後續 wave 又合併了部分槽
 
 ### 2.2 MCP layer + agent 間通訊（約 22K LOC）
 
-宏觀架構上是健全的：單一不可變的 29 筆 registry
+宏觀架構上是健全的：單一不可變的 32 筆 registry
 （`mcp/registry.rs` 的 `ALL_TOOLS`；數量由
 `tool_definitions_count_invariant_post_sprint_30` 釘住）將 JSON-schema
 定義與 handler fn-pointer 配對，並透過一個經過驗證的 chokepoint
@@ -119,12 +121,13 @@ UsageLimit-release/heartbeat 閘門）→ 單一 transition funnel
 `record_set`（state/mod.rs:2038）。Pattern 優先序僅由 Vec
 位置決定——first-match-wins，沒有 compile-time precedence invariant。
 
-對於支援 hook 的 backend（目前是 claude）存在第二條、具權威性的路徑：
-backend hook 會 POST event → `daemon/hook_shadow.rs`；
-`authoritative_state()` 會讓 Fresh 的 hook state 凌駕於 heuristic 之上，
-受 flag 控制，且**僅限 snapshot 範圍**（#1523 phase-1，即
-`per_tick/snapshot.rs:51` chokepoint）。仍有五個 per-tick decider 讀取
-原始 heuristic state（見 §6.2——計畫中的 phase-2 收斂）。
+第二條 evidence plane 餵給 Shadow Observer：Claude/Agy lifecycle hook 與
+Kiro session stream 會在 raw screen state 旁產生較高 authority 的事件。reducer
+寫入 `observed_status`；default-on 的 `shadow::operated_state` gate 只會把高信心
+Hook/Stream 修正套到 `snapshot.json` 與選定的 dispatch decider
+（`AGEND_OBSERVED_DISPATCH=0` 恢復 raw 行為）。舊的
+`hook_shadow::authoritative_state` POC 已移除。health、hang、recovery、respawn 與
+SRL 路徑刻意繼續讀 raw state，避免 stale observed Active 遮住真正的 wedge（見 §6.2）。
 
 每個 backend 的設定乾淨地集中在 `BackendProfile`
 （每個 backend 的 patterns/behavioral/markers）；`backend.rs` 擁有 spawn、
@@ -187,16 +190,13 @@ Release → crates.io publish（見 RELEASING.md）。
 | UX sinks | mutex 只保護 sink vec；clone Arc，釋放後才發送；發送為 fire-and-forget | sink_registry.rs:67-74 |
 | Per-tick handlers | 每個 `run()` 都包在 `catch_unwind` 內——一個 panic 永遠不會跳過其他兄弟 | per_tick/mod.rs:182-214 |
 
-一個已稽核的殘留問題：在 supervisor.rs:1857 附近，registry-lock 範圍內有一個
-`handle.core.lock()`——已在 #1530/F2 標記；任何 supervisor 重構前都應先讀過它。
-
 ## 4. 承重的 invariant（lock 之外）
 
 | Invariant | 位置 | 違反時會壞掉什麼 |
 |---|---|---|
 | State pattern 順序：error 在 Thinking/Idle 之前，first-match wins | `BackendProfile.patterns` 的 Vec 順序 | 誤分類 → 錯誤的 idle/hang 反應 |
 | `feed_with_fg` 中的 gate-gauntlet 順序（position gate 在 working-marker override 之前等等） | state/mod.rs:1208-1757 | FP 抑制機制停止組合 |
-| Hook 升級只能透過 `authoritative_state()`（把 freshness 與 `has_state_hooks()` 耦合）——絕不直接走 `resolved_state_for` | hook_shadow.rs:113-123 | 在非 hook backend 上信任了過期的 hook |
+| operated correction 只能透過 `shadow::operated_state()` 與共用 `gated_override`；不得改寫 raw screen state 或回饋到它 | daemon/shadow/mod.rs（`operated_state`） | observer evidence 形成分類 feedback loop，或讓不同決策面分歧 |
 | Hook ToolUse 是 event-pair-closed，而非 clock-bounded（刻意如此——保護長時間執行的工具，即 #1985 那一類） | hook_shadow.rs:79-98 | 加上 clock backstop 會重新弄壞 #1523 當初要修的東西 |
 | `request_id` 在 bridge 處只產生一次，retry 時沿用 | agend-mcp-bridge.rs:329-340 | transport retry 造成重複的 side effect |
 | Inbox drain 回應 ≤ 48KB，使其維持 dedup-cacheable（< 64KB） | inbox/storage.rs:270 | lost-transport retry 會漏掉剩餘部分 |
@@ -231,7 +231,7 @@ Release → crates.io publish（見 RELEASING.md）。
    inline supervisor `maybe_scan` tracker，如今都是同一條
    `build_default_handlers` pipeline 中的 `PerTickHandler`；一個
    completeness invariant 釘住整組集合，使這套雙機制的分裂無法靜默重新出現。
-   （已註冊數量隨後續合併變動——2026-07 時為 35 個 handler。）
+   （已註冊數量隨後續合併變動——`1d83b423` 時為 37 個 handler。）
 2. **Heuristic vs hook / observed state，雙 reader**（§2.4）：snapshot 與若干
    dispatch 消費者走 `operated_state`（#2413/#2465——Shadow Observer 高信心
    修正，受 `AGEND_OBSERVED_DISPATCH` 閘控）。health/hang/recovery/respawn 與
@@ -265,8 +265,9 @@ handler 上限）、`tick_emitters_run_after_core_lock_drops`（#1644）、
 heartbeat-pair atomicity 稽核、spawn-rationale invariant（Phase 5b）、
 `daemon_git_helper_invariant`（#2068——per-slice 的 `MODULE_SCOPE` 封印：已 migrate 的
 module 中不得有未標記的原始 `Command::new("git")`）。
-Worktree 端的測試執行需要 `AGEND_GIT_BYPASS=1`（shim 會在受管 worktree 中攔截
-原始 git subprocess）。Review 紀律 §3.9：測試須透過真實進入點
+在 daemon-managed worktree 中直接正常執行測試。shim deny 後不得臨時加上
+`AGEND_GIT_BYPASS=1`；只有 repo 自己擁有的 wrapper 可以為其 nested-git 測試
+管線設定 bypass。Review 紀律 §3.9：測試須透過真實進入點
 搭配具代表性的 fixture 進入——合成的 unit-inject fixture 一再隱藏了 production 接線的漏洞。
 
 ## 8. 出處
@@ -274,7 +275,8 @@ Worktree 端的測試執行需要 `AGEND_GIT_BYPASS=1`（shim 會在受管 workt
 整理自六份 #2050 調查文件（daemon-core、mcp-comms、
 channels-tui、state-detection、worktree-git-fleet、ops-entry），由
 fixup-dev、fixup-dev-2 與 fixup-reviewer 對照 `main` @ `65d9ad82` 撰寫，
-另加上 2026-06-10 的 production-readiness 稽核。行號會漂移；
+另加上 2026-06-10 的 production-readiness 稽核，並於 2026-07-16 對
+`main@1d83b423` 做結構重驗。行號會漂移；
 那些命名過的 anchor（函式名、invariant test 名、issue 編號）才是
 穩定的參照。請在 REFACTOR-PLAN 的某一波 wave 落地時更新本地圖，
 而非每個 PR 都更新。

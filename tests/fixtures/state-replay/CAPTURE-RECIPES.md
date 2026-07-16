@@ -31,6 +31,8 @@ Before starting the capture session, prepare the environment:
   which codex && codex --version
   which kiro && kiro --version
   which opencode && opencode --version
+  which agy && agy --version
+  which grok && grok --version
   ```
 
 - [ ] Back up backend config if you need a clean-state capture:
@@ -262,6 +264,26 @@ script -q "$CAPTURE_DIR/codex-productive-silence.raw" codex
 # 3. Press Ctrl-C mid-response.
 ```
 
+#### R7. Agy productive_marker_fire (~5 min)
+
+```bash
+script -q "$CAPTURE_DIR/agy-productive-marker.raw" agy
+
+# 1. Ask Agy to create a file.
+# 2. Wait for the tool completion marker.
+# 3. Exit the session.
+```
+
+#### R8. Agy productive_silence (~5 min)
+
+```bash
+script -q "$CAPTURE_DIR/agy-productive-silence.raw" agy
+
+# 1. Ask a complex question.
+# 2. Wait 30-60 seconds during generation.
+# 3. Interrupt mid-response.
+```
+
 #### R9. Kiro productive_marker_fire (~5 min)
 
 ```bash
@@ -302,6 +324,26 @@ script -q "$CAPTURE_DIR/opencode-productive-silence.raw" opencode
 # 3. Press Ctrl-C mid-response.
 ```
 
+#### R13. Grok productive_marker_fire (~5 min)
+
+```bash
+script -q "$CAPTURE_DIR/grok-productive-marker.raw" grok
+
+# 1. Ask Grok to create a file or run a visible tool action.
+# 2. Wait for the completion marker.
+# 3. Exit the session.
+```
+
+#### R14. Grok productive_silence (~5 min)
+
+```bash
+script -q "$CAPTURE_DIR/grok-productive-silence.raw" grok
+
+# 1. Ask a complex question.
+# 2. Wait 30-60 seconds during generation.
+# 3. Interrupt mid-response.
+```
+
 ---
 
 ## Post-Capture Workflow
@@ -335,7 +377,7 @@ For each new fixture, add an entry to `tests/fixtures/state-replay/MANIFEST.yaml
 using the template from the setup checklist. Fields to fill:
 
 - `file`: filename (e.g. `claude-yes-proceed.raw`)
-- `backend`: backend identifier (`claude-code`, `codex`, `kiro-cli`, `opencode`, `agy`)
+- `backend`: backend identifier (`claude-code`, `codex`, `kiro-cli`, `opencode`, `agy`, `grok`)
 - `cli_version`: exact version string from `<backend> --version`
 - `recorded_on`: today's date in YYYY-MM-DD
 - `scenario`: one-line description of what was captured
@@ -367,9 +409,9 @@ entry -- the fixture is ground truth, not the expectation.
 |--------|------|
 | R1. claude-yes-proceed | ~3 min |
 | R2. claude-trust-prompt | ~2 min |
-| R3-R12. productive markers (5 backends x 2) | ~50 min |
+| R3-R14. productive markers (6 backends x 2) | ~60 min |
 | Post-capture sanitize + MANIFEST | ~15 min |
-| **Total session** | **~70 min** |
+| **Total session** | **~80 min** |
 
 Tip: batch the productive captures per-backend to minimize context
 switching. Do all claude captures, then all codex, etc.

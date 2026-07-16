@@ -3,9 +3,11 @@
 # AgEnD Terminal — Architecture Map
 
 > Current-state structural map, synthesized from the #2050 architecture pass
-> (six subsystem surveys, all claims verified against `main` @ `65d9ad8`,
-> 2026-06-12). Companion doc: [REFACTOR-PLAN.md](REFACTOR-PLAN.md) — the
-> phased plan derived from this map.
+> and revalidated for its named structural anchors against `main` @ `1d83b423`
+> on 2026-07-16. Survey-era LOC figures remain sizing hints rather than
+> invariants. [REFACTOR-PLAN.md](REFACTOR-PLAN.md) is the historical phased
+> plan derived from the original survey; current convergence status lives in
+> [architecture/ARCHITECTURE-14-LEDGER.md](architecture/ARCHITECTURE-14-LEDGER.md).
 >
 > Newcomers: read [ARCHITECTURE-QUICK-START.md](ARCHITECTURE-QUICK-START.md)
 > first. The original rewrite-era design doc is archived at
@@ -16,13 +18,14 @@
 ## 1. What it is
 
 A long-running daemon that supervises multiple AI coding agents
-(claude / codex / kiro / agy / opencode) as PTY child processes and gives
+(claude / codex / kiro / agy / opencode / grok) as PTY child processes and gives
 them: inter-agent MCP communication, fleet-as-code configuration, per-agent
 git-worktree isolation, health monitoring with auto-respawn, and TUI +
 Telegram remote control. The core value is **multi-agent orchestration**;
 everything else serves it.
 
-~292K LOC Rust across ~429 files under `src/` (integration tests extra).
+~340K LOC Rust across 489 tracked Rust files under `src/` at the revalidation
+baseline (integration tests extra).
 Four binaries: `agend-terminal` (daemon + TUI + CLI), `agend-mcp-bridge`
 (per-agent stdio↔TCP MCP relay), `agend-git` (PATH-shim `git` policy gate),
 and vendored `agentic-git` (flag-gated shim alternative; see fleet
@@ -40,15 +43,15 @@ The heart: observe each agent's state machine, react, recover.
 | Module | LOC | Role |
 |---|---|---|
 | `daemon/supervisor.rs` | 5408 | Per-agent state OBSERVATION + reaction emission + error recovery (SRL/ApiError). The 12 inline slow-tracker scans moved to `PerTickHandler`s in W1.1 (#2065) |
-| `daemon/mod.rs` | 2764 | Entry/init/shutdown; re-exports `build_default_handlers` from `per_tick` (35 registered handlers as of 2026-07) |
-| `daemon/per_tick/` | — | `PerTickHandler` trait + 35 handler impls, panic-guarded dispatch, boot-grace / `CadenceGate` |
+| `daemon/mod.rs` | 2764 | Entry/init/shutdown; the canonical handler builder lives in `per_tick` (37 registered handlers at `1d83b423`) |
+| `daemon/per_tick/` | — | `PerTickHandler` trait + 37 registered handlers, panic-guarded dispatch, boot-grace / `CadenceGate` |
 | `daemon/crash_respawn.rs` | 568 | Crash→respawn decision: health budget, escalation persist, respawn worker |
 | `health.rs` | 2385 | Per-agent hang/crash budgets, blocked-reason, escalation persist+rehydrate |
 | `state/mod.rs` | 2176 | Per-agent `StateTracker` — screen-heuristic state machine (see 2.4) |
 
 Periodic work is now a single pipeline (W1.1 / #2065, see §6.1): the daemon
-loop dispatches all registered `PerTickHandler`s (35 in
-`per_tick::build_default_handlers` as of 2026-07; count drifts as merges/
+loop dispatches all registered `PerTickHandler`s (37 in
+`per_tick::build_default_handlers` at `1d83b423`; count drifts as merges/
 extractions land — pin via the completeness invariant) with per-handler
 `catch_unwind` + timing. The 12 trackers that used to run inline in the
 supervisor `run_loop` were wrapped as handlers and appended in their
@@ -59,7 +62,7 @@ only `tick()` / `process_error_recovery()` / a boot-time sidecar GC
 
 ### 2.2 MCP layer + inter-agent comms (~22K LOC)
 
-Macro-architecturally sound: a single immutable 29-entry registry
+Macro-architecturally sound: a single immutable 32-entry registry
 (`mcp/registry.rs` `ALL_TOOLS`; count pinned by
 `tool_definitions_count_invariant_post_sprint_30`) pairs JSON-schema
 definitions with handler fn-pointers, dispatched through one validated
@@ -120,12 +123,15 @@ UsageLimit-release/heartbeat gates) → single transition funnel
 `record_set` (state/mod.rs:2038). Pattern priority is enforced by Vec
 position only — first-match-wins, no compile-time precedence invariant.
 
-A second, authoritative path exists for hook-capable backends (claude
-today): backend hooks POST events → `daemon/hook_shadow.rs`;
-`authoritative_state()` promotes a Fresh hook state over the heuristic,
-flag-gated, **snapshot-scoped only** (#1523 phase-1, the
-`per_tick/snapshot.rs:51` chokepoint). Five per-tick deciders still read
-raw heuristic state (see §6.2 — the planned phase-2 convergence).
+A second evidence plane feeds the Shadow Observer: Claude/Agy lifecycle hooks
+and Kiro's session stream produce higher-authority events beside the raw screen
+state. The reducer writes `observed_status`; the default-on
+`shadow::operated_state` gate may apply only a high-confidence Hook/Stream
+correction to `snapshot.json` and selected dispatch deciders
+(`AGEND_OBSERVED_DISPATCH=0` restores raw behavior). The old
+`hook_shadow::authoritative_state` POC was removed. Health, hang, recovery,
+respawn, and SRL paths deliberately keep reading raw state so a stale observed
+Active cannot mask a real wedge (see §6.2).
 
 Per-backend config is cleanly co-located in `BackendProfile`
 (patterns/behavioral/markers per backend); `backend.rs` owns spawn,
@@ -188,17 +194,13 @@ The load-bearing disciplines, each runtime- or CI-enforced:
 | UX sinks | mutex protects the sink vec only; clone Arcs, emit after release; emit is fire-and-forget | sink_registry.rs:67-74 |
 | Per-tick handlers | each `run()` wrapped in `catch_unwind` — one panic never skips siblings | per_tick/mod.rs:182-214 |
 
-One audited residual: a `handle.core.lock()` inside a registry-lock scope
-near supervisor.rs:1857 — flagged in #1530/F2; read it before any
-supervisor refactor.
-
 ## 4. Load-bearing invariants (beyond locks)
 
 | Invariant | Where | What breaks if violated |
 |---|---|---|
 | State pattern order: errors before Thinking/Idle, first-match wins | `BackendProfile.patterns` Vec order | misclassification → false idle/hang reactions |
 | Gate-gauntlet order in `feed_with_fg` (position gate before working-marker override, etc.) | state/mod.rs:1208-1757 | FP suppression regimes stop composing |
-| Hook promotion only via `authoritative_state()` (couples freshness to `has_state_hooks()`) — never `resolved_state_for` directly | hook_shadow.rs:113-123 | stale-hook trust on non-hook backends |
+| Operated correction only via `shadow::operated_state()` and the shared `gated_override`; never mutate or feed back into raw screen state | daemon/shadow/mod.rs (`operated_state`) | observer evidence can create a classification feedback loop or diverging decision surfaces |
 | Hook ToolUse is event-pair-closed, NOT clock-bounded (deliberate — protects long tools, the #1985 class) | hook_shadow.rs:79-98 | a clock backstop would re-break what #1523 exists to fix |
 | `request_id` generated once at the bridge, reused on retry | agend-mcp-bridge.rs:329-340 | duplicate side effects on transport retry |
 | Inbox drain response ≤ 48KB so it stays dedup-cacheable (< 64KB) | inbox/storage.rs:270 | lost-transport retry drops the remainder |
@@ -233,7 +235,7 @@ entry; none is free to "just clean up" without the listed care.
    inline supervisor `maybe_scan` trackers are now `PerTickHandler`s in the one
    `build_default_handlers` pipeline; a completeness invariant pins the full
    set so the two-mechanism split can't silently reappear. (Registered count
-   moves with later merges — 35 handlers as of 2026-07.)
+   moves with later merges — 37 handlers at `1d83b423`.)
 2. **Heuristic vs hook / observed state, dual readers** (§2.4): snapshot and
    several dispatch consumers use `operated_state` (#2413/#2465 — Shadow
    Observer high-confidence correction when `AGEND_OBSERVED_DISPATCH` is on).
@@ -271,8 +273,9 @@ handler cap), `tick_emitters_run_after_core_lock_drops` (#1644),
 heartbeat-pair atomicity audit, spawn-rationale invariant (Phase 5b),
 `daemon_git_helper_invariant` (#2068 — per-slice `MODULE_SCOPE` seal: no
 unmarked raw `Command::new("git")` in a migrated module).
-Worktree-side test runs need `AGEND_GIT_BYPASS=1` (the shim intercepts
-raw-git subprocesses in managed worktrees). Review discipline §3.9: tests
+Run tests normally inside the daemon-managed worktree. Do not add an ad-hoc
+`AGEND_GIT_BYPASS=1` after a shim denial; only repository-owned wrappers may
+set it for their own nested-git test plumbing. Review discipline §3.9: tests
 enter through real entry points with representative fixtures — synthetic
 unit-inject fixtures have repeatedly hidden production wiring gaps.
 
@@ -281,7 +284,8 @@ unit-inject fixtures have repeatedly hidden production wiring gaps.
 Synthesized from the six #2050 survey documents (daemon-core, mcp-comms,
 channels-tui, state-detection, worktree-git-fleet, ops-entry) authored by
 fixup-dev, fixup-dev-2 and fixup-reviewer against `main` @ `65d9ad82`,
-plus the 2026-06-10 production-readiness audit. Line numbers drift; the
+plus the 2026-06-10 production-readiness audit, then structurally revalidated
+at `main@1d83b423` on 2026-07-16. Line numbers drift; the
 named anchors (function names, invariant test names, issue numbers) are
 the stable references. Update this map when a REFACTOR-PLAN wave lands,
 not on every PR.

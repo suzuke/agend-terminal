@@ -6,7 +6,7 @@
 生命週期，以及冷啟動（沒有 daemon 在運行）與熱啟動（已有 daemon 在運行）
 之間的差異。
 
-內容對應 `fe528c1`（#879v3 revert 之後的狀態）。
+內容對應 `1d83b423`（2026-07-16）。
 
 ## TL;DR 對照表
 
@@ -22,7 +22,7 @@
 
 - `attach <name>` — 在目前的 shell 中連接到既有 agent 的 PTY。Ctrl+B d
   會 detach 回到 shell。
-- `connect <name> --backend X` — 向運行中的 daemon 註冊一個新 agent。
+- `connect <name> --backend X` — 在目前終端暫時註冊、spawn、等待並解除註冊一個 external backend。
 - `stop` — 乾淨地關閉 daemon。
 - `kill <name>` — 停止單一 agent。
 - `list`（別名 `status`、`ls`）— 列出運行中的 agent。
@@ -39,8 +39,8 @@
 
 決策分成 4 個步驟：
 
-1. `try_attach()` — 掃描 `~/.agend-terminal/run/*`，探測 `api.port`（TCP
-   connect，200ms timeout）。如果探測成功，回傳 Attached。
+1. `try_attach()` — 掃描 `$AGEND_HOME/run/*`，以三次 100ms 嘗試探測
+   `api.port`（總 budget 300ms）。任一次成功就回傳 Attached。
 2. 取得 daemon 的獨佔鎖（`acquire_daemon_lock`）。這會擋掉其他 starter
    彼此競爭。
 3. 再跑一次 `try_attach()`（TOCTOU 防護——在步驟 1 和步驟 2 之間可能又有
@@ -70,8 +70,8 @@ Attached 路徑，在冷啟動時自動 spawn 一個 detached daemon，讓這種
 消失。
 
 PR #903（#879v3）嘗試這麼做，但在踩到兩個既有的競態 bug 之後被 revert
-（`fe528c1`）——這兩個 bug 原本被舊的 Owned 模式遮蓋住了（見 issue #879
-——#879v4 是針對這些競態的後續修復，而不是 always-Attached 這個轉向本身）。
+（`fe528c1`）。Issue #879 已於 2026-05-18 在後續 race work 完成後關閉；上述
+Owned／Attached 不對稱仍是現行行為，並非進行中的 always-Attached migration。
 
 ## Tray 分離契約（#548 Q7）
 
@@ -102,4 +102,4 @@ fork 成 `agend-terminal start --foreground ...`——傳入 `--foreground` 是
 - `src/bootstrap/daemon_spawn.rs` — detached-spawn 實作。
 - `src/tray/mod.rs::start_daemon_via_cli` — tray 的 CLI shell-out。
 - `src/app/mod.rs::run_app` — app 的 bootstrap 消費端。
-- Issue #879 — always-Attached 轉向（進行中）。
+- Issue #879 — 已關閉；記錄被 revert 的 always-Attached 轉向與後續 race 修正。

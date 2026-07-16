@@ -6,7 +6,7 @@
 
 > **Target audience:** Both operators and agents.
 
-**Diagnosing a stuck agent.** An agent's health status shows "hung" in the dashboard. You `attach` to its terminal to see what's happening — maybe it's waiting for a permission prompt, or stuck in a loop. You can type directly to unstick it, or `kill` and let the daemon auto-restart.
+**Diagnosing a stuck agent.** An agent's health status shows "hung" in the dashboard. You `attach` to its terminal to see what's happening — maybe it's waiting for a permission prompt, or stuck in a loop. You can type directly to unstick it; use `kill` only when you intend to stop and remove that process.
 
 **Scripted automation.** Your CI pipeline needs to send instructions to a running agent. Using `inject`, you send text into the agent's PTY from a shell script — no interactive terminal session required. The agent processes it as if an operator typed it.
 
@@ -204,9 +204,9 @@ agend-terminal kill dev
 6. As a fallback, also calls the PTY handle's `kill()` method
 7. Records the event to the event log
 
-### Auto-Restart
+### Restart semantics
 
-After `kill`, the daemon's health monitoring may automatically restart the agent (depending on current crash count and backoff state). To permanently stop an agent, remove it from fleet.yaml and restart the daemon, or use `agend-terminal stop` to stop the entire daemon.
+An operator/API `kill` is classified as a signal kill, not a crash, and is not auto-respawned. Crash supervision is a separate path. Start or respawn the agent explicitly when you want it back; remove it from fleet.yaml if it should stay out of future fleet starts.
 
 ### External Agents
 
@@ -214,13 +214,13 @@ For agents added via the `connect` command, `kill` removes them from the externa
 
 ---
 
-## connect — Attach an External Agent
+## connect — Run an External Agent
 
 ```
 agend-terminal connect <name> --backend <backend> [--working-dir <path>] [-- extra-args...]
 ```
 
-Connects a locally running agent to the daemon, giving it access to the daemon's MCP tools and communication features.
+Registers an external instance, spawns the selected backend in the current terminal with fleet MCP configuration, waits for it to exit, and deregisters it. It does not attach to an already-running process.
 
 ### Usage
 
@@ -229,14 +229,14 @@ Connects a locally running agent to the daemon, giving it access to the daemon's
 agend-terminal connect my-agent --backend claude --working-dir ~/Projects/foo
 
 # Pass extra arguments to the backend
-agend-terminal connect my-agent --backend gemini -- --model pro
+agend-terminal connect my-agent --backend grok -- --model fast
 ```
 
 ### Differences from fleet.yaml
 
 - Agents in fleet.yaml are **managed** (daemon spawns and manages their lifecycle)
-- Agents added via `connect` are **external** (daemon provides tools only, no lifecycle management)
-- External agents lack auto-restart, health monitoring, and related features
+- Agents added via `connect` are **external**: the CLI process owns their spawn/wait/deregister lifecycle, while the daemon provides registration and tools
+- External agents do not get daemon-owned PTY, auto-restart, or managed health supervision
 
 ---
 
@@ -297,9 +297,8 @@ agend-terminal list --detailed
 # Try attaching to see where it's stuck
 agend-terminal attach dev
 
-# Force restart if needed
+# Stop the agent if needed; restart is explicit
 agend-terminal kill dev
-# The daemon will auto-restart the agent
 ```
 
 ---
@@ -316,9 +315,9 @@ Possible causes:
 
 Confirm the agent's state is `ready` or `idle`. If the agent is in `thinking` or `tool_use` state, injected text enters the PTY buffer but the agent may not process it immediately.
 
-### Q: Agent auto-restarted after kill — how to prevent it?
+### Q: Does `kill` auto-restart the agent?
 
-The daemon's health monitor auto-restarts crashed agents by default. To permanently disable an agent, remove it from fleet.yaml and restart the daemon. Or simply `agend-terminal stop` to stop the entire daemon.
+No. An explicit signal kill is not treated as a respawnable crash. Restart the agent explicitly if needed; remove it from fleet.yaml to keep it out of later fleet starts, or use `agend-terminal stop` for the entire daemon.
 
 ### Q: Can I attach to multiple agents at once?
 

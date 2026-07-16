@@ -30,7 +30,7 @@ process notes are English-only.
 | Communication | [EN](FEATURE-communication.md) | [中文](FEATURE-communication.zh-TW.md) | `send` / `inbox` / `reply` — how agents talk |
 | Task Board | [EN](FEATURE-task-board.md) | [中文](FEATURE-task-board.zh-TW.md) | Shared work tracking: create, claim, done |
 | Teams | [EN](FEATURE-teams.md) | [中文](FEATURE-teams.zh-TW.md) | Grouping agents and scoping coordination |
-| Git Worktree Isolation | [EN](FEATURE-worktree.md) | [中文](FEATURE-worktree.zh-TW.md) | Per-agent worktrees and how they are pooled |
+| Git Worktree Isolation | [EN](FEATURE-worktree.md) | [中文](FEATURE-worktree.zh-TW.md) | Branch-bound managed worktrees and pooling |
 
 ### Advanced
 
@@ -56,7 +56,7 @@ process notes are English-only.
 | Document | EN | 中文 | What it covers |
 |---|---|---|---|
 | Architecture | [EN](architecture.md) | [中文](architecture.zh-TW.md) | Daemon design, worktree pool, health monitor, channel lifecycle |
-| MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | All 29 agent-coordination MCP tools, by category |
+| MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | All 32 agent-coordination MCP tools, by category |
 | Environment Variables | [EN](env-vars.md) | [中文](env-vars.zh-TW.md) | Every `AGEND_*` variable and its effect |
 | Git Behavior | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | What the daemon changes in a spawned agent's git env |
 | Compatibility Policy | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | On-disk format stability guarantees under `$AGEND_HOME` |

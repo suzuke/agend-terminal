@@ -19,8 +19,8 @@ official knobs to opt out.
 | `<pwd>/CLAUDE.md` and `<pwd>/.claude/CLAUDE.md` | Per project | Loaded if present |
 
 agend-terminal already gives every managed instance its own working directory
-under `~/.agend-terminal/workspace/<instance-name>/` (or a dedicated worktree
-under `~/.agend-terminal/worktrees/<…>/` when a branch is assigned). Because the
+under `$AGEND_HOME/workspace/<instance-name>/` (or a dedicated worktree under
+`$AGEND_HOME/worktrees/<…>/` when a branch is assigned). Because the
 auto-memory path is derived from the pwd slug, **each instance automatically
 gets its own empty auto-memory directory** — nothing leaks between instances on
 that axis.
@@ -71,14 +71,14 @@ testing or when verifying default behavior from scratch.
 ## Applying it inside agend-terminal
 
 `create_instance` does not currently inject environment variables, but it does
-provision a per-instance workspace at `~/.agend-terminal/workspace/<name>/`. The
+provision a per-instance workspace at `$AGEND_HOME/workspace/<name>/`. The
 practical recipe:
 
 1. Pick the instance name you intend to spawn — say, `clean-agent`.
 2. Pre-create the workspace and drop a settings file:
    ```bash
-   mkdir -p ~/.agend-terminal/workspace/clean-agent/.claude
-   cat > ~/.agend-terminal/workspace/clean-agent/.claude/settings.json <<'JSON'
+   mkdir -p "$AGEND_HOME/workspace/clean-agent/.claude"
+   cat > "$AGEND_HOME/workspace/clean-agent/.claude/settings.json" <<'JSON'
    {
      "autoMemoryEnabled": false,
      "claudeMdExcludes": ["~/.claude/CLAUDE.md"]

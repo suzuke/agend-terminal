@@ -7,7 +7,7 @@
 | Binary | Purpose |
 |---|---|
 | `agend-terminal` | Main program — all features enter through here |
-| `agend-git` | Git PATH shim for fleet worktrees — intercepts spawned agents' `git` (route / passthrough / deny) |
+| `agend-git` | Legacy kill-only compatibility helper; git interception is owned by the vendored `agentic-git` shim |
 | `agend-mcp-bridge` | MCP stdio ↔ daemon bridge — spawned per agent by the AI backend, not run directly |
 
 ## Startup Modes
@@ -77,13 +77,13 @@ access without keeping a terminal open.
 agend-mcp-bridge
 ```
 
-Stdio JSON-RPC 2.0 server providing 35+ tools (task management,
+Stdio JSON-RPC 2.0 server providing 32 tools (task management,
 decisions, messaging, CI watch, etc.). Not meant to be run manually.
 
-Each AI backend (Claude Code, Kiro, Codex, Gemini, OpenCode) auto-
+Each supported AI backend (Claude Code, Kiro, Codex, OpenCode, Antigravity,
+and Grok) auto-
 launches this as a child process based on its MCP config — the
-daemon writes the bridge path into every backend's mcp.json on
-every start.
+daemon writes the bridge configuration in that backend's native format.
 
 **When to use:** You don't run this directly. It's started
 automatically when an AI agent needs to talk to the daemon.
@@ -132,7 +132,7 @@ alerts pushed back to the group).
 ```yaml
 channel:
   type: telegram
-  bot_token_env: AGEND_BOT_TOKEN          # env var holding the bot token
+  bot_token_env: AGEND_TELEGRAM_BOT_TOKEN # env var holding the bot token
   group_id: -1001234567890                # Telegram chat id of the group
   user_allowlist: [123456789]             # operator Telegram user_id(s)
 ```
@@ -140,12 +140,12 @@ channel:
 Then export the bot token before `agend-terminal start`:
 
 ```bash
-export AGEND_BOT_TOKEN="123456:abcdef..."
+export AGEND_TELEGRAM_BOT_TOKEN="123456:abcdef..."
 ```
 
 ### How to get values
 
-- **Bot token** (`AGEND_BOT_TOKEN`): create a bot via [@BotFather](https://t.me/BotFather), copy the token it returns.
+- **Bot token** (`AGEND_TELEGRAM_BOT_TOKEN`): create a bot via [@BotFather](https://t.me/BotFather), copy the token it returns.
 - **Group id**: add your bot to the target group, then send any message and inspect the bot's `getUpdates` API (`https://api.telegram.org/bot<TOKEN>/getUpdates`) — the `chat.id` is your `group_id` (negative for groups / supergroups).
 - **User id**: message [@userinfobot](https://t.me/userinfobot) on Telegram and it replies with your numeric user id. Add every operator who should be allowed to command the fleet.
 
@@ -155,62 +155,21 @@ export AGEND_BOT_TOKEN="123456:abcdef..."
 |---|---|---|
 | `[123, 456]` (≥ 1 entry) | Listed users only — others rejected | ✅ Notifications delivered |
 | `[]` (empty list) | Everyone rejected | 🔇 Notifications dropped (fail-closed) |
-| field absent / `null` | Legacy: everyone accepted (deprecated) | 🔇 Notifications dropped (fail-closed) |
+| field absent / `null` | Everyone rejected | 🔇 Notifications dropped (fail-closed) |
 
-The outbound gate landed in [PR #216](https://github.com/suzuke/agend-terminal/pull/216) (Sprint 21 Phase 1) to close the
-[Sprint 20.5 cross-validation](codebase-review-2026-04-27/SYNTHESIS.md) outbound info-leak finding (40-line PTY tails were leaking to anyone added to a bound group regardless of inbound auth state). Inbound fail-closed is being landed in Phase 2.
+Both inbound commands and outbound notifications are fail-closed when the
+allowlist is absent or empty. There is no legacy accept-all fallback.
 
 ### Migration: upgrading from < Sprint 21
 
-If your `fleet.yaml` previously had a `channel.telegram` block **without** `user_allowlist`, the fleet still runs after upgrading but **outbound notifications now drop silently** (fail-closed). You will see:
+If your `fleet.yaml` has a Telegram channel without a non-empty
+`user_allowlist`, the daemon keeps the channel disabled for inbound commands and
+outbound notifications. Add the operator Telegram user IDs to restore both
+directions; bot token and group ID remain unchanged.
 
-```
-WARN: telegram channel.user_allowlist is not set — any group member can command the fleet. \
-      Set `user_allowlist: [123, 456]` in fleet.yaml to lock this down.
-```
-
-To restore outbound notifications, add your operator user_id(s) to `user_allowlist`. This is the **only required migration step**; bot token and group id remain unchanged.
-
-If you previously relied on legacy "anyone in the group can command the fleet" behaviour, the inbound side still accepts all users until Phase 2 lands; configure `user_allowlist` now to close both sides simultaneously.
-
-### `outbound_capabilities` semantics (Sprint 23 P1 — default-open)
-
-Per-instance gate for **agent-callable** outbound MCP→Channel ops (`reply` / `react` / `edit_message` / `delegate_task` provenance). Independent of `user_allowlist` (which gates inbound + daemon-internal notifications and is still **fail-closed**).
-
-| `outbound_capabilities` value | Behaviour |
-|---|---|
-| field absent | **Default-open — all ops permitted** |
-| `[reply, react, edit, inject_provenance]` | Only listed ops permitted |
-| `[]` (explicit empty) | All ops rejected (operator opt-out, retained) |
-
-**Why default-open?** Single-operator threat model. The TUI is already full machine access; the cascade-attack-chain defence from Sprint 22 P0 was over-spec for the actual deployment shape. Operator explicitly accepts the security trade-off (Sprint 23 P1 reversal).
-
-Built-in instances (`general` and any future auto-created coordinator) inherit default-open — no auto-injected list needed (was the case in Sprint 22 P0 PR #230 and is now retired).
-
-### Restricting / opting out
-
-Default-open is the recommended posture for single-operator deployments. Two opt-out shapes if you want the gate active:
-
-**Restrict to a subset of ops** (e.g. allow `reply` only):
-
-```yaml
-instances:
-  my-worker:
-    backend: claude
-    outbound_capabilities: [reply]
-    # … other fields …
-```
-
-**Block all agent outbound** (relay / read-only roles):
-
-```yaml
-instances:
-  my-readonly-relay:
-    backend: claude
-    outbound_capabilities: []                # explicit "no agent outbound"
-```
-
-See `docs/archived/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sprint 22 P0 fail-closed → Sprint 23 P1 default-open reversal section) and the `ChannelOpKind` enum reference.
+The former per-instance `outbound_capabilities` layer has been removed. Do not
+add it to new configurations; channel authorization is enforced by the channel
+allowlist and operator authority gates.
 
 ## Other Commands
 
@@ -221,13 +180,17 @@ See `docs/archived/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sp
 | `status` | Detailed agent status (state, health) |
 | `inject <name> <text>` | Inject text into an agent's PTY |
 | `kill <name>` | Kill a specific agent |
-| `connect <name>` | Connect an external agent to the daemon |
+| `connect <name>` | Run a backend under temporary daemon registration |
 | `stop` | Stop the daemon |
 | `quickstart` | Interactive setup (detect backends, configure Telegram, generate fleet.yaml) |
 | `doctor` | Health check (verify installation, backends, connectivity) |
 | `bugreport` | Generate diagnostic report with logs and config |
 | `verify [--quick]` | Full E2E verification (subsumes the former `test` subcommand) |
-| `capture` | Capture backend output (debugging) |
+| `mode <active|away|sleep>` | Set operator availability and delegation |
+| `service <install|uninstall|status>` | Manage the OS service |
+| `skills <action>` | Manage shared backend skills |
+| `capture backend|promote` | Capture backend output or promote a fixture |
+| `verify-push` | Verify a semantic push claim against a diff |
 | `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell) |
 | `admin cleanup-branches [--yes]` | Delete local branches whose PRs were merged (dry-run by default) |
 | `admin cleanup-zombies [--age <D>] [--yes]` | Kill zombie daemons holding stale `run/<pid>/` (#927; default `--age 14d`) |

@@ -26,9 +26,9 @@ Write the problem, not the fix. -->
 
 <!-- Minimal steps to trigger. Copy-pasteable is best.
 Example:
-1. `agend-terminal create_instance name=foo backend=claude`
+1. `agend-terminal start --agents foo:claude --foreground`
 2. Wait for telegram topic (~3s)
-3. Check `~/.agend-terminal/fleet.yaml` → expected topic_id=<n>, actual null
+3. Check `$AGEND_HOME/fleet.yaml` → expected topic_id=<n>, actual null
 
 If not reliably reproducible, mark "intermittent" and describe the
 trigger conditions you've observed. -->
@@ -44,7 +44,7 @@ trigger conditions you've observed. -->
      - daemon build: commit on the first line of daemon startup log
      - OS: macOS 14.5 / Linux Ubuntu 24.04 / Windows 11 / …
      - Backend (if relevant): claude-code 2.1.81 / codex-cli x.x /
-       kiro-cli x.x / gemini-cli 0.42.0 / opencode x.x
+       kiro-cli x.x / opencode x.x / agy x.x / grok x.x
      - Shell: zsh / bash / fish -->
 
 ## Concrete evidence

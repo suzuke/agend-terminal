@@ -6,37 +6,54 @@ Every backend runs through the same PTY-orchestration machinery, but the UI each
 
 **Discipline**: every cell here is either backed by a `path:line` code citation (this repo, `main` branch) or explicitly marked **unverified**. No cell is a guess. Where a claim couldn't be confirmed against the source, it says so — an honest gap is worth more than a plausible-sounding fabrication.
 
+**Revalidated**: `main@1d83b423` (2026-07-16). `Backend::all()` contains six
+first-class backends: ClaudeCode, KiroCli, Codex, OpenCode, Agy, and Grok.
+Gemini is retired; Shell and `Raw(String)` remain utility variants outside
+`Backend::all()`.
+
 ## Scope boundary vs. #2413
 
 This matrix documents **current, already-shipped** behavior — what state detection actually consumes in production today, for each backend. It is a snapshot, not a plan.
+
+Two views intentionally coexist: `core.state.current` is always the raw
+screen-heuristic baseline, while the default-on Shadow Observer may apply a
+high-confidence Hook/Stream correction through `shadow::operated_state` for
+`snapshot.json` and selected dispatch deciders. Health/recovery paths keep the
+raw view. The signal column below names both when a backend has that second
+plane; it does not imply that hooks rewrite `core.state.current`.
 
 [#2413](https://github.com/suzuke/agend-terminal/issues/2413) ("Out-of-path API-activity probe to fix false-idle blind spot in pattern-based agent_state") is the **improvement roadmap**: an ongoing empirical effort (the Shadow Observer, see `docs/SHADOW-OBSERVER-QUANT-AGY-2413.md` and its claude/codex siblings under `docs/archived/`) to measure whether additional structured signals — beyond raw PTY-pattern matching — can close the false-idle blind spot backend-by-backend. Where this matrix says "PTY heuristic," #2413's work may already be actively quantifying whether that can be upgraded for that backend. This document doesn't speak to that roadmap or its findings — only to what's true today. Read #2413's own docs for where that effort currently stands.
 
 ## Signal-authority ladder (for reference)
 
-`src/daemon/shadow/evidence.rs:65-90` ranks signal authority, highest first: **Hook** (`Confirmed` confidence) → **Stream** (session-log tail, e.g. Kiro's jsonl) → **Screen** (PTY pattern match) → **ProcessHeuristic** → **Inferred**. The per-backend sections below say which rung each backend actually sits on for `agent_state` today — not which rung it could theoretically reach.
+`src/daemon/shadow/evidence.rs` ranks signal authority, highest first: **Hook** (`Confirmed` confidence) → **Stream** (session-log tail, e.g. Kiro's jsonl) → **Screen** (PTY pattern match) → **ProcessHeuristic** → **Inferred**. The per-backend sections distinguish the raw baseline from any higher-authority observed correction actually wired today.
 
 ## Overview
 
 | Backend | Agent-state signal | Context usage | Submit / inject | Resume | MCP | Fragile-points summary |
 |---|---|---|---|---|---|---|
-| **ClaudeCode** | Hook, `Confirmed` authority — the only backend at the top of the ladder | StatusLine (fleet's custom format only) | Bulk, `submit_key="\r"` | `--continue`, gated by on-disk session check | Yes — explicit `--mcp-config` flag | Best-covered backend; still version-pinned to a specific Claude Code release |
+| **ClaudeCode** | Screen baseline + Hook/`Confirmed` observed correction; shares the top observer rung with Agy | StatusLine (fleet's custom format only) | Bulk, `submit_key="\r"` | `--continue`, gated by on-disk session check | Yes — explicit `--mcp-config` flag | Best-covered backend; still version-pinned to a specific Claude Code release |
 | **Codex** | Pure PTY/Screen heuristic — no hook | Unavailable | Typed/paced (`typed_inject=true`, #1670) | Hardcoded `resume --last` in spawn args, not via the generic `ResumeMode` abstraction | Yes — per-project `.codex/config.toml` | Most PTY-dependent backend; root fragility is #1670's ratatui input widget |
-| **KiroCli** | PTY/Screen heuristic drives `agent_state`; a separate jsonl tail exists but is Stream-authority only and never promotes | StatusLine | Bulk, `submit_key="\r"`, fixed 50ms pre-submit sleep | `--resume` | Yes — own auto-discovery (`.kiro/settings/mcp.json`) | Only backend needing `redraw_after_resize`; several input-line false-latch guards |
+| **KiroCli** | Screen baseline + Stream-authority session-tail correction when the observer gate has high confidence | StatusLine | Bulk, `submit_key="\r"`, fixed 50ms pre-submit sleep | `--resume` | Yes — own auto-discovery (`.kiro/settings/mcp.json`) | Only backend needing `redraw_after_resize`; several input-line false-latch guards |
 | **OpenCode** | Pure PTY/Screen heuristic — no hook | Unavailable (footer shows a token/cost string that isn't parsed) | Typed/paced (`typed_inject=true`) | `--continue`; carries an **open** dummy-session-id incident | Yes — `opencode.json` `"mcp"` key | Open: dummy-session wedge (rare "process never exits" variant evades detection) |
-| **Agy** | Hybrid — real hooks exist but only for busy/idle transitions; every finer state (rate-limit, API error, git conflict, permission prompt, ...) is PTY/Screen heuristic | Unavailable | Typed/paced, ~2ms/byte | `--continue` — code comment says "operator-verified," no automated behavior test found | Yes — standard `mcpServers` schema at `.agents/mcp_config.json` | Newest first-class backend (#987, Gemini's successor); hooks were dead once and had to be re-fixed |
+| **Agy** | Screen baseline + Hook correction for busy/idle; finer states remain screen heuristic | Unavailable | Typed/paced, ~2ms/byte | `--continue` — code comment says "operator-verified," no automated behavior test found | Yes — standard `mcpServers` schema at `.agents/mcp_config.json` | Gemini's successor; hooks were dead once and had to be re-fixed |
+| **Grok** | PTY/Screen heuristic; no lifecycle hook | Unavailable | Typed/paced | `--continue`, gated by a cwd-scoped on-disk session probe | Yes — project `.grok/config.toml` | Newest first-class backend; active/idle patterns recalibrated against Grok 0.2.93 after #2707 false-idle |
 | **Shell** / **Raw(String)** | None — no detection patterns at all; `agent_state` is hardcoded to `Idle` on spawn | Not applicable | Bulk; text still gets written + submitted (not a true no-op), just no backend-specific customization | Not supported — `args_for()` returns empty, so Resume and Fresh spawn identically | None — MCP config is skipped entirely for this backend | Utility tier; no incidents found in CHANGELOG (**unverified** whether that means "never broke" or "never tracked") |
 
 ---
 
 ## ClaudeCode
 
-**Agent-state signal**: Hook-based, `authority=Hook`, `confidence=Confirmed` — the highest rung on the ladder (`src/daemon/shadow/evidence.rs:65-90,92-109`). `has_state_hooks()` names only `ClaudeCode` and `Agy` (`src/backend.rs:55-76`).
+**Agent-state signal**: the raw state remains the PTY/Screen heuristic. Claude
+lifecycle hooks additionally produce `authority=Hook`, `confidence=Confirmed`
+evidence — the highest observer rung (`src/daemon/shadow/evidence.rs`). A fresh,
+high-confidence disagreement may correct the operated snapshot/dispatch view;
+it never rewrites `core.state.current`. `has_state_hooks()` names Claude and Agy.
 Unverified: whether the initial ready-gate (`ready_pattern: "bypass permissions|❯"`) ever consults hooks, or is pure screen-pattern like every other backend's ready-gate — no hook-based ready path was found, but this is absence-of-evidence, not a confirmed negative.
 
 **Context usage**: `ContextProvider::StatusLine` via `CLAUDE_CONTEXT_PATTERN` (`src/backend_profile.rs:39-46,86-92`) — but the regex only matches the fleet's custom statusline format (`Ctx Used: N%`). A vanilla Claude Code install renders an inverted "remaining %" string this pattern deliberately does not match — an unimplemented gap, not a bug.
 
-**Submit / inject**: Bulk inject, `submit_key: "\r"`, `typed_inject: false` (inherits `DEFAULTS`, `src/backend.rs:382-399`; pinned by test array at `:1474-1486`) — unlike Codex/OpenCode/Agy, which all use paced typed inject. No pre-send confirm-first gate exists; instead there's a post-hoc, hook-gated delivery-verification watchdog (`src/daemon/inject_delivery.rs:1-20`, 30s window) — which in practice only fires for backends with hooks, i.e. effectively Claude-only.
+**Submit / inject**: Bulk inject, `submit_key: "\r"`, `typed_inject: false` (inherits `DEFAULTS`, `src/backend.rs:382-399`; pinned by the preset-default test) — unlike Codex/OpenCode/Agy/Grok, which use paced typed inject. No pre-send confirm-first gate exists; instead there's a post-hoc, hook-history-gated delivery-verification watchdog (`src/daemon/inject_delivery.rs`, 30s window). It can arm for Claude or Agy once that instance has emitted hook-shadow evidence; heuristic-only backends never arm.
 
 **Resume**: `ResumeMode::ContinueInCwd { flag: "--continue" }` (`src/backend.rs:405`), gated by on-disk session detection reading `~/.claude/projects/<encoded-cwd>/*.jsonl` (`src/backend.rs:878+`) — auto-downgrades to Fresh when no resumable session exists.
 
@@ -64,7 +81,14 @@ Unverified: whether the initial ready-gate (`ready_pattern: "bypass permissions|
 
 ## KiroCli
 
-**Agent-state signal**: PTY/Screen heuristic drives the real `agent_state` today (`src/backend_profile.rs:220-273`, `kirocli_profile()`). A separate `~/.kiro/sessions/cli/<uuid>.jsonl` read-only tail exists (`src/daemon/shadow/kiro.rs:1-23`, wired live in production per `src/app/mod.rs:2774-2797`), but the whole Shadow Observer system is explicitly "additive only... never drives `agent_state`" (`src/daemon/shadow/mod.rs:15-16`) — it sits at `Authority::Stream`, below `Authority::Hook`. Kiro has no lifecycle hook at all. Caveat: the jsonl only flushes at tool-round/turn-end (not prompt-submit), so a pure-thinking turn with no tool calls isn't caught mid-turn even by the Stream-authority shadow.
+**Agent-state signal**: PTY/Screen heuristic remains the raw baseline
+(`kirocli_profile()`). A separate `~/.kiro/sessions/cli/<uuid>.jsonl` read-only
+tail emits `Authority::Stream` evidence (`src/daemon/shadow/kiro.rs`). When the
+shared observer gate has a fresh high-confidence correction, that Stream state
+may drive the operated snapshot/dispatch view; it never rewrites the raw state.
+Kiro has no lifecycle hook. Caveat: the jsonl flushes at tool-round/turn-end,
+not prompt-submit, so a pure-thinking turn with no tool call is not caught
+mid-turn by this plane.
 
 **Context usage**: StatusLine, available — `KIRO_CONTEXT_PATTERN = r"◔\s*(\d+(?:\.\d+)?)\s*%"` (`src/backend_profile.rs:97`). The doc comment at `:38-46` explicitly names Claude and Kiro as the only two `StatusLine` providers.
 
@@ -98,7 +122,12 @@ Unverified: whether the initial ready-gate (`ready_pattern: "bypass permissions|
 
 ## Agy
 
-**Agent-state signal**: Hybrid. Real lifecycle hooks exist (`has_state_hooks()` returns true, `src/backend.rs:74-76`) but fire only for busy/idle transitions (`PreInvocation`→`UserPromptSubmit`/`Stop`, `src/mcp_config.rs:470`) — empirically confirmed to carry no tool-call-granularity signal (task-board finding `t-...93090-0`). Every finer state (`Active`, `UsageLimit`, `RateLimit`, `ApiError`, `GitConflict`, `PermissionPrompt`) is pure PTY/Screen heuristic — 8 ordered regexes (`src/backend_profile.rs:129-213`).
+**Agent-state signal**: Hybrid. The raw state remains PTY/Screen heuristic.
+Lifecycle hooks (`has_state_hooks() == true`) emit busy/idle evidence through
+`PreInvocation` / `Stop`; a fresh high-confidence result may correct the
+operated snapshot/dispatch view. They provide no tool-call granularity
+(task-board finding `t-...93090-0`), so finer states such as UsageLimit,
+RateLimit, ApiError, GitConflict, and PermissionPrompt remain screen-derived.
 
 **Context usage**: Unavailable — `context_pattern: None` (`src/backend_profile.rs:209`), explicitly grouped with Codex/OpenCode as having "no trustworthy passive context signal" (`src/backend_profile.rs:43-45`).
 
@@ -106,9 +135,42 @@ Unverified: whether the initial ready-gate (`ready_pattern: "bypass permissions|
 
 **Resume**: `ResumeMode::ContinueInCwd { flag: "--continue" }` (`src/backend.rs:613`) — the code comment says "operator-verified in issue body," but no automated CLI-behavior test was found, only a unit-test pin of the args themselves.
 
-**MCP**: Yes — standard `{command, args, env}` `mcpServers` schema at `<workdir>/.agents/mcp_config.json` (`src/mcp_config.rs:391-436`, `mcp_server_entry` at `:86-99`); `fleet_mcp_supported: true` (`src/backend.rs:641`, test `:1436`). A **stale doc comment** was found at `src/backend.rs:1416-1421` claiming Agy's MCP support is `false`/unsupported — this is outdated and directly contradicted by the actual assertion two lines later. Worth a follow-up doc-comment cleanup, independent of this matrix.
+**MCP**: Yes — standard `{command, args, env}` `mcpServers` schema at `<workdir>/.agents/mcp_config.json` (`src/mcp_config.rs::configure_agy`, `mcp_server_entry`); `fleet_mcp_supported: true` in the Agy preset and its regression test. A **stale field doc comment** near `BackendPreset::fleet_mcp_supported` still describes Agy as unsupported; the live preset, writer, and test directly contradict it. That source-comment cleanup is independent of this matrix.
 
 **Known fragile points**: #987 (Agy added), #995 (workspace-trust dismiss + a dead `.antigravitycli/` MCP write path), #1547 (fixed the real MCP path to `.agents/`), #1580 (Gemini retired, Agy is its successor), #1523 / #2413 Phase D (hooks were dead at one point and had to be re-fixed — see the scope-boundary note above), #2236 (quota-wall pattern ordering), #2409 (a transient high-traffic `ApiError` pattern), #2524 P1b-r1/r2 (a missing `GitConflict` pattern; the `RateLimit` pattern is flagged low-confidence/synthetic — not yet verified against real Agy output).
+
+---
+
+## Grok
+
+**Agent-state signal**: PTY/Screen heuristic with no lifecycle hook.
+`has_state_hooks()` excludes Grok (`src/backend.rs:60-77`). Its profile keeps a
+deliberately small ordered set: project-trust `PermissionPrompt`, busy
+`Active` (`[stop]` / `Ctrl+c:cancel`), then completion/prompt `Idle`
+(`src/backend_profile.rs:129-181`).
+
+**Context usage**: Unavailable — `context_pattern: None`
+(`src/backend_profile.rs:182`); no passive token-percentage parser is shipped.
+
+**Submit / inject**: `typed_inject: true`, default `submit_key: "\r"`; the
+full-screen TUI requires paced injection (`src/backend.rs:658-667`). The
+first-use project trust modal is dismissed with one Enter, and the stable empty
+prompt marker is `❯`.
+
+**Resume**: `ResumeMode::ContinueInCwd { flag: "--continue" }`, but unlike an
+optimistic resume it is gated by `grok_session::has_resumable`: the encoded cwd
+directory must contain a session subdirectory (`src/backend.rs:668-678,978+`).
+
+**MCP**: Yes. `configure_grok` writes project-local `.grok/config.toml` using
+Grok's native `[mcp_servers.agend-terminal]` schema and never writes the user's
+global `~/.grok` config (`src/mcp_config.rs:906-1025`).
+
+**Known fragile points**: the original one-shot calibration treated permanent
+footer chrome as busy/idle evidence and produced systemic false-idle. #2707
+recalibrated the profile against a live Grok 0.2.93 soak; finer rate-limit/auth
+states still have no reliable screen signature and remain deliberately
+unclassified. Grok currently reuses the generic F9 productivity markers, so
+backend-specific marker coverage is **unverified**.
 
 ---
 

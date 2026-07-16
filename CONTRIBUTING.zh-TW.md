@@ -202,9 +202,9 @@ Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一
 - 非測試程式碼中不要有 `unwrap()` / `expect()`。用 `?` 搭配 `anyhow::Context` 做錯誤標註。
 - production 程式碼路徑中不要有 `println!` / `eprintln!`。用 `tracing::{info, warn, error, debug}`。
 - 讓模組職責保持緊湊:
-  - `src/agent_ops.rs`——共用 helper（messaging、fleet 變更、分支驗證）,由 daemon API 和 MCP handler 路徑共同呼叫。新的重複邏輯放這裡,而不要在兩處內聯;`tests/no_dual_track_drift.rs` 強制 `src/agent_ops.rs` 與 `src/mcp/handlers.rs` 之間不得漂移。
+  - `src/agent_ops.rs`——共用 helper（messaging、fleet 變更、分支驗證）,由 daemon API 和 MCP handler 路徑共同呼叫。新的重複邏輯放這裡,而不要在兩處內聯;`tests/no_dual_track_drift.rs` 強制 `src/agent_ops.rs` 與 `src/mcp/handlers/` tree 之間不得漂移。
   - `src/api/`——daemon 的 JSON 控制 API（wire protocol + `src/api/handlers/` 底下的 per-method handler）。
-  - `src/mcp/`——給 agent 的 MCP 介面。`handlers.rs` 把大多數 tool call proxy 到 daemon API;`start_instance` 自 Task #12 起在那裡內聯處理（沒有獨立的 `ops.rs`）。
+  - `src/mcp/`——給 agent 的 MCP 介面。`handlers/mod.rs` 與其子模組把大多數 tool call proxy 到 daemon API;`start_instance` 自 Task #12 起在那裡內聯處理（沒有獨立的 `ops.rs`）。
   - `src/<area>.rs`——領域邏輯（agent、fleet、telegram、health、schedules……）。
 
 ## 文件

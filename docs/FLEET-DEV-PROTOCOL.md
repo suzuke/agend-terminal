@@ -233,7 +233,7 @@ Reviewers MUST inspect PRs without mutating the canonical source repo. Read-only
 
 - **Never `cd` into the canonical source repo** to inspect a PR. The canonical is the operator's working tree; reviewer activity must not leave detached HEAD or stale refs there.
 - **Never create refs in canonical** (`git checkout -b tmp_pr_review`, `git checkout <sha>`, `git fetch origin pr/N/head:pr_head`, etc.). These leave `pr*_head` / `tmp*` / `review/*` branches behind that pollute `git branch --list` and confuse later operator commands.
-- **Use `gh pr diff <N>` or `gh pr view <N> --json files`** to read PR contents without checkout. If a full tree inspection is needed, `repo({action:"checkout", repository_path:"<canonical>", branch:"<review-branch>", from_ref:"<PR-head>", bind:true, task_id:"<task-id>"})` provisions a daemon-managed named worktree; `release_worktree({instance:"<self>"})` returns it without touching canonical.
+- **Use `gh pr diff <N>` or `gh pr view <N> --json files`** to read PR contents without checkout. If a full tree inspection is needed, `repo({action:"checkout", repository_path:"<canonical>", branch:"<new-review-branch>", from_ref:"<full-PR-head>", expected_head:"<full-PR-head>", bind:true, task_id:"<task-id>", checkout_purpose:"disposable_review"})` provisions a daemon-managed named worktree with exact disposable-review provenance; `release_worktree({instance:"<self>"})` returns it without touching canonical.
 - **If canonical state is observed dirty post-review** (detached HEAD, stale `tmp*` / `pr*_head` branches), pause the review and report an operational blocker. Do not turn unrelated workspace hygiene into a PR verdict. Operator cleanup uses a dry-run `repo({action:"cleanup_merged_branches", base:"main"})`, then applies selected candidate IDs with an audit reason.
 
 Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from agent callers when cwd=canonical (PR-B). L3 sweeper cleans the residue and auto-switches detached canonical HEAD back to main at daemon boot (PR-C).
@@ -244,14 +244,14 @@ Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from
 
 **Anti-pattern 1 — `AGEND_GIT_BYPASS=1` to escape a shim deny.**
 
-When the `agend-git` shim denies an agent action, the deny is a protocol signal, not a transient error. Re-running the same command with `AGEND_GIT_BYPASS=1` is forbidden.
+When the active git guard denies an agent action, the deny is a protocol signal, not a transient error. Re-running the same command with `AGEND_GIT_BYPASS=1` is forbidden.
 
 - **WRONG**: shim denies → set `AGEND_GIT_BYPASS=1` → retry. The bypass succeeds at the git level but skips the protocol gate that the deny was enforcing; whatever the gate was protecting (canonical hygiene, lease invariants, reviewer workspace boundary) is now violated silently.
 - **RIGHT**: abort the operation. Send `send({instance:"<lead>", request_kind:"query", message:"<denied command + reason>"})` and ask for the correct routing.
 
 Reasoning:
 
-- `AGEND_GIT_BYPASS=1` exists for **daemon-internal helpers** (`canonical_hygiene`, `branch_sweep`, `conflict_notify`) that read worktree state from canonical-rooted paths and would otherwise self-deny. It is not an escape hatch for agents.
+- The legacy-compatible `AGEND_GIT_BYPASS=1` input exists for **daemon-internal helpers** (`canonical_hygiene`, `branch_sweep`, `conflict_notify`) that read worktree state from canonical-rooted paths and would otherwise self-deny. It is not an escape hatch for agents.
 - The bypass typically surfaces hidden state on top of the original problem.
 - "Ask, don't bypass" is the universal recovery: a deny means the daemon owns the routing answer, and asking is cheap.
 
@@ -265,7 +265,7 @@ Even in the agent's own daemon-bound worktree, `git checkout <sha>` is the wrong
 
 Right path, by inspection depth:
 
-- **Full tree** (`cargo test` replay, runtime validation, multi-file inspection): `repo({action:"checkout", repository_path:"<canonical>", branch:"<review-branch>", from_ref:"<PR-head>", bind:true, task_id:"<task-id>"})`. The daemon provisions a named worktree, binds it to the caller, and `release_worktree({instance:"<self>"})` returns cleanly with no residue.
+- **Full tree** (`cargo test` replay, runtime validation, multi-file inspection): `repo({action:"checkout", repository_path:"<canonical>", branch:"<new-review-branch>", from_ref:"<full-PR-head>", expected_head:"<full-PR-head>", bind:true, task_id:"<task-id>", checkout_purpose:"disposable_review"})`. The daemon requires a branch proven new locally and on `origin`, records the exact provisioned head in the initial signed binding, and permits guarded cleanup once the review task is terminal. `release_worktree({instance:"<self>"})` returns cleanly with no residue; dirty/diverged/ambiguous state is preserved fail-closed.
 - **Read-only** (diff inspection, file listing): `gh pr diff <N>` or `gh pr view <N> --json files`. No working-tree mutation at all.
 
 If `repo({action:"checkout", ...})` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send a `request_kind:"query"` message to lead with the failure mode; an authorized recovery may use `release_worktree({instance:"<target>", force:true, branch:"<branch>"})` or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
@@ -274,12 +274,12 @@ If `repo({action:"checkout", ...})` fails (lease already held, branch unknown, w
 
 ### 3.19.2 Reviewer Base Workspace Branch Discipline
 
-§3.19 covers the canonical source repo. This section covers the reviewer agent's OWN base workspace dir (e.g. `~/.agend-terminal/workspace/fixup-reviewer/`).
+§3.19 covers the canonical source repo. This section covers the reviewer agent's OWN base workspace dir (e.g. `$AGEND_HOME/workspace/fixup-reviewer/`).
 
 **Reviewers MUST NOT** do in-place `git checkout` of an impl branch into the agent's base workspace dir. The base workspace is daemon-bound to a specific branch (typically `main` or a long-lived review-housekeeping branch); checking out an impl branch in-place pollutes the base with stale-branch state that bleeds into future sessions.
 
 Use one of:
-- **(a) Dedicated review worktree**: provision a daemon-managed named worktree with `repo({action:"checkout", repository_path:"<canonical>", branch:"review/<N>-r0", from_ref:"origin/<impl-branch>", bind:true, task_id:"<task-id>"})`. Release it with `release_worktree({instance:"<self>"})` when done.
+- **(a) Dedicated review worktree**: resolve the subject PR's full head SHA, then provision a daemon-managed named worktree with `repo({action:"checkout", repository_path:"<canonical>", branch:"review/<N>-r0", from_ref:"<full-PR-head>", expected_head:"<full-PR-head>", bind:true, task_id:"<task-id>", checkout_purpose:"disposable_review"})`. The review branch must be new locally and remotely. Release it with `release_worktree({instance:"<self>"})` when done.
 - **(b) GH-only review** (preferred for diff-only inspection): `gh pr diff <N>` + `gh pr view <N> --json files,reviews,statusCheckRollup`. No local checkout, no cleanup needed.
 
 **NEVER** in-place `git checkout` of an impl branch in the agent's base workspace dir.
@@ -290,7 +290,7 @@ Use one of:
 
 ### 3.19.3 Source-File Lookup — No Full-Disk Scan
 
-Locating a source file (e.g. the `agend-git` shim source `agend-git.rs`) with a full-disk `find / -name …` or `find ~ -name …` is **forbidden**. Run concurrently across the fleet, it spikes machine load fleet-wide (#2386: load 108 on a 16-core box).
+Locating a source file (for example the active guard source under `vendor/agentic-git/`) with a full-disk `find / -name …` or `find ~ -name …` is **forbidden**. Run concurrently across the fleet, it spikes machine load fleet-wide (#2386: load 108 on a 16-core box).
 
 Find source from a **fixed point**, not the filesystem root:
 - Inside your bound worktree/repo: `git ls-files | rg <name>` or `rg --files | rg <name>` (index-scoped, fast).
@@ -317,7 +317,7 @@ Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (rev
 
 **Post-merge smoke procedure**:
 
-- Operator (or lead on operator's behalf) reproduces the race scenario on a **fresh, isolated `$AGEND_HOME`** — e.g. `/tmp/smoke` or `$TMPDIR/agend-smoke-$$`. **NEVER use the operator's daily `~/.agend-terminal`**; smoke runs MUST be hermetic and disposable so a regression cannot leak into operator state.
+- Operator (or lead on operator's behalf) reproduces the race scenario on a **fresh, isolated `$AGEND_HOME`** — e.g. `/tmp/smoke` or `$TMPDIR/agend-smoke-$$`. **NEVER use the operator's daily `$AGEND_HOME`** (normally `~/.agend`, or the legacy fallback); smoke runs MUST be hermetic and disposable so a regression cannot leak into operator state.
 - PR body MAY include a suggested smoke script enumerating the race scenario the fix targets (e.g. "start daemon cold + watch inbox for `bridge_connected` within 5s"). Optional, not required for merge approval.
 - If post-merge smoke uncovers a regression: operator-driven revert (`git revert <merge-sha>`) — race regressions auto-escalate to P0 per §3.11(a) deferred-defense.
 
@@ -333,7 +333,7 @@ Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (rev
 
 For race-class PRs, the reviewer MUST execute the RED→GREEN protocol (not skim it):
 
-1. Materialize the pre-fix commit as a daemon-managed named worktree/branch (for example `review/<N>-red`) via `repo({action:"checkout", ...})`; never checkout the SHA in-place.
+1. Materialize the pre-fix commit as a daemon-managed named worktree on a new branch (for example `review/<N>-red`) via `repo({action:"checkout", from_ref:"<full-pre-fix-SHA>", expected_head:"<full-pre-fix-SHA>", bind:true, task_id:"<task-id>", checkout_purpose:"disposable_review", ...})`; never checkout the SHA in-place.
 2. Confirm RED: the new tests compile-fail, fail at runtime, or fail with the expected error signature.
 3. Release the RED worktree, then inspect the fix in a separate daemon-managed named worktree/branch (for example `review/<N>-green`).
 4. Confirm GREEN without flakiness on three back-to-back runs.
@@ -558,7 +558,7 @@ This recovery technique parallels [§3.19.1](#3191-agent-git-anti-patterns)'s fr
 
 ## §8. Progress Visibility
 
-Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml origin) broadcast with `origin` field. `create_instance` defaults to isolated workspace (`~/.agend-terminal/workspace/<name>`).
+Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml origin) broadcast with `origin` field. `create_instance` defaults to isolated workspace (`$AGEND_HOME/workspace/<name>`).
 
 ## §9. Waiting & Timeout
 
@@ -577,7 +577,7 @@ Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml o
 
 **Backend modifiers**:
 - kiro-cli: 1-2h longer wait (context compaction self-heals); escalate to operator rather than `interrupt`
-- Other backends (claude/codex/gemini/opencode): use staircase above as-is
+- Other backends (claude/codex/opencode/agy/grok): use staircase above as-is
 
 ### Supervisor Notify
 Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/AuthError/PermissionPrompt) → notifies orchestrator. 60s debounce per agent.
@@ -625,70 +625,29 @@ A task send with `branch` auto-binds the **assignee**. It does not bind or move 
 
 If the assignee is already bound to a different branch, resolve that binding before dispatch: ask the assignee to commit/hand off and call `release_worktree({instance: "<assignee>"})`, or have an authorized orchestrator use the forced form with the exact branch. Never release another agent's worktree speculatively; an active dirty binding may contain unreported work.
 
-### 10.7 Bare `init` Commits on a Worktree Branch — Source & Handling (#1462)
+### 10.7 Empty `init` Commits on a Worktree Branch
 
-Empty `init` commits sometimes pile up on a bound branch. **The daemon does NOT
-write them**, and — correcting an earlier hypothesis in this section — they are
-**NOT a backend session-checkpoint "heartbeat" either**.
+Backend CLIs, including Claude Code, Codex, and Kiro CLI, may create empty
+`init` session-checkpoint commits in a bound worktree. A scratch-test leak was
+also a historical source, but repository tests now guard mutating scratch-repo
+git commands; a `t <t@t>` committer is not a timeless or exclusive RCA. Do not
+infer the producer from the subject or committer alone.
 
-**Confirmed source (RCA t-…50430-10)**: they are **`agend-git`'s own BIN-test
-fixtures leaking onto the real branch**. When a dev runs `cargo test --bins` (or
-the `agend-git` bin tests specifically) *inside a bound worktree*, those tests'
-`git commit --allow-empty -m "init"` calls go through the `agend-git` shim, whose
-`ChdirPass` redirects them onto the worktree's REAL branch — the same "in-worktree
-cargo test writes through the shim" trap. The fixtures set
-`-c user.name=t -c user.email=t@t`, so the tell-tale committer on the pile is
-**`t <t@t>`**, which proves the source is the test fixtures — not the daemon, not a
-backend.
+The live git interception and pre-push cleanup now live in vendored
+`agentic-git` (`cleanup_init_pile_pre_push`). The in-tree `agend-git` binary is
+kill-family-only and no longer handles git, so its old line references and
+behavior are not an operational source of truth. On a normal guarded push,
+eligible `init` / `initial` commits are removed only after the guard proves the
+subject, body, and file diff are safe. The daemon also exposes
+`repo({action:"cleanup_init_commits", instance:"<agent>"})` for an explicit
+cleanup request.
 
-**Distinct from agend's own init commit**: in a fresh/empty repo agend creates a
-**one-time** init commit, committer `agend-terminal <agend@localhost>`, set with an
-*ephemeral* `-c user.name/-c user.email` on that one commit only
-(`src/worktree.rs:112-115`, under `AGEND_GIT_BYPASS`) — NOT persisted, so it does
-not affect later commits. That is a different, legitimate, single commit. So there
-are two init committers to recognise: the test-leak pile = **`t <t@t>`**; agend's
-own empty-repo init = **`agend@localhost`**. (A real backend commit via the shim's
-`commit → ChdirPass` carries the operator's GLOBAL git identity — the shim does not
-inject `-c user.*`, `src/bin/agend-git.rs:135-136` — but that is the backend's
-*real* work, never the empty-`init` pile.)
-
-**What the daemon does** (it never creates these): (a) stamps `Agend-Agent` /
-`Agend-Task` / `Agend-Branch` / `Agend-Issued-At` trailers onto whatever commit
-happens, via the `prepare-commit-msg` hook; (b) **cleans the pile on push** — a
-normal `git push` of a bound worktree routes through the shim's
-`CleanupAndChdirPushPass`, which calls `cleanup_init_pile_pre_push` to soft-reset
-the empty `init` commits out of the push range
-(`src/bin/agend-git.rs:196-222`).
-
-**Agent guidance — do NOT hand-clean the pile**:
-- **Never** manually rewrite history to scrub it — not `git reset --soft`
-  + force-push, **not `git rebase`** (`rebase -i` / `--onto` to drop the inits),
-  not `commit --amend`. A normal push strips them automatically and squash-merge
-  collapses anything that slips through. The local pile is **cosmetic** — it does
-  not reach `main`, so there is nothing to clean.
-- **It is NOT daemon tampering.** A worktree-local `init` pile (or a base/HEAD that
-  looks "shifted" by it) is the test-fixture leak above — NOT the daemon rewriting
-  your branch. Do not open an RCA over it. ⚠ This exact mistake has recurred:
-  **two separate devs hand-`rebase`d these off as "daemon pollution", one burning a
-  whole RCA spike**, for zero benefit. Let the push handle the pile.
-- **⚠ One real exception — an operator-authorized `AGEND_GIT_BYPASS=1 git push`**: a bypass push skips the
-  shim ENTIRELY (`src/bin/agend-git.rs:256`), so `cleanup_init_pile_pre_push` does
-  NOT run and the pile would be pushed as-is. (Note `--no-verify` does NOT cause
-  this — the cleanup is shim code in the push arm, not a git pre-push hook, so it
-  runs regardless of `--no-verify`.) If §13 authorizes that exact push and the branch
-  carries the pile, a manual cleanup before the single push is legitimate; otherwise
-  prefer a normal push and leave it alone.
-- **TODO (root fix, not in this PR)**: isolate the `agend-git` BIN tests so their
-  `git commit --allow-empty` fixtures cannot leak through the shim onto the real
-  branch (e.g. run them under bypass / an unbound env). Code fix, cosmetic, low
-  priority.
-
-**Acceptance / §3.10 verifiability**: these commits are NOT to be amend-rewritten
-or force-pushed away (per §10 hard rule). Reviewers look past them via
-`git log --no-merges --grep`. An anchor RED commit may sit between `init` commits
-and the impl GREEN commit. Verify §3.10 by materializing each immutable ref in a
-daemon-managed named worktree as described in §3.10/§3.20, observing RED at the
-anchor and GREEN at the implementation ref, and ignoring the cosmetic `init` noise.
+**Agent guidance:** never hand-clean these commits with reset, rebase, amend, or
+force-push. Push normally and let the guard perform its bounded cleanup. If an
+unexpected commit is non-empty, carries a meaningful body, or survives the normal
+cleanup, preserve it and report the exact branch/SHA to the lead; do not classify
+it as harmless from the word `init` alone. Reviewers still verify immutable RED
+and GREEN refs in daemon-managed worktrees (§3.10/§3.20).
 
 ### 10.8 Backend TUI Render Duplication (#1464)
 
@@ -741,15 +700,13 @@ Use `$AGEND_INSTANCE_NAME` for the instance and your resolved backend/model. Ski
 | Schedule | `schedule({action: "create", ...})` | backend-specific tools |
 | Timeout | §9 staircase, then `restart_instance({instance: "...", mode: "fresh", ...})` | immediate destructive restart |
 
-**Daemon-state error format (Sprint 54 #488 hotfix)**. Tools that
-depend on daemon-resident state — `reply`,
-`download_attachment` — never silently fall back to a local handler
-when the daemon is unreachable. They return a structured error of the
-form `tool '<NAME>' requires daemon API; not reachable: <CAUSE>`.
-Agents seeing this prefix should surface the message as-is to the
-user (it's operator-actionable: restart daemon / check socket) rather
-than retry blindly. Stateless tools (`inbox`, `task`, `send`, etc.)
-still fall back gracefully for offline workflows.
+**Daemon-unreachable behavior.** The agent-facing MCP bridge is a daemon proxy;
+do not plan any tool workflow around a local/offline fallback. When the daemon
+connection is unavailable, a tool call returns an actionable connection error
+instead of proving that a mutation or delivery occurred. Surface that error,
+restore the daemon/socket, then retry the original operation with the same
+correlation identifiers. Internal handler fallbacks used by tests or recovery
+code are not an agent-facing availability contract.
 
 ### 11.1 State Persistence Across Daemon Refresh (Sprint 62)
 

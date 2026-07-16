@@ -28,7 +28,7 @@ part of `fleet.yaml` — not as a separate data source.
 ## 2. Files and Modules
 
 - `src/teams.rs` — primary implementation (projection model).
-- `src/fleet.rs` — actual storage layer.
+- `src/fleet/mod.rs` — actual storage layer.
 - `src/mcp/handlers/dispatch.rs` — routes the `team` parameter to `send`.
 - `src/mcp/handlers/comms.rs` — checks team and orchestrator relationships.
 - `src/api/handlers/instance.rs` — reads team info for prompt injection.
@@ -46,19 +46,17 @@ part of `fleet.yaml` — not as a separate data source.
 | `description` | Optional description |
 | `created_at` | Creation timestamp |
 | `source_repo` | The team's source repository path |
+| `project_id` | Optional explicit project-board id override |
+| `accept_from` | External agent names allowed to message the orchestrator directly; empty denies cross-team direct sends |
 | `stale_members` | View-only; members not found in the live registry |
-
-Key query helpers:
-- `find_team_for(home, member)` — returns the team a member belongs to.
-- `get_members(home, team_name)` — returns the member list.
-- `resolve_team_orchestrator(home, name)` — resolves the orchestrator for routing.
-- `is_orchestrator_of(home, caller, member)` — ACL check.
 
 ## 4. `team action=create`
 
 - `name` and `members` are required.
 - `orchestrator` is optional but recommended; must be one of the members.
 - `repository_path` is optional; omitting it triggers a warning about dispatch binding fallback.
+- `project_id` optionally overrides project-board slug derivation without changing `repository_path`.
+- `accept_from` sets the cross-team direct-send allowlist; the default empty list is fail-closed.
 - Rejects creation if a team with the same name already exists.
 - Enforces the **one-agent-one-team** constraint: rejects if any member belongs to another team.
 - On success, writes the team to `fleet.yaml` and returns `status=created`.
@@ -74,11 +72,12 @@ Key query helpers:
 ## 6. `team action=update`
 
 - Requires `name`.
-- Supports `add` (new members), `remove` (existing members), `orchestrator`, and `repository_path`.
+- Supports `add` (new members), `remove` (existing members), `orchestrator`, `repository_path`, `project_id`, and `accept_from`.
 - Cannot remove the current orchestrator without first designating a new one.
 - The new orchestrator must be in the post-update member list.
 - `add` enforces one-agent-one-team (cannot add a member who belongs to another team).
 - `repository_path` is preserved if not explicitly changed.
+- `project_id` and `accept_from` are also preserved unless explicitly supplied.
 - Writes back to `fleet.yaml` on success.
 
 ## 7. `team action=delete`
@@ -98,7 +97,15 @@ Key query helpers:
 - An urgent task is created for each newly degraded team.
 - This function is part of instance teardown, not general collaboration.
 
-## 9. Relationship with `send team=...`
+## 9. Reference Queries
+
+- `find_team_for(home, member)` — returns the team a member belongs to.
+- `get_members(home, team_name)` — returns the member list.
+- `resolve_team_orchestrator(home, name)` — resolves the orchestrator for routing; a degraded team returns an error.
+- `is_orchestrator_of(home, caller, member)` — ACL check.
+- These helpers expose the read model; they do not mutate team state.
+
+## 10. Relationship with `send team=...`
 
 - `send` supports a `team` parameter for broadcast delivery.
 - `team=fixup` broadcasts to all members of the fixup team.
@@ -106,32 +113,34 @@ Key query helpers:
 - `stale_members` helps identify members who will not receive broadcasts.
 - Team broadcast (message delivery) and orchestrator routing (task/ACL routing) are distinct operations that often appear together.
 
-## 10. Relationship with the Task Board
+## 11. Relationship with the Task Board
 
 - A task's `assignee` can be a team name.
 - When assigned to a team, the task routes to the orchestrator via `resolve_team_orchestrator`.
 - Degraded teams cannot route tasks.
 - `team delete` may trigger task orphan cleanup and urgent task creation.
 
-## 11. Relationship with Instance Lifecycle
+## 12. Relationship with Instance Lifecycle
 
 - Deleting an instance calls `remove_member_from_all`.
 - If the instance was an orchestrator, its team degrades.
 - If the instance was the sole member, its team is deleted.
 - `team list` with `stale_members` reveals discrepancies between the member roster and live registry.
 
-## 12. Behavioral Constraints
+## 13. Behavioral Constraints
 
 - Team names should be stable.
 - Member lists must not contain duplicates.
 - The orchestrator must always be a member.
 - `source_repo` should be set; without it, dispatch auto-bind falls back to a weaker path.
+- Keep `project_id` aligned with the intended task board when repository-path slug derivation is ambiguous.
+- Keep `accept_from` minimal; an empty list intentionally denies cross-team direct sends to the orchestrator.
 - `update` should not leave a team in an un-routable state.
 - `delete` cascade failures must be visible.
 - `stale_members` output must be sorted.
 - `degraded` status must be immediately obvious to operators.
 
-## 13. Typical Workflow
+## 14. Typical Workflow
 
 1. Create a team with `team action=create` (specify orchestrator from the start).
 2. Adjust members with `team action=update`.
@@ -141,7 +150,7 @@ Key query helpers:
 6. To broadcast messages, use `send team=...`.
 7. To find who coordinates whom, use `find_team_for`.
 
-## 14. Implementation Checklist
+## 15. Implementation Checklist
 
 - `fleet.yaml` is the sole write target.
 - `list` is a projection — it must not become a write path.
@@ -153,6 +162,6 @@ Key query helpers:
 - One-agent-one-team is a critical invariant.
 - Broadcast and routing must not be conflated.
 
-## 15. Summary
+## 16. Summary
 
 Teams are the basic unit of collaborative grouping. Their source of truth is `fleet.yaml`. CRUD operations are `team create/delete/list/update`; broadcast is via `send team=...`. The orchestrator is the team's coordination point. A degraded team is not broken data — it is a state requiring operator attention. `stale_members` is an observability field. When team behavior is unexpected, check fleet first, then the live registry.

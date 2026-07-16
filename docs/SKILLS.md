@@ -2,9 +2,9 @@
 
 # Skills
 
-Unified community-skill discovery for the five backends agend-terminal supports (Claude Code, Codex, Gemini CLI, OpenCode, Kiro CLI).
+Unified community-skill discovery for six backends: Claude Code, Codex, OpenCode, Kiro CLI, Antigravity CLI, and Grok Build.
 
-A skill is a directory (typically containing `SKILL.md` plus supporting files) that an agent's backend picks up at launch. agend-terminal stores **one copy** of each skill under `~/.agend-terminal/skills/` and lets every backend discover it through its conventional sub-directory — usually via a symlink, with a copy fallback on Windows.
+A skill is a directory (typically containing `SKILL.md` plus supporting files) that an agent's backend picks up at launch. agend-terminal stores **one copy** of each skill under `$AGEND_HOME/skills/` and lets every backend discover it through its conventional sub-directory — usually via a symlink, with a copy fallback on Windows.
 
 ## Why
 
@@ -14,16 +14,17 @@ Different backends each have their own skill-discovery path:
 |---------|------------------------------------------|
 | Claude  | `.claude/skills/`                        |
 | Codex   | `.codex/skills/`                         |
-| Gemini  | `.gemini/skills/`                        |
 | OpenCode| `.opencode/skills/`                      |
 | Kiro    | `.kiro/skills/`                          |
+| Antigravity CLI | `.agents/skills/`                |
+| Grok Build | `.grok/skills/`                       |
 
 Without agend-terminal you would copy every skill into every backend's directory for every agent. agend-terminal stores one canonical source and surfaces it to each backend automatically.
 
 ## Architecture
 
 ```
-~/.agend-terminal/skills/                ← single source of truth
+$AGEND_HOME/skills/                      ← single source of truth
   ├── skill-forge/
   │   └── SKILL.md
   ├── opencli-adapter-author/
@@ -31,20 +32,21 @@ Without agend-terminal you would copy every skill into every backend's directory
   └── ...
 
 agent working directory/
-  ├── .claude/skills/   → symlink → ~/.agend-terminal/skills/
-  ├── .codex/skills/    → symlink → ~/.agend-terminal/skills/
-  ├── .gemini/skills/   → symlink → ~/.agend-terminal/skills/
-  ├── .opencode/skills/ → symlink → ~/.agend-terminal/skills/
-  └── .kiro/skills/     → symlink → ~/.agend-terminal/skills/
+  ├── .claude/skills/   → symlink → $AGEND_HOME/skills/
+  ├── .codex/skills/    → symlink → $AGEND_HOME/skills/
+  ├── .opencode/skills/ → symlink → $AGEND_HOME/skills/
+  ├── .kiro/skills/     → symlink → $AGEND_HOME/skills/
+  ├── .agents/skills/   → symlink → $AGEND_HOME/skills/
+  └── .grok/skills/     → symlink → $AGEND_HOME/skills/
 ```
 
 On Unix the per-backend entries are symlinks (zero maintenance). On Windows agend-terminal falls back to copying the files; re-running `install` replaces managed targets.
 
 State files:
 
-- `~/.agend-terminal/skills/<name>/` — the canonical skill content
-- `~/.agend-terminal/skills-lock.json` — per-skill source + pinned version (commit SHA for git, mtime for local paths) + install timestamp
-- `~/.agend-terminal/.skills-stage/<digest>/` — short-lived staged copies used when a particular agent only wants a subset of skills (see fleet.yaml integration below). GC'd after 7 days.
+- `$AGEND_HOME/skills/<name>/` — the canonical skill content
+- `$AGEND_HOME/skills-lock.json` — per-skill source + pinned version (commit SHA for git, mtime for local paths) + install timestamp
+- `$AGEND_HOME/.skills-stage/<digest>/` — short-lived staged copies used when a particular agent only wants a subset of skills (see fleet.yaml integration below). GC'd after 7 days.
 
 ## CLI
 
@@ -56,7 +58,7 @@ All commands run as `agend-terminal skills <subcommand>`.
 agend-terminal skills add <source>
 ```
 
-`<source>` is either a local path or a git URL (`https://…`, `git@…`, `ssh://…`, anything ending in `.git`). The skill directory name is taken from the source basename, so `git clone … repo-foo` becomes `~/.agend-terminal/skills/repo-foo/`.
+`<source>` is either a local path or a git URL (`https://…`, `git@…`, `ssh://…`, anything ending in `.git`). The skill directory name is taken from the source basename, so `git clone … repo-foo` becomes `$AGEND_HOME/skills/repo-foo/`.
 
 - Local path: copied recursively into the canonical source root.
 - Git URL: `git clone --depth=1` into the canonical source root; the pinned version is the resulting HEAD SHA.
@@ -69,7 +71,7 @@ Re-adding an existing name overwrites in place and updates the lock entry; if yo
 agend-terminal skills remove <name>
 ```
 
-Deletes `~/.agend-terminal/skills/<name>/` and clears its lock entry. Idempotent — running against a name that does not exist is a no-op.
+Deletes `$AGEND_HOME/skills/<name>/` and clears its lock entry. Idempotent — running against a name that does not exist is a no-op.
 
 ### List
 
@@ -77,7 +79,7 @@ Deletes `~/.agend-terminal/skills/<name>/` and clears its lock entry. Idempotent
 agend-terminal skills list
 ```
 
-Prints every directory under `~/.agend-terminal/skills/` together with the recorded source and pinned version (`(unrecorded)` / `(unpinned)` if missing).
+Prints every directory under `$AGEND_HOME/skills/` together with the recorded source and pinned version (`(unrecorded)` / `(unpinned)` if missing).
 
 ### Update
 
@@ -94,7 +96,7 @@ Replays `add` against the source stored in `skills-lock.json`. Skills that were 
 agend-terminal skills install <working_dir>
 ```
 
-Creates the five per-backend sub-directories under `<working_dir>` and points each at `~/.agend-terminal/skills/` (symlink, or copy on Windows). Used when you want to make skills visible inside a directory that the daemon did not spawn — the daemon performs the same install automatically for managed agents (see below).
+Creates the six per-backend sub-directories under `<working_dir>` and points each at `$AGEND_HOME/skills/` (symlink, or copy on Windows). Used when you want to make skills visible inside a directory that the daemon did not spawn — the daemon performs the same install automatically for managed agents (see below).
 
 ## Daemon integration
 
@@ -113,8 +115,8 @@ instances:
 
 Behaviour:
 
-- `skills:` omitted (default) — every skill under `~/.agend-terminal/skills/` is exposed to the agent.
-- `skills: [name1, name2]` — only the named skills are staged into a temporary digest directory under `~/.agend-terminal/.skills-stage/<digest>/`, and that staged directory is symlinked into the backend paths. The agent sees only those skills.
+- `skills:` omitted (default) — every skill under `$AGEND_HOME/skills/` is exposed to the agent.
+- `skills: [name1, name2]` — only the named skills are staged into a temporary digest directory under `$AGEND_HOME/.skills-stage/<digest>/`, and that staged directory is symlinked into the backend paths. The agent sees only those skills.
 - `skills: []` — explicit opt-out: the per-backend directories are created but contain no skills (only the daemon's `.agend-skills-managed` marker).
 - Names that don't exist in the canonical source are skipped with a warning; the agent still launches.
 
@@ -126,14 +128,14 @@ The staged copies have stable per-allowlist names (SHA-256 prefix of the sorted 
 cargo test skills::
 ```
 
-Runs the 24 unit/integration tests in `src/skills.rs::tests` — covers add/remove/list/install/update, the skills-lock round-trip, SHA-256 staging digest, and the stage GC including TOCTOU same-run exclusion. All pass on a clean checkout.
+Runs the 30 unit/integration tests in `src/skills.rs::tests` — covers add/remove/list/install/update, the skills-lock round-trip, SHA-256 staging digest, and the stage GC including TOCTOU same-run exclusion.
 
 Other useful one-shot checks:
 
 ```
 agend-terminal skills list                            # canonical source inventory
 agend-terminal skills install /tmp/scratch-agent      # exercises the symlink/copy path
-cat ~/.agend-terminal/skills-lock.json                # inspect pinned versions
+cat "$AGEND_HOME/skills-lock.json"                   # inspect pinned versions
 ```
 
 ## Examples
@@ -163,7 +165,7 @@ instances:
     skills: [writing-style-guide, markdown-linter]
 ```
 
-After `agend-terminal start`, `~/.agend-terminal/workspace/doc-writer/.claude/skills/` resolves to a stage containing only those two skills.
+After `agend-terminal start`, `$AGEND_HOME/workspace/doc-writer/.claude/skills/` resolves to a stage containing only those two skills.
 
 ## Troubleshooting
 
@@ -185,4 +187,4 @@ The skills feature shipped across Sprints 60–62:
 - #590 — SHA-256 prefix staging digest (Sprint 62 W1 PR-1)
 - #591 — stage GC with TOCTOU same-run exclusion (Sprint 62 W1 PR-2)
 
-Implementation lives in `src/skills.rs` (single module, ~650 LOC + 24 tests). The CLI surface is in `src/cli.rs` under the `Sprint 60 W2 PR-1 — agend skills CLI subcommands` heading.
+Implementation lives in `src/skills.rs` (about 1,475 LOC including 30 tests). The CLI surface is in `src/cli.rs` (`run_skills_*`) and dispatched from `src/main.rs`.

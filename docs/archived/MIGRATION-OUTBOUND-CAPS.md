@@ -79,9 +79,9 @@ The shared `crate::channel::auth::gate_outbound_for_agent` helper extracted in S
 
 ## References
 
-- [`docs/USAGE.md`](USAGE.md) — operator setup guide, `outbound_capabilities` semantics section
-- [`src/fleet.rs`](../src/fleet.rs) — `InstanceConfig.outbound_capabilities` field doc-comment with full 2-stage transition table
-- [`src/channel/auth.rs`](../src/channel/auth.rs) — `ChannelOpKind` enum + `gate_outbound_for_agent` shared helper
+- [`docs/USAGE.md`](../USAGE.md) — operator setup guide, `outbound_capabilities` semantics section
+- [`src/fleet/mod.rs`](../../src/fleet/mod.rs) — `InstanceConfig.outbound_capabilities` field
+- [`src/channel/auth.rs`](../../src/channel/auth.rs) — `ChannelOpKind` enum + `gate_outbound_for_agent` shared helper
 - [PR #223](https://github.com/suzuke/agend-terminal/pull/223) — gradual bridge introducing the field
 - [PR #224](https://github.com/suzuke/agend-terminal/pull/224) — `Channel::send/edit/delete` real dispatcher
 - [PR #216](https://github.com/suzuke/agend-terminal/pull/216) — `user_allowlist` outbound fail-closed default

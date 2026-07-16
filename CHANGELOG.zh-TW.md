@@ -5,6 +5,8 @@
 本文件記錄本專案所有重要變更。
 格式基於 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)；專案遵循 [SemVer](https://semver.org/spec/v2.0.0.html)。
 
+## [Unreleased]
+
 ## [0.10.0] — 2026-07-07
 
 自 0.9.0 起 311 個 commit。以下依主題整理重點(非完整 commit 清單)。
@@ -26,7 +28,7 @@
 
 ### Changed
 
-- **MCP tool-surface 整併(#2548)** — 多波縮減 MCP surface:移除死工具(#2554);`replace_instance` 退役,併入 `restart_instance mode=fresh`(#2556);`set_display_name` / `set_description` 併入 `set_metadata`(#2557);五個工具移到 CLI 並收窄設定(#2560);`mode` 折入 `list_instances`,`force_release_worktree` 併入 `release_worktree(force:true)`(#2561)——公告的 surface 收斂到 37 個工具。
+- **MCP tool-surface 整併(#2548)** — 多波縮減 MCP surface:移除死工具(#2554);`replace_instance` 退役,併入 `restart_instance mode=fresh`(#2556);`set_display_name` / `set_description` 併入 `set_metadata`(#2557);五個工具移到 CLI 並收窄設定(#2560);`mode` 折入 `list_instances`,`force_release_worktree` 併入 `release_worktree(force:true)`(#2561)——在 v0.10.0 tag 時讓公告的 surface 收斂到 29 個工具。
 - **Notification-watchdog handler 整併(#2549)** — poll-reminder + inbox-stuck + handoff-timeout 併成一個 handler(#2572);context-alert + context-handoff 併入 `ContextThresholdsHandler`(#2577);四個 GC tick handler 折成一個 `HourlyGcHandler`,改成 per-sweep(而非 per-handler)的 panic isolation(#2568);`ProgressBackstop` / `Mirror` 退役,handler 數量從 40 降到 37(#2571)。
 - **Binding / GC / agend-git 收斂(#2550)** — 一輪廣泛整併,把 `binding.json` 路徑建構、scan-all 讀取與 `bind_self` read-back 統一到共用 helper(#2583–#2585);把 GC 折成單一 fire-on-first driver(#2599、#2605);把 `cleanup_merged_branch` 的刪除 gate 收斂到 `is_squash_gc_eligible`(#2597);並抽出帶 protected-refs 收斂的 `agend-git` classify predicate(#2580)。
 - **agend-git policy engine(#2379)** — git 操作被分類為 deny / warn / info,衝突會路由到 `fleet_events`(#2462);fail-closed 的 protected-ref push deny,可用 `policy.toml` override(#2468);以及對 `$AGEND_HOME` config/audit blob 寫入的 push-shim deny(#2390)。

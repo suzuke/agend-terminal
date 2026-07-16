@@ -1,5 +1,9 @@
 # #2158 Design Spike — sub-agent workspace boundary hardening
 
+> **Historical design snapshot:** The SHA and gaps below describe the code at
+> investigation time. This file is not a current security or worktree contract;
+> re-verify every claim against current source and `docs/FEATURE-worktree.md`.
+
 **Status:** SPIKE (analysis only — no production code). For lead dialectic (dual reviewer, security).
 **Freshness:** origin/main 509b7af. **Author:** fixup-dev-2.
 **Proportionality:** single-machine single-user → defense-in-depth + fail-closed, NOT OS isolation.

@@ -18,8 +18,8 @@
 | `<pwd>/CLAUDE.md` 和 `<pwd>/.claude/CLAUDE.md` | 每個專案 | 存在時載入 |
 
 agend-terminal 早已替每個受管 instance 配置自己的工作目錄，位於
-`~/.agend-terminal/workspace/<instance-name>/`（或在指派分支時，位於專屬的 worktree
-`~/.agend-terminal/worktrees/<…>/`）。由於 auto-memory 路徑是從 pwd slug 推導而來，
+`$AGEND_HOME/workspace/<instance-name>/`（或在指派分支時，位於專屬的 worktree
+`$AGEND_HOME/worktrees/<…>/`）。由於 auto-memory 路徑是從 pwd slug 推導而來，
 **每個 instance 都會自動取得自己的空白 auto-memory 目錄**——在這個面向上 instance
 之間不會互相洩漏。
 
@@ -68,14 +68,14 @@ home 裡面重新配置所有 Claude Code 設定（MCP server、auth、佈景主
 ## 在 agend-terminal 中套用
 
 `create_instance` 目前不會注入環境變數，但它確實會在
-`~/.agend-terminal/workspace/<name>/` 替每個 instance 配置一個 workspace。實務上的
+`$AGEND_HOME/workspace/<name>/` 替每個 instance 配置一個 workspace。實務上的
 做法如下：
 
 1. 先選好你打算啟動的 instance 名稱——比方說 `clean-agent`。
 2. 預先建立 workspace 並放入一個設定檔：
    ```bash
-   mkdir -p ~/.agend-terminal/workspace/clean-agent/.claude
-   cat > ~/.agend-terminal/workspace/clean-agent/.claude/settings.json <<'JSON'
+   mkdir -p "$AGEND_HOME/workspace/clean-agent/.claude"
+   cat > "$AGEND_HOME/workspace/clean-agent/.claude/settings.json" <<'JSON'
    {
      "autoMemoryEnabled": false,
      "claudeMdExcludes": ["~/.claude/CLAUDE.md"]

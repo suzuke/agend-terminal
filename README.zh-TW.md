@@ -11,16 +11,16 @@
 
 ![AgEnD Terminal — orchestrating a fleet of AI coding agents in a multi-pane TUI](docs/tui-screenshot.png)
 
-用一份 `fleet.yaml` 宣告你的整個 AI 開發團隊。AgEnD Terminal 會把每個 agent 啟動成長駐的 PTY process，配上各自獨立的 git worktree，透過內建的 MCP 工具串起 agent 之間的溝通，再以自動重啟與上下文移交把整個團隊維持運轉。
+用一份 `fleet.yaml` 宣告你的整個 AI 開發團隊。AgEnD Terminal 會把每個 agent 啟動成長駐的 PTY process，可將綁定 branch 的工作隔離到 daemon 管理的 git worktree，透過內建 MCP 工具串起 agent 之間的溝通，再以自動重啟與上下文移交把整個團隊維持運轉。
 
 > ⚠️ **Pre-alpha。** API、CLI 旗標與 `fleet.yaml` 結構可能在小版本之間變動，尚不適合用於生產環境。請鎖定特定版本，升級前先讀 release notes。
 
 ## 功能特色
 
 - **Fleet-as-code** — 一份 YAML 就宣告完每個 agent 的 backend、role、工作目錄與所屬 team。`agend-terminal start` 一次把整個 fleet 拉起來。
-- **5 種 backend** — Claude Code、Codex、Kiro、OpenCode、Antigravity CLI。換 backend 只要改一個欄位。
-- **內建 agent 協調** — agent 之間透過 29 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
-- **自動 git worktree 隔離** — 每個 agent 在自己的 worktree 裡工作。agent 之間不會有 merge 衝突，也不會意外互相污染。
+- **6 種 backend** — Claude Code、Codex、Kiro、OpenCode、Antigravity CLI 與 Grok Build。換 backend 只要改一個欄位。
+- **內建 agent 協調** — agent 之間透過 32 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
+- **自動 git worktree 隔離** — 綁定 branch 的 task／instance 可使用 daemon 管理的 worktree；未綁定者使用設定的 workspace。
 - **Crash 後自動復原並移交上下文** — agent 會自動重啟並接續原本的對話。內建指數退避、健康監控與 hung 偵測。
 - **遠端操控** — 透過多 pane 的 TUI、Telegram 或 Discord 操控整個 fleet，agent 需要你介入時會主動通知。
 
@@ -82,7 +82,7 @@ graph LR
 | 輸出擷取 | 螢幕刮取 | VTerm 狀態追蹤 |
 | Agent 健康 | 手動監控 | 自動重啟 + 狀態偵測 |
 | 多 agent 通訊 | 自訂 IPC | 內建 MCP 工具 |
-| Git 隔離 | 手動 worktree | 自動 per-agent worktree |
+| Git 隔離 | 手動 worktree | branch-bound 工作使用受管 worktree |
 
 ## Backend 支援
 
@@ -93,9 +93,10 @@ graph LR
 | Codex | `codex` | 已測試 |
 | OpenCode | `opencode` | 已測試 |
 | Antigravity CLI | `agy` | 已測試 |
+| Grok Build | `grok` | 實驗性 |
 
 > Gemini CLI 已於 [#1580](https://github.com/suzuke/agend-terminal/issues/1580) 退役（2026-06-18 起對免費／Pro／Ultra 方案停止服務）。其官方後繼者 Antigravity CLI（`agy`）已是受支援的 Fleet MCP backend（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）。`fleet.yaml` 內若仍指定 `gemini`，現在會以泛用的 `Raw` backend 啟動。
-> `agy` 會拒絕任何路徑帶有 dot 前綴（隱藏）祖先目錄的 workspace，因此 `~/.agend-terminal` 底下的 daemon agent 原本對它是不可見的。daemon 現在會建立一個非隱藏的連結（`<base>/<instance>` → 真正的隱藏 workspace），並把 agy 的 `$PWD` 指向該連結，藉此通過 agy 的隱藏路徑檢查，而真實檔案仍留在 `$AGEND_HOME` 底下。`configure_agy` 會寫入 project-scoped 的 `.agents/mcp_config.json` + `.agents/AGENTS.md`（agy 官方的 Customization Roots），讓 `agy` 像其他 backend 一樣載入 fleet 的 `send`／`inbox`／`task` 工具。
+> `agy` 會拒絕任何路徑帶有 dot 前綴（隱藏）祖先目錄的 workspace，因此存放在隱藏 `$AGEND_HOME` 底下的 daemon agent 原本對它是不可見的。daemon 現在會建立一個非隱藏的連結（`<base>/<instance>` → 真正的隱藏 workspace），並把 agy 的 `$PWD` 指向該連結，藉此通過 agy 的隱藏路徑檢查，而真實檔案仍留在 `$AGEND_HOME` 底下。`configure_agy` 會寫入 project-scoped 的 `.agents/mcp_config.json` + `.agents/AGENTS.md`（agy 官方的 Customization Roots），讓 `agy` 像其他 backend 一樣載入 fleet 的 `send`／`inbox`／`task` 工具。
 
 ## 功能穩定度
 
@@ -110,13 +111,14 @@ graph LR
 | 範圍 | 等級 | 備註 |
 |---|---|---|
 | Fleet 統籌（`fleet.yaml`、PTY 啟動、監督、自動重啟） | Beta | 核心路徑；測試充分 |
-| Git worktree 隔離 | Beta | per-agent worktree lease／release／GC |
-| MCP 協調工具（29 個） | Beta | `send`／`inbox`／`task`／… |
+| Git worktree 隔離 | Beta | branch-bound worktree lease／release／GC |
+| MCP 協調工具（32 個） | Beta | `send`／`inbox`／`task`／… |
 | 任務看板 | Beta | append-only event log（schema v2） |
-| Telegram channel | Beta | 唯一完整實作的 channel |
+| Telegram channel | Beta | 主要 channel；支援 polling、binding 與通知 |
 | Claude Code／Codex／Kiro／OpenCode backend | Beta | 已測試 |
 | Antigravity CLI（`agy`）backend | Experimental | 較新（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）；workspace-link shim |
-| Shadow Observer 狀態層 | Experimental | 附加、唯讀觀測（[#2413](https://github.com/suzuke/agend-terminal/issues/2413)）；kill-switch `AGEND_SHADOW_OBSERVER=0` |
+| Grok Build backend | Experimental | 較新；使用 generic state detection、project-scoped MCP 與 skills |
+| Shadow Observer 狀態層 | Experimental | 預設開啟的高信心 Hook／Stream 修正（[#2413](https://github.com/suzuke/agend-terminal/issues/2413)）；kill-switch 為 `AGEND_SHADOW_OBSERVER=0` 與 `AGEND_OBSERVED_DISPATCH=0` |
 | CI 監看 + PR 自動關閉 sweep | Experimental | GitHub／GitLab／Bitbucket poller |
 | 跨 backend ephemeral worker | Experimental · opt-in，無 MCP 介面 | #2547：`ephemeral` MCP 工具已退場（零呼叫）；tracking／reap 基礎設施保留待 #2548 P1。真 backend 由 `AGEND_EPHEMERAL_REAL_BACKEND` 把關 |
 | Discord channel | Experimental · opt-in | `--features discord` |
@@ -130,7 +132,7 @@ Kill-switch 與 feature flag 詳見 [環境變數](docs/env-vars.zh-TW.md) 與 [
 - [快速開始指南](docs/FEATURE-quickstart.zh-TW.md) — 首次啟動逐步教學
 - [Fleet 設定](docs/FEATURE-fleet.zh-TW.md) — `fleet.yaml` 參考
 - [CLI 參考](docs/CLI.zh-TW.md) — 所有子命令
-- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 29 個 agent 協調工具
+- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 32 個 agent 協調工具
 - [已知問題](docs/KNOWN_ISSUES.zh-TW.md) — 刻意暫緩的項目；開 issue 前請先看
 - [**文件總索引**](docs/README.zh-TW.md) — 所有指南與參考文件的雙語地圖
 

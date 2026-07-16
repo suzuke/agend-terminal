@@ -1,5 +1,14 @@
 # Reviewer Contract v0.1
 
+> **狀態：SUPERSEDED（歷史快照，請勿作為現行操作手冊）。** 現行且唯一具規範性的
+> reviewer contract 是 [`FLEET-DEV-PROTOCOL.md`](FLEET-DEV-PROTOCOL.md) §3、§5、
+> §6。reviewer 現在以 `send({request_kind:"report", parent_id, correlation_id,
+> reviewed_head, ...})` 回報；verdict 只接受 `VERIFIED`、`REJECTED`、
+> `UNVERIFIED`，其中前兩者必須附 `### Evidence`。本快照中的
+> `report_result`、`delegate_task`、`request_information`、`REQUEST_CHANGES`，以及
+> 「UNVERIFIED 不阻擋 merge」等敘述都已退役。以下內容保留作為 v0.1 的設計與事件
+> 歷史，不得用來覆蓋 live MCP schema 或現行 Fleet Protocol。
+
 > AgEnD multi-agent cross-review 協議。首次試跑於 Wave 2（2026-04-22），
 > PR #47 與 PR #49 各走完一輪 REJECTED → fix → VERIFIED → merge。
 > 本文件固化該協議供新 reviewer agent 加入時引用。

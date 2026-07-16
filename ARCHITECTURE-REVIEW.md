@@ -1,19 +1,29 @@
 # Architectural Review — agend-terminal
 
+> **HISTORICAL SNAPSHOT — 2026-06-25.** This review preserves the findings and
+> measurements from its original baseline; it is not a current architecture
+> reference. At `main@1d83b423` (2026-07-16) the MCP registry contains **32**
+> tools and the crate version is `0.10.0`. Use
+> [`docs/architecture.md`](docs/architecture.md) and
+> [`docs/architecture/ARCHITECTURE-14-LEDGER.md`](docs/architecture/ARCHITECTURE-14-LEDGER.md)
+> for current structure and convergence status. Counts and line references
+> below intentionally remain snapshot evidence unless a paragraph explicitly
+> names a newer baseline.
+
 **Date**: 2026-06-25
 **Version**: v0.9.0
 **Scope**: Architectural overview (no line-by-line review)
 **Codebase size**: 380 Rust source files, ~263K lines of code
 
-## 0. Post-review status update (2026-06-26)
+## 0. Historical post-review status update (2026-06-26)
 
 This review was written before the 2026-06-26 cleanup pass. Keep the original
 findings below for historical context, but treat the following as the current
 status:
 
-- **MCP tool count/docs drift fixed**: the registry has 37 tools and the README
-  + `docs/MCP-TOOLS*.md` now say 37; `mcp::registry::tests::docs_match_registry_tool_set`
-  prevents future doc/registry drift.
+- **Historical MCP tool count/docs result**: the registry had 37 tools at this
+  update's baseline. It has 32 at `main@1d83b423`; the registry/docs invariant,
+  rather than this dated count, is authoritative.
 - **`worktree_pool.rs` split**: 6011 LOC → 642 LOC main file plus
   `worktree_pool/{workspace,gc,target_sweep,tests}.rs`.
 - **`daemon/supervisor.rs` split**: 6439 LOC → 2123 LOC main file plus
@@ -109,7 +119,7 @@ Plus lock-free mirrors for the TUI render hot path: `published_state: Arc<Atomic
 
 ## 3. Subsystem Architecture
 
-### 3.1 MCP Tools (37 tools)
+### 3.1 MCP Tools (37 at the review baseline; 32 at `1d83b423`)
 
 **Registration**: Static array registry (`registry.rs:146`), `static ALL_TOOLS: [ToolEntry; 37]`. Each entry has name, definition fn, handler fn pointer. Adding a tool = write schema + handler + append to array. Count pinned by invariant test.
 

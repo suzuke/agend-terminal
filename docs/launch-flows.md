@@ -6,7 +6,7 @@ This doc maps every way to start `agend-terminal`, the daemon lifecycle each
 path implies, and how cold-start (no daemon running) differs from warm-start
 (a daemon is already up).
 
-Current as of `fe528c1` (post-#879v3 revert).
+Current as of `1d83b423` (2026-07-16).
 
 ## TL;DR matrix
 
@@ -22,7 +22,7 @@ Auxiliary subcommands (not full launches, but lifecycle-relevant):
 
 - `attach <name>` — connect to an existing agent's PTY in the current
   shell. Ctrl+B d detaches back to the shell.
-- `connect <name> --backend X` — register a new agent with the running daemon.
+- `connect <name> --backend X` — temporarily register, spawn, wait for, and deregister an external backend in the current terminal.
 - `stop` — clean shutdown of the daemon.
 - `kill <name>` — stop a single agent.
 - `list` (alias `status`, `ls`) — list running agents.
@@ -39,8 +39,8 @@ Both `start` and `app` go through the same `bootstrap::prepare()` seam in
 
 The decision is made in 4 steps:
 
-1. `try_attach()` — scan `~/.agend-terminal/run/*`, probe `api.port` (TCP
-   connect, 200ms timeout). If the probe succeeds, return Attached.
+1. `try_attach()` — scan `$AGEND_HOME/run/*`, probe `api.port` with three
+   100ms attempts (300ms total budget). If a probe succeeds, return Attached.
 2. Acquire the exclusive daemon lock (`acquire_daemon_lock`). This blocks
    other starters from racing.
 3. Re-run `try_attach()` (TOCTOU guard — another daemon could have come
@@ -72,9 +72,10 @@ take the Attached path, auto-spawning a detached daemon during cold
 start so the asymmetry disappears.
 
 PR #903 (#879v3) attempted this and was reverted (`fe528c1`) after
-hitting two pre-existing race bugs that the previous Owned-mode masked
-(see issue #879 — #879v4 is the follow-up fix for those races, not the
-always-Attached pivot itself).
+hitting two pre-existing race bugs that the previous Owned-mode masked. Issue
+#879 was closed on 2026-05-18 after the follow-up race work; the Owned/Attached
+asymmetry described above remains the current behavior, not an in-progress
+always-Attached migration.
 
 ## Tray separation contract (#548 Q7)
 
@@ -108,4 +109,4 @@ default-detach branch and recursively spawns itself.
 - `src/bootstrap/daemon_spawn.rs` — detached-spawn implementation.
 - `src/tray/mod.rs::start_daemon_via_cli` — tray's CLI shell-out.
 - `src/app/mod.rs::run_app` — app's bootstrap consumer.
-- Issue #879 — always-Attached pivot (in progress).
+- Issue #879 — closed history of the reverted always-Attached pivot and follow-up race fixes.

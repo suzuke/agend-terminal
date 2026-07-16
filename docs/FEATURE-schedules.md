@@ -31,7 +31,7 @@ For repeatable team setups, a deployment can create the whole arrangement at onc
   "action": "create",
   "cron": "0 9 * * *",
   "message": "Good morning! Please report yesterday's progress and today's plan.",
-  "target": "lead"
+  "instance": "lead"
 }
 
 // Run once in 30 minutes
@@ -39,7 +39,7 @@ For repeatable team setups, a deployment can create the whole arrangement at onc
   "action": "create",
   "run_at": "2026-05-25T10:00:00",
   "message": "Reminder: the PR review deadline is here.",
-  "target": "reviewer"
+  "instance": "reviewer"
 }
 ```
 
@@ -52,8 +52,11 @@ For repeatable team setups, a deployment can create the whole arrangement at onc
 | `cron` | string | one of two | Cron expression (recurring jobs) |
 | `run_at` | string | one of two | One-shot time (RFC 3339 or local time) |
 | `message` | string | yes | Message to send when the job fires |
-| `target` | string | no | Target agent (defaults to the creator) |
+| `instance` | string | no | Target agent (defaults to the creator) |
 | `label` | string | no | Human-readable label |
+| `timezone` | string | no | IANA timezone; detected at creation when omitted |
+| `fire_strategy` | string | no | `always` (default) or `until_success` |
+| `linked_task_id` | string | conditional | Existing task ID required by `until_success` |
 
 `cron` and `run_at` are mutually exclusive. Exactly one of them must be set.
 
@@ -63,7 +66,7 @@ For repeatable team setups, a deployment can create the whole arrangement at onc
 {"action": "list"}
 ```
 
-Returns all schedules, including execution history (the most recent 50 runs).
+Returns all schedules, including `next_scheduled_fire_at`, `runs_total`, and the newest three history entries by default. Pass `full_history: true` for the full retained history (up to 50 entries), or `instance` to filter by delivery target.
 
 #### update — edit a schedule
 
@@ -73,11 +76,18 @@ Returns all schedules, including execution history (the most recent 50 runs).
 | `cron` | string | New cron expression |
 | `run_at` | string | Switch to a one-shot schedule |
 | `message` | string | New message body |
-| `target` | string | New target agent |
+| `instance` | string | New target agent |
 | `label` | string | New label |
 | `enabled` | bool | Enable / disable |
+| `timezone` | string | New IANA timezone |
+| `fire_strategy` | string | `always` or `until_success` |
+| `linked_task_id` | string | Task linked to `until_success` |
 
 You can switch between recurring and one-shot schedules.
+
+#### Fire strategy
+
+`fire_strategy: "always"` fires on every cron match. With `"until_success"`, the linked task must exist; after that task is done, the schedule skips the remaining matches for the same calendar day in the schedule's timezone and becomes eligible again the next day. If the linked task later disappears, the schedule is disabled and records `target_task_missing`.
 
 #### delete — delete a schedule
 
@@ -93,7 +103,7 @@ Both the standard 5-field and 6-field cron formats are supported:
 # 5-field (the system auto-fills seconds as 0)
 minute hour day month day-of-week
 0 9 * * *           → daily at 09:00
-30 14 * * 1-5       → Mon–Fri at 14:30
+30 14 * * 2-6       → Mon–Fri at 14:30
 0 */2 * * *         → every 2 hours
 
 # 6-field (second minute hour day month day-of-week)
@@ -144,7 +154,7 @@ If the daemon was not running at the scheduled time:
 
 ### Execution History
 
-Each schedule keeps a record of its most recent 50 runs:
+Each schedule stores at most 50 runs. The `list` response trims this to the newest three by default and reports `runs_total`; set `full_history: true` to return all retained entries:
 
 ```json
 {
@@ -261,9 +271,9 @@ On startup the daemon automatically checks for orphan deployments — cases wher
 ```json
 {
   "action": "create",
-  "cron": "0 9 * * 1-5",
+  "cron": "0 9 * * 2-6",
   "message": "早安！請回報：1) 昨天完成了什麼 2) 今天計畫做什麼 3) 有沒有阻塞",
-  "target": "lead",
+  "instance": "lead",
   "label": "daily-standup"
 }
 ```
@@ -275,7 +285,7 @@ On startup the daemon automatically checks for orphan deployments — cases wher
   "action": "create",
   "cron": "0 */3 * * *",
   "message": "請檢查所有 open PR 的 CI 狀態，回報任何失敗的 check。",
-  "target": "reviewer",
+  "instance": "reviewer",
   "label": "pr-health-check"
 }
 ```
@@ -287,7 +297,7 @@ On startup the daemon automatically checks for orphan deployments — cases wher
   "action": "create",
   "run_at": "2026-05-25T15:00:00",
   "message": "提醒：今天 3 點有 release cut，確認所有 PR 已合併",
-  "target": "lead"
+  "instance": "lead"
 }
 ```
 
@@ -337,9 +347,9 @@ A good rule of thumb:
 
 If the cron expression does not parse, creation fails immediately. Fix the expression before retrying.
 
-### Missing target
+### Missing instance
 
-If a schedule should fire to a specific agent but the name is wrong, the message will route nowhere useful. Always validate the target name against the fleet.
+If a schedule should fire to a specific agent but `instance` is wrong, the schedule cannot deliver usefully. Validate the instance name against the fleet. Deleting a target instance disables its schedules and records an orphaned history entry rather than deleting them.
 
 ### Deployment template mismatch
 
@@ -349,11 +359,11 @@ If the deployment template does not match the fleet structure, the resulting set
 
 ## Source Pointers
 
-- `src/schedule.rs`: schedule storage and dispatch
-- `src/deployment.rs`: deployment orchestration
+- `src/schedules.rs`: schedule storage and validation
+- `src/deployments.rs`: deployment orchestration
 - `src/main.rs`: CLI subcommand routing
 - `src/mcp/handlers/schedule.rs`: MCP surface
-- `src/mcp/handlers/deployment.rs`: deployment surface
+- `src/daemon/cron_tick.rs`: schedule evaluation and delivery
 
 ---
 

@@ -8,7 +8,7 @@
 
 **Automatic crash recovery.** A dev agent's process crashes due to an unexpected API error. The daemon detects the exit, records it in the crash sliding window, waits for an exponential backoff delay (starting at 5 seconds), and restarts the agent automatically. If the agent stabilizes, it resumes work as if nothing happened. If it crashes repeatedly (5+ times), the daemon stops restarting and notifies the operator.
 
-**Hang detection and recovery.** An agent receives a task but produces no PTY output for over 600 seconds while in `Thinking` state. The daemon classifies it as `Hung` and initiates the three-stage recovery ladder: first sending an ESC key to interrupt, then restarting the process if ESC fails, and finally pausing the agent and alerting the operator if restarts are also ineffective.
+**Hang detection and recovery.** An agent receives a task but produces no PTY output for over 600 seconds while in `Thinking` state. If hang auto-recovery is enabled, the daemon sends one guarded ESC interrupt and observes the result. The former automatic Stage 2 restart and Stage 3 pause/escalation ladder is no longer part of Hung recovery; unsuccessful Stage 1 outcomes are logged for operator action.
 
 **Operator health dashboard.** The operator checks the TUI and sees that one agent is in `Unstable` state (3 crashes in 10 minutes) while another shows `IdleLong` (no pending work, just waiting). The structured health state lets the operator quickly distinguish between agents that need attention and those that are simply idle.
 
@@ -63,7 +63,7 @@ agent's overall health trend and does not change from a single line of output.
 | `Hung` | Has pending input but timed out without responding | Yes |
 | `IdleLong` | No activity for a long time, but no pending input (not anomalous) | No |
 | `ErrorLoop` | 3+ same-state errors within 10 minutes | No |
-| `Paused` | All 3 auto-recovery stages failed; awaiting manual intervention | No (terminal) |
+| `Paused` | A separate lifecycle handler reached its retry cap; awaiting manual intervention | No (terminal) |
 
 ---
 
@@ -226,23 +226,27 @@ Report the current blocked reason to the daemon:
   "tool": "health",
   "action": "report",
   "reason": "rate_limit",
-  "retry_after_secs": 60
+  "retry_after_secs": 60,
+  "note": "Provider reset is expected soon"
 }
 ```
 
-Agents can proactively report issues so the watchdog knows not to trigger hang
-detection.
+`report` applies to the authenticated calling instance. Supported reasons are `rate_limit`, `quota_exceeded`, and `awaiting_operator`; `retry_after_secs` and `note` are optional. Agents can proactively report issues so the watchdog knows not to trigger hang detection.
 
-### health clear_blocked_reason
+### health clear
 
-Clear a previously set blocked reason, restoring normal hang detection:
+Clear a previously set blocked reason for an explicit instance, restoring normal hang detection:
 
 ```json
 {
   "tool": "health",
-  "action": "clear_blocked_reason"
+  "action": "clear",
+  "instance": "dev",
+  "reason": "rate_limit"
 }
 ```
+
+`instance` is required. `reason` is an optional match filter; if it does not match the currently blocked reason, the operation fails rather than clearing unrelated state.
 
 ---
 
@@ -262,8 +266,9 @@ Solutions:
 
 Yes, but it takes time. The crash count decays by 1 every 30 minutes. When
 `total_crashes` drops below 5, the state transitions to Recovering; below 3, to
-Healthy. However, while in Failed state the process is stopped — the operator
-must manually restart it or wait for Stage 2 auto-recovery to trigger.
+Healthy. However, while in Failed state the process is stopped. The operator can
+restart it explicitly; natural crash-count decay may later permit normal lifecycle
+recovery, but there is no Hung Stage 2 auto-restart to wait for.
 
 ### Q: How to clear Paused state?
 

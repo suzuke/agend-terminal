@@ -1,4 +1,10 @@
-# Operator PTY-Capture Queue
+# Historical Operator PTY-Capture Queue
+
+> **Status: completed historical queue.** The three tracked items (#1014,
+> #1054, and #1559) were closed on 2026-06-01. Do not treat the checklist below
+> as current work. For the live corpus status and new gaps (including Grok), use
+> [`F685-FIXTURE-CORPUS.md`](F685-FIXTURE-CORPUS.md) and
+> [`CAPTURE-RECIPES.md`](../tests/fixtures/state-replay/CAPTURE-RECIPES.md).
 
 > 給 operator 的待錄製清單 + 操作指南。
 > Agent 無法 spawn 真 interactive backend(無真 PTY allocator),所有 `.raw` fixture 必須由 operator 在真實終端錄製。

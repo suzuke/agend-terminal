@@ -2,6 +2,13 @@
 
 Source-of-truth for the `#685` staged auto-recovery dispatcher.
 
+> **CURRENT STATUS (revalidated at `main@1d83b423`, 2026-07-16):** the live
+> dispatcher is Stage-1-only and remains shadow-by-default. In canonical
+> per-tick order it runs after `HangDetectionHandler` and
+> `BackendExitDetectionHandler`. Shadow mode performs no PTY I/O, but it
+> still records `Stage1Pending` plus `last_stage1_fired_at` as a one-shot
+> re-fire guard. Sections §RS.9 and §RS.10 are historical records only.
+
 **#2549 P2 update (operator decision `d-20260703021554626467-13`):**
 Stage 2 (auto-restart) and the dispatcher-driven Stage 3 escalation path
 were **removed** — converged to **Stage-1-only**. `§RS.9` (Stage 2) and
@@ -16,7 +23,7 @@ this dispatcher's ladder. See `src/daemon/per_tick/recovery_dispatcher.rs`'s
 module doc for the full rationale (why the pre-#2549 default-gate-off
 behavior made this a behavior-preserving, not a scope-expanding, cut).
 
-This PR (`#685` sub-task 7a) ships **Stage 1 ESC interrupt** with full
+The original `#685` sub-task 7a shipped **Stage 1 ESC interrupt** with full
 infrastructure (state machine, env-var gate, anti-thrash cooldown,
 telemetry pattern).
 
@@ -104,14 +111,18 @@ mechanics themselves are unchanged and still live — see `§RS.7` and
 
 ## §RS.3 — Tick order & dispatcher placement
 
-The dispatcher runs as the **second** entry in
-`src/daemon/mod.rs:537-546` `handlers: Vec<Box<dyn PerTickHandler>>`,
-immediately after `HangDetectionHandler`. Sequencing matters:
+The dispatcher runs as the **third** entry in
+`src/daemon/per_tick/mod.rs::build_default_handlers`, after
+`HangDetectionHandler` and `BackendExitDetectionHandler`. Sequencing matters:
 
 1. `HangDetectionHandler` runs `check_hang` → possibly transitions
    `core.health.state` to `Hung` (sub-task 1 §Invariants 5b — sole
    mutator).
-2. `RecoveryDispatcherHandler` runs immediately after, reading the
+2. `BackendExitDetectionHandler` checks foreground/backend identity. A matching
+   backend leaves `Hung` unchanged; a persistent identity mismatch reclassifies
+   the agent as `Unhealthy`, so the recovery dispatcher correctly skips that
+   distinct failure mode.
+3. `RecoveryDispatcherHandler` then reads the
    fresh `core.health.state` value. Subsequent ticks while still
    `Hung` use the same read — dispatcher does NOT subscribe to
    `check_hang`'s `bool` return (which only fires on the transition
@@ -150,6 +161,11 @@ helper (decision §1.4 Delta 2 Option a — DRY, single source of truth).
 The dispatcher reads the gate env var **each tick** — operator can flip
 `AGEND_AUTO_RECOVERY_STAGE1=1` without restarting the daemon. Important
 for the shadow→active promotion workflow.
+
+Both gate modes transition to `Stage1Pending` and stamp
+`last_stage1_fired_at`. In shadow mode these fields are bookkeeping only:
+they suppress repeat would-have-fired decisions and drive timeout/cooldown
+telemetry; they do **not** claim that ESC was delivered.
 
 The Stage 1 timeout (10 s, `STAGE1_TIMEOUT_DEFAULT_MS`) and cooldown
 (60 s, `STAGE1_COOLDOWN_DEFAULT_MS`) are **fixed consts, not

@@ -6,12 +6,12 @@ evidence for an item, but does not complete the item by itself.
 
 ## Snapshot and authority
 
-- Snapshot date: 2026-07-15
-- `agend-terminal` baseline: `73bee63f6edf67b331ff63e21e7d8ddc615a8e63`
+- Snapshot date: 2026-07-16
+- `agend-terminal` baseline: `31130f9324d42d3e699a7c560ffc0b07d5dc3776`
   on `main`
 - vendored `agentic-git` baseline: `5c02b1421beda6590e8ebdfd137df9b49ee0bd02`
-- GitHub state at the snapshot: zero open `agend-terminal` PRs; the five-PR
-  dependency update train is merged
+- GitHub state at the snapshot: PR #2818 is merged and included in this source
+  baseline; issue #2782 is closed after its exact-revoke acceptance scope landed
 - Program state: **0 done, 9 in progress, 5 pending, 0 blocked**
 
 Evidence is ranked in this order:
@@ -65,14 +65,14 @@ parallel, but the order must be re-evaluated after every exact-main close loop.
 |---:|---|---|---|
 | 1 | Exact authority identity | in progress | Generation-scoped admission must cover crash recovery and every mutation/review/release entry point. |
 | 2 | Unified durable workflow | pending | One replayable workflow episode must own dispatch through exact-main completion. |
-| 3 | Ledger/outbox authority | in progress | Separate durable rows must converge on one action authority with CAS settlement. |
-| 4 | Strict task-board routing and owner normalization | in progress | Owner identity and membership-change settlement are not yet canonical end to end. |
-| 5 | Usage-limit takeover | in progress | Transactional, generation-fenced takeover and exact-once resume remain. |
-| 6 | Review provenance | in progress | Reviewer release/reassignment and pre-CI review assignment remain unsafe. |
+| 3 | Ledger/outbox authority | in progress | Reporter- and CI-scoped settlements are bounded slices; separate durable rows must still converge on one action authority. |
+| 4 | Strict task-board routing and owner normalization | in progress | Routing and typed blank-owner normalization are merged; membership-change settlement is not canonical end to end. |
+| 5 | Usage-limit takeover | in progress | Operator-capability ingress is enforced; a generation-fenced replacement transaction and exact-once resume remain. |
+| 6 | Review provenance | in progress | Exact revoke and pre-CI assignment are merged; reviewer transfer/restart/reassignment remains incomplete. |
 | 7 | Ordered merge train | pending | No durable restart-resumable merge queue owns all gates. |
 | 8 | Notification routing and obligation settlement | in progress | All actionable notifications must share correlated delivery and settlement semantics. |
 | 9 | Session continuity | pending | Coherent checkpoint proof and exactly-once fresh-session resume are not implemented. |
-| 10 | Transactional worktree lifecycle | in progress | All destructive paths need the same permit/journal; shared-directory deletion and submodule writes remain open. |
+| 10 | Transactional worktree lifecycle | in progress | Managed release and branch retirement now fail closed; all destructive paths still need one permit/journal, and shared-directory deletion plus submodule writes remain open. |
 | 11 | Shared `RuntimeCore` | in progress | App and headless modes still have duplicate ownership and local API loopbacks. |
 | 12 | Typed backend capability contract | pending | Partial model/resume types must become one complete per-backend capability matrix. |
 | 13 | Typed invariant migration | in progress | String/source guards still need a systematic proof-type replacement audit. |
@@ -119,8 +119,9 @@ plan-ack authority), and
 [PR #2798](https://github.com/suzuke/agend-terminal/pull/2798) (`af24226f`,
 durable protected-CI handoff). They do not yet form one aggregate.
 [Issue #2454](https://github.com/suzuke/agend-terminal/issues/2454) is also a
-boundary symptom: 15 production `crate::api::call` loopbacks remain under
-`src/mcp/handlers` at this baseline, rather than the 35 in the historical title.
+boundary symptom: 18 production `crate::api::call` / `call_at` references
+remain under `src/mcp/handlers` at this baseline (excluding test/repro modules
+and doc comments), rather than the 35 in the historical title.
 
 **Remaining invariant.** A single `DispatchSaga`-equivalent authority must own
 phase transitions, exact subject identity, receipts, recovery, and settlement;
@@ -142,8 +143,14 @@ become actionable again.
 [PR #2788](https://github.com/suzuke/agend-terminal/pull/2788) (`029fa3a7`)
 made obsolete-assignment retirement durable; and
 [PR #2798](https://github.com/suzuke/agend-terminal/pull/2798) (`af24226f`)
-added a durable protected-CI handoff episode. These are independent ledgers
-with related but non-identical lifecycle rules.
+added a durable protected-CI handoff episode. Subsequent bounded slices added
+CAS-checked terminal feature-watch removal in
+[PR #2808](https://github.com/suzuke/agend-terminal/pull/2808) (`76d9ab33`)
+and reporter-scoped dispatch settlement in
+[PR #2813](https://github.com/suzuke/agend-terminal/pull/2813) (`17df827f`).
+These remain independent ledgers with related but non-identical lifecycle
+rules; the new slices narrow replay ambiguity but do not establish one outbox
+authority.
 
 **Remaining invariant.** Converge action authority on row-first persistence,
 stable correlation identity, monotone states, CAS claim/settlement, explicit
@@ -166,13 +173,15 @@ and ACL decisions use one canonical owner identity across membership changes.
 [PR #2797](https://github.com/suzuke/agend-terminal/pull/2797) (`a306be9c`)
 validates plan-ack authority under the transition lock, and
 [PR #2799](https://github.com/suzuke/agend-terminal/pull/2799) (`be1b3546`)
-fixed cross-board, cross-lease auto-release. Owner input is still copied
-directly from JSON in [`tasks/handler.rs`](../../src/tasks/handler.rs#L101),
-without canonical blank/whitespace normalization.
+fixed cross-board, cross-lease auto-release.
+[PR #2809](https://github.com/suzuke/agend-terminal/pull/2809) (`ba4dc043`)
+then introduced typed `AssigneePatch` handling: omitted owner preserves the
+current value, explicit null clears it, and blank/whitespace strings normalize
+to unassigned at the task write boundary (`src/tasks/handler.rs`).
 
-**Remaining invariant.** Normalize owner identity at the write boundary and add
-an explicit administrative settlement/migration path for tasks orphaned by team
-or project membership changes.
+**Remaining invariant.** Add an explicit administrative settlement/migration
+path for tasks orphaned by team or project membership changes, and prove every
+secondary ACL/serialization path consumes the normalized owner representation.
 
 **Done/verification.** The routing/ACL matrix must cover default and project
 boards, unreadable/duplicate IDs, blank owners, team assignees, membership
@@ -188,9 +197,14 @@ unproven state refuses; resume is exactly once.
 **Current evidence.** [PR #2759](https://github.com/suzuke/agend-terminal/pull/2759)
 (`864bd5db`) merged durable UsageLimit control-plane episodes. This is Slice 1:
 it establishes episode identity and durability, not transactional replacement.
+[PR #2814](https://github.com/suzuke/agend-terminal/pull/2814) (`e4fd2d20`)
+added the operator-invoked `usage_limit_takeover` MCP action and enforces its
+operator capability at API ingress, with the real handler and ingress paths
+covered together. That closes the agent-self-invocation authority gap, but the
+handler remains a bounded takeover slice rather than the full replacement saga.
 
 **Remaining invariant.** Implement the mandatory operator-invoked, idempotent
-takeover transaction with generation fencing, coherent checkpoint proof,
+replacement transaction with generation fencing, coherent checkpoint proof,
 recovery from every partial state, and typed backend refusal. Automatic takeover
 remains optional until telemetry justifies it; it must not be required to close
 the safety invariant.
@@ -211,20 +225,25 @@ reconciled after restart.
 [PR #2772](https://github.com/suzuke/agend-terminal/pull/2772) (`bce3cb39`),
 [PR #2783](https://github.com/suzuke/agend-terminal/pull/2783) (`cf83697f`),
 and [PR #2788](https://github.com/suzuke/agend-terminal/pull/2788)
-(`029fa3a7`). Two current gaps keep the item open:
-[issue #2782](https://github.com/suzuke/agend-terminal/issues/2782) because
-`revoke_all_for_target` is wired only to instance deletion and `transfer` has no
-production caller in
-[`assignment_authority.rs`](../../src/daemon/assignment_authority.rs#L1078), and
-[issue #2800](https://github.com/suzuke/agend-terminal/issues/2800) because
-review assignment strictly loads PR state in
-[`review_assignment.rs`](../../src/mcp/handlers/comms_delegate/review_assignment.rs#L154)
-while CI polling creates/updates it only after a terminal conclusion in
-[`poller.rs`](../../src/daemon/ci_watch/poller.rs#L1902).
+(`029fa3a7`).
+[PR #2805](https://github.com/suzuke/agend-terminal/pull/2805) (`02b7dd67`)
+added an orchestrator-authorized exact-target revoke surface (slice 1 of
+[#2782](https://github.com/suzuke/agend-terminal/issues/2782));
+[PR #2806](https://github.com/suzuke/agend-terminal/pull/2806) (`742ecc1a`)
+creates an exact-subject pending PR-state record before terminal CI and closed
+[#2800](https://github.com/suzuke/agend-terminal/issues/2800); and
+[PR #2807](https://github.com/suzuke/agend-terminal/pull/2807) (`afbf9c84`)
+made review-worktree deletion authority-proven with durable cleanup intents.
+[PR #2818](https://github.com/suzuke/agend-terminal/pull/2818) (`31130f93`)
+added typed daemon-provisioned disposable-review provenance in the initial
+signed binding, with exact-head and new-branch admission plus fail-closed release
+gates independent of assignment authority.
 
-**Remaining invariant.** Add orchestrator-usable, idempotent revoke/transfer and
-create exact-subject pending PR state before terminal CI, without weakening the
-exact-head merge gate.
+**Remaining invariant.** Issue #2782's orchestrator exact-revoke scope is closed,
+but the broader Architecture-14 lifecycle still requires reviewer restart/swap
+and orchestrator transfer/reassignment to release or move the exact assignment
+without a delete-only workaround. Reconcile receipts after restart and preserve
+the exact-head merge gate across each transition.
 
 **Done/verification.** Reviewer restart/swap, stale generation, head move,
 assignment before CI completion, duplicate verdict, GitHub mirror restart, and
@@ -240,9 +259,9 @@ and only the exact reviewed and CI-verified head may merge.
 provides freshness-aware PR state and
 [PR #2796](https://github.com/suzuke/agend-terminal/pull/2796) (`528b0c28`)
 exposes exact target SHA for CI watches. The recent merge train was coordinated
-successfully, but by orchestration policy rather than a durable queue. Issue
-[#2800](https://github.com/suzuke/agend-terminal/issues/2800) must also be fixed
-so review can run before CI while exact-head CI remains the merge gate.
+successfully, but by orchestration policy rather than a durable queue. PR #2806
+closed #2800, so review can now be assigned before terminal CI while exact-head
+CI remains the merge gate; that prerequisite does not itself serialize a train.
 
 **Remaining invariant.** Build a restart-resumable queue owned by the unified
 workflow aggregate, with explicit invalidation and successor activation.
@@ -316,7 +335,20 @@ rollback.
 [PR #2787](https://github.com/suzuke/agend-terminal/pull/2787) (`4c7d814d`),
 [PR #2790](https://github.com/suzuke/agend-terminal/pull/2790) (`b4d2be1f`),
 and [PR #2799](https://github.com/suzuke/agend-terminal/pull/2799)
-(`be1b3546`). [Issue #2764](https://github.com/suzuke/agend-terminal/issues/2764)
+(`be1b3546`). The post-ledger slices materially narrow destructive lifecycle
+paths: [PR #2810](https://github.com/suzuke/agend-terminal/pull/2810)
+(`0b127f2a`) delegates daemon-managed `repo release` to the canonical guarded
+release using an exact binding fingerprint, marker identity validation, and
+WIP preservation;
+[PR #2815](https://github.com/suzuke/agend-terminal/pull/2815) (`06efae12`)
+enforces branch-retirement disposition and occupancy gates; and
+[PR #2816](https://github.com/suzuke/agend-terminal/pull/2816) (`1d83b423`)
+makes checkout-recovery sweeps respect active path locks; and
+[PR #2818](https://github.com/suzuke/agend-terminal/pull/2818) (`31130f93`)
+adds typed `disposable_review` checkout provenance, exact provisioned-head CAS,
+new-branch proof, and terminal-task/occupancy/PR cleanup gates for self-provisioned
+review worktrees. These are foundations, not yet one durable lifecycle transaction.
+[Issue #2764](https://github.com/suzuke/agend-terminal/issues/2764)
 remains: deletion captures fleet state before removal, but
 [`cleanup_working_dir`](../../src/agent_ops.rs#L504) receives only home/name/path
 and trusts on-disk identity artifacts, so another live instance sharing the
@@ -325,9 +357,9 @@ canonical directory is not always rejected. In vendored `agentic-git`,
 `submodule` writes are not classified as mutating.
 
 **Remaining invariant.** Migrate all mutation roots and leaves to the same typed
-permit/capability, including janitor/retention/GC and branch creation; fix shared
-live-owner deletion and the upstream submodule classification before updating
-the gitlink.
+permit/capability and durable journal, including janitor/retention/GC and branch
+creation; fix shared live-owner deletion and the upstream submodule
+classification before updating the gitlink.
 
 **Done/verification.** Race create/reuse/rebase/release/delete under aliases,
 symlinks, corrupt bindings, nested submodules, process death, and concurrent new
@@ -450,8 +482,8 @@ correctness outcomes.
 | [agend-terminal #2765](https://github.com/suzuke/agend-terminal/issues/2765) | Confirmed current bug | 1, 9, 11 | App-created agents still use `crash_tx: None`; restart publication is not generation-admitted. |
 | [agend-terminal #2779](https://github.com/suzuke/agend-terminal/issues/2779) | **Excluded optional feature** | — | Per-instance thresholds add configurability, not a missing correctness invariant. |
 | [agend-terminal #2781](https://github.com/suzuke/agend-terminal/issues/2781) | **Excluded separate P3 bug** | — | Decimal percentage formatting/Kiro regex inconsistency is real but not an Architecture-14 dependency. |
-| [agend-terminal #2782](https://github.com/suzuke/agend-terminal/issues/2782) | Confirmed current bug | 6 | Production revoke-all is deletion-only; restart/reviewer-swap release is missing at this baseline. |
-| [agend-terminal #2800](https://github.com/suzuke/agend-terminal/issues/2800) | Confirmed current bug | 6, 7 | Assignment requires PR state that terminal CI currently creates; review must be able to start before CI. |
+| [agend-terminal #2782](https://github.com/suzuke/agend-terminal/issues/2782) | Acceptance scope fixed; closed | 6 | #2805 added orchestrator exact revoke and closed the issue; restart/reviewer-swap transfer and complete reassignment settlement remain broader Architecture-14 hardening. |
+| [agend-terminal #2800](https://github.com/suzuke/agend-terminal/issues/2800) | Fixed on main; closed | — | #2806 creates exact-subject pending PR state before terminal CI; do not keep it on the critical path. |
 | [agentic-git #26](https://github.com/suzuke/agentic-git/issues/26) | Confirmed contract gap | 12, 13 | No machine-verifiable embedder/binding/event contract exists. |
 | [agentic-git #30](https://github.com/suzuke/agentic-git/issues/30) | Supporting refactor only | — | The library remains large, but a module split does not itself close an invariant. |
 | [agentic-git #34](https://github.com/suzuke/agentic-git/issues/34) | Confirmed current safety gap | 10, 13 | `submodule` and `submodule--helper` are absent from mutating-command classification. |
