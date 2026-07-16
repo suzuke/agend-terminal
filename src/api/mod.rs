@@ -700,7 +700,7 @@ fn handle_session(
         // Agent principal can only be on `mcp_tool`/`mcp_tools_list`; Operator has
         // full authority (mode gate is a pass-through for direct methods). A deny
         // short-circuits before dispatch.
-        let response = if !operator_gate::capability_allows(principal, method) {
+        let response = if !operator_gate::capability_allows_request(principal, method, params) {
             json!({
                 "ok": false,
                 "error": format!(
@@ -1445,21 +1445,20 @@ mod tests {
         (port, home, rec, shutdown)
     }
 
-    /// Send an NDJSON request to the API server and read one response.
-    fn api_request(port: u16, home: &std::path::Path, request: &Value) -> Value {
+    /// Send an NDJSON request to the API server and read one response using a
+    /// caller-supplied authenticated principal token.
+    fn api_request_with_auth(
+        port: u16,
+        request: &Value,
+        auth: &crate::auth_cookie::Cookie,
+    ) -> Value {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let stream =
             std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = std::io::BufReader::new(stream);
 
-        // Auth handshake — this helper drives operator-surface DIRECT methods
-        // (delete/create_team/…), so it presents the operator full-capability
-        // token (P0a), exactly as the real `api::call`/`call_at` now do.
-        let run_dir = crate::daemon::run_dir(home);
-        let operator_token = crate::auth_cookie::read_operator_token(&run_dir).unwrap();
-        crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &operator_token)
-            .unwrap();
+        crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, auth).unwrap();
 
         writeln!(writer, "{}", request).unwrap();
         writer.flush().unwrap();
@@ -1467,6 +1466,13 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         serde_json::from_str(line.trim()).unwrap_or(json!({"error": "parse failed"}))
+    }
+
+    /// Send an NDJSON request on the operator-capability surface.
+    fn api_request(port: u16, home: &std::path::Path, request: &Value) -> Value {
+        let run_dir = crate::daemon::run_dir(home);
+        let operator_token = crate::auth_cookie::read_operator_token(&run_dir).unwrap();
+        api_request_with_auth(port, request, &operator_token)
     }
 
     fn stop_server(shutdown: &Arc<AtomicBool>, home: &std::path::Path) {
@@ -1483,6 +1489,55 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn authenticated_agent_usage_limit_takeover_is_denied_at_api_ingress() {
+        let (port, home, _notifier, shutdown) = start_test_server("usage-limit-api-gate");
+        let run_dir = crate::daemon::run_dir(&home);
+        let agent_cookie = crate::auth_cookie::read_cookie(&run_dir).unwrap();
+
+        for mode in ["active", "away", "sleep"] {
+            let mode_resp = api_request(
+                port,
+                &home,
+                &json!({"method": "mode", "params": {"mode": mode}}),
+            );
+            assert_eq!(mode_resp["ok"], true, "mode setup failed: {mode_resp}");
+            for instance in ["", "forged-operator"] {
+                let response = api_request_with_auth(
+                    port,
+                    &json!({
+                        "method": "mcp_tool",
+                        "params": {
+                            "tool": "usage_limit_takeover",
+                            "instance": instance,
+                            "arguments": {
+                                "source": "worker-a",
+                                "episode_id": "forged"
+                            }
+                        }
+                    }),
+                    &agent_cookie,
+                );
+                assert_eq!(
+                    response["ok"], false,
+                    "agent request unexpectedly allowed: {response}"
+                );
+                assert_eq!(
+                    response["denied_by"], "capability",
+                    "denial must occur at authenticated API ingress: {response}"
+                );
+            }
+        }
+
+        let _ = api_request(
+            port,
+            &home,
+            &json!({"method": "mode", "params": {"mode": "active"}}),
+        );
+        stop_server(&shutdown, &home);
     }
 
     #[test]

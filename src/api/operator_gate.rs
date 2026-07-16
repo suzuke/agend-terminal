@@ -167,6 +167,16 @@ pub(crate) fn capability_allows(principal: crate::auth_cookie::Principal, method
     }
 }
 
+/// Per-request capability gate, including the inner MCP tool carried by the
+/// authenticated `mcp_tool` transport.
+pub(crate) fn capability_allows_request(
+    principal: crate::auth_cookie::Principal,
+    method: &str,
+    _params: &Value,
+) -> bool {
+    capability_allows(principal, method)
+}
+
 /// Decide whether `method` (+ `params`) is allowed under the current
 /// `state`. `Ok(())` = allowed; `Err(reason)` = denied (caller returns the
 /// reason to the requester). Pure — no I/O, fully unit-testable.
@@ -777,5 +787,25 @@ mod tests {
                 "agent cookie must NOT be capable of direct method '{m}'"
             );
         }
+    }
+
+    #[test]
+    fn capability_agent_cannot_invoke_usage_limit_takeover_at_request_gate() {
+        for instance in ["", "forged-operator"] {
+            let params = json!({
+                "tool": "usage_limit_takeover",
+                "instance": instance,
+                "arguments": {"source": "worker-a", "episode_id": "forged"}
+            });
+            assert!(
+                !capability_allows_request(P::Agent, method::MCP_TOOL, &params),
+                "authenticated agent must be denied regardless of payload instance"
+            );
+        }
+        assert!(capability_allows_request(
+            P::Operator,
+            method::MCP_TOOL,
+            &json!({"tool": "usage_limit_takeover", "instance": ""})
+        ));
     }
 }
