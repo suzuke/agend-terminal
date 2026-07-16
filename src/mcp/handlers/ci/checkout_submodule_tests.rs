@@ -947,39 +947,26 @@ fn txn_sweep_ignores_canonical_path_lock_file() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A lookalike lock name is not in the producer namespace. It must still pass
-/// through typed recovery handling and remain fail-closed as an unreadable
-/// journal artifact rather than being silently skipped.
+/// A lookalike lock name is not in the producer namespace. A valid due journal
+/// using that key must still be processed rather than silently skipped.
 #[test]
-#[tracing_test::traced_test]
-fn txn_sweep_near_miss_path_lock_name_remains_fail_closed() {
+fn txn_sweep_near_miss_path_lock_name_is_processed() {
     let home = tmp_home("sweep-path-lock-near-miss");
     let near_miss = "wtpath-not-a-canonical-lock.lock";
-    let artifact = super::checkout_txn::txn_root(&home).join(near_miss);
-    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-    std::fs::write(&artifact, b"").unwrap();
-    let callbacks = std::cell::Cell::new(0);
-
-    let n = recover_pending_sweep(
+    let wt = home.join("wt");
+    save_pending(
         &home,
-        fixed_now(),
-        |_| {
-            callbacks.set(callbacks.get() + 1);
-            Some(())
-        },
-        |_| {
-            callbacks.set(callbacks.get() + 1);
-            true
-        },
-        |_| callbacks.set(callbacks.get() + 1),
+        near_miss,
+        &wt,
+        1,
+        fixed_now() - chrono::Duration::seconds(1),
     );
-    assert_eq!(n, 0);
-    assert_eq!(callbacks.get(), 0, "near-miss remains fail-closed");
+    let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
+    assert_eq!(n, 1, "near-miss journal must be recovered");
     assert!(
-        logs_contain("journal unreadable") && logs_contain(near_miss),
-        "near-miss must be observed as an unreadable journal artifact"
+        Journal::load(&home, near_miss).is_none(),
+        "processed near-miss journal is cleared"
     );
-    assert!(artifact.is_file(), "near-miss evidence remains untouched");
     std::fs::remove_dir_all(&home).ok();
 }
 
