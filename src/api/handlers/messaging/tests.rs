@@ -3092,13 +3092,18 @@ fn report_fields_on_kind_task_rejected_without_leaked_task() {
 // a stale report/update from agent-A incorrectly affects agent-B's state.
 
 /// RED 1: stale prior-assignee report must NOT remove current assignee's
-/// dispatch_tracking entry. mark_completed removes ALL entries matching
-/// the correlation_id regardless of reporter vs entry.to — the function
-/// itself is unscoped. (The MCP handle_report_result path calls it
-/// directly at comms.rs:274 with the sender as _to, which is ignored.)
+/// dispatch_tracking entry. Exercises the real MCP handle_report_result →
+/// mark_completed path (comms.rs:274). mark_completed removes ALL entries
+/// matching the correlation_id regardless of reporter vs entry.to.
 #[test]
 fn red_stale_report_cannot_remove_current_dispatch_tracking() {
     let home = tmp_home("red-dt-stale-report");
+    // Fleet needed for handle_report_result's fallback delivery.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  lead:\n    backend: claude\n  agent-a:\n    backend: claude\n  agent-b:\n    backend: claude\n",
+    )
+    .unwrap();
 
     // Dispatch same task to both agent-A and agent-B.
     crate::dispatch_tracking::track_dispatch(
@@ -3124,9 +3129,22 @@ fn red_stale_report_cannot_remove_current_dispatch_tracking() {
         },
     );
 
-    // Stale agent-A reports — mark_completed called with reporter="agent-a".
-    // This simulates the MCP handle_report_result path (comms.rs:274).
-    crate::dispatch_tracking::mark_completed(&home, Some("t-shared"), "agent-a");
+    // Stale agent-A sends report through real MCP handle_report_result.
+    let sender = crate::identity::Sender::new("agent-a");
+    let args = json!({
+        "instance": "lead",
+        "summary": "done (stale)",
+        "correlation_id": "t-shared",
+        "request_kind": "report",
+    });
+    let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+        home: &home,
+        args: &args,
+        instance_name: sender.as_ref().map_or("", |s| s.as_str()),
+        sender: &sender,
+        runtime: None,
+    };
+    crate::mcp::handlers::dispatch::dispatch_send(&ctx);
 
     // Agent-B's dispatch_tracking entry must survive.
     let store = crate::dispatch_tracking::take_pending_dispatchers_to(&home, "agent-b");
@@ -3234,8 +3252,9 @@ fn red_restart_preserves_current_watchdog_after_stale_report() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// RED 4: watchdog must still fire (detect exceeded threshold) for current
-/// assignee after a stale prior-assignee report.
+/// RED 4: watchdog must still fire (dispatch_idle_threshold_exceeded) for
+/// current assignee after a stale prior-assignee report. Uses an already-
+/// expired issued_at fixture and invokes the real scan_and_emit. No sleep.
 #[test]
 fn red_watchdog_fires_for_current_assignee_after_stale_report() {
     let home = tmp_home("red-watchdog-fires");
@@ -3245,18 +3264,27 @@ fn red_watchdog_fires_for_current_assignee_after_stale_report() {
         &[("team", &["lead", "agent-a", "agent-b"])],
     );
 
-    // Agent-B sidecar with a 1-second threshold (expires immediately).
-    let id_b = crate::daemon::dispatch_idle::record_dispatch(
-        &home,
-        "lead",
-        "agent-b",
-        Some("t-shared"),
-        "task",
-        1,
-    )
-    .expect("seed agent-b sidecar");
+    // Seed agent-B sidecar with already-expired issued_at (30s threshold, 2min ago).
+    let expired_time = chrono::Utc::now() - chrono::TimeDelta::try_seconds(120).unwrap();
+    let dispatch_id = format!("disp-red4-{}", std::process::id());
+    let sidecar = crate::daemon::dispatch_idle::PendingDispatch {
+        schema_version: 1,
+        dispatch_id: dispatch_id.clone(),
+        dispatcher: "lead".into(),
+        target: "agent-b".into(),
+        correlation_id: Some("t-shared".into()),
+        expected_kind: "task".into(),
+        threshold_secs: 30,
+        issued_at: expired_time.to_rfc3339(),
+        status: crate::daemon::dispatch_idle::DispatchStatus::Pending,
+        ..Default::default()
+    };
+    let dir = home.join("pending-dispatches");
+    std::fs::create_dir_all(&dir).ok();
+    let path = crate::daemon::dispatch_idle::pending_path(&home, &dispatch_id);
+    std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
 
-    // Stale agent-A report.
+    // Stale agent-A report (deletes the sidecar via mark_resolved).
     let ctx = test_ctx(&home);
     let _ = handle_send(
         &json!({
@@ -3269,15 +3297,20 @@ fn red_watchdog_fires_for_current_assignee_after_stale_report() {
         &ctx,
     );
 
-    // Wait for threshold to expire.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Run the real watchdog scan — must detect exceeded for agent-b.
+    crate::daemon::dispatch_idle::scan_and_emit(&home);
 
-    // The sidecar must still exist AND be detectable as exceeded.
+    // The sidecar must still exist with Exceeded status.
     let pending = crate::daemon::dispatch_idle::list_pending(&home);
-    let entry = pending.iter().find(|p| p.dispatch_id == id_b);
+    let entry = pending.iter().find(|p| p.dispatch_id == dispatch_id);
     assert!(
         entry.is_some(),
         "RED: agent-b's sidecar must survive stale report so watchdog can fire"
+    );
+    assert_eq!(
+        entry.unwrap().status,
+        crate::daemon::dispatch_idle::DispatchStatus::Exceeded,
+        "RED: scan_and_emit must flip agent-b's sidecar to Exceeded"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3345,7 +3378,10 @@ fn red_stale_update_cannot_refresh_current_issued_at() {
 
 /// RED 6: validated-review bridge settlement must be reporter-scoped.
 /// A verdict from a stale reviewer must NOT resolve the current reviewer's
-/// dispatch_idle sidecar.
+/// dispatch_idle sidecar. Uses a genuine ValidatedCodeReviewReceipt
+/// through the bridge path. The sidecar is keyed by task_id (not
+/// repo@branch) so generic report settlement (correlation_id-based)
+/// cannot reach it — only the bridge can.
 #[test]
 fn red_validated_review_bridge_settlement_is_reporter_scoped() {
     let home = tmp_home("red-review-bridge");
@@ -3360,26 +3396,57 @@ fn red_validated_review_bridge_settlement_is_reporter_scoped() {
         &home,
         "lead",
         "reviewer-b",
-        Some("t-review"),
+        Some("t-review-task"),
         "task",
         600,
     )
     .expect("seed reviewer-b sidecar");
 
-    // Stale reviewer-A sends report. The bridge_verdict_to_review_task
-    // path calls mark_resolved(home, task_id) without checking reporter.
-    // We simulate a report with correlation matching the review task.
-    let ctx = test_ctx(&home);
-    let _ = handle_send(
-        &json!({
-            "from": "reviewer-a",
-            "target": "lead",
-            "text": "VERIFIED — looks good",
-            "kind": "report",
-            "correlation_id": "t-review",
-        }),
-        &ctx,
+    // Construct genuine validated-review receipt from stale reviewer-A.
+    // Receipt's task_id matches the sidecar correlation; the bridge
+    // resolves mark_resolved via this task_id.
+    let receipt = crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:red6".into(),
+            source_id: "m-red6".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId(uuid::Uuid::new_v4()),
+            reviewer_name: "reviewer-a".into(),
+            repo: "org/repo".into(),
+            pr_number: 42,
+            branch: "feat/x".into(),
+            task_id: "t-review-task".into(),
+            reviewed_head: "b".repeat(40),
+            review_class: crate::daemon::pr_state::ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        },
     );
+
+    // Drive through track_dispatch with repo@branch as correlation_id
+    // (different from the task_id-keyed sidecar) so the generic
+    // mark_resolved at messaging.rs:583 does NOT match the sidecar.
+    // Only bridge_verdict_to_review_task (called inside track_dispatch
+    // at messaging.rs:611) can reach the task-keyed sidecar.
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 1,
+        id: Some("m-red6-stale".into()),
+        from: "reviewer-a".into(),
+        text: "VERIFIED — looks good".into(),
+        kind: Some("report".into()),
+        correlation_id: Some("org/repo@feat/x".into()),
+        validated_code_review: Some(receipt),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    let params = json!({
+        "from": "reviewer-a",
+        "target": "lead",
+        "kind": "report",
+        "correlation_id": "org/repo@feat/x",
+    });
+    crate::api::handlers::messaging::track_dispatch(&home, &params, "reviewer-a", "lead", &msg);
 
     // Reviewer-B's sidecar must survive.
     let pending = crate::daemon::dispatch_idle::list_pending(&home);
