@@ -67,7 +67,7 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
             "code": "managed_release_unauthorized",
         });
     }
-    let outcome = crate::worktree_pool::release_full_exact(home, &marker_agent, &fingerprint);
+    let outcome = crate::worktree_pool::release_full_exact(home, &marker_agent, &fingerprint, true);
     json!({
         "path": canonical.display().to_string(),
         "delegated_to_canonical": true,

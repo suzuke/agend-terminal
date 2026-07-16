@@ -916,6 +916,7 @@ fn release_full_guarded(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
     provenance: ReleaseProvenance,
+    validate_marker: bool,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
@@ -971,7 +972,7 @@ fn release_full_guarded(
     };
     let wt_path = current["worktree"].as_str().unwrap_or("");
     let wt_exists = !wt_path.is_empty() && Path::new(wt_path).exists();
-    if wt_exists {
+    if validate_marker && wt_exists {
         let marker_path = Path::new(wt_path).join(MANAGED_MARKER);
         let marker_content = match std::fs::read_to_string(&marker_path) {
             Ok(c) => c,
@@ -1123,6 +1124,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         &permit,
         None,
         ReleaseProvenance::Manual,
+        false,
     )
 }
 
@@ -1142,13 +1144,14 @@ pub(crate) fn release_full_with_permit_origin(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     provenance: ReleaseProvenance,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, permit, None, provenance)
+    release_full_guarded(home, agent, dry_run, permit, None, provenance, false)
 }
 
 pub(crate) fn release_full_exact(
     home: &Path,
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
+    validate_marker: bool,
 ) -> ReleaseOutcome {
     let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
@@ -1170,6 +1173,7 @@ pub(crate) fn release_full_exact(
         &permit,
         Some(expected),
         ReleaseProvenance::Auto,
+        validate_marker,
     )
 }
 
