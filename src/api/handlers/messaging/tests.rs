@@ -3312,6 +3312,16 @@ fn red_watchdog_fires_for_current_assignee_after_stale_report() {
         crate::daemon::dispatch_idle::DispatchStatus::Exceeded,
         "RED: scan_and_emit must flip agent-b's sidecar to Exceeded"
     );
+    // dispatch_idle_threshold_exceeded must be durably enqueued to the dispatcher.
+    let msgs = crate::inbox::drain(&home, "lead");
+    assert!(
+        msgs.iter().any(|m| m
+            .kind
+            .as_deref()
+            .is_some_and(|k| k == "dispatch_idle_threshold_exceeded")
+            && m.correlation_id.as_deref() == Some("t-shared")),
+        "RED: scan_and_emit must enqueue dispatch_idle_threshold_exceeded to lead for t-shared"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
