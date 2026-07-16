@@ -959,9 +959,10 @@ impl HealthTracker {
     /// **Why this exists**: Windows `Instant::now()` is anchored to system
     /// uptime via `QueryPerformanceCounter`. On a fresh CI VM with low
     /// uptime, `Instant::now() - Duration::from_secs(30 * 60)` underflows
-    /// and panics. Tests instead use `base + offset` (cross-platform safe;
-    /// `Instant::add` saturates to `Instant::MAX` on all platforms) and
-    /// pass the resulting future-Instant as the `now` argument. Internal
+    /// and panics. Tests instead use `base + offset` with a small, bounded
+    /// test duration and pass the resulting future-Instant as the `now`
+    /// argument. (`Instant::add` is not generally saturating; production code
+    /// accepting untrusted durations should use `checked_add`.) Internal
     /// elapsed checks use `now.saturating_duration_since(t)` defensively
     /// against clock skew.
     ///
