@@ -9,6 +9,7 @@
 //! does NOT apply here: the fleet keeps self-healing even in away/sleep. An
 //! agent cannot invoke this (it can at most crash ITSELF → its own respawn).
 
+use crate::agent::crash_disposition::{ClaimToken, Claimant, CrashObservation};
 use crate::agent::{self, AgentRegistry};
 use crate::channel::NotifySeverity;
 use std::path::Path;
@@ -17,7 +18,50 @@ use std::sync::Arc;
 
 use super::{run_dir, serve_agent_tui, AgentConfig, DaemonContext};
 
+/// Compatibility entry used by legacy tests and name-triggered internal call
+/// sites. Production PTY events use [`handle_crash_observation`] directly.
+#[allow(dead_code)]
 pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &DaemonContext) {
+    let Some(instance_id) = crate::fleet::resolve_uuid(home, crashed_name) else {
+        tracing::warn!(agent = %crashed_name, "no fleet UUID, skipping respawn");
+        return;
+    };
+    let observation = {
+        let reg = agent::lock_registry(&ctx.registry);
+        reg.get(&instance_id).map(|handle| CrashObservation {
+            instance_id,
+            generation: handle.generation,
+            core: Arc::clone(&handle.core),
+            deleted: Arc::clone(&handle.deleted),
+            // Name-triggered compatibility entry is not a source publication;
+            // the source event already carries its own shutdown Arc.
+            owner_shutdown: None,
+            name: handle.name.clone(),
+        })
+    };
+    let Some(observation) = observation else {
+        return;
+    };
+    handle_crash_observation(home, &observation, ctx);
+}
+
+pub(super) fn handle_crash_observation(
+    home: &Path,
+    observation: &CrashObservation,
+    ctx: &DaemonContext,
+) {
+    let crashed_name = observation.name.as_str();
+    let key = observation.key();
+    let ledger = agent::crash_disposition::owner_ledger();
+    if ledger.disposition(key).is_none() && !ledger.publish(observation.clone()) {
+        return;
+    }
+    let Some(claim) = ledger.claim(key, Claimant::Crash) else {
+        return;
+    };
+    if !ledger.mark_ready(claim) {
+        return;
+    }
     tracing::warn!(agent = %crashed_name, "crashed");
     crate::event_log::log(home, "crash", crashed_name, "agent crashed");
 
@@ -25,15 +69,12 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
         Some(c) => c,
         None => {
             tracing::debug!(agent = %crashed_name, "no config for respawn (likely deleted)");
+            ledger.discard(key);
             return;
         }
     };
 
-    // #1441: registry is UUID-keyed; resolve the crashed name via fleet.yaml.
-    let Some(instance_id) = crate::fleet::resolve_uuid(home, crashed_name) else {
-        tracing::warn!(agent = %crashed_name, "no fleet UUID, skipping respawn");
-        return;
-    };
+    let instance_id = observation.instance_id;
 
     // #1701: is the crashed agent its OWN team orchestrator? Resolved here (a
     // teams-file read) BEFORE taking the registry lock, so no file IO runs under
@@ -134,6 +175,7 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
 
     if !should_respawn {
         tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
+        ledger.discard(key);
         return;
     }
 
@@ -162,10 +204,40 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
                 &reg,
                 tx,
                 &shutdown_for_respawn,
+                Some(claim),
             );
         })
     {
+        ledger.discard(key);
         tracing::warn!(agent = %name_for_err, error = %e, "failed to spawn respawn thread");
+    }
+}
+
+/// Advisory-channel backstop. A full or disconnected crash channel leaves the
+/// exact observation Pending in the owner ledger; the per-tick watchdog calls
+/// this sweep so recovery does not depend on delivery of that wake-up.
+pub(crate) fn sweep_pending_dispositions(
+    home: &Path,
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+    configs: &crate::api::ConfigRegistry,
+) {
+    let pending = agent::crash_disposition::owner_ledger().pending();
+    if pending.is_empty() {
+        return;
+    }
+    let tx = agent::crash_disposition::owner_crash_wake()
+        .unwrap_or_else(|| crossbeam_channel::unbounded().0);
+    let ctx = DaemonContext {
+        registry: Arc::clone(registry),
+        externals: Arc::clone(externals),
+        configs: Arc::clone(configs),
+        crash_tx: tx,
+        crash_rx: crossbeam_channel::never(),
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+    for observation in pending {
+        handle_crash_observation(home, &observation, &ctx);
     }
 }
 
@@ -263,6 +335,7 @@ fn notify_crash(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn respawn_agent_worker(
     home: &Path,
     config: AgentConfig,
@@ -271,11 +344,21 @@ fn respawn_agent_worker(
     reg: &AgentRegistry,
     tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
     shutdown: &Arc<AtomicBool>,
+    claim: Option<ClaimToken>,
 ) {
     std::thread::sleep(delay);
     if shutdown.load(Ordering::Relaxed) {
+        if let Some(token) = claim {
+            agent::crash_disposition::owner_ledger().discard(token.key());
+        }
         tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
         return;
+    }
+    if let Some(token) = claim {
+        if !agent::crash_disposition::owner_ledger().begin_execute(token) {
+            tracing::info!(agent = %config.name, "exact-generation recovery was discarded before execution");
+            return;
+        }
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     if let Some(ref wd) = config.working_dir {
@@ -322,6 +405,9 @@ fn respawn_agent_worker(
         reg,
     ) {
         Ok(_) => {
+            if let Some(token) = claim {
+                let _ = agent::crash_disposition::owner_ledger().mark_live(token);
+            }
             tracing::info!(agent = %config.name, "respawned");
             crate::event_log::log(home, "respawn", &config.name, "agent respawned");
             // #1441: registry is UUID-keyed; resolve the respawned name once.
@@ -375,6 +461,9 @@ fn respawn_agent_worker(
             }
         }
         Err(e) => {
+            if let Some(token) = claim {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(token);
+            }
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
             crate::event_log::log(
                 home,
@@ -480,6 +569,7 @@ mod deleted_gate_tests_1913 {
     /// `reg.get` align), backed by a real already-exited `true` child PTY.
     fn make_handle(deleted: bool) -> AgentHandle {
         use portable_pty::{native_pty_system, PtySize};
+        let generation = crate::agent::crash_disposition::owner_generation_source().next();
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -519,6 +609,7 @@ mod deleted_gate_tests_1913 {
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
             spawn_mode: crate::backend::SpawnMode::Fresh,
+            generation,
             deleted: Arc::new(AtomicBool::new(deleted)),
         }
     }
@@ -637,6 +728,7 @@ mod deleted_gate_tests_1913 {
             &reg,
             crash_tx,
             &shutdown,
+            None,
         );
 
         // Verify 1: event-log.jsonl should have a crash_respawn_failed record

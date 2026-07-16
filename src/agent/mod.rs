@@ -18,6 +18,7 @@ use std::sync::Arc;
 mod dismiss;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
+pub(crate) mod crash_disposition;
 use dismiss::{
     dismiss_scan_armed, is_dismissible_prompt_state, prepare_dismiss_patterns,
     try_prepared_dismiss_dialog, PreparedDismissPattern,
@@ -101,6 +102,9 @@ pub struct AgentHandle {
     /// slow `Fresh` (the load-bearing false-kill guard). Immutable for the life of
     /// the handle; a respawn replaces the whole handle with a freshly-stamped one.
     pub(crate) spawn_mode: crate::backend::SpawnMode,
+    /// Owner-scoped monotonic identity for the process represented by this
+    /// handle. Recovery must carry this exact generation, never just `name`.
+    pub(crate) generation: crash_disposition::SpawnGeneration,
     /// Set by DELETE handler to prevent reaper from spawning shell fallback.
     pub(crate) deleted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -592,7 +596,7 @@ fn strip_ansi(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum AgentExitEvent {
     /// Agent crashed or exited unexpectedly — daemon should respawn.
-    Crash(String),
+    Crash(crash_disposition::CrashObservation),
     /// Agent exited cleanly (exit code 0, e.g. `/exit` or `/quit`) — no respawn.
     CleanExit(String),
 }
@@ -1302,6 +1306,7 @@ pub fn spawn_agent(
     // lookup. Extracted to `resolve_spawn_instance_id` so the managed/unmanaged
     // identity policy is unit-testable without a live PTY spawn.
     let instance_id = resolve_spawn_instance_id(config.home, name)?;
+    let generation = crash_disposition::owner_generation_source().next();
 
     // Register in registry
     {
@@ -1335,11 +1340,13 @@ pub fn spawn_agent(
                 // #t-777-3: stamp the spawn mode so the respawn-stuck watchdog
                 // distinguishes a hung Resume from a slow Fresh boot.
                 spawn_mode: config.spawn_mode,
+                generation,
                 deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }
     rollback.mark_registered(instance_id);
+    crash_disposition::owner_ledger().register_generation(instance_id, generation);
 
     // PTY read thread — feeds VTerm + broadcasts + auto-dismiss trust dialog + session reaper
     let core2 = Arc::clone(&core);
@@ -1377,6 +1384,7 @@ pub fn spawn_agent(
         dismiss_patterns: dismiss,
         shutdown: shutdown_for_reaper,
         deleted: deleted_for_reaper,
+        generation,
     };
     let capture = {
         let backend_str = detected_backend
@@ -1688,6 +1696,7 @@ struct PtyReadContext {
     dismiss_patterns: Vec<PreparedDismissPattern>,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
+    generation: crash_disposition::SpawnGeneration,
 }
 
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
@@ -1750,6 +1759,7 @@ fn pty_read_loop(
         dismiss_patterns,
         shutdown,
         deleted,
+        generation,
     } = ctx;
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
@@ -1888,6 +1898,8 @@ fn pty_read_loop(
         crash_tx,
         shutdown,
         deleted,
+        core,
+        *generation,
     );
 }
 
@@ -2037,12 +2049,13 @@ fn is_startup_failure(name: &str, id: &crate::types::InstanceId, registry: &Agen
 }
 
 fn on_startup_failure(
-    name: &str,
+    observation: &crash_disposition::CrashObservation,
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
 ) {
+    let name = observation.name.as_ref();
     tracing::warn!(
-        agent = name,
+        agent = %name,
         "startup failure (exited too quickly, no user input)"
     );
     if let Some(ref home) = home {
@@ -2053,8 +2066,13 @@ fn on_startup_failure(
             "exited too quickly, no user input",
         );
     }
+    if !crash_disposition::owner_ledger().publish(observation.clone()) {
+        return;
+    }
     if let Some(ref tx) = crash_tx {
-        let _ = tx.send(AgentExitEvent::Crash(name.to_string()));
+        if let Err(e) = tx.try_send(AgentExitEvent::Crash(observation.clone())) {
+            tracing::warn!(agent = %name, error = %e, "startup-failure channel wake dropped; ledger sweep remains authoritative");
+        }
     }
 }
 
@@ -2152,30 +2170,23 @@ fn on_clean_exit_shell_fallback(
 }
 
 fn on_crash_exit(
-    name: &str,
-    id: &crate::types::InstanceId,
-    registry: &AgentRegistry,
+    observation: &crash_disposition::CrashObservation,
     crash_tx: &Option<CrashChannel>,
 ) {
-    tracing::info!(agent = name, "setting restarting state");
-    {
-        let reg = lock_registry(registry);
-        if let Some(handle) = reg.get(id) {
-            // registry → core order; `core` is a short non-self-IPC temporary
-            // (set_restarting only) dropped on this statement. Safe per the
-            // unidirectional registry→core invariant — no reverse path in-tree
-            // (#1593 killed it; runtime guard #1492/#1535) — so no snapshot-Arc.
-            // See the spawn-site note + docs/DAEMON-LOCK-ORDERING.md.
-            handle.core.lock().state.set_restarting();
-        }
+    let name = observation.name.as_ref();
+    if !crash_disposition::owner_ledger().publish(observation.clone()) {
+        return;
     }
+    tracing::info!(agent = name, "setting restarting state");
+    observation.core.lock().state.set_restarting();
     if let Some(ref tx) = crash_tx {
-        if let Err(e) = tx.try_send(AgentExitEvent::Crash(name.to_string())) {
+        if let Err(e) = tx.try_send(AgentExitEvent::Crash(observation.clone())) {
             tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_pty_close(
     name: &str,
     id: &crate::types::InstanceId,
@@ -2184,6 +2195,8 @@ fn handle_pty_close(
     crash_tx: &Option<CrashChannel>,
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: &Arc<std::sync::atomic::AtomicBool>,
+    core: &Arc<CoreMutex<AgentCore>>,
+    generation: crash_disposition::SpawnGeneration,
 ) {
     let is_shutdown = shutdown
         .as_ref()
@@ -2215,7 +2228,18 @@ fn handle_pty_close(
     match classify_exit(exit_code) {
         ExitKind::UserExit => {
             if is_startup_failure(name, id, registry) {
-                on_startup_failure(name, home, crash_tx);
+                on_startup_failure(
+                    &crash_disposition::CrashObservation {
+                        instance_id: *id,
+                        generation,
+                        core: Arc::clone(core),
+                        deleted: Arc::clone(deleted),
+                        owner_shutdown: shutdown.clone(),
+                        name: name.to_string().into(),
+                    },
+                    home,
+                    crash_tx,
+                );
             } else {
                 on_clean_exit_shell_fallback(
                     name, id, exit_code, registry, home, crash_tx, shutdown,
@@ -2254,7 +2278,17 @@ fn handle_pty_close(
             cleanup_agent(name, id, registry, home);
         }
         ExitKind::Crash => {
-            on_crash_exit(name, id, registry, crash_tx);
+            on_crash_exit(
+                &crash_disposition::CrashObservation {
+                    instance_id: *id,
+                    generation,
+                    core: Arc::clone(core),
+                    deleted: Arc::clone(deleted),
+                    owner_shutdown: shutdown.clone(),
+                    name: name.to_string().into(),
+                },
+                crash_tx,
+            );
         }
     }
 }
@@ -2850,6 +2884,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }

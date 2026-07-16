@@ -1406,6 +1406,7 @@ fn mock_agent_handle_with_size(
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (handle, reader)
