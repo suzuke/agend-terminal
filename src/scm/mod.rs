@@ -681,6 +681,10 @@ type CompareHook = Box<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct MockScmProvider {
     pr_list: Option<MockPrList>,
+    pr_list_calls: std::sync::atomic::AtomicUsize,
+    pr_list_saw_base: std::sync::atomic::AtomicBool,
+    pr_list_saw_head: std::sync::atomic::AtomicBool,
+    pr_list_last_limit: std::sync::atomic::AtomicU32,
     compare: Option<Result<CompareResult, String>>,
     /// #2749 correction: counts `compare` invocations so a test can assert the
     /// off-tick populator's retry-lease BACKOFF (one compare per lease, not per cycle).
@@ -697,6 +701,8 @@ pub(crate) struct MockScmProvider {
 pub(crate) enum MockPrList {
     /// Return this many default PRs — non-empty ⇒ "the branch has/had a PR".
     Prs(usize),
+    /// Return open PR summaries with the supplied head branch names.
+    Branches(Vec<String>),
     /// Return an `Err` ⇒ a transient gh failure (a no-PR confirm must NOT release).
     Fail(String),
 }
@@ -750,6 +756,31 @@ impl MockScmProvider {
         self.compare_calls
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    pub(crate) fn pr_list_calls(&self) -> usize {
+        self.pr_list_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_saw_base(&self) -> bool {
+        self.pr_list_saw_base
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_saw_head(&self) -> bool {
+        self.pr_list_saw_head
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_last_limit(&self) -> Option<u32> {
+        match self
+            .pr_list_last_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            limit => Some(limit),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -757,12 +788,29 @@ impl ScmProvider for MockScmProvider {
     fn pr_list(
         &self,
         _repo: &str,
-        _filter: &ListFilter,
+        filter: &ListFilter,
         _fields: &[&str],
         _cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<PrSummary>> {
+        self.pr_list_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pr_list_saw_base
+            .store(filter.base.is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.pr_list_saw_head
+            .store(filter.head.is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.pr_list_last_limit.store(
+            filter.limit.unwrap_or_default(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         match &self.pr_list {
             Some(MockPrList::Prs(n)) => Ok(vec![PrSummary::default(); *n]),
+            Some(MockPrList::Branches(branches)) => Ok(branches
+                .iter()
+                .map(|branch| PrSummary {
+                    head_ref: Some(branch.clone()),
+                    ..Default::default()
+                })
+                .collect()),
             Some(MockPrList::Fail(msg)) => Err(anyhow::anyhow!(msg.clone())),
             None => Ok(vec![]),
         }

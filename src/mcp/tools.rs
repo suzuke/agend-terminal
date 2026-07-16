@@ -373,7 +373,7 @@ pub(crate) fn def_repo() -> Value {
             "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits", "cleanup_merged_branches", "merge"]},
             "pr": {"type": "integer", "description": "PR number for merge action."},
             "repository": {"type": "string", "description": "merge: GitHub `owner/repo` slug to merge the PR in (defaults to the canonical repo). Distinct from `repository_path` (a local checkout path)."},
-            "repository_path": {"type": "string", "description": "checkout: local filesystem path to the source repository. Standard cross-tool name (matches bind_self / team update)."},
+            "repository_path": {"type": "string", "description": "checkout: local filesystem path to the source repository; cleanup_merged_branches: explicit cleanup target (authorized only for its configured orchestrator). Standard cross-tool name (matches bind_self / team update)."},
             "branch": {"type": "string"},
             "path": {"type": "string"},
             "instance": {"type": "string", "description": "#789: name of the existing instance to target for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},

@@ -53,7 +53,8 @@ pub(crate) fn handle_cleanup_init_commits(home: &Path, args: &Value, instance_na
 /// (default "main"; compare target for clean/squash-merged detection),
 /// `min_age_days` (default 90; stale_idle threshold), `apply` (default false),
 /// `confirm_ids` + `audit_reason` (required when apply=true; the latter logged to
-/// event-log.jsonl per deleted branch).
+/// event-log.jsonl per deleted branch). An explicit `repository_path` is accepted
+/// for its configured orchestrator and never falls back to an unrelated binding.
 pub(crate) fn handle_cleanup_merged_branches(
     home: &Path,
     args: &Value,
@@ -63,16 +64,9 @@ pub(crate) fn handle_cleanup_merged_branches(
         .as_str()
         .filter(|s| !s.is_empty())
         .unwrap_or(instance_name);
-    let source_repo = match crate::binding::read(home, agent)
-        .and_then(|v| v["source_repo"].as_str().map(std::path::PathBuf::from))
-    {
-        Some(p) => p,
-        None => {
-            return json!({
-                "error": format!("no binding source_repo for agent '{agent}'"),
-                "code": "no_binding_source_repo",
-            });
-        }
+    let source_repo = match resolve_cleanup_source_repo(home, args, agent, instance_name) {
+        Ok(path) => path,
+        Err(error) => return error,
     };
     let base = args["base"].as_str().unwrap_or("main");
     let min_age_days = args["min_age_days"]
@@ -109,7 +103,7 @@ pub(crate) fn handle_cleanup_merged_branches(
             "candidate_ids": categories.deletable_ids(),
             "total_candidates": categories.total(),
             "to_apply_hint": "repo action=cleanup_merged_branches apply=true confirm_ids=<subset> audit_reason=<...>",
-            "active_unknown_note": "active_unknown bucket is NOT in candidate_ids by default — include those names explicitly in confirm_ids if you really want to delete them",
+            "active_unknown_note": "active_unknown bucket is not deletable until terminal provenance and preservation evidence are proven; it remains visible for operator follow-up",
         });
     }
     let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
@@ -134,8 +128,8 @@ pub(crate) fn handle_cleanup_merged_branches(
         });
     }
     // Validate confirm_ids ⊆ all_ids (including active_unknown for
-    // explicit opt-in). Mismatch ⇒ reject loudly — operator must
-    // re-run dry-run to refresh the candidate list.
+    // visibility). Mismatch ⇒ reject loudly — operator must re-run dry-run
+    // to refresh the candidate list; lifecycle apply remains fail-closed.
     let candidate_set: std::collections::HashSet<String> =
         categories.all_ids().into_iter().collect();
     let unknown: Vec<String> = confirm_ids.difference(&candidate_set).cloned().collect();
@@ -147,9 +141,10 @@ pub(crate) fn handle_cleanup_merged_branches(
             "code": "stale_confirm_ids",
         });
     }
-    match crate::branch_sweep::emit_delete_batch(
-        home,
+    match crate::branch_sweep::emit_delete_batch_with_context(
+        Some(home),
         &source_repo,
+        base,
         &categories,
         &confirm_ids,
         audit_reason,
@@ -163,5 +158,134 @@ pub(crate) fn handle_cleanup_merged_branches(
             "error": format!("branch sweep apply failed: {e}"),
             "code": "apply_failed",
         }),
+    }
+}
+
+/// Resolve the cleanup target without ever falling back from an explicit
+/// `repository_path` to a caller binding. An unbound caller is allowed only
+/// when it is the configured orchestrator for the canonical source path;
+/// operator-direct calls (`instance_name == ""`) retain the existing operator
+/// authority.
+fn resolve_cleanup_source_repo(
+    home: &Path,
+    args: &Value,
+    agent: &str,
+    caller: &str,
+) -> Result<std::path::PathBuf, Value> {
+    if let Some(raw) = args["repository_path"].as_str().filter(|s| !s.is_empty()) {
+        let path = match std::fs::canonicalize(raw) {
+            Ok(path) if path.is_dir() => path,
+            Ok(path) => {
+                return Err(json!({
+                    "error": format!("repository_path is not a directory: {}", path.display()),
+                    "code": "invalid_repository_path",
+                }));
+            }
+            Err(e) => {
+                return Err(json!({
+                    "error": format!("repository_path is not readable: {e}"),
+                    "code": "invalid_repository_path",
+                }));
+            }
+        };
+        let authority = if caller.is_empty() { agent } else { caller };
+        if !authority.is_empty() && !orchestrator_owns_repo(home, authority, &path) {
+            return Err(json!({
+                "error": format!("'{authority}' is not authorized to clean repository_path '{}'", path.display()),
+                "code": "repository_path_unauthorized",
+            }));
+        }
+        return Ok(path);
+    }
+
+    crate::binding::read(home, agent)
+        .and_then(|v| v["source_repo"].as_str().map(std::path::PathBuf::from))
+        .ok_or_else(|| {
+            json!({
+                "error": format!("no binding source_repo for agent '{agent}'"),
+                "code": "no_binding_source_repo",
+            })
+        })
+}
+
+fn orchestrator_owns_repo(home: &Path, caller: &str, repo: &Path) -> bool {
+    let Ok(repo) = std::fs::canonicalize(repo) else {
+        return false;
+    };
+    crate::teams::list_all(home).into_iter().any(|team| {
+        team.orchestrator.as_deref() == Some(caller)
+            && team
+                .source_repo
+                .as_deref()
+                .and_then(|source| std::fs::canonicalize(source).ok())
+                .is_some_and(|source| source == repo)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_repository_path_requires_its_orchestrator_and_never_falls_back() {
+        let root = std::env::temp_dir().join(format!(
+            "agend-cleanup-auth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let target = root.join("target-repo");
+        let unrelated = root.join("unrelated-repo");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::create_dir_all(&unrelated).expect("unrelated");
+
+        // An unbound non-orchestrator cannot redirect cleanup to an explicit
+        // repository, even when its stale binding points at another repo.
+        let binding_dir = home.join("runtime").join("worker");
+        std::fs::create_dir_all(&binding_dir).expect("binding dir");
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::json!({"source_repo": unrelated}).to_string(),
+        )
+        .expect("binding");
+        let args = serde_json::json!({"repository_path": target});
+        let denied =
+            resolve_cleanup_source_repo(&home, &args, "worker", "worker").expect_err("deny");
+        assert_eq!(denied["code"], "repository_path_unauthorized");
+
+        let created = crate::teams::create(
+            &home,
+            &serde_json::json!({
+                "name": "archfix",
+                "members": ["orchestrator"],
+                "orchestrator": "orchestrator",
+                "repository_path": target,
+            }),
+        );
+        assert_eq!(created["status"], "created", "team setup failed: {created}");
+        let spoofed = resolve_cleanup_source_repo(
+            &home,
+            &serde_json::json!({"repository_path": target}),
+            "orchestrator",
+            "worker",
+        )
+        .expect_err("target instance must not spoof caller authority");
+        assert_eq!(spoofed["code"], "repository_path_unauthorized");
+        let resolved = resolve_cleanup_source_repo(
+            &home,
+            &serde_json::json!({"repository_path": target}),
+            "orchestrator",
+            "orchestrator",
+        )
+        .expect("configured orchestrator may target its repo");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&target).expect("target canonicalization")
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }
