@@ -3514,3 +3514,45 @@ fn repo_release_marker_blanked_after_snapshot_refuses() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Both binding and marker share the same non-existent source_repo path.
+/// Canonicalize must fail → refuse, not pass via raw string equality.
+#[test]
+#[cfg(unix)]
+fn repo_release_nonexistent_source_refuses() {
+    let (base, home, _repo, wt) = managed_wt_fixture("nosrc");
+    let bogus = "/nonexistent/source/repo/for/test";
+    // Write marker with non-existent source.
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!("agent=agent-nosrc\nbranch=feat/test\nsource_repo={bogus}\n"),
+    )
+    .expect("write marker");
+    // Bind with the same non-existent source.
+    crate::binding::bind_full(
+        &home,
+        "agent-nosrc",
+        "",
+        "feat/test",
+        &wt,
+        std::path::Path::new(bogus),
+        false,
+    )
+    .expect("bind");
+
+    let r = dispatch_repo_release(&home, "agent-nosrc", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "non-existent source_repo must refuse even when both match: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved on non-existent source"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-nosrc").is_some(),
+        "binding must be preserved on non-existent source"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}

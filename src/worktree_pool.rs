@@ -1021,17 +1021,43 @@ fn release_full_guarded(
                 ..ReleaseOutcome::default()
             };
         }
-        let bound_source = source_repo_from_binding(&current, Path::new(wt_path));
-        let mk_source_canonical =
-            std::fs::canonicalize(&mk_source).unwrap_or_else(|_| PathBuf::from(&mk_source));
-        let bound_source_canonical =
-            std::fs::canonicalize(&bound_source).unwrap_or_else(|_| bound_source.clone());
+        let bound_source_str = current["source_repo"].as_str().unwrap_or("");
+        if bound_source_str.is_empty() {
+            return ReleaseOutcome {
+                error: Some("binding source_repo is empty — refusing (fail-closed)".into()),
+                ..ReleaseOutcome::default()
+            };
+        }
+        let Ok(mk_source_canonical) = std::fs::canonicalize(&mk_source) else {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker source_repo '{mk_source}' cannot be canonicalized — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        };
+        let Ok(bound_source_canonical) = std::fs::canonicalize(bound_source_str) else {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "binding source_repo '{bound_source_str}' cannot be canonicalized — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        };
         if mk_source_canonical != bound_source_canonical {
             return ReleaseOutcome {
                 error: Some(format!(
                     "marker source_repo '{}' does not match binding source_repo '{}' — refusing",
-                    mk_source,
-                    bound_source.display()
+                    mk_source, bound_source_str
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        if !target_source_repo_matches(Path::new(wt_path), &bound_source_canonical) {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "worktree git pointer does not match source_repo '{}' — refusing",
+                    bound_source_canonical.display()
                 )),
                 ..ReleaseOutcome::default()
             };
