@@ -1467,8 +1467,10 @@ mod tests {
             "**Worktree mandatory** (§10.4)",
             "**Spawn site rationale** (§10.5)",
             "clear_blocked_reason",
-            "sending kind=report",
-            "`send` with kind=task",
+            "Reply obligation depends on `request_kind`",
+            "If you receive a `send` with request_kind=task",
+            "ACK obligation depends on `request_kind`",
+            "For a dispatched task the daemon ALREADY auto-binds",
         ] {
             assert!(
                 !body.contains(stale),
@@ -1481,8 +1483,11 @@ mod tests {
             "**Worktree mandatory** (§12.4)",
             "**Spawn site rationale** (§12.5)",
             "actions: `report` / `clear`",
+            "received message's `kind`",
             "request_kind=report",
-            "request_kind=task",
+            "inbound `kind=task`",
+            "ACK obligation depends on inbound `kind`",
+            "branch-carrying dispatched task with binding enabled",
         ] {
             assert!(
                 body.contains(current),

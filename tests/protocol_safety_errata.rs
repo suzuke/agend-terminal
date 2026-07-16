@@ -57,15 +57,21 @@ fn protocol_post_merge_ci_is_pinned_to_the_merge_head() {
 }
 
 #[test]
-fn protocol_dispatch_does_not_invent_delivery_receipts() {
+fn protocol_dispatch_distinguishes_routing_from_receipt() {
     let body = protocol();
 
-    for unavailable in ["returned message ID", "`delivery_mode`"] {
-        assert!(
-            !body.contains(unavailable),
-            "protocol must not promise unavailable send receipt: {unavailable}"
-        );
-    }
+    assert!(
+        !body.contains("returned message ID"),
+        "protocol must not promise a message ID that send does not return"
+    );
+    assert!(
+        body.contains("`delivery_mode` is a routing outcome"),
+        "protocol must document the live delivery_mode response field"
+    );
+    assert!(
+        body.contains("not proof that the receiver read, understood, or acknowledged"),
+        "delivery_mode must not be described as read/understanding/ACK proof"
+    );
     assert!(
         body.contains("review_class: \"single\" | \"dual\""),
         "PR-producing branch tasks must set review_class before dispatch"
@@ -119,4 +125,14 @@ fn protocol_red_green_and_worktree_recipes_are_daemon_managed() {
         body.contains("Full rule + exceptions: §12.4 and §13"),
         "worktree guidance must point at the current sections"
     );
+    assert!(
+        !body.contains("For dispatched tasks the daemon **already auto-binds the assignee**"),
+        "protocol must not claim that branchless or bind:false dispatches auto-bind"
+    );
+    for conditional_bind_rule in ["branch-carrying task dispatch", "`bind:false`"] {
+        assert!(
+            body.contains(conditional_bind_rule),
+            "protocol must state the auto-bind boundary: {conditional_bind_rule}"
+        );
+    }
 }
