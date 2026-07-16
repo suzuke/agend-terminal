@@ -1,4 +1,83 @@
 use serde_json::{json, Value};
+use std::path::Path;
+
+fn parse_managed_marker(wt: &Path) -> Option<(String, String, String)> {
+    let content = std::fs::read_to_string(wt.join(crate::worktree_pool::MANAGED_MARKER)).ok()?;
+    let get = |prefix: &str| {
+        content
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let agent = get("agent=");
+    if agent.is_empty() {
+        return None;
+    }
+    Some((agent, get("branch="), get("source_repo=")))
+}
+
+fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Value {
+    let Some((marker_agent, _marker_branch, _marker_repo)) = parse_managed_marker(canonical) else {
+        return json!({
+            "error": "managed worktree marker unreadable or missing agent — refusing (fail-closed)",
+            "code": "managed_marker_invalid",
+        });
+    };
+    let fingerprint = match crate::binding::snapshot_guarded_binding(home, &marker_agent) {
+        Ok(crate::binding::GuardedBinding::Known { value, fingerprint }) => {
+            let bound_wt = value["worktree"].as_str().unwrap_or("");
+            if bound_wt != canonical.to_str().unwrap_or("") {
+                return json!({
+                    "error": format!(
+                        "managed marker claims agent '{}' but binding worktree '{}' \
+                         does not match requested path '{}' — refusing (stale marker)",
+                        marker_agent, bound_wt, canonical.display()
+                    ),
+                    "code": "managed_release_path_mismatch",
+                });
+            }
+            fingerprint
+        }
+        Ok(crate::binding::GuardedBinding::Absent) => {
+            return json!({
+                "error": format!(
+                    "managed marker claims agent '{}' but no binding exists — refusing",
+                    marker_agent
+                ),
+                "code": "managed_release_no_binding",
+            });
+        }
+        Ok(crate::binding::GuardedBinding::Opaque(reason)) | Err(reason) => {
+            return json!({
+                "error": format!("binding opaque for '{}': {reason} — refusing", marker_agent),
+                "code": "managed_release_opaque",
+            });
+        }
+    };
+    if !caller.is_empty()
+        && caller != marker_agent
+        && !crate::teams::is_orchestrator_of(home, caller, &marker_agent)
+    {
+        return json!({
+            "error": format!(
+                "caller '{}' not authorized to release agent '{}' worktree",
+                caller, marker_agent
+            ),
+            "code": "managed_release_unauthorized",
+        });
+    }
+    let outcome = crate::worktree_pool::release_full_exact(home, &marker_agent, &fingerprint);
+    json!({
+        "path": canonical.display().to_string(),
+        "delegated_to_canonical": true,
+        "released": outcome.released,
+        "worktree_removed": outcome.worktree_removed,
+        "binding_removed": outcome.binding_removed,
+        "branch_deleted": outcome.branch_deleted,
+        "error": outcome.error,
+    })
+}
 
 /// #t-…83936-6 P0 (data-loss incident): is `p` a TRUE linked git worktree — the
 /// ONLY shape `handle_release_repo`'s `remove_dir_all` fallback may delete?
@@ -106,17 +185,21 @@ pub(crate) fn validate_release_path(path_str: &str) -> Result<std::path::PathBuf
     Ok(canonical)
 }
 
-pub(crate) fn handle_release_repo(args: &Value) -> Value {
+pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let path = match args["path"].as_str() {
         Some(p) => p,
         None => return json!({"error": "missing 'path'"}),
     };
 
-    // H3 fix: validate + canonicalize path before any filesystem ops.
     let canonical = match validate_release_path(path) {
         Ok(p) => p,
         Err(e) => return json!({"error": e}),
     };
+
+    if crate::worktree_pool::is_daemon_managed(&canonical) {
+        return delegate_managed_release(home, &canonical, instance_name);
+    }
+
     let path_str = canonical.to_string_lossy();
 
     // Derive source repo from worktree .git link before any removal —

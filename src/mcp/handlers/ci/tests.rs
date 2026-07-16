@@ -2,7 +2,11 @@ use super::*;
 
 #[test]
 fn release_repo_rejects_root_path() {
-    let result = handle_release_repo(&serde_json::json!({"path": "/"}));
+    let result = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": "/"}),
+        "",
+    );
     assert!(result["error"].as_str().is_some(), "root must be rejected");
 }
 
@@ -14,7 +18,11 @@ fn release_repo_rejects_system_path() {
 
 #[test]
 fn release_repo_rejects_empty_path() {
-    let result = handle_release_repo(&serde_json::json!({"path": ""}));
+    let result = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": ""}),
+        "",
+    );
     assert!(result["error"].as_str().is_some(), "empty must be rejected");
 }
 
@@ -146,7 +154,11 @@ fn handle_release_repo_never_deletes_bare_repo_83936() {
     assert!(bare.join("HEAD").exists(), "a bare repo must have HEAD");
     assert!(!bare.join(".git").exists(), "a bare repo has NO .git child");
 
-    let _ = handle_release_repo(&serde_json::json!({"path": bare.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": bare.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         bare.exists() && bare.join("HEAD").exists(),
@@ -181,7 +193,11 @@ fn handle_release_repo_never_deletes_separate_git_dir_main_83936() {
     let keep = worktree.join("KEEP.txt");
     std::fs::write(&keep, "main content").unwrap();
 
-    let _ = handle_release_repo(&serde_json::json!({"path": worktree.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": worktree.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         worktree.exists() && keep.exists(),
@@ -200,7 +216,11 @@ fn handle_release_repo_refuses_non_repo_dir_83936() {
     std::fs::create_dir_all(&dir).ok();
     std::fs::write(dir.join("file.txt"), "data").unwrap();
 
-    let _ = handle_release_repo(&serde_json::json!({"path": dir.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": dir.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         dir.exists(),
@@ -220,7 +240,11 @@ fn handle_release_repo_never_deletes_main_repo_83936() {
     let keep = repo.join("KEEP.txt");
     std::fs::write(&keep, "canonical content").unwrap();
 
-    let _ = handle_release_repo(&serde_json::json!({"path": repo.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": repo.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         repo.exists(),
@@ -260,7 +284,11 @@ fn handle_release_repo_still_removes_linked_worktree_83936() {
         super::validate_release_path(wt.to_str().unwrap()).is_ok(),
         "a linked worktree must validate OK"
     );
-    let _ = handle_release_repo(&serde_json::json!({"path": wt.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": wt.to_str().unwrap()}),
+        "",
+    );
     assert!(
         !wt.exists(),
         "a linked worktree must still be releasable/removed"
@@ -3108,8 +3136,21 @@ fn seed_managed_marker(
     crate::binding::bind_full(home, agent, "", branch, wt, repo, false).expect("bind");
 }
 
-fn dispatch_repo_release(_home: &std::path::Path, _caller: &str, path: &str) -> serde_json::Value {
-    handle_release_repo(&serde_json::json!({"path": path}))
+fn dispatch_repo_release(home: &std::path::Path, caller: &str, path: &str) -> serde_json::Value {
+    let args = serde_json::json!({"action": "release", "path": path});
+    let sender: Option<crate::identity::Sender> = if caller.is_empty() {
+        None
+    } else {
+        crate::identity::Sender::new(caller)
+    };
+    let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+        home,
+        args: &args,
+        instance_name: sender.as_ref().map_or("", |s| s.as_str()),
+        sender: &sender,
+        runtime: None,
+    };
+    crate::mcp::handlers::dispatch::dispatch_repo(&ctx)
 }
 
 /// RED A1: managed worktree release must clear binding.
