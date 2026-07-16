@@ -532,6 +532,70 @@ pub(crate) enum OpenPrStatus {
     Unknown,
 }
 
+/// One bounded open-PR inventory for a repository/sweep.  The daemon cleanup
+/// path must not issue one SCM lookup per branch; a failed inventory remains
+/// `Unknown` for every affected branch so the lifecycle classifier preserves
+/// them all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OpenPrSnapshot {
+    open_branches: Option<std::collections::HashSet<String>>,
+}
+
+impl OpenPrSnapshot {
+    pub(crate) fn status_for(&self, branch: &str) -> OpenPrStatus {
+        match &self.open_branches {
+            Some(open) if open.contains(branch) => OpenPrStatus::Open,
+            Some(_) => OpenPrStatus::NotOpen,
+            None => OpenPrStatus::Unknown,
+        }
+    }
+}
+
+/// Gather the repository's open-PR inventory once.  `headRefName` is the only
+/// field needed by the lifecycle gate; the explicit limit keeps this external
+/// call bounded even for a repository with a large review backlog.
+pub(crate) fn open_pr_snapshot(repo: &Path, base: &str) -> OpenPrSnapshot {
+    let remote_url = match crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]) {
+        Ok(url) => url,
+        Err(crate::git_helpers::GitError::NonZero { stderr, .. })
+            if stderr.contains("No such remote") =>
+        {
+            return OpenPrSnapshot {
+                open_branches: Some(std::collections::HashSet::new()),
+            };
+        }
+        Err(_) => return OpenPrSnapshot::default(),
+    };
+    let Some(gh_repo) = extract_github_repo(&remote_url) else {
+        return OpenPrSnapshot::default();
+    };
+    let Ok(prs) = crate::scm::make_scm_provider(&gh_repo, None).pr_list(
+        &gh_repo,
+        &crate::scm::ListFilter {
+            state: Some("open"),
+            base: Some(base.to_string()),
+            limit: Some(1000),
+            ..Default::default()
+        },
+        &["headRefName"],
+        None,
+    ) else {
+        return OpenPrSnapshot::default();
+    };
+    let mut open_branches = std::collections::HashSet::new();
+    for pr in prs {
+        let Some(branch) = pr.head_ref else {
+            // A malformed/partial provider response is not proof that the
+            // branch has no open PR; preserve all candidates on this snapshot.
+            return OpenPrSnapshot::default();
+        };
+        open_branches.insert(branch);
+    }
+    OpenPrSnapshot {
+        open_branches: Some(open_branches),
+    }
+}
+
 /// Resolve whether `branch` still has an open PR. The lifecycle classifier
 /// owns the fail direction; this helper only gathers the SCM evidence.
 pub(crate) fn open_pr_status(repo: &Path, base: &str, branch: &str) -> OpenPrStatus {

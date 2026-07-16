@@ -4895,6 +4895,61 @@ fn authority_proven_clean_review_deleted_immediately() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+#[test]
+fn active_task_branch_mismatch_preserves_review_branch() {
+    let home = tmp_home("task-branch-mismatch-home");
+    let repo = tmp_repo("task-branch-mismatch");
+    let tip = make_review_branch(&repo, "review/task-mismatch-1234");
+    let task_id = "T-task-branch-mismatch";
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("test"),
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId::from(task_id),
+            title: "active mismatch".to_string(),
+            description: String::new(),
+            priority: "normal".to_string(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("review/another-branch".to_string()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        },
+    )
+    .unwrap();
+    let mut binding = binding_with_lease(
+        "review/task-mismatch-1234",
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-task-mismatch"),
+        Some(&tip),
+    );
+    binding["task_id"] = serde_json::json!(task_id);
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    assert!(
+        !out.branch_deleted,
+        "contradictory active task evidence preserves branch"
+    );
+    assert!(branch_exists(&repo, "review/task-mismatch-1234"));
+    assert!(
+        out.branch_cleanup_skipped_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("fail-closed")),
+        "mismatch must report fail-closed preservation: {:?}",
+        out.branch_cleanup_skipped_reason
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// RED #4: an authority-proven review lease on a DIRTY worktree must preserve
 /// the branch — dirty work was stashed but the branch ref should stay for
 /// manual recovery.

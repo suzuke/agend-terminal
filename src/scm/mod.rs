@@ -681,6 +681,7 @@ type CompareHook = Box<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct MockScmProvider {
     pr_list: Option<MockPrList>,
+    pr_list_calls: std::sync::atomic::AtomicUsize,
     compare: Option<Result<CompareResult, String>>,
     /// #2749 correction: counts `compare` invocations so a test can assert the
     /// off-tick populator's retry-lease BACKOFF (one compare per lease, not per cycle).
@@ -750,6 +751,11 @@ impl MockScmProvider {
         self.compare_calls
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    pub(crate) fn pr_list_calls(&self) -> usize {
+        self.pr_list_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -761,6 +767,8 @@ impl ScmProvider for MockScmProvider {
         _fields: &[&str],
         _cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<PrSummary>> {
+        self.pr_list_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match &self.pr_list {
             Some(MockPrList::Prs(n)) => Ok(vec![PrSummary::default(); *n]),
             Some(MockPrList::Fail(msg)) => Err(anyhow::anyhow!(msg.clone())),

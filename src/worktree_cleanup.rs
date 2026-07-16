@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod occupancy;
+pub(crate) use occupancy::{binding_scan_all_strict, bound_worktree_paths_or_ambiguous, is_in_use};
+
 /// Returns true unless `AGEND_WORKTREE_AUTO_CLEANUP` is explicitly set to "0".
 /// Cleanup is on by default — set `AGEND_WORKTREE_AUTO_CLEANUP=0` to disable.
 pub fn auto_cleanup_enabled() -> bool {
@@ -270,101 +273,6 @@ fn remove_worktree(
         let _ = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
     }
     wt_ok
-}
-
-/// Normalize a path: strip Windows `\\?\` UNC prefix.
-fn normalize_path(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-}
-
-/// Canonicalize `p`, or — when it does not exist yet — resolve symlinks on its
-/// longest EXISTING ancestor and re-append the missing tail. Returns `None`
-/// only when not even an existing ancestor canonicalizes.
-///
-/// #worktree-git-7: an active agent's `working_dir` recorded through a symlink
-/// alias whose leaf is transiently absent (mid-creation) would fail
-/// `canonicalize()` outright; the prior fail-OPEN fell back to the raw path,
-/// whose textual prefix misses the canonical worktree → `is_in_use` returned
-/// false and the sweep could remove a worktree out from under a live agent.
-fn canonicalize_lenient(p: &Path) -> Option<PathBuf> {
-    if let Ok(c) = p.canonicalize() {
-        return Some(c);
-    }
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut cur = p;
-    while let Some(parent) = cur.parent() {
-        if let Some(name) = cur.file_name() {
-            tail.push(name);
-        }
-        if let Ok(c) = parent.canonicalize() {
-            let mut out = c;
-            out.extend(tail.iter().rev());
-            return Some(out);
-        }
-        cur = parent;
-    }
-    None
-}
-
-/// #t-…81457-1: distinct `worktree` paths of every LIVE `binding.json`, for
-/// the delete-path occupancy check (mirrors `binding::bound_source_repos`'s
-/// self-healing shape, but this one MUST distinguish "no binding.json"
-/// (normal — agent never bound) from "binding.json exists but failed to
-/// read/parse" (ambiguous — may be hiding a live binding). `Err` signals the
-/// latter; the caller fails the whole sweep round closed rather than treat
-/// an ambiguous row as absent.
-fn bound_worktree_paths_or_ambiguous(home: &Path) -> Result<Vec<PathBuf>, ()> {
-    let entries = match std::fs::read_dir(crate::paths::runtime_dir(home)) {
-        Ok(entries) => entries,
-        // A missing runtime_dir is the normal "no agent has ever bound" state
-        // (mirrors the per-file NotFound branch below) — a genuine absence.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        // Any OTHER error (dir exists but unreadable: permissions, fd
-        // exhaustion) COULD be hiding a live binding.json — treat as ambiguity
-        // and fail the sweep round closed rather than report a false absence.
-        Err(_) => return Err(()),
-    };
-    let mut paths = Vec::new();
-    for entry in entries {
-        // A per-entry iteration error (the dir became unreadable mid-scan) is
-        // the same ambiguity as an unreadable binding.json below — fail closed
-        // instead of silently dropping the entry (was `entries.flatten()`).
-        let entry = entry.map_err(|_| ())?;
-        let agent = entry.file_name().to_string_lossy().into_owned();
-        let content = match std::fs::read_to_string(crate::paths::binding_path(home, &agent)) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(()),
-        };
-        let v: serde_json::Value = serde_json::from_str(&content).map_err(|_| ())?;
-        if let Some(wt) = v["worktree"].as_str() {
-            let path = PathBuf::from(wt);
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-    }
-    Ok(paths)
-}
-
-/// Check if a worktree path is in use by any active agent.
-fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
-    let wt_norm = normalize_path(
-        &wt_path
-            .canonicalize()
-            .unwrap_or_else(|_| wt_path.to_path_buf()),
-    );
-    active_dirs.iter().any(|wd| match canonicalize_lenient(wd) {
-        Some(canon) => {
-            let wd_norm = normalize_path(&canon);
-            wd_norm.starts_with(&wt_norm) || wd.starts_with(wt_path)
-        }
-        // Fail-CLOSED: not even an existing ancestor canonicalizes, so we cannot
-        // prove this active dir is outside the worktree. Treat the ambiguity as
-        // in-use rather than risk sweeping a worktree a live agent is using.
-        None => true,
-    })
 }
 
 /// Runtime-based sweep: uses live `binding.json` state to find repos and
@@ -836,7 +744,8 @@ pub(crate) fn branch_has_other_active_binding(
     excluded_worktree: Option<&str>,
 ) -> Option<bool> {
     let canonical_repo = std::fs::canonicalize(repo).ok()?;
-    for (_, binding) in crate::binding::binding_scan_all(home) {
+    let bindings = binding_scan_all_strict(home).ok()?;
+    for (_, binding) in bindings {
         if excluded_worktree
             .zip(binding["worktree"].as_str())
             .is_some_and(|(excluded, bound)| excluded == bound)
@@ -905,6 +814,11 @@ fn prune_orphaned_branches_with_home(
                 .collect(),
             _ => return Vec::new(),
         };
+    // Snapshot the open-PR inventory once for this repository/sweep.  Each
+    // branch below consumes the bounded snapshot instead of issuing its own
+    // synchronous SCM lookup; an Unknown snapshot keeps all terminal
+    // candidates fail-closed.
+    let open_pr_snapshot = crate::branch_sweep::open_pr_snapshot(repo_root, &default);
 
     let mut pruned = Vec::new();
     for branch in &branches {
@@ -957,7 +871,7 @@ fn prune_orphaned_branches_with_home(
             _ => None,
         };
         let open_pr = if merged || squash || scaffold {
-            match crate::branch_sweep::open_pr_status(repo_root, &default, branch) {
+            match open_pr_snapshot.status_for(branch) {
                 crate::branch_sweep::OpenPrStatus::Open => Some(true),
                 crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
                 crate::branch_sweep::OpenPrStatus::Unknown => None,
@@ -2545,6 +2459,9 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+#[cfg(test)]
+mod lifecycle_r1_tests;
 
 #[cfg(test)]
 mod review_repro_worktree_git;

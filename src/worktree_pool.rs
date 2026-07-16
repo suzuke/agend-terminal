@@ -621,7 +621,15 @@ fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bo
                 .as_deref()
                 .map(|task_branch| task_branch == branch)
                 .unwrap_or(true);
-            Some(active && branch_matches)
+            if active && !branch_matches {
+                // A live task explicitly tied to a different branch is
+                // contradictory evidence, not proof that this branch is
+                // unoccupied. Preserve the branch until the task/binding
+                // records converge or an operator resolves the conflict.
+                None
+            } else {
+                Some(active)
+            }
         }
         Err(crate::tasks::TaskRouteError::NotFound) => Some(false),
         Err(crate::tasks::TaskRouteError::Unreadable { .. })
