@@ -52,26 +52,42 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
     );
 }
 
-/// Mark a dispatch as completed. When `reporter` is non-empty, only the
-/// entry whose `to` matches the reporter is removed (reporter-scoped
-/// settlement). When `reporter` is empty, all entries for the correlation
-/// are removed (task-terminal cleanup — intentionally task-wide).
+/// Reporter-scoped settlement: remove only the entry whose `to` matches
+/// `reporter`. Empty reporter matches nothing (fail-closed).
 pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str) {
     let cid = match correlation_id {
         Some(c) if !c.is_empty() => c,
         _ => return,
     };
+    if reporter.is_empty() {
+        return;
+    }
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-            store.entries.retain(|e| {
-                if e.task_id.as_deref() != Some(cid) {
-                    return true;
-                }
-                !reporter.is_empty() && e.to != reporter
-            });
+            store
+                .entries
+                .retain(|e| e.task_id.as_deref() != Some(cid) || e.to != reporter);
             Ok(())
         }),
         "dispatch_mark_completed"
+    );
+}
+
+/// Task-wide cleanup: remove ALL entries for a task_id regardless of
+/// assignee. Used by `task_terminal_cleanup` when a task reaches a
+/// terminal state (done/cancelled).
+pub fn remove_all_for_task(home: &Path, task_id: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            store
+                .entries
+                .retain(|e| e.task_id.as_deref() != Some(task_id));
+            Ok(())
+        }),
+        "dispatch_remove_all_for_task"
     );
 }
 

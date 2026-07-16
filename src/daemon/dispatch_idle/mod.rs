@@ -677,14 +677,14 @@ pub(crate) fn has_pending_for_instance(home: &Path, instance_name: &str) -> bool
 /// each with a distinct correlation_id). Returns the resolved
 /// dispatch_id, or `None` if no matching pending entry exists.
 pub(crate) fn mark_resolved(home: &Path, correlation_id: &str, reporter: &str) -> Option<String> {
-    if correlation_id.is_empty() {
+    if correlation_id.is_empty() || reporter.is_empty() {
         return None;
     }
     let mut first_deleted: Option<String> = None;
     for d in list_pending(home).into_iter().filter(|d| {
         matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
             && d.correlation_id.as_deref() == Some(correlation_id)
-            && (reporter.is_empty() || d.target == reporter)
+            && d.target == reporter
     }) {
         // [M2] DELETE the sidecar (rather than flip to `Resolved` and leave the
         // file to accumulate — the pre-fix primary `pending-dispatches/` leak)
@@ -718,13 +718,13 @@ pub(crate) fn refresh_issued_at(
     correlation_id: &str,
     reporter: &str,
 ) -> Option<String> {
-    if correlation_id.is_empty() {
+    if correlation_id.is_empty() || reporter.is_empty() {
         return None;
     }
     let matched = list_pending(home).into_iter().find(|d| {
         d.status == DispatchStatus::Pending
             && d.correlation_id.as_deref() == Some(correlation_id)
-            && (reporter.is_empty() || d.target == reporter)
+            && d.target == reporter
     });
     let d = matched?;
     let id = d.dispatch_id.clone();
