@@ -27,6 +27,7 @@ mod send_envelope;
 mod task;
 mod usage_limit_takeover;
 #[cfg(test)]
+#[path = "usage_limit_takeover_tests.rs"]
 mod usage_limit_takeover_tests;
 mod worktree;
 
