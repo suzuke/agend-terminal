@@ -30,12 +30,12 @@ Keybinds: see `src/keybinds.rs`. Prefix `Ctrl+B`, then `c` new tab, `n`/`p` next
 Start the daemon using `fleet.yaml` or explicit `--agents`.
 
 ```
-agend-terminal start [--detached] [--fleet <path>]
+agend-terminal start [--foreground] [--fleet <path>]
 agend-terminal start --agents <name:cmd>...        # ad-hoc, no fleet.yaml
 ```
-- `--detached` — background the daemon (stdio → `$AGEND_HOME/daemon.log`); the foreground process exits once the daemon has published its run dir.
+- Detached service mode is the default. `--foreground` keeps stdio attached and blocks the calling shell, which is useful for debugging or an OS service manager.
 - `--fleet <path>` — override fleet file. Default: `$AGEND_HOME/fleet.yaml`.
-- `--agents <NAME:CMD>...` — start with explicit agent specs instead of `fleet.yaml`. Mutually exclusive with `--fleet`/`--detached`. Subsumes the former `daemon` subcommand.
+- `--agents <NAME:CMD>...` — start with explicit agent specs instead of `fleet.yaml`. Mutually exclusive with `--fleet` and implies `--foreground`. Subsumes the former `daemon` subcommand.
 
 Example: `agend-terminal start --agents dev:claude reviewer:claude shell:/bin/bash`
 
@@ -162,12 +162,12 @@ Set a runtime-mutable daemon config key. Moved from the `config` MCP tool's `set
 - `<KEY> <VALUE>` — positional key and new value.
 
 ### `connect`
-Register an *already-running* local agent with the daemon (inbox-only — no PTY management). Useful in headless environments or to mix a manually-launched CLI into a running fleet.
+Run an externally requested backend under daemon registration. `connect` registers the instance, spawns the backend command, waits for it to exit, then deregisters it; it is not an attach operation for an already-running process.
 
 ```
 agend-terminal connect <name> --backend <backend> [--working-dir <dir>] [-- <extra-args>...]
 ```
-- `--backend` — `claude`, `kiro-cli`, `codex`, `opencode`, `gemini`, `antigravity-cli` (binary `agy`; Gemini CLI's official successor — #987/#995). The aliases `agy` / `antigravity` / `antigravity-cli` all resolve to the same backend.
+- `--backend` — `claude`, `kiro-cli`, `codex`, `opencode`, `antigravity-cli` (binary `agy`), or `grok`. The aliases `agy` / `antigravity` / `antigravity-cli` resolve to the same backend. Gemini CLI is retired.
 - `--working-dir` — defaults to current directory.
 - Extra args after `--` are passed to the backend.
 
@@ -193,13 +193,14 @@ Start the MCP stdio server for the current instance. Intended to be invoked by a
 AGEND_INSTANCE_NAME=<name> agend-mcp-bridge
 ```
 
-Running without `AGEND_INSTANCE_NAME` is allowed but enters standalone mode and emits a warning. Sprint 56 Track I (#531) retired the previous `agend-terminal mcp` subcommand; see [Phase 1 RCA](RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md) for the migration history.
+Running without `AGEND_INSTANCE_NAME` is allowed but enters standalone mode and emits a warning. Sprint 56 Track I (#531) retired the previous `agend-terminal mcp` subcommand; see the [Phase 1 RCA](archived/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md) for the migration history.
 
 ### `capture`
-Spawn a backend CLI for N seconds and dump its VTerm screen (ANSI-stripped). Used for debugging state-detection regexes and onboarding new backends.
+Capture backend output or promote a passive capture into the state-replay corpus.
 
 ```
-agend-terminal capture --backend <name> [--seconds <N>]    # default 15s
+agend-terminal capture backend --backend <name> [--seconds <N>]    # default 15s
+agend-terminal capture promote <capture.cap> <scenario> --scenario-kind <kind>
 ```
 
 ### `verify`
@@ -218,18 +219,41 @@ Health check: home directory, `.env`, `fleet.yaml` parse, active sockets, backen
 agend-terminal doctor
 ```
 
-### `demo`
-Interactive 30-second demo — spawns two fake agents (`alice`, `bob`), scripts a short conversation with split-screen rendering, and demonstrates crash recovery. No real AI backend required.
-
-```
-agend-terminal demo
-```
-
 ### `quickstart`
 Interactive setup wizard: detects installed backends, optionally configures Telegram, writes `fleet.yaml` + `.env`. Handles existing config without stomping it.
 
 ```
-agend-terminal quickstart
+agend-terminal quickstart [--unattended]
+```
+
+`--unattended` never reads stdin or waits on the network; it is intended for CI and scripted installs.
+
+### `mode`
+Set operator availability and optional sleep-mode delegation. Operator-only authority control.
+
+```
+agend-terminal mode <active|away|sleep> [--delegate <instance>] [--scope <op,...>]
+```
+
+### `service`
+Install, remove, or inspect the user-level OS service:
+
+```
+agend-terminal service <install|uninstall|status>
+```
+
+### `skills`
+Manage the unified skills source and install it into backend-specific paths:
+
+```
+agend-terminal skills <add|remove|list|update|install> ...
+```
+
+### `verify-push`
+Verify a semantic push claim against the actual diff:
+
+```
+agend-terminal verify-push --base <commit> [--head <commit>] (--claim <text>|--claim-from-stdin) [--json]
 ```
 
 ### `bugreport`

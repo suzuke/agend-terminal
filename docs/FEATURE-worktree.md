@@ -2,196 +2,223 @@
 
 # Worktree Management
 
-This document describes git worktree creation, binding, release, and garbage
-collection, as well as the division of responsibility among `bind_self`,
-`release_worktree` (including its `force:true` emergency-recovery mode,
-absorbed from the former standalone `force_release_worktree` tool — #2548),
-`repo action=checkout`, and `repo action=release`.
+AgEnD isolates branch-carrying work in daemon-managed Git worktrees. This document describes the current provision, binding, guarded release, and automatic-release behavior.
 
 ## Usage Scenarios
 
-> **Target audience:** Agent infrastructure — fully managed by the daemon; agents work in worktrees transparently without needing to manage them directly.
+> **Target audience:** agent infrastructure. Agents normally receive a bound worktree from task dispatch and use ordinary Git inside it.
 
-**Automatic workspace isolation.** When a lead dispatches a task with a branch name to a dev agent, the daemon provisions a dedicated git worktree for that agent at `~/.agend/worktrees/<agent>/<branch>/`. The dev works in this isolated directory, making commits and pushing without risk of conflicting with other agents working on different branches in the same repository.
+- **Fresh branch task:** dispatch with a branch, or call `repo action=checkout` with `bind:true`, to provision and bind a dedicated worktree.
+- **Recovery or rebind:** call `bind_self` when an existing agent needs to recover or re-establish its own binding.
+- **Normal cleanup:** call `release_worktree` after work is safe to reclaim.
+- **Path-oriented cleanup:** call `repo action=release` for a known linked-worktree path.
+- **Automatic cleanup:** terminal PR/task lifecycle events enqueue a durable release intent; the daemon releases only when the current lease still satisfies the release invariant.
 
-**Mid-lifecycle recovery.** An agent's worktree binding becomes stale after a crash or daemon restart. The agent uses `bind_self` to re-establish its binding to the existing worktree, optionally with `rebase_mode=true` to rebase onto the latest upstream changes before resuming work.
+## State and Layout
 
-**Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC removes it automatically (its archive-to-`.trash` fallthrough belt is gated by `AGEND_WORKTREE_ARCHIVE_FALLBACK=1`, renamed from the now-deprecated `AGEND_WORKTREE_GC`). For stuck or orphaned worktrees, the operator can use `release_worktree(force:true)` as an emergency measure.
+Branch-dispatch worktrees use the canonical pool layout:
 
-**Auto-release on merge (#1344).** When the pr_state scanner detects a PR has been merged, it automatically calls `auto_release_for_merged_branch` to free the worktree before emitting the `[pr-merged]` notification. This ensures `gh pr merge --delete-branch` succeeds without manual intervention. Dirty worktrees are skipped (with a warning log) and retried on the next scanner tick.
+```text
+$AGEND_HOME/worktrees/<instance>/<branch>/
+```
 
-## 1. Design Rationale
+An explicit `repo action=checkout` currently uses a stable single-level
+`<instance>-<repository-key>` directory under `$AGEND_HOME/worktrees/`. Treat
+the `worktree` path returned by the daemon and `binding_state` as authoritative;
+callers must not derive or hard-code either layout.
 
-- Each agent works in its own isolated workspace to avoid branch conflicts and shared-checkout contention.
-- Worktrees are the core isolation mechanism, making the relationship between branches and agents trackable.
-- The canonical layout is `~/.agend/worktrees/<agent>/<branch>/` (daemon-managed).
-- Legacy layouts are detected but never used for new creation.
-- State is described by three markers:
-  - `binding.json` — runtime lease (the key input for release).
-  - `.agend-managed` — daemon ownership marker (agent, branch, leased_at, released_at).
-  - `.agend-pinned` — operator override to prevent GC.
-- GC only targets daemon-managed worktrees; operator-created worktrees are never auto-deleted.
+Two pieces of state establish authority:
 
-## 2. Directories and Markers
+- `.agend-managed` inside the worktree proves daemon ownership.
+- `runtime/<instance>/binding.json` records the instance, branch, source repository, worktree path, task, and lease identity.
 
-- `worktree_path(home, agent, branch)` returns the canonical path: `<home>/worktrees/<agent>/<branch>/`.
-- `legacy_worktree_path` is used only for detecting old layouts (`<source_repo>/.worktrees/<agent>/`).
-- `is_daemon_managed()` checks for `.agend-managed`.
-- `.agend-managed` records `agent=`, `branch=`, `leased_at=`; after release, also `released_at=`.
-- `.agend-pinned` contains a timestamp and prevents GC.
-- `binding.json` records the worktree path and `source_repo`, enabling release to operate from the owning repo's perspective.
+Legacy layouts may be recognized for recovery, but new worktrees use the canonical layout. An operator-created worktree without the managed marker is never treated as a normal daemon-owned release target.
 
-## 3. Worktree Creation
+## Provision and Bind
 
-- `worktree::create()` verifies the target is a git repo (returns `None` otherwise).
-- For repos without HEAD, it attempts an init commit to bootstrap worktree creation.
-- If no branch is specified, it defaults to `agend/<instance_name>`.
-- Branch names are validated; illegal names are rejected.
-- If the target directory already exists:
-  - Matching branch: reuse the existing worktree.
-  - Mismatched branch: report a lease conflict.
-- If the directory does not exist, `git worktree add` is called (with a fallback path on failure).
+### Fresh work: `repo action=checkout`
 
-## 4. Creation Entry Points
+```json
+{
+  "tool": "repo",
+  "action": "checkout",
+  "repository_path": "/path/to/repo",
+  "branch": "feature/example",
+  "bind": true
+}
+```
 
-### `repo action=checkout`
+With `bind:true`, AgEnD provisions the branch worktree and writes the marker and binding as one lifecycle operation. Protected branches are rejected. This is the preferred entry point for a fresh task when the source-repository path is known.
 
-The most common external entry point.
+With `bind:false`, checkout creates an unbound inspection worktree. It is not a dispatch lease.
 
-- `bind=true` — atomic provision + bind. Requires `AGEND_INSTANCE_NAME`, rejects protected branches, creates a named branch on HEAD, and runs tail-ops (marker, binding.json, CI watch).
-- `bind=false` — creates a detached-HEAD worktree for inspection only.
+### Disposable review checkout
 
-### `bind_self`
+For a full-tree review, use typed disposable provenance instead of leaving an
+ordinary review branch behind:
 
-Suitable for mid-lifecycle rebinding.
+```json
+{
+  "tool": "repo",
+  "action": "checkout",
+  "repository_path": "/path/to/repo",
+  "branch": "review/2819-r0",
+  "from_ref": "<full subject-head SHA>",
+  "expected_head": "<same full subject-head SHA>",
+  "bind": true,
+  "task_id": "t-...",
+  "checkout_purpose": "disposable_review"
+}
+```
 
-- Can use `source_repo` from `fleet.yaml`.
-- Supports `rebase_mode=true`.
-- Preferred for recovery scenarios; fresh-task dispatch should use `repo action=checkout bind:true`.
+`disposable_review` is accepted only for a branch that this checkout proves is
+new both locally and on `origin`. The initial signed binding records
+`DaemonProvisionedReview` provenance and the exact `provisioned_head`; there is
+no later metadata-upgrade window.
 
-## 5. Lease and Bind
+Release may delete the clean review branch after its matching review task is
+terminal, no other binding holds it, no PR is headed by the review branch, and
+the actual tip still equals `provisioned_head`. The subject PR may remain open.
+Dirty work, divergence, missing/corrupt provenance, unknown task state, or an
+unproven remote branch state fails closed and preserves the branch.
 
-- `worktree_pool::lease()` rejects protected branches (per `agent_ops::is_protected_ref`).
-- Lease calls `worktree::create()`, then writes `.agend-managed` and `binding.json`.
-- Both `bind_self` and `repo action=checkout bind:true` ultimately go through lease logic.
-- Lease failure typically indicates a branch conflict or validation issue.
-- The bind-in-flight guard is cleaned up by release/cleanup.
+### Recovery: `bind_self`
 
-## 6. Soft Release
+```json
+{
+  "tool": "bind_self",
+  "repository_path": "/path/to/repo",
+  "branch": "feature/example",
+  "task_id": "t-...",
+  "rebase_mode": true
+}
+```
 
-- `worktree_pool::release()` is a soft mark — it does not delete the worktree.
-- It unbinds the lease and writes `released_at` into `.agend-managed`.
-- The worktree becomes a GC candidate seed but continues to exist.
-- This is Phase 3 soft marking, not hard deletion.
+`bind_self` binds the calling instance only. Use it for recovery, a safe rebind, or when the repository is resolved from fleet configuration. `repository_path` and the legacy `repository` argument are mutually exclusive; prefer `repository_path`.
 
-## 7. Hard Release
+`rebase_mode:true` first runs the guarded repair/rebind path. It does not authorize overwriting another live lease.
 
-`release_full()` is the core of the `release_worktree` MCP tool.
+Neither `bind_self` nor a self-claimed checkout silently invents a CI continuation. CI watch is armed from an actual branch-carrying task dispatch or by an explicit `ci action=watch` call.
 
-1. Reads `binding.json`; returns idempotent no-op if absent.
-2. Only processes `.agend-managed` worktrees; refuses to delete unmarked ones.
-3. If the worktree path no longer exists, prunes related git metadata.
-4. Attempts `git worktree remove --force`; falls back to `remove_dir_all` on failure.
-5. Cleans up `binding.json` and the bind-in-flight guard.
-6. Optionally runs branch cleanup (only for managed-verified worktrees).
+## Binding Guarantees
 
-## 8. Branch Cleanup
+- Branch names and repository paths are validated before creation.
+- Protected branches cannot become ordinary agent leases.
+- A branch already leased to another agent is a conflict, not an implicit takeover.
+- Binding and lifecycle operations are serialized so bind, rebase, and release cannot race freely.
+- Fresh dispatch should carry `task_id`; automatic lifecycle release applies only to dispatch leases with a non-empty task ID.
 
-- Runs only for released daemon-managed worktrees.
-- Skips protected branches.
-- Fetches with `--prune`, checks if the branch is merged into main, and checks if the remote tracking ref has vanished.
-- Deletes the local branch only when conditions are met.
-- `branch_cleanup_skipped_reason` provides an auditable explanation when cleanup is skipped.
+Use `binding_state` to inspect the authoritative binding before acting on a worktree.
 
-## 9. Emergency Cleanup
+## Normal Release
 
-`release_worktree(force:true)` (#2548: absorbed the former standalone
-`force_release_worktree` tool) is the emergency tool for stale worktree
-directories. Requires `branch` in addition to `instance`; restricted to the
-worktree's own agent or its team orchestrator (AUDIT2-002).
+```json
+{
+  "tool": "release_worktree",
+  "instance": "dev-agent"
+}
+```
 
-- Target must be within `<home>/worktrees/<agent>/<branch>/`; paths outside the pool are rejected.
-- Attempts `remove_dir_all` directly (directory deletion failure does not block binding cleanup).
-- Calls `release_full()` and runs git metadata prune.
-- Shares safety logic with `rebase_clean_self()` (used by `bind_self(rebase_mode=true)`).
+The current MCP release is a guarded hard release; there is no normal 24-hour “soft release” phase.
 
-## 10. Repo Release
+The release transaction:
 
-`repo action=release` is a path-centric release.
+1. acquires the lifecycle permit;
+2. snapshots the guarded binding;
+3. reacquires the branch, agent, and binding locks;
+4. confirms the fresh binding fingerprint still matches the snapshot;
+5. preserves dirty work before removal;
+6. verifies the managed marker and exact target;
+7. removes the linked worktree, prunes Git metadata, and clears the matching binding.
 
-- Accepts a path; validates and canonicalizes it.
-- Rejects unsafe system paths (including `HOME` itself) and paths that are too shallow.
-- Attempts `git worktree remove --force`; falls back to `remove_dir_all`.
-- Does not depend on agent binding — it is purely path-based.
-- Compare with `release_worktree`, which is agent-centric.
+If preservation fails, release fails closed and keeps the binding. A changed lease fingerprint also stops the operation. A second call after a successful release is an idempotent success.
 
-## 11. Garbage Collection Semantics
+Use `dry_run:true` to preview the operation without destructive effects.
 
-- `gc_dry_run()` lists candidates without deleting anything.
-- `gc_cutover()` performs actual deletion; its archive-fallthrough belt (archive a hard-delete-blocked candidate to `.trash` in the same pass) is gated by `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` (renamed from `AGEND_WORKTREE_GC` in PR-D6; the old name is honored as a deprecated alias for one release cycle).
-- GC skips: non-daemon-managed worktrees, pinned worktrees, worktrees with active bindings, and worktrees without `released_at`.
-- Grace window: 24 hours after `released_at`.
-- Both dry-run and cutover record to the event log.
+The removal implementation first asks Git to remove the worktree. A filesystem fallback is permitted only after the target has been verified as the daemon-managed worktree selected by the guarded transaction.
 
-## 12. GC Candidate Criteria
+## Emergency Release
 
-A worktree is a GC candidate when:
-1. It is daemon-managed.
-2. It is not pinned.
-3. Its agent name can be parsed.
-4. It has no active binding.
-5. It has a `released_at` timestamp older than 24 hours.
+`release_worktree(force:true)` is the guarded recovery path that absorbed the former standalone force-release tool.
 
-Both the new layout (`<home>/worktrees/<agent>/<branch>/`) and legacy layout (`<home>/workspace/*/.worktrees/*/`) are scanned. `evaluate_candidate()` centralizes the criteria so dry-run and cutover share the same logic.
+```json
+{
+  "tool": "release_worktree",
+  "instance": "dev-agent",
+  "branch": "feature/example",
+  "force": true,
+  "repository_path": "/path/to/repo"
+}
+```
 
-## 13. Pin / Unpin
+- `branch` is required.
+- The caller must be the owning instance, its team orchestrator, or an operator.
+- The target must resolve below the daemon worktree pool.
+- Markerless, opaque, ambiguous, ownerless, or mismatched state is preserved rather than guessed away.
+- `repository_path` is an optional hint for Git metadata cleanup.
 
-- `.agend-pinned` is an operator override marker.
-- `pin()` writes a timestamp; `unpin()` removes the file.
-- Pinning prevents GC but does not change binding or `released_at`.
-- Use pin for worktrees that need long-term preservation.
+Force is for stale-state recovery, not a shortcut around the normal release checks.
 
-## 14. Orphan Reconciliation
+## `repo action=release`
 
-- `reconcile_orphan_leases()` is a boot-time, log-only scan.
-- It finds runtime `binding.json` entries whose worktree paths no longer exist.
-- It does not delete anything — it is diagnostic, not destructive.
-- Use this to identify stale registry state when binding and filesystem are inconsistent.
+`repo action=release` accepts a worktree path and revalidates it at execution time.
 
-## 15. Safety Boundaries
+- A daemon-managed target is delegated to the canonical guarded release using its marker owner, binding fingerprint, exact-path check, and caller authorization.
+- An unmanaged target is eligible only when Git proves that it is a linked, non-bare worktree.
+- Main worktrees, bare repositories, non-repositories, shallow/system paths, stale managed markers, and ambiguous targets are rejected.
+- The direct removal fallback is used only after the unmanaged target is revalidated as that exact linked worktree.
 
-- Never `remove_dir_all` on paths outside the worktree pool.
-- Never treat operator-created worktrees as daemon-managed.
-- Never lease without validating the branch name.
-- Never allow protected branches into lease.
-- Never hard-delete without verifying `.agend-managed`.
-- Never skip bind-in-flight cleanup.
-- Release is explicit reclamation; GC is deferred collection; force_release is emergency recovery — they are not interchangeable.
+This action is path-oriented, but it is not an unrestricted directory deletion API.
 
-## 16. Typical Workflow
+## Automatic Release
 
-1. New task: `repo action=checkout bind:true`.
-2. Mid-lifecycle recovery: `bind_self`.
-3. Ready to release: `release_worktree`.
-4. Stale directory remains: `release_worktree(force:true)`.
-5. Preview candidates: `gc_dry_run`.
-6. Execute collection: run cutover. Collection/hard-delete runs regardless of any env var. Optionally set `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` (deprecated alias: `AGEND_WORKTREE_GC`) to opt into the archive-fallback belt, which archives a worktree to `.trash` only when hard-delete FAILS — it does not gate collection.
-7. Preserve a worktree: `pin`.
-8. Remove preservation: `unpin`.
+Merge, close, task completion, and qualifying reviewer-verdict events enqueue disk-backed recompute intents. The worker processes an intent only when it contains a dispatch lease with a task ID and the live lease still matches the captured identity, including source repository, branch, path, and issue time.
 
-## 17. Implementation Checklist
+The core release invariant is:
 
-- Canonical path must be consistent across all code paths.
-- New behaviors must preserve the daemon-managed marker.
-- Release must never delete operator worktrees.
-- GC must never scan worktrees with active bindings.
-- GC grace must respect `released_at`.
-- Legacy layout is detect-only, never create.
-- Emergency cleanup must maintain path safety.
-- `release_full` binding cleanup must not be skipped.
-- Branch cleanup must check the protected set.
-- Any new entry point must align with worktree pool semantics.
+```text
+terminal PR
+OR
+positively confirmed no PR AND all matching repository/branch tasks are terminal
+```
 
-## 18. Summary
+An open PR or unknown PR state keeps the worktree. Close-without-merge follows its conservative grace rules. Cross-repository evidence cannot satisfy another repository's lease.
 
-Worktrees are the isolation layer between agents and branches. `repo action=checkout bind:true` creates new bindings; `bind_self` rebinds mid-lifecycle; `release_worktree` releases formally; `release_worktree(force:true)` (#2548: absorbed the former standalone `force_release_worktree` tool) handles emergencies; `repo action=release` releases by path. GC (`agend-terminal admin gc-dry-run` — #2548: moved from the `gc_dry_run` MCP tool — / `gc_cutover`) handles deferred reclamation. `.agend-managed`, `.agend-pinned`, and `binding.json` together describe the full state. When something goes wrong, determine whether the issue is in lease, release, or GC.
+Automatic release also:
+
+- honors worktree release opt-out;
+- preserves dirty WIP before releasing an eligible terminal lease and retries if preservation fails;
+- keeps non-terminal or otherwise ineligible intents for later recomputation;
+- compares the exact lease fingerprint immediately before release so a re-lease cannot be deleted;
+- permits the narrow reviewer-cleanup path only for eligible clean reviewer bindings after a terminal review task or verdict.
+
+A typed `disposable_review` binding uses the stricter provenance path described
+above. Its subject PR is not the branch-lifecycle signal; terminal review-task
+state plus exact provenance/tip/occupancy checks are.
+
+The PR-state notification and release worker are decoupled; consumers must not depend on release occurring immediately before a `pr-merged` message.
+
+## Branch Cleanup
+
+Worktree removal and local branch deletion are separate decisions. Branch cleanup skips protected branches and fails closed when merge or lifecycle evidence is insufficient. Cleanup intent may be recorded for a clean branch that cannot yet be deleted.
+
+## Operational Checklist
+
+1. Start fresh work with a branch-carrying dispatch or `repo action=checkout bind:true`.
+2. Confirm the daemon-reported worktree and work inside that directory.
+3. For a full-tree review, add `checkout_purpose:"disposable_review"`, exact `expected_head`, and the review `task_id` on a new branch.
+4. Use `bind_self` only for recovery/rebinding.
+5. Inspect uncertain state with `binding_state` or `release_worktree dry_run:true`.
+6. Use normal `release_worktree` when cleanup is authorized.
+7. Reserve `force:true` for guarded recovery and supply the exact branch.
+8. Never manually delete a managed directory while its binding is live.
+
+## Source Pointers
+
+- `src/mcp/handlers/worktree.rs` — `bind_self` and `release_worktree`
+- `src/mcp/handlers/ci/release.rs` — `repo action=release`
+- `src/mcp/handlers/ci/checkout_disposable.rs` — typed disposable-review admission
+- `src/worktree.rs` — canonical dispatch-worktree path derivation
+- `src/worktree_pool.rs` — lease, guarded release, WIP preservation, and branch cleanup
+- `src/daemon/auto_release.rs` — durable auto-release intents and release invariant
+- `src/binding.rs` — binding records and guarded fingerprints

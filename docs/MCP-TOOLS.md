@@ -2,186 +2,241 @@
 
 # AgEnD MCP Tools Reference (32 tools)
 
+The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 32 registered tools to an instance.
+
 ## Action-based Tools
 
 ### `task`
-Manage task board. Actions: create, list, get, claim, done, update.
-- **action**: create / list / get / claim / done / update
-- title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration, fields
-- `list` is **terse by default** (#2475): `description` / `result` are length-capped (~200 chars). Pass `verbose: true` for full text; response carries `terse: true` when capping fired.
-- `list` accepts `fields: "minimal"` (#2475) to project rows down to id/title/status/assignee/priority; response carries `fields: "minimal"|"full"`.
-- `get` (#2475) returns ONE task's FULL record by `id` (alias `task_id`) — the companion to the terse `list` when you need one task's full text.
+
+Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`.
+
+- Core fields include `id`/`task_id`, `title`, `description`, `assignee`, `priority`, `status`, `branch`, `depends_on`, `result`, `due_at`, `project`, and `scope`.
+- `list` returns actionable tasks by default; use `include_history:true` to include done/cancelled tasks and filters such as `filter_status` or `filter_assignee` to narrow it.
+- `list` is terse by default. Use `verbose:true` for full text or `fields:"minimal"` for only the compact identity/status projection.
+- `get` returns one full record by `id` or `task_id`.
+- Metadata and plan-ack actions operate on the durable task record; use the live schema for their required keys.
 
 ### `decision`
-Manage decisions. Actions: post, list, update.
-- **action**: post / list / update
-- title, content, id, tags, scope, supersedes, archive, include_archived, ttl_days
+
+Manage durable decisions and operator questions. Actions: `post`, `list`, `update`, `answer`.
+
+- Decision fields: `id`, `title`, `content`, `tags`, `scope`, `supersedes`, `archive`, `include_archived`, `ttl_days`.
+- Questions use `needs_answer`, `options`, `allow_free_text`, `timeout_secs`, and `timeout_default`; `answer` records the selected/free-text response.
 
 ### `team`
-Manage teams. Actions: create, delete, list, update.
-- **action**: create / delete / list / update
-- name, members, orchestrator, description, repository_path, add, remove
+
+Manage teams. Actions: `create`, `delete`, `list`, `update`.
+
+- Fields: `name`, `members`, `orchestrator`, `description`, `repository_path`, `project_id`, `accept_from`, `add`, `remove`.
+- `project_id` overrides project-board derivation; `accept_from` is the cross-team sender allowlist.
 
 ### `schedule`
-Manage schedules. Actions: create, list, update, delete.
-- **action**: create / list / update / delete
-- id, label, instance, message, cron, run_at, timezone, enabled
+
+Manage timed delivery. Actions: `create`, `list`, `update`, `delete`.
+
+- Fields: `id`, `label`, `instance`, `message`, `cron`, `run_at`, `timezone`, `enabled`.
+- `list` returns the newest three history entries and `runs_total` by default; use `full_history:true` for all retained entries, up to 50.
+- `fire_strategy` is `always` or `until_success`; the latter requires `linked_task_id`.
 
 ### `deployment`
-Manage deployments. Actions: deploy, teardown, list.
-- **action**: deploy / teardown / list
-- name, template, branch, directory
+
+Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
+
+- Fields: `name`, `template`, `branch`, `directory`.
 
 ### `ci`
-Manage CI watching. Actions: watch, unwatch, status.
-- **action**: watch / unwatch / status
-- repository, branch, interval_secs
+
+Manage CI watches. Actions: `watch`, `unwatch`, `status`.
+
+- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`.
+- Use `repository` (GitHub `owner/repo`), not `repo`. `watch` may derive it from the caller's binding; `unwatch` requires it explicitly.
+- Generic `main`/`master` watches are rejected. A protected-ref exact-head watch requires a full 40/64-hex `head_sha`, `task_id`, explicit `next_after_ci`, GitHub, and an authorized orchestrator/operator caller.
 
 ### `repo`
-Manage repo worktrees. Actions: checkout, release.
-- **action**: checkout / release
-- repository_path, branch, path
+
+Manage repository worktrees, branch cleanup, and PR merge. Actions: `checkout`, `release`, `cleanup_init_commits`, `cleanup_merged_branches`, `merge`.
+
+- Common fields include `repository_path`, `repository`, `branch`, `path`, `instance`, `bind`, `task_id`, `expected_head`, and `checkout_purpose`.
+- `checkout bind:true` provisions and binds; `bind:false` creates an inspection worktree.
+- `checkout_purpose:"disposable_review"` creates typed review provenance. It requires `bind:true`, a non-empty `task_id`, a full `expected_head`, and a branch proven new locally and on `origin`.
+- `cleanup_merged_branches` is dry-run by default and requires `confirm_ids` plus `audit_reason` when applying.
+- `merge` uses `pr`; `force:true` requires `force_reason` and is audited.
 
 ### `health`
-Manage health state. Actions: report, clear.
-- **action**: report / clear
-- reason (rate_limit / quota_exceeded / awaiting_operator), retry_after_secs, instance, note
+
+Manage blocked health state. Actions: `report`, `clear`.
+
+- `report` uses the caller identity and accepts `reason` (`rate_limit`, `quota_exceeded`, or `awaiting_operator`), optional `retry_after_secs`, and `note`.
+- `clear` requires target `instance`; an optional `reason` limits which blocked reason is cleared.
 
 ## Communication
 
 ### `send`
-Send a message to another instance or broadcast to multiple. Unified replacement for send_to_instance/delegate_task/report_result/request_information/broadcast.
-- **message**: text content
-- instance, instances, team, tags (routing)
-- request_kind: query / task / report / update
-- task_id (required for kind=task), success_criteria, branch, working_directory
-- context, requires_reply, task_summary, correlation_id, parent_id, thread_id
-- force, force_reason, second_reviewer, second_reviewer_reason
-- reviewed_head, artifacts
+
+Send to one instance or broadcast. This is the unified inter-agent messaging tool.
+
+- Required: `message`. Route with one of `instance`, `instances`, `team`, or `tags`.
+- `request_kind`: `query`, `task`, `report`, or `update`; typed reports should set `report_purpose`.
+- Task fields include `task_id`, `success_criteria`, `context`, `branch`, `bind`, `worktree_binding_required`, `eta_minutes`, `reporting_cadence`, `expect_reply_within_secs`, and `next_after_ci`.
+- Broadcast task dispatches require an existing `task_id`. The current single-target compatibility path can auto-create when it is omitted, but explicit `task action=create` plus `task_id` is the stable contract.
+- Thread/correlation fields: `correlation_id`, `parent_id`, `thread_id`.
+- Busy/review fields include `force`, `force_reason`, `second_reviewer`, `second_reviewer_reason`, `review_class`, plan-ack fields, typed review-assignment fields, `reviewed_head`, and `artifacts`.
+- Report controls include `terminal`, `ack_inbox`, and `triaged`; fire-and-forget tasks can use `no_report_expected`.
 
 ### `inbox`
-Check pending messages, look up by ID, or fetch thread messages.
-- message_id, thread_id, instance
+
+Drain or manage the calling instance's durable inbox.
+
+- No arguments drains unread messages and marks them `delivering`; it does not yet mark them processed.
+- `message_id` describes one message; `thread_id` fetches a thread. Optional `instance` scopes authorized lookups.
+- `action:"ack"` confirms one delivering `message_id`, or the whole in-flight batch when the ID is omitted.
+- `action:"clear"` compact-clears non-obligations while keeping unanswered queries/tasks unread and reporting them in `requires_response`.
+- `action:"discharge"` requires `message_id` and non-empty `reason`; it closes a channel-reply obligation without answering and notifies the operator.
+- Re-draining implicitly acknowledges the previous delivery batch; an unconfirmed batch can be reclaimed for redelivery after about ten minutes.
 
 ### `reply`
-Reply to the user via the active channel (NOT for inter-agent use).
-- **message**: reply content
-- default_action, timeout_secs
+
+Reply to the user/operator through an external channel; do not use it for inter-agent messages.
+
+- Required: `message`.
+- `message_id` routes by the original inbox message's channel and settles that row after a successful send.
+- Optional `task_id` and `correlation_id` preserve reply-to correlation.
+- Pair `default_action` with `timeout_secs` to record a timed default decision.
 
 ### `download_attachment`
-Download a file attachment (telegram multimedia). Returns local path.
-- **file_id**: attachment file ID
+
+Download a Telegram multimedia attachment and return its local path.
+
+- Required: `file_id`.
 
 ## Instance Lifecycle
 
 ### `create_instance`
-Create agent instance(s). Supports homogeneous teams (count + backend) and heterogeneous teams (backends list).
-- **name**: instance or team base name
-- backend, model, model_tier, args, branch, working_directory, task
-- team, count, backends, layout, target_pane
+
+Create one instance or a homogeneous/heterogeneous team.
+
+- Fields include `name`, `backend`, `model`, `model_tier`, `args`, `working_directory`, `branch`, `task`, `role`, `env`, `topic_binding`, `team`, `count`, `backends`, `layout`, and `target_pane`.
 
 ### `delete_instance`
+
 Stop and remove an instance.
-- **instance**: instance to delete
+
+- Required: `instance`. A creator-path delete of an instance with in-flight work additionally requires `force:true` and non-empty `force_reason`; the override is audited.
 
 ### `start_instance`
+
 Start a stopped instance.
-- **instance**: instance to start
+
+- Required: `instance`.
 
 ### `restart_instance`
-Kill and restart an instance. Default mode `resume` preserves conversation state; `fresh` starts clean.
-- **instance**: instance to restart
-- mode (resume / fresh), reason, force
-- `fresh` refuses by default if the bound worktree has uncommitted changes (#2476); commit/push or leave a task-board handoff first, or pass `force: true`.
+
+Restart an instance.
+
+- Required: `instance`; optional `mode` (`resume` or `fresh`), `reason`, and `force`.
+- `resume` is the default and preserves backend conversation state.
+- `fresh` starts clean and refuses a dirty bound worktree unless `force:true` is explicitly supplied.
 
 ### `set_model`
-#2744: persist an instance's model intent to fleet.yaml. Exactly ONE of `model`/`tier`; setting one atomically clears the other (last-write-wins intent). Takes effect on the next respawn unless `restart: true`.
-- **instance**: fleet instance whose entry to update
-- model (concrete id/alias for the DECLARED backend), tier (symbolic `model_tiers` key), restart (default false)
-- Shell/Raw/custom backends have no declared model capability → hard error; a pre-existing model flag in the entry's `args` is a hard conflict (no automatic argv rewriting; move payload after `--` or clean the args). A restart failure after a durable persist reports `persisted:true, restart_ok:false` — the intent still applies on the next respawn.
+
+Persist exactly one model intent (`model` or `tier`) for an instance; setting one clears the other. `restart:true` applies it immediately, otherwise it takes effect on the next respawn.
+
+- Required: `instance` and exactly one of `model`/`tier`.
 
 ### `bind_topic`
-#991: retrofit a Telegram topic for an instance spawned with `topic_binding=deferred` (or `auto` that ended up without one, e.g. spawned during the ~6s post-boot channel-init window).
-- **instance**: instance to bind a topic for
-- channel (defaults to `telegram` — the only channel currently supported)
-- Idempotent: an instance that already has a topic returns `already_bound: true`, no-op.
-- Refuses `skip`-mode instances (`code: not_eligible`) — `skip`'s promise is "no topic, ever"; change `topic_binding_mode` first if you want one.
+
+Create a deferred/eligible Telegram topic binding.
+
+- Required: `instance`; optional `channel` currently defaults to `telegram`.
+- Already-bound instances are an idempotent no-op; `skip` mode is not eligible.
 
 ### `list_instances`
-List all active agent instances. Pass optional `instance` for detailed info on a single instance.
-- **compact by default** (#2475): each row drops the noisy `observed_status.evidence` trail. Pass `verbose: true` (or `include_evidence: true`) to include it.
-- **operator_mode** (#2548): the response also carries a top-level `operator_mode: {mode, delegate_to, delegate_scope}` field — the retired `mode` tool's read side folded in here, so agents can observe operator availability alongside fleet state. Setting the mode stays CLI-only (`agend-terminal mode <active|away|sleep>`).
-- **topic_binding_mode** (#991): each row carries `topic_binding_mode` when the instance was spawned with `topic_binding: skip`/`deferred` — omitted for `auto` (the default), so an operator can grep the fleet for intentionally topic-less agents.
+
+List active instances, or pass `instance` for detail. Output is compact by default; `verbose:true` or `include_evidence:true` includes observed-status evidence. The response also exposes operator mode.
 
 ### `set_metadata`
-Set per-instance display metadata. #2547: merged from the former standalone `set_display_name` / `set_description` tools.
-- **action**: display_name / description
-- action=display_name: **name** — new display name
-- action=description: **description** — instance description
+
+Set display metadata for the caller. Actions: `display_name`, `description`.
+
+- `display_name` uses `name`; `description` uses `description`.
 
 ### `set_waiting_on`
-Declare what this instance is currently waiting for. Empty string to clear.
-- **condition**: what you're waiting for
+
+Declare the caller's current wait condition; send an empty `condition` to clear it.
 
 ### `interrupt`
-Send ESC to target agent's PTY to interrupt current LLM turn.
-- **instance**: instance name
-- reason
+
+Send ESC to a target PTY.
+
+- Required: `instance`; optional `reason` and `snapshot`. Set `snapshot:true` to return a post-ESC diagnostic snapshot.
 
 ### `move_pane`
-Move an instance's pane into a different tab in the TUI.
-- **instance**: instance to move
-- **target_tab**: destination tab name
-- split_dir (horizontal / vertical)
+
+Move an instance pane to a TUI tab.
+
+- Required: `instance`, `target_tab`; optional `split_dir` (`horizontal` or `vertical`).
 
 ### `pane_snapshot`
-Read visible text from a target instance's PTY scrollback (ANSI stripped).
-- **instance**: instance name
-- lines (default 100, max 10000)
-- `to_file: true` (#2478) writes the full snapshot under `$AGEND_HOME/captures/` and returns only a compact summary + path, keeping diagnostic dumps out of context.
+
+Read ANSI-stripped PTY scrollback.
+
+- Required: `instance`; optional `lines`, `head`, and `to_file`.
+- `to_file:true` stores the full capture under `$AGEND_HOME/captures/` and returns a compact response.
 
 ### `instance`
-#2550: folded **read-only** alias for the per-name instance tools. Read-only only — the standalone `list_instances` / `pane_snapshot` tools remain available unchanged, and structural lifecycle (create/delete/start/restart/move_pane) stays on its own tools.
-- **action**: list / pane_snapshot
-- action=list ≡ `list_instances` (optional `instance` for one instance's detail; `verbose` / `include_evidence` for the full evidence trail)
-- action=pane_snapshot ≡ `pane_snapshot` (`instance` required; `lines`, `to_file`, `head`)
+
+Read-only folded alias. Actions: `list`, `pane_snapshot`; semantics match the standalone tools above.
 
 ## Worktree & Binding
 
 ### `bind_self`
-Bind the calling agent to a fresh worktree on the named branch. Rejects main/master (E4.5) and cross-agent conflicts.
-- **branch**: branch to bind
-- repository_path, repository (deprecated), rebase_mode
+
+Recover or rebind the calling instance to a branch worktree. Prefer `repo action=checkout bind:true` for fresh work.
+
+- Required: `branch`; optional `repository_path`, legacy mutually exclusive `repository`, `rebase_mode`, and `task_id`.
+- Rejects protected branches and cross-agent lease conflicts. It does not silently create a CI continuation.
 
 ### `release_worktree`
-Release the daemon-managed worktree and clear binding. Only removes worktrees with `.agend-managed` marker. #2548: `force:true` absorbs the former standalone `force_release_worktree` tool — cleans a stale worktree directory directly (no marker check, requires `branch`), for emergency recovery when a directory survives after its binding is already gone.
-- **instance**: instance to release
-- dry_run, force, branch (required when force:true), repository_path
+
+Guardedly release the exact daemon-managed worktree and binding. The normal path preserves WIP and checks a fresh binding fingerprint; it is idempotent after success.
+
+- Required: `instance`; optional `dry_run` and `force`.
+- `force:true` additionally requires `branch`; `repository_path` is an optional cleanup hint. Markerless, opaque, ambiguous, or mismatched state is preserved.
 
 ### `binding_state`
-Report structured daemon-side bind state for an agent. Non-destructive introspection.
-- **instance**: instance to inspect
+
+Non-destructively report binding content, worktree/marker state, signature diagnostics, CI subscriptions, in-flight guard, and branch holders.
+
+- Required: `instance`.
 
 ### `revoke_review_assignment`
-Revoke a specific reviewer assignment by exact `assignment_id`. Authorization: team orchestrator or operator. Idempotent — repeated calls with a stale/missing assignment_id return success. After successful revoke, merge readiness is recomputed.
-- **assignment_id**: UUID of the assignment to revoke (exact CAS identity)
+
+Revoke a reviewer assignment by exact CAS identity. Authorized for the owning team orchestrator or operator; repeated revoke is idempotent.
+
+- Required: `assignment_id`.
 
 ### `usage_limit_takeover`
-Architecture-14 item 5 Slice 2A operator-only PREPARE seam. Validates the persisted `CandidateReady` episode and writes one durable `Prepared` journal; it does not execute takeover or mutate the source binding/task/process.
-- **instance**: source instance whose persisted usage-limit episode is being prepared
-- **episode_id**: exact persisted episode id; the candidate is derived from `CandidateReady` and cannot be supplied by the caller
+
+Operator-only PREPARE step for a persisted usage-limit takeover episode. It writes the durable prepared journal but does not execute the takeover.
+
+- Required: source `instance` and exact `episode_id`.
 
 ## Daemon Operations
 
 ### `config`
-Runtime-mutable daemon configuration. Actions: get, list. #2548: the set action moved to the `agend-terminal admin config-set` CLI (zero MCP calls in 20 days). (Available keys are derived from the daemon's runtime config and listed in the live tool description.)
-- **action**: get / list
-- key (required for get)
+
+Read runtime configuration. Actions: `get`, `list`; MCP mutation is not supported.
+
+- `get` requires `key`.
+- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`.
+- Change a value with `agend-terminal admin config-set <KEY> <VALUE>`.
 
 ### `restart_daemon`
 
-Request graceful daemon restart. Daemon exits with code 42; wrapper script restarts it. Idempotent.
+Request a graceful daemon restart. Parameters: none.
 
-**Note**: All agent PTY sessions will be interrupted. Persistent state (tasks, bindings, ci_watch) survives; in-flight inbox messages may be lost.
-
-**Parameters**: None.
+- Default standalone mode self-respawns a successor, waits for its health gate, then exits normally; no external supervisor is required.
+- With `AGEND_RESTART_HANDOFF=0`, legacy mode exits with code 42 and requires an installed service supervisor or wrapper; it returns failure if none is detected.
+- In Unix `agend-terminal app` mode, restart preflights and re-execs in place with the same PID. A successful preparation response is followed by the connection dropping during re-exec.
+- Windows app mode remains fail-closed; quit and relaunch instead.
+- A shared gate permits at most one restart in flight; a concurrent request is retryable.

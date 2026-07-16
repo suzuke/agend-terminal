@@ -29,7 +29,7 @@
 | 通訊系統 | [EN](FEATURE-communication.md) | [中文](FEATURE-communication.zh-TW.md) | `send`／`inbox`／`reply`——agent 如何對話 |
 | 任務看板 | [EN](FEATURE-task-board.md) | [中文](FEATURE-task-board.zh-TW.md) | 共享的工作追蹤：create、claim、done |
 | 團隊 | [EN](FEATURE-teams.md) | [中文](FEATURE-teams.zh-TW.md) | 把 agent 分組並界定協調範圍 |
-| Git Worktree 隔離 | [EN](FEATURE-worktree.md) | [中文](FEATURE-worktree.zh-TW.md) | per-agent worktree 與其池化方式 |
+| Git Worktree 隔離 | [EN](FEATURE-worktree.md) | [中文](FEATURE-worktree.zh-TW.md) | branch-bound 受管 worktree 與池化方式 |
 
 ### 進階
 
@@ -55,7 +55,7 @@
 | 文件 | EN | 中文 | 內容 |
 |---|---|---|---|
 | 架構 | [EN](architecture.md) | [中文](architecture.zh-TW.md) | daemon 設計、worktree pool、健康監控、channel 生命週期 |
-| MCP 工具 | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | 全部 29 個 agent 協調 MCP 工具，依類別列出 |
+| MCP 工具 | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | 全部 32 個 agent 協調 MCP 工具，依類別列出 |
 | 環境變數 | [EN](env-vars.md) | [中文](env-vars.zh-TW.md) | 每一個 `AGEND_*` 變數與其作用 |
 | Git 行為 | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | daemon 對被啟動 agent 的 git 環境做了哪些修改 |
 | 相容性政策 | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | `$AGEND_HOME` 底下磁碟格式的穩定性保證 |
@@ -89,6 +89,7 @@
 
 - [Architecture Groups](ARCHITECTURE-GROUPS.md) — 原始碼樹的子系統分組
 - [Architecture Quick Start](ARCHITECTURE-QUICK-START.md) — 新貢獻者的入門導覽
+- [Architecture-14 收斂台帳](architecture/ARCHITECTURE-14-LEDGER.md) — 14 項架構計畫的權威 invariant、證據、狀態與完成門檻
 - [Daemon Lock Ordering](DAEMON-LOCK-ORDERING.md) — 鎖的取得順序與死鎖避免
 - [Hung State Transitions](HUNG-STATE-TRANSITIONS.md) — hung 偵測狀態機
 - [Recovery Stages](RECOVERY-STAGES.md) — crash 復原的分段

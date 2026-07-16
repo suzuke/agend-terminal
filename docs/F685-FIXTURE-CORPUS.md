@@ -3,8 +3,17 @@
 Source-of-truth for the F685 fixture corpus and measurement harness.
 Unlocks F39 mitigation selection (six hypotheses fixture-FP-gated, see
 `docs/HUNG-STATE-TRANSITIONS.md §F39.4`) and F9 promotion-to-default-active
-(FP < 1% on N ≥ 3+ confirmed cases, see
+(FP < 1% with the statistical minimum in §F685-CORPUS.4, see
 `docs/F9-PRODUCTIVE-OUTPUT-GATE.md §F9.5`).
+
+> **CURRENT CORPUS (revalidated at `main@1d83b423`, 2026-07-16):**
+> `tests/fixtures/state-replay/MANIFEST.yaml` is authoritative and currently
+> contains **44 fixtures**, including **8 schema-v2-labelled fixtures**:
+> six `silent_stuck`, one `productive_marker_fire`, and one
+> `productive_silence`. The manifest covers Agy, Claude, Codex, Kiro/Kiro
+> CLI, and OpenCode; it has **no Grok fixture yet**. Gemini is retired and no
+> longer appears in the live manifest. Section §F685-CORPUS.3 preserves the
+> smaller launch corpus as historical provenance, not as a current count.
 
 Decision: `d-20260514015214320625-1` (sub-task 5 of N for `#685`).
 Sibling chain: sub-tasks 1 (Hung audit, PR #750), 2 (F39 audit, PR #752),
@@ -26,18 +35,18 @@ The corpus is **shared infrastructure** across multiple `#685` deliverables:
 - **F39 mitigation selection** — six hypotheses (a)/(b)/(c)/(d)/(e)/(f) in
   `docs/HUNG-STATE-TRANSITIONS.md §F39.4` need FP measurement to pick a
   winner. Same corpus, different harness pass (per `§F685-CORPUS.4`).
-- **Future Phase 2 auto-recovery** — staged escalation will need confidence
-  in detection FP/FN before any automated action.
+- **Recovery calibration** — the live Stage-1 recovery action remains
+  shadow-by-default and needs confidence in detection FP/FN before promotion.
 
-The corpus does **not** own to F9 or F39 individually — it is the
+The corpus does **not** belong exclusively to F9 or F39 — it is the
 **measurement substrate** both rely on. Hence its standalone doc and
 top-level integration test entry point.
 
 ## §F685-CORPUS.2 — Manifest schema extension
 
-`ReplayFixture` at `rg "struct ReplayFixture" src/state.rs` was extended
+`ReplayFixture` at `rg "struct ReplayFixture" src/state/tests.rs` was extended
 with seven optional fields (serde defaults preserve backward-compat with
-the 13 existing schema-v1 fixtures):
+schema-v1 fixtures):
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -49,29 +58,33 @@ the 13 existing schema-v1 fixtures):
 | `provenance` | `Option<String>` | Human-readable origin: PR #, operator session note, or `synthetic from <template>`. Audit trail. |
 | `schema_version` | `u32` (default `1`) | Future-compat marker. **No runtime enforcement in Phase 1** — informational only; future schema changes bump and add migration. |
 
-**Backward-compat**: existing 13 fixtures (schema-v1) parse unchanged via
-serde defaults. The `state::tests::replay_manifest_regression` test pins
-the v1 path.
+**Backward-compat**: schema-v1 fixtures parse unchanged via serde defaults.
+The `state::tests::replay_manifest_regression` test pins the compatibility
+path.
 
-## §F685-CORPUS.3 — Initial corpus
+## §F685-CORPUS.3 — Initial corpus (historical launch snapshot)
 
-Phase 1 ships three new synthetic schema-v2 fixtures plus the schema-v1
-baseline:
+> The counts and backend names in this section describe the Phase 1 launch
+> plan. They are retained to explain the original measurement design. Use
+> the current-corpus banner above and `MANIFEST.yaml` for live coverage.
+
+The Phase 1 documentation listed three synthetic schema-v2 fixtures plus the
+then-current schema-v1 baseline:
 
 | Fixture | Backend | Scenario | Classification | Capture |
 |---|---|---|---|---|
 | `f685-f9-positive-savedfile.raw` | claude-code | `productive_marker_fire` | `not_hung` | `synthetic` |
 | `f685-f9-negative-saved-prose.raw` | claude-code | `productive_silence` | `not_hung` | `synthetic` |
-| `f685-silent-stuck-stub.raw` | gemini | `silent_stuck` | `hung` | `synthetic_from_real_template` |
+| `f685-silent-stuck-stub.raw` | gemini | `silent_stuck` | `hung` | `synthetic_from_real_template` (historical planned stub; not in the current manifest) |
 
-Plus 13 legacy schema-v1 fixtures (1 per backend × {thinking, tooluse,
-+occasional perm/update}). These continue passing
-`replay_manifest_regression` without manifest edits.
+At launch, 13 legacy schema-v1 fixtures (1 per backend × {thinking, tooluse,
++occasional perm/update}) parsed without manifest edits under
+`replay_manifest_regression`.
 
-Backend coverage priority is **gemini + kiro** (issue `#659` names these
-explicitly as known-stuck backends). Claude/Codex/OpenCode receive sample
-coverage via existing schema-v1 fixtures; deliverable #4 will calibrate
-per-backend markers.
+The launch coverage priority was **Gemini + Kiro** (issue `#659` named these
+explicitly as known-stuck backends). Gemini was later retired in favour of
+Agy. The current corpus adds Agy coverage, while Grok remains the active
+backend with no labelled or schema-v1 fixture.
 
 This initial set is **not** statistically sufficient for the FP < 1% /
 FN < 10% gates. Corpus growth is delegated to operators and follow-up
@@ -87,7 +100,7 @@ sub-tasks per `§F685-CORPUS.6`.
      - `productive_marker_fire` → expect `Productive { source: Marker(_) }` or `Productive { source: Heartbeat }`
      - `productive_silence` → expect `NoSignal`
      - `silent_stuck` → expect `NoSignal`
-   - Smoke-test pinned in `rg "corpus_measurement_smoke_f9_marker_signals" src/state.rs`.
+   - Smoke-test pinned in `rg "corpus_measurement_smoke_f9_marker_signals" src/state/tests.rs`.
 2. **F39 oscillation pipeline** (deferred, see `§F685-CORPUS.6`).
    - Replay each schema-v2 fixture through `StateTracker::feed` with
      wall-clock injection between chunks.
@@ -106,7 +119,7 @@ classifier returns `true` only on the entry transition (sub-task 1
 Reports break out into three lines:
 
 ```
-F9 measurement (current N=3):
+F9 measurement (N at report time):
   Real:        X/Y  (high signal value — actual operator sessions)
   Synthetic:   X/Y  (specific scenario coverage — crafted to exercise paths)
   Combined:    X/Y  (aggregate)
@@ -126,8 +139,9 @@ Strictness ratchets up as N grows.
 - **FP < 1%** at 95% confidence (Rule of Three): N ≥ 300 not-stuck fixtures
 - **FN < 10%** at reasonable confidence: N ≥ 30 known-stuck fixtures
 
-Phase 1 ships N = 3 schema-v2 fixtures plus the harness. **The harness
-reports rates against current N**; the promotion gate criteria (in F9
+Phase 1 shipped N = 3 schema-v2 fixtures plus the harness; the current
+manifest has N = 8 labelled fixtures. **The harness reports rates against
+current N**; the promotion gate criteria (in F9
 commit msg and F39 audit) gate on `N ≥ minimum AND rate < threshold`.
 This is a deliberate reframe of the issue's `FP < 1%` wording from
 "hit the bar in one PR" to "hit the bar via corpus growth over time".
@@ -195,7 +209,7 @@ own unless code/harness changes are bundled).
 
 - **Time-injection harness extension**: F39 Scenario C measurement requires
   wall-clock advancement between byte chunks (the priority `min_hold` gates
-  in `rg "min_hold" src/state.rs` use `Instant::now()`). The replay loop
+  in `rg "min_hold" src/state/mod.rs` use `Instant::now()`). The replay loop
   currently runs in microseconds; even a 30-second real trace replays
   instantly, so `since.elapsed()` never crosses `min_hold`. Extension
   needed: per-chunk timestamp metadata in `.raw` companion + harness that
@@ -206,9 +220,10 @@ own unless code/harness changes are bundled).
   fixture; synthetic-from-real-template (timeline-faithful byte sequence
   derived from an operator's incident report) is acceptable in interim.
 - **Per-backend marker calibration**: deliverable #4 (sub-task 6,
-  decision `d-20260514022917793418-0`) shipped per-backend MARKERS for
-  5 managed backends — see `docs/F9-PRODUCTIVE-OUTPUT-GATE.md §F9.2`
-  for current listings. Codex and OpenCode markers remain
+  decision `d-20260514022917793418-0`) shipped backend-specific marker
+  caches, later renamed from Gemini to Agy. Grok currently uses the generic
+  cache — see `docs/F9-PRODUCTIVE-OUTPUT-GATE.md §F9.2` for current listings.
+  Codex and OpenCode markers remain
   **synthetic-only** pending real PTY captures via this corpus growth
   protocol; corpus-side fixtures for those backends will join the same
   harness loop once captured.
@@ -224,7 +239,7 @@ own unless code/harness changes are bundled).
   fixture corpus capture criteria.
 - `docs/F9-PRODUCTIVE-OUTPUT-GATE.md §F9.5` activation gate points here
   for promotion measurement methodology.
-- `src/state.rs::tests::corpus_measurement_smoke_f9_marker_signals` —
+- `src/state/tests.rs::corpus_measurement_smoke_f9_marker_signals` —
   unit-test smoke harness for F9 marker measurement.
 - `tests/fixture_corpus_measurement.rs` — integration-test harness for
   manifest schema validation + corpus counts report.
@@ -240,7 +255,8 @@ own unless code/harness changes are bundled).
   + time-injection harness first.
 - F9 promotion flip — needs corpus growth + active-mode measurement first.
 - Per-backend tuning (deliverable #4) — separate sub-task.
-- Phase 2 staged auto-recovery — full Phase 2.
+- Recovery automation beyond the current Stage-1-only dispatcher — requires a
+  fresh scope decision and new evidence; removed Stages 2/3 are not a live plan.
 - Schema migration code for `schema_version` enforcement — Phase 1
   metadata-only.
 - `cargo test --features f9-measure` gating — defer until N ≈ 100.

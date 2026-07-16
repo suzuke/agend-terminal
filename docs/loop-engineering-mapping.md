@@ -24,7 +24,7 @@
 |---|------|----------|-----------|----------|------|
 | 1 | **automation** | 按時觸發、自行發掘分類 | ✅ 做滿且更深 | `src/schedules.rs`、`src/daemon/cron_tick.rs`、`src/daemon/{idle,handoff_timeout,inbox_stuck,helper_staleness}_watchdog.rs` | 文章只講「按時觸發」；agend 多一層**卡住偵測**——不只啟動迴圈，還抓迴圈空轉/卡死。比概念更進階。 |
 | 2 | **worktree** | 多代理平行不互踩 | ✅ 做滿 | `src/worktree.rs`、`src/worktree_pool.rs`、`src/worktree_cleanup.rs` | 連**池化複用**與**自動回收**都有，工程級而非 demo 級。 |
-| 3 | **skills** | 外部專案知識 | ✅ 有，偏新 | `src/skills.rs`、`~/.agend-terminal/skills/`（5 backend 統一 symlink） | 跨 backend 統一做得好。空間在「知識的結構化/主動檢索」——目前偏存放，未來可更主動餵給 agent。 |
+| 3 | **skills** | 外部專案知識 | ✅ 有，偏新 | `src/skills.rs`、`$AGEND_HOME/skills/`（6 backend 統一 symlink） | 跨 backend 統一做得好。空間在「知識的結構化/主動檢索」——目前偏存放，未來可更主動餵給 agent。 |
 | 4 | **plugins / connectors（MCP）** | 串接既有工具服務 | ✅ 做滿，是核心 | `src/mcp/registry.rs`、`src/mcp/tools.rs`、`src/mcp/handlers/` | MCP 是 agend 的神經系統，agent 間的 send/task/decision 全走這層。比「串接工具」更進一步用於 agent 協調。 |
 | 5 | **sub-agents（審查分離）** | 提案者/審查者分離，避免自評 | ✅✅ 領先最多 | `src/claim_verifier.rs`、`src/verify.rs`、verdict 協定（VERIFIED/REJECTED/UNVERIFIED）、issue #1666 | 文章列為「一個零件」，agend 做成**一整套協定**：獨立 reviewer、強制證據、dual-review、cross-team borrow。護城河最深處。 |
 | 6 | **外部記憶** | 存磁碟不存 context | ✅ 做滿 | `src/decisions.rs`、`src/inbox/`、memory 系統（markdown） | 文章講「markdown 存磁碟」；agend 有三層——decision log（為什麼這樣決定）、inbox（發生過什麼）、memory（跨 session 事實）。 |

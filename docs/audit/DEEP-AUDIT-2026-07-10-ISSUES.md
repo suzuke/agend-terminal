@@ -1,11 +1,17 @@
-# Deep Audit 2026-07-10 — Issue Drafts (NOT yet filed on GitHub)
+# Deep Audit 2026-07-10 — Historical Issue Drafts
+
+> **Historical snapshot:** These drafts preserve the audit's findings at
+> `30489362`; they are not the current GitHub backlog, and individual findings
+> may since have been fixed, superseded, or filed. Re-verify source and issue
+> state before acting on any item.
 
 > Structural multi-lens audit by `grok-soak` (5 parallel adversarial explore agents + main
 > premise-check). Every issue below was **verified against actual source** (quoted file:line).
 > Overlaps with resolved AUDIT2 items are excluded. Nothing here is a GitHub issue yet.
 >
-> **Status: drafts.** Canonical `docs/audit/` was **not** written (isolated soak workspace +
-> `$AGEND_HOME/captures/audit-2026-07-10/`). Promote into the repo only after gapfix/operator triage.
+> **Original status:** drafts produced in an isolated soak workspace and later
+> preserved here for audit history. This copy does not imply that every draft
+> became a GitHub issue.
 >
 > **Threat-model note:** same as AUDIT2 — same-UID agents, loopback cookie, self-declared
 > `params["instance"]`. Severities calibrate to trusted co-worker fleets + prompt-injection depth

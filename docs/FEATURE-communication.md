@@ -8,18 +8,18 @@ AgEnD Terminal's communication system enables structured message passing between
 
 > **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
 
-**Dev reports completion to lead.** After finishing a PR, the dev agent calls `send` with `kind=report` and the task's `correlation_id`. The lead agent's inbox receives the report, and the dispatch idle tracker clears the pending sidecar — no human coordination needed.
+**Dev reports completion to lead.** After finishing a PR, the dev agent calls `send` with `request_kind=report` and the task's `correlation_id`. The lead agent's inbox receives the report, and the dispatch idle tracker clears the pending sidecar — no human coordination needed.
 
-**Lead delegates a task.** The lead agent creates a task on the board, then uses `send` with `kind=task`, a `branch` name, and `next_after_ci=reviewer`. The daemon auto-provisions a worktree for the dev, and once CI passes, the reviewer is automatically notified — the entire handoff chain is wired up in a single `send` call.
+**Lead delegates a task.** The lead agent creates a task on the board, then uses `send` with `request_kind=task`, a `branch` name, and `next_after_ci=reviewer`. The daemon auto-provisions a worktree for the dev, and once CI passes, the reviewer is automatically notified — the entire handoff chain is wired up in a single `send` call.
 
-**Cross-team status broadcast.** An agent needs to inform the whole team about a merge freeze. It calls `send` with `team=fixup` and `kind=update`. Every team member receives the message in their inbox; no reply is expected. The sender is automatically excluded from the broadcast list.
+**Cross-team status broadcast.** An agent needs to inform the whole team about a merge freeze. It calls `send` with `team=fixup` and `request_kind=update`. Every team member receives the message in their inbox; no reply is expected. The sender is automatically excluded from the broadcast list.
 
 ## Design Philosophy
 
 Multi-agent collaboration requires a reliable communication channel. Passing messages through raw terminal output is neither structured nor traceable. The communication system provides:
 
 - **Structured messages**: Every message has a clear type (task/query/report/update)
-- **Persistent inbox**: Messages are never lost, even if the recipient is temporarily offline
+- **Persistent inbox**: Once enqueue succeeds, messages remain durable even if the recipient is temporarily offline
 - **Task tracking**: Delegated tasks can be tracked for progress and results
 - **Multiple delivery modes**: Single target, multi-target broadcast, team broadcast
 
@@ -50,15 +50,19 @@ Check the inbox for pending messages.
 
 Calling with no parameters returns all unread messages. You can also query a specific message's status or fetch a thread.
 
+Draining marks the returned batch `delivering`, not processed. After handling it, acknowledge the batch with `{"action":"ack"}` or acknowledge one row by `message_id`.
+
 ### `reply` — Reply to External Channels
 
 Reply to users or operators through external channels like Telegram or Discord.
 
 ```json
 {
-  "text": "Task complete, PR has been created"
+  "message": "Task complete, PR has been created"
 }
 ```
+
+When responding to a message obtained from `inbox`, pass its `message_id` so `reply` uses that message's original external channel and settles the channel-reply obligation after a successful send.
 
 ---
 
@@ -75,7 +79,7 @@ Every message has a `request_kind` that determines the recipient's handling obli
 
 ### task — Task Delegation
 
-Used to assign work to another agent. Must include a `task_id` (obtained from the task board).
+Used to assign work to another agent. Create and pass a `task_id` whenever possible. Broadcast task dispatch requires one; the current single-target compatibility path can auto-create a task when it is omitted.
 
 ```json
 {
@@ -92,7 +96,7 @@ Task type supports additional management parameters:
 
 | Parameter | Description |
 |-----------|-------------|
-| `task_id` | Task board ID (required; obtain via `task action=create`) |
+| `task_id` | Task board ID (required for broadcast; recommended for every dispatch) |
 | `branch` | Target git branch (auto-binds worktree) |
 | `success_criteria` | Completion criteria |
 | `eta_minutes` | Expected completion time |
@@ -132,6 +136,7 @@ Report task results or review conclusions. Typically paired with `correlation_id
 | `correlation_id` | Corresponding task ID (for tracking correlation) |
 | `parent_id` | Message ID being replied to (thread linking) |
 | `reviewed_head` | Git HEAD SHA at review time |
+| `ack_inbox` | With `true`, atomically acknowledge the reporter's delivering messages for this `correlation_id` after the send succeeds |
 
 ### update — Status Updates
 
@@ -212,29 +217,18 @@ When the target agent is running:
 
 ### Inbox Fallback
 
-When the target agent is offline (not started, cross-team, daemon offline):
+When the target agent is offline or stopped, but the daemon accepted the send:
 
-1. Message is written directly to the inbox JSONL file
+1. The daemon persists the message in the inbox JSONL log
 2. Agent receives it the next time it comes online and calls `inbox`
 
-### Failure Degradation
+### Daemon Failure Behavior
 
-When the daemon API call fails:
+The daemon is the sole messaging authority. If the MCP bridge cannot reach it, the call fails visibly; the bridge does not write inbox files or execute `send` locally. Retry after daemon service returns. A message that the daemon has already enqueued remains durable in the append-only, locked and fsynced JSONL inbox.
 
-1. Automatically degrades to direct inbox file write
-2. Resolves threading (derives `thread_id` from `parent_id`)
-3. Records delivery mode as `inbox_fallback`
+### Idempotent Retry
 
-Regardless of mode, messages are never lost. The inbox uses append-only JSONL format with file locking to ensure safe concurrent writes.
-
-### Idempotent Retry (#1341)
-
-All three MCP→daemon `api::call` sites (`send`, `delegate_task`,
-`report_result`) include a UUIDv4 `request_id` in the JSON envelope. The
-daemon's `request_dedup::DedupCache` uses this to deduplicate retries: if
-the same `request_id` arrives while the first call is still processing (or
-has already completed), the duplicate is suppressed or returns the cached
-result. Without `request_id`, the legacy at-least-once path applies.
+The MCP bridge gives every proxied request a UUIDv4 `request_id`. After a retryable transport break it reconnects and retries exactly once with the same ID. The daemon deduplicates that ID, so a transport retry cannot enqueue the same message twice. Application errors are returned without that transport retry, and there is no local fallback.
 
 ---
 
@@ -247,7 +241,15 @@ result. Without `request_id`, the legacy at-least-once path applies.
 {}
 ```
 
-Returns all unread messages and marks them as read. Read messages do not reappear on subsequent calls.
+Returns unread messages and marks the batch `delivering`. This is a lease for the current turn, not final confirmation that the messages were handled.
+
+After handling them, call:
+
+```json
+{"action": "ack"}
+```
+
+This transitions the whole in-flight batch to `processed`; add `message_id` to acknowledge only one row. A new drain implicitly acknowledges the previous batch. If neither happens, a reclaim timeout of about ten minutes can return unconfirmed rows to unread for redelivery.
 
 ### Query a Specific Message
 
@@ -270,6 +272,26 @@ Returns the message's delivery status: read (with timestamp and delivery mode), 
 ```
 
 Returns all messages in the specified thread, including both read and unread.
+
+### Clear a Stale Backlog
+
+```json
+{"action": "clear"}
+```
+
+`clear` compact-clears non-obligation messages and returns a bounded summary. Unanswered queries and unsettled tasks stay unread and are listed in `requires_response`.
+
+### Discharge an External Reply Obligation
+
+```json
+{
+  "action": "discharge",
+  "message_id": "m-...",
+  "reason": "Handled in the incident channel"
+}
+```
+
+Use `discharge` only when no channel reply is owed. It durably closes that obligation without answering, records the reason, and notifies the operator. Use `reply` when an answer should actually be sent.
 
 ---
 
@@ -295,8 +317,8 @@ Rules:
 
 Sprint 58 Wave 4 introduced the anti-stall contract:
 
-- `kind=task` in broadcast mode (team/targets/tags) **must** include `task_id`
-- `kind=task` in single-target mode auto-creates a task if `task_id` is omitted
+- `request_kind=task` in broadcast mode (`instances`/`team`/`tags`) **must** include `task_id`
+- `request_kind=task` in single-target mode currently auto-creates a task if `task_id` is omitted; explicit creation remains the stable, auditable flow
 
 How to obtain a `task_id`:
 
@@ -328,7 +350,7 @@ Enable timeout monitoring with `expect_reply_within_secs`:
 }
 ```
 
-If no matching `kind=report` (paired by `correlation_id`) arrives within the specified time, the daemon sends a `dispatch_idle_threshold_exceeded` notification to the sender's inbox.
+If no matching `request_kind=report` (paired by `correlation_id`) arrives within the specified time, the daemon sends a `dispatch_idle_threshold_exceeded` notification to the sender's inbox.
 
 Fixup team tasks automatically enable a 10-minute timeout by default. Other teams must specify explicitly.
 
@@ -336,7 +358,7 @@ Fixup team tasks automatically enable a 10-minute timeout by default. Other team
 
 ## Busy Gate
 
-When the target agent already has a claimed or in-progress task, `kind=task` delivery is blocked by the busy gate.
+When the target agent already has a claimed or in-progress task, `request_kind=task` delivery is blocked by the busy gate.
 
 ```json
 // Override the busy gate
@@ -354,7 +376,7 @@ When the target agent already has a claimed or in-progress task, `kind=task` del
 
 ## Automatic Worktree Binding
 
-When `kind=task` includes a `branch` parameter, the system automatically creates and binds a git worktree for the target agent:
+When `request_kind=task` includes a `branch` parameter, the system automatically creates and binds a git worktree for the target agent:
 
 ```json
 {
@@ -368,7 +390,7 @@ When `kind=task` includes a `branch` parameter, the system automatically creates
 Binding flow:
 1. Checks out the specified branch into a worktree from the source repo
 2. Binds the target agent to that worktree
-3. If `next_after_ci` is set, automatically monitors CI results
+3. Auto-arms feature-branch CI monitoring for the actual dispatch; `next_after_ci`, when present, supplies the explicit follow-up target(s)
 
 Set `"bind": false` to skip automatic binding (e.g., for notifications that don't need a working directory).
 
@@ -403,16 +425,16 @@ No manual CI watch setup needed — everything is wired up at dispatch time.
 
 ```
 Lead: task(create, title="Fix #1177") -> task_id="t-..."
-Lead: send(target=dev, kind=task, task_id="t-...", branch="fix/1177", next_after_ci="reviewer")
+Lead: send(instance=dev, request_kind=task, task_id="t-...", branch="fix/1177", next_after_ci="reviewer")
 Dev:  inbox() -> receives the task
-Dev:  send(target=lead, kind=report, correlation_id="t-...", message="PR created")
+Dev:  send(instance=lead, request_kind=report, correlation_id="t-...", ack_inbox=true, message="PR created")
 CI passes -> Reviewer auto-receives [ci-ready-for-action]
-Reviewer: send(target=lead, kind=report, correlation_id="t-...", message="VERIFIED")
+Reviewer: send(instance=lead, request_kind=report, correlation_id="t-...", message="VERIFIED")
 ```
 
 ### Team Broadcast / Cross-Agent Queries
 
 ```
-send(team="fixup", kind=update, message="Merge freeze today")
-send(target=reviewer, kind=query, message="When should the M3 session be deleted?")
+send(team="fixup", request_kind=update, message="Merge freeze today")
+send(instance=reviewer, request_kind=query, message="When should the M3 session be deleted?")
 ```

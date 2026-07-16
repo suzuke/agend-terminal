@@ -2,9 +2,9 @@
 
 # Skills
 
-為 agend-terminal 支援的五種 backend（Claude Code、Codex、Gemini CLI、OpenCode、Kiro CLI）提供統一的社群 skill 探索機制。
+為六種 backend（Claude Code、Codex、OpenCode、Kiro CLI、Antigravity CLI 與 Grok Build）提供統一的社群 skill 探索機制。
 
-一個 skill 就是一個目錄（通常包含 `SKILL.md` 加上相關的支援檔案），agent 的 backend 會在啟動時載入它。agend-terminal 將每個 skill 的**單一副本**存放在 `~/.agend-terminal/skills/` 之下，並讓每個 backend 透過各自慣用的子目錄探索到它——通常是用 symlink，在 Windows 上則退而使用複製。
+一個 skill 就是一個目錄（通常包含 `SKILL.md` 加上相關的支援檔案），agent 的 backend 會在啟動時載入它。agend-terminal 將每個 skill 的**單一副本**存放在 `$AGEND_HOME/skills/` 之下，並讓每個 backend 透過各自慣用的子目錄探索到它——通常是用 symlink，在 Windows 上則退而使用複製。
 
 ## 設計初衷
 
@@ -14,16 +14,17 @@
 |---------|------------------------------------------|
 | Claude  | `.claude/skills/`                        |
 | Codex   | `.codex/skills/`                         |
-| Gemini  | `.gemini/skills/`                        |
 | OpenCode| `.opencode/skills/`                      |
 | Kiro    | `.kiro/skills/`                          |
+| Antigravity CLI | `.agents/skills/`                |
+| Grok Build | `.grok/skills/`                       |
 
 沒有 agend-terminal 時，你得為每個 agent、每個 backend 的目錄都各複製一份所有 skill。agend-terminal 只存一份標準來源，並自動把它呈現給每個 backend。
 
 ## Architecture
 
 ```
-~/.agend-terminal/skills/                ← single source of truth
+$AGEND_HOME/skills/                      ← single source of truth
   ├── skill-forge/
   │   └── SKILL.md
   ├── opencli-adapter-author/
@@ -31,20 +32,21 @@
   └── ...
 
 agent working directory/
-  ├── .claude/skills/   → symlink → ~/.agend-terminal/skills/
-  ├── .codex/skills/    → symlink → ~/.agend-terminal/skills/
-  ├── .gemini/skills/   → symlink → ~/.agend-terminal/skills/
-  ├── .opencode/skills/ → symlink → ~/.agend-terminal/skills/
-  └── .kiro/skills/     → symlink → ~/.agend-terminal/skills/
+  ├── .claude/skills/   → symlink → $AGEND_HOME/skills/
+  ├── .codex/skills/    → symlink → $AGEND_HOME/skills/
+  ├── .opencode/skills/ → symlink → $AGEND_HOME/skills/
+  ├── .kiro/skills/     → symlink → $AGEND_HOME/skills/
+  ├── .agents/skills/   → symlink → $AGEND_HOME/skills/
+  └── .grok/skills/     → symlink → $AGEND_HOME/skills/
 ```
 
 在 Unix 上，各 backend 的項目都是 symlink（零維護）。在 Windows 上 agend-terminal 退而複製檔案；重新執行 `install` 會替換掉受管理的目標。
 
 狀態檔案：
 
-- `~/.agend-terminal/skills/<name>/` — 標準的 skill 內容
-- `~/.agend-terminal/skills-lock.json` — 每個 skill 的來源 + 釘選版本（git 用 commit SHA，本地路徑用 mtime）+ 安裝時間戳
-- `~/.agend-terminal/.skills-stage/<digest>/` — 短暫存在的暫存副本，當某個 agent 只需要部分 skill 時使用（見下方 fleet.yaml 整合）。超過 7 天後會被 GC 回收。
+- `$AGEND_HOME/skills/<name>/` — 標準的 skill 內容
+- `$AGEND_HOME/skills-lock.json` — 每個 skill 的來源 + 釘選版本（git 用 commit SHA，本地路徑用 mtime）+ 安裝時間戳
+- `$AGEND_HOME/.skills-stage/<digest>/` — 短暫存在的暫存副本，當某個 agent 只需要部分 skill 時使用（見下方 fleet.yaml 整合）。超過 7 天後會被 GC 回收。
 
 ## CLI
 
@@ -56,7 +58,7 @@ agent working directory/
 agend-terminal skills add <source>
 ```
 
-`<source>` 可以是本地路徑，也可以是 git URL（`https://…`、`git@…`、`ssh://…`，或任何以 `.git` 結尾的字串）。skill 目錄名稱取自來源的 basename，所以 `git clone … repo-foo` 會變成 `~/.agend-terminal/skills/repo-foo/`。
+`<source>` 可以是本地路徑，也可以是 git URL（`https://…`、`git@…`、`ssh://…`，或任何以 `.git` 結尾的字串）。skill 目錄名稱取自來源的 basename，所以 `git clone … repo-foo` 會變成 `$AGEND_HOME/skills/repo-foo/`。
 
 - 本地路徑：遞迴複製到標準來源根目錄。
 - Git URL：以 `git clone --depth=1` 複製到標準來源根目錄；釘選版本就是產生出來的 HEAD SHA。
@@ -69,7 +71,7 @@ agend-terminal skills add <source>
 agend-terminal skills remove <name>
 ```
 
-刪除 `~/.agend-terminal/skills/<name>/` 並清除它的 lock 項目。具冪等性——對一個不存在的名稱執行時不會有任何作用。
+刪除 `$AGEND_HOME/skills/<name>/` 並清除它的 lock 項目。具冪等性——對一個不存在的名稱執行時不會有任何作用。
 
 ### List
 
@@ -77,7 +79,7 @@ agend-terminal skills remove <name>
 agend-terminal skills list
 ```
 
-列出 `~/.agend-terminal/skills/` 之下的每個目錄，連同記錄的來源和釘選版本（若缺漏則顯示 `(unrecorded)` / `(unpinned)`）。
+列出 `$AGEND_HOME/skills/` 之下的每個目錄，連同記錄的來源和釘選版本（若缺漏則顯示 `(unrecorded)` / `(unpinned)`）。
 
 ### Update
 
@@ -94,7 +96,7 @@ agend-terminal skills update <name>   # update just one
 agend-terminal skills install <working_dir>
 ```
 
-在 `<working_dir>` 之下建立五個各 backend 的子目錄，並讓每個都指向 `~/.agend-terminal/skills/`（symlink，Windows 上為複製）。當你想讓 skill 在某個並非由 daemon 產生的目錄裡可見時使用——對於受管理的 agent，daemon 會自動執行相同的 install（見下文）。
+在 `<working_dir>` 之下建立六個 backend 子目錄，並讓每個都指向 `$AGEND_HOME/skills/`（symlink，Windows 上為複製）。當你想讓 skill 在某個並非由 daemon 產生的目錄裡可見時使用——對於受管理的 agent，daemon 會自動執行相同的 install（見下文）。
 
 ## Daemon 整合
 
@@ -113,8 +115,8 @@ instances:
 
 行為：
 
-- 省略 `skills:`（預設）—— `~/.agend-terminal/skills/` 之下的每個 skill 都會暴露給該 agent。
-- `skills: [name1, name2]` —— 只有指定名稱的 skill 會被暫存到 `~/.agend-terminal/.skills-stage/<digest>/` 之下的一個臨時 digest 目錄，再把那個暫存目錄 symlink 進各 backend 路徑。該 agent 只會看到那些 skill。
+- 省略 `skills:`（預設）—— `$AGEND_HOME/skills/` 之下的每個 skill 都會暴露給該 agent。
+- `skills: [name1, name2]` —— 只有指定名稱的 skill 會被暫存到 `$AGEND_HOME/.skills-stage/<digest>/` 之下的一個臨時 digest 目錄，再把那個暫存目錄 symlink 進各 backend 路徑。該 agent 只會看到那些 skill。
 - `skills: []` —— 明確選擇不使用：各 backend 目錄會被建立，但不含任何 skill（只有 daemon 的 `.agend-skills-managed` 標記）。
 - 在標準來源中不存在的名稱會被跳過並發出警告；該 agent 仍會啟動。
 
@@ -126,14 +128,14 @@ instances:
 cargo test skills::
 ```
 
-執行 `src/skills.rs::tests` 中的 24 個單元／整合測試——涵蓋 add/remove/list/install/update、skills-lock 的往返、SHA-256 暫存 digest，以及暫存區 GC（包含 TOCTOU 同次執行排除）。在乾淨的 checkout 上全部通過。
+執行 `src/skills.rs::tests` 中的 30 個單元／整合測試——涵蓋 add/remove/list/install/update、skills-lock 的往返、SHA-256 暫存 digest，以及暫存區 GC（包含 TOCTOU 同次執行排除）。
 
 其他好用的一次性檢查：
 
 ```
 agend-terminal skills list                            # canonical source inventory
 agend-terminal skills install /tmp/scratch-agent      # exercises the symlink/copy path
-cat ~/.agend-terminal/skills-lock.json                # inspect pinned versions
+cat "$AGEND_HOME/skills-lock.json"                   # inspect pinned versions
 ```
 
 ## 範例
@@ -163,7 +165,7 @@ instances:
     skills: [writing-style-guide, markdown-linter]
 ```
 
-執行 `agend-terminal start` 之後，`~/.agend-terminal/workspace/doc-writer/.claude/skills/` 會解析到一個只含那兩個 skill 的暫存區。
+執行 `agend-terminal start` 之後，`$AGEND_HOME/workspace/doc-writer/.claude/skills/` 會解析到一個只含那兩個 skill 的暫存區。
 
 ## 疑難排解
 
@@ -185,4 +187,4 @@ skills 功能在 Sprint 60–62 之間陸續推出：
 - #590 — SHA-256 前綴暫存 digest（Sprint 62 W1 PR-1）
 - #591 — 暫存區 GC，含 TOCTOU 同次執行排除（Sprint 62 W1 PR-2）
 
-實作位於 `src/skills.rs`（單一模組，約 650 LOC + 24 個測試）。CLI 介面在 `src/cli.rs` 的 `Sprint 60 W2 PR-1 — agend skills CLI subcommands` 標題之下。
+實作位於 `src/skills.rs`（約 1,475 LOC，包含 30 個測試）。CLI 介面位於 `src/cli.rs` 的 `run_skills_*`，由 `src/main.rs` dispatch。

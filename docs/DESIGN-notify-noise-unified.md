@@ -1,4 +1,8 @@
 # Unified design: notification-noise 3-in-1 (spike → VET)
+
+> **Historical design snapshot:** This point-in-time spike is retained as design
+> provenance. Its gaps and proposed remedies are not a current runtime contract;
+> verify them against current source before acting.
 Tasks 35896-11 (poll/delivering) + 67777-1 (ci-ready dismiss) + 24134-4 (tombstone). base=main.
 All claims file:line-confirmed (RCA read + Explore map). Design only — no code until vet.
 

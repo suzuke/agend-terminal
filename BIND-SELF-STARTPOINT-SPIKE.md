@@ -1,5 +1,9 @@
 # Spike: bind_self re-provision start-point data-loss (t-…83936-5)
 
+> **Historical snapshot:** This spike records a point-in-time investigation and is
+> not the current `bind_self` contract. Verify behavior against
+> [`docs/FEATURE-worktree.md`](docs/FEATURE-worktree.md) and the current source.
+
 Spike-first (lead vet BEFORE impl — data-loss surface, DUAL). All file:line in
 `src/mcp/handlers/dispatch_hook/mod.rs` unless noted.
 

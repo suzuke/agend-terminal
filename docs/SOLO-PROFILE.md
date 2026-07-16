@@ -3,10 +3,10 @@
 # Solo Profile — Running AgEnD as Operator + One Agent
 
 **Status:** informative, non-normative. Where this document and
-`FLEET-DEV-PROTOCOL.md` disagree, the protocol wins for anything touching
-merge safety (CI gates, worktree discipline); this document only narrows
-which *ceremony* actually applies when there's no one else to coordinate
-with.
+`FLEET-DEV-PROTOCOL.md` disagree, the protocol always wins. This document only
+helps apply §3.21 proportional-ceremony judgment when there is no peer to
+coordinate with; it does not waive task tracking, CI, worktree, review, or
+merge-authority gates.
 
 ## Why this exists
 
@@ -35,9 +35,13 @@ follow `FLEET-DEV-PROTOCOL.md` as written.
 These protect *you*, the operator's repo, or the merge pipeline — not a
 peer agent. Nothing about being alone changes their purpose:
 
-- **Worktree discipline (§10).** Still use a worktree + branch, never
-  commit to main. This isolates your changes from the operator's canonical
-  working tree, which exists whether or not you have teammates.
+- **Task board (§1).** A solo agent handling a direct operator request creates
+  and claims its own task, then records the evidence-backed result. The board is
+  still the durable source of truth across restarts and handoff.
+- **Worktree discipline (§10/§12.4).** Still use a daemon-managed worktree +
+  branch, never commit to main and never create the worktree with raw git. This
+  isolates your changes from the operator's canonical working tree, which
+  exists whether or not you have teammates.
 - **Test-first (§3.10).** Still write the failing test before the fix.
   This catches *your own* regressions — the value isn't "so a reviewer can
   verify," it's "so you don't ship a fix that doesn't fix anything."
@@ -46,25 +50,21 @@ peer agent. Nothing about being alone changes their purpose:
 - **Evidence-gated claims (§3.3's "comments are claims, not evidence").**
   Still true when you're the only one who'll ever read your own claim back.
 
-## What's exempt or optional solo
+## What's lighter solo
 
-- **Task board (§1).** Optional, not load-bearing. The board's value is
-  a *shared* source of truth for others to read; solo, your own working
-  memory (or a local scratch note) is a legitimate substitute. Using the
-  board anyway is harmless and keeps a paper trail — do so if it's not
-  extra friction, but it isn't a requirement.
-- **Review dispatch / dual-VERIFIED (§3.2–3.5).** There's no second party
-  to dispatch to. Either the operator reviews directly, or you self-assess
-  under §3.21's axis C (review tier) — solo is not "dual review, minus
-  one," it's a different mode entirely. Don't manufacture a fake second
-  reviewer to satisfy the letter of a fleet rule written for a different
-  situation.
-- **Decision-board threading / badges (#2313).** These exist so *other
-  agents* notice an open decision. Solo, the operator either sees it
-  directly (same terminal) or answers via the timeout+default path below.
-- **`send`/`inbox`/team communication tools.** Largely no-ops with no
-  peers to reach. Operator communication still goes through the
-  channel-appropriate `reply` path — that's unrelated to fleet size.
+- **Review coordination (§3.2–3.5).** Do not manufacture a fake reviewer. The
+  review tier is still selected under §3.21, and merge authority still follows
+  §3.5: an implementer self-merge requires two independent VERIFIED verdicts;
+  an operator may review/merge directly only through an applicable protocol
+  path such as §3.6. If the required reviewer does not exist, hand the merge
+  decision back to the operator or add a real reviewer instance.
+- **Decision-board discussion.** There may be no peer discussion thread, but a
+  scope decision, correction, or unresolved operator fork still belongs in
+  `decision`. Use the timeout/default path below only when a default is safe and
+  explicitly declared.
+- **`send`/`inbox`/team communication tools.** There may be no peer recipient,
+  so peer dispatch is unnecessary. Operator communication still goes through
+  the channel-appropriate `reply` path — that's unrelated to fleet size.
 - **Timeout staircase for a "stale peer" (§9).** Nothing to escalate
   against when there's no peer.
 

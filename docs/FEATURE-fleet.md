@@ -22,7 +22,8 @@ fleet.yaml solves this: a single YAML file describes every agent's configuration
 
 ## fleet.yaml Structure
 
-fleet.yaml lives at `$AGEND_HOME/fleet.yaml` (default `~/.agend-terminal/fleet.yaml`).
+fleet.yaml lives at `$AGEND_HOME/fleet.yaml` (normally `~/.agend/fleet.yaml`,
+with legacy `~/.agend-terminal/fleet.yaml` fallback).
 
 ### Full Example
 
@@ -95,7 +96,7 @@ All instances inherit settings from defaults. Individual instances can override 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `backend` | string | Backend name (claude / kiro-cli / codex / opencode / gemini / agy / shell) |
+| `backend` | string | Backend name (claude / kiro-cli / codex / opencode / antigravity-cli/agy / grok / shell) |
 | `command` | string | Custom command (overrides backend default) |
 | `args` | [string] | CLI argument list |
 | `model` | string | Concrete model name (e.g., opus, sonnet). Wins over `model_tier` |
@@ -185,7 +186,7 @@ Sets the timezone the daemon uses in human-readable timestamps. Accepts IANA tim
 
 #### `templates` — Deployment Templates
 
-Defines reusable agent configuration templates for dynamically creating instances via `fleet deployment deploy`.
+Defines reusable agent configuration templates for dynamically creating instances via the MCP call `deployment(action=deploy, ...)`.
 
 #### `watchdog` — Watchdog Topology
 
@@ -387,8 +388,8 @@ When the daemon restarts (auto-restart after crash or manual stop/start), agents
 | Kiro CLI | `--resume` | Resumes the most recent conversation |
 | Codex | Built-in | Session managed internally by Codex |
 | OpenCode | `--continue` | Resumes the most recent conversation |
-| Gemini | `--resume latest` | Resumes the most recent conversation |
 | Agy | `--continue` | Resumes the most recent conversation |
+| Grok Build | `--continue` | Resumes the most recent cwd session when one exists |
 | Shell | Not supported | Every launch is a new session |
 
 ### Fallback Mechanism
@@ -432,7 +433,7 @@ The auto-restart mechanism uses exponential backoff starting at 5 seconds, cappe
 
 ## fleet.yaml Field Merge Rules
 
-When fleet.yaml is updated (e.g., via `fleet deployment deploy` or manual editing), fields fall into two categories:
+When fleet.yaml is updated (e.g., via MCP `deployment(action=deploy)` or manual editing), fields fall into two categories:
 
 ### Daemon-Managed Fields
 

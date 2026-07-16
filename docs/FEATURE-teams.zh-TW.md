@@ -37,7 +37,7 @@
 ## 2. 檔案與模組
 
 - `src/teams.rs` 是主要實作檔。
-- `src/fleet.rs` 是實際存放層。
+- `src/fleet/mod.rs` 是實際存放層。
 - `src/mcp/handlers/task.rs` 不碰 team。
 - `src/mcp/handlers/dispatch.rs` 會把 `team` 參數送進 `send`。
 - `src/mcp/handlers/comms.rs` 會檢查 team 與 orchestrator。
@@ -60,6 +60,8 @@
 - `description` 是可選說明。
 - `created_at` 是 runtime 或 operator 建立時間。
 - `source_repo` 是 team 的來源 repo 路徑。
+- `project_id` 是可選的 project-board id override。
+- `accept_from` 是允許直接傳訊給 orchestrator 的外部 agent allowlist；空陣列代表拒絕跨 team direct send。
 - `stale_members` 是 list 投影用。
 - `stale_members` 的值來自 live registry 比對。
 - `stale_members` 空時不會輸出到 JSON。
@@ -78,6 +80,8 @@
 - `orchestrator` 必須是 members 的其中一個。
 - 如果 orchestrator 不在 members 內，create 會錯。
 - `repository_path` 可省略。
+- `project_id` 可覆寫 project-board slug 推導，而不改動 `repository_path`。
+- `accept_from` 可設定跨 team direct-send allowlist；預設空陣列是 fail-closed。
 - 省略時會產生 warning。
 - 那個 warning 會提醒你 dispatch binding 可能 fall through。
 - create 會先讀 fleet.yaml。
@@ -114,12 +118,15 @@
 - update 可加 `remove`。
 - update 可加 `orchestrator`。
 - update 可加 `repository_path`。
+- update 可改 `project_id`。
+- update 可改 `accept_from`。
 - `remove` 不能移除目前 orchestrator。
 - 若要換 orchestrator，要先指定新的 orchestrator。
 - 新 orchestrator 必須在更新後的 members 裡。
 - `add` 不能把 member 加進另一個 team。
 - 這個檢查遵守 one-agent-one-team。
 - `repository_path` 若沒給，會沿用舊值。
+- `project_id` 與 `accept_from` 未提供時也會沿用舊值。
 - update 成功後會寫回 `fleet.yaml`。
 - update 回傳 `status=updated`。
 - update 失敗時會回傳 error。
@@ -221,6 +228,8 @@
 - member 名單應該避免重複。
 - orchestrator 應該總是屬於 members。
 - source_repo 最好不要缺。
+- repository path 的 slug 推導可能有歧義時，`project_id` 應與預期 task board 對齊。
+- `accept_from` 應維持最小集合；空陣列會刻意拒絕跨 team direct send 到 orchestrator。
 - 如果缺了，dispatch 自動 bind 會掉到較弱的 fallback。
 - update 不應讓 team 掉到無法路由的狀態。
 - delete 不應默默跳過整個 team。

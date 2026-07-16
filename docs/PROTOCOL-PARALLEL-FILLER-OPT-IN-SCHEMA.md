@@ -1,5 +1,16 @@
 # Parallel filler opt-in — formal schema
 
+> **Status: SUPERSEDED — historical Sprint 61 dispatch convention.** The literal
+> `parallel-filler:` marker is not part of the live MCP schema and does not
+> authorize worktree, rebase, force-push, or merge exceptions. Current behavior
+> is governed by [`FLEET-DEV-PROTOCOL.md`](FLEET-DEV-PROTOCOL.md) §10, §12.1,
+> §12.4, and §12.6: each task uses a daemon-managed branch/worktree, pipeline
+> depth is at most two, and PRs in one wave merge sequentially with rebase,
+> fresh CI, and refreshed verdict evidence between merges. The old
+> `force_release_worktree` / `restart_daemon` tool names and the ad-hoc
+> force-push recovery recipe below are retired. The remainder is preserved only
+> as the original incident/design record.
+
 **Sprint 61 W2 PR-1 — process protocol.** Closes Sprint 60 #583 §5
 deferral by replacing the MVP "parallel-feasible vs PR-X" dispatch-text
 semantic with a formal opt-in schema. Sequential-default remains the

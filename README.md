@@ -11,14 +11,14 @@ Orchestrate AI coding agents — not just run them.
 
 ![AgEnD Terminal — orchestrating a fleet of AI coding agents in a multi-pane TUI](docs/tui-screenshot.png)
 
-Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches each agent as a long-lived PTY process with its own git worktree, wires up inter-agent communication via built-in MCP tools, and keeps everything running with auto-respawn and context handover.
+Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches each agent as a long-lived PTY process, can isolate branch-bound work in daemon-managed git worktrees, wires up inter-agent communication via built-in MCP tools, and keeps everything running with auto-respawn and context handover.
 
 ## Features
 
 - **Fleet-as-code** — One YAML file declares every agent's backend, role, working directory, and team membership. `agend-terminal start` brings the whole fleet up.
-- **5 backends** — Claude Code, Codex, Kiro, OpenCode, and Antigravity CLI. Swap backends by changing one field.
-- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 29 MCP tools. No glue code.
-- **Automatic git worktree isolation** — Each agent works in its own worktree. No merge conflicts between agents, no accidental cross-contamination.
+- **6 backends** — Claude Code, Codex, Kiro, OpenCode, Antigravity CLI, and Grok Build. Swap backends by changing one field.
+- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 32 MCP tools. No glue code.
+- **Automatic git worktree isolation** — Branch-bound tasks and instances can use daemon-managed worktrees. Unbound instances use their configured workspace.
 - **Crash recovery with context handover** — Agents auto-respawn and resume their conversation. Exponential backoff, health monitoring, and hung detection built in.
 - **Remote control** — Drive the fleet through a multi-pane TUI, Telegram, or Discord. Get notifications when agents need attention.
 
@@ -73,7 +73,7 @@ graph LR
     A1 <-->|MCP bridge| A2
     A2 <-->|MCP bridge| A3
     A1 <-->|MCP bridge| A3
-    D ---|worktree per agent| G[(Git repo)]
+    D ---|managed worktree for branch-bound work| G[(Git repo)]
     D ---|health monitor<br/>auto-respawn| A1
 ```
 
@@ -85,7 +85,7 @@ graph LR
 | Output capture | Screen scraping | VTerm state tracking |
 | Agent health | Manual monitoring | Auto-respawn + state detection |
 | Multi-agent comms | Custom IPC | Built-in MCP tools |
-| Git isolation | Manual worktrees | Auto per-agent worktree |
+| Git isolation | Manual worktrees | Managed worktrees for branch-bound work |
 
 ## Backends
 
@@ -96,9 +96,10 @@ graph LR
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
 | Antigravity CLI | `agy` | Tested |
+| Grok Build | `grok` | Experimental |
 
 > Gemini CLI was retired in [#1580](https://github.com/suzuke/agend-terminal/issues/1580) (it sunsets 2026-06-18 for free/Pro/Ultra tiers). Antigravity CLI (`agy`) is its official successor and a **supported** Fleet MCP backend ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)). A `gemini` backend in fleet.yaml now spawns as a generic `Raw` backend.
-> agy refuses any workspace whose path has a dot-prefixed (hidden) ancestor, so daemon agents under `~/.agend-terminal` were invisible to it. The daemon now creates a non-hidden link (`<base>/<instance>` → the hidden real workspace) and spawns agy with `$PWD` pointed at that link, clearing agy's hidden-path guard while the real files stay under `$AGEND_HOME`. `configure_agy` writes the project-scoped `.agents/mcp_config.json` + `.agents/AGENTS.md` (agy's official Customization Roots), so `agy` loads the fleet `send`/`inbox`/`task` tools like every other backend.
+> agy refuses any workspace whose path has a dot-prefixed (hidden) ancestor, so daemon agents stored under a hidden `$AGEND_HOME` were invisible to it. The daemon now creates a non-hidden link (`<base>/<instance>` → the hidden real workspace) and spawns agy with `$PWD` pointed at that link, clearing agy's hidden-path guard while the real files stay under `$AGEND_HOME`. `configure_agy` writes the project-scoped `.agents/mcp_config.json` + `.agents/AGENTS.md` (agy's official Customization Roots), so `agy` loads the fleet `send`/`inbox`/`task` tools like every other backend.
 
 ## Feature stability
 
@@ -115,13 +116,14 @@ change between minor versions.
 | Area | Tier | Notes |
 |---|---|---|
 | Fleet orchestration (`fleet.yaml`, PTY spawn, supervision, auto-respawn) | Beta | Core path; extensive tests |
-| Git worktree isolation | Beta | Per-agent worktree lease / release / GC |
-| MCP coordination tools (29) | Beta | `send` / `inbox` / `task` / … |
+| Git worktree isolation | Beta | Branch-bound worktree lease / release / GC |
+| MCP coordination tools (32) | Beta | `send` / `inbox` / `task` / … |
 | Task board | Beta | Append-only event log (schema v2) |
-| Telegram channel | Beta | The only fully-implemented channel |
+| Telegram channel | Beta | Primary channel; polling, bindings, and notifications |
 | Claude Code / Codex / Kiro / OpenCode backends | Beta | Tested |
 | Antigravity CLI (`agy`) backend | Experimental | Newer ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)); workspace-link shim |
-| Shadow Observer state plane | Experimental | Additive, observe-only ([#2413](https://github.com/suzuke/agend-terminal/issues/2413)); kill-switch `AGEND_SHADOW_OBSERVER=0` |
+| Grok Build backend | Experimental | Newer; generic state detection with project-scoped MCP and skills |
+| Shadow Observer state plane | Experimental | Default-on high-confidence Hook/Stream corrections ([#2413](https://github.com/suzuke/agend-terminal/issues/2413)); kill-switches `AGEND_SHADOW_OBSERVER=0` and `AGEND_OBSERVED_DISPATCH=0` |
 | CI watch + PR auto-close sweep | Experimental | GitHub / GitLab / Bitbucket pollers |
 | Ephemeral cross-backend workers | Experimental · opt-in, no MCP surface | #2547: `ephemeral` MCP tool retired (zero calls); tracking/reap infra retained pending #2548 P1. Real backend gated by `AGEND_EPHEMERAL_REAL_BACKEND` |
 | Discord channel | Experimental · opt-in | `--features discord` |
@@ -136,7 +138,7 @@ and [configuration](docs/FEATURE-configuration.md).
 - [Quick Start Guide](docs/FEATURE-quickstart.md) — First-run walkthrough
 - [Fleet Configuration](docs/FEATURE-fleet.md) — `fleet.yaml` reference
 - [CLI Reference](docs/CLI.md) — All subcommands
-- [MCP Tools](docs/MCP-TOOLS.md) — 29 agent coordination tools
+- [MCP Tools](docs/MCP-TOOLS.md) — 32 agent coordination tools
 - [Known Issues](docs/KNOWN_ISSUES.md) — Intentionally-deferred items; check before filing an issue
 - [**Documentation Index**](docs/README.md) — Full bilingual map of every guide and reference
 

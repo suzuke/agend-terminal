@@ -13,7 +13,10 @@
 
 如果只滿足其中一個條件，先等待並重新檢查，再決定是否升級處理。
 
-## 2. 本地測試關卡
+## 2. 凍結 merge 與本地診斷
+
+啟用本 SOP 期間，**不得 merge 受影響的 PR**。本地通過是有用的診斷證據，
+但不是 CI 證據，也不會授權使用 `--admin`、`--force` 或其他方式繞過 merge gate。
 
 在該 PR 的 worktree 裡執行以下三個命令，全部都必須通過。
 
@@ -23,7 +26,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-**注意：** 這涵蓋編譯、單元/整合測試、lint 和格式檢查。跨平台驗證（Windows/Linux）延後到恢復之後再做。
+**注意：** 這只涵蓋本機平台上的編譯、單元／整合測試、lint 和格式檢查，
+不能取代 repo 的 hosted 跨平台檢查。
 
 ## 3. PR 留言範本
 
@@ -35,20 +39,29 @@ cargo fmt --check
 - [x] `cargo test --all` — passed (N tests)
 - [x] `cargo clippy --all-targets -- -D warnings` — clean
 - [x] `cargo fmt --check` — clean
-- [ ] Cross-platform (deferred to post-recovery)
+- [ ] Hosted cross-platform CI — blocked by the current Actions incident
 
 GitHub Status: [degraded since HH:MM UTC](https://githubstatus.com)
 Verified by: @agent-name
+
+Merge status: FROZEN until CI runs on this PR head and all required checks pass.
 ```
 
 把 `N tests`、`HH:MM UTC` 和 `@agent-name` 換成實際的值。
 
 ## 4. Merge 流程
 
-1. Agent 執行 3 個本地測試關卡命令，並用上面的範本貼出 PR 留言
-2. Lead 確認 review 已完成且本地驗證已貼出 → `gh pr merge --admin`
-3. Actions 恢復後，main 分支的 CI 會自動補做驗證
+1. 記錄受影響 PR、branch 與不可變的 PR head SHA，並保持 PR 開啟。
+2. 執行三項本地診斷，並用上面的範本貼出結果。
+3. Actions 降級期間持續凍結 merge；本地綠燈與已完成的 review 都不會放寬 CI gate。
+4. Actions 恢復後，確認它對同一個 PR head 執行。必要時重新註冊該 branch 的
+   `ci` watch；若 outage 期間完全沒建立 workflow run，請對未變更的 PR branch
+   觸發 workflow，而不是先 merge。
+5. 獨立執行 `gh pr checks <PR#>`。只有命令以 0 結束、所有 required check
+   都成功，且 review／verdict gate 也成立時，PR 才具備 merge 資格。
 
 ## 5. 恢復之後
 
-不需要任何特別處置。main 分支的 CI pipeline 會在每次 push 到 main 時執行，因此 Actions 恢復後，已 merge 的 PR 都會自動完成驗證。
+不得把稍後的 `main` run 當成尚未驗證之 PR 的補驗證。每個被凍結的 PR 都要從
+記錄的 head SHA 恢復，取得該 PR 完整的 CI 結果，再走正常 merge 流程。若 outage
+期間 head 已改變，先前的 review 已 stale，必須針對新 head 重新審查。

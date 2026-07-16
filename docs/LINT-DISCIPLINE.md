@@ -6,8 +6,10 @@
 fix-forward cycles in Sprint 56–57 *before* push, so CI matrix runs
 verify rather than discover.
 
-**Companion**: `scripts/clippy-all-platforms.sh`. This document captures
-the *patterns* the script is designed to surface. Running the script
+**Primary preflight**: `scripts/preflight.sh`. Its full mode matches the owned
+fmt/clippy/test surface used by CI and adds the Windows cross-check. The narrower
+`scripts/clippy-all-platforms.sh` remains useful when iterating specifically on
+cfg-gated lint failures. This document captures the *patterns* those scripts surface. Running them
 without internalizing the patterns leaves you blind to the failure
 modes the script can't detect (because they're at link/runtime, not
 lint).
@@ -19,8 +21,8 @@ lint).
 Run before every push that touches platform-specific code:
 
 ```bash
-scripts/clippy-all-platforms.sh           # full matrix
-scripts/clippy-all-platforms.sh --quick   # host only (fast iteration)
+scripts/preflight.sh           # fmt + owned clippy + tests + Windows cross-check
+scripts/preflight.sh --quick   # skip the Windows cross-check
 ```
 
 If the script reports a `failed` target, **fix locally first** rather
@@ -60,7 +62,7 @@ scope landed.
 ### 2. fire-and-forget spawn rationale
 
 **Symptom**: clippy doesn't directly enforce this — but the project's
-**Phase 5b invariant test** (`tests/spawn_rationale_invariant.rs`) does.
+**Phase 5b invariant test** (`tests/spawn_rationale_audit.rs`) does.
 Every `tokio::spawn` and `thread::spawn` site MUST carry either:
 
 - a `// fire-and-forget: <reason>` comment on the call site, OR
@@ -72,15 +74,14 @@ effort", "background cache warmer, daemon shutdown waits via global
 cancellation token").
 
 ```rust
+// fire-and-forget: telemetry is best-effort; daemon shutdown happens via the
+// global cancellation token observed inside the future, so no join is needed.
 tokio::spawn(async move {
-    // fire-and-forget: telemetry is best-effort; daemon shutdown
-    // happens via the global cancellation token observed inside the
-    // future, no join needed.
     emit_telemetry(...).await;
 });
 ```
 
-**Reference**: `FLEET-DEV-PROTOCOL.md` §10.5. Tests are exempt
+**Reference**: `FLEET-DEV-PROTOCOL.md` §12.5. Tests are exempt
 (test helpers may spawn ad-hoc); trait methods inherit the caller's
 rationale.
 
@@ -191,14 +192,12 @@ does **not** catch:
 The expected workflow is:
 
 1. Edit code.
-2. `cargo clippy --features tray --bin agend-terminal --tests -- -D warnings`
-   (host-only, fast).
-3. **`scripts/clippy-all-platforms.sh`** — catches Patterns 1, 4, 5, 6.
-4. `cargo test --features tray` (host-only, fast).
-5. `git push` → CI matrix verifies link + runtime on all 3 platforms.
-6. CI green → merge.
+2. **`scripts/preflight.sh`** — runs owned fmt/clippy/tests and the Windows cross-check.
+3. For focused cfg-lint iteration only, optionally run `scripts/clippy-all-platforms.sh`.
+4. `git push` → CI matrix verifies link + runtime on all 3 platforms.
+5. CI green → merge.
 
-If you skip step 3, you may get fix-forward cycles for Patterns 1, 4,
+If you skip the preflight, you may get fix-forward cycles for Patterns 1, 4,
 5, 6 — each cycle costs ~10–15 min of wall time per platform. The local
 script costs ~30 sec.
 

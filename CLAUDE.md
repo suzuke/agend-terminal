@@ -61,7 +61,10 @@ and CI still apply, so `--no-verify` is not a free pass).
 A post-merge hook triggers a background `cargo build --release` when `src/`
 files change. Desktop notification on completion. Does not auto-restart the
 daemon — operator decides restart timing. Disable with
-`git config core.hooksPath /dev/null`.
+`git config core.hooksPath /dev/null` only in an operator-owned standalone
+clone, with the understanding that this disables every tracked hook. Never
+change `core.hooksPath` in a daemon-managed agent worktree; it also carries the
+provenance and pre-push safety hooks.
 
 ### If the hook isn't installed
 
@@ -77,8 +80,8 @@ writes only `prepare-commit-msg` there — it does *not* clear the directory. So
 `install-hooks.sh` *copies* the tracked `pre-push` into `$AGEND_HOME/hooks/pre-push`,
 where it coexists and fires for agent pushes (one copy covers every current and
 future worktree, since they share that dir). Agent pushes DO run the hook: the
-`agend-git` shim and the `AGEND_GIT_BYPASS` path both `exec` real `git`, which
-honours `core.hooksPath`. This coexistence relies on the daemon not deleting
+The active agent git guard ultimately invokes real `git`, which honours
+`core.hooksPath`. This coexistence relies on the daemon not deleting
 `$AGEND_HOME/hooks/pre-push`; if that changes, re-run `install-hooks.sh`.
 
 ## Test fidelity: feed consumers the producer's real output (#1493)
@@ -115,7 +118,7 @@ context changes, not the bridge's.
 `tokio::runtime::Handle::try_current().is_ok()` and, when already inside a
 runtime, runs the future on a `std::thread::scope` thread with a *fresh* runtime
 (never nested). See `src/channel/telegram/state.rs::block_on_value` and
-`src/channel/discord.rs::block_on_value`.
+`src/channel/discord/adapter.rs::block_on_value`.
 
 Local, freshly-built runtimes (`let rt = Builder::…build()?; rt.block_on(…)`)
 are exempt — a non-shared runtime is never nested. Only the shared-accessor
@@ -128,27 +131,22 @@ fails CI. Adding a new channel/bridge? Add a guarded helper, never a raw
 
 ## Worktree branch policy
 
-When creating a worktree, **always use `-b <dedicated-branch>`** to create a
-fresh branch. **Never** check out `main` (or any other long-lived shared
-branch) directly into a worktree:
+Fleet agents must let the daemon provision and bind worktrees. Never run raw
+`git worktree add/remove/move`, never switch the canonical repo, and never use a
+shim bypass after a deny. Provision a dedicated non-protected branch through
+the MCP lifecycle:
 
-```bash
-# Good — dedicated branch
-git worktree add ../path -b feat/short-name origin/main
-
-# Bad — locks main checkout, blocks operator/CI build
-git worktree add ../path main
+```text
+repo({action: "checkout", repository_path: "<canonical>",
+      branch: "feat/short-name", from_ref: "origin/main",
+      bind: true, task_id: "<task-id>"})
+binding_state({instance: "<self>"})
 ```
 
-A worktree that holds `main` makes the canonical repo go `detached HEAD` (or
-errors on `git switch main`) and breaks `cargo build --release` for operator
-and tooling. The fix is `cd <worktree> && git switch -c <dedicated-branch>`,
-but it is far cheaper to never take main in the first place.
-
-This applies to fleet agents (lead/dev/reviewer) and to the MCP `repo` tool —
-when calling `mcp__agend-terminal__repo action=checkout`, pass a non-main
-`branch` argument (the daemon honours it verbatim and will not derive a fresh
-branch for you).
+Work only in the worktree returned by `binding_state`. When the work is safely
+pushed or handed off, release it with `release_worktree({instance: "<self>"})`.
+The daemon rejects `main`/`master`, owns the marker and binding transaction, and
+preserves the canonical checkout for operator and tooling use.
 
 ## Daemon logging (#914)
 
@@ -363,7 +361,8 @@ agy (Antigravity CLI) loads project-scoped fleet MCP from
 `configure_agy` (`src/mcp_config.rs`). But agy **refuses any workspace folder
 whose path has a dot-prefixed (hidden) ancestor** — `addWorkspaceFolder` logs
 `is hidden: ignore uri` (`root.go:132`) and never reads `.agents/`. Every daemon
-workspace lives under `$AGEND_HOME` (`~/.agend-terminal`, dot-prefixed) → hidden
+workspace lives under `$AGEND_HOME` (normally `~/.agend`, or the legacy
+`~/.agend-terminal`; both are dot-prefixed) → hidden
 → no fleet `send`/`inbox`/`task` tools.
 
 **Mechanism (operator e2e-verified):** agy decides "hidden" from the **`$PWD`

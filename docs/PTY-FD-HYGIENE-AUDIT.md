@@ -1,5 +1,9 @@
 # PTY fd hygiene audit (t-20260704054906745324-67777-4)
 
+> **Historical audit snapshot:** Findings below were verified at audit time and
+> are retained as evidence. They are not a continuously maintained runtime
+> contract; re-check current dependencies and source before relying on them.
+
 Scope note on provenance: this task was framed as "herdr-inspired" — herdr is
 AGPL-3.0, so this is a clean-room audit of **our own dependency**
 (`portable-pty` 0.9.0, MIT) and **our own code**, not a reading of herdr's

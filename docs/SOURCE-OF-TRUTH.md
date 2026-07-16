@@ -8,13 +8,15 @@ reader of existing state must be classified here before merge.
 **Origin**: formalizes `workspace/fugu-0acdd8/agend-terminal-solutions.md`
 §3.2–§3.6 (source-of-truth dispersion). Motivation: dispersed truth is an
 empirical failure class — the 2026-07 branch pile-up root cause was a *stale
-field nobody knew was dead* (`worktree_source`, task `…67777-3`); the
+field nobody knew was dead* (`AgentConfig.worktree_source`, since removed;
+task `…67777-3`); the
 post-#994 `topics.json` single-source rule and the `binding.json` truth-source
 fix were each established case-by-case. This doc systematizes them.
 
-**Verified**: every `path:line` below was checked against `origin/main`
-@ `15ab267f` (2026-07-04). This is not written from memory. When you touch a
-listed entry point, update its line reference here.
+**Revalidated**: named stores, writers, and readers below were checked against
+`main@1d83b423` (2026-07-16). Function/type names are the stable anchors;
+`path:line` suffixes are navigation hints and may move as files are split. When
+you touch a listed entry point, update the anchor and its line hint here.
 
 ---
 
@@ -46,7 +48,7 @@ or otherwise irreversible action.
 | Task state | task event log (`task_events.jsonl`) | Source (append-only file) | rendered task list = projection |
 | Inbox state | inbox storage (`inbox/<name>.jsonl`) | Source (append-only file) | PTY-injected message = side-effect |
 | Decision state | decision store (`decisions/*.json`) | Source (file) | channel notification = side-effect |
-| Worktree lease/binding | `binding.json` | Source (file) | git worktree dir = materialized state; `worktree_source` = **dead field** |
+| Worktree lease/binding | `binding.json` | Source (file) | git worktree dir + `.agend-managed` = materialized identity evidence; removed `AgentConfig.worktree_source` is historical only |
 | Agent runtime state | in-memory `StateTracker` | Source (in-mem) | `snapshot.json` = fail-open projection |
 | Channel / topic binding | `topics.json` | Source (file) | `fleet.yaml` `topic_id` = fallback |
 | CI watch | `ci-watches/<hash>.json` sidecar | Source (file) | CI notification = side-effect |
@@ -57,16 +59,17 @@ or otherwise irreversible action.
 ## Per-state detail (read/write entry points)
 
 ### Instance declarative config — Source: `fleet.yaml`
-- **Write**: `src/fleet/persist.rs:18` `mutate_fleet_yaml()` (acquires lock
-  `:13`, then `atomic_write_yaml` `:5`); e.g. `add_instances_to_yaml:43`.
-- **Read**: `src/fleet/mod.rs:618` `FleetConfig::load()` → `load_arc:585` →
-  `load_uncached:621`.
-- **Projection**: `FLEET_CACHE` mtime/size cache (`src/fleet/mod.rs:585-599`),
-  invalidated on write via `invalidate_cache()` (`src/fleet/persist.rs:9`).
-- ⚠ **Write-entry not fully converged**: `src/quickstart.rs:814` writes
+- **Write**: `src/fleet/persist.rs:19` `mutate_fleet_yaml()` (acquires the
+  `acquire_lock` guard, then calls `atomic_write_yaml`); e.g.
+  `add_instances_to_yaml:67`.
+- **Read**: `src/fleet/mod.rs:665` `FleetConfig::load()` → `load_arc:632` →
+  `load_uncached:674`.
+- **Projection**: `FLEET_CACHE` mtime/size cache (`src/fleet/mod.rs:632-656`),
+  invalidated on write via `invalidate_cache()` (`src/fleet/persist.rs:10`).
+- ⚠ **Write-entry not fully converged**: `src/quickstart.rs:811` writes
   `fleet.yaml` with a raw `std::fs::write`, bypassing the lock + atomic path.
   This is confined to the interactive quickstart overwrite-confirm branch
-  (`:743-758`), not a runtime path. Tracked here as an exception, not a
+  (`:741-763`), not a runtime path. Tracked here as an exception, not a
   second truth source.
 
 ### Teams — Source: `fleet.yaml` `teams:` block
@@ -159,6 +162,13 @@ Daemon-only writer; the `agend-git` shim and hooks are read-only consumers
   created at `src/worktree.rs:81`. `src/worktree.rs:5-10,48` — the canonical
   layout means "production code reads `binding.source_repo` directly"
   (`binding.rs:371`).
+- **Destructive release admission**: `repo release` snapshots the live binding
+  and parses `.agend-managed`, then requires caller ownership plus exact
+  agent/branch/source/path identity before delegating to
+  `worktree_pool::release_full_exact` (`src/mcp/handlers/ci/release.rs`). A
+  missing, corrupt, changed, or stale marker/binding fails closed; dirty WIP is
+  preserved by the canonical release path. The marker is evidence that the
+  materialized directory belongs to the lease, not an independent truth store.
 
 ### Agent runtime state — Source: in-memory `StateTracker`
 `src/state/mod.rs:241` — per-agent state held under the agent core lock.
@@ -170,20 +180,26 @@ Daemon-only writer; the `agend-git` shim and hooks are read-only consumers
 ### snapshot — Projection (fail-open)
 `snapshot.json` is a read-optimized, file-based projection of `StateTracker`,
 overwritten every tick for lock-free reads
-(`src/daemon/per_tick/snapshot.rs:30-37`). It **is** read by deciders, so the
-fail-open rule is mandatory. Four current readers, all verified conservative:
+(`src/daemon/per_tick/snapshot.rs`). It **is** read by deciders, so the
+fail-open rule is mandatory. The production read surface is pinned by
+`tests/snapshot_failopen_invariant.rs`; its eight current readers are:
 
 | Decider | Read | Fallback on missing/stale snapshot |
 |---|---|---|
-| dispatch idle | `src/daemon/dispatch_idle/mod.rs:1041` `snapshot::load` | `target_is_working` false → still fires the (reversible) nudge (`:942-946`; test `no_snapshot_falls_back_to_firing_1516` `:3559-3575`) |
-| inbox inject | `src/inbox/notify.rs:326` `agent_state_of` | `None` → do not defer → inject directly (`:360-397`, `:423`) |
-| handoff timeout | `src/daemon/handoff_timeout_watchdog.rs:192,213` `agent_is_busy` | missing → not-busy → re-nudge (reversible) |
-| reply ledger | `src/reply_ledger.rs:374` `agent_is_busy` | missing → `emit_warn` + `NudgeAgent` (`:386-392`) — never an irreversible delete |
+| dispatch idle | `src/daemon/dispatch_idle/mod.rs` `snapshot::load` | `target_is_working` false → still fires a reversible nudge |
+| inbox inject/deferred drain | `src/inbox/notify.rs` `agent_state_of` / `agent_is_busy` | missing → not busy → deliver the already-authoritative inbox payload now (timing changes only) |
+| handoff timeout | `src/daemon/handoff_timeout_watchdog.rs` `agent_is_busy` | missing → not busy → reversible re-nudge |
+| reply ledger | `src/reply_ledger.rs` `agent_is_busy` | missing → `emit_warn` + `NudgeAgent` — never an irreversible delete |
+| stale-delivery reclaim | `src/inbox/storage.rs` `agent_is_busy` | missing → not busy → bounded reclaim/redelivery timing; no row is invented or dropped |
+| daemon startup | `src/daemon/mod.rs` `snapshot::load` | missing → omit a diagnostic log only |
+| status API | `src/api/handlers/query.rs` `snapshot::load` | missing → read-only empty status response |
+| bug report | `src/bugreport.rs` `snapshot::load` | missing → omit the read-only snapshot section |
 
 Field-level base: `src/snapshot.rs:21-38` (`#[serde(default)]`) +
 `src/snapshot.rs:44-46` `default_silent_secs() → i64::MAX` — a missing field
 reads as "very quiet," not "busy," steering every decider onto the
-continue-action (never silently-swallow) path. No snapshot reader performs an
+continue-action (never silently-swallow) path. The invariant above also blocks
+an unreviewed reader from joining this surface. No snapshot reader performs an
 irreversible mutation (worktree/branch deletion, etc.).
 
 ### Channel / topic binding — Source: `topics.json`
@@ -243,33 +259,29 @@ mirror. In `bind_topic_for_instance` (`src/channel/telegram/topic_registry.rs:17
 warns (`:182`) — it does not block the `Bound` result. **Lesson**: a mirror
 that can fail without failing the operation is a projection, not a source.
 
-### 2. `binding.json` vs `worktree_source` — a dead field (task `…67777-3`)
-The 2026-07 branch pile-up traced to `AgentConfig.worktree_source`, which is
-**always `None`** under the current architecture:
-- `src/worktree.rs:52-60` `source_repo_of` only recognizes the legacy
-  `{repo}/.worktrees/{name}` layout (`.any(|c| c == ".worktrees")`) and
-  returns `None` for the canonical `$AGEND_HOME/worktrees/…` layout. Its own
-  docstring (`:44-51`) says it is "retained for legacy-layout detection only."
-- `src/daemon/mod.rs:1676-1678` sets `worktree_source` once at spawn from the
-  working dir via `source_repo_of` → therefore always `None`.
-- `src/daemon/per_tick/worktree_registry_sweep.rs:54-71` feeds that field into
-  `worktree_cleanup::sweep_from_registry`, which uses it as the repo scope
-  (`src/worktree_cleanup.rs:229-232`).
+### 2. `binding.json` vs removed `AgentConfig.worktree_source` (task `…67777-3`)
+The 2026-07 branch pile-up traced to `AgentConfig.worktree_source`, a spawn-time
+cache derived from the legacy `{repo}/.worktrees/{name}` layout. It stayed empty
+for the canonical `$AGEND_HOME/worktrees/…` layout, so the registry-derived repo
+set was empty and cleanup silently did nothing.
 
-Chain: canonical layout → `source_repo_of` = `None` → `worktree_source` =
-`None` → the registry-derived repo set is empty. The real truth for a
-worktree's source repo is `binding.json.source_repo` (`src/binding.rs:371`),
-which production code reads directly (`src/worktree.rs:48`). **Lesson**: a
-field derived by a helper that no longer matches reality becomes a silent dead
-field — audit derivation helpers when the layout they assume changes.
+This is now a **resolved historical case**, not a live-field warning:
+`AgentConfig.worktree_source` and `source_repo_of` are gone. Runtime cleanup
+discovers repositories from live signed `binding.json` records via
+`binding::bound_source_repos`; `WorktreeRegistrySweepHandler` separately passes
+resolved fleet working directories to `worktree_cleanup::sweep_from_registry`
+(`src/daemon/per_tick/worktree_registry_sweep.rs`). The real source-repo truth
+remains `binding.json.source_repo`. **Lesson**: remove a dead projection after
+convergence; leaving it in the type makes future readers mistake it for truth.
 
 ### 3. snapshot fail-open (solutions.md §3.4)
 `snapshot.json` is not a useless cache — deciders read it (see the snapshot
 section). The correct rule is not "never decide on snapshot" but "a decision
 that reads snapshot must fail-open, be idempotent, and never cause irreversible
-damage from a stale/missing snapshot." All four current readers were verified
-against this rule. **Lesson**: a projection that feeds deciders is allowed, but
-only if every reader degrades safely.
+damage from a stale/missing snapshot." All production readers are enumerated
+and role-reviewed by `tests/snapshot_failopen_invariant.rs`. **Lesson**: a
+projection that feeds deciders is allowed, but only if every reader degrades
+safely.
 
 ### 4. pr_state `record_verdict` (#2603)
 `src/daemon/pr_state/mod.rs:917` `record_verdict` is the sole verdict writer of
@@ -293,7 +305,7 @@ state file. This is **partially enforced today**:
 - **Not yet enforced**: inbox and decisions have no equivalent invariant test;
   their `enqueue` / `save` APIs are the intended entry but are not
   test-guarded against direct file access.
-- **Known exception**: `src/quickstart.rs:814` writes `fleet.yaml` directly
+- **Known exception**: `src/quickstart.rs:811` writes `fleet.yaml` directly
   (interactive overwrite branch only).
 
 `agend-git` shim (§3.6): a separate binary that cannot link daemon internal

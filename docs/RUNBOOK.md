@@ -3,8 +3,9 @@
 # Incident Runbook
 
 Symptom-driven recovery guide. Every command here was run against a live
-deployment before being written down. `$AGEND_HOME` defaults to
-`~/.agend-terminal`; substitute yours throughout.
+deployment before being written down. Set `$AGEND_HOME` to the directory the
+daemon uses before running them. A fresh install normally uses `~/.agend`; if
+only the legacy `~/.agend-terminal` exists, the daemon keeps using it.
 
 **Find the log first.** Log files are date-stamped with the **UTC** date and
 rotate daily — `app.<YYYY-MM-DD>.log` when you run the TUI (`agend-terminal
@@ -14,7 +15,7 @@ write of that UTC day, so just after midnight UTC "today's" file may not
 exist yet. The robust way to grab the newest:
 
 ```sh
-ls -t ~/.agend-terminal/app.*.log ~/.agend-terminal/daemon.*.log 2>/dev/null | head -1
+ls -t "$AGEND_HOME"/app.*.log "$AGEND_HOME"/daemon.*.log 2>/dev/null | head -1
 ```
 
 Two other files you will meet repeatedly:
@@ -34,7 +35,7 @@ keep dying and respawning.
 **Diagnose**
 
 ```sh
-LOG=$(ls -t ~/.agend-terminal/app.*.log ~/.agend-terminal/daemon.*.log 2>/dev/null | head -1)
+LOG=$(ls -t "$AGEND_HOME"/app.*.log "$AGEND_HOME"/daemon.*.log 2>/dev/null | head -1)
 grep -E " ERROR " "$LOG" | tail -20
 agend-terminal doctor          # home dir / .env / fleet.yaml / live agents, all checked
 ```
@@ -79,7 +80,7 @@ the agent looks fine — or the agent really is wedged.
 
 ```sh
 # What changed, when, and what the screen looked like at that moment:
-grep '"agent":"<name>"' ~/.agend-terminal/state-transitions.jsonl | tail -5
+grep '"agent":"<name>"' "$AGEND_HOME/state-transitions.jsonl" | tail -5
 # Look at the live screen (read-only enough — detach by closing the viewer):
 agend-terminal attach <name>
 agend-terminal doctor
@@ -101,14 +102,19 @@ on a version older than those fixes, upgrade; on a current version, treat
 - Agent truly wedged → `agend-terminal kill <name>`; the daemon respawns it
   (within the crash budget, §1).
 - A worktree binding survived its agent (e.g. you deleted/recreated an
-  instance and `bind_self` now refuses): use `release_worktree(force:true)`
-  (#2548: absorbed the former standalone `force_release_worktree` tool; from
-  any connected agent or the lead — restricted to the worktree's own agent
-  or its team orchestrator).
-  **Warning: it deletes the worktree directory on disk — any uncommitted
-  WIP in `~/.agend-terminal/worktrees/<agent>/...` is gone.** Commit/push
-  first if the work matters. It refuses paths outside the daemon worktree
-  pool, and it is idempotent.
+  instance and `bind_self` now refuses): first inspect
+  `binding_state({instance:"<name>"})`. The worktree owner or its team
+  orchestrator may then use
+  `release_worktree({instance:"<name>", force:true, branch:"<exact-branch>"})`.
+  Force release requires the exact branch and refuses opaque, mismatched,
+  markerless, or ambiguous ownership instead of guessing.
+  Before removing a dirty worktree, the daemon snapshots recoverable tracked,
+  staged, and untracked WIP to a `refs/agend/recovery/...` ref and reports the
+  recovery ref. If that snapshot fails, or dirt exists inside a nested
+  submodule that the parent ref cannot preserve, release fails closed and
+  leaves the directory in place. Never bypass a refusal or remove the
+  directory manually; preserve/commit the reported WIP and retry through the
+  same daemon operation.
 
 ---
 
@@ -125,9 +131,9 @@ keeps running but refuses to advance the board rather than guess.
 **Diagnose**
 
 ```sh
-LOG=$(ls -t ~/.agend-terminal/app.*.log | head -1)
+LOG=$(ls -t "$AGEND_HOME"/app.*.log | head -1)
 grep "FAIL-CLOSED" "$LOG" | tail -3
-grep "task_replay_fail_closed" ~/.agend-terminal/event-log.jsonl
+grep "task_replay_fail_closed" "$AGEND_HOME/event-log.jsonl"
 ```
 
 The ERROR line spells out the contract:
@@ -147,7 +153,7 @@ you; the greppable ERROR repeats.)
   a bug: see `docs/COMPATIBILITY.md` tier (b).
 - Genuinely garbled lines (a torn write from a crash) are handled for you:
   at every startup the daemon quarantines non-JSON lines into
-  `~/.agend-terminal/task_events.recovery/<timestamp>/` and keeps the good
+  `$AGEND_HOME/task_events.recovery/<timestamp>/` and keeps the good
   ones. Check that directory to see what was pulled out. Valid-JSON
   future-version records are deliberately NOT auto-dropped (they belong to
   a newer daemon — upgrading restores them).
@@ -169,19 +175,19 @@ started with defaults (#2017): the backup is right next to the original as
 **Diagnose**
 
 ```sh
-ls ~/.agend-terminal/*.corrupt.* 2>/dev/null
-LOG=$(ls -t ~/.agend-terminal/app.*.log | head -1)
+ls "$AGEND_HOME"/*.corrupt.* 2>/dev/null
+LOG=$(ls -t "$AGEND_HOME"/app.*.log | head -1)
 grep "store load: corrupt JSON" "$LOG"
-grep "store_corrupt" ~/.agend-terminal/event-log.jsonl   # once per boot per file
+grep "store_corrupt" "$AGEND_HOME/event-log.jsonl"   # once per boot per file
 ```
 
 **Recover**
 
 ```sh
 agend-terminal stop
-cp ~/.agend-terminal/<store>.corrupt.<ts> /tmp/inspect.json   # look at it; often a truncated tail
+cp "$AGEND_HOME/<store>.corrupt.<ts>" /tmp/inspect.json   # look at it; often a truncated tail
 # fix the JSON (usually: delete the torn last record), then:
-mv /tmp/inspect.json ~/.agend-terminal/<store>
+mv /tmp/inspect.json "$AGEND_HOME/<store>"
 agend-terminal app
 ```
 
@@ -196,7 +202,7 @@ until you delete it.
 **Symptom**: an agent shows pending notifications, or Telegram messages
 stop arriving.
 
-Deferred messages live in `~/.agend-terminal/notification-queue/` (one
+Deferred messages live in `$AGEND_HOME/notification-queue/` (one
 `.jsonl` file per agent; line count = pending messages). They are held
 on purpose while the agent is mid-generation or you are mid-keystroke,
 and released by both the TUI loop and a daemon-side per-tick flusher
@@ -207,8 +213,8 @@ queue is retried, never misreported as empty.
 **Diagnose**
 
 ```sh
-wc -l ~/.agend-terminal/notification-queue/*.jsonl 2>/dev/null
-LOG=$(ls -t ~/.agend-terminal/app.*.log | head -1)
+wc -l "$AGEND_HOME"/notification-queue/*.jsonl 2>/dev/null
+LOG=$(ls -t "$AGEND_HOME"/app.*.log | head -1)
 grep "telegram notify failed" "$LOG" | tail -3   # network/token class
 grep "requeue FAILED" "$LOG"                     # disk class — a queued message was LOST
 ```
@@ -216,7 +222,7 @@ grep "requeue FAILED" "$LOG"                     # disk class — a queued messa
 **Recover**
 
 - `telegram notify failed` → it's the network or the bot token. Verify the
-  token env (`AGEND_TELEGRAM_BOT_TOKEN` in `~/.agend-terminal/.env`), the
+  token env (`AGEND_TELEGRAM_BOT_TOKEN` in `$AGEND_HOME/.env`), the
   bot's group membership/admin rights, and connectivity. The daemon keeps
   retrying; nothing to clean up locally.
 - Queue files growing without bound while agents are idle → attach to the

@@ -21,7 +21,7 @@ AgEnD Terminal provides a tmux-like terminal multiplexer that lets you manage, m
 agend-terminal app
 
 # Attach to an already-running daemon (attached mode — no new agents spawned)
-agend-terminal app --attach
+agend-terminal app
 ```
 
 ### Owned vs Attached Mode
@@ -93,8 +93,8 @@ To send a literal `Ctrl+B` to the agent, press `Ctrl+B Ctrl+B`.
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+B D` | Open decisions panel (read-only, scrollable) |
-| `Ctrl+B T` | Open task board (four-column kanban view) |
+| `Ctrl+B D` | Open decisions panel; inspect records and answer pending questions |
+| `Ctrl+B T` | Open task board (five-column kanban view) |
 | `Ctrl+B ?` | Open keyboard shortcut help |
 | `Ctrl+B ~` | Open floating shell (Esc to close and terminate) |
 | `Ctrl+B :` | Open command palette |
@@ -132,7 +132,7 @@ Press `Ctrl+B :` to open the command palette. Type a command and press Enter to 
 | `:broadcast` | `<msg>` | Broadcast to all agents |
 | `:status` | — | Log agent status (for debugging) |
 
-`backend` defaults to `claude`. Supported backends: claude, codex, gemini, opencode, kiro.
+`backend` defaults to `claude`. Supported presets: claude, kiro-cli, codex, opencode, antigravity-cli (`agy`), and grok.
 
 ---
 
@@ -140,7 +140,7 @@ Press `Ctrl+B :` to open the command palette. Type a command and press Enter to 
 
 Press `Ctrl+B T` to open the task board. The board offers four views, toggled with `Tab`:
 
-- **Tasks**: Four-column kanban (Backlog / Open / InProgress / Done)
+- **Tasks**: Five-column kanban (Todo / Working / Review / Blocked / Done)
 - **Fleet**: Agent list with status
 - **Status**: Agent health dashboard
 - **Monitor**: Real-time monitoring
@@ -165,7 +165,7 @@ Press `Ctrl+B T` to open the task board. The board offers four views, toggled wi
 
 ## Session Persistence
 
-The TUI automatically saves the current layout to `~/.agend-terminal/session.json`, including:
+The TUI automatically saves the current layout to `$AGEND_HOME/session.json`, including:
 
 - Tab names and order
 - Pane split tree structure and proportions

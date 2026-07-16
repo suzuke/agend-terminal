@@ -2,312 +2,177 @@
 
 # CI Watch — Automated PR CI Monitoring
 
+CI Watch polls a forge CI provider for a repository and branch, records PR/CI state, and delivers terminal results to subscribers and optional follow-up agents.
+
 ## Usage Scenarios
 
-> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+> **Target audience:** agent infrastructure. Agents normally receive an auto-armed feature-branch watch from task dispatch, or create one explicitly through MCP.
 
-**Automatic CI-to-reviewer handoff.** A dev agent finishes implementation and creates a PR. The daemon automatically attaches a CI watch to the PR's branch. When all GitHub Actions checks pass, the daemon sends a `[ci-pass]` notification to the reviewer agent, who begins the code review immediately — no human intervention required.
+- **CI-to-review handoff:** a branch task carries `next_after_ci`; when the current head passes, the daemon sends `[ci-ready-for-action]` to the named target or targets.
+- **Subscriber notification:** every subscribed agent receives informational pass/fail updates without multiplying provider polls.
+- **Conflict warning:** a mergeability transition to conflicting emits `[ci-conflict-detected]`.
+- **Post-merge validation:** an authorized exact-head watch can pin one immutable commit on `main`/`master` without allowing a later push to satisfy the original task.
 
-**Selective workflow monitoring.** A repository has multiple CI workflows, but only "build" and "test" are required for merge. The dev specifies `required_checks: ["build", "test"]` when the watch is created, so a flaky "windows-compat" workflow does not block the reviewer handoff.
+CI Watch evaluates all latest CI runs returned for the selected head. The MCP schema does not expose a `required_checks` filter.
 
-**Conflict early warning.** While monitoring CI, the daemon also checks the PR's mergeable status. If upstream changes cause a merge conflict, a `[ci-conflict-detected]` notification is sent to the dev agent immediately, allowing it to rebase before the reviewer wastes time on a conflicted branch.
-
-## Design Rationale
-
-In a multi-agent workflow, after a dev agent pushes a PR it typically needs to
-wait for CI to pass before notifying the reviewer. Without automation, the
-operator must manually watch GitHub Actions and ping the reviewer when the
-checks go green.
-
-CI Watch eliminates this manual step: when a PR is created, the daemon
-automatically attaches a CI monitor. It polls the CI provider periodically and,
-upon completion, notifies all subscribers. The optional `next_after_ci`
-parameter chains the next agent automatically — for example, dispatching the
-reviewer as soon as CI passes.
-
-```
-dev pushes PR → daemon attaches ci watch →
-CI finishes  → daemon notifies reviewer →
-reviewer starts review automatically
-```
-
----
-
-## Usage
-
-### Subscribe to CI Monitoring
-
-Via the MCP tool `ci action=watch`:
+## Create a Feature-Branch Watch
 
 ```json
 {
   "tool": "ci",
   "action": "watch",
-  "repo": "owner/repo",
+  "repository": "owner/repo",
   "branch": "feat/my-feature",
-  "next_after_ci": "reviewer"
+  "next_after_ci": ["reviewer-a", "reviewer-b"],
+  "task_id": "t-...",
+  "interval_secs": 60
 }
 ```
 
 | Parameter | Required | Description |
-|-----------|----------|-------------|
-| `repo` | Yes | GitHub repository (`owner/repo` format) |
-| `branch` | Yes | Branch to monitor |
-| `next_after_ci` | No | Agent to notify automatically when CI passes |
-| `interval_secs` | No | Polling interval (default 60 seconds) |
-| `task_id` | No | Associated task board ID |
-| `required_checks` | No | Only track these workflow names (ignore others) |
+|---|---|---|
+| `repository` | Conditional | Forge repository slug. `watch` can derive it from the caller's binding; otherwise supply it explicitly. |
+| `branch` | No | Branch to watch; defaults to `main`, but a generic protected-branch watch is rejected. |
+| `interval_secs` | No | Baseline polling interval; defaults to 60 seconds. |
+| `next_after_ci` | No | One instance or an array to receive `[ci-ready-for-action]` after success. |
+| `task_id` | No | Durable back-link copied into the CI handoff. |
+| `review_class` | No | `single` or `dual` review threshold for PR readiness. |
+| `ci_provider` | No | Provider override, normally `github` or `bitbucket_cloud`; `bitbucket_server` is rejected. |
+| `ci_provider_url` | No | Custom provider base URL; credentials are sent only to trusted hosts. |
+| `head_sha` | Protected only | Full 40/64-hex SHA for an exact-head protected-ref watch. Ignored on feature branches. |
 
-### Unsubscribe
+The argument name is `repository`, not `repo`.
+
+Calling `watch` again for the same key is append-idempotent: it preserves poll state and other subscribers while adding the caller if needed. It also refreshes the requested interval/provider settings and clears a prior explicit-unwatch tombstone.
+
+## Unwatch and Status
 
 ```json
 {
   "tool": "ci",
   "action": "unwatch",
-  "repo": "owner/repo",
+  "repository": "owner/repo",
   "branch": "feat/my-feature"
 }
 ```
 
-### Query Status
+`unwatch` requires explicit `repository`. It removes only the caller's subscription, resolves that caller's matching CI-handoff obligation, and preserves co-subscribers. When the final subscriber is removed, the daemon keeps an opt-out tombstone instead of deleting the file, preventing automatic re-arm until the PR becomes terminal or someone explicitly calls `watch` again.
 
 ```json
 {
   "tool": "ci",
-  "action": "status"
+  "action": "status",
+  "repository": "owner/repo",
+  "branch": "feat/my-feature"
 }
 ```
 
-Returns all active CI watches and their latest poll results.
+Both status filters are optional. The result exposes persisted watch and latest-poll diagnostics.
 
-### Auto-Attach
+Releasing a worktree does not implicitly unsubscribe CI Watch. Watch lifetime is managed by terminal state, TTL, explicit `unwatch`, and its own cleanup rules.
 
-When a lead dispatches a task (`kind=task`) via `send` with both `branch` and
-`next_after_ci`, the daemon automatically creates a CI watch for that branch.
-The dev does not need to call `ci action=watch` manually.
+## Dispatch Auto-Arm
 
----
+An actual `send` task dispatch with a feature `branch` auto-arms CI Watch as part of the dispatch lease. `next_after_ci` is optional: when absent, the subscriber still receives informational CI results, but no extra handoff target is inferred from names or roles.
 
-## How It Works
-
-### File Structure
-
-Each CI watch maps to a JSON file under `$AGEND_HOME/ci-watches/`. The
-filename is the SHA-256 hash of `{repo}:{branch}` (64 hex chars + `.json`),
-avoiding path issues from `/` in repo names.
-
-### Polling Loop
-
-The daemon runs a continuous background polling loop:
-
-1. **Scan** the `ci-watches/` directory for all `.json` files.
-2. **Throttle**: compare `last_polled_at` + `effective_interval_secs` to decide whether to poll.
-3. **Query the CI provider API** for the latest workflow run status.
-4. **Compare** with the previously recorded `last_run_id` / `head_sha`.
-5. **Notify**: if a new terminal result (success / failure / cancelled) is detected, notify all subscribers.
-6. **Persist**: write the updated state back to the watch JSON.
-
-### Adaptive Polling Interval
-
-To avoid exceeding GitHub API rate limits, the daemon adjusts polling intervals
-based on remaining quota:
-
-| Remaining Quota | Zone | Multiplier |
-|----------------|------|------------|
-| > 50% | Healthy | x1 (configured interval) |
-| 10%–50% | Cautious | x2 |
-| <= 10% | Critical | x4 |
-
-For example, a 60-second watch in the Critical zone polls every 240 seconds.
-The upper bound is 4x the configured value. If the API does not return rate
-limit headers (GitLab / Bitbucket), the original interval is used.
-
-### Notification Deduplication
-
-CI Watch uses a two-layer dedup mechanism:
-
-**Layer 1: Run Selection**
-`select_runs_to_notify` compares the latest workflow run against the recorded
-`last_run_id` and selects only new terminal runs.
-
-**Layer 2: SHA Dedup**
-`dedupe_notifications_by_head_sha` ensures the same `head_sha` conclusion
-(success / failure) is notified only once. This handles the `gh run rerun --failed`
-scenario where the run_id stays the same but the conclusion changes.
-
-### Multi-Subscriber Support
-
-A single CI watch can have multiple subscribers. Polling runs once; notifications
-are sent to each subscriber's inbox individually. Each notification carries a
-supersede token — if the inbox already contains an older notification for the
-same repo@branch, the new one replaces it (preventing notification pileup).
-
-### Zombie Subscriber Filtering
-
-If a subscriber has been removed from the fleet (agent deleted), the daemon
-skips that subscriber during notification. The check requires the subscriber to
-be absent from both the agent registry and fleet.yaml instances.
-
----
-
-## PR Conflict Detection
-
-CI Watch also monitors the PR's mergeable status.
-
-### At Watch Creation
-
-`ci action=watch` immediately queries the PR's mergeable state. If it detects
-`CONFLICTING`, a `[ci-conflict-detected]` notification is sent to all
-subscribers.
-
-### During Polling
-
-The polling loop periodically rechecks the mergeable state. If the status
-transitions from non-conflicting to conflicting, a conflict notification is
-sent.
-
----
-
-## Stall Detection
-
-If a CI watch is consecutively skipped due to rate limiting (unable to poll),
-the daemon tracks the skip count. After 3 consecutive skips, a
-`[ci-watch-stalled]` notification is sent to all subscribers, including:
-
-- When the stall started
-- Estimated next poll time (rate limit reset time)
-- Configuration advice (how to obtain a higher API quota)
-
-When polling resumes normally, a `[ci-watch-resumed]` notification is sent.
-
----
-
-## Discharge Ledger (Duplicate-Notification Suppression)
-
-A red CI run on a busy branch can produce several `[ci-fail]` notifications
-for the exact same underlying failure (a poll re-emits, a stale row gets
-reclaimed and re-nudged, `poll-reminder` re-pings on an unread-count bump).
-Once an agent has actually triaged a failure — investigated it, told the
-lead it's a known flaky job, or is already fixing it — repeated notifications
-for that SAME failure are noise, not signal.
-
-### Discharging a failure
-
-Report the triage via the SAME `send(kind=update` or `kind=report)` call you'd
-already make, with an added `triaged` field:
-
-```
-send(kind=report, ..., triaged={head: "<commit-sha>", job: "Coverage", reason: "known flaky, reran"})
+```json
+{
+  "tool": "send",
+  "instance": "dev",
+  "request_kind": "task",
+  "task_id": "t-...",
+  "branch": "feat/my-feature",
+  "next_after_ci": "reviewer",
+  "message": "Implement the task and open a PR"
+}
 ```
 
-- `head` and `job` must both be present (or both omitted) — a half-signature
-  is rejected, never silently ignored.
-- `reason` is optional free-text context.
-- This is a field on an existing `send` call, not a separate tool call — the
-  discharge ledger's design deliberately avoids adding a new mandatory
-  action agents have to remember to invoke (a prior mechanism with its own
-  dedicated "mark done" action measured effectively 0% real-world usage).
+`bind_self` and `repo action=checkout bind:true` used as self-claim/recovery operations do not silently arm a new watch. Call `ci action=watch` explicitly if those flows need monitoring.
 
-The daemon persists the discharge to a disk-backed ledger (survives a daemon
-restart — an in-memory-only ledger would replay every already-triaged
-failure as unactioned on every restart, which is worse than no mechanism at
-all).
+## Protected-Ref Exact-Head Watch
 
-### What gets suppressed
+Generic watches on protected refs such as `main` and `master` remain rejected. The narrow post-merge exception pins one exact immutable GitHub SHA:
 
-A discharge is keyed by `(head_sha, job_name)`:
+```json
+{
+  "tool": "ci",
+  "action": "watch",
+  "repository": "owner/repo",
+  "branch": "main",
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "task_id": "t-...",
+  "next_after_ci": "release-owner"
+}
+```
 
-- **Same head, same job** → suppressed (the exact failure you triaged).
-- **Same head, different job** → still notifies (a different check failing
-  is a different problem, even on the same commit).
-- **New head (you pushed a fix, or CI re-ran on a new commit)** → notifies
-  again automatically. There is no separate expiry/cleanup step: the ledger
-  is keyed against the branch's CURRENT head, so once the head moves on, an
-  old discharge simply stops matching.
+All of these conditions are required:
 
-### Suppression is fail-open
+1. `head_sha` is a full 40- or 64-hex commit ID, not an abbreviation.
+2. `task_id` is non-empty.
+3. `next_after_ci` is explicit and non-empty.
+4. The provider is GitHub.
+5. The caller is an operator or the orchestrator of every target's team.
 
-If the daemon can't establish BOTH sides of the signature with confidence —
-the message isn't a recognized ci-fail shape, the branch's current head is
-unknown, the ledger can't be read — it always falls through to notifying.
-Nothing is ever silently dropped on an inability to confirm a discharge;
-worst case is one extra (harmless) notification, never a missed one.
+The sidecar key includes repository, branch, and SHA. The poller queries runs for that SHA only, so a newer `main` run cannot falsely complete the pinned episode.
 
----
+## Polling and Result Aggregation
 
-## TTL and Auto-Cleanup
+Each watch is persisted below `$AGEND_HOME/ci-watches/`. The daemon groups due watches by repository where possible, polls once, then fans results out to subscribers.
 
-### Absolute TTL
+For each head, it selects the latest attempt per workflow and derives an aggregate terminal result. Pending runs keep the watch active. A head change resets feature-branch run tracking; notifications are deduplicated by immutable head and terminal episode.
 
-Each watch has an `expires_at` set at creation (default 72 hours). The watch is
-unconditionally removed after this time.
+The configured interval is adapted to provider quota:
 
-### Inactivity TTL
+| Remaining quota | Effective interval |
+|---|---:|
+| More than 50% | 1× baseline |
+| 10%–50% | 2× baseline |
+| 10% or less | 4× baseline |
 
-If `last_terminal_seen_at` (the last time a terminal result was observed)
-exceeds the configured hours, the watch is removed due to inactivity.
+The multiplier is capped at 4×. Providers without usable quota headers keep the baseline interval.
 
-### Startup Sweep
+After three consecutive repository-level rate-limit/provider skips, subscribers receive `[ci-watch-stalled]`. A later successful poll emits `[ci-watch-resumed]`.
 
-The daemon runs a one-time startup sweep to clean up watches that expired while
-the daemon was stopped.
+## Subscribers and Delivery
 
-### Protected Branch Filtering
+- Multiple instances share one watch and one poll stream.
+- Delivery skips a subscriber that is absent from both the runtime registry and fleet roster.
+- Newer branch notifications supersede older pending rows for the same delivery class where applicable.
+- `next_after_ci` produces the action handoff; ordinary subscribers receive informational CI events.
+- A terminal exact-head watch is removed after its pinned run reaches a terminal result.
 
-Watches on protected branches (`main` / `master`) are automatically removed,
-as these are not PR branches.
+The `send` field `triaged:{head,job,reason?}` currently records a durable triage ledger entry. It requires both `head` and `job`. That ledger is an audit/data-layer surface today; it does not yet promise that every duplicate notification path will be suppressed.
 
----
+## Conflict Detection
 
-## CI Provider Support
+On watch creation and later polling, the daemon examines PR mergeability when the provider supports it. A transition to `CONFLICTING` emits `[ci-conflict-detected]` to subscribers. Unknown mergeability fails safe and does not fabricate a conflict result.
 
-| Provider | Detection | API |
-|----------|-----------|-----|
-| GitHub | Default, or remote URL contains `github` | GitHub Actions API |
-| GitLab | Remote URL contains `gitlab` | GitLab CI/CD API |
-| Bitbucket | Remote URL contains `bitbucket` | Bitbucket Pipelines API |
+## Lifetime and Cleanup
 
-The provider is auto-detected from the repo URL, or can be specified manually
-via the `ci_provider` parameter.
+- A subscription refreshes its 72-hour expiry.
+- Terminal inactivity is subject to the same 72-hour cleanup window.
+- A seven-day absolute age cap prevents continuously refreshed leaked watches.
+- Startup sweep removes watches that expired while the daemon was down.
+- Terminal PR/CI paths may remove their watch earlier.
+- Explicit `unwatch` removes only the caller; removing the final subscriber leaves a non-polled opt-out tombstone until terminal cleanup, re-watch, or its tombstone age backstop.
 
-### GitHub Token
+## Provider and Credential Rules
 
-GitHub API requires authentication to avoid strict rate limits. The daemon uses
-`GITHUB_TOKEN` or `GH_TOKEN` environment variables. Without a token, CI Watch
-still works but is more likely to trigger rate limit stalls. Authenticated
-requests get 5,000 requests/hour (vs. 60 unauthenticated).
+Provider detection supports GitHub, GitLab, and Bitbucket Cloud. Explicit `bitbucket_server` is currently rejected. Exact-head protected watches are GitHub-only.
 
----
+For GitHub, token discovery is:
 
-## FAQ
+1. `GITHUB_TOKEN`;
+2. authenticated `gh` CLI (`gh auth status`, then `gh auth token`);
+3. unauthenticated access.
 
-### Q: What does CI Watch monitor?
+`GH_TOKEN` is not part of this discovery chain. Discovery is cached once per daemon process, so restart the daemon after `gh auth login` or token rotation. Without a token, `watch` returns a `setup_warning`; GitHub's usual unauthenticated allowance is about 60 requests/hour versus 5,000/hour when authenticated.
 
-It monitors GitHub Actions workflow runs (or the equivalent on GitLab CI /
-Bitbucket Pipelines). When all checks complete, it sends a notification based
-on the aggregate conclusion (success / failure).
+Custom `ci_provider_url` credentials are sent only to trusted HTTPS SaaS hosts, loopback, or hosts explicitly allowed by `AGEND_CI_TRUSTED_HOSTS`. An untrusted custom host is polled without the forge token and produces a warning rather than receiving credentials.
 
-### Q: Can I monitor only specific workflows?
+## Source Pointers
 
-Yes. Use the `required_checks` parameter to specify workflow names. Only those
-workflows are considered for pass/fail judgment; others (e.g., a flaky Windows
-CI) are ignored.
-
-### Q: Does CI Watch auto-cancel?
-
-Yes. A watch is automatically removed when:
-1. It exceeds the absolute TTL (default 72 hours).
-2. It exceeds the inactivity TTL.
-3. The PR reaches a terminal state (merged / closed) and conditions are met.
-
-### Q: Can multiple agents subscribe to the same watch?
-
-Yes. Multiple `ci action=watch` calls for the same repo + branch with different
-agent names add each agent to the subscriber list. Polling runs once;
-notifications go out separately.
-
-### Q: What about rate limits?
-
-The adaptive polling interval slows down automatically. If rate limiting
-persists, a stall notification is sent. Setting the `GITHUB_TOKEN` environment
-variable is recommended — authenticated requests have a much higher rate limit.
+- `src/mcp/handlers/ci/watch.rs` — watch/unwatch validation, persistence, subscriber removal, and opt-out tombstone
+- `src/daemon/ci_watch/` — polling, providers, aggregation, delivery, stall detection, and cleanup
+- `src/github_token.rs` — GitHub credential discovery and cache
+- `src/mcp/handlers/dispatch_hook/` — task-dispatch auto-arm

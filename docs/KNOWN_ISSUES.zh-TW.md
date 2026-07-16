@@ -37,28 +37,10 @@
   `pane_snapshot(to_file=true)` 會把完整畫面寫進 `$AGEND_HOME/captures/`；一旦
   restart/replace，唯一的證據就沒了。
 
-## Deferred — 等待 operator 擷取資料或決策
-
-### 真實 PTY corpus（5 個 backend × 2 種情境）尚未完成
-- **Status：** Needs-operator-input
-- **Why：** 穩健的狀態偵測工作需要橫跨各支援 backend 的真實終端擷取資料，作為驗證
-  關卡；目前這份 corpus 還不完整。
-- **Revisit when：** operator 擷取完剩下的 corpus。
-- **Refs：** #1014
-
-### Claude Code「Yes, proceed」modal——預設游標位置尚未驗證
-- **Status：** Needs-operator-input
-- **Why：** 確認該 modal 的預設游標位置需要一份真實擷取資料。
-- **Revisit when：** operator 擷取了該 modal。
-- **Refs：** #1054
-
-### Operator Mode（active / away / sleep / dnd + delegation）
-- **Status：** Needs-operator-input
-- **Why：** 在開始實作之前，需要先凍結 operator 政策並做分階段拆解。
-- **Revisit when：** operator 凍結政策且工作完成分階段拆解。
-- **Refs：** #1339
-
 <!--
+#1014、#1054 與 #1339 的 acceptance work 已完成，issue 於 2026-06-01
+關閉，因此已從 deferred 清單移除；勿重新加入。
+
 #1521 Schedule fire-strategy — 已出貨（2026-07 自本清單移除）。
 `FireStrategy::{Always, UntilSuccess}` 定義於 `src/schedules.rs`，
 由 `src/daemon/cron_tick.rs` 執行（linked-task gate + 當日 suppress）。

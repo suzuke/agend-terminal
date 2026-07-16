@@ -44,29 +44,10 @@ Status legend: **Upstream-blocker** (fix lives in another project) ·
   wedged instance writes the full pane to `$AGEND_HOME/captures/`; a
   restart/replace destroys the only evidence.
 
-## Deferred — awaiting operator capture or decision
-
-### Real PTY corpus (5 backends × 2 scenarios) incomplete
-- **Status:** Needs-operator-input
-- **Why:** robust state-detection work needs real terminal captures across the
-  supported backends as a validation gate; the corpus isn't complete yet.
-- **Revisit when:** the operator captures the remaining corpus.
-- **Refs:** #1014
-
-### Claude Code "Yes, proceed" modal — default cursor position unverified
-- **Status:** Needs-operator-input
-- **Why:** confirming the modal's default cursor position needs a real capture.
-- **Revisit when:** the operator captures the modal.
-- **Refs:** #1054
-
-### Operator Mode (active / away / sleep / dnd + delegation)
-- **Status:** Needs-operator-input
-- **Why:** needs an operator-policy freeze and a phased breakdown before
-  implementation can start.
-- **Revisit when:** the operator freezes the policy and the work is phased.
-- **Refs:** #1339
-
 <!--
+#1014, #1054, and #1339 were removed after their acceptance work completed
+and the issues closed on 2026-06-01. Do not re-add them as deferred.
+
 #1521 Schedule fire-strategy — SHIPPED (removed from this list 2026-07).
 `FireStrategy::{Always, UntilSuccess}` lives in `src/schedules.rs` and is
 enforced by `src/daemon/cron_tick.rs` (linked-task gate + per-day suppress).

@@ -1,309 +1,178 @@
 [English](FEATURE-ci-watch.md)
 
-# CI Watch — 自動監控 PR 的 CI 狀態
+# CI Watch — 自動 PR CI 監看
+
+CI Watch 會針對 repository 與 branch 輪詢 forge CI provider、記錄 PR／CI 狀態，並把終態結果送給 subscribers 與可選的後續 agents。
 
 ## 使用情境
 
-> **適用對象：** Agent 基礎設施——agent 透過 MCP tools 使用，operator 通常不直接操作。
+> **目標讀者：** agent 基礎設施。Agent 通常由任務派送自動取得 feature-branch watch，或透過 MCP 明確建立。
 
-**自動 CI 到 reviewer 的交接。** Dev agent 完成實作並建立 PR。Daemon 自動在該 PR 的分支上掛載 CI watch。當所有 GitHub Actions check 通過後，daemon 向 reviewer agent 發送 `[ci-pass]` 通知，reviewer 立即開始 code review——完全不需要人工介入。
+- **CI 到 review handoff：** branch task 帶有 `next_after_ci`；目前 head 通過後，daemon 會把 `[ci-ready-for-action]` 送給指定的一個或多個 target。
+- **Subscriber notification：** 每位 subscriber 都會收到 informational pass/fail update，但不會增加 provider polling 次數。
+- **衝突預警：** mergeability 轉為 conflicting 時會送出 `[ci-conflict-detected]`。
+- **Merge 後驗證：** 經授權的 exact-head watch 可鎖定 `main`／`master` 上某個 immutable commit，後來的 push 不會誤完成原本的任務。
 
-**選擇性 workflow 監控。** 一個 repo 有多個 CI workflow，但只有 "build" 和 "test" 是合併的必要條件。Dev 在建立 watch 時指定 `required_checks: ["build", "test"]`，這樣不穩定的 "windows-compat" workflow 不會阻擋 reviewer 的交接。
+CI Watch 會評估 selected head 所回傳的所有最新 CI runs。MCP schema 沒有公開 `required_checks` filter。
 
-**衝突早期預警。** 在監控 CI 的同時，daemon 也會檢查 PR 的 mergeable 狀態。如果上游變更導致合併衝突，daemon 會立即向 dev agent 發送 `[ci-conflict-detected]` 通知，讓 dev 可以在 reviewer 浪費時間審查衝突分支之前先完成 rebase。
-
-## 設計初衷
-
-在多 agent 協作的工作流中，dev agent push 完 PR 之後，通常需要等 CI 跑完
-才能通知 reviewer 開始 review。如果沒有自動化機制，operator 必須手動盯著
-GitHub Actions，等綠燈亮了再去戳 reviewer。
-
-CI Watch 解決這個問題：dev 建立 PR 時自動掛上 CI 監控，daemon 定期輪詢
-GitHub（或 GitLab / Bitbucket）的 CI 狀態。CI 通過時自動通知訂閱者，並且
-可以透過 `next_after_ci` 參數自動串接下一個 agent——例如直接通知 reviewer
-開始工作。
-
-整個流程零人工介入：
-
-```
-dev push PR → daemon 自動掛 ci watch →
-CI 跑完 → daemon 通知 reviewer →
-reviewer 自動開始 review
-```
-
----
-
-## 使用方式
-
-### 訂閱 CI 監控
-
-透過 MCP 工具 `ci action=watch`：
+## 建立 Feature-Branch Watch
 
 ```json
 {
   "tool": "ci",
   "action": "watch",
-  "repo": "owner/repo",
+  "repository": "owner/repo",
   "branch": "feat/my-feature",
-  "next_after_ci": "reviewer"
+  "next_after_ci": ["reviewer-a", "reviewer-b"],
+  "task_id": "t-...",
+  "interval_secs": 60
 }
 ```
 
-參數說明：
-
 | 參數 | 必填 | 說明 |
-|------|------|------|
-| `repo` | 是 | GitHub 倉庫（`owner/repo` 格式） |
-| `branch` | 是 | 要監控的分支 |
-| `next_after_ci` | 否 | CI 通過後自動通知的 agent 名稱 |
-| `interval_secs` | 否 | 輪詢間隔（預設 60 秒） |
-| `task_id` | 否 | 關聯的 task board ID |
-| `required_checks` | 否 | 只追蹤這些 workflow 名稱（其餘忽略） |
+|---|---|---|
+| `repository` | 視情況 | Forge repository slug。`watch` 可從 caller binding 推導；否則必須明確提供。 |
+| `branch` | 否 | 要監看的分支；預設 `main`，但一般 protected-branch watch 會被拒絕。 |
+| `interval_secs` | 否 | 基準 polling interval；預設 60 秒。 |
+| `next_after_ci` | 否 | CI 成功後接收 `[ci-ready-for-action]` 的單一 instance 或 array。 |
+| `task_id` | 否 | 複製到 CI handoff 的 durable back-link。 |
+| `review_class` | 否 | PR readiness 的 `single` 或 `dual` review threshold。 |
+| `ci_provider` | 否 | Provider override，通常為 `github` 或 `bitbucket_cloud`；`bitbucket_server` 會被拒絕。 |
+| `ci_provider_url` | 否 | 自訂 provider base URL；credentials 只會送到 trusted host。 |
+| `head_sha` | 僅 protected ref | Exact-head protected-ref watch 的完整 40/64-hex SHA。Feature branch 會忽略。 |
 
-### 取消訂閱
+參數名稱是 `repository`，不是 `repo`。
+
+對相同 key 再次呼叫 `watch` 具 append-idempotency：會保留 poll state 與其他 subscribers，並在需要時加入 caller。它也會更新指定的 interval/provider 設定，並清除先前 explicit-unwatch tombstone。
+
+## Unwatch 與 Status
 
 ```json
 {
   "tool": "ci",
   "action": "unwatch",
-  "repo": "owner/repo",
+  "repository": "owner/repo",
   "branch": "feat/my-feature"
 }
 ```
 
-### 查詢狀態
+`unwatch` 必須明確提供 `repository`。它只移除 caller 的 subscription、resolve 該 caller 相符的 CI-handoff obligation，並保留 co-subscribers。移除最後一位 subscriber 時，daemon 會保留 opt-out tombstone 而不是刪檔，避免自動 re-arm；直到 PR 進入終態或有人明確再次呼叫 `watch`。
 
 ```json
 {
   "tool": "ci",
-  "action": "status"
+  "action": "status",
+  "repository": "owner/repo",
+  "branch": "feat/my-feature"
 }
 ```
 
-回傳所有活躍的 CI watch 及其最近一次輪詢結果。
+兩個 status filter 都是可選的。結果會顯示持久化 watch 與最新 polling diagnostics。
 
-### 自動掛載
+釋放 worktree 不會隱式取消 CI Watch。Watch 的生命週期由 terminal state、TTL、明確 `unwatch` 與自身 cleanup 規則管理。
 
-在 lead 使用 `send` 工具分派任務（`kind=task`）時，如果指定了 `branch` 和
-`next_after_ci`，daemon 會自動為該分支掛上 CI watch。dev 不需要手動呼叫
-`ci action=watch`。
+## Dispatch 自動啟用
 
----
+真正帶有 feature `branch` 的 `send` task dispatch，會在建立 dispatch lease 時自動啟用 CI Watch。`next_after_ci` 可省略：省略時 subscriber 仍收到 informational CI result，但系統不會依名稱或 role 猜測額外 handoff target。
 
-## 運作原理
-
-### 檔案結構
-
-每個 CI watch 對應 `$AGEND_HOME/ci-watches/` 目錄下的一個 JSON 檔案。
-檔名是 `{repo}:{branch}` 的 SHA-256 雜湊值（64 hex chars + `.json`），
-避免 repo 名稱中的 `/` 造成路徑問題。
-
-### 輪詢機制
-
-daemon 在背景持續執行 CI watch 輪詢迴圈：
-
-1. **掃描 ci-watches 目錄**：讀取所有 `.json` 檔案
-2. **節流判斷**：根據 `last_polled_at` + `effective_interval_secs` 決定是否該輪詢
-3. **呼叫 CI Provider API**：查詢最新的 workflow run 狀態
-4. **狀態比較**：與上次記錄的 `last_run_id` / `head_sha` 比較
-5. **通知發送**：如果有新的終態結果（success / failure / cancelled），通知所有訂閱者
-6. **狀態持久化**：將最新狀態寫回 watch JSON
-
-### 自適應輪詢間隔
-
-為了避免超過 GitHub API rate limit，daemon 會根據剩餘配額自動調整輪詢間隔：
-
-| 剩餘配額 | 區間 | 乘數 |
-|---------|------|------|
-| > 50% | Healthy | ×1（使用設定的 interval） |
-| 10%–50% | Cautious | ×2 |
-| ≤ 10% | Critical | ×4 |
-
-例如設定 60 秒的 watch，在 Critical 區間會變成 240 秒輪詢一次。
-上限為設定值的 4 倍，不會更長。
-
-如果 API 沒有回傳 rate limit header（GitLab / Bitbucket），保持原始間隔。
-
-### 通知去重
-
-CI Watch 使用兩層去重機制，避免同一個事件重複通知：
-
-**第一層：Run 選取**
-`select_runs_to_notify` 比較最新的 workflow run 與已記錄的 `last_run_id`，
-只選取新的終態 run。
-
-**第二層：SHA 去重**
-`dedupe_notifications_by_head_sha` 確保同一個 `head_sha` 的結論
-（success / failure）只通知一次。處理 `gh run rerun --failed` 的情境：
-run_id 不變但 conclusion 改變。
-
-### 多訂閱者支援
-
-一個 CI watch 可以有多個訂閱者。輪詢只執行一次，通知分別送到每個
-訂閱者的 inbox。每個通知都帶有 supersede token，如果 inbox 中已有
-同一個 repo@branch 的舊通知，新通知會取代舊的（避免通知堆積）。
-
-### Zombie 訂閱者過濾
-
-如果某個訂閱者已經從 fleet 中移除（agent 被刪除），daemon 會在通知時
-跳過該訂閱者，避免向不存在的 inbox 寫入。判斷條件是同時不在 agent
-registry 和 fleet.yaml 的 instances 中。
-
----
-
-## PR 衝突偵測
-
-CI Watch 同時監控 PR 的 mergeable 狀態。
-
-### Watch 建立時
-
-`ci action=watch` 時會立即查詢 PR 的 mergeable 狀態。如果偵測到
-`CONFLICTING`，會向所有訂閱者送出 `[ci-conflict-detected]` 通知。
-
-### 定期檢查
-
-輪詢過程中也會定期重新檢查 mergeable 狀態。如果狀態從非衝突變成
-衝突（transition detection），同樣送出衝突通知。
-
----
-
-## 停滯偵測
-
-如果 CI watch 連續被 rate limit 跳過（無法輪詢），daemon 會追蹤
-連續跳過次數。超過 3 次後，向所有訂閱者送出 `[ci-watch-stalled]`
-通知，包含：
-
-- 停滯開始時間
-- 預估下次輪詢時間（rate limit reset 時間）
-- 設定建議（如何取得更高的 API 配額）
-
-當輪詢恢復正常時，送出 `[ci-watch-resumed]` 通知。
-
----
-
-## Discharge Ledger（重複通知抑制）
-
-同一個底層失敗，在活躍分支上可能因為輪詢重新發出、stale 訊息被 reclaim 重新
-nudge、poll-reminder 因 unread 數量變化再次提醒等原因，產生多則 `[ci-fail]`
-通知。一旦某個 agent 已經實際處理過這則失敗——查過原因、跟 lead 說這是已知的
-不穩定 job、或正在修——同一件事的重複通知就是雜訊，不是訊號。
-
-### 標記已處理
-
-在你原本就會發出的 `send(kind=update` 或 `kind=report)` 呼叫上，加一個
-`triaged` 欄位即可：
-
-```
-send(kind=report, ..., triaged={head: "<commit-sha>", job: "Coverage", reason: "known flaky, reran"})
+```json
+{
+  "tool": "send",
+  "instance": "dev",
+  "request_kind": "task",
+  "task_id": "t-...",
+  "branch": "feat/my-feature",
+  "next_after_ci": "reviewer",
+  "message": "Implement the task and open a PR"
+}
 ```
 
-- `head` 與 `job` 必須同時提供（或同時省略）——只給一半的簽名會被拒絕，
-  不會被悄悄忽略。
-- `reason` 是選填的自由文字備註。
-- 這是既有 `send` 呼叫上的一個欄位，不是獨立的工具呼叫——discharge ledger
-  的設計刻意避免新增一個 agent 得另外記得呼叫的必要動作（先前一個機制帶了
-  獨立的「標記完成」動作，實測使用率趨近於 0%）。
+用於 self-claim／recovery 的 `bind_self` 與 `repo action=checkout bind:true` 不會默默啟用新 watch。這些流程需要監看時，請明確呼叫 `ci action=watch`。
 
-Daemon 會把這次處理紀錄持久化到磁碟上的 ledger（daemon 重啟後仍然存在——
-純記憶體的 ledger 會讓重啟後所有已處理的失敗瞬間變回「未處理」，比完全沒有
-這個機制還糟）。
+## Protected Ref Exact-Head Watch
 
-### 什麼會被抑制
+一般 `main`、`master` 等 protected ref watch 仍會被拒絕。狹窄的 post-merge 例外會鎖定單一 immutable GitHub SHA：
 
-Discharge 以 `(head_sha, job_name)` 為鍵：
+```json
+{
+  "tool": "ci",
+  "action": "watch",
+  "repository": "owner/repo",
+  "branch": "main",
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "task_id": "t-...",
+  "next_after_ci": "release-owner"
+}
+```
 
-- **同一個 head、同一個 job** → 抑制（你剛處理過的那個確切失敗）。
-- **同一個 head、不同 job** → 照常通知（同一個 commit 上另一個 check 失敗，
-  是不同的問題）。
-- **新的 head（你推了修復，或 CI 在新的 commit 上重跑）** → 自動恢復通知。
-  不需要額外的過期/清理步驟：ledger 是對照分支「目前」的 head 查表，
-  head 一旦前進，舊的 discharge 紀錄自然就不再匹配。
+以下條件全部必須成立：
 
-### 抑制邏輯是 fail-open
+1. `head_sha` 是完整 40 或 64 hex commit ID，不是縮寫。
+2. `task_id` 非空。
+3. `next_after_ci` 明確且非空。
+4. Provider 是 GitHub。
+5. Caller 是 operator，或每個 target 所屬 team 的 orchestrator。
 
-只要 daemon 無法同時確立簽名的兩端——訊息不是可辨識的 ci-fail 格式、
-分支目前的 head 未知、ledger 讀取失敗——一律照常通知。沒有任何情況會因為
-「無法確認是否已處理」而悄悄漏發；最壞情況只是多一則（無害的）通知，
-絕不會漏掉一則。
+Sidecar key 包含 repository、branch 與 SHA。Poller 只查詢該 SHA 的 runs，因此較新的 `main` run 不會誤完成 pinned episode。
 
----
+## Polling 與結果聚合
 
-## TTL 與自動清理
+每個 watch 會持久化在 `$AGEND_HOME/ci-watches/` 下。Daemon 會盡可能依 repository 將到期 watches 分組、輪詢一次，再把結果 fan out 給 subscribers。
 
-CI Watch 有兩種過期機制：
+每個 head 會選取各 workflow 最新 attempt，並推導 aggregate terminal result。Pending run 會讓 watch 繼續存在。Feature branch head 改變時會重設 run tracking；notification 依 immutable head 與 terminal episode 去重。
 
-### 絕對 TTL
+設定的 interval 會依 provider quota 調整：
 
-每個 watch 建立時設定 `expires_at`（預設 72 小時後）。超過此時間
-無條件移除。
+| 剩餘 quota | 有效 interval |
+|---|---:|
+| 超過 50% | 基準的 1× |
+| 10%–50% | 基準的 2× |
+| 10% 以下 | 基準的 4× |
 
-### 不活動 TTL
+Multiplier 上限為 4×。沒有可用 quota header 的 provider 維持基準 interval。
 
-如果 `last_terminal_seen_at`（最後一次看到終態結果的時間）超過
-設定的小時數，watch 會因不活動而被移除。
+Repository-level rate-limit/provider skip 連續三次後，subscriber 會收到 `[ci-watch-stalled]`。之後輪詢成功時會送出 `[ci-watch-resumed]`。
 
-### 啟動清掃
+## Subscribers 與投遞
 
-daemon 啟動時會執行一次 startup sweep，清理上次 daemon 停止期間
-過期的 watch。
+- 多個 instance 共用一個 watch 與一組 poll stream。
+- Subscriber 同時不存在於 runtime registry 與 fleet roster 時會跳過投遞。
+- 適用時，同一 delivery class 較新的 branch notification 會 supersede 較舊 pending row。
+- `next_after_ci` 產生 action handoff；一般 subscriber 收到 informational CI event。
+- Terminal exact-head watch 在 pinned run 到達終態後移除。
 
-### 保護分支過濾
+`send` 的 `triaged:{head,job,reason?}` 目前會記錄 durable triage ledger entry，且 `head` 與 `job` 必須同時提供。該 ledger 現階段是 audit／data-layer surface；尚未承諾所有重複 notification path 都會被 suppression。
 
-對 `main` / `master` 等保護分支的 watch 會被自動移除（保護分支
-不應該有 CI watch，因為它們不是 PR 分支）。
+## 衝突偵測
 
----
+建立 watch 與之後 polling 時，若 provider 支援，daemon 會檢查 PR mergeability。狀態轉為 `CONFLICTING` 時會對 subscribers 送出 `[ci-conflict-detected]`。Mergeability 未知時會 fail safe，不會捏造 conflict result。
 
-## CI Provider 支援
+## 生命週期與 Cleanup
 
-CI Watch 支援三種 CI 提供者：
+- Subscription 會更新 72 小時 expiry。
+- Terminal inactivity 也使用相同 72 小時 cleanup window。
+- 七天 absolute age cap 防止持續被更新的 leaked watch。
+- Startup sweep 會移除 daemon 停止期間已過期的 watch。
+- Terminal PR／CI path 可能更早移除 watch。
+- 明確 `unwatch` 只移除 caller；最後一位 subscriber 被移除後會留下不 polling 的 opt-out tombstone，直到 terminal cleanup、re-watch 或 tombstone age backstop。
 
-| Provider | 偵測方式 | API |
-|----------|---------|-----|
-| GitHub | 預設，或 remote URL 含 `github` | GitHub Actions API |
-| GitLab | Remote URL 含 `gitlab` | GitLab CI/CD API |
-| Bitbucket | Remote URL 含 `bitbucket` | Bitbucket Pipelines API |
+## Provider 與 Credential 規則
 
-Provider 透過 repo URL 自動偵測，也可以在 watch 時透過 `ci_provider`
-參數手動指定。
+Provider detection 支援 GitHub、GitLab 與 Bitbucket Cloud。明確指定 `bitbucket_server` 目前會被拒絕。Exact-head protected watch 僅支援 GitHub。
 
-### GitHub Token
+GitHub token discovery 順序是：
 
-GitHub API 需要認證才能避免嚴格的 rate limit。daemon 使用環境變數
-`GITHUB_TOKEN` 或 `GH_TOKEN`。如果沒有設定，CI Watch 仍然可以
-運作但會更容易觸發 rate limit 停滯。
+1. `GITHUB_TOKEN`；
+2. 已驗證的 `gh` CLI（先 `gh auth status`，再 `gh auth token`）；
+3. unauthenticated access。
 
----
+`GH_TOKEN` 不在此 discovery chain。Discovery 在每個 daemon process 只快取一次，因此 `gh auth login` 或 token rotation 後請重啟 daemon。沒有 token 時，`watch` 會回傳 `setup_warning`；GitHub 一般 unauthenticated 額度約為每小時 60 次，authenticated 則為每小時 5,000 次。
 
-## 常見問題
+自訂 `ci_provider_url` 的 credentials 只會送到 trusted HTTPS SaaS host、loopback，或由 `AGEND_CI_TRUSTED_HOSTS` 明確允許的 host。未受信任的 custom host 會以不帶 forge token 的方式 polling 並產生 warning，而不會收到 credentials。
 
-### Q: CI Watch 監控的是什麼？
+## 原始碼位置
 
-監控 GitHub Actions 的 workflow run（或 GitLab CI / Bitbucket Pipelines
-的等價物）。當所有 check 都完成時，根據聚合結論（success / failure）
-發送通知。
-
-### Q: 可以只監控特定的 workflow 嗎？
-
-可以。使用 `required_checks` 參數指定 workflow 名稱列表。只有這些
-workflow 會被納入通過/失敗判斷，其他的（例如不穩定的 Windows CI）
-會被忽略。
-
-### Q: CI Watch 會自動取消嗎？
-
-會。三種情況下 watch 會自動移除：
-1. 超過絕對 TTL（預設 72 小時）
-2. 超過不活動 TTL
-3. PR 進入終態（merged / closed）且滿足條件
-
-### Q: 多個 agent 可以訂閱同一個 watch 嗎？
-
-可以。多次呼叫 `ci action=watch` 指定同一個 repo + branch 但不同的
-agent 名稱，該 agent 會被加入訂閱者清單。輪詢只執行一次，通知分別
-送到每個訂閱者。
-
-### Q: rate limit 怎麼辦？
-
-daemon 的自適應輪詢間隔會自動降速。如果持續被限速，會送出 stall
-通知。建議設定 `GITHUB_TOKEN` 環境變數，authenticated 請求的 rate
-limit 是每小時 5,000 次（vs 未認證的 60 次）。
+- `src/mcp/handlers/ci/watch.rs` — watch／unwatch validation、persistence、subscriber removal 與 opt-out tombstone
+- `src/daemon/ci_watch/` — polling、providers、aggregation、delivery、stall detection 與 cleanup
+- `src/github_token.rs` — GitHub credential discovery 與 cache
+- `src/mcp/handlers/dispatch_hook/` — task-dispatch auto-arm

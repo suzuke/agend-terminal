@@ -6,7 +6,7 @@
 
 > **適用對象：** Operator 和 agent 皆適用。
 
-**診斷卡住的 agent。** 儀表板上某個 agent 的健康狀態顯示「hung」。你 `attach` 到它的終端看發生了什麼——也許它在等待權限確認，或陷入迴圈。你可以直接打字讓它脫困，或 `kill` 後讓 daemon 自動重啟。
+**診斷卡住的 agent。** 儀表板上某個 agent 的健康狀態顯示「hung」。你 `attach` 到它的終端看發生了什麼——也許它在等待權限確認，或陷入迴圈。你可以直接打字讓它脫困；只有確定要停止並移除該 process 時才使用 `kill`。
 
 **腳本自動化。** CI pipeline 需要向正在運行的 agent 發送指令。透過 `inject`，你可以從 shell script 送文字到 agent 的 PTY——不需要互動式終端 session。Agent 會像 operator 親手打字一樣處理它。
 
@@ -214,12 +214,9 @@ agend-terminal kill dev
 6. 作為備用措施，同時呼叫 PTY handle 的 `kill()` 方法
 7. 記錄事件到 event log
 
-### 自動重啟
+### Restart 語意
 
-`kill` 之後，daemon 的健康監控系統可能會自動重啟 agent（取決於
-目前的 crash 計數和退避狀態）。如果你想永久停止一個 agent，需要
-從 fleet.yaml 中移除它然後重啟 daemon，或使用 `agend-terminal stop`
-停止整個 daemon。
+operator／API 的 `kill` 會被分類為 signal kill，而不是 crash，因此不會 auto-respawn。Crash supervision 是另一條路徑。要讓 agent 回來時請明確 start／respawn；若不希望它出現在之後的 fleet start，請從 fleet.yaml 移除。
 
 ### 外部 Agent
 
@@ -228,14 +225,13 @@ registry 中移除。外部 agent 的實際程序不由 daemon 管理。
 
 ---
 
-## connect — 連接外部 Agent
+## connect — 執行外部 Agent
 
 ```
 agend-terminal connect <name> --backend <backend> [--working-dir <path>] [-- extra-args...]
 ```
 
-將一個本地運行的 agent 連接到 daemon，讓它可以使用 daemon 提供的
-MCP 工具和通訊功能。
+先註冊 external instance，再於目前終端 spawn 選定 backend 並載入 fleet MCP 設定；CLI 等待它退出後解除註冊。這不是接管已經在執行的 process。
 
 ### 使用方式
 
@@ -244,14 +240,14 @@ MCP 工具和通訊功能。
 agend-terminal connect my-agent --backend claude --working-dir ~/Projects/foo
 
 # 傳遞額外參數給 backend
-agend-terminal connect my-agent --backend gemini -- --model pro
+agend-terminal connect my-agent --backend grok -- --model fast
 ```
 
 ### 與 fleet.yaml 的區別
 
 - fleet.yaml 中的 agent 是 **managed**（由 daemon spawn 和管理生命週期）
-- `connect` 加入的是 **external**（daemon 只提供工具，不管理生命週期）
-- external agent 沒有自動重啟、健康監控等功能
+- `connect` 加入的是 **external**：CLI process 負責 spawn／wait／deregister，daemon 提供註冊與工具
+- external agent 沒有 daemon-owned PTY、auto-restart 或 managed health supervision
 
 ---
 
@@ -312,9 +308,8 @@ agend-terminal list --detailed
 # 嘗試 attach 看看它卡在哪裡
 agend-terminal attach dev
 
-# 如果需要強制重啟
+# 如果需要停止；restart 必須明確執行
 agend-terminal kill dev
-# daemon 會自動重啟 agent
 ```
 
 ---
@@ -334,11 +329,9 @@ agend-terminal kill dev
 `tool_use` 狀態，inject 的文字會進入 PTY buffer 但 agent 可能不會
 立即處理。
 
-### Q: kill 之後 agent 自動重啟了，怎麼阻止？
+### Q: `kill` 之後會自動重啟嗎？
 
-daemon 的健康監控預設會自動重啟 crash 的 agent。如果要永久停用一個
-agent，從 fleet.yaml 中移除它並重啟 daemon。或者直接 `agend-terminal stop`
-停止整個 daemon。
+不會。明確 signal kill 不會被當成可 respawn 的 crash。需要時請明確 restart；若要讓它不再出現在之後的 fleet start，請從 fleet.yaml 移除；要停止整個 daemon 則使用 `agend-terminal stop`。
 
 ### Q: 可以同時 attach 多個 agent 嗎？
 

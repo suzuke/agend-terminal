@@ -2,7 +2,7 @@
 
 # Channels — Telegram / Discord Integration
 
-The Channels system lets operators talk to agents from Telegram or Discord without opening a terminal. Each agent maps to its own Telegram forum topic, and messages are mirrored bidirectionally.
+The Channels system lets operators talk to agents from Telegram or the feature-gated Discord adapter without opening a terminal. Telegram maps each agent to a forum topic; Discord routes gateway messages through its configured channel mappings.
 
 ## Usage Scenarios
 
@@ -33,14 +33,14 @@ Add the channel config to `fleet.yaml`:
 
 ```yaml
 channel:
-  telegram:
-    bot_token: "123456:ABC-DEF..."
-    group_id: -1001234567890
-    user_allowlist:
-      - 12345678    # your Telegram user ID
+  type: telegram
+  bot_token_env: AGEND_TELEGRAM_BOT_TOKEN
+  group_id: -1001234567890
+  user_allowlist:
+    - 12345678    # your Telegram user ID
 ```
 
-- `bot_token`: obtained from @BotFather
+- `bot_token_env`: environment variable containing the token obtained from @BotFather
 - `group_id`: Telegram supergroup ID (must have Topics enabled)
 - `user_allowlist`: Telegram user IDs allowed to interact with agents
 
@@ -80,7 +80,7 @@ All channel implementations share one trait interface:
 | `create_topic` | Create a new forum topic |
 | `poll_event` | Poll for incoming events |
 
-The core code only talks to the trait. It never calls Telegram APIs directly. If we add Discord or Slack later, it only needs to implement this trait.
+The core code only talks to the trait. It never calls Telegram APIs directly. Telegram and the feature-gated Discord adapter both implement this surface.
 
 ### Binding
 
@@ -269,12 +269,11 @@ Neither case requires operator intervention.
 
 ## Multi-Channel Support
 
-Telegram is currently supported, with Discord as a reserved interface (feature gate). The architecture is designed to support using multiple channels at once:
-
-- Each channel registers independently in the global registry
-- Each agent can bind to a different channel
-- Inbound events are merged uniformly by the dispatcher
-- Outbound messages are routed to the correct adapter based on the binding's channel kind
+`fleet.yaml` currently selects one tagged `channel:` configuration (`type:
+telegram` or `type: discord`). The runtime registry is channel-agnostic, but the
+schema does not configure several adapters simultaneously. Discord requires the
+`discord` Cargo feature and `AGEND_DISCORD_BOT_TOKEN` (or the configured
+`bot_token_env`).
 
 ---
 
@@ -296,13 +295,11 @@ Topic cleanup that mutates the chat requires the bot to have `can_manage_topics`
 
 ## Discord Notes
 
-The docs mention Discord because the channel abstraction is not Telegram-only in spirit. The current implementation centers on Telegram, but the abstractions are designed so another platform can be added by implementing the same trait surface.
-
-If a future Discord backend is added, the main expectations are the same:
-
-- each agent needs a stable addressable conversation target
-- messages must round-trip without losing thread identity
-- registry state must be persisted so the daemon can recover after restart
+Discord is implemented behind the `discord` feature gate. Bootstrap starts the
+live gateway, maps authorized `MESSAGE_CREATE` events into the inbox, and
+registers the adapter for outbound operations. It does not yet implement
+Telegram's `fleet_binding` / `UxEventSink` path, so fleet-wide UX-event mirroring
+remains Telegram-only.
 
 ---
 
@@ -384,11 +381,11 @@ If the problem persists, check whether multiple daemon instances are running at 
 
 ## Source Pointers
 
-- `src/channel/telegram.rs`: Telegram channel implementation
+- `src/channel/telegram/mod.rs`: Telegram channel implementation
 - `src/bootstrap/doctor_topics.rs`: topic classification and cleanup logic
 - `src/cli.rs`: `doctor topics` CLI flow
 - `src/main.rs`: subcommand routing and entry points
-- `src/fleet.rs`: fleet and instance metadata, including topic fields
+- `src/fleet/mod.rs`: fleet and instance metadata, including topic fields
 
 ---
 

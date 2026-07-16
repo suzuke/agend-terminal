@@ -7,6 +7,10 @@ supervisor tick + MCP handler load.
 **Status**: ACTIVE — all daemon code paths must observe this ordering.
 **Maintained**: alongside `tests/heartbeat_pair_atomicity_audit.rs`
 invariant test (Sprint 23 P0 anti-bypass).
+**Revalidated**: named lock and writer/reader anchors against
+`main@1d83b423` (2026-07-16). The conceptual levels below start at Level 0;
+`sync_audit`'s runtime tier numbers start at 1. Do not compare the numeric
+labels without that offset.
 
 **Scope** (Sprint 23 P0 r2 F4 clarification): locks acquired in the
 daemon's runtime hot path (supervisor tick + MCP handler dispatch + agent
@@ -22,7 +26,7 @@ addresses.
 
 ```
 Level 0 (root):
-  agent_registry            — global HashMap<String, AgentHandle>
+  agent_registry            — global HashMap<InstanceId, AgentHandle>
                               (`crate::agent::AgentRegistry`)
   external_registry         — global HashMap<String, ExternalAgentHandle>
                               (`crate::agent::ExternalRegistry`)
@@ -45,10 +49,12 @@ Level 2 (storage / transactional):
                               (`crate::task_events::append`); anti-bypass
                               invariant `tests/task_events_invariant.rs`
                               enforces single-writer (Sprint 24 P0 PR #236)
-  decision_store_lock       — file lock around `<home>/decisions.jsonl`
+  decision_store_lock       — per-decision file lock beside
+                              `<home>/decisions/<id>.json`
                               (`crate::decisions::with_decision_lock`)
-  inbox_jsonl_lock          — implicit via atomic temp+rename
-                              (`crate::inbox::enqueue` / `drain`)
+  inbox_jsonl_lock          — per-agent flock around append/fsync or
+                              rewrite of `<home>/inbox/<agent>.jsonl`
+                              (`crate::inbox::storage::with_inbox_lock`)
 
 Level 3 (leaf-level):
   heartbeat_pair (per-agent) — `Mutex<HeartbeatPair>`
@@ -117,14 +123,19 @@ only as instantaneous-release sinks → no cycle possible → deadlock-free.
 
 ## Why heartbeat_pair is leaf-level (Sprint 23 P0 F6)
 
-The `heartbeat_pair` lock guards `(heartbeat_at_ms, waiting_on_since_ms,
-last_input_at_ms)` — a 3-field `Copy` struct — for consistent snapshot
-read across the supervisor + main-loop + MCP heartbeat write race window
-(Sprint 20 DAEMON.md §1 F6). Fields:
+The `heartbeat_pair` lock began as the three timing fields below and now also
+owns per-turn reply-routing/settlement fields. `snapshot_for` clones the whole
+`HeartbeatPair` under one brief guard, preserving a consistent view across the
+per-tick + MCP heartbeat/write race window (Sprint 20 DAEMON.md §1 F6). Timing
+fields:
 
 - `heartbeat_at_ms: u64` — last MCP tool call timestamp (Sprint 23 P0 PR #235)
 - `waiting_on_since_ms: Option<u64>` — when current `waiting_on` started (Sprint 23 P0 PR #235)
 - `last_input_at_ms: u64` — last daemon→agent input delivery timestamp (Sprint 24 P1 PR #243)
+
+The additional `reply_to_*`, mirror, pending-turn, and settled-group fields are
+listed on `HeartbeatPair` in `src/daemon/heartbeat_pair.rs`; they follow the
+same leaf-lock rule and are intentionally not duplicated here.
 
 Per dev-reviewer-2 threat model synthesis, the lock-around-pair design is
 preferred over `AtomicU64` per-field because correctness-corruption
@@ -133,24 +144,26 @@ exposes inconsistent-pair window.
 
 Leaf-level placement means:
 
-- **MCP heartbeat write site** (`src/mcp/handlers.rs:62` implicit
-  heartbeat): acquire pair lock, update field, release lock, THEN
+- **MCP heartbeat write site** (`src/mcp/handlers/mod.rs`, implicit
+  heartbeat in `handle_tool`): acquire pair lock, update field, release lock, THEN
   `save_metadata` for crash-recovery persistence. Disk I/O happens
   outside the lock.
 
-- **MCP `set_waiting_on` write site** (`src/mcp/handlers.rs:1078` arm):
+- **MCP `set_waiting_on` write site**
+  (`src/mcp/handlers/instance_metadata.rs::handle_set_waiting_on`):
   acquire pair lock, update both fields, release lock, THEN
   `save_metadata_batch` for atomic disk write. Two-stage: in-memory
   pair-update first, disk persist second. Sprint 22 P2a `save_metadata_batch`
   helper (PR #233, my author) handles disk-side atomicity; pair lock
   handles in-memory atomicity.
 
-- **Supervisor tick read site** (`src/daemon/supervisor.rs::tick`):
+- **Hang-detection read site**
+  (`src/daemon/per_tick/hang_detection.rs::HangDetectionHandler::run`):
   acquire pair lock for pair snapshot, release lock immediately, then
-  use snapshot for stale-decay decision. The `core` lock is held during
-  the tick body; pair lock acquired AFTER core lock is dropped (Rule 2
-  — no Level-1-while-acquiring-Level-3 violation; in this code we
-  release core lock between operations).
+  use the copied snapshot for `check_hang`. This acquisition occurs while the
+  per-agent core lock is held, which is the permitted top-down Level 1 →
+  Level 3 order. The pair guard is released inside `snapshot_for` before
+  `check_hang` continues, so no leaf lock escapes the call.
 
 If a future contributor needs to hold the pair lock while acquiring
 another lock, they MUST first refactor to acquire the other lock first
@@ -170,9 +183,10 @@ enforces:
    or `heartbeat_pair::pair_for(...).lock()` call. Pre-pair writes that
    skip the in-memory update are flagged.
 
-2. **EXEMPTED_LEGACY_FILES** anti-growth contract (Sprint 22 P0 pattern
-   from `tests/legacy_outbound_path_audit.rs`): empty by intent. New
-   entries forbidden without explicit dispatch scope.
+2. **EXEMPTED_LEGACY_FILES** anti-growth contract: empty by intent. New
+   entries are forbidden without explicit dispatch scope. The pattern came
+   from a retired Sprint 22 outbound-path audit; the live enforcement is in
+   `tests/heartbeat_pair_atomicity_audit.rs`.
 
 ---
 
@@ -199,7 +213,7 @@ enforces:
 - **F1 heartbeat-spam cross-check (Sprint 24 P2 PR #249)**: the
   `check_hang` classifier cross-checks `heartbeat_at_ms` freshness
   against PTY silence. "Heartbeat fresh" means the agent recently called
-  MCP tools (implicit heartbeat via `notify_agent` hook). "PTY silent"
+  MCP tools (implicit heartbeat in the MCP dispatch chokepoint). "PTY silent"
   means no operator-visible output was produced. If heartbeat is fresh
   but PTY is silent past the hang threshold, the classifier overrides
   `IdleLong` → `Hung` — catching prompt-injected agents that suppress
@@ -217,9 +231,10 @@ enforces:
 - Sprint 20 Track B audit: `docs/codebase-review-2026-04-27/DAEMON.md`
   §1 F6 (this race window) + F7 (the disk-side companion, fixed Sprint 22
   P2a PR #233 via `save_metadata_batch`).
-- Sprint 22 P2a: `tests/legacy_outbound_path_audit.rs` — EXEMPTED_LEGACY_FILES
-  anti-growth contract template.
-- Sprint 21 PR #226: protocol §10.5 Rule 5 spawn site rationale (parallel
+- Sprint 22 P2a: the now-retired outbound-path audit established the
+  EXEMPTED_LEGACY_FILES anti-growth template retained by the live heartbeat
+  atomicity audit.
+- Sprint 21 PR #226: protocol §12.5 spawn site rationale (parallel
   doc-doc convention; this lock-ordering doc is the Sprint 23 analogue
   for shared-state primitives).
 - Sprint 24 P0: PR #236 (`task_events.jsonl` storage substrate), PR #239

@@ -79,22 +79,22 @@ channel:
 
 ---
 
-## 1. Discord（部分實作 🔸 — Gateway + Channel trait 骨架已完成）
+## 1. Discord（已實作 ✅ — `discord` feature gate）
 
 ### 現有實作狀態
 
-**已完成（`src/channel/discord.rs`）：**
+**已完成（`src/channel/discord/`）：**
 - `DiscordChannel` struct + `DiscordState` + `DiscordBindingPayload`
 - `ChannelCapabilities` 設定（markdown dialect、mention style）
 - `twilight-http::Client` 整合
-- 基本的 `send()` / `poll_event()` Channel trait 骨架
-- 測試基礎建設（`new_for_test` / `new_for_test_authorized` / `new_for_test_with_http`）
+- outbound send/edit/delete 與 binding lifecycle
+- live Gateway WebSocket、`MESSAGE_CREATE` mapping、heartbeat/reconnect supervisor
+- daemon/app bootstrap 與 inbound `poll_event()` → agent inbox dispatcher
+- allowlist fail-closed 與 inbound/outbound/reconnect 測試矩陣
 
-**未完成：**
-- Gateway WebSocket 連接 loop（shard lifecycle）
-- `MESSAGE_CREATE` → `ChannelEvent` 轉換
-- Thread 自動建立
-- `fleet_binding` 支援
+**目前邊界：** Discord 尚未提供 Telegram 的 `UxEventSink`／`fleet_binding`
+等價功能；fleet activity mirror 仍是 Telegram-only。編譯時也必須啟用
+`discord` feature。
 
 **Feature gate:** `discord` feature in Cargo.toml → 啟用 `twilight-gateway` 0.16 + `twilight-http` 0.16 + `twilight-model` 0.17
 
@@ -144,25 +144,12 @@ wss://gateway.discord.gg/?v=10&encoding=json
 
 選 twilight 而非 serenity 的原因：模組化、低層控制、不帶 cache 開銷。
 
-### 實作計劃（剩餘工作）
+### Runtime wiring
 
-```rust
-// 需要加的：gateway reader task
-async fn run_gateway(token: &str, intents: Intents, tx: mpsc::Sender<ChannelEvent>) {
-    let (shard, mut events) = Shard::new(ShardId::ONE, token.to_string(), intents);
-    shard.start().await?;
-    while let Some(event) = events.next().await {
-        match event {
-            Event::MessageCreate(msg) => {
-                // filter by allowed_channels + allowed_users
-                // convert to ChannelEvent::Inbound
-                tx.send(ChannelEvent::Inbound { ... })?;
-            }
-            _ => {} // ignore other events
-        }
-    }
-}
-```
+`channel::discord::init_from_config` resolves the token, starts the gateway
+supervisor, and returns a registered `DiscordChannel`. The bootstrap layer then
+starts the inbound dispatcher, attaches the agent registry when ready, and routes
+authorized gateway events into the target agent inbox.
 
 ### Rate Limit
 
@@ -177,10 +164,8 @@ channel:
   type: discord
   bot_token_env: AGEND_DISCORD_BOT_TOKEN
   guild_id: 123456789012345678        # Discord server (guild) snowflake ID
-  allowed_channels:                   # channel ID allowlist
-    - "987654321098765432"
-  # allowed_users:                    # optional user snowflake allowlist
-  #   - "111222333444555666"
+  user_allowlist:                     # Discord user snowflakes; omit/empty = deny all
+    - 111222333444555666
 ```
 
 ---
@@ -436,7 +421,7 @@ channel:
 | 平台 | 連接方式 | 需要 Public URL | 狀態 | 優先級 |
 |------|---------|----------------|------|--------|
 | **Telegram** | Long Polling | ❌ | ✅ 已完成（13 個 rs 文件） | — |
-| **Discord** | Gateway WebSocket | ❌ | 🔸 骨架完成，需補 gateway loop | P1 |
+| **Discord** | Gateway WebSocket | ❌ | ✅ 已完成（feature-gated；無 fleet activity sink） | — |
 | **Slack** | Socket Mode WS | ❌ | 🆕 未開始 | P1 |
 | **Feishu/Lark** | WebSocket 長連接 | ❌ | 🆕 未開始 | P2 |
 | LINE | Webhook | ⚠️ 需要 | 🆕 未開始 | P3 |

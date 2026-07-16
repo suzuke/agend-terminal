@@ -211,9 +211,9 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
 - No `unwrap()` / `expect()` in non-test code. Use `?` with `anyhow::Context` for error annotation.
 - No `println!` / `eprintln!` in production code paths. Use `tracing::{info, warn, error, debug}`.
 - Keep module responsibilities tight:
-  - `src/agent_ops.rs` — shared helpers (messaging, fleet mutation, branch validation) called by both the daemon API and the MCP handler path. Drop new duplication here rather than inlining it in two places; `tests/no_dual_track_drift.rs` enforces no drift between `src/agent_ops.rs` and `src/mcp/handlers.rs`.
+  - `src/agent_ops.rs` — shared helpers (messaging, fleet mutation, branch validation) called by both the daemon API and the MCP handler path. Drop new duplication here rather than inlining it in two places; `tests/no_dual_track_drift.rs` enforces no drift between `src/agent_ops.rs` and the `src/mcp/handlers/` tree.
   - `src/api/` — daemon JSON control API (wire protocol + per-method handlers under `src/api/handlers/`).
-  - `src/mcp/` — MCP surface for agents. `handlers.rs` proxies most tool calls to the daemon API; `start_instance` is handled inline there (no separate `ops.rs` since Task #12).
+  - `src/mcp/` — MCP surface for agents. `handlers/mod.rs` and its submodules proxy most tool calls to the daemon API; `start_instance` is handled inline there (no separate `ops.rs` since Task #12).
   - `src/<area>.rs` — domain logic (agent, fleet, telegram, health, schedules, …).
 
 ## Documentation

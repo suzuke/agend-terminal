@@ -14,7 +14,7 @@
 
 ## Motivation
 
-AgEnD integrates multiple AI coding backends (Claude Code, Kiro CLI, Codex, OpenCode, Gemini, Agy), each with its own installation path, CLI arguments, and environment variables. The first question every new user faces is: "What do I have installed, and how do I get it running?"
+AgEnD integrates six AI coding backends (Claude Code, Kiro CLI, Codex, OpenCode, Antigravity CLI, and Grok Build), each with its own installation path, CLI arguments, and environment variables. The first question every new user faces is: "What do I have installed, and how do I get it running?"
 
 `quickstart` answers that question. It auto-detects installed backends, walks you through Telegram notification setup, and generates a ready-to-use `fleet.yaml`. The whole process takes roughly 2-5 minutes.
 
@@ -36,8 +36,8 @@ On launch, quickstart scans your `$PATH` for known backend executables:
 | Kiro CLI | `kiro-cli` |
 | Codex | `codex` |
 | OpenCode | `opencode` |
-| Gemini | `gemini` |
 | Agy (Antigravity) | `agy` |
+| Grok Build | `grok` |
 
 Detected backends are shown with their version number. If multiple are found, you choose a default. If only one is found, it is auto-selected.
 
@@ -90,7 +90,7 @@ Maximum 3 retries before suggesting to skip.
 
 #### 2d. Save the Token
 
-After successful group detection, quickstart writes `AGEND_BOT_TOKEN` to `~/.env`.
+After successful group detection, quickstart writes `AGEND_TELEGRAM_BOT_TOKEN` to `$AGEND_HOME/.env` (normally `~/.agend/.env`). Existing legacy `AGEND_BOT_TOKEN` entries are migrated on write.
 
 Security measures:
 - File permissions set to `0600` (owner read/write only, Unix)
@@ -110,7 +110,7 @@ defaults:
 # Telegram notification channel (if configured)
 channel:
   type: telegram
-  bot_token_env: AGEND_BOT_TOKEN
+  bot_token_env: AGEND_TELEGRAM_BOT_TOKEN
   group_id: -100123456789
   mode: topic
   user_allowlist:
@@ -120,12 +120,12 @@ channel:
 instances:
   general:
     role: "General-purpose coding assistant"
-    working_directory: ~/workspace
+    working_directory: $AGEND_HOME/workspace/general
 ```
 
 If Telegram was skipped, the channel block is preserved as comments for easy manual configuration later.
 
-The `user_allowlist` field is always generated (even if empty) — this is the Sprint 21 fail-closed security design: Telegram users not on the allowlist cannot operate agents.
+The `user_allowlist` field is always generated. If group detection sees exactly one sender, quickstart fills that user ID automatically; otherwise it emits an empty TODO list. An empty list is fail-closed and must be completed before the channel can operate.
 
 ### Step 4: Next Steps
 
@@ -192,21 +192,21 @@ AgEnD uses Telegram's topic (forum thread) feature to create separate conversati
 | Kiro CLI | `kiro-cli` | `--dangerously-skip-permissions` | `--resume` |
 | Codex | `codex` | (version-dependent) | Built-in |
 | OpenCode | `opencode` | (none) | `--continue` |
-| Gemini | `gemini` | (none) | `--resume latest` |
 | Agy | `agy` | (none) | `--continue` |
+| Grok Build | `grok` | `--always-approve` | `--continue` when a cwd session exists |
 
 ### File Locations
 
 | File | Path | Description |
 |------|------|-------------|
 | fleet.yaml | `$AGEND_HOME/fleet.yaml` | Agent configuration |
-| .env | `~/.env` | Bot token environment variable |
+| .env | `$AGEND_HOME/.env` | Bot token environment variable |
 
-`$AGEND_HOME` defaults to `~/.agend-terminal`.
+`$AGEND_HOME` defaults to `~/.agend`; an existing legacy `~/.agend-terminal` installation is still detected.
 
 ### Token Security
 
-- The token is stored in fleet.yaml as an environment variable name (`AGEND_BOT_TOKEN`), not the plaintext value
-- The actual token value only exists in `~/.env`
-- `~/.env` permissions are `0600` (Unix)
+- The token is stored in fleet.yaml as an environment variable name (`AGEND_TELEGRAM_BOT_TOKEN`), not the plaintext value
+- The actual token value only exists in `$AGEND_HOME/.env`
+- `$AGEND_HOME/.env` permissions are `0600` (Unix)
 - Quickstart traverses `.gitignore` files from the working directory up to the root to ensure `.env` is not tracked by git

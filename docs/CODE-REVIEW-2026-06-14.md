@@ -1,5 +1,9 @@
 # agend-terminal 完整 Code Review
 
+> **歷史快照：** 本文件記錄 2026-06-14、`eaf65a9` 的 point-in-time review，
+> 不是目前 backlog 或程式碼品質狀態。修復狀態與任何 file:line 都必須在現行
+> source／GitHub issue 上重新確認。
+
 - **日期**：2026-06-14
 - **範圍**：`main` @ `eaf65a9`，整棵 `src/`（約 227k 行 Rust / 375 檔）
 - **方法**：多代理對抗式評審 — 18 個模組範圍 reviewer + 4 個跨切面全樹掃描（安全 / 併發 / panic / 持久化），每一條發現再由一個獨立驗證者開檔到 `file:line` 嘗試「反駁」，只有經得起反駁的才列入。

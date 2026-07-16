@@ -1,5 +1,9 @@
 # Spike: canonical heartbeat + binding path-resolve (t-…83936-4)
 
+> **Historical snapshot:** This is point-in-time design evidence, not a current
+> runtime contract. Use [`docs/FEATURE-worktree.md`](docs/FEATURE-worktree.md)
+> and the current source for authoritative behavior.
+
 Spike-first design for lead vet BEFORE impl (touches daemon lifecycle core). DUAL.
 
 ## Root cause (confirmed at file:line)

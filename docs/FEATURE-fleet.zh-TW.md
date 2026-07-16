@@ -26,7 +26,8 @@ backend、在哪個目錄工作、屬於哪個團隊、用什麼通訊頻道。`
 
 ## fleet.yaml 結構
 
-fleet.yaml 位於 `$AGEND_HOME/fleet.yaml`（預設 `~/.agend-terminal/fleet.yaml`）。
+fleet.yaml 位於 `$AGEND_HOME/fleet.yaml`（通常是 `~/.agend/fleet.yaml`，舊安裝則
+fallback 到 `~/.agend-terminal/fleet.yaml`）。
 
 ### 完整範例
 
@@ -99,7 +100,7 @@ teams:
 
 | 欄位 | 型別 | 說明 |
 |------|------|------|
-| `backend` | string | Backend 名稱（claude / kiro-cli / codex / opencode / gemini / agy / shell） |
+| `backend` | string | Backend 名稱（claude / kiro-cli / codex / opencode / antigravity-cli/agy / grok / shell） |
 | `command` | string | 自訂執行命令（覆蓋 backend 預設命令） |
 | `args` | [string] | CLI 參數列表 |
 | `model` | string | 具體模型名稱（如 opus、sonnet）。優先於 `model_tier` |
@@ -191,7 +192,7 @@ channel:
 
 #### `templates` — 部署模板
 
-定義可重複使用的 agent 配置模板，供 `fleet deployment deploy` 動態建立
+定義可重複使用的 agent 配置模板，供 MCP `deployment(action=deploy, ...)` 動態建立
 instance 使用。
 
 #### `watchdog` — Watchdog 拓撲
@@ -403,8 +404,8 @@ agend-terminal start --agents dev:claude reviewer:kiro-cli
 | Kiro CLI | `--resume` | 恢復最近一次對話 |
 | Codex | 內建 | 由 Codex 自行管理 session |
 | OpenCode | `--continue` | 恢復最近一次對話 |
-| Gemini | `--resume latest` | 恢復最近一次對話 |
 | Agy | `--continue` | 恢復最近一次對話 |
+| Grok Build | `--continue` | cwd 有 session 時恢復最近一次對話 |
 | Shell | 不支援 | 每次啟動都是新 session |
 
 ### 降級機制
@@ -451,7 +452,7 @@ daemon 持續監控每個 agent 的健康狀態：
 
 ## fleet.yaml 欄位合併規則
 
-當 fleet.yaml 被更新（例如透過 `fleet deployment deploy` 或手動編輯）時，
+當 fleet.yaml 被更新（例如透過 MCP `deployment(action=deploy)` 或手動編輯）時，
 欄位分為兩類：
 
 ### Daemon 管理欄位

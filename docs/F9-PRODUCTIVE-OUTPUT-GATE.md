@@ -2,8 +2,14 @@
 
 Source-of-truth for the F9 sub-finding (`#685` Phase 1 deliverables #2 + #3):
 the dual-path supplement to silence-based Hung detection. Companion to the
-F9 inline structured comments in `src/state.rs`, `src/behavioral.rs`, and
+F9 inline structured comments in `src/state/mod.rs`, `src/behavioral.rs`, and
 `src/health.rs`.
+
+**Current baseline**: revalidated at `main@1d83b423` (2026-07-16). The gate
+remains shadow-by-default (`AGEND_PRODUCTIVE_GATE=1` enables classification).
+Gemini-specific calibration was renamed to Agy when Gemini retired. Grok is a
+supported backend but currently uses the generic marker/cache path; its
+backend-specific F9 calibration remains unverified.
 
 Issue: [#685](https://github.com/suzuke/agend-terminal/issues/685) F9 sub-finding.
 Sibling sub-tasks: 1 (Hung audit, PR #750), 2 (F39 audit, PR #752), 3 (F39
@@ -72,16 +78,17 @@ completion-glyph + tool-vocab regex. Look up each via
 
 | Backend | Completion regex (added to generic anchors) | Source | Validation |
 |---|---|---|---|
-| Claude | `^[✓●⏺]\s+(Read\|Bash\|Edit\|Write\|Grep\|Glob\|Listing\|Reading\|Writing\|Searching\|Editing)\b` | `rg "Read\|Bash\|Edit\|Write\|Grep" src/state.rs` (state.rs:212 ToolUse vocab) | F685 fixture `f685-f9-positive-savedfile.raw` (synthetic). Real captures pending corpus growth. |
-| Kiro | `^●\s+(Read\|Write\|Edit\|Bash\|Grep\|Glob\|Task\|List\|Search)\b` PLUS `\[(fs_read\|fs_write\|execute_bash)\]` | `rg "●" src/state.rs` (state.rs:261 ToolUse vocab + bracket-form fs/exec tools) | Synthetic unit tests only — `kiro_markers_*` in `src/behavioral.rs::tests`. **Not validated against real captures** — corpus growth path per F685. |
-| Codex | `^•\s+(Explored\|Edited\|Ran)\b` PLUS `apply_patch` | `rg "Explored\|Edited\|Ran" src/state.rs` (state.rs:308 past-tense title vocab + `apply_patch` literal) | **Synthetic only — not validated against real captures.** Corpus growth path. |
-| Gemini | `^✓\s+(ReadFile\|WriteFile\|ReadManyFiles\|Edit\|Shell\|WebFetch\|Glob\|GoogleSearch\|MemoryTool\|ReadFolder)\b` | `rg "ReadFile\|WriteFile" src/state.rs` (state.rs:405 CamelCase ToolUse vocab) | F685 fixture `f685-silent-stuck-stub.raw` (synthetic_from_real_template). Real captures pending. |
-| OpenCode | `^→\s+(Read\|Write\|Edit\|Glob\|Grep\|Bash\|List\|Task)\b` | `rg "→" src/state.rs` (state.rs:357 completion arrow — distinct from in-flight `✱`) | **Synthetic only — not validated against real captures.** Corpus growth path. |
+| Claude | `^[✓●⏺]\s+(Read\|Bash\|Edit\|Write\|Grep\|Glob\|Listing\|Reading\|Writing\|Searching\|Editing)\b` | `CLAUDE_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | F685 fixture `f685-f9-positive-savedfile.raw` (synthetic). Real captures pending corpus growth. |
+| Kiro | `^●\s+(Read\|Write\|Edit\|Bash\|Grep\|Glob\|Task\|List\|Search)\b` PLUS `\[(fs_read\|fs_write\|execute_bash)\]` | `KIRO_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | Synthetic unit tests only — `kiro_markers_*` in `src/behavioral.rs` tests. **Not validated against real captures** — corpus growth path per F685. |
+| Codex | `^•\s+(Explored\|Edited\|Ran)\b` PLUS `apply_patch` | `CODEX_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | **Synthetic only — not validated against real captures.** Corpus growth path. |
+| Agy | `^✓\s+(ReadFile\|WriteFile\|ReadManyFiles\|Edit\|Shell\|WebFetch\|Glob\|GoogleSearch\|MemoryTool\|ReadFolder)\b` | `AGY_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | Inherited from the retired Gemini engine calibration; current Agy real-capture validation remains incomplete. |
+| OpenCode | `^→\s+(Read\|Write\|Edit\|Glob\|Grep\|Bash\|List\|Task)\b` | `OPENCODE_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | **Synthetic only — not validated against real captures.** Corpus growth path. |
+| Grok | Generic save-banner anchors only | `GENERIC_PRODUCTIVE_MARKERS` via `grok_profile()` in `src/backend_profile.rs` | **Unverified backend-specific coverage**; no Grok-labelled corpus fixture. |
 
 **Excluded from F9 markers**:
 - All in-progress / spinner glyphs (Braille `[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]`, OpenCode `✱`, Codex `◦ Working`,
-  Gemini `⠦ Thinking`). F9 productivity = completion-only; these fire BEFORE work completes.
-- Gemini `tool.*call` / `MCP.*tool` literals — heartbeat path already covers MCP signals
+  historical Gemini `⠦ Thinking`). F9 productivity = completion-only; these fire BEFORE work completes.
+- Agy/Gemini-engine `tool.*call` / `MCP.*tool` literals — heartbeat path already covers MCP signals
   (avoid double counting).
 - Bare keyword markers (e.g. `Saved` / `Wrote` without line-start anchor). Prose like
   "I saved your time" must not match — pinned by
@@ -96,7 +103,7 @@ ubuntu/windows CI failure). Sub-task 6 introduced the `MarkerCacheId`
 enum on `ProductivityConfig`:
 
 ```rust
-pub enum MarkerCacheId { Generic, Claude, Kiro, Codex, Gemini, OpenCode }
+pub enum MarkerCacheId { Generic, Claude, Kiro, Codex, Agy, OpenCode }
 
 pub struct ProductivityConfig {
     pub markers: &'static [&'static str],
@@ -169,10 +176,11 @@ negative (bare prose does not) contracts.
 **Residual risk acknowledged**: documented for fixture-corpus measurement.
 
 ### 4.3 Cross-backend pattern uniformity
-Phase 1 ships the same generic markers across all backends. Per-backend
-calibration (kiro `[fs_read]`, Gemini-specific tool banners, etc.) lives
-in deliverable #4. Backends whose progress markers differ from the
-generic set will have lower F9 sensitivity in Phase 1.
+Phase 1 shipped the same generic markers across all backends. Subsequent
+per-backend calibration added Kiro `[fs_read]` and Agy tool banners (renamed
+from the retired Gemini engine). Grok currently still uses the generic
+profile, so backend-specific Grok progress that differs from those anchors
+will have lower F9 sensitivity until real-capture calibration lands.
 
 ## §F9.5 — Activation gate (shadow → opt-in → promotion)
 
@@ -189,8 +197,9 @@ unset / not "1"   → shadow mode (default): telemetry collected,
 shipped in shadow mode and never promoted. This PR's commit message
 encodes explicit promotion criteria to avoid the same outcome:
 
-1. **Fixture corpus measures FP rate < 1% on 3+ confirmed cases**
-   (`#685` issue acceptance criterion). Measurement methodology and
+1. **Fixture corpus measures FP rate < 1% with N ≥ 300 not-stuck fixtures**
+   (the Rule-of-Three statistical minimum; the original `#685` wording used a
+   smaller 3+ case floor). Measurement methodology and
    corpus growth protocol live in
    `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.4` (per-transition unit,
    source-separated reporting, statistical minimums delegate-to-growth).
@@ -222,8 +231,8 @@ for removal — dead shadow infra is worse than no infra.
   #2547 as dead code (zero external references, live consumer already
   retired); `BehavioralConfig` itself is kept (still populated/read by
   `backend_profile.rs`).
-- `docs/RECOVERY-STAGES.md` — `#685` Phase 2 staged auto-recovery
-  dispatcher reads `productive_silence_exceeds` helper (extracted
+- `docs/RECOVERY-STAGES.md` — the current Stage-1-only recovery dispatcher
+  reads `productive_silence_exceeds` helper (extracted
   from `check_hang`) directly to decide Stage 1 alive-stuck vs
   dead-likely branch. Recovery treats all `Hung` sources the same
   regardless of F9 promotion state — see §RS.4.

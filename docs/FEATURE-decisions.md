@@ -64,18 +64,23 @@ Create a new decision entry.
 | Parameter | Type | Required | Description |
 |------|------|------|------|
 | `title` | string | yes | Decision title |
-| `content` | string | yes | Decision content and rationale |
-| `scope` | string | yes | `"project"` (project-scoped) or `"fleet"` (fleet-scoped) |
+| `content` | string | yes | Decision content and rationale (`text` is accepted as an alias) |
+| `scope` | string | no | `"project"` (default) or `"fleet"` |
 | `tags` | string[] | no | Classification tags |
 | `ttl_days` | number | no | Auto-expiry window in days (default 90) |
 | `supersedes` | string | no | Decision ID being replaced |
+| `needs_answer` | bool | no | Create a pending question instead of a plain record |
+| `options` | string[] or object[] | no | Suggested answers; objects use `{label, recommended}` |
+| `allow_free_text` | bool | no | Allow an answer outside the option labels (default false) |
+| `timeout_secs` | integer | no | Auto-answer a pending question after this many seconds |
+| `timeout_default` | string | conditional | Required with `timeout_secs` unless a recommended option supplies it |
 
 The response includes the auto-generated decision ID:
 
 ```json
 {
   "id": "d-20260525040000000000-1",
-  "status": "created"
+  "status": "posted"
 }
 ```
 
@@ -103,6 +108,10 @@ Edit the content, tags, or status of an existing decision.
 | `archive` | bool | no | Set to true to archive manually |
 
 Edit permission: only the original author or the orchestrator of their team can edit.
+
+### answer — resolve a pending question
+
+Requires `id` and `answer`. The question's author cannot self-answer; an operator or another attributed caller records the answer. When `allow_free_text=false` and options exist, `answer` must exactly match an option label. The first valid answer wins under the decision lock, and the author receives a notification.
 
 ---
 
@@ -421,7 +430,7 @@ If the reasoning is about a system-level tradeoff, record it here.
 
 - `src/decisions.rs`: storage and query implementation
 - `src/store.rs`: shared JSON persistence helpers
-- `src/mcp/handlers/decision.rs`: MCP handler surface
+- `src/mcp/handlers/dispatch.rs`: MCP action adapter and handler routing
 - `src/mcp/tools.rs`: tool registration
 
 ---
