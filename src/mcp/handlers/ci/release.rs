@@ -18,7 +18,7 @@ fn parse_managed_marker(wt: &Path) -> Option<(String, String, String)> {
 }
 
 fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Value {
-    let Some((marker_agent, marker_branch, marker_repo)) = parse_managed_marker(canonical) else {
+    let Some((marker_agent, _, _)) = parse_managed_marker(canonical) else {
         return json!({
             "error": "managed worktree marker unreadable or missing agent — refusing (fail-closed)",
             "code": "managed_marker_invalid",
@@ -67,16 +67,7 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
             "code": "managed_release_unauthorized",
         });
     }
-    let marker_id = crate::worktree_pool::MarkerIdentity {
-        branch: marker_branch,
-        source_repo: marker_repo,
-    };
-    let outcome = crate::worktree_pool::release_full_exact(
-        home,
-        &marker_agent,
-        &fingerprint,
-        Some(&marker_id),
-    );
+    let outcome = crate::worktree_pool::release_full_exact(home, &marker_agent, &fingerprint);
     json!({
         "path": canonical.display().to_string(),
         "delegated_to_canonical": true,

@@ -3389,7 +3389,7 @@ fn repo_release_marker_source_mismatch_refuses() {
     // Overwrite marker with a DIFFERENT source_repo.
     std::fs::write(
         wt.join(".agend-managed"),
-        format!("agent=agent-srmm\nbranch=feat/test\nsource_repo=/bogus/repo\n"),
+        "agent=agent-srmm\nbranch=feat/test\nsource_repo=/bogus/repo\n",
     )
     .expect("overwrite marker");
 
@@ -3403,6 +3403,44 @@ fn repo_release_marker_source_mismatch_refuses() {
     assert!(
         crate::binding::read(&home, "agent-srmm").is_some(),
         "binding must be preserved on source mismatch"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker rewritten AFTER pre-read but BEFORE canonical locks — proves
+/// the under-lock fresh re-read catches it.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_rewritten_after_snapshot_refuses() {
+    use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
+
+    let (base, home, repo, wt) = managed_wt_fixture("seam");
+    seed_managed_marker(&wt, &repo, &home, "agent-seam", "feat/test");
+
+    let wt_clone = wt.clone();
+    let _guard = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::AfterBindingSnapshot {
+            std::fs::write(
+                wt_clone.join(".agend-managed"),
+                "agent=agent-seam\nbranch=feat/tampered\nsource_repo=/tampered\n",
+            )
+            .expect("rewrite marker in seam");
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "agent-seam", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "marker rewritten after snapshot must be caught under lock: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is tampered"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-seam").is_some(),
+        "binding must be preserved when marker is tampered"
     );
     std::fs::remove_dir_all(&base).ok();
 }

@@ -149,11 +149,6 @@ pub fn is_daemon_managed(worktree_path: &Path) -> bool {
     worktree_path.join(MANAGED_MARKER).exists()
 }
 
-pub(crate) struct MarkerIdentity {
-    pub branch: String,
-    pub source_repo: String,
-}
-
 /// Outcome of a hard release — emitted by `release_full` and serialized
 /// directly into the `release_worktree` MCP tool response.
 #[derive(Clone, Copy, Debug)]
@@ -921,7 +916,6 @@ fn release_full_guarded(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
     provenance: ReleaseProvenance,
-    marker: Option<&MarkerIdentity>,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
@@ -975,24 +969,60 @@ fn release_full_guarded(
         } if live == fingerprint => value,
         GuardedBinding::Known { .. } => return stale_release(),
     };
-    if let Some(mk) = marker {
-        let bound_branch = current["branch"].as_str().unwrap_or("");
-        let bound_source = current["source_repo"].as_str().unwrap_or("");
-        if !mk.branch.is_empty() && bound_branch != mk.branch {
+    let wt_path = current["worktree"].as_str().unwrap_or("");
+    let marker_path = Path::new(wt_path).join(MANAGED_MARKER);
+    if marker_path.exists() {
+        let marker_content = match std::fs::read_to_string(&marker_path) {
+            Ok(c) => c,
+            Err(_) => {
+                return ReleaseOutcome {
+                    error: Some(
+                        "managed marker unreadable under lock — refusing (fail-closed)".into(),
+                    ),
+                    ..ReleaseOutcome::default()
+                };
+            }
+        };
+        let mk_get = |prefix: &str| {
+            marker_content
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let mk_agent = mk_get("agent=");
+        let mk_branch = mk_get("branch=");
+        let mk_source = mk_get("source_repo=");
+        if mk_agent.is_empty() {
+            return ReleaseOutcome {
+                error: Some(
+                    "managed marker missing agent under lock — refusing (fail-closed)".into(),
+                ),
+                ..ReleaseOutcome::default()
+            };
+        }
+        if mk_agent != agent {
             return ReleaseOutcome {
                 error: Some(format!(
-                    "marker branch '{}' does not match binding branch '{bound_branch}' — refusing",
-                    mk.branch
+                    "marker agent '{mk_agent}' does not match release agent '{agent}' — refusing"
                 )),
                 ..ReleaseOutcome::default()
             };
         }
-        if !mk.source_repo.is_empty() && !bound_source.is_empty() && bound_source != mk.source_repo
-        {
+        let bound_branch = current["branch"].as_str().unwrap_or("");
+        if !mk_branch.is_empty() && mk_branch != bound_branch {
             return ReleaseOutcome {
                 error: Some(format!(
-                    "marker source_repo '{}' does not match binding source_repo '{bound_source}' — refusing",
-                    mk.source_repo
+                    "marker branch '{mk_branch}' does not match binding branch '{bound_branch}' — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        let bound_source = current["source_repo"].as_str().unwrap_or("");
+        if !mk_source.is_empty() && !bound_source.is_empty() && mk_source != bound_source {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker source_repo '{mk_source}' does not match binding source_repo '{bound_source}' — refusing"
                 )),
                 ..ReleaseOutcome::default()
             };
@@ -1058,7 +1088,6 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         &permit,
         None,
         ReleaseProvenance::Manual,
-        None,
     )
 }
 
@@ -1078,14 +1107,13 @@ pub(crate) fn release_full_with_permit_origin(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     provenance: ReleaseProvenance,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, permit, None, provenance, None)
+    release_full_guarded(home, agent, dry_run, permit, None, provenance)
 }
 
 pub(crate) fn release_full_exact(
     home: &Path,
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
-    marker: Option<&MarkerIdentity>,
 ) -> ReleaseOutcome {
     let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
@@ -1107,7 +1135,6 @@ pub(crate) fn release_full_exact(
         &permit,
         Some(expected),
         ReleaseProvenance::Auto,
-        marker,
     )
 }
 
