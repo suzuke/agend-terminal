@@ -2990,7 +2990,8 @@ fn update_clear_settles_three_sidecars() {
         "dev-agent",
         &serde_json::json!({"action": "claim", "id": id}),
     );
-    // Seed a dispatch-idle pending entry via record_dispatch.
+    // Seed all three sidecars.
+    // 1. dispatch-idle
     crate::daemon::dispatch_idle::record_dispatch(
         &home,
         "lead",
@@ -3003,6 +3004,37 @@ fn update_clear_settles_three_sidecars() {
         crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
         "precondition: dispatch-idle sidecar exists"
     );
+    // 2. ci-watch with task_id + next_after_ci
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch_fname = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/t9");
+    std::fs::write(
+        ci_dir.join(&watch_fname),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "repo": "owner/repo", "branch": "feat/t9", "interval_secs": 60,
+            "task_id": id, "next_after_ci": ["dev-agent"],
+            "subscribers": [{"instance": "lead"}],
+        }))
+        .expect("json"),
+    )
+    .expect("write watch");
+    // 3. dispatch-tracking
+    crate::dispatch_tracking::track_dispatch(
+        &home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some(id.to_string()),
+            from: "lead".to_string(),
+            to: "dev-agent".to_string(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".to_string(),
+        },
+    );
+    assert!(
+        crate::dispatch_tracking::active_target_names(&home).contains(&"dev-agent".to_string()),
+        "precondition: dispatch-tracking sidecar exists"
+    );
     // Clear assignee.
     let r = handle(
         &home,
@@ -3010,10 +3042,25 @@ fn update_clear_settles_three_sidecars() {
         &serde_json::json!({"action": "update", "id": id, "assignee": ""}),
     );
     assert!(r.get("error").is_none(), "clear must succeed: {r}");
-    // After commit, sidecars cleared.
+    // After commit, all three sidecars cleared.
     assert!(
         !crate::daemon::dispatch_idle::has_pending_for_instance(&home, "dev-agent"),
-        "dispatch-idle sidecar must be cleared after assignee clear"
+        "dispatch-idle sidecar must be cleared"
+    );
+    // ci-watch: next_after_ci must be reassigned to None
+    let watch_content = std::fs::read_to_string(ci_dir.join(&watch_fname)).unwrap_or_default();
+    let watch: serde_json::Value = serde_json::from_str(&watch_content).unwrap_or_default();
+    assert!(
+        watch.get("next_after_ci").is_none()
+            || watch["next_after_ci"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+        "ci-watch next_after_ci must be cleared: {watch}"
+    );
+    // dispatch-tracking: dev-agent no longer active target
+    assert!(
+        !crate::dispatch_tracking::active_target_names(&home).contains(&"dev-agent".to_string()),
+        "dispatch-tracking must clear dev-agent"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3052,6 +3099,22 @@ fn combined_status_done_and_clear_attributes_to_old_owner() {
         "status must be done"
     );
     assert!(task.assignee.is_none(), "assignee must be cleared");
+    // Inspect persisted envelopes: Done event must be attributed to the
+    // pre-commit owner (dev-agent), not the post-clear None.
+    let envelopes = crate::task_events::envelopes_for_task_at(&home, id).expect("envelopes");
+    let done_event = envelopes
+        .iter()
+        .find(|e| matches!(&e.event, crate::task_events::TaskEvent::Done { .. }))
+        .expect("Done event must exist");
+    match &done_event.event {
+        crate::task_events::TaskEvent::Done { by, .. } => {
+            assert_eq!(
+                by.0, "dev-agent",
+                "Done.by must be the pre-commit owner, not cleared"
+            );
+        }
+        _ => panic!("expected Done"),
+    }
     std::fs::remove_dir_all(&home).ok();
 }
 
