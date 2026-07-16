@@ -14,7 +14,7 @@
 //!   future callers (e.g. `handle_spawn` rejection-message enrichment)
 //!   that want to surface the divergent-store list to the operator.
 
-use crate::agent_ops::cleanup_working_dir;
+use crate::agent_ops::{cleanup_admission, cleanup_working_dir_admitted};
 use crate::channel::telegram;
 use serde_json::json;
 use std::path::Path;
@@ -82,13 +82,23 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // leaked mark would make it un-spawnable for the daemon's lifetime.
     let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    let (topic_id, working_dir) = fleet
+    let topic_id = fleet
         .as_ref()
-        .and_then(|c| {
-            c.resolve_instance(name)
-                .map(|r| (r.topic_id, r.working_directory))
+        .and_then(|c| c.resolve_instance(name).and_then(|r| r.topic_id));
+    // Derive the candidate from the raw pre-delete entry, not
+    // `resolve_instance`: an unrelated resolution error (for example a raw
+    // `..` path) must not fall back to a different default workspace.
+    let working_dir = fleet
+        .as_ref()
+        .and_then(|config| config.instances.get(name))
+        .and_then(|instance| {
+            instance
+                .working_directory
+                .as_deref()
+                .map(crate::fleet::resolve::expand_tilde_path)
         })
-        .unwrap_or((None, None));
+        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
+    let cleanup_admission = cleanup_admission::derive(fleet.as_ref(), home, name, &working_dir);
     // #1157: extract InstanceId before fleet.yaml removal for id-based metadata cleanup.
     let instance_id = fleet
         .as_ref()
@@ -146,16 +156,14 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // `working_directory:` explicitly. `cleanup_working_dir` only `remove_dir_all`s
     // paths UNDER `$AGEND_HOME/workspace/`, so a user-provided dir is never nuked —
     // the default fed here is always under workspace/, the path it's safe to remove.
-    let wd = working_dir
-        .clone()
-        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
     // #46776: cleanup_working_dir holds the workspace-identity lock, decides
     // ownership ONCE under it, and returns the single verdict — NO separate,
     // unlocked probe (which could observe a different state). A refusal (foreign/
     // corrupt/unreadable identity, or a lock-acquire failure) preserves the
     // foreign tree; surface it as a step error so the delete reports failure
     // instead of a false success while B's directory is (correctly) left intact.
-    if let Some(reason) = cleanup_working_dir(home, name, &wd) {
+    if let Some(reason) = cleanup_working_dir_admitted(home, name, &working_dir, &cleanup_admission)
+    {
         step_errors.push(format!("working_dir cleanup refused: {reason}"));
     }
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,

@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) mod cleanup_admission;
+
 // ---------------------------------------------------------------------------
 // Messaging
 // ---------------------------------------------------------------------------
@@ -658,6 +660,54 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) -> Optio
     crate::agy_workspace::remove_link(home, name);
 
     conflict
+}
+
+/// Apply a pre-delete admission derived from the FleetConfig snapshot.
+/// `Preserve` is intentionally a complete path-local no-op: the shared
+/// directory must not even enter the backend scrub path.
+pub(crate) fn cleanup_working_dir_admitted(
+    home: &Path,
+    name: &str,
+    working_dir: &Path,
+    admission: &cleanup_admission::CleanupAdmission,
+) -> Option<String> {
+    match admission {
+        cleanup_admission::CleanupAdmission::Preserve { reason } => {
+            tracing::warn!(
+                name,
+                dir = %working_dir.display(),
+                %reason,
+                "pre-delete cleanup admission preserved working directory"
+            );
+            None
+        }
+        cleanup_admission::CleanupAdmission::NoOp { reason } => {
+            tracing::debug!(
+                name,
+                dir = %working_dir.display(),
+                %reason,
+                "pre-delete cleanup admission found no working directory to mutate"
+            );
+            None
+        }
+        cleanup_admission::CleanupAdmission::Refuse { reason } => Some(reason.clone()),
+        cleanup_admission::CleanupAdmission::RemoveOwned { canonical }
+        | cleanup_admission::CleanupAdmission::ScrubExclusive { canonical } => {
+            match dunce::canonicalize(working_dir) {
+                Ok(actual) if actual == *canonical => cleanup_working_dir(home, name, working_dir),
+                Ok(actual) => Some(format!(
+                    "working directory changed after admission: {} now resolves to {}, expected {}",
+                    working_dir.display(),
+                    actual.display(),
+                    canonical.display()
+                )),
+                Err(error) => Some(format!(
+                    "working directory no longer canonicalizes after admission: {} ({error})",
+                    working_dir.display()
+                )),
+            }
+        }
+    }
 }
 
 /// Whether `working_dir`'s on-disk identity artifacts name an instance OTHER
