@@ -96,7 +96,7 @@ pub(crate) fn dispose_release_exact(
     expected: &crate::binding::BindingFingerprint,
 ) -> DispositionOutcome {
     DispositionOutcome::Released(crate::worktree_pool::release_full_exact(
-        home, agent, expected,
+        home, agent, expected, None,
     ))
 }
 

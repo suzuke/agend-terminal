@@ -149,6 +149,11 @@ pub fn is_daemon_managed(worktree_path: &Path) -> bool {
     worktree_path.join(MANAGED_MARKER).exists()
 }
 
+pub(crate) struct MarkerIdentity {
+    pub branch: String,
+    pub source_repo: String,
+}
+
 /// Outcome of a hard release — emitted by `release_full` and serialized
 /// directly into the `release_worktree` MCP tool response.
 #[derive(Clone, Copy, Debug)]
@@ -916,6 +921,7 @@ fn release_full_guarded(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
     provenance: ReleaseProvenance,
+    marker: Option<&MarkerIdentity>,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
@@ -969,6 +975,29 @@ fn release_full_guarded(
         } if live == fingerprint => value,
         GuardedBinding::Known { .. } => return stale_release(),
     };
+    if let Some(mk) = marker {
+        let bound_branch = current["branch"].as_str().unwrap_or("");
+        let bound_source = current["source_repo"].as_str().unwrap_or("");
+        if !mk.branch.is_empty() && bound_branch != mk.branch {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker branch '{}' does not match binding branch '{bound_branch}' — refusing",
+                    mk.branch
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        if !mk.source_repo.is_empty() && !bound_source.is_empty() && bound_source != mk.source_repo
+        {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker source_repo '{}' does not match binding source_repo '{bound_source}' — refusing",
+                    mk.source_repo
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+    }
     let mut locked = release_known_locked(home, agent, &current, dry_run, permit);
     // Explicit drops document the lock boundary: no notice, marker cleanup,
     // branch cleanup, or release event runs with a flock held.
@@ -1029,6 +1058,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         &permit,
         None,
         ReleaseProvenance::Manual,
+        None,
     )
 }
 
@@ -1048,13 +1078,14 @@ pub(crate) fn release_full_with_permit_origin(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     provenance: ReleaseProvenance,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, permit, None, provenance)
+    release_full_guarded(home, agent, dry_run, permit, None, provenance, None)
 }
 
 pub(crate) fn release_full_exact(
     home: &Path,
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
+    marker: Option<&MarkerIdentity>,
 ) -> ReleaseOutcome {
     let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
@@ -1076,6 +1107,7 @@ pub(crate) fn release_full_exact(
         &permit,
         Some(expected),
         ReleaseProvenance::Auto,
+        marker,
     )
 }
 

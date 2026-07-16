@@ -3346,3 +3346,63 @@ fn repo_release_non_owner_refused_owner_succeeds() {
     let _ = r; // response structure TBD
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Marker says branch=feat/other but binding has branch=feat/test → refuse,
+/// preserve worktree + binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_branch_mismatch_refuses() {
+    let (base, home, repo, wt) = managed_wt_fixture("br-mm");
+    // Bind normally (branch=feat/test from the worktree add).
+    seed_managed_marker(&wt, &repo, &home, "agent-brmm", "feat/test");
+    // Overwrite marker with a DIFFERENT branch — simulates stale/tampered marker.
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!(
+            "agent=agent-brmm\nbranch=feat/other\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .expect("overwrite marker");
+
+    let r = dispatch_repo_release(&home, "agent-brmm", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "branch mismatch must return error: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on branch mismatch");
+    assert!(
+        crate::binding::read(&home, "agent-brmm").is_some(),
+        "binding must be preserved on branch mismatch"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker says source_repo=/other but binding has the real repo → refuse,
+/// preserve worktree + binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_source_mismatch_refuses() {
+    let (base, home, repo, wt) = managed_wt_fixture("sr-mm");
+    seed_managed_marker(&wt, &repo, &home, "agent-srmm", "feat/test");
+    // Overwrite marker with a DIFFERENT source_repo.
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!("agent=agent-srmm\nbranch=feat/test\nsource_repo=/bogus/repo\n"),
+    )
+    .expect("overwrite marker");
+
+    let r = dispatch_repo_release(&home, "agent-srmm", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "source mismatch must return error: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on source mismatch");
+    assert!(
+        crate::binding::read(&home, "agent-srmm").is_some(),
+        "binding must be preserved on source mismatch"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
