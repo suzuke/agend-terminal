@@ -892,7 +892,7 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
     let parent = tmp_home("disposable-review-fresh-src");
     let source = setup_source_repo(&parent, "seed");
     let expected = get_sha(&source, "main");
-    seed_origin_view(&source, "review/disposable-fresh", &expected);
+    seed_origin_view(&source, "main", &expected);
     seed_terminal_task(
         &home,
         "task-disposable-fresh",

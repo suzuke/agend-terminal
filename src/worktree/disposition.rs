@@ -574,4 +574,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn disposable_review_subject_pr_open_is_irrelevant_but_review_pr_protects() {
+        let mut input = branch_input(BranchProvenance::ManagedReview);
+        // The subject PR may remain open; the lifecycle probe is scoped to the
+        // disposable review branch itself, so no PR headed at this branch is
+        // evidence of safety to delete.
+        input.open_pr = Some(false);
+        assert_eq!(
+            branch_lifecycle_disposition(&input),
+            BranchLifecycleDisposition::Delete
+        );
+        input.open_pr = Some(true);
+        assert_eq!(
+            branch_lifecycle_disposition(&input),
+            BranchLifecycleDisposition::Keep
+        );
+    }
 }
