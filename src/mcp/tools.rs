@@ -385,6 +385,7 @@ pub(crate) fn def_repo() -> Value {
             "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
             "expected_head": {"type": "string", "description": "#6: optional exact full-SHA precondition. When provided, the branch HEAD must equal this value; mismatch returns structured error with zero mutation. Omitted preserves current behavior."},
+            "checkout_purpose": {"type": "string", "enum": ["disposable_review"], "description": "Architecture-14 item 10: typed daemon-provisioned disposable review checkout. Requires bind=true, task_id, expected_head, and a newly-created branch."},
             "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
             "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. The handler always read this field, but it was never declared here — an MCP client validating against this schema had no way to send it, so force=true silently never reached the daemon (#2539)."},
             "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."}
@@ -1144,6 +1145,7 @@ mod tests {
             ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
             ("repo", "task_id", "ci/checkout.rs checkout bind:true → binding::bind_full task_id linkage (#2533)"),
             ("repo", "expected_head", "ci/checkout.rs checkout bind:true full-SHA precondition — mismatch returns structured error with zero mutation (#6 d-4)"),
+            ("repo", "checkout_purpose", "ci/checkout.rs typed disposable_review provenance gate (Architecture-14 item 10)"),
             ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
             ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
             // ── bind_self ──

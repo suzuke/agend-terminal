@@ -20,6 +20,8 @@ pub(crate) use release_guard::{
     acquire_agent_mutation_lock, acquire_binding_file_lock, guarded_binding_disk_fresh,
     preflight_guarded_binding, snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
 };
+mod rebind_guard;
+use rebind_guard::same_agent_metadata_catchup_allowed;
 mod signature;
 pub(crate) use signature::signature_valid;
 mod unbind;
@@ -143,52 +145,6 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
     }
 }
 
-/// #2496: strict, same-agent-only exception to guard-b (see call site). ALL
-/// conditions below must hold for a metadata-only catch-up to be allowed —
-/// any failure keeps guard-b's existing reject.
-fn same_agent_metadata_catchup_allowed(
-    home: &Path,
-    agent: &str,
-    worktree: &Path,
-    source_repo: &Path,
-    branch: &str,
-    ex_branch: &str,
-) -> bool {
-    if !crate::worktree::is_git_repo(worktree) {
-        return false;
-    }
-    if !crate::worktree_pool::is_daemon_managed(worktree) {
-        return false;
-    }
-    // Marker present (checked above) but its recorded `agent=` doesn't match
-    // the caller: this worktree is daemon-managed for a DIFFERENT agent —
-    // reject rather than treat as this agent's own stale metadata.
-    if let Some(marker_agent) = managed_marker_agent(worktree) {
-        if marker_agent != agent {
-            return false;
-        }
-    }
-    if crate::worktree::has_uncommitted_changes(worktree) {
-        return false;
-    }
-    let actual_branch =
-        crate::git_helpers::git_cmd(worktree, &["branch", "--show-current"]).unwrap_or_default();
-    if actual_branch != branch {
-        return false;
-    }
-    let source_repo_str = source_repo.display().to_string();
-    if scan_existing_branch_binding(home, &source_repo_str, branch, agent).is_some() {
-        return false;
-    }
-    if agent_has_active_ci_watch_on_branch(home, agent, ex_branch) {
-        return false;
-    }
-    if branch_has_active_task(home, ex_branch) {
-        return false;
-    }
-    true
-}
-
 /// Parse a daemon-managed worktree's `.agend-managed` marker for its recorded
 /// `agent=` line. `None` when the marker is missing or the line isn't present
 /// — callers that require ownership certainty must already have checked
@@ -259,6 +215,11 @@ pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindingProvenance<'a> {
+    DaemonProvisionedReview { provisioned_head: &'a str },
+}
+
 /// Write a full binding including worktree + source-repo paths.
 ///
 /// `source_repo` is the parent repo that owns the worktree, persisted as a
@@ -290,6 +251,33 @@ pub fn bind_full(
     // task_id here — a single-target auto-create `send kind=task` legitimately
     // binds with task_id="" and must NOT false-notify.
     is_self_claim: bool,
+) -> Result<(), String> {
+    bind_full_with_provenance(
+        home,
+        agent,
+        task_id,
+        branch,
+        worktree,
+        source_repo,
+        is_self_claim,
+        None,
+    )
+}
+
+/// Write a full binding with optional typed provenance included in the initial
+/// signed document. Provenance is deliberately not a post-bind augmentation:
+/// callers that need destructive lifecycle authority must publish all identity
+/// fields before the binding is signed and visible to release/GC readers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_full_with_provenance(
+    home: &Path,
+    agent: &str,
+    task_id: &str,
+    branch: &str,
+    worktree: &std::path::Path,
+    source_repo: &std::path::Path,
+    is_self_claim: bool,
+    provenance: Option<BindingProvenance<'_>>,
 ) -> Result<(), String> {
     // #1888 phase-2: the agent claiming a branch is acting on any pending
     // ci-handoff for it — resolve the track (re-nudge stops). Scoped to this
@@ -383,6 +371,11 @@ pub fn bind_full(
     if !src_str.is_empty() {
         binding["source_repo"] = json!(src_str);
         register_managed_repo(home, &src_str);
+    }
+    if let Some(BindingProvenance::DaemonProvisionedReview { provisioned_head }) = provenance {
+        binding["checkout_purpose"] = json!("disposable_review");
+        binding["provenance"] = json!("DaemonProvisionedReview");
+        binding["provisioned_head"] = json!(provisioned_head);
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())

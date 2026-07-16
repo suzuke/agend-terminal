@@ -806,6 +806,12 @@ impl ScmProvider for MockScmProvider {
             Some(MockPrList::Prs(n)) => Ok(vec![PrSummary::default(); *n]),
             Some(MockPrList::Branches(branches)) => Ok(branches
                 .iter()
+                .filter(|branch| {
+                    filter
+                        .head
+                        .as_deref()
+                        .is_none_or(|head| head == branch.as_str())
+                })
                 .map(|branch| PrSummary {
                     head_ref: Some(branch.clone()),
                     ..Default::default()

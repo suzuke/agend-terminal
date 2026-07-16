@@ -4827,6 +4827,74 @@ fn binding_with_lease(
     b
 }
 
+fn binding_with_disposable_review(
+    branch: &str,
+    source_repo: &str,
+    task_id: &str,
+    provisioned_head: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "agent": "test-agent",
+        "task_id": task_id,
+        "branch": branch,
+        "issued_at": "2026-07-16T00:00:00Z",
+        "source_repo": source_repo,
+        "checkout_purpose": "disposable_review",
+        "provenance": "DaemonProvisionedReview",
+        "provisioned_head": provisioned_head,
+    })
+}
+
+fn seed_disposable_task(home: &Path, task_id: &str, branch: &str, terminal: bool) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+
+    let emitter = InstanceName::from("disposable-review-pool-test");
+    let id = TaskId::from(task_id);
+    crate::task_events::append(
+        home,
+        &emitter,
+        TaskEvent::Created {
+            task_id: id.clone(),
+            title: "disposable review".to_string(),
+            description: String::new(),
+            priority: "normal".to_string(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some(branch.to_string()),
+            bind: Some(true),
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        },
+    )
+    .unwrap();
+    if terminal {
+        finish_disposable_task(home, task_id);
+    }
+}
+
+fn finish_disposable_task(home: &Path, task_id: &str) {
+    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+
+    let emitter = InstanceName::from("disposable-review-pool-test");
+    crate::task_events::append(
+        home,
+        &emitter,
+        TaskEvent::Done {
+            task_id: TaskId::from(task_id),
+            by: emitter.clone(),
+            source: DoneSource::OperatorManual {
+                authored_at: "2026-07-16T00:00:00Z".to_string(),
+                result: None,
+            },
+        },
+    )
+    .unwrap();
+}
+
 /// RED #2: a branch named `review/*` but WITHOUT authority-proven provenance
 /// (no lease_kind in binding) must NOT be deleted by the authority-proven path.
 /// It falls through to the normal merged/squash check, which keeps it (review
@@ -5081,5 +5149,125 @@ fn expected_head_drift_fail_closed() {
         "skip reason must mention fail-closed: {reason}"
     );
 
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn disposable_review_active_task_kept_then_terminal_task_deletes() {
+    let home = tmp_home("disposable-active-terminal-home");
+    let repo = tmp_repo("disposable-active-terminal");
+    let branch = "review/disposable-active-terminal";
+    let tip = make_review_branch(&repo, branch);
+    let task_id = "T-disposable-active-terminal";
+    let binding =
+        binding_with_disposable_review(branch, &repo.display().to_string(), task_id, &tip);
+
+    seed_disposable_task(&home, task_id, branch, false);
+    let mut active = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut active);
+    assert!(
+        !active.branch_deleted,
+        "active task must preserve review branch"
+    );
+    assert!(branch_exists(&repo, branch));
+
+    // Transition the SAME task from active to terminal; a different terminal
+    // task id must not authorize deletion of this branch.
+    finish_disposable_task(&home, task_id);
+    let mut terminal = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut terminal);
+    assert!(
+        terminal.branch_deleted,
+        "terminal disposable review must delete: {:?}",
+        terminal.branch_cleanup_skipped_reason
+    );
+    assert!(!branch_exists(&repo, branch));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn disposable_review_missing_corrupt_or_drifted_state_is_kept() {
+    let home = tmp_home("disposable-fail-closed-home");
+    let repo = tmp_repo("disposable-fail-closed");
+    let branch = "review/disposable-fail-closed";
+    let tip = make_review_branch(&repo, branch);
+
+    let missing_task = binding_with_disposable_review(
+        branch,
+        &repo.display().to_string(),
+        "T-disposable-missing",
+        &tip,
+    );
+    let mut missing_out = ReleaseOutcome::default();
+    resolve_branch_cleanup(
+        &home,
+        &missing_task,
+        true,
+        false,
+        false,
+        false,
+        &mut missing_out,
+    );
+    assert!(!missing_out.branch_deleted);
+    assert!(branch_exists(&repo, branch));
+
+    let mismatch_task = "T-disposable-branch-mismatch";
+    seed_disposable_task(
+        &home,
+        mismatch_task,
+        "review/another-disposable-branch",
+        true,
+    );
+    let mut mismatch = missing_task.clone();
+    mismatch["task_id"] = serde_json::json!(mismatch_task);
+    let mut mismatch_out = ReleaseOutcome::default();
+    resolve_branch_cleanup(
+        &home,
+        &mismatch,
+        true,
+        false,
+        false,
+        false,
+        &mut mismatch_out,
+    );
+    assert!(!mismatch_out.branch_deleted);
+    assert!(branch_exists(&repo, branch));
+
+    let mut corrupt = missing_task.clone();
+    corrupt["provenance"] = serde_json::json!("Forged");
+    let mut corrupt_out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &corrupt, true, false, false, false, &mut corrupt_out);
+    assert!(!corrupt_out.branch_deleted);
+    assert!(branch_exists(&repo, branch));
+
+    let mut drift = missing_task;
+    drift["task_id"] = serde_json::json!("T-disposable-drift");
+    seed_disposable_task(&home, "T-disposable-drift", branch, true);
+    let _new_tip = make_review_branch(&repo, "review/disposable-drift-scaffold");
+    // Move the disposable branch itself after provenance was recorded.
+    git_in(&repo, &["checkout", branch]);
+    std::fs::write(repo.join("drift.txt"), "drift").unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "drift",
+        ],
+    );
+    git_in(&repo, &["checkout", "main"]);
+    let mut drift_out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &drift, true, false, false, false, &mut drift_out);
+    assert!(!drift_out.branch_deleted);
+    assert!(branch_exists(&repo, branch));
+
+    std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
