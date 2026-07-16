@@ -172,9 +172,21 @@ pub(crate) fn capability_allows(principal: crate::auth_cookie::Principal, method
 pub(crate) fn capability_allows_request(
     principal: crate::auth_cookie::Principal,
     method: &str,
-    _params: &Value,
+    params: &Value,
 ) -> bool {
-    capability_allows(principal, method)
+    if !capability_allows(principal, method) {
+        return false;
+    }
+    // `usage_limit_takeover` is an operator-only seam. Enforce that authority
+    // from the authenticated principal before the mcp_tool worker resolves
+    // the spoofable payload instance or enters the mode gate.
+    if principal == crate::auth_cookie::Principal::Agent
+        && method == super::method::MCP_TOOL
+        && params.get("tool").and_then(Value::as_str) == Some("usage_limit_takeover")
+    {
+        return false;
+    }
+    true
 }
 
 /// Decide whether `method` (+ `params`) is allowed under the current

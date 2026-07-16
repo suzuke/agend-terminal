@@ -1532,11 +1532,36 @@ mod tests {
             }
         }
 
-        let _ = api_request(
+        let active_resp = api_request(
             port,
             &home,
             &json!({"method": "mode", "params": {"mode": "active"}}),
         );
+        assert_eq!(active_resp["ok"], true, "mode reset failed: {active_resp}");
+        let operator_response = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "mcp_tool",
+                "params": {
+                    "tool": "usage_limit_takeover",
+                    "instance": "",
+                    "arguments": {
+                        "source": "worker-a",
+                        "episode_id": "forged"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            operator_response["ok"], true,
+            "operator path was gated: {operator_response}"
+        );
+        assert_eq!(
+            operator_response["result"]["error_code"], "binding_unreadable",
+            "operator request must reach the usage-limit handler: {operator_response}"
+        );
+
         stop_server(&shutdown, &home);
     }
 
