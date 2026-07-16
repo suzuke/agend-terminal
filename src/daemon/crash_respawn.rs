@@ -533,7 +533,7 @@ mod tests {
 /// gate, so `0` proves the gate fired and `1` proves it let a real crash through.
 #[cfg(test)]
 mod deleted_gate_tests_1913 {
-    use super::handle_crash_respawn;
+    use super::{handle_crash_observation, handle_crash_respawn};
     use super::{AgentConfig, DaemonContext};
     use crate::agent::{AgentHandle, AgentRegistry};
     use crate::types::InstanceId;
@@ -746,6 +746,40 @@ mod deleted_gate_tests_1913 {
             assert_eq!(core.health.state, crate::health::HealthState::Failed);
         }
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn missing_registry_after_ready_is_discarded() {
+        let home = tmp_home("missing-registry");
+        let handle = make_handle(false);
+        let observation = crate::agent::crash_disposition::CrashObservation {
+            // Keep this key unique so parallel tests cannot reuse the fixed
+            // fleet UUID used by the legacy delete-gate fixtures.
+            instance_id: InstanceId::new(),
+            generation: handle.generation,
+            core: Arc::clone(&handle.core),
+            deleted: Arc::clone(&handle.deleted),
+            owner_shutdown: None,
+            name: handle.name.clone(),
+        };
+        let key = observation.key();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = make_ctx(registry);
+
+        handle_crash_observation(&home, &observation, &ctx);
+
+        assert_eq!(
+            crate::agent::crash_disposition::owner_ledger().disposition(key),
+            Some(crate::agent::crash_disposition::Disposition::Discarded)
+        );
+        assert!(
+            !crate::agent::crash_disposition::owner_ledger()
+                .pending()
+                .iter()
+                .any(|pending| pending.key() == key),
+            "a missing registry must not strand a Ready recovery as Pending"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

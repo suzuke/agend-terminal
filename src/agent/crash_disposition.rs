@@ -474,4 +474,98 @@ mod tests {
         assert!(ledger.mark_failed(failed_token));
         assert_eq!(ledger.disposition(failed.key()), Some(Disposition::Failed));
     }
+
+    #[test]
+    fn executing_cannot_be_mutated_by_late_claim_or_begin_or_discard() {
+        let ledger = CrashDispositionLedger::new();
+
+        let id_claim = InstanceId::new();
+        let deleted_claim = Arc::new(AtomicBool::new(false));
+        let claim_obs = observation(id_claim, SpawnGeneration::new(8), &deleted_claim, None);
+        ledger.register_generation(id_claim, claim_obs.generation);
+        assert!(ledger.publish(claim_obs.clone()));
+        let claim_token = ledger
+            .claim(claim_obs.key(), Claimant::Crash)
+            .expect("claim");
+        assert!(ledger.mark_ready(claim_token));
+        assert!(ledger.begin_execute(claim_token));
+        ledger.register_generation(id_claim, SpawnGeneration::new(9));
+        assert!(ledger
+            .claim(claim_obs.key(), Claimant::RespawnWatchdog)
+            .is_none());
+        assert_eq!(
+            ledger.disposition(claim_obs.key()),
+            Some(Disposition::Executing)
+        );
+
+        let id_begin = InstanceId::new();
+        let deleted_begin = Arc::new(AtomicBool::new(false));
+        let begin_obs = observation(id_begin, SpawnGeneration::new(10), &deleted_begin, None);
+        ledger.register_generation(id_begin, begin_obs.generation);
+        assert!(ledger.publish(begin_obs.clone()));
+        let begin_token = ledger
+            .claim(begin_obs.key(), Claimant::Crash)
+            .expect("claim");
+        assert!(ledger.mark_ready(begin_token));
+        assert!(ledger.begin_execute(begin_token));
+        deleted_begin.store(true, Ordering::SeqCst);
+        assert!(!ledger.begin_execute(begin_token));
+        assert!(!ledger.begin_execute(begin_token));
+        assert_eq!(
+            ledger.disposition(begin_obs.key()),
+            Some(Disposition::Executing)
+        );
+
+        let id_discard = InstanceId::new();
+        let deleted_discard = Arc::new(AtomicBool::new(false));
+        let discard_obs = observation(id_discard, SpawnGeneration::new(11), &deleted_discard, None);
+        ledger.register_generation(id_discard, discard_obs.generation);
+        assert!(ledger.publish(discard_obs.clone()));
+        let discard_token = ledger
+            .claim(discard_obs.key(), Claimant::Crash)
+            .expect("claim");
+        assert!(ledger.mark_ready(discard_token));
+        assert!(ledger.begin_execute(discard_token));
+        assert!(!ledger.discard(discard_obs.key()));
+        assert_eq!(
+            ledger.disposition(discard_obs.key()),
+            Some(Disposition::Executing)
+        );
+        assert!(ledger.mark_live(discard_token));
+        assert_eq!(
+            ledger.disposition(discard_obs.key()),
+            Some(Disposition::Live)
+        );
+    }
+
+    #[test]
+    fn superseded_terminal_entries_release_core_and_fence_late_publish() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let old = observation(id, SpawnGeneration::new(12), &deleted, None);
+        let weak_core = Arc::downgrade(&old.core);
+        ledger.register_generation(id, old.generation);
+        assert!(ledger.publish(old.clone()));
+        let token = ledger.claim(old.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+        assert!(ledger.begin_execute(token));
+        assert!(ledger.mark_failed(token));
+
+        ledger.register_generation(id, SpawnGeneration::new(13));
+        drop(old);
+        assert!(
+            weak_core.upgrade().is_none(),
+            "superseded terminal entries must not retain the old core Arc"
+        );
+        let late = observation(id, SpawnGeneration::new(12), &deleted, None);
+        assert!(!ledger.publish(late));
+        assert_eq!(
+            ledger.disposition(DispositionKey {
+                instance_id: id,
+                generation: SpawnGeneration::new(12)
+            }),
+            Some(Disposition::Failed)
+        );
+    }
 }

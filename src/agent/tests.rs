@@ -2058,13 +2058,14 @@ fn deleted_guard_is_precise_real_crash_still_emits_rank4() {
 #[allow(clippy::unwrap_used)]
 fn crash_publication_carries_exact_generation_context_slice1_red() {
     let (handle, id) = make_crash_exit_handle(false);
+    let expected_generation = handle.generation;
     let rx = run_pty_close_capturing_crash(handle, id);
     let got = rx.try_recv().unwrap();
     let crate::agent::AgentExitEvent::Crash(observation) = got else {
         panic!("real crash must publish a Crash observation");
     };
     assert_eq!(observation.instance_id, id);
-    assert!(observation.generation.value() > 0);
+    assert_eq!(observation.generation, expected_generation);
     assert!(std::sync::Arc::strong_count(&observation.core) >= 1);
     assert!(!observation
         .deleted
