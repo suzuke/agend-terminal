@@ -2,7 +2,11 @@ use super::*;
 
 #[test]
 fn release_repo_rejects_root_path() {
-    let result = handle_release_repo(&serde_json::json!({"path": "/"}));
+    let result = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": "/"}),
+        "",
+    );
     assert!(result["error"].as_str().is_some(), "root must be rejected");
 }
 
@@ -14,7 +18,11 @@ fn release_repo_rejects_system_path() {
 
 #[test]
 fn release_repo_rejects_empty_path() {
-    let result = handle_release_repo(&serde_json::json!({"path": ""}));
+    let result = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": ""}),
+        "",
+    );
     assert!(result["error"].as_str().is_some(), "empty must be rejected");
 }
 
@@ -146,7 +154,11 @@ fn handle_release_repo_never_deletes_bare_repo_83936() {
     assert!(bare.join("HEAD").exists(), "a bare repo must have HEAD");
     assert!(!bare.join(".git").exists(), "a bare repo has NO .git child");
 
-    let _ = handle_release_repo(&serde_json::json!({"path": bare.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": bare.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         bare.exists() && bare.join("HEAD").exists(),
@@ -181,7 +193,11 @@ fn handle_release_repo_never_deletes_separate_git_dir_main_83936() {
     let keep = worktree.join("KEEP.txt");
     std::fs::write(&keep, "main content").unwrap();
 
-    let _ = handle_release_repo(&serde_json::json!({"path": worktree.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": worktree.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         worktree.exists() && keep.exists(),
@@ -200,7 +216,11 @@ fn handle_release_repo_refuses_non_repo_dir_83936() {
     std::fs::create_dir_all(&dir).ok();
     std::fs::write(dir.join("file.txt"), "data").unwrap();
 
-    let _ = handle_release_repo(&serde_json::json!({"path": dir.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": dir.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         dir.exists(),
@@ -220,7 +240,11 @@ fn handle_release_repo_never_deletes_main_repo_83936() {
     let keep = repo.join("KEEP.txt");
     std::fs::write(&keep, "canonical content").unwrap();
 
-    let _ = handle_release_repo(&serde_json::json!({"path": repo.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": repo.to_str().unwrap()}),
+        "",
+    );
 
     assert!(
         repo.exists(),
@@ -260,7 +284,11 @@ fn handle_release_repo_still_removes_linked_worktree_83936() {
         super::validate_release_path(wt.to_str().unwrap()).is_ok(),
         "a linked worktree must validate OK"
     );
-    let _ = handle_release_repo(&serde_json::json!({"path": wt.to_str().unwrap()}));
+    let _ = handle_release_repo(
+        std::path::Path::new("/tmp"),
+        &serde_json::json!({"path": wt.to_str().unwrap()}),
+        "",
+    );
     assert!(
         !wt.exists(),
         "a linked worktree must still be releasable/removed"
@@ -3036,4 +3064,495 @@ fn rewatch_clears_tombstone_optout_1991() {
         vec!["dev-2".to_string()]
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Arch-14 item 10: repo release canonical delegation (real dispatch entry)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn managed_wt_fixture(
+    tag: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let base = release_guard_tmp(tag);
+    let repo = base.join("source");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    git_init(&repo);
+    let wt = base.join("managed-wt");
+    std::process::Command::new("git")
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "feat/test"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).ok();
+    (base, home, repo, wt)
+}
+
+#[cfg(unix)]
+fn git_init(repo: &std::path::Path) {
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+}
+
+#[cfg(unix)]
+fn seed_managed_marker(
+    wt: &std::path::Path,
+    repo: &std::path::Path,
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+) {
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .expect("write marker");
+    crate::binding::bind_full(home, agent, "", branch, wt, repo, false).expect("bind");
+}
+
+#[cfg(unix)]
+fn dispatch_repo_release(home: &std::path::Path, caller: &str, path: &str) -> serde_json::Value {
+    let args = serde_json::json!({"action": "release", "path": path});
+    let sender: Option<crate::identity::Sender> = if caller.is_empty() {
+        None
+    } else {
+        crate::identity::Sender::new(caller)
+    };
+    let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+        home,
+        args: &args,
+        instance_name: sender.as_ref().map_or("", |s| s.as_str()),
+        sender: &sender,
+        runtime: None,
+    };
+    crate::mcp::handlers::dispatch::dispatch_repo(&ctx)
+}
+
+/// RED A1: managed worktree release must clear binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_managed_clears_binding_via_dispatch() {
+    let (base, home, repo, wt) = managed_wt_fixture("a1");
+    seed_managed_marker(&wt, &repo, &home, "agent-a1", "feat/test");
+    assert!(
+        crate::binding::read(&home, "agent-a1").is_some(),
+        "precondition"
+    );
+    let _ = dispatch_repo_release(&home, "agent-a1", wt.to_str().unwrap());
+    assert!(
+        crate::binding::read(&home, "agent-a1").is_none(),
+        "managed release must clear binding (RED: currently orphaned)"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// RED A3: corrupt marker must fail-closed — worktree preserved.
+#[test]
+#[cfg(unix)]
+fn repo_release_corrupt_marker_refuses_via_dispatch() {
+    let (base, home, _repo, wt) = managed_wt_fixture("a3");
+    std::fs::write(wt.join(".agend-managed"), "corrupt\n").expect("corrupt");
+    let _ = dispatch_repo_release(&home, "anyone", wt.to_str().unwrap());
+    assert!(
+        wt.exists(),
+        "corrupt-marker managed worktree must be preserved (RED)"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// RED A5: stale marker naming agent-a while agent-a's binding is at
+/// different live path → refuse, preserve live binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_stale_marker_preserves_live_binding() {
+    let (base, home, repo, stale_wt) = managed_wt_fixture("a5");
+    // Agent-a bound to a DIFFERENT live worktree.
+    let live_wt = base.join("live-wt");
+    std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            live_wt.to_str().unwrap(),
+            "-b",
+            "feat/live",
+        ])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    seed_managed_marker(&live_wt, &repo, &home, "agent-a", "feat/live");
+    // Stale worktree claims agent-a with full marker but binding points elsewhere.
+    std::fs::write(
+        stale_wt.join(".agend-managed"),
+        format!(
+            "agent=agent-a\nbranch=feat/test\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .expect("stale marker");
+
+    let r = dispatch_repo_release(&home, "agent-a", stale_wt.to_str().unwrap());
+
+    // Stale path must also be preserved (not deleted).
+    assert!(
+        stale_wt.exists(),
+        "stale managed worktree must be preserved when binding mismatches (RED)"
+    );
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "stale-path mismatch must return error/code (RED): {r}"
+    );
+    assert!(live_wt.exists(), "live worktree must survive stale release");
+    let binding = crate::binding::read(&home, "agent-a");
+    assert!(binding.is_some(), "binding must survive");
+    assert_eq!(
+        binding.unwrap()["worktree"].as_str().unwrap_or(""),
+        live_wt.to_str().unwrap(),
+        "binding must still point to live worktree"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// RED A2: dirty managed worktree → WIP preserved in recovery ref,
+/// binding + worktree still released.
+#[test]
+#[cfg(unix)]
+fn repo_release_dirty_managed_preserves_wip() {
+    let (base, home, repo, wt) = managed_wt_fixture("a2");
+    seed_managed_marker(&wt, &repo, &home, "agent-a2", "feat/test");
+    // Seed tracked file + dirty it.
+    std::fs::write(wt.join("tracked.txt"), "v1\n").expect("tracked");
+    std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed",
+        ])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    std::fs::write(wt.join("tracked.txt"), "v1\nDIRTY\n").expect("dirty");
+
+    let _r = dispatch_repo_release(&home, "agent-a2", wt.to_str().unwrap());
+
+    // Binding must be cleared even for dirty release (WIP preserved first).
+    assert!(
+        crate::binding::read(&home, "agent-a2").is_none(),
+        "dirty managed release must clear binding (RED)"
+    );
+    // Recovery ref must contain the DIRTY content.
+    let refs = {
+        let out = std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/agend/recovery/feat/test/",
+            ])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git for-each-ref");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !refs.is_empty(),
+        "dirty managed release must create a recovery ref (RED)"
+    );
+    let show = std::process::Command::new("git")
+        .args(["show", &format!("{}:tracked.txt", refs[0])])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git show");
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("DIRTY"),
+        "recovery ref must contain the DIRTY modification (RED)"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// RED A4: non-owner peer caller is refused; owner succeeds.
+#[test]
+#[cfg(unix)]
+fn repo_release_non_owner_refused_owner_succeeds() {
+    let (base, home, repo, wt) = managed_wt_fixture("a4");
+    seed_managed_marker(&wt, &repo, &home, "owner-agent", "feat/test");
+
+    // Peer caller (not owner) → must be refused.
+    let r = dispatch_repo_release(&home, "peer-agent", wt.to_str().unwrap());
+    assert!(
+        crate::binding::read(&home, "owner-agent").is_some(),
+        "binding must survive peer attempt (RED)"
+    );
+    assert!(
+        r.get("error").is_some(),
+        "non-owner peer must be refused (RED): {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must survive non-owner release attempt (RED)"
+    );
+
+    // Owner caller → must succeed.
+    let r = dispatch_repo_release(&home, "owner-agent", wt.to_str().unwrap());
+    assert!(
+        crate::binding::read(&home, "owner-agent").is_none(),
+        "owner release must clear binding (RED)"
+    );
+    let _ = r; // response structure TBD
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker says branch=feat/other but binding has branch=feat/test → refuse,
+/// preserve worktree + binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_branch_mismatch_refuses() {
+    let (base, home, repo, wt) = managed_wt_fixture("br-mm");
+    // Bind normally (branch=feat/test from the worktree add).
+    seed_managed_marker(&wt, &repo, &home, "agent-brmm", "feat/test");
+    // Overwrite marker with a DIFFERENT branch — simulates stale/tampered marker.
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!(
+            "agent=agent-brmm\nbranch=feat/other\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .expect("overwrite marker");
+
+    let r = dispatch_repo_release(&home, "agent-brmm", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "branch mismatch must return error: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on branch mismatch");
+    assert!(
+        crate::binding::read(&home, "agent-brmm").is_some(),
+        "binding must be preserved on branch mismatch"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker says source_repo=/other but binding has the real repo → refuse,
+/// preserve worktree + binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_source_mismatch_refuses() {
+    let (base, home, repo, wt) = managed_wt_fixture("sr-mm");
+    seed_managed_marker(&wt, &repo, &home, "agent-srmm", "feat/test");
+    // Overwrite marker with a DIFFERENT source_repo.
+    std::fs::write(
+        wt.join(".agend-managed"),
+        "agent=agent-srmm\nbranch=feat/test\nsource_repo=/bogus/repo\n",
+    )
+    .expect("overwrite marker");
+
+    let r = dispatch_repo_release(&home, "agent-srmm", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "source mismatch must return error: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on source mismatch");
+    assert!(
+        crate::binding::read(&home, "agent-srmm").is_some(),
+        "binding must be preserved on source mismatch"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker rewritten AFTER pre-read but BEFORE canonical locks — proves
+/// the under-lock fresh re-read catches it.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_rewritten_after_snapshot_refuses() {
+    use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
+
+    let (base, home, repo, wt) = managed_wt_fixture("seam");
+    seed_managed_marker(&wt, &repo, &home, "agent-seam", "feat/test");
+
+    let wt_clone = wt.clone();
+    let _guard = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::AfterBindingSnapshot {
+            std::fs::write(
+                wt_clone.join(".agend-managed"),
+                "agent=agent-seam\nbranch=feat/tampered\nsource_repo=/tampered\n",
+            )
+            .expect("rewrite marker in seam");
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "agent-seam", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "marker rewritten after snapshot must be caught under lock: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is tampered"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-seam").is_some(),
+        "binding must be preserved when marker is tampered"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker DELETED after pre-read — under-lock re-read must refuse.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_deleted_after_snapshot_refuses() {
+    use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
+
+    let (base, home, repo, wt) = managed_wt_fixture("del");
+    seed_managed_marker(&wt, &repo, &home, "agent-del", "feat/test");
+
+    let wt_clone = wt.clone();
+    let _guard = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::AfterBindingSnapshot {
+            let _ = std::fs::remove_file(wt_clone.join(".agend-managed"));
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "agent-del", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "marker deleted after snapshot must be caught under lock: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is deleted"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-del").is_some(),
+        "binding must be preserved when marker is deleted"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Marker rewritten with BLANK branch/source after pre-read — must refuse.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_blanked_after_snapshot_refuses() {
+    use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
+
+    let (base, home, repo, wt) = managed_wt_fixture("blank");
+    seed_managed_marker(&wt, &repo, &home, "agent-blank", "feat/test");
+
+    let wt_clone = wt.clone();
+    let _guard = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::AfterBindingSnapshot {
+            std::fs::write(
+                wt_clone.join(".agend-managed"),
+                "agent=agent-blank\nbranch=\nsource_repo=\n",
+            )
+            .expect("blank marker in seam");
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "agent-blank", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "blanked marker after snapshot must be caught under lock: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is blanked"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-blank").is_some(),
+        "binding must be preserved when marker is blanked"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Both binding and marker share the same non-existent source_repo path.
+/// Canonicalize must fail → refuse, not pass via raw string equality.
+#[test]
+#[cfg(unix)]
+fn repo_release_nonexistent_source_refuses() {
+    let (base, home, _repo, wt) = managed_wt_fixture("nosrc");
+    let bogus = "/nonexistent/source/repo/for/test";
+    // Write marker with non-existent source.
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!("agent=agent-nosrc\nbranch=feat/test\nsource_repo={bogus}\n"),
+    )
+    .expect("write marker");
+    // Bind with the same non-existent source.
+    crate::binding::bind_full(
+        &home,
+        "agent-nosrc",
+        "",
+        "feat/test",
+        &wt,
+        std::path::Path::new(bogus),
+        false,
+    )
+    .expect("bind");
+
+    let r = dispatch_repo_release(&home, "agent-nosrc", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "non-existent source_repo must refuse even when both match: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved on non-existent source"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-nosrc").is_some(),
+        "binding must be preserved on non-existent source"
+    );
+    std::fs::remove_dir_all(&base).ok();
 }

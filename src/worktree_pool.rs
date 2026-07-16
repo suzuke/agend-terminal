@@ -916,6 +916,7 @@ fn release_full_guarded(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
     provenance: ReleaseProvenance,
+    validate_marker: bool,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
@@ -969,6 +970,100 @@ fn release_full_guarded(
         } if live == fingerprint => value,
         GuardedBinding::Known { .. } => return stale_release(),
     };
+    let wt_path = current["worktree"].as_str().unwrap_or("");
+    let wt_exists = !wt_path.is_empty() && Path::new(wt_path).exists();
+    if validate_marker && wt_exists {
+        let marker_path = Path::new(wt_path).join(MANAGED_MARKER);
+        let marker_content = match std::fs::read_to_string(&marker_path) {
+            Ok(c) => c,
+            Err(_) => {
+                return ReleaseOutcome {
+                    error: Some(
+                        "managed marker absent or unreadable under lock — refusing (fail-closed)"
+                            .into(),
+                    ),
+                    ..ReleaseOutcome::default()
+                };
+            }
+        };
+        let mk_get = |prefix: &str| {
+            marker_content
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let mk_agent = mk_get("agent=");
+        let mk_branch = mk_get("branch=");
+        let mk_source = mk_get("source_repo=");
+        if mk_agent.is_empty() || mk_branch.is_empty() || mk_source.is_empty() {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "managed marker has empty identity under lock (agent={mk_agent:?} \
+                     branch={mk_branch:?} source={mk_source:?}) — refusing (fail-closed)"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        if mk_agent != agent {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker agent '{mk_agent}' does not match release agent '{agent}' — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        let bound_branch = current["branch"].as_str().unwrap_or("");
+        if mk_branch != bound_branch {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker branch '{mk_branch}' does not match binding branch '{bound_branch}' — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        let bound_source_str = current["source_repo"].as_str().unwrap_or("");
+        if bound_source_str.is_empty() {
+            return ReleaseOutcome {
+                error: Some("binding source_repo is empty — refusing (fail-closed)".into()),
+                ..ReleaseOutcome::default()
+            };
+        }
+        let Ok(mk_source_canonical) = std::fs::canonicalize(&mk_source) else {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker source_repo '{mk_source}' cannot be canonicalized — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        };
+        let Ok(bound_source_canonical) = std::fs::canonicalize(bound_source_str) else {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "binding source_repo '{bound_source_str}' cannot be canonicalized — refusing"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        };
+        if mk_source_canonical != bound_source_canonical {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "marker source_repo '{}' does not match binding source_repo '{}' — refusing",
+                    mk_source, bound_source_str
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+        if !target_source_repo_matches(Path::new(wt_path), &bound_source_canonical) {
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "worktree git pointer does not match source_repo '{}' — refusing",
+                    bound_source_canonical.display()
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+    }
     let mut locked = release_known_locked(home, agent, &current, dry_run, permit);
     // Explicit drops document the lock boundary: no notice, marker cleanup,
     // branch cleanup, or release event runs with a flock held.
@@ -1029,6 +1124,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         &permit,
         None,
         ReleaseProvenance::Manual,
+        false,
     )
 }
 
@@ -1048,13 +1144,14 @@ pub(crate) fn release_full_with_permit_origin(
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     provenance: ReleaseProvenance,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, permit, None, provenance)
+    release_full_guarded(home, agent, dry_run, permit, None, provenance, false)
 }
 
 pub(crate) fn release_full_exact(
     home: &Path,
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
+    validate_marker: bool,
 ) -> ReleaseOutcome {
     let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
@@ -1076,6 +1173,7 @@ pub(crate) fn release_full_exact(
         &permit,
         Some(expected),
         ReleaseProvenance::Auto,
+        validate_marker,
     )
 }
 

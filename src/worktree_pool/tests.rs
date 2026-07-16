@@ -1012,7 +1012,7 @@ fn aliased_manual_and_auto_release_share_one_lifecycle_transaction_s2() {
     });
 
     entered_rx.recv().expect("manual release reached snapshot");
-    let auto = release_full_exact(&alias, "agent-alias", &expected);
+    let auto = release_full_exact(&alias, "agent-alias", &expected, false);
     assert!(
         auto.error
             .as_deref()
@@ -1227,7 +1227,7 @@ fn auto_release_exact_fingerprint_cannot_release_new_generation_s1() {
     .expect("write generation B");
     drop(branch_lock);
 
-    let outcome = release_full_exact(&home, "agent-auto", &old);
+    let outcome = release_full_exact(&home, "agent-auto", &old, false);
     assert!(
         outcome.stale_fingerprint && !outcome.released,
         "auto-release A must reject B exactly: {outcome:?}"
@@ -4699,7 +4699,7 @@ fn r6_dirty_recovery_ref_integrity_under_concurrent_release() {
     // Actor B (auto-CAS release via release_full_exact): must be refused
     // by the permit — it must create no recovery ref, remove no binding,
     // remove no worktree content.
-    let outcome_b = release_full_exact(&home, "agent-di", &fingerprint);
+    let outcome_b = release_full_exact(&home, "agent-di", &fingerprint, false);
     assert!(
         outcome_b
             .error

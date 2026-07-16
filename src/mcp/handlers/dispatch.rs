@@ -350,7 +350,7 @@ pub(crate) fn dispatch_health(ctx: &HandlerCtx<'_>) -> Value {
 
 action_adapter!(dispatch_repo, "repo", [
     "checkout"                => ci::handle_checkout_repo,              hai;
-    "release"                 => ci::handle_release_repo,               a;
+    "release"                 => ci::handle_release_repo,               hai;
     "cleanup_init_commits"    => ci::handle_cleanup_init_commits,       hai;
     "cleanup_merged_branches" => ci::handle_cleanup_merged_branches,    hai;
     "merge"                   => ci::handle_merge_repo,                 hai;
