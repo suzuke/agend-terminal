@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     // Sprint 21 Phase 5 — atomic multi-field metadata helper tests.
-    // Closes the F7 race window from Sprint 20 Track B audit (DAEMON.md
+    // Closes the F7 race window documented in docs/DAEMON-LOCK-ORDERING.md
     // §1 F7): two sequential `save_metadata` calls had a partial-write
     // window where a daemon crash between the two writes left disk state
     // inconsistent (waiting_on cleared but waiting_on_since stale).

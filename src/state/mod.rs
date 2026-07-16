@@ -266,7 +266,7 @@ pub struct StateTracker {
     /// a `Productive` signal (heartbeat refresh or structural marker match) at
     /// `t`. Bare screen change does NOT set this — unlike `last_output`. Read by
     /// the daemon supervisor and passed to `check_hang` as `silent_productive`
-    /// for the dual-path Hung detection. See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md`
+    /// for the dual-path Hung detection. See `docs/HUNG-STATE-TRANSITIONS.md`
     /// §F9.1 architecture and §F9.3 dual-path decision table.
     ///
     /// `None` until the FIRST productive signal — distinguishing "never produced"
@@ -349,7 +349,7 @@ pub struct StateTracker {
     /// F9 (#685 sub-task 4): productive-output config for the dual-path
     /// supplement to silence-based Hung detection. Per-backend markers +
     /// heartbeat-as-productive toggle. See
-    /// `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.2 productive-signal design.
+    /// `docs/HUNG-STATE-TRANSITIONS.md` productive-signal design.
     productivity_config: Option<crate::behavioral::ProductivityConfig>,
     /// Instance name for telemetry logging.
     instance_name: String,
@@ -1479,7 +1479,7 @@ impl StateTracker {
     /// `last_productive_output.elapsed()` and passes it to `check_hang` as the
     /// dual-path signal. Activation of the new classification branch is gated on
     /// `AGEND_PRODUCTIVE_GATE=1` in `check_hang` (shadow-mode default). See
-    /// `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
+    /// `docs/HUNG-STATE-TRANSITIONS.md`.
     ///
     /// #685 PR-2 (reviewer #1009 / #1005 same-class flag): scan ONLY the recent
     /// tail (last MARKER_SCAN_TAIL_LINES rows) — historical completion markers

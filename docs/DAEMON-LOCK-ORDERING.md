@@ -1,3 +1,5 @@
+[繁體中文](DAEMON-LOCK-ORDERING.zh-TW.md)
+
 # Daemon Lock Ordering
 
 **Sprint 23 P0 deliverable** (per dev-reviewer-2 cross-vantage demand) —
@@ -126,7 +128,7 @@ only as instantaneous-release sinks → no cycle possible → deadlock-free.
 The `heartbeat_pair` lock began as the three timing fields below and now also
 owns per-turn reply-routing/settlement fields. `snapshot_for` clones the whole
 `HeartbeatPair` under one brief guard, preserving a consistent view across the
-per-tick + MCP heartbeat/write race window (Sprint 20 DAEMON.md §1 F6). Timing
+per-tick + MCP heartbeat/write race window identified in the Sprint 20 audit. Timing
 fields:
 
 - `heartbeat_at_ms: u64` — last MCP tool call timestamp (Sprint 23 P0 PR #235)
@@ -228,9 +230,9 @@ enforces:
 
 ## Related
 
-- Sprint 20 Track B audit: `docs/codebase-review-2026-04-27/DAEMON.md`
-  §1 F6 (this race window) + F7 (the disk-side companion, fixed Sprint 22
-  P2a PR #233 via `save_metadata_batch`).
+- Sprint 20 Track B daemon audit (historical; retrieve it from repository
+  history): §1 F6 (this race window) + F7 (the disk-side companion, fixed
+  Sprint 22 P2a PR #233 via `save_metadata_batch`).
 - Sprint 22 P2a: the now-retired outbound-path audit established the
   EXEMPTED_LEGACY_FILES anti-growth template retained by the live heartbeat
   atomicity audit.

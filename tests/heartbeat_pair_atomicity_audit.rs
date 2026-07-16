@@ -2,7 +2,7 @@
 //!
 //! Mirrors PR #233 dual-coverage anti-rollback pattern (source-grep guard
 //! plus behavioural test) applied to F6 lock-around-pair (Sprint 20
-//! DAEMON.md F6). Extends Sprint 22 P0 anti-growth contract pattern.
+//! docs/DAEMON-LOCK-ORDERING.md). Extends Sprint 22 P0 anti-growth contract pattern.
 //!
 //! ## Two enforcement layers
 //!

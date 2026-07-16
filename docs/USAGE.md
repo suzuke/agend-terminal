@@ -96,7 +96,7 @@ detection — `src/daemon/supervisor.rs`). A graceful restart / binary reload is
 driven by the `restart_daemon` MCP tool (self-respawn: the daemon spawns a
 successor, health-gates it, then exits — #1814), or by the OS service manager
 when installed via `agend-terminal service install` (systemd / launchd / Task
-Scheduler). For an external keep-alive wrapper, see `docs/MCP-DAEMON-PROXY-CONTRACT.md`.
+Scheduler).
 
 **When to use:** run `agend-terminal service install` for OS-managed restart on
 crash/boot; call `restart_daemon` to reload after upgrading the binary.

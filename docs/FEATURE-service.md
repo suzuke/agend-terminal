@@ -145,6 +145,22 @@ Status checks are:
 - That is treated as a warning, not as a hard failure for the file-rendering part.
 - No sudo is required because this is all user-level.
 
+### Logout persistence with `loginctl`
+
+A systemd user manager normally stops after the user's final login session
+ends. On a headless or always-on Linux host, enable linger once after install:
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" --property=Linger  # expected: Linger=yes
+```
+
+This starts the user manager at boot and keeps the service alive across logout.
+It is idempotent and does not require root for the current user. Opt out with
+`loginctl disable-linger`; use `agend-terminal service uninstall` when the
+service itself should be removed. macOS launchd and the Windows at-logon task
+have no equivalent extra step.
+
 ## Windows behavior
 
 Windows uses Task Scheduler.
@@ -199,6 +215,32 @@ In practice:
 - `service status` asks whether the OS still has the service registration.
 
 If you upgrade the binary, re-run `service install` so the service manager gets the new absolute path and current `AGEND_HOME`.
+
+### Launch path matrix
+
+| Command | No daemon running | Daemon already running | Shell behavior |
+|---|---|---|---|
+| `agend-terminal start` | spawns a detached daemon; parent exits | refuses the second daemon | non-blocking |
+| `agend-terminal start --foreground` | runs the daemon in the foreground | refuses the second daemon | blocks; Ctrl+C stops it |
+| `agend-terminal start --agents NAME:CMD ...` | implies foreground mode, skips `fleet.yaml`, and starts only the listed agents | refuses the second daemon | blocks |
+| `agend-terminal app` | **Owned**: the TUI owns an in-process daemon | **Attached**: the TUI is a client of the existing daemon | blocks |
+| `agend-terminal tray` | resident UI; its Start action shells out to `start --foreground` | reflects daemon state without spawning another | resident |
+
+`bootstrap::prepare()` probes the run directory, acquires the exclusive daemon
+lock, probes again as a TOCTOU guard, then returns either `Attached` or `Owned`.
+This creates one important operator asymmetry: leaving a cold-started Owned
+`app` also ends its daemon and PTYs, while leaving an Attached `app` only closes
+the TUI. Issue #879 closed the attempted always-Attached migration; the
+asymmetry is current behavior.
+
+The tray must remain outside daemon internals. Its Start action executes
+`agend-terminal start --foreground`; it does not take the daemon lock or call
+the API directly. Detached spawn also re-executes with `--foreground` so the
+child cannot recursively enter the detach branch.
+
+Lifecycle-adjacent commands are `attach <name>` (attach to an existing PTY),
+`connect <name> --backend X` (temporary external backend), `stop`, `kill
+<name>`, and `list` (`status` / `ls`).
 
 ## Common workflows
 

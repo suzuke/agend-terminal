@@ -694,7 +694,7 @@ impl HealthTracker {
     /// catching the F9 grey failure where 1-byte spinner output keeps
     /// `silent` below threshold while no productive work happens. Default
     /// (env var unset) behavior is shadow-mode: telemetry collected, no
-    /// classification change. See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
+    /// classification change. See `docs/HUNG-STATE-TRANSITIONS.md`.
     pub fn check_hang(
         &mut self,
         agent_state: AgentState,

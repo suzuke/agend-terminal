@@ -1,3 +1,5 @@
+[繁體中文](PULL_REQUEST_TEMPLATE.zh-TW.md)
+
 <!-- Thanks for contributing! Please complete the checklist below. PRs that
 duplicate an already-merged change, or re-implement an already-decided approach
 without advancing it, may be closed without further review. -->

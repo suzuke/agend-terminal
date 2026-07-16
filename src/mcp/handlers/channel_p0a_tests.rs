@@ -3,8 +3,8 @@
 //! Located in this sibling file (loaded via `#[path]` from channel.rs) per
 //! Sprint 54 PR #517 / Sprint 55 PR #522 cycle-10 file_size_invariant pattern.
 //!
-//! Covers 11 edge cases (7 from dev RCA + 4 reviewer-added per design doc
-//! `docs/DESIGN-sprint55-p0a-channel-discipline-guard.md` §4). EC1/3/4/5/7
+//! Covers 11 edge cases (7 from dev RCA + 4 reviewer-added; the current
+//! channel contract is `docs/FEATURE-channels.md`). EC1/3/4/5/7
 //! collapse onto the same "snapshot read at handler-time → fallback when
 //! reply_to is None" path (Sprint 52 prior-art inheritance) and are
 //! consolidated into a single test case to avoid 5× boilerplate.

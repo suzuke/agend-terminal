@@ -5,6 +5,8 @@ title: 'feat: '
 labels: ['enhancement']
 ---
 
+[繁體中文](feature_request.zh-TW.md)
+
 ## Prior art check (required)
 
 <!-- Requests that duplicate an existing (open OR closed) issue, or re-raise an

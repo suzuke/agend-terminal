@@ -1,6 +1,6 @@
 //! Channel capabilities — feature matrix consulted by core and UX layers.
 //!
-//! Per `docs/archived/PLAN-channel-abstraction.md` §3.4, this struct lets core code
+//! Per the contract in `docs/FEATURE-channels.md`, this struct lets core code
 //! query "does this channel emit deletion events?" / "what markdown dialect?"
 //! via data rather than `if channel.kind() == "telegram"` branches.
 //!
@@ -9,7 +9,7 @@
 //! - **Transport-layer caps** — consumed by the transport path (rate-limit,
 //!   markdown rendering, msg size split).
 //! - **UX-layer caps** — consumed by the UX renderer (see
-//!   `PLAN-channel-ux-layer.md` §6). Transport path **never** branches on
+//!   `docs/FEATURE-channels.md`). Transport path **never** branches on
 //!   UX caps directly.
 //!
 //! **Status (T1 prep scaffold):** fields are defined; readers for the UX

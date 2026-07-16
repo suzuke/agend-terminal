@@ -5,6 +5,8 @@ title: 'bug: '
 labels: ['bug']
 ---
 
+[繁體中文](bug_report.zh-TW.md)
+
 ## Prior art check (required)
 
 <!-- Reports that duplicate an existing (open OR closed) issue, or re-raise an

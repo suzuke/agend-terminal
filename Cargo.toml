@@ -3,7 +3,7 @@ name = "agend-terminal"
 version = "0.10.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 29 MCP tools"
+description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 32 MCP tools"
 license = "Apache-2.0"
 repository = "https://github.com/suzuke/agend-terminal"
 keywords = ["agent", "pty", "terminal", "mcp", "orchestration"]
@@ -41,18 +41,21 @@ include = [
     # fails with "No such file or directory" — caught the hard way during
     # the v0.4.0 publish attempt. Add any future bundled docs here too.
     "docs/FLEET-DEV-PROTOCOL.md",
+    "docs/FLEET-DEV-PROTOCOL.zh-TW.md",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
+    "README.zh-TW.md",
     "LICENSE",
     "NOTICE",
     "CHANGELOG.md",
+    "CHANGELOG.zh-TW.md",
 ]
 
 [lints.clippy]
 unwrap_used = "deny"
 
-# Menu-bar / system-tray resident app (see docs/archived/PLAN-tray-resident.md).
+# Menu-bar / system-tray resident app (see docs/FEATURE-service.md).
 # Default build stays lean: `tray-icon` + `tao` only pull in when
 # `--features tray` is passed (release binaries ship with it).
 [features]
@@ -242,9 +245,8 @@ rust-ini = "0.21"
 # `include_str!` paths against `[package].include` glob patterns
 # (e.g. `src/**/*.rs`, `assets/hooks/*`). Test-only.
 glob = "0.3"
-# Log-capture for failure-visibility regression pins (DESIGN-stage-b-ux.md
-# §7 PR-C names `tracing-test` as the sanctioned approach for asserting
-# `tracing::warn!` records are actually emitted).
+# Log-capture for failure-visibility regression pins: `tracing-test` is the
+# sanctioned approach for asserting `tracing::warn!` records are emitted.
 tracing-test = "0.2"
 # #2524 P2 cross-build proof (tests/agentic_git_shim_swap.rs): sign a bound
 # binding with the SAME core the daemon links (agend-terminal's build) so the

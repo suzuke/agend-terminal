@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end tests for the daemon-resident lifecycle (Stage 3.6).
 #
-# Scenarios (from docs/PLAN-daemon-resident.md §3.6):
+# Scenarios (see docs/FEATURE-service.md):
 #   1. start --detached → parent exits → daemon survives.
 #   2. Second start with fleet hits the flock → exits non-zero.
 #   3. app while daemon is live → connects as remote client (Stage 3.4).

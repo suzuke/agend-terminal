@@ -1,8 +1,8 @@
 //! Sprint 58 Wave 3 PR-1 (#12) — invariants for the cross-platform
-//! clippy gate helper script + lint-discipline doc.
+//! clippy gate helper script + contributing guide.
 //!
 //! Pins the structural contract of `scripts/clippy-all-platforms.sh`
-//! and `docs/LINT-DISCIPLINE.md` so future edits don't accidentally
+//! and `CONTRIBUTING.md` so future edits don't accidentally
 //! break the operator-runnable form (Shape c, passive Q3-aligned).
 
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ fn script_path() -> PathBuf {
 }
 
 fn doc_path() -> PathBuf {
-    repo_root().join("docs").join("LINT-DISCIPLINE.md")
+    repo_root().join("CONTRIBUTING.md")
 }
 
 #[test]
@@ -160,14 +160,14 @@ fn script_unknown_arg_exits_two_with_stderr() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// docs/LINT-DISCIPLINE.md invariants
+// CONTRIBUTING.md invariants
 // ─────────────────────────────────────────────────────────────
 
 #[test]
 fn doc_exists() {
     assert!(
         doc_path().exists(),
-        "docs/LINT-DISCIPLINE.md must exist (companion to the helper script)"
+        "CONTRIBUTING.md must exist (companion to the helper script)"
     );
 }
 
@@ -185,14 +185,16 @@ fn doc_covers_all_seven_recurring_patterns() {
     // The doc is the operator's reference for *why* the script is
     // useful — it captures the patterns from Sprint 56–57 fix-forward
     // cycles. Pin the surface so future edits don't drop coverage.
-    let content = std::fs::read_to_string(doc_path()).expect("read");
+    let content = std::fs::read_to_string(doc_path())
+        .expect("read")
+        .to_ascii_lowercase();
     let patterns = [
         ("dead_code", "Pattern 1 cfg-gated dead_code"),
         ("fire-and-forget", "Pattern 2 spawn-rationale"),
-        ("escap", "Pattern 3 format-aware shell escaping"), // matches "escape" or "escaping"
-        ("EXE_SUFFIX", "Pattern 4 Windows .exe handling"),
-        ("mtime", "Pattern 5 mtime cross-platform"),
-        ("canonicalize", "Pattern 6 path-separator + canonical-path"),
+        ("escape", "Pattern 3 format-aware shell escaping"),
+        ("exe_suffix", "Pattern 4 Windows .exe handling"),
+        ("modified()", "Pattern 5 mtime cross-platform"),
+        ("canonical", "Pattern 6 path-separator + canonical-path"),
         ("sleep", "Pattern 7 timing-sensitive cross-platform tests"),
     ];
     for (needle, label) in &patterns {
@@ -208,12 +210,10 @@ fn doc_covers_all_seven_recurring_patterns() {
 #[test]
 fn doc_documents_workflow_with_script_step() {
     let content = std::fs::read_to_string(doc_path()).expect("read");
-    // Pin the operator workflow: the doc must show a numbered checklist
-    // that includes the script as one of the steps.
+    // Pin the operator workflow inside the consolidated cross-platform section.
     let workflow_section = content
-        .split("workflow")
-        .nth(1)
-        .or_else(|| content.split("Workflow").nth(1))
+        .split_once("### Cross-platform lint patterns")
+        .map(|(_, section)| section)
         .unwrap_or("");
     assert!(
         workflow_section.contains("scripts/clippy-all-platforms.sh"),

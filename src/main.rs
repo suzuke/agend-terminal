@@ -613,7 +613,7 @@ enum CaptureAction {
         /// Scenario name (becomes the file stem in tests/fixtures/state-replay/)
         scenario_name: String,
         /// Required: F9 measurement classification per
-        /// docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6. Valid values:
+        /// tests/fixtures/state-replay/CAPTURE-RECIPES.md. Valid values:
         /// `productive_marker_fire`, `productive_silence`,
         /// `silent_stuck`, `hung`, `real_capture`.
         #[arg(long)]

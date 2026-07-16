@@ -3,6 +3,8 @@ name: setup-telegram
 description: Interactive guide to configure a Telegram channel for AgEnD — creates bot, detects group, writes fleet.yaml
 ---
 
+[繁體中文](SKILL.zh-TW.md)
+
 # /setup-telegram — Telegram Channel Setup
 
 Guide the user through setting up a Telegram bot channel for AgEnD. Use `AskUserQuestion` for choices, `Bash` (curl) for API verification, and `Read`/`Edit`/`Write` for config files.

@@ -174,7 +174,7 @@ fn rotate_captures_with_budget(dir: &Path, budget: u64) {
 
 // ── Promote ────────────────────────────────────────────────────────────────
 
-/// Canonical fixture destination per `docs/F685-FIXTURE-CORPUS.md`
+/// Canonical fixture destination per `tests/fixtures/state-replay/CAPTURE-RECIPES.md`
 /// §F685-CORPUS.6 — every promoted capture lands here so the replay
 /// harness discovers it. Public for `promote_capture` tests.
 pub const PROMOTE_DEST_DIR: &str = "tests/fixtures/state-replay";
@@ -185,7 +185,7 @@ pub const PROMOTE_MANIFEST_PATH: &str = "tests/fixtures/state-replay/MANIFEST.ya
 
 /// Operator-supplied classification for a promoted capture.
 ///
-/// Mirrors `docs/F685-FIXTURE-CORPUS.md` §F685-CORPUS.6 scenario_kind
+/// Mirrors the scenario-kind contract in `tests/fixtures/state-replay/CAPTURE-RECIPES.md`
 /// vocabulary + the `corpus_count_report` thresholds at
 /// `tests/fixture_corpus_measurement.rs`. CLI rejects values outside
 /// this set to keep MANIFEST.yaml schema-clean.

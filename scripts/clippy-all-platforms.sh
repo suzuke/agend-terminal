@@ -26,8 +26,8 @@
 #   - Full cross-compile linking still needs `cross` (Docker required) or
 #     CI matrix coverage. This script bridges the lint gap, not the
 #     link gap.
-#   - Rationale: see docs/LINT-DISCIPLINE.md for the patterns the cross-
-#     platform gate is designed to catch.
+#   - Rationale: see CONTRIBUTING.md ("Cross-platform lint patterns") for
+#     the patterns the cross-platform gate is designed to catch.
 
 set -euo pipefail
 

@@ -275,7 +275,8 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         // #35896-11 ⑤ (Q2 vet): any kind=report+correlation auto-settles the
         // SENDER's own delivering dispatch row (was gated on ack_inbox=true);
         // sender-scoped via ack_by_correlation (#2647 isolation), ack_inbox now a
-        // no-op. Q2 over-settle tradeoff: docs/DESIGN-notify-noise-unified.md.
+        // no-op. The sender-scoped correlation prevents another agent's row
+        // from being settled by the same report.
         if let Some(cid) = cid.filter(|s| !s.is_empty()) {
             let settled = crate::inbox::ack_by_correlation(home, sender.as_str(), cid);
             if let Some(obj) = result.as_object_mut() {

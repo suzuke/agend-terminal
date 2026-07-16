@@ -152,8 +152,8 @@ pub struct FleetConfig {
     pub passthrough_env: Vec<String>,
     /// Channel configuration (e.g., Telegram). Legacy singular form.
     ///
-    /// Prefer [`FleetConfig::channels`] (plural) going forward — per
-    /// `docs/archived/PLAN-channel-abstraction.md` §3.6. When both are omitted,
+    /// Prefer [`FleetConfig::channels`] (plural) going forward — see
+    /// `docs/FEATURE-channels.md`. When both are omitted,
     /// Telegram stays off. When only `channels:` is set, `normalize()`
     /// collapses the first entry into this field so existing call sites
     /// (which read `self.channel` directly) keep working unchanged.
@@ -293,9 +293,8 @@ pub enum ChannelConfig {
         /// this channel; the producer registry in `src/mcp/handlers.rs`
         /// still emits events, but nothing routes them to Telegram.
         ///
-        /// PR-A lands the schema only; resolution into a concrete
-        /// `BindingRef` and the rendering pipeline land with PR-B (see
-        /// `docs/archived/DESIGN-stage-b-ux.md` §3 and §5).
+        /// Resolution into a concrete `BindingRef` and the rendering pipeline
+        /// are described in `docs/FEATURE-channels.md`.
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
     },

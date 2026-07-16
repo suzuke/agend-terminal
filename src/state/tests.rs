@@ -1620,7 +1620,7 @@ struct ReplayFixture {
     // defaults — existing 13 fixtures (schema_version 1, implicit)
     // remain valid without manifest edits. Schema_version is a
     // future-compat metadata marker; no runtime enforcement Phase 1.
-    // See docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.2.
+    // See tests/fixtures/state-replay/CAPTURE-RECIPES.md.
     #[serde(default)]
     scenario_kind: Option<String>,
     #[serde(default)]

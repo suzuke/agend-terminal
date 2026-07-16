@@ -62,7 +62,7 @@ pub fn config_for(backend: &Backend) -> BehavioralConfig {
 // Uses presence-of-specific-output evidence (absence-of-output silence
 // inference was #2547-deleted dead code). Shares this module + the
 // `behavioral_shadow` tracing target for telemetry infrastructure reuse.
-// See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.2 for design rationale.
+// See `docs/HUNG-STATE-TRANSITIONS.md` for design rationale.
 // ---------------------------------------------------------------------------
 
 /// Productive-output inference result. Returned by `infer_productivity()`
@@ -237,7 +237,7 @@ pub(crate) const AGY_PRODUCTIVE_MARKERS: &[&str] = &[
 /// OpenCode: generic anchors + `→` completion glyph (NOT the in-flight
 /// `✱` glyph) with OpenCode tool-name vocabulary. Synthetic-only —
 /// not validated against real PTY captures; corpus growth path per
-/// `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6`.
+/// `tests/fixtures/state-replay/CAPTURE-RECIPES.md`.
 // #8 Phase 2 step-1: pub(crate) so the co-located OpenCode BackendProfile
 // references the SAME markers const (not a re-typed copy) → byte-identity with
 // the legacy config_for_productivity arm. Matches KIRO_PRODUCTIVE_MARKERS.

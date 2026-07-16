@@ -193,7 +193,7 @@ agend-terminal stop
 AGEND_INSTANCE_NAME=<name> agend-mcp-bridge
 ```
 
-不帶 `AGEND_INSTANCE_NAME` 執行是允許的，但會進入 standalone 模式並發出警告。Sprint 56 Track I (#531) 已退役先前的 `agend-terminal mcp` 子指令；遷移歷史見 [Phase 1 RCA](archived/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md)。
+不帶 `AGEND_INSTANCE_NAME` 執行是允許的，但會進入 standalone 模式並發出警告。Sprint 56 Track I (#531) 已退役先前的 `agend-terminal mcp` 子指令；舊 Phase 1 RCA 仍可依[歷史紀錄還原規則](README.zh-TW.md#歷史紀錄)取得。
 
 ### `capture`
 擷取 backend 輸出，或把 passive capture 提升到 state-replay corpus。

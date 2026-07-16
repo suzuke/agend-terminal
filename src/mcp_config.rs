@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Sprint 56 Track I-Phase2b (#531): the previous "fall back to
 /// `agend-terminal mcp` if bridge missing" behaviour is removed. Phase
-/// 1 RCA (`docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md`)
+/// 1 investigation (summarized in `docs/MCP-TOOLS.md`)
 /// identified the fallback as the load-bearing failure path: backends
 /// spawned with `agend-terminal mcp` route through `mcp::run`'s
 /// `proxy_or_local`, which for daemon-state-required tools (`reply` /

@@ -4,15 +4,12 @@
 
 > 當前狀態的結構地圖，整理自 #2050 架構盤點，並於 2026-07-16 對照
 > `main` @ `1d83b423` 重新核實命名過的結構錨點。盤點時期的 LOC 數字只作
-> 規模提示，不是不變量。[REFACTOR-PLAN.md](REFACTOR-PLAN.md) 是原始盤點
-> 衍生的歷史分階段計畫；現行收斂進度請看
-> [architecture/ARCHITECTURE-14-LEDGER.md](architecture/ARCHITECTURE-14-LEDGER.md)。
->
-> 新進人員：請先閱讀 [ARCHITECTURE-QUICK-START.md](ARCHITECTURE-QUICK-START.md)。
-> 重寫時期的原始設計文件已封存於
-> [archived/architecture-design-doc-2026-05.md](archived/architecture-design-doc-2026-05.md)。
-> Lock 紀律記載於 [DAEMON-LOCK-ORDERING.md](DAEMON-LOCK-ORDERING.md)，
-> 此處只做摘要（不重複內容）。
+> 規模提示，不是不變量。現行收斂進度請看
+> [ARCHITECTURE-14-LEDGER.zh-TW.md](ARCHITECTURE-14-LEDGER.zh-TW.md)。歷史盤點、
+> 計畫及重寫時期的設計，仍可依[文件索引](README.zh-TW.md#歷史紀錄)所記載的
+> immutable history snapshot 還原。Lock 紀律記載於
+> [DAEMON-LOCK-ORDERING.zh-TW.md](DAEMON-LOCK-ORDERING.zh-TW.md)，此處只做摘要
+> （不重複內容）。
 
 ## 1. 這是什麼
 
@@ -29,6 +26,28 @@ Telegram 遠端控制。核心價值在於 **multi-agent orchestration**；
 （每個 agent 的 stdio↔TCP MCP 中繼）、`agend-git`（PATH-shim 的 `git`
 政策閘門），以及 vendored `agentic-git`（flag 閘控的 shim 替代方案；見
 fleet `use_agentic_git_shim`）。
+
+### 1.1 操作邊界與閱讀路徑
+
+AgEnD 是單一 operator 使用的開發工具；信任邊界是本機使用者帳號與
+`$AGEND_HOME`（通常是 `~/.agend`，並相容舊的 `~/.agend-terminal`），不是
+multi-tenant service。Daemon 非預期 crash 時，由安裝好的 launchd、systemd 或
+Task Scheduler service 負責 supervise，而不是靠行程內的自我 supervisor。
+
+第一次閱讀程式碼時，可依下列穩定入口追蹤：
+
+- fleet schema：`src/fleet/`
+- app mode：`src/main.rs` → `src/app/mod.rs`
+- headless daemon：`src/daemon/mod.rs`
+- agent spawn：`src/agent/mod.rs` + `src/bootstrap/agent_resolve.rs`
+- MCP dispatch：`src/mcp/handlers/mod.rs` → `src/mcp/handlers/dispatch.rs`
+- state classification：`src/state/`、`src/backend_profile.rs` 與
+  `src/behavioral.rs`
+- TUI rendering：`src/render/` + `src/app/`
+
+開發及 fleet 流程的不變量，以
+[FLEET-DEV-PROTOCOL.zh-TW.md](FLEET-DEV-PROTOCOL.zh-TW.md)為規範；本架構地圖
+只解釋實作形狀，不會覆蓋該 protocol。
 
 ## 2. 子系統地圖
 
@@ -203,7 +222,7 @@ Release → crates.io publish（見 RELEASING.md）。
 | Fleet allowlist 解析是 fail-closed：一筆格式錯誤的 entry 就讓整份清單失敗 → 下游 auth 全部拒絕 | fleet load / `is_authorized_recipient` | 靜默的部分授權 |
 | binding.json 單一 writer + HMAC sidecar | binding.rs | shim 信任了偽造的 binding |
 | Task event log：在 lock 之下 append 並 re-replay（`append_checked`），對未知的未來 event 採 fail-closed | task_events.rs:1034,1538 | TOCTOU 造成 board 損毀 / 靜默丟失 event |
-| Boot grace（180s）在 restart 後抑制 notification watchdog | per_tick/mod.rs:118 | restart 時爆出一連串假警報（每個 handler 手工接線——見 REFACTOR-PLAN W2） |
+| Boot grace（180s）在 restart 後抑制 notification watchdog | per_tick/mod.rs:118 | restart 時爆出一連串假警報（handler 收斂進度記錄於 Architecture-14 台帳） |
 | Per-tick handler 順序須與 pre-extraction 的呼叫順序一致 | daemon/mod.rs:577-579 | 細微的反應重新排序 |
 | `spawn` 處須附帶 fire-and-forget 理由，或保存 JoinHandle | protocol §10.4、Phase-5b invariant test | 關閉時留下 orphan task |
 
@@ -224,8 +243,9 @@ Release → crates.io publish（見 RELEASING.md）。
 
 ## 6. 已知的架構張力
 
-這些是刻意或日積月累形成的雙路徑。每一項都是 REFACTOR-PLAN 的
-條目；沒有一項能在不顧及所列注意事項的情況下「隨手清乾淨」。
+這些是刻意或日積月累形成的雙路徑。目前處置記錄於
+[Architecture-14 台帳](ARCHITECTURE-14-LEDGER.zh-TW.md)；沒有一項能在
+不顧及所列注意事項的情況下「隨手清乾淨」。
 
 1. **兩套週期性工作機制**（§2.1）：✅ 已由 W1.1（#2065）解決。原本 12 個
    inline supervisor `maybe_scan` tracker，如今都是同一條
@@ -278,5 +298,5 @@ fixup-dev、fixup-dev-2 與 fixup-reviewer 對照 `main` @ `65d9ad82` 撰寫，
 另加上 2026-06-10 的 production-readiness 稽核，並於 2026-07-16 對
 `main@1d83b423` 做結構重驗。行號會漂移；
 那些命名過的 anchor（函式名、invariant test 名、issue 編號）才是
-穩定的參照。請在 REFACTOR-PLAN 的某一波 wave 落地時更新本地圖，
+穩定的參照。請在 Architecture-14 的成果落地時更新本地圖，
 而非每個 PR 都更新。

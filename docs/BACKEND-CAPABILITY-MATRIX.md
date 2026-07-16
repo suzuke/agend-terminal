@@ -22,7 +22,7 @@ high-confidence Hook/Stream correction through `shadow::operated_state` for
 raw view. The signal column below names both when a backend has that second
 plane; it does not imply that hooks rewrite `core.state.current`.
 
-[#2413](https://github.com/suzuke/agend-terminal/issues/2413) ("Out-of-path API-activity probe to fix false-idle blind spot in pattern-based agent_state") is the **improvement roadmap**: an ongoing empirical effort (the Shadow Observer, see `docs/SHADOW-OBSERVER-QUANT-AGY-2413.md` and its claude/codex siblings under `docs/archived/`) to measure whether additional structured signals — beyond raw PTY-pattern matching — can close the false-idle blind spot backend-by-backend. Where this matrix says "PTY heuristic," #2413's work may already be actively quantifying whether that can be upgraded for that backend. This document doesn't speak to that roadmap or its findings — only to what's true today. Read #2413's own docs for where that effort currently stands.
+[#2413](https://github.com/suzuke/agend-terminal/issues/2413) ("Out-of-path API-activity probe to fix false-idle blind spot in pattern-based agent_state") is the **improvement roadmap**: an ongoing empirical effort to measure whether structured signals beyond raw PTY-pattern matching can close the false-idle blind spot backend-by-backend. Where this matrix says "PTY heuristic," #2413 may be quantifying whether that backend can be upgraded. This document records only shipped behavior; historical measurement reports remain available through [the immutable history snapshot](README.md#historical-records).
 
 ## Signal-authority ladder (for reference)
 
@@ -41,6 +41,41 @@ plane; it does not imply that hooks rewrite `core.state.current`.
 | **Shell** / **Raw(String)** | None — no detection patterns at all; `agent_state` is hardcoded to `Idle` on spawn | Not applicable | Bulk; text still gets written + submitted (not a true no-op), just no backend-specific customization | Not supported — `args_for()` returns empty, so Resume and Fresh spawn identically | None — MCP config is skipped entirely for this backend | Utility tier; no incidents found in CHANGELOG (**unverified** whether that means "never broke" or "never tracked") |
 
 ---
+
+## Harness and model-provider overrides
+
+Backend detection has two separate axes:
+
+1. the **CLI harness**, which owns the PTY/tool loop and is detected from
+   `PATH`; and
+2. the **model provider**, which supplies the hosted or local token endpoint
+   configured through that harness.
+
+A provider is available only when a compatible harness, provider configuration,
+and usable credential are all present. Installer artifacts are hints, not proof
+of availability.
+
+| Provider | Harness | `base_url` | `env_key` | `wire_api` | Probe |
+|---|---|---|---|---|---|
+| Fugu / Sakana | `codex` | `https://api.sakana.ai/v1` | `SAKANA_API_KEY` | `responses` | `/models` |
+
+Fugu uses an isolated `CODEX_HOME` (`~/.agend-fugu-codex`) and a per-instance
+`env.CODEX_HOME` in `fleet.yaml`, so provisioning never mutates the operator's
+global `~/.codex`. Endpoint probes are optional, cached, and fail-open: a probe
+failure is reported as `unknown`, not as provider absence, and startup never
+depends on a live network call.
+
+`kiro-cli` (AWS signed-auth shape) and `agy` (Google service-account/OAuth
+shape) are intentionally fixed-provider backends rather than bearer
+`base_url` overrides.
+
+Inspect the resolved boundary with:
+
+```sh
+agend-terminal doctor providers
+agend-terminal doctor providers --format json
+agend-terminal doctor providers --probe
+```
 
 ## ClaudeCode
 

@@ -167,7 +167,7 @@ Kill-switch 與 feature flag 詳見 [環境變數](docs/env-vars.zh-TW.md) 與 [
 
 - [架構](docs/architecture.zh-TW.md) — worktree 隔離、健康監控、Telegram 生命週期、daemon 設計
 - [Git 行為](docs/GIT-BEHAVIOR.zh-TW.md) — daemon 對被啟動 agent 的 git 環境做了哪些修改
-- [秘訣](docs/RECIPE-clean-claude-instance.zh-TW.md) — 啟動一個乾淨的 Claude Code instance
+- [Incident Runbook](docs/RUNBOOK.zh-TW.md) — 復原流程、CI outage 與不繼承 context 的 Claude recipe
 - [貢獻指南](CONTRIBUTING.zh-TW.md)
 - [更新日誌](CHANGELOG.zh-TW.md)
 </details>

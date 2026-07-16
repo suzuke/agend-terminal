@@ -18,7 +18,7 @@
 //! Only the modules W1.2 actually migrated are in scope. The daemon has
 //! ~150 raw git sites across ~25 modules (worktree.rs, auto_release,
 //! retention, admin, claim_verifier, …); migrating all of them is the
-//! REFACTOR-PLAN's later slices, not W1.2. As each subsequent slice lands,
+//! Architecture-14's later slices, not W1.2. As each subsequent slice lands,
 //! ADD its module to `MODULE_SCOPE` below — the guard's coverage grows
 //! monotonically with the migration, never claiming a seal it hasn't earned.
 //!

@@ -1,3 +1,5 @@
+[繁體中文](RECOVERY-STAGES.zh-TW.md)
+
 # Recovery Stages
 
 Source-of-truth for the `#685` staged auto-recovery dispatcher.
@@ -134,8 +136,9 @@ per-tick handler mirroring the sub-task 5 / #694 BLOCK 1 idiom.
 ## §RS.4 — Combined-gate three branches
 
 Decision §1.4 Delta 2 — dispatcher inspects raw silence + productive
-silence elapsed times directly (NOT via F9 classification flag) so
-Stage 1 ships valuable independent of F9 promotion timeline:
+silence elapsed times directly (NOT via the §F9.5 classification gate in
+[HUNG-STATE-TRANSITIONS.md](HUNG-STATE-TRANSITIONS.md)) so Stage 1 remains
+valuable independent of productive-gate promotion timing:
 
 | Branch | Condition | Action |
 |---|---|---|
@@ -175,8 +178,10 @@ demoted).
 
 ### Promotion criteria (operator action)
 
-Mirrors F9 sub-task 4 §F9.5 SOP and sub-task 5 corpus-growth-delegate
-methodology:
+Mirrors the maintained productive-output promotion SOP in
+[HUNG-STATE-TRANSITIONS.md §F9.5](HUNG-STATE-TRANSITIONS.md)
+and grows real evidence with the
+[PTY fixture capture playbook](../tests/fixtures/state-replay/CAPTURE-RECIPES.md):
 
 1. Operator runs daemon with `AGEND_AUTO_RECOVERY_STAGE1` unset
    (shadow) for at least 2 weeks across the agent fleet.
@@ -236,15 +241,14 @@ Phase 1 implements the guards already (decision §5), still in effect:
 
 ### Cross-references
 
-- `docs/HUNG-STATE-TRANSITIONS.md §F39.5` — open questions list now
-  references this doc for staged-recovery details.
-- `docs/F9-PRODUCTIVE-OUTPUT-GATE.md §F9.5` — recovery dispatcher
-  treats all `Hung` sources same; F9 promotion does not require
-  separate recovery wiring.
-- `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6` — recovery dispatcher
-  shadow telemetry will inform future corpus growth (operator can
-  capture PTY traces around Stage 1 shadow fires for fixture
-  collection).
+- [HUNG-STATE-TRANSITIONS.md §F39.5](HUNG-STATE-TRANSITIONS.md)
+  — open questions list references this doc for staged-recovery details.
+- [HUNG-STATE-TRANSITIONS.md §F9.5](HUNG-STATE-TRANSITIONS.md)
+  — recovery treats all `Hung` sources the same; productive-gate promotion
+  does not require separate recovery wiring.
+- [PTY fixture capture playbook](../tests/fixtures/state-replay/CAPTURE-RECIPES.md)
+  — recovery shadow telemetry informs future corpus growth; operators can
+  capture PTY traces around Stage 1 shadow fires for fixture collection.
 - `src/daemon/per_tick/recovery_dispatcher.rs` — module implementation.
 - `src/health.rs::RecoveryStageState` — state machine variants
   (`None` / `Stage1Pending` / `Stage3Pending` post-#2549).
@@ -258,7 +262,7 @@ Phase 1 implements the guards already (decision §5), still in effect:
   similar to sub-task 6's per-backend marker calibration.
 - Telegram notify for Stage 1 — decision §6 Refinement A: Stage 1
   silent on success (info-level log only).
-- F39 mitigation selection / F9 promotion — fixture-corpus-N-gated.
+- F39 mitigation selection / productive-gate promotion — fixture-corpus-N-gated.
 
 ## §RS.9 — Stage 2 specifics (sub-task 7b)
 

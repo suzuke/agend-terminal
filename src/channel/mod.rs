@@ -1,8 +1,8 @@
 //! Channel abstraction — platform-neutral surface for messaging backends.
 //!
 //! This module defines the trait + types that `src/telegram.rs` (and future
-//! Discord / Slack / Matrix adapters) implement. The design follows
-//! `docs/archived/PLAN-channel-abstraction.md` §3.
+//! Discord / Slack / Matrix adapters) implement. The public contract is
+//! documented in `docs/FEATURE-channels.md`.
 //!
 //! **Status (T1 prep scaffold):** this module is intentionally unused by any
 //! call site. PR2 in the T1 series (the atomic type cut-over) is the one that
@@ -19,7 +19,7 @@
 //! - **Event / outbound naming** — we use the parent plan's §3.1 names
 //!   (`ChannelEvent`, `OutMsg`, `MsgRef`) rather than the UX-layer plan's
 //!   `InboundEvent` / `OutboundIntent` terminology. The transport trait lives
-//!   in this module; UX layer sits on top (see `PLAN-channel-ux-layer.md`) and
+//!   in this module; the UX layer sits on top and
 //!   can rename as needed without touching the transport contract.
 //! - **`ChannelCapabilities::Default`** — conservative "nothing supported".
 //!   Concrete adapters must opt-in per capability. This makes a new adapter's
@@ -330,7 +330,7 @@ pub enum ChannelKind {
 /// Platform-neutral channel trait. Implementations live next to their
 /// platform glue (e.g., `src/telegram.rs` → future `src/channel/telegram.rs`).
 ///
-/// Signature mirrors `docs/archived/PLAN-channel-abstraction.md` §3.1. Events are
+/// The signature mirrors the contract in `docs/FEATURE-channels.md`. Events are
 /// delivered through a pull-style API (`poll_event`) rather than an async
 /// stream, to keep the trait agnostic to the caller's runtime choice
 /// (today's core loop is sync; teloxide runs on a private tokio runtime

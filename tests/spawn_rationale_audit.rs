@@ -14,7 +14,7 @@
 //! Test code (`#[cfg(test)] mod tests`) is exempt — test fixtures need broad
 //! latitude on spawn semantics.
 //!
-//! Sprint 20 Track B audit (DAEMON.md §3 JoinHandle inventory) found 11
+//! The lock/spawn audit summarized in docs/DAEMON-LOCK-ORDERING.md found 11
 //! daemon spawn sites with 0 graceful-join-on-shutdown handling; Phase 5
 //! sweeps those + the telegram surface, then this invariant fails-loud on
 //! any new spawn that lacks rationale.

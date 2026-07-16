@@ -166,7 +166,7 @@ fn bridge_binary_path_does_not_fall_back_to_local_mode() {
         "Phase 2b fail-loud invariant: src/mcp_config.rs must not \
          contain the `vec![\"mcp\"]` fallback that previously made \
          backends spawn `agend-terminal mcp` instead of the bridge. \
-         See docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md."
+         See docs/MCP-TOOLS.md."
     );
 }
 
@@ -188,7 +188,7 @@ fn commands_mcp_enum_variant_removed() {
         "Phase 2c hard-removal invariant: src/main.rs must not contain \
          a `Some(Commands::Mcp)` match arm. The `agend-terminal mcp` \
          subcommand was retired per operator directive — see \
-         docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md."
+         docs/MCP-TOOLS.md."
     );
     // Stricter pin: also no `Commands::Mcp` enum variant declaration.
     // This catches a subtler regression where someone adds the

@@ -219,6 +219,7 @@
 - **Replay cache mtime→generation counter (#1355, PR #1357)** — 使用單調遞增的 generation counter + mtime 四元組修復 mtime 碰撞導致的假快取命中。
 - **`task action=list` 預設過濾 (#806)** — 預設只回傳可操作狀態；`include_history=true` 可查看 `done`/`cancelled`。
 - **`task action=create` 回應格式 (#807, PR #811)** — 回傳完整 task 物件而非僅 `{id, status}`。
+- **Protocol 文件重新命名（歷史路徑 `docs/FLEET-DEV-PROTOCOL-v1.md` → 現行 `docs/FLEET-DEV-PROTOCOL.md`）**——移除 `-v1` 後綴。文件標頭內已有版本號（`v1.2`），也沒有進行中的 v2；路徑上的 `-v1` 是 2025 年留下的誤稱，容易讓人以為另有平行的 v2。`src/protocol.rs` 的 compile-time `include_str!`、`Cargo.toml` 的 `[package].include` whitelist、`tests/cargo_include_invariant.rs` 的 mock-pattern filter、README 連結，以及現已退役的 architecture quick-start 與 lint-discipline 紀錄均已更新；退役文件收錄於[歷史紀錄](docs/README.zh-TW.md)。手動覆寫舊路徑的 operator 必須自行重新命名（不自動遷移；這項機制很少使用）。
 
 ### 修復
 
@@ -252,3 +253,332 @@
 
 - **`admin::cleanup_zombies::poll_until_dead` (#934)** — 確定性輪詢原語，取代基於 sleep 的等待。
 - **`api::handlers::instance::await_sentinel_nonempty` (#949)** — 重新命名以釐清合約：等待檔案有內容，而非僅存在。
+
+### 工作流程驗證 snapshot
+
+- **2026-05-14 post-#779 partial-fix canary 通過**——距離完全不需 bypass 的流程仍有 1 個手動 git branch 步驟。記錄於 `/tmp/val-workflow-2026-05-14.md`（post-mortem reference）。
+
+## [Workflow validation 2 — 2026-05-14] post #779 partial-fix canary pass（1 個手動 git branch 步驟）
+
+## [0.6.1] - 2026-05-10
+
+### 移除
+
+- **`agend-terminal mcp` subcommand（Sprint 56 Track I，#531）**——local-mode stdio JSON-RPC server 退役。`Commands::Mcp` enum variant、`mcp::run` function、ACL machinery、framing helper 與 `proxy_or_local` fallback 全數從 `src/` 刪除。手動編輯 mcp.json 的 operator 會在下次啟動時由 daemon atomic upsert 將 config 改寫為使用 `agend-mcp-bridge`；新安裝會在 release artifact 中附帶 bridge（Phase 2a，v0.7+）。此後 bridge 是 canonical MCP server。問題由 changhansung 在 Windows 11 + kiro-cli backend 上回報，並經過 4 個連續 PR 調查（Phase 1 RCA / 2a packaging / 2b deprecation / 2c hard removal）。已退役 RCA 與完整架構推理收錄於[歷史紀錄](docs/README.zh-TW.md)。
+- **`ensure_gitignore` worktree helper（#602、#604）**——`src/worktree.rs::ensure_gitignore` 會將 `.worktrees` 自動注入 project `.gitignore`，作為 Sprint-57-Wave-4 之前 layout 的向後相容後援。Wave 4 之後的 worktree 位於 repo 外（`$AGEND_HOME/worktrees/` 下），此注入因此多餘且會污染 user `.gitignore`。已移除 callsite、helper 與 obsolete test assert（-42 LOC）。由 @cheerc 回報。
+
+### 新增
+
+- **Bridge runtime invariant（Sprint 56 Track I-Phase2c，#531）**——新增 `tests/no_local_mcp_mode_invariant.rs::bridge_emits_daemon_error_when_daemon_down`：在沒有 daemon 執行的 clean home 中 spawn `agend-mcp-bridge`，並斷言 stdout/stderr 會出現 daemon-related error。這固定移除後的 contract：bridge 沒有可靜默降級的 local-handler fallback path。
+
+## [0.6.0] — 2026-05-07
+
+自 `0.5.0` 以來超過 50 個 commit，涵蓋 Sprint 53（`agend-git-shim` Phase 1–5 + production wiring）與 Sprint 54（`ci_watch` reliability overhaul + adaptive backoff + agent-visible health surface）。本 release 有兩大主題：multi-agent git isolation 獲得自己的 enforcement layer，而 agent 的 CI feedback 也足夠可靠，讓 operator 能信任 polling loop。
+
+### 新增
+
+- **`agend-git-shim`（Sprint 53）**——在 agent 與 `git` 之間加入五階段 shim layer。Phase 1：`prepare-commit-msg` hook 自動附加 `Agend-Agent`、`Agend-Branch`、`Agend-Issued-At`、`Agend-Task` trailer（具 idempotency，存在時略過）（#446）。Phase 2：`$AGEND_HOME/bin/git` 的 shim binary，deny matrix 涵蓋 `worktree add/remove/move`、跨分支 `checkout` 與 unbound-context operation；合法 operator override 可用 `AGEND_GIT_BYPASS=1` bypass（#447）。Phase 3：per-agent worktree lease/release lifecycle，帶有 `.agend-managed` marker（#449）。Phase 4：每小時 GC dry-run sweep 會標示 stale worktree 而不移除——operator-driven cutover 延後（#454）。Phase 5：hotspot detection telemetry，供後續調校（#455）。Windows 在範圍內（#448）。
+- **Sprint 53 production wiring**——修復 §1.4 hard learning 中「Phase 1–5 已交付 binary 卻沒有 caller」的缺口。P0-1 dispatch hook 在含 branch field 的 `delegate_task` 上自動 bind 與 lease（#464）。P0-1.5 central lease registry 拒絕跨 agent branch claim conflict（#465）。P0-1.6 重用既有 checkout 前會驗證實際 HEAD（#466）。P0-2 將 `watch_ci` 接到 dispatch hook（整併 Hotfix C）（#467）。P0-3 anti-pattern CI lint gate 強制測試必須呼叫 production path `dispatch_auto_bind_lease`（#471）。P0-X `release_worktree` MCP tool——binding + worktree cleanup 的唯一真相來源，取代 ad-hoc `binding::unbind` call（#470）。P1-4 `gc_dry_run` MCP tool 將 Phase 4 GC finding 顯示給 operator（#479）。
+- **`ci_watch` multi-caller fan-out（Sprint 54 P0-1）**——`ci watch` MCP action 現在附加至 `subscribers` array，不再 last-write-wins overwrite。無論 subscriber 數量，每 cycle 只 poll 一次；terminal classification 會 fan out 給所有 subscriber（不會 shadow-drop）。Schema 將 legacy `instance: "X"` migration 為 `subscribers: [{instance, subscribed_at}]`，並保留 legacy field read fallback。`ci unwatch` 只移除 caller；subscriber 清空時才刪除 watch file。（#484，關閉 `d-20260506155323776106-0`）
+- **`ci_watch` adaptive backoff（Sprint 54 P0-2）**——依剩餘 quota 使用三區 curve：healthy（>50% remaining）使用設定 interval，cautious（10–50%）放寬 2×，critical（≤10%）放寬 4×。下限是 baseline，上限是 baseline×4。GitHub provider 在每次成功 response 解析 `X-RateLimit-Remaining` / `X-RateLimit-Limit`；GitLab + Bitbucket 發出 `None`（維持 baseline behavior）。Watch JSON 新增 `rate_limit_remaining` / `rate_limit_limit` / `effective_interval_secs` diagnostic field。從 rate-limit-until reset 的 recovery path 與 Sprint 53（Hotfix F）相同。（#490）
+- **GitHub token auto-detect（Sprint 54 P0-4）**——daemon 依 `GITHUB_TOKEN` env → `gh auth token` → unauthenticated fallback 的順序解析 auth。結果快取在 process-wide `OnceLock`；絕不寫回 env（避免污染 child PTY）。若兩個來源都無 token，`ci watch` / `ci status` MCP response 會包含 canonical `setup_warning` field 與可操作文字。Daemon restart 會重新 discovery；涵蓋 daemon 已執行後才做 `gh auth login` 的情況。（#487，關閉 `d-20260506171309264856-1`）
+- **Agent-visible CI health surface（Sprint 54 P0-5）**——`ci watch` response 新增 `rate_limit_active` / `rate_limit_until` / `next_poll_eta` health field。Daemon 在連續 3 次因 rate limit 略過後 fan out `[ci-watch-stalled]` inbox event（每個 stall window 恰好一次），並在第一次成功 poll 後 fan out `[ci-watch-resumed]`；兩種 event 都依 P0-1 fan-out contract 送給每個 subscriber。新的 `ci status` MCP action 回傳 caller-scoped 的 16-field health snapshot，並支援 optional `repo` / `branch` filter。（#492）
+- **Sprint 54 P1-5——`cleanup_deployment_dirs` rmdir 空 parent**——完成 per-member cleanup 後，best-effort 對 deployment-directory parent 執行 `remove_dir`（非 recursive）；若 operator 放入檔案，non-empty error path 會保留它們。（#489）
+- **Sprint 54 P1-7——`bind_self` MCP tool**——agent 不必經外部 dispatch，就能自行 bind 到具名 branch 的 fresh worktree。它重用 dispatch-hook lifecycle，讓 `binding.json` + worktree + `.agend-managed` marker + auto `watch_ci` registration 全都走同一 code path。拒絕 `main` / `master`（E4.5）與 cross-agent branch conflict。搭配 `release_worktree` unbind。解決 agent 需要 worktree、卻沒有可委派來源的 recovery case。（#493）
+
+### 變更
+
+- **Worktree lifecycle 由 daemon 管理**——agent 不再直接呼叫 `git worktree add/remove`。Dispatch 時 auto bind（P0-1）、透過 Phase 1 trailer 建立 audit trail，並以 `release_worktree` MCP tool（P0-X）離開。Crashed agent、stale dispatch 與 abandoned branch 會進入 daemon GC queue，不再成為 orphan filesystem entry。
+- **CI watch architecture 拆分**——`ci_watch` tick loop 將 polling（每 cycle 一個 HTTP request，擁有 rate-limit + adaptive backoff + watch-state persistence）與 notification fan-out（terminal classification 後每 subscriber enqueue 一個 inbox）分離。過去 last-write-wins 的 multi-caller flow 現在可正確組合。（#484）
+- **`watch_ci` MCP response shape**——`warning` field 改名為 canonical `setup_warning`（Sprint 54 P0-4）；新增 `subscribers` / `rate_limit_active` / `next_poll_eta` health field（P0-5）。Pre-Sprint-54 daemon 讀取 post-Sprint-54 watch JSON 時，仍可在一個 release cycle 內看到 legacy `instance` alias。
+- **預設 PR open mode 為 `ready`**——implementer 不再預設將 PR 開為 draft。`--draft` 僅保留給不會 merge 的 smoke / verification PR、明確 WIP，以及 external-PR augmentation。Draft 不會出現在 GitHub UI 預設 filter；default-ready 讓 review pipeline 保持可見。（#491）
+
+### 修復
+
+- **`comms.rs` 在 `kind=report` reply path 自動 unbind（CRITICAL）**——每個 `kind=report` reply 都會呼叫 `binding::unbind`，即使 task 尚在進行也會清除 agent → branch binding。修復 cascade 後：Phase 1 trailer 正確觸發、orphan worktree 不再累積、P0-X release_worktree 不再是 no-op、Phase 4 GC 不再把合法 live binding 誤標為 suspect。`release_worktree` 的 single-mutation-point invariant 現在是關鍵保障。（#477）
+- **TUI close path 略過 deployment teardown（#474）**——tab/pane 上的 `Ctrl+B x` close 會 bypass `cleanup_deployment_dirs`，使 custom-directory subdir 跨 daemon restart 洩漏。Close path 現在對每個 pane 執行 `full_delete_instance` + `reconcile_after_close`。（#475、#481）
+- **`ci_watch` malformed head query（Hotfix F gap）**——Hotfix F（#461）修復了 `closed_at` freshness gap，但底層 GitHub query 仍錯誤：`head={branch}`（沒有 owner prefix）會被 GitHub API filter 靜默丟棄，因此 response 回傳的是整個 repo 最近 merge 的 PR，而非 watched branch。與 closed_at freshness 結合後，會在 in-flight PR watch 上出現 false-positive auto-clear。修正改用文件化的 `head={owner}:{branch}` 形式，並加入 defensive `head.ref` mismatch guard；response 不符時回傳 `Unknown`。已擷取 empirical regression proof（將 URL 改回裸 `head=` → owner-prefix test panic）。（#498）
+- **`ci_watch` fresh-branch classification 修正（Hotfix F）**——daemon 因未檢查 `closed_at` freshness，而將 fresh-no-PR branch 自動清除為 `merged=true`。此狀態的 PR 現在分類為 `pending` 並繼續 polling。修正規則為 `closed_at > 1h ago = stale, not auto-clear`。（#461）
+- **`ci_watch` no-PR-yet false positive（Hotfix E）**——沒有對應 PR 的 branch 被分類為 terminal，導致 notification 被丟棄。新增 60 秒 grace period + closed_at freshness check。（#458）
+- **`agend-git-shim` 缺少 app-mode wiring（Hotfix D）**——`app::run_app`（CLI）未初始化 shim init function，使 Phase 1–5 operation 在 user-facing CLI 中成為 dead code。Init seam 移至 `bootstrap::prepare`，讓 daemon 與 app path 都涵蓋 wiring。（#457）
+- **Dispatch 上的 `watch_ci` auto-watch（Hotfix C）**——含 branch field 的 `delegate_task` 不會自動建立 `ci-watch` registration。已明確接線；之後整併進 Sprint 53 P0-2。（#451、#467）
+- **Server rate-limit retry 儲存 raw body（Hotfix A/B）**——retry loop 在 attempt 之間遺失原始 429 body，遮蔽真正 error message。現在會儲存 raw body 並於 inject 時 replay。Provenance side-channel message 會截短至 Telegram 長度限制，以防 oversize message drop。（#436、#452、#453）
+- **Issue #456 deployment teardown cleanup gap**——`deployment teardown` 清除 deployment record，卻留下 workspace + config + channel topic registry。現在完整清理三者（workspace + config + registry）。（#459）
+- **Issue #468——Gemini dismiss pattern substring 誤中 scrollback**——`try_dismiss_dialog` regex 會匹配 scrollback buffer 內的 dialog text，觸發 spurious dismissal。改用有 bounded prefix character class 的 anchored regex。（#469、#472）
+- **`reply` MCP `no active channel` silent fallback（#488——第一個社群回報 issue）**——即使 Telegram message 有效，`reply` 仍持續回傳 `no active channel`。根因：MCP subprocess 無法連到 daemon，並靜默 fallback 至缺少 `ACTIVE_CHANNEL` registration 的 local handler，因而顯示誤導 error。修正分兩層：Tier 1 在 `proxy_or_local` 兩個 fallback branch 都發出 `tracing::warn!`，含 `tool` / `instance` / `error` field，讓未來 silent fallback 可觀測；Tier 2 引入 `requires_daemon_state(tool)` predicate。會接觸 `ACTIVE_CHANNEL` / `heartbeat_pair` 的 tool（`reply`、`react`、`download_attachment`）絕不靜默 fallback，而回傳 structured `{"error": "tool '<NAME>' requires daemon API; not reachable: <CAUSE>"}`。Stateless tool（`inbox`、`task`、`list_instances`、`send`）保留 offline-friendly fallback behavior。`requires_daemon_state` schema field 透過 `tools/list` 公開，讓 consumer 可預先 filter。（#495；感謝 @changhansung 回報）
+- **Telegram 在 image + no-caption + download-fail 時靜默丟棄**——image 無 caption 且下載失敗（network / token / size）時，`handle_message` 會靜默丟掉 inbox message。User 看見 image 已送出，agent 卻未收到 inbox event，也沒有 log 顯示 failure。修正沿用 #488 silent-fallback 模式：增強的 `WARN` log 帶有 `file_id` + `sender_id` + `kind` + `error`；當 `is_image && text.is_empty()` 時，inbox text 現在為 `[image attached but download failed]`。Caption 絕不被覆寫——user-supplied text 永遠優先。（#497）
+- **PTY-inject layer attachment indicator（silent-drop class layer 4）**——`#497` 修復 inbound layer（telegram → message store），但後續 layer 仍會丟失 signal：純 image 無 caption 成功下載、以 populated `attachments` 存入 inbox 時，PTY-inject formatter（`format_notification_for_inject`）會建立沒有 `attachments=[…]` field 的 `[AGEND-MSG]` header，inline body 也是空文字；agent 合理地將它視為意外空 message。修正加入兩種互補 indicator：`pointer_only=true` header 現在會以 kind-aggregated stable order 發出 `attachments=[1 photo, 2 document]`，`pointer_only=false` body 則在 text 為空但有 attachment 時 fallback 為 `[1 photo: cat.jpg]` / `[1 photo attached]` / `[1 photo, 2 document attached]`。Filename 來自 `original_filename`，不是 filesystem `path`，因此不洩漏 local path。新的 `notify_agent_with_attachments` variant 攜帶 metadata；plain `notify_agent` 變成 thin shim，使三個 non-telegram caller 維持舊 API。已擷取 empirical regression proof（將 `summarize_attachments_for_header` 改為一律回傳 `None` → 3 個 anchor test 以逐字 signature panic）。（#501）
+- **TUI restart input routing**——Pane struct restoration 取代零碎 field update；後者會破壞 respawn 時的 input routing。（#445；感謝 @cheerc）
+- **Telegram ANSI ESC + typed injection optimization**——從 outbound 移除 ANSI escape sequence，並最佳化 typed injection 以避免 ESC conflict。（#462；感謝 @cheerc）
+
+### 社群
+
+本 release 包含外部 contributor 的貢獻：
+
+- **@cheerc**——#445（TUI Pane restart routing）、#462（ANSI ESC strip）、#473（fleet.yaml instructions wiring）、#474 issue（TUI close path）
+- **@changhansung**——第一個社群回報 issue #488（`reply` MCP no-active-channel）
+
+感謝你使用本專案並回報問題——multi-agent CLI tooling 的成敗仰賴 real-world workflow 揭露缺口。
+
+### 文件
+
+- **FLEET-DEV-PROTOCOL §13——`AGEND_GIT_BYPASS=1` Usage**——何時需要 bypass（在 bound path 上 worktree add/remove、daemon-internal git operation）、何時不需要（bound worktree 內的 routine operation 可正常通過），以及各 scenario hint。（#476）
+- **README「Git Behavior Modification」揭露**——醒目的 pre-alpha banner section 說明修改內容（PATH shim、prepare-commit-msg hook、deny matrix、auto bind/lease）、原因（multi-agent safety、audit trail、lifecycle hygiene、foot-gun guard）、風險（agent 看到不同的 `git`、commit 增加 trailer、部分 command 意外被拒、shim update 需要 restart），以及 bypass path。（#478）
+- **FLEET-DEV-PROTOCOL §7——PR open semantics**——規定 default-ready policy 與 `--draft` 保留的三種 scenario。（#491）
+- **Sprint 53 PLAN doc + Sprint 54 PLAN doc**——wire-and-cleanup proposal（#463）與 reliability+docs sprint proposal（#483、#485 §5.1 amendment、#486 P0-3 absorption note）。公開記錄 §1.4 hard learning + Path A/C smoke gate classification policy。
+
+### 內部
+
+- **Sprint 53 §1.4 hard learning**——`cargo test green + dual VERIFIED + soak ≠ production wired`。在 pre-IMPL invariant 中攔下 Sprint 49 deadlock-class regression 的 cushion，沒有攔下 dead-code-class regression，因為沒有測試真正的 production entry point（`app::run_app`）。Sprint 54 PLAN §5 將 per-phase production-smoke gate 設為強制；§5.1 為 non-wiring refactor 分出可平行化的 Path C（`d-20260507004113587226-7`）。
+- **Empirical regression-proof discipline**（`d-20260506171720519048-2`）——每個 Tier-2 fix 都要證明停用 production change 會使特定 test FAIL；恢復後回到 PASS。擷取的 FAIL signature 逐字附於 PR description。
+- **`release_worktree` 是 binding lifecycle 的唯一真相來源**（`d-20260506171736738779-3`）——所有 comms.rs handler 將 binding state 視為 read-only；只有 dispatch hook（init）與 `release_worktree`（exit）可 mutation。#477 cascade 展示違反此原則的代價。
+- **Cleanup lifecycle 分層**（`d-20260506171805866878-4`）——三個 tier 各有明確 ownership：per-pane（`full_delete_instance`）、per-deployment（`cleanup_deployment_dirs` + `reconcile_after_close`）、boot reconcile（`reconcile_orphans`）。新的 cleanup logic 必須指出由哪個 tier 擁有新 behavior。
+- **Fleet IMPL/review dispatch policy**——只有 `dev`（IMPL）與 `reviewer`（review）可 dispatch；`claude-76f359` / `kiro-cli-*` / `gemini-*` 不是 designated。Dev 無法使用時，lead 採 Path A escalation。記錄於 operator m-57 + m-62 correction 後的 lead-side memory。
+
+## [0.5.0] — 2026-05-04
+
+### 新增
+
+- **以 ID 為基礎的 routing migration（Sprint 46）**——每個 fleet instance 都會獲得 `InstanceId`（UUIDv4）。Routing 透過 `resolve_instance(name_or_id)` 以三步驟解析（完整 UUID → short-id → name）。取代 Sprint 44 M5 的 name-lookup 臨時修補。Self-route check 會比較 ID。Task event 與 dispatch tracking 新增 audit-trail field（`emitter_id`、`from_id`、`to_id`）。（#407、#409、#412）
+- **CI hardening（Sprint 47）**——Job-level `timeout-minutes: 60` safety net。Per-step timeout（fmt 5m、clippy 10m、build 20m、test 20–30m、smoke 10m）。PR 使用帶 `cancel-in-progress` 的 concurrency group——被取代的 CI run 會自動取消。（#411）
+- **File path migration infrastructure（Sprint 46 P2）**——新增 `inbox_path_resolved` 與 `metadata_path_resolved` helper，透過 symlink 將 name-based path migration 至 id-based path。（#409）
+
+### 變更
+
+- **大型檔案拆分 refactor（Sprint 48）**——三個 oversized file（總計約 8700 LOC）拆成 25 個 submodule，全部 ≤700 LOC：
+  - `layout.rs`（2170 LOC）→ 6 個 submodule：`pane`、`tree`、`preset`、`split`、`tab`、`mod`（#414）
+  - `channel/telegram.rs`（4201 LOC）→ 13 個 submodule：`state`、`topic_registry`、`send`、`inbound`、`error`、`creds`、`reply`、`bot_api`、`notify`、`adapter`、`ux_sink`、`bootstrap`、`mod`（#416、#419）
+  - `render.rs`（2352 LOC）→ 7 個 submodule：`core_render`、`border`、`overlay`、`panels`、`panels_fleet`、`scratch`、`mod`（#421）
+  - 解決 circular dependency：`split_chunks` 從 render 移至 layout/split（#414）
+- **CI workflow cleanup**——合併重複的 clippy/test step，並將 checkout 升至 v5。（#422）
+
+### 修復
+
+- **Codex InteractivePrompt false positive**——移除 codex `Update available!|Press enter to continue` regex；它會誤中普通 idle prompt，造成 spurious operator notification。（#408）
+- **create_instance 未持久化 topic_id**——`create_instance` 建立 Telegram topic，卻從未將 `topic_id` 寫入 `fleet.yaml`。Daemon restart 後該 topic 會成為 orphan。現在透過 `update_instance_field` 持久化；`describe_instance` 也會顯示 `topic_id`。（#417，關閉 #415）
+- **Windows CI mock server hang**——Test mock server 新增 `Connection: close` header，讓 Windows CI 能可靠執行。（#420）
+
+### 還原
+
+- **Sprint 49 channel discipline correction**——Inject-only nudge mechanism（PR #424）因 daemon deadlock 與設計問題而 revert。後續重新設計追蹤於 issue #426。（#425）
+
+### 內部
+
+- Sprint 44 push-time semantic gate：claim verifier + pre-push hook（M1+M2）、reviewer SHA gate + ci-watch supersede（M3+M6）、hallucinated-fn extension（M4）。（#384、#385、#386）
+- Sprint 44.5：post-merge rebuild hook + CI slowness investigation。（#388、#389）
+- Sprint 45：橫跨 9 個 architecture group 的 15 個 PR——persistence/audit、set_var removal、shared runtime、lifecycle、channel、MCP、fleet config、state classifier、CLI/bootstrap。（#390–#404）
+- Sprint 48 investigation：Windows 上 bitbucket test 在 tray feature 下 hang——根因是 `tao` Win32 message pump interference，不是 test logic。（#418）
+
+## [0.4.1] — 2026-04-24
+
+### 修復
+
+- **0.4.0 的 `cargo install agend-terminal` build failure**——`src/protocol.rs` 對該 release 的歷史 protocol path 使用 `include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md")`，但檔案不在 `Cargo.toml` `include` whitelist 中。因此 `cargo publish` 發往 crates.io 的 packaged tarball 缺少 bundled protocol doc，verification compile 以「No such file or directory」失敗。GitHub Release binary 從 source tree 建置，不是 packaged tarball，因此 v0.4.0 binary download 仍可使用——但 crates.io 上沒有 v0.4.0。除這一項 packaging fix 外，v0.4.1 與 v0.4.0 source 完全相同。
+
+## [0.4.0] — 2026-04-24
+
+自 `0.3.2` 以來超過 170 個 commit——包含 multi-agent collaboration plumbing（fleet protocol v1.1、correlation thread、health reporting）、inbox resilience + correlation、task-board dependency + deadline、`watch_ci` reliability overhaul，以及一系列 TUI / spawn lifecycle / Telegram fix。
+
+### 新增
+
+- **Fleet Development Protocol v1 + v1.1**——`protocol/.default/FLEET-DEV-PROTOCOL.md` 正式定義 source-of-truth、dispatch contract、ack absorption、`set_waiting_on` / timeout（§7），以及 Reviewer Contract addendum（wire-up grep enforcement）。它內嵌於 binary，第一次執行時會解壓至 `$AGEND_HOME/protocol/.default/`。
+- **Live `<fleet-update>` injection**——daemon 會即時將 instance / team / role mutation broadcast 給每個 active agent（`fleet_broadcast`）；roster 與 role 無需 restart 即可傳播（#113、#123）。
+- **MCP correlation thread**——`send_to_instance` / `delegate_task` 接受 `thread_id` + `parent_id`（reply 時自動繼承）；新的 `describe_thread` + `get_thread` MCP tool 顯示完整 conversation chain。
+- **Health reporting MCP**——agent 呼叫 `report_health(reason, retry_after?, note?)`；operator 透過 `clear_blocked_reason` 清除。`BlockedReason` enum（Hang / RateLimit / QuotaExceeded / AwaitingOperator / PermissionPrompt / Crash）與 hang detector 共用 mutex，兩者不會 race-classify。
+- **帶 dry-run mode 的 daemon watchdog**——每個 tick 對 per-backend fixture（Claude / Kiro / Codex / Gemini，包含 `kiro_false_usage_limit.txt` guard）執行 `classify_pty_output`，並將 `BlockedReason` 寫入 event_log。`AGEND_WATCHDOG_DRY_RUN=1` 在切換 live 前的一週 soak 期間只寫 log。
+- **Task board：dependency + deadline**——`depends_on` 會在 parent 完成前自動 block downstream task；新增 `due_at` + `--duration` field；daemon sweep 會把 overdue task unclaim 回 `open`，並寫入 event_log + notification。
+- **Task-board mutation integrity**——`claim` / `done` / `update` 現在會強制 assignee ownership 與 target existence；使用 descriptive error，不再 silent no-op（Sprint 5 #4 expanded scope）。
+- **MCP `target` validation**——`send_to_instance` / `delegate_task` 會拒絕未知 instance name，不再 enqueue 至 phantom inbox；`delegate_task` 也像 `task create` 一樣，將 team 解析為 orchestrator（#136）。
+- **Spawn `delivery_mode` field**——`send_to_instance` / `delegate_task` response 會區分 `pty` 與 `inbox_fallback`，讓 caller 知道 message 是 live 抵達 agent，或只落入 inbox（#140）。
+- **Inbox correlation + observability**——加入 `thread_id` / `parent_id` field、`read_at` + TTL sweep（已讀 7d / 未讀 30d soft-delete）、`describe_message` MCP tool，以及會拒絕 future version 的 schema versioning。
+- **Inbox disk resilience**——free space <5% 時進入 readonly mode；atomic append（tmp + fsync + rename）；`.draining` half-write recovery；per-file flock 涵蓋 enqueue / drain / sweep，且 recovery 在 lock 內進行。
+- **大型 message 的 PTY header injection**——message >300 chars（Unicode-aware char count）時，只注入 `[AGEND-MSG] from=X id=Y kind=Z thread=T parent=P size=N`，field 會 sanitize control character；agent 透過 `inbox` MCP drain。Backend instruction 教導全部四個 CLI 辨識 header（可帶 optional ANSI prefix）。
+- **Idle poll-reminder injection**——daemon 發現 idle agent + unread inbox > 0 時，注入 `[AGEND-MSG] kind=poll-reminder unread=N`，並以 atomic dedup 防止相同 count spam。
+- **Schedule：重播錯過的 one-shot**——daemon startup 會掃描 `enabled && run_at < now && trigger=once`，在 24h window 內觸發（超過則丟棄並警告），透過真實 fire path 接線並有 integration test。
+- **`watch_ci` reliability overhaul**——
+  - `head_sha` tracking + PR 到達 terminal state 時 auto-clear（#119、#121）
+  - registration 後第一次 poll 立即執行，不再等待 `interval_secs`
+  - `per_page=5` + `select_runs_to_notify` 掃描 `last_run_id` 之後的每個 terminal run（rapid-push run 不再被之後的 in-progress run shadow）
+  - `classify_runs_response` 區分 API error 與「沒有 run」——rate-limit JSON 不再靜默丟失 notification（#131）
+  - background thread error 以 `warn` 記錄，不再靜默丟棄
+  - `GITHUB_TOKEN` 未設定時，`watch_ci` MCP response 的 preventive `warning` field 會提供 `gh auth token` 提示（#133）
+- **`save_metadata_batch`**——atomic batched write 取代 per-instance loop；後者會在 Windows CI 造成 cross-process write race。
+- **Vertical-split mouse resize tolerance**——`│` separator 有 ±1 column hit zone，off-by-one click 不再落到 text selection（#139）。
+- MovePaneTarget menu 中的**分割方向 picker**——將 pane 移到 target tab 時，可選 horizontal / vertical（#37）。
+- **TUI usability hint**——Task Board overlay 顯示 `? help` indicator；main status bar 顯示 `Ctrl+B ? help`（#93、#94）。
+- **`agend.md` 中 team-aware peer section**——auto-generated peer block 會區分 team member 與其他 fleet agent。
+- **Pre-flight Claude session check**——當 `~/.claude/projects/<encoded-cwd>/` 沒有任何含 `"type":"user"` line 的 jsonl 時，daemon、TUI session restore 與 API spawn path 會預先將 `Resume → Fresh` 降級。消除 idle-pane restart 時短暫顯示「No conversation found to continue」error（#130）。
+
+### 變更
+
+- **Schema 內的 `watch_ci` throttle state**——`last_polled_at` field 取代 mtime-backdating workaround；first-poll-immediate 現在是 schema-local rule，不是 filesystem trick。
+- **Crash-respawn 使用 `Fresh` mode**——crash 後 stale `--resume` 會穩定陷入「conversation not found」loop；respawn 現在略過它。
+- **`spawn_one` 回傳實際使用的 `SpawnMode`**——Resume → Fresh downgrade 對 caller 可見，使 post-spawn gate（例如 broadcast suppression）依真實 outcome 運作，而非 requested mode。
+- **獨立 `is_tab_bar_row` fn + `TAB_BAR_HEIGHT` const**——消除 mouse + render path 中的 magic `row == 0` check（#38）。
+- **`spawn_one` 使用 backend preset `submit_key`**——Gemini 的 `\n\r` 不再 hardcode 為 `\r`（#98）。
+- **Task ID 加入 microsecond + atomic seq**——concurrent create 時不會 collision（沿用 `decisions.rs` format）。
+- **State detection 對 shell / stuck prompt 更溫和**——降低 stall classification 的 false positive（#122）。
+- **Periodic tick 接入 app mode**——schedule、CI watch、health decay、sweep 在 app mode 中都以相同 daemon cadence 執行（之前僅 daemon mode）（#100）。
+
+### 修復
+
+- **`watch_ci` 會通知每種 terminal CI state**，不再只有 `failure`（#105）。
+- **Mouse selection white-block residue + Cmd+C false PTY input**（#104）。
+- **Ctrl+B prefix Shift+key binding** 在 Kitty-protocol terminal 上失效（#100、#102）。
+- **Shift+Enter newline** + Repeat mode + 在需要 keyboard enhancement disambiguation 的 terminal 上使用 LF（#71、#72、#75）。
+- **`compose_aware_inject` 在 agent idle 時自動 submit**——先前路徑需要手動 submit（#96、#99）。
+- Status bar 的 **Help hint 靠右對齊**（#109）。
+- **Telegram routing**——從傳入 home 解析 channel（#115）；將 thread home 傳入 react / edit / download（#116）；每次 API spawn 建立 topic；接通 UxEvent producer（#66、#68）；防止 block_on-inside-runtime panic（#69）；macOS contract test 不需要 bot（#48）。
+- 將 MCP **`AGEND_INSTANCE_NAME` injection** 加入所有 backend 的 MCP config env（#61）。
+- **Stale `ToolUse` / `Thinking` state** 透過 periodic tick expire（#102 follow-up）。
+- **`delete_instance` guard** 只 block fleet member，不 block pure ad-hoc instance。
+- 透過 `Sender` newtype **stamp sender identity**——修復空白 `[from:]` header injection。
+- **Quickstart `working_directory`** 預設為 `$AGEND_HOME/workspace/general`。
+- **Tab drag highlight + persistent selection**（#74）；4 項 UX fix——Shift+Enter / tab drag reorder / pane drag hit area / single-pane drag（#70）。
+- **Notify-agent input race**——從 `notify_agent` 移除 `submit_key`（#81）。
+- **Team tab 初始 ingest 時重新 tile TUI**。
+- **Template member 使用 per-instance workdir**。
+- 測試中的 **`AGEND_HOME` env var race**——Windows CI flake source（#107）。
+
+### 移除
+
+- watch_ci 的 **`per_page=1` polling**（由 per_page=5 + multi-run scan 取代）。
+- watch_ci 的 **Mtime-based throttle state**（由 schema field 取代）。
+
+### 文件
+
+- **USAGE.md**——startup mode、architecture、keyboard shortcut（#73）。
+- **Fleet Development Protocol v1 + v1.1**，包含 §7 Waiting and timeout（#62、#64）。
+- **Wave 3 Stage B-UX design + Reviewer Contract v0.1**（#50）。
+- **Track 1 design**——waiting_on annotation + heartbeat（A2 + A5 fix）（#58）。
+
+## [0.3.2] — 2026-04-22
+
+Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review correctness fix 與 performance hotspot。
+
+### 新增
+
+- **System tray integration（`agend-terminal tray`，Cargo `--features tray`）**——在三個平台提供 native menu-bar / system-tray support。Icon color 依狀態區分（offline / idle / active）；每 2 秒 poll status；menu 頂部有 disabled status label；「Open App」會啟動設定的 terminal emulator；可切換 Autostart（launch-at-login）。Linux 以 AppImage 出貨，bundle GTK + AppIndicator library，並用 custom AppRun 在啟動時強制執行 tray subcommand；macOS + Windows release tarball 預設包含此 feature。
+- **Dual-track fn drift detector**（`tests/no_dual_track_drift.rs`）——integration test 掃描 `src/ops.rs` 與 `src/mcp/handlers.rs` 的 top-level fn definition，body divergence 時 panic，byte-identical duplicate 時 warning。#31 hardening 涵蓋 top-level fn body 中的 raw string literal（fail-loud；guard 只作用於 extracted body，tests/impl block 不會 false-fail）、`extern "C" fn` / `extern "Rust" fn` prefix handling，以及 `match_balanced_brace` 無法關閉 detected fn 時的 silent-drop panic。
+- **Positive-pin CREATE_TEAM dispatch test**——以 `RecordingNotifier` 為基礎的 in-process assertion，驗證 `spawn_one` 成功時恰好發出一個具有 expected payload 的 `ApiEvent::TeamCreated`；完成 C2 的三件式 equivalence bracket，並關閉 LESSONS-04-21 open item。
+
+### 變更
+
+- **Task #9 Option C——dual-track elimination**——shared helper 整併至 `src/agent_ops.rs`；`src/api.rs` 拆成 per-tool handler module（`handlers/instance.rs`、`handlers/team.rs`、`handlers/*`）；`src/ops.rs` 縮減為單一 `start_instance` wrapper（Task #12 之後完全刪除，inline 至 MCP dispatcher）；移除 21 個 dead CLI-wrapper fn 與 crate-level `#![allow(dead_code)]` attribute。`validate_branch` 也從 `src/worktree.rs` 移至 `agent_ops`。
+- **MCP tool ACL 透過 `OnceLock` 快取**——在 startup 解析一次，不再每次 tool call 解析。
+- **Layout pane-id enumeration**——新的 `collect_pane_ids()` 避免 layout traversal hotspot 中的 recursive allocation。
+- **拆分 `spawn_agent`**——抽出 `build_command()`，提升清晰度與 unit-testability。
+
+### 修復
+
+- **Invalid state regex 現在會 panic**，不再靜默降低 state detection 能力。
+- **`strip_ansi` 不再於 cursor-move sequence 插入 phantom space**；先前會破壞 captured output。
+- **MCP stdio framing** 在 `Content-Length` error recovery 期間遇到 EOF 時回傳 `None`，不再 hang loop。
+- **Cron schedule robustness**——`parse_run_at` 拒絕 invalid timezone（先前 fallback 至 UTC）；bad tz 時略過 schedule，不再誤觸發；`.schedule_last_check` 會 atomic write。
+- **Fleet `ready_pattern` hardening**——resolve 時驗證 regex 並設 size ceiling，關閉 ReDoS surface。
+- **Tray「Open App」不再凍結 tray**——terminal launch 會 detach。
+
+## [0.3.1] — 2026-04-21
+
+自 `0.3.0` 以來，大量工作已落到 `main`。以下依領域整理重點。
+
+### 新增
+
+- **Terminal app（`agend-terminal app` / 無參數啟動）**——in-process spawn 並 attach agent 的 multi-tab、multi-pane TUI。每個 agent 一個 tab、nested split、joined pane border、layout preset（`Ctrl+B Space`）、zoom、rename、scroll mode、command palette、decision / task overlay。Session layout 會透過與 `fleet.yaml` reconcile 來持久化。
+- **Tmux-style keybind**（`Ctrl+B` prefix）：`c n p l 0-9 & , . w " % o x z [ d ?`，加上 repeat mode。
+- **Pane interaction**——drag 交換 pane、以 arrow key resize、每 pane mouse scroll、selection + clipboard（`arboard`）、IME-aware cursor。
+- **MCP spawn instance 的 auto tab/pane**——agent 透過 `create_instance` / `create_team` 建立的 instance 會自動在 TUI 顯示新 pane。
+- **Windows-support Phase A**——移除 `nix` dependency；使用 `fs2` 做 file lock；透過 `src/process.rs` 提供 PID helper，並使用 platform-conditional `libc` / `windows-sys` impl；將 `/tmp` hardcoding 換成 `dirs::home_dir()` / `std::env::temp_dir()`。UDS 當時仍是最後一個 Windows blocker；已退役 Windows plan 收錄於[歷史紀錄](docs/README.zh-TW.md)。
+- **Connect command（`agend-terminal connect`）**——在 running daemon 中動態註冊 external agent（只使用 inbox，不做 PTY management），供 headless environment 使用。
+- **App mode 中的 Telegram**——status-bar connection indicator、將 notification route 至 owning pane。
+- **CI & release workflow**——artifact upload、per-platform build。
+
+### 變更
+
+- **Fleet 唯一真相來源**——`fleet.yaml` 保存 agent definition；`session.json` 只保存 layout。Startup 時 session 會與 fleet reconcile。
+- **Unified daemon**——standalone daemon 與 in-process app 共用 `DaemonCore`；兩種 mode 都有 API server + MCP tool。
+- **Logging**——所有 `eprintln!` migration 至 `tracing`；log timestamp 使用 local timezone。
+- **Agent instruction**——auto-written `agend.md` 涵蓋 identity / role / peer / MCP tool usage；各 backend variant 為 `.claude/rules/agend.md`、`.kiro/steering/agend.md`、`AGENTS.md`、`GEMINI.md`、`.codex/config.toml`。
+- **Backend alias**——接受 `kiro` 作為 `kiro-cli` alias 等；serde alias 防止 fleet.yaml breakage。
+- **Code review follow-up**——多輪 hardening 已落地：統一 mutex poison recovery、split fallback 不再 leak forwarder thread、預先產生 team handler instruction、layout hint parsing 改名（`from_str` → `parse_hint`）、在 clippy 1.95 下修正 overlay bound。
+- **Drag / resize hardening**——drag border 與 state color disambiguate；tmux-style resize direction；split-ratio bound 依 cell count scale；title hit-testing 使用 Unicode width。
+- **Mouse event routing**——overlay modal、drag guard、zoom gating；zoom 時 mouse click 不再切換 pane。
+
+### 修復
+
+- Shutdown 會在 kill process 前乾淨 drain registry。
+- Delete-instance 會移除 working directory、metadata、session entry、Telegram topic。
+- Respawn 保留 `--mcp-config` 與 `--settings` flag；使用 `fresh_args` 終止 resume crash loop。
+- Codex trust directory prompt 會 auto-dismiss；`.codex/config.toml` 限定 per-project scope。
+- Claude Code 會收到 `--mcp-config`，從而使用 agend MCP server。
+- Daemon restart 時清除 orphaned Telegram topic。
+- Worktree creation 處理 empty-repo + set-git-config edge case。
+- Bugreport 會 redact `group_id`。
+- 各種 clippy 1.95 fix（`collapsible_if`、`type_complexity`、`unwrap_used`、overlay bounds match guard）。
+- **每次 spawn 都使用 unique instance name**——以 6-hex suffix 對 `fleet.yaml` ∪ `workspace/` ∪ `inbox/` 檢查；pane close 會清除 workspace 與 inbox entry，避免下一次 spawn 意外 resume stale agent session。
+- **Codex trust prompt auto-dismiss 現在可在 macOS 運作**——dismiss pattern 會對 VTerm-rendered screen 執行（不再對 raw byte 使用手刻 strip_ansi），因此 Ink-style char-by-char cursor-positioned paint 仍能 match。Codex dismiss key 從 LF 改成 CR——macOS/openpty 不像 ConPTY 會在 input 將 LF→CR，所以 LF 先前會靜默成為 Ctrl+J（將 selection 下移）。
+
+### 移除
+
+- Obsolete stale debug block；`workspaces/` → `workspace/` directory rename；移除 `agend-terminal agent` CLI subcommand（agent 現在使用 MCP，而非 CLI，進行 inter-agent communication）。
+
+---
+
+## [0.3.0] — 2026-03（tag：`release: v0.3.0`）
+
+> Commit `85f2bc3`——「release: v0.3.0 — fleet orchestration + stability」
+
+### 新增
+
+- **Fleet orchestration**——以 `fleet.yaml` 作為 first-class config；dynamic instance 的 Telegram topic persistence；`fleet.yaml` single-source reconciliation。
+- **MCP tool surface**——涵蓋 user comms、agent comms、instance lifecycle、decision、task、team、schedule、deployment、repo sharing 的 35 個 tool。MCP socket pooling（透過 daemon proxy）。
+- **Quickstart wizard**（`agend-terminal quickstart`）——interactive setup，處理既有 `fleet.yaml` / `.env`。
+- **Demo command**（`agend-terminal demo`）——帶 crash recovery 的 split-screen live conversation。
+- **Bugreport command**——單檔 diagnostic export。
+- **Git worktree isolation**——`src/worktree.rs`，auto per-agent worktree；original repo 不受影響。
+- 透過 `tracing` 的 **structured logging**。
+- **Protocol versioning** + fleet snapshot。
+- **CI loop**——auto-watch GitHub Actions，並將 failure log inject 至 agent。
+- **Friendly error**、`--json` output、shell completion。
+- **Telegram integration**——topic-per-instance routing、crash notification。
+
+### 變更
+
+- 透過 `flock` 做 file locking（crash 時 auto-release）。
+- `AGEND_TERMINAL_HOME` → `AGEND_HOME`，default dir 為 `~/.agend`。
+- `create_instance` 套用 backend preset arg（例如 `--yolo`、`--dangerously-skip-permissions`）。
+- 縮減 Tokio feature（`full` → `rt,net,io-util,fs,macros,time`）。
+- 對 instance name、branch name、path、download filename 做 input sanitization。
+
+### 修復
+
+- Exit code 0 時 respawn（daemon-managed agent 不應靜默消失）。
+- 修正全部 5 個 backend 的 MCP config format。
+- Delete flow：沒有 spurious crash log；清除 stale session ID。
+- Shutdown flag 區分 crash 與 daemon stop；`Ctrl+C` 期間抑制 crash handling。
+- Attach 使用 daemon run directory，而非 CLI process PID。
+- Respawn 時保留 `HealthTracker`。
+- Attach mode 支援 mouse scroll。
+
+### Baseline
+
+- PTY ownership 使用 `portable-pty`；VTerm 使用 `alacritty_terminal`。
+- TUI 使用 `ratatui` + `crossterm`。
+- Release 時僅支援 Unix；Windows support 在 0.3.0 後仍在進行（Phase A 已落到 `main`）。
+- Backend：Claude Code、Kiro CLI、Codex、OpenCode、Gemini CLI。
+
+---
+
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/suzuke/agend-terminal/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/suzuke/agend-terminal/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/suzuke/agend-terminal/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/suzuke/agend-terminal/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/suzuke/agend-terminal/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/suzuke/agend-terminal/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/suzuke/agend-terminal/compare/85f2bc3...v0.3.1
+[0.3.0]: https://github.com/suzuke/agend-terminal/commit/85f2bc3

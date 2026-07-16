@@ -173,7 +173,7 @@ and [configuration](docs/FEATURE-configuration.md).
 
 - [Architecture](docs/architecture.md) — Worktree isolation, health monitoring, Telegram lifecycle, daemon design
 - [Git Behavior](docs/GIT-BEHAVIOR.md) — What the daemon modifies in spawned agents' git environment
-- [Recipes](docs/RECIPE-clean-claude-instance.md) — Spawning a clean Claude Code instance
+- [Incident Runbook](docs/RUNBOOK.md) — Recovery procedures, CI outages, and a context-isolated Claude recipe
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 </details>

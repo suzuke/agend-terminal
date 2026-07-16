@@ -1,3 +1,5 @@
+[繁體中文](HUNG-STATE-TRANSITIONS.zh-TW.md)
+
 # Hung-State Transition Audit
 
 > **CURRENT-STATUS NOTE (`main@1d83b423`, 2026-07-16).** This file preserves
@@ -27,6 +29,10 @@ inline comments + decision references. Cross-references in this doc to
 source use `rg <pattern>` grep hints rather than file-line refs, so refactor
 that re-flows lines does not invalidate this doc; line refs in the prose
 below are illustrative-only and reflect HEAD `2f24376`.
+
+The F9 productive-output contract is consolidated into §F9.1–§F9.5 below.
+Those sections are the maintained source for the productive-output gate;
+the former standalone F9 document is only a consolidation input.
 
 ## Lifecycle overview
 
@@ -230,6 +236,240 @@ it anything" from "agent silent because it stopped responding to input"
   `check_hang` returns `false`)
 - **FP / FN**: same as §Exit.X1
 
+## Productive-output supplement (F9)
+
+This is the maintained contract for the F9 sub-finding (`#685` Phase 1
+deliverables #2 + #3): the dual-path supplement to silence-based Hung
+detection. It is a companion to the F9 inline structured comments in
+`src/state/mod.rs`, `src/behavioral.rs`, and `src/health.rs`.
+
+**Current baseline**: revalidated at `main@1d83b423` (2026-07-16). The gate
+remains shadow-by-default (`AGEND_PRODUCTIVE_GATE=1` enables classification).
+Gemini-specific calibration was renamed to Agy when Gemini retired. Grok is a
+supported backend but currently uses the generic marker/cache path; its
+backend-specific F9 calibration remains unverified.
+
+Issue: [#685](https://github.com/suzuke/agend-terminal/issues/685) F9
+sub-finding. Sibling sub-tasks: 1 (Hung audit, PR #750), 2 (F39 audit, PR
+#752), 3 (F39 speculative narrow, PR #763).
+
+Decision chain:
+- `d-20260513154400110972-2` (sub-task 1 base — Hung invariants)
+- `d-20260513161542381785-0` (sub-task 2 audit — F39 hypotheses)
+- `d-20260513231713506833-1` (sub-task 3 speculative — F39 Gemini narrow)
+- `d-20260513235514013631-0` (sub-task 4 — F9 productive-output gate)
+
+Maintenance: section IDs (`§F9.1`-`§F9.5`) are contract anchors. Renaming
+must propagate in the same PR. M1/M2/M3 discipline from the Hung audit applies:
+inline comments use `§F9.<n>` refs, this doc uses `rg <pattern>` grep hints, and
+section headings are stable.
+
+### §F9.1 — Architecture rationale (dual-path supplement)
+
+The naïve framing "replace silence_exceeds_threshold with productive-output
+detection" is **wrong**. It would regress `#659` silent-stuck-in-thinking
+detection — a process that truly stops emitting any PTY bytes would never
+trigger Hung if classification waited for *productive* bytes specifically
+(none come; agent stays in pre-Hung state forever).
+
+F9 ships as a **dual-path supplement**:
+
+- **Existing silent path** (any output = alive, threshold-based) remains in
+  `check_hang`. It catches the `#659` case where the agent goes truly silent.
+- **Productive path** supplements it: when silence is below threshold (the
+  agent is producing *some* output) but no *productive* output has arrived
+  past a separate threshold, the agent is flagged as a Hung candidate. This
+  catches the F9 grey failure where 1-byte spinner output resets the upstream
+  silence timer indefinitely while no real work happens.
+- `check_hang` returns `true` if EITHER path triggers; the union strictly ADDS
+  coverage and never removes it.
+
+This is the layer at which F9 operates: **HealthState** classification. The
+sibling F39(c) hypothesis (§F39.4) operates at the **AgentState** layer
+(`Thinking` pattern stickiness) — a different concern and bug surface.
+
+### §F9.2 — Productive-signal design
+
+A signal is **productive** if either:
+
+1. **MCP heartbeat** refreshed recently (`use_heartbeat: true` configs).
+   Heartbeat refresh means the agent called an MCP tool, concrete evidence of
+   forward progress. This is universal across managed backends.
+2. **Structural marker** matched the rendered screen text. Markers use
+   **line-start anchors and specific formats** — NOT bare keywords. The
+   bare-keyword approach (`Saved` / `Wrote`) has the same scrollback FP surface
+   as the F39 audit's Scenario A/B/C taxonomy.
+
+Generic structural anchors shared by all backends (file save banners):
+- `^Saved to \S+` — file save banner
+- `^Wrote \d+ bytes` — explicit byte count
+- `^Created file: \S+` — structured creation
+
+Per-backend completion markers shipped in `#685` sub-task 6 (deliverable #4,
+decision `d-20260514022917793418-0`). Each backend's `MARKERS` const lists the
+generic anchors above plus its own completion-glyph + tool-vocabulary regex.
+Look up each via `rg "<BACKEND>_PRODUCTIVE_MARKERS" src/behavioral.rs`:
+
+| Backend | Completion regex (added to generic anchors) | Source | Validation |
+|---|---|---|---|
+| Claude | `^[✓●⏺]\s+(Read\|Bash\|Edit\|Write\|Grep\|Glob\|Listing\|Reading\|Writing\|Searching\|Editing)\b` | `CLAUDE_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | F685 fixture `f685-f9-positive-savedfile.raw` (synthetic). Real captures pending corpus growth. |
+| Kiro | `^●\s+(Read\|Write\|Edit\|Bash\|Grep\|Glob\|Task\|List\|Search)\b` PLUS `\[(fs_read\|fs_write\|execute_bash)\]` | `KIRO_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | Synthetic unit tests only — `kiro_markers_*` in `src/behavioral.rs` tests. **Not validated against real captures** — use the fixture capture playbook. |
+| Codex | `^•\s+(Explored\|Edited\|Ran)\b` PLUS `apply_patch` | `CODEX_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | **Synthetic only — not validated against real captures.** Use the fixture capture playbook. |
+| Agy | `^✓\s+(ReadFile\|WriteFile\|ReadManyFiles\|Edit\|Shell\|WebFetch\|Glob\|GoogleSearch\|MemoryTool\|ReadFolder)\b` | `AGY_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | Inherited from the retired Gemini engine calibration; current Agy real-capture validation remains incomplete. |
+| OpenCode | `^→\s+(Read\|Write\|Edit\|Glob\|Grep\|Bash\|List\|Task)\b` | `OPENCODE_PRODUCTIVE_MARKERS` in `src/behavioral.rs` | **Synthetic only — not validated against real captures.** Use the fixture capture playbook. |
+| Grok | Generic save-banner anchors only | `GENERIC_PRODUCTIVE_MARKERS` via `grok_profile()` in `src/backend_profile.rs` | **Unverified backend-specific coverage**; no Grok-labelled corpus fixture. |
+
+**Excluded from F9 markers**:
+- All in-progress / spinner glyphs (Braille `[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]`, OpenCode
+  `✱`, Codex `◦ Working`, historical Gemini `⠦ Thinking`). F9 productivity =
+  completion-only; these fire BEFORE work completes.
+- Agy/Gemini-engine `tool.*call` / `MCP.*tool` literals — the heartbeat path
+  already covers MCP signals, so counting them again would duplicate evidence.
+- Bare keyword markers (for example, `Saved` / `Wrote` without a line-start
+  anchor). Prose such as "I saved your time" must not match. This is pinned by
+  `infer_productivity_rejects_bare_keyword_scrollback` (legacy) and
+  `<backend>_markers_reject_*` per-backend tests.
+
+#### Cache routing
+
+Per-backend markers are NOT routed via pointer equality. That would fall
+through to per-call `Regex::new()` compilation — the bug that caused PR #766's
+Ubuntu/Windows CI failure. Sub-task 6 introduced the `MarkerCacheId` enum on
+`ProductivityConfig`:
+
+```rust
+pub enum MarkerCacheId { Generic, Claude, Kiro, Codex, Agy, OpenCode }
+
+pub struct ProductivityConfig {
+    pub markers: &'static [&'static str],
+    pub use_heartbeat: bool,
+    pub heartbeat_fresh_window_ms: u64,
+    pub cache_id: Option<MarkerCacheId>,
+}
+```
+
+`infer_productivity` matches on `cache_id` to route to the corresponding
+per-backend `LazyLock<Vec<Regex>>` static (`CLAUDE_PRODUCTIVE_REGEXES`, etc.).
+The compile-time exhaustive match prevents missing-backend bugs. `None` is
+reserved for ad-hoc test configs and falls back to `Regex::new()` per call;
+Phase 1 production code never reaches that path.
+
+Future per-backend `heartbeat_fresh_window_ms` tuning and per-backend silence
+threshold tuning are out of scope until corpus measurement data supports the
+calibration (see §F9.5).
+
+### §F9.3 — Dual-path decision table
+
+| `silent` | `silent_productive` | `agent_state` | Default mode | `AGEND_PRODUCTIVE_GATE=1` |
+|---|---|---|---|---|
+| ≤ threshold | ≤ threshold | any | not-Hung | not-Hung |
+| > threshold | any | non-Idle | discriminator (existing) | discriminator (existing) |
+| ≤ threshold | > threshold | non-Idle | not-Hung + telemetry | discriminator (NEW path) |
+| any | any | `Idle` | not-Hung (Idle never hangs) | not-Hung (Idle never hangs) |
+
+"discriminator" means the existing input-pending-past-heartbeat /
+heartbeat-fresh / IdleLong branch in `check_hang`. Both paths route into the
+same discriminator once a path triggers. F9 adds a new entry condition, not a
+new discriminator branch.
+
+Find threshold mapping in source with
+`rg "silence_exceeds_threshold" src/health.rs` (silent path) and
+`rg "productive_silence_exceeds" src/health.rs` (F9 path). Both currently use
+the same per-`AgentState` thresholds.
+
+### §F9.4 — Known limitations (to be measured by fixture corpus)
+
+#### 4.1 Heartbeat-as-productive gap
+
+Pure-reasoning long sessions (for example, Claude internal thinking without MCP
+tool calls) generate no heartbeat refresh **and** no productive markers. Once
+`AGEND_PRODUCTIVE_GATE=1` is set, these sessions are flagged Hung after the
+threshold despite legitimate work in progress.
+
+**Mitigation deferred**:
+- A follow-up integrating spinner-cycling-as-productive (the F39 hypothesis (e)
+  variant — pattern-source-line tracking, inverted to count spinner-glyph
+  activity as evidence).
+- An operator override mechanism (out of F9 scope).
+
+**Risk-contained**: shadow mode plus env-var opt-in means only opted-in users
+encounter this FN during rollout. Activation is gated on fixture-corpus
+measurement (§F9.5).
+
+#### 4.2 Generic markers FP residual
+
+Even with structural anchors, edge cases remain. A user pasting the literal
+string `Saved to /tmp/foo` into a chat message that the agent echoes could match
+the marker. The negative test `infer_productivity_rejects_bare_keyword_scrollback`
+pins the anchor approach, which substantially narrows but does not eliminate the
+surface.
+
+**Mitigation applied**: line-start anchors (`^`) plus specific formats. Tests
+pin both the positive (real markers match) and negative (bare prose does not)
+contracts.
+
+**Residual risk acknowledged**: keep measuring it with real captured fixtures.
+
+#### 4.3 Cross-backend pattern uniformity
+
+Phase 1 shipped the same generic markers across all backends. Later calibration
+added Kiro `[fs_read]` and Agy tool banners (renamed from the retired Gemini
+engine). Grok still uses the generic profile, so backend-specific Grok progress
+that differs from those anchors has lower F9 sensitivity until real-capture
+calibration lands.
+
+### §F9.5 — Activation gate (shadow → opt-in → promotion)
+
+F9 productive-silence telemetry fires unconditionally
+(`rg "F9 dual-path candidate" src/health.rs`). **Classification** is gated on
+the `AGEND_PRODUCTIVE_GATE` env var:
+
+```
+unset / not "1"   → shadow mode (default): telemetry collected,
+                    no Hung classification from productive path
+"1"               → active mode: productive-silence path can flag Hung
+```
+
+**Anti-dead-infra clause**: the Sprint 27 PR-A behavioral telemetry shipped in
+shadow mode and never promoted. The productive-output path therefore keeps
+explicit promotion criteria:
+
+1. **Fixture corpus measures FP rate < 1% with N ≥ 300 not-stuck fixtures**
+   (the Rule-of-Three statistical minimum; the original `#685` wording used a
+   smaller 3+ case floor). Capture and grow the corpus with the
+   [PTY fixture capture playbook](../tests/fixtures/state-replay/CAPTURE-RECIPES.md),
+   and run the measurement in `tests/fixture_corpus_measurement.rs` with
+   per-transition, source-separated reporting.
+2. **2-week shadow-mode telemetry shows behavioral divergence stable**
+   (the Sprint 27 PR-A divergence-dashboard pattern, found with
+   `rg "behavioral_shadow" src/behavioral.rs`).
+3. **Operator decision to flip the env-var default**, in a separate PR that
+   changes the default in `check_hang` from unset to `"1"`, or removes the gate
+   entirely once promoted.
+
+Without all three, the gate stays default-off. If the timeline exceeds 6 weeks
+without measurement, the F9 path itself becomes a removal candidate; dead
+shadow infrastructure is worse than no infrastructure.
+
+#### 5.1 Cross-references
+
+- §F39.4 hypothesis (c) footnote — layer distinction between F39(c)
+  `AgentState` and F9 `HealthState`.
+- §Invariants 5b/5c — F9 preserves the `check_hang -> bool` return contract and
+  `display_name()` string contract. The new `silent_productive: Duration`
+  parameter is an internal-API refactor; the sole production caller is
+  `src/daemon/per_tick/hang_detection.rs` (`rg "check_hang(" src/daemon`).
+- `src/behavioral.rs` — `ProductivitySignal`, `ProductivitySource`,
+  `ProductivityConfig`, `config_for_productivity`, `infer_productivity`, and
+  `log_productivity_telemetry`. Historically these paralleled the Sprint 27
+  PR-A silence-side equivalents (`BehavioralSignal` / `infer_from_silence` /
+  `log_shadow_telemetry`); those were removed in #2547 as dead code, while
+  `BehavioralConfig` remains because `backend_profile.rs` still uses it.
+- [RECOVERY-STAGES.md](RECOVERY-STAGES.md) — the current Stage-1-only recovery
+  dispatcher reads `productive_silence_exceeds` directly to select the Stage 1
+  alive-stuck versus dead-likely branch. Recovery treats all `Hung` sources the
+  same regardless of F9 promotion state; see §RS.4.
+
 ## §F39 — AgentState Thinking Pattern Stickiness (cross-audit: AgentState, not HealthState)
 
 This section is a **cross-audit boundary**: §F39 documents `AgentState::Thinking`
@@ -390,8 +630,8 @@ Re-evaluate the full (c) hypothesis when fixture corpus data is available.
 
 **F9 layer distinction**: this hypothesis lives at the `AgentState`
 layer (`Thinking` pattern stickiness in `src/state.rs`). The F9
-productive-output gate (sub-task 4, decision `d-20260513235514013631-0`,
-see `docs/F9-PRODUCTIVE-OUTPUT-GATE.md`) operates at the `HealthState`
+productive-output gate (§F9.1–§F9.5, decision
+`d-20260513235514013631-0`) operates at the `HealthState`
 layer (`Hung` classification in `src/health.rs::check_hang`). The two
 do NOT overlap: F39 mitigations adjust *which `AgentState::Thinking`
 transitions fire*, while F9 adds a parallel `HealthState::Hung`
@@ -420,12 +660,11 @@ reset mechanic.
   measurement of hypotheses (a)–(f) cannot differentiate fixes that
   address the bug from fixes that only mask Scenarios A and B.
 
-  **Update (sub-task 5 ship)**: corpus infrastructure landed in PR
-  containing `rg "F685-FIXTURE-CORPUS" docs/`. The Scenario C measurement
-  itself remains deferred — replay test runs in microseconds so
-  `min_hold` thresholds (wall-clock based) never cross during byte-only
-  replay. Time-injection harness extension required; see
-  `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6` open questions.
+  **Update (sub-task 5 ship)**: corpus infrastructure landed. The Scenario C
+  measurement itself remains deferred — replay tests run in microseconds, so
+  wall-clock-based `min_hold` thresholds never cross during byte-only replay.
+  A time-injection harness extension remains required; collect new traces with
+  the [PTY fixture capture playbook](../tests/fixtures/state-replay/CAPTURE-RECIPES.md).
 
 - **Cross-backend pattern overlap**: Kiro `r"Kiro is working|esc to cancel"`
   and Gemini `r"esc to cancel"` share the literal `"esc to cancel"`. State
@@ -450,9 +689,12 @@ reset mechanic.
 
 ## F9 / F10 follow-up scope cross-reference
 
+The F9 row is now maintained by §F9.1–§F9.5 in this contract. The table remains
+as the transition-to-finding map.
+
 | Finding | Affected transitions | Sub-task scope |
 |---|---|---|
-| F9 (productive-output gate) | §Entry.E1 FN, §Entry.E2 FN, §IdleLong.Entry.E1 FN, §Exit.X1 FP | New "productive output" signal (PR push, MCP tool success, structured log markers); changes silence-timer reset semantics in `StateTracker` and/or `check_hang` predicates. Separate PR. |
+| F9 (productive-output gate) | §Entry.E1 FN, §Entry.E2 FN, §IdleLong.Entry.E1 FN, §Exit.X1 FP | Dual-path productive-output signal and activation gate maintained in §F9.1–§F9.5; changes remain internal to `StateTracker` and/or `check_hang` predicates. |
 | F10 (doc-only confirmation) | §Exit.X1 FP | Confirm that `maybe_decay` truly does not affect Hung (this audit's §Invariants 5b/5d is the evidence) and that §Exit.X1 is the sole recovery path. Doc-only sub-task. |
 
 ## Open questions (for Phase 2 / future sub-tasks)
@@ -474,10 +716,11 @@ reset mechanic.
   + `RecoveryStageState` state machine + `HealthState::Paused` variant
   + env-var-gated shadow-mode default. Stages 2 and 3 follow-up
   sub-tasks reuse the same dispatcher tick + state machine. See
-  `docs/RECOVERY-STAGES.md` for full lifecycle + promotion criteria.
+  [RECOVERY-STAGES.md](RECOVERY-STAGES.md) for the full lifecycle and
+  promotion criteria.
   **Update (#2549)**: Stage 2/3 (and the dispatcher-driven Stage 3 arm)
   were later removed — converged to Stage-1-only. See
-  `docs/RECOVERY-STAGES.md`'s header banner for the rationale.
+  [RECOVERY-STAGES.md](RECOVERY-STAGES.md)'s header banner for the rationale.
 
 ## Consumer audit
 

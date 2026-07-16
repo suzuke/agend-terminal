@@ -42,7 +42,7 @@ fi
 marker=$(echo "$body" | grep -oE '<!--[[:space:]]*LOC-EST:[[:space:]]*[0-9]+-[0-9]+[[:space:]]*-->' | head -1 || true)
 if [[ -z "$marker" ]]; then
     echo "[loc-overrun] no <!-- LOC-EST: X-Y --> marker in PR body — skipping check." >&2
-    echo "[loc-overrun] (To enforce: add the marker per docs/PROCESS-LOC-ESTIMATION-METHODOLOGY.md §5.1)" >&2
+    echo "[loc-overrun] (To enforce: add <!-- LOC-EST: lower-upper --> to the PR body.)" >&2
     exit 0
 fi
 range=$(echo "$marker" | grep -oE '[0-9]+-[0-9]+')

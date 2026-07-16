@@ -1,7 +1,7 @@
-//! [fugu §3.4] Snapshot fail-open invariant — every reader of the snapshot
+//! Snapshot fail-open invariant — every reader of the snapshot
 //! projection must be a reviewed fail-open consumer.
 //!
-//! `workspace/fugu-0acdd8/agend-terminal-solutions.md` §3.4: `snapshot.json` is
+//! Per `docs/SOURCE-OF-TRUTH.md`, `snapshot.json` is
 //! a FAIL-OPEN projection of the in-memory `StateTracker`. It MAY be read by
 //! deciders, but — per the corrected rule — a decision that reads it MUST
 //! fail-open, be idempotent, and NEVER cause an IRREVERSIBLE action from a

@@ -117,3 +117,69 @@ and no 1.88-compatible pin exists — see below.
 (grep `ci.yml` and `release.yml` for `1.88`). Treat an MSRV bump as a
 minor-version event and call it out in the changelog. Prefer a still-
 conservative new floor over tracking the latest stable.
+
+## Release smoke test (target: 30 minutes)
+
+Run this against the exact release commit or its CI artifact before tagging.
+
+### Preflight
+
+- [ ] Stop any daemon left by an earlier session and work from the repository root.
+- [ ] Build with `cargo build --release`; confirm `agend-terminal doctor` exits 0.
+- [ ] Confirm credentials for every backend under test; set
+  `AGEND_TELEGRAM_BOT_TOKEN` when testing Telegram.
+
+### Backend matrix
+
+For every installed backend, spawn it, send `echo hello`, exercise one tool
+call such as `list files in /tmp`, exit normally, and confirm no orphan process
+remains. Record skipped backends in the sign-off.
+
+| Backend | Ready evidence | Normal exit | Extra check |
+|---|---|---|---|
+| Claude Code (`claude`) | `❯` or `bypass permissions` within 30 s | `/exit` | `admin cleanup-branches` preview exits 0 and deletes nothing |
+| Kiro CLI (`kiro-cli`) | `Trust All Tools active` or `ask a question` within 30 s | `/quit` | trust dialog is dismissed |
+| Codex (`codex`) | `OpenAI Codex` or `›` within 20 s | `exit` | trust-directory dialog is dismissed |
+| OpenCode (`opencode`) | `Ask anything` or `tab agents` within 45 s | `/exit` | mouse wheel inside alt-screen stays with the backend (#744) |
+| Agy (`agy`) | `Antigravity CLI` or `Type your message` within 20 s | `/exit` | `.agents/mcp_config.json` loads fleet MCP tools (#1547) |
+| Grok (`grok`) | `Grok Build` or `❯` within 30 s | `/exit` | project-trust dialog is dismissed |
+
+### Cross-cutting checks
+
+- [ ] `Ctrl+B n` / `Ctrl+B p` cycles tabs, `Ctrl+B o` cycles panes, and
+  `Ctrl+B d` detaches cleanly.
+- [ ] Mouse wheel scrolls history in a normal, non-alt-screen pane.
+- [ ] A Telegram message reaches the correct agent pane when the channel is enabled.
+- [ ] A disposable `repo(action=checkout, bind=true)` followed by
+  `release_worktree` leaves `binding_state` unbound and no dangling worktree.
+- [ ] With `AGEND_CAPTURE_FIXTURES=1`, one backend run writes a `.cap` plus
+  `.cap.meta.json`; unset the variable afterwards.
+
+### Sign-off
+
+Paste this in the release PR:
+
+```text
+Date: YYYY-MM-DD
+Operator: <name>
+agend-terminal version: <version>
+OS / arch: <value>
+
+Backend versions tested:
+- claude:
+- kiro-cli:
+- codex:
+- opencode:
+- agy:
+- grok:
+
+Backends skipped (reason):
+-
+
+Known deviations / failures:
+-
+
+Overall verdict: [ ] PASS  [ ] PASS with caveats  [ ] FAIL
+```
+
+When all six pass, include `Real-backend smoke: ✓ all 6 backends` in the PR.

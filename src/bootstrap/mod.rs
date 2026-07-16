@@ -293,7 +293,7 @@ pub(crate) fn boot_hygiene_sweeps(home: &Path) {
                 "#704 AGEND_CAPTURE_FIXTURES=1 active — PTY captures land at \
                  $AGEND_HOME/captures/<agent>/ and may contain secrets / prompts. \
                  Operator MUST review tests/fixtures/state-replay/*.raw before \
-                 commit. Promote workflow: see docs/CONTRIBUTING.md \"Capturing a new fixture\"."
+                 commit. Promote workflow: see CONTRIBUTING.md \"Capturing a new fixture\"."
             );
         }
     });
