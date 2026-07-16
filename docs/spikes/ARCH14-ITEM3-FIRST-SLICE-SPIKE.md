@@ -171,6 +171,15 @@ when the stale report removes the current assignee's tracking.
 | `reassign_to` doesn't invalidate old epoch | `dispatch_tracking.rs:81-116` |
 | Sender passes unused `_to` to mark_completed | `comms.rs:274` |
 | Reporter identity available but not passed to mark_resolved | `messaging.rs:577-583` |
+| Existing test documents unscoped settlement as intentional design | `dispatch_idle/mod.rs:2329` (`mark_resolved_keys_on_correlation_id_not_sender`) |
+
+**Note**: The unscoped settlement in `mark_resolved` is not an oversight — an
+existing test explicitly asserts that resolution keys on `correlation_id`, not
+sender. The gap arises because this design predates the reassignment scenario:
+when only one agent ever holds a dispatch for a given correlation, unscoped
+settlement is correct. The reassignment path (`reassign_to` +
+`record_dispatch` to a new target) creates a second sidecar for the same
+correlation, which the original design did not anticipate.
 
 ---
 
