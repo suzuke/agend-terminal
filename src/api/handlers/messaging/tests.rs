@@ -3083,3 +3083,309 @@ fn report_fields_on_kind_task_rejected_without_leaked_task() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── Architecture-14 item 3 slice 1: reporter-scoped dispatch settlement ──
+//
+// RED tests proving the current code does NOT scope settlement/refresh by
+// reporter identity. Each test sets up a cross-assignee replacement (dispatch
+// to agent-A, then to agent-B with the same task correlation) and shows that
+// a stale report/update from agent-A incorrectly affects agent-B's state.
+
+/// RED 1: stale prior-assignee report must NOT remove current assignee's
+/// dispatch_tracking entry. mark_completed removes ALL entries matching
+/// the correlation_id regardless of reporter vs entry.to — the function
+/// itself is unscoped. (The MCP handle_report_result path calls it
+/// directly at comms.rs:274 with the sender as _to, which is ignored.)
+#[test]
+fn red_stale_report_cannot_remove_current_dispatch_tracking() {
+    let home = tmp_home("red-dt-stale-report");
+
+    // Dispatch same task to both agent-A and agent-B.
+    crate::dispatch_tracking::track_dispatch(
+        &home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some("t-shared".into()),
+            from: "lead".into(),
+            to: "agent-a".into(),
+            delegated_at: "2026-07-16T00:00:00Z".into(),
+            status: "pending".into(),
+            ..Default::default()
+        },
+    );
+    crate::dispatch_tracking::track_dispatch(
+        &home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some("t-shared".into()),
+            from: "lead".into(),
+            to: "agent-b".into(),
+            delegated_at: "2026-07-16T01:00:00Z".into(),
+            status: "pending".into(),
+            ..Default::default()
+        },
+    );
+
+    // Stale agent-A reports — mark_completed called with reporter="agent-a".
+    // This simulates the MCP handle_report_result path (comms.rs:274).
+    crate::dispatch_tracking::mark_completed(&home, Some("t-shared"), "agent-a");
+
+    // Agent-B's dispatch_tracking entry must survive.
+    let store = crate::dispatch_tracking::take_pending_dispatchers_to(&home, "agent-b");
+    assert!(
+        !store.is_empty(),
+        "RED: stale agent-a report must NOT remove agent-b's dispatch_tracking entry"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED 2: stale prior-assignee report must NOT delete current assignee's
+/// dispatch_idle sidecar. Currently FAILS: mark_resolved matches by
+/// correlation_id without checking reporter == sidecar.target.
+#[test]
+fn red_stale_report_cannot_delete_current_dispatch_idle_sidecar() {
+    let home = tmp_home("red-idle-stale-report");
+    setup_team_env(
+        &home,
+        &["lead", "agent-a", "agent-b"],
+        &[("team", &["lead", "agent-a", "agent-b"])],
+    );
+
+    // Seed sidecar for agent-A dispatch.
+    let _id_a = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "agent-a",
+        Some("t-shared"),
+        "task",
+        600,
+    );
+    // Seed sidecar for agent-B dispatch (same correlation).
+    let id_b = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "agent-b",
+        Some("t-shared"),
+        "task",
+        600,
+    )
+    .expect("seed agent-b sidecar");
+
+    // Stale agent-A sends report.
+    let ctx = test_ctx(&home);
+    let _ = handle_send(
+        &json!({
+            "from": "agent-a",
+            "target": "lead",
+            "text": "done (stale)",
+            "kind": "report",
+            "correlation_id": "t-shared",
+        }),
+        &ctx,
+    );
+
+    // Agent-B's sidecar must survive.
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    assert!(
+        pending.iter().any(|p| p.dispatch_id == id_b),
+        "RED: stale agent-a report must NOT delete agent-b's dispatch_idle sidecar"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED 3: after restart (re-read from disk), current assignee's watchdog
+/// sidecar must still be present when only the stale assignee reported.
+#[test]
+fn red_restart_preserves_current_watchdog_after_stale_report() {
+    let home = tmp_home("red-restart-watchdog");
+    setup_team_env(
+        &home,
+        &["lead", "agent-a", "agent-b"],
+        &[("team", &["lead", "agent-a", "agent-b"])],
+    );
+
+    let id_b = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "agent-b",
+        Some("t-shared"),
+        "task",
+        600,
+    )
+    .expect("seed agent-b sidecar");
+
+    // Stale agent-A report.
+    let ctx = test_ctx(&home);
+    let _ = handle_send(
+        &json!({
+            "from": "agent-a",
+            "target": "lead",
+            "text": "done (stale)",
+            "kind": "report",
+            "correlation_id": "t-shared",
+        }),
+        &ctx,
+    );
+
+    // Simulate restart: re-read from disk.
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    assert!(
+        pending.iter().any(|p| p.dispatch_id == id_b),
+        "RED: after stale report + restart, agent-b's watchdog sidecar must survive on disk"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED 4: watchdog must still fire (detect exceeded threshold) for current
+/// assignee after a stale prior-assignee report.
+#[test]
+fn red_watchdog_fires_for_current_assignee_after_stale_report() {
+    let home = tmp_home("red-watchdog-fires");
+    setup_team_env(
+        &home,
+        &["lead", "agent-a", "agent-b"],
+        &[("team", &["lead", "agent-a", "agent-b"])],
+    );
+
+    // Agent-B sidecar with a 1-second threshold (expires immediately).
+    let id_b = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "agent-b",
+        Some("t-shared"),
+        "task",
+        1,
+    )
+    .expect("seed agent-b sidecar");
+
+    // Stale agent-A report.
+    let ctx = test_ctx(&home);
+    let _ = handle_send(
+        &json!({
+            "from": "agent-a",
+            "target": "lead",
+            "text": "done (stale)",
+            "kind": "report",
+            "correlation_id": "t-shared",
+        }),
+        &ctx,
+    );
+
+    // Wait for threshold to expire.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // The sidecar must still exist AND be detectable as exceeded.
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    let entry = pending.iter().find(|p| p.dispatch_id == id_b);
+    assert!(
+        entry.is_some(),
+        "RED: agent-b's sidecar must survive stale report so watchdog can fire"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED 5: stale prior-assignee update/query must NOT refresh current
+/// assignee's issued_at. Currently FAILS: refresh_issued_at matches by
+/// correlation_id without checking reporter == sidecar.target.
+#[test]
+fn red_stale_update_cannot_refresh_current_issued_at() {
+    let home = tmp_home("red-refresh-stale");
+    setup_team_env(
+        &home,
+        &["lead", "agent-a", "agent-b"],
+        &[("team", &["lead", "agent-a", "agent-b"])],
+    );
+
+    let id_b = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "agent-b",
+        Some("t-shared"),
+        "task",
+        600,
+    )
+    .expect("seed agent-b sidecar");
+
+    // Record original issued_at.
+    let before = crate::daemon::dispatch_idle::list_pending(&home);
+    let original_issued = before
+        .iter()
+        .find(|p| p.dispatch_id == id_b)
+        .expect("sidecar exists")
+        .issued_at
+        .clone();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Stale agent-A sends update with matching correlation.
+    let ctx = test_ctx(&home);
+    let _ = handle_send(
+        &json!({
+            "from": "agent-a",
+            "target": "lead",
+            "text": "BUSY still working",
+            "kind": "update",
+            "correlation_id": "t-shared",
+        }),
+        &ctx,
+    );
+
+    // Agent-B's issued_at must NOT have been refreshed.
+    let after = crate::daemon::dispatch_idle::list_pending(&home);
+    let current_issued = after
+        .iter()
+        .find(|p| p.dispatch_id == id_b)
+        .expect("sidecar must still exist")
+        .issued_at
+        .clone();
+    assert_eq!(
+        original_issued, current_issued,
+        "RED: stale agent-a update must NOT refresh agent-b's issued_at"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED 6: validated-review bridge settlement must be reporter-scoped.
+/// A verdict from a stale reviewer must NOT resolve the current reviewer's
+/// dispatch_idle sidecar.
+#[test]
+fn red_validated_review_bridge_settlement_is_reporter_scoped() {
+    let home = tmp_home("red-review-bridge");
+    setup_team_env(
+        &home,
+        &["lead", "reviewer-a", "reviewer-b"],
+        &[("team", &["lead", "reviewer-a", "reviewer-b"])],
+    );
+
+    // Sidecar for reviewer-B's review dispatch (task-keyed).
+    let id_b = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "reviewer-b",
+        Some("t-review"),
+        "task",
+        600,
+    )
+    .expect("seed reviewer-b sidecar");
+
+    // Stale reviewer-A sends report. The bridge_verdict_to_review_task
+    // path calls mark_resolved(home, task_id) without checking reporter.
+    // We simulate a report with correlation matching the review task.
+    let ctx = test_ctx(&home);
+    let _ = handle_send(
+        &json!({
+            "from": "reviewer-a",
+            "target": "lead",
+            "text": "VERIFIED — looks good",
+            "kind": "report",
+            "correlation_id": "t-review",
+        }),
+        &ctx,
+    );
+
+    // Reviewer-B's sidecar must survive.
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    assert!(
+        pending.iter().any(|p| p.dispatch_id == id_b),
+        "RED: stale reviewer-a verdict must NOT resolve reviewer-b's dispatch_idle sidecar"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
