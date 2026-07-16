@@ -25,6 +25,8 @@ mod restart;
 mod schedule;
 mod send_envelope;
 mod task;
+#[cfg(test)]
+mod usage_limit_takeover_tests;
 mod worktree;
 
 /// Test-only thin shim into `release_worktree`'s production handler. Used by

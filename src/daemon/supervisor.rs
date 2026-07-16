@@ -24,7 +24,7 @@ const TICK: Duration = Duration::from_secs(10);
 mod usage_limit;
 pub(crate) use usage_limit::*;
 mod reactions;
-mod usage_limit_control;
+pub(crate) mod usage_limit_control;
 pub(crate) use reactions::*;
 
 /// Vterm tail size pushed to Telegram when a stall is detected.
