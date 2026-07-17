@@ -232,6 +232,15 @@ fn build_message(
             }
         }
     }
+    let task_id = params["task_id"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| auto_task_id.clone());
+    let correlation_id = if params["kind"].as_str() == Some("task") {
+        task_id.clone()
+    } else {
+        params["correlation_id"].as_str().map(String::from)
+    };
     crate::inbox::InboxMessage {
         schema_version: 0,
         id: None,
@@ -239,14 +248,11 @@ fn build_message(
         delivering_at: None,
         thread_id,
         parent_id,
-        task_id: params["task_id"]
-            .as_str()
-            .map(String::from)
-            .or_else(|| auto_task_id.clone()),
+        task_id,
         force_meta: params
             .get("force_meta")
             .and_then(|v| serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()),
-        correlation_id: params["correlation_id"].as_str().map(String::from),
+        correlation_id,
         // Display only. A validated review uses the server-derived exact head;
         // non-review reports may retain the caller's display value, but no
         // authorization logic reads it.
@@ -486,7 +492,13 @@ pub(crate) fn track_dispatch(
 ) {
     let kind_str = msg.kind.as_deref().unwrap_or("");
     if matches!(kind_str, "task" | "query") {
-        let outbound_corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
+        // For tasks, task_id is the canonical lifecycle identity. Queries
+        // retain the historical correlation_id/task_id fallback semantics.
+        let outbound_corr = if kind_str == "task" {
+            msg.task_id.as_deref()
+        } else {
+            msg.correlation_id.as_deref().or(msg.task_id.as_deref())
+        };
         let explicit_threshold = params["expect_reply_within_secs"].as_i64();
         // #2099: a fire-and-forget dispatch (`no_report_expected`) records NO
         // dispatch-idle sidecar, so the ~threshold watchdog never nags the
@@ -567,13 +579,13 @@ pub(crate) fn track_dispatch(
         }
     } else if kind_str == "report" {
         // #1525: clear the dispatch-idle sidecar with the SAME key the record
-        // path uses — `correlation_id.or(task_id)` (see the kind=task branch
-        // above). `record_dispatch` keys the sidecar via that fallback, so a
-        // report that carries the id only in `task_id` (correlation_id empty)
-        // must match by task_id too; otherwise `mark_resolved`'s exact lookup
-        // silently no-ops and the completed dispatch's sidecar lingers until it
-        // fires a spurious `dispatch_idle_threshold_exceeded` nudge once the
-        // target goes Idle (#1516's working-state gate does not cover that).
+        // path uses — task_id for task dispatches, correlation_id/task_id
+        // fallback for query dispatches. A report that carries the id only in
+        // task_id (correlation_id empty) must match by task_id too; otherwise
+        // mark_resolved's exact lookup silently no-ops and the completed
+        // dispatch's sidecar lingers until it fires a spurious
+        // dispatch_idle_threshold_exceeded nudge once the target goes Idle
+        // (#1516's working-state gate does not cover that).
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             // #2004: `None` here is NORMAL (a report whose correlation has no
             // pending sidecar — most reports). The real swallowed failure —
@@ -710,6 +722,9 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         };
     if let Some(ref tid) = auto_task_id {
         msg.task_id = Some(tid.clone());
+        if params["kind"].as_str() == Some("task") {
+            msg.correlation_id = Some(tid.clone());
+        }
     }
     // #bughunt2: a failed enqueue (disk read-only / I/O) must surface as a real
     // failure — never report ok:true for a silently-dropped message. Return

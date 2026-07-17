@@ -90,6 +90,14 @@ impl SendEnvelope {
             provenance,
             branch,
         } = self;
+        // A task's lifecycle identity is its task_id. Ignore a stale or
+        // umbrella correlation before projecting the envelope so the daemon
+        // route and API-down fallback remain side-effect equivalent.
+        let correlation_id = if kind.as_deref() == Some("task") {
+            task_id
+        } else {
+            correlation_id
+        };
         let mut params = json!({
             "from": from,
             "target": target,
@@ -156,6 +164,14 @@ impl SendEnvelope {
             provenance: _,
             branch: _,
         } = self;
+        // Keep fallback delivery on the same canonical task correlation as the
+        // normal daemon SEND projection; non-task correlation semantics stay
+        // unchanged.
+        let correlation_id = if kind.as_deref() == Some("task") {
+            task_id
+        } else {
+            correlation_id
+        };
         let report_purpose = report_purpose
             .as_deref()
             .and_then(|p| {
