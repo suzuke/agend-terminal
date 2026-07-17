@@ -74,8 +74,7 @@ fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
 #[test]
 #[cfg(unix)]
 fn reconcile_runs_before_fetch_loop_ordering() {
-    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    let _lock = ENV_LOCK.lock();
+    let _lock = super::tests::ENV_LOCK.lock();
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     let home = tmp_home("reconcile-order");
     let repo = setup_test_repo("reconcile-order-repo");

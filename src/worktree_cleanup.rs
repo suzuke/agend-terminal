@@ -977,7 +977,7 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_test_repo(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
