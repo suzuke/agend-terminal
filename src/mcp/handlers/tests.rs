@@ -1596,7 +1596,11 @@ fn delegate_task_forwards_dispatch_directives_high1() {
         Some(true),
         "worktree_binding_required must reach the InboxMessage (delivery gate)"
     );
-    assert_eq!(m.correlation_id.as_deref(), Some("c-high1"));
+    assert_eq!(
+        m.correlation_id.as_deref(),
+        Some("t-high1-1"),
+        "kind=task must use task_id as canonical correlation"
+    );
     assert_eq!(m.reviewed_head.as_deref(), Some("abc1234"));
     assert_eq!(m.eta_minutes, Some(30));
     assert_eq!(m.reporting_cadence.as_deref(), Some("wave-end"));
