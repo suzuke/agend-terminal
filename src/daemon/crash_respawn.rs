@@ -44,9 +44,7 @@ fn await_test_worker_gate() -> Option<Sender<()>> {
         .lock()
         .expect("test worker gate lock")
         .take();
-    let Some((entered, release, done)) = gate else {
-        return None;
-    };
+    let (entered, release, done) = gate?;
     let _ = entered.send(());
     let _ = release.recv();
     Some(done)
