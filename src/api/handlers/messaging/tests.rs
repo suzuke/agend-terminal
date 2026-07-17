@@ -1306,6 +1306,119 @@ fn hook_fixup_team_dispatch_records_pending_via_default_threshold() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// RED: a task dispatch must key delivery tracking by its leaf `task_id`, not
+/// by a stale umbrella `correlation_id`; a terminal report then closes the leaf
+/// while leaving the legitimate umbrella task open.
+#[test]
+fn task_dispatch_mismatch_tracks_and_closes_leaf_only() {
+    let home = tmp_home("task-correlation-leaf");
+    write_fixup_fleet(&home, &["fixup-lead", "fixup-reviewer"]);
+    let leaf = crate::tasks::handle(
+        &home,
+        "fixup-lead",
+        &json!({
+            "action": "create",
+            "title": "leaf task",
+            "assignee": "fixup-reviewer",
+        }),
+    )["id"]
+        .as_str()
+        .expect("leaf task id")
+        .to_string();
+    let umbrella = crate::tasks::handle(
+        &home,
+        "fixup-lead",
+        &json!({
+            "action": "create",
+            "title": "umbrella task",
+            "assignee": "fixup-reviewer",
+        }),
+    )["id"]
+        .as_str()
+        .expect("umbrella task id")
+        .to_string();
+    let ctx = test_ctx(&home);
+
+    let dispatched = handle_send(
+        &json!({
+            "from": "fixup-lead",
+            "target": "fixup-reviewer",
+            "text": "[delegate_task] leaf",
+            "kind": "task",
+            "task_id": leaf,
+            "correlation_id": umbrella,
+            "expect_reply_within_secs": 600,
+        }),
+        &ctx,
+    );
+    assert_eq!(
+        dispatched["ok"], true,
+        "task dispatch must succeed: {dispatched}"
+    );
+    let delivered = crate::inbox::drain(&home, "fixup-reviewer")
+        .into_iter()
+        .find(|m| m.text == "[delegate_task] leaf")
+        .expect("task message must be delivered to the target inbox");
+    assert_eq!(delivered.task_id.as_deref(), Some(leaf.as_str()));
+    assert_eq!(
+        delivered.correlation_id.as_deref(),
+        Some(leaf.as_str()),
+        "delivered task message must use task_id as canonical correlation"
+    );
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.correlation_id.as_deref() == Some(leaf.as_str())),
+        "dispatch tracking must use the leaf task_id: {pending:?}"
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|p| p.correlation_id.as_deref() != Some(umbrella.as_str())),
+        "stale umbrella correlation must not receive the leaf sidecar: {pending:?}"
+    );
+
+    let reported = handle_send(
+        &json!({
+            "from": "fixup-reviewer",
+            "target": "fixup-lead",
+            "text": "leaf complete",
+            "kind": "report",
+            "correlation_id": leaf,
+            "terminal": true,
+        }),
+        &ctx,
+    );
+    assert_eq!(
+        reported["ok"], true,
+        "terminal report must deliver: {reported}"
+    );
+    let listed = crate::tasks::handle(
+        &home,
+        "fixup-lead",
+        &json!({"action": "list", "include_history": true}),
+    );
+    let tasks = listed["tasks"].as_array().expect("task list");
+    let status = |id: &str| {
+        tasks
+            .iter()
+            .find(|task| task["id"].as_str() == Some(id))
+            .and_then(|task| task["status"].as_str())
+    };
+    assert_eq!(
+        status(&leaf),
+        Some("done"),
+        "leaf must auto-close: {tasks:?}"
+    );
+    assert_eq!(
+        status(&umbrella),
+        Some("open"),
+        "umbrella must remain open: {tasks:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2099 rework (PR #2108, reviewer-2 catch): close the SECOND ~30min nag
 /// channel. A fixup-team dispatch auto-arms dispatch_idle at the 1800s team
 /// default; a fire-and-forget dispatch (`no_report_expected=true`) must
@@ -2301,6 +2414,11 @@ fn auto_create_task_on_send_kind_task_without_task_id() {
         msg.task_id.as_deref(),
         Some(task_id),
         "outbound message must carry auto-generated task_id"
+    );
+    assert_eq!(
+        msg.correlation_id.as_deref(),
+        Some(task_id),
+        "auto-created task message must use task_id as canonical correlation"
     );
     std::fs::remove_dir_all(&home).ok();
 }

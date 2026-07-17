@@ -271,6 +271,78 @@ mod tests {
         );
     }
 
+    /// A completed child is not a reason to block a legitimate terminal report
+    /// for its still-open parent. Auto-close must not grow a has-children guard.
+    #[test]
+    fn parent_with_completed_child_still_auto_closes() {
+        let home = tmp_home("parent_completed_child");
+        let emitter = InstanceName::from("test:seed");
+        let parent = TaskId("t-parent-correlation".into());
+        let child = TaskId("t-child-correlation".into());
+        crate::task_events::append_batch_at(
+            &home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: parent.clone(),
+                    title: "parent".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from("dev-agent")),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Created {
+                    task_id: child.clone(),
+                    title: "child".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from("dev-agent")),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: Some(parent.clone()),
+                },
+                TaskEvent::Done {
+                    task_id: child,
+                    by: InstanceName::from("dev-agent"),
+                    source: crate::task_events::DoneSource::OperatorManual {
+                        authored_at: "2026-01-01T00:00:00Z".into(),
+                        result: Some("child complete".into()),
+                    },
+                },
+            ],
+        )
+        .expect("seed parent and completed child");
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            &parent.0,
+            "dev-agent",
+            "parent complete",
+            true,
+        )
+        .unwrap();
+        assert!(closed, "parent terminal report should auto-close");
+        assert_eq!(
+            task_status(&home, &parent.0),
+            Some(crate::task_events::TaskStatus::Done),
+            "completed child must not block its parent from closing"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #78445-2 PR-C (defect d) RED-first: closing a task must SETTLE its
     /// `dispatch_tracking` rows (matched by task_id) so the stuck-dispatch sweep
     /// stops nagging about a dispatch whose task the board already closed (the
