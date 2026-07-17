@@ -2465,7 +2465,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod reconcile_ordering_tests;
 
 #[cfg(test)]
