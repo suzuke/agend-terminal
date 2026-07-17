@@ -36,6 +36,15 @@ const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable â
 /// `check_hang` threshold.
 const AWAITING_OP_SILENCE: Duration = Duration::from_secs(30);
 
+fn backoff_delay_for(total_crashes: u32) -> Duration {
+    if total_crashes == 0 {
+        return BACKOFF_BASE;
+    }
+    let exp = (total_crashes - 1).min(10);
+    let delay = BACKOFF_BASE.mul_f64(2.0_f64.powi(exp as i32));
+    delay.min(BACKOFF_MAX)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)] // ErrorLoop constructed by record_error() in health monitoring
@@ -529,6 +538,20 @@ impl HealthTracker {
         (true, delay, should_notify)
     }
 
+    /// Return the delay that the next crash-respawn attempt would use without
+    /// mutating the crash budget.  Crash disposition admission calls
+    /// [`record_crash`] only after an exact-generation permit admits
+    /// `Restarting`; the daemon uses this read-only projection to schedule the
+    /// backoff while the raw observation remains truthfully `Crashed`.
+    pub fn next_crash_delay(&self) -> Duration {
+        let next_total = self.total_crashes.saturating_add(1);
+        if next_total >= self.max_retries {
+            Duration::ZERO
+        } else {
+            backoff_delay_for(next_total)
+        }
+    }
+
     /// Mark successful respawn.
     pub fn respawn_ok(&mut self, has_live_handle: bool) {
         if has_live_handle
@@ -546,12 +569,7 @@ impl HealthTracker {
 
     /// Calculate exponential backoff delay.
     fn backoff_delay(&self) -> Duration {
-        if self.total_crashes == 0 {
-            return BACKOFF_BASE;
-        }
-        let exp = (self.total_crashes - 1).min(10);
-        let delay = BACKOFF_BASE.mul_f64(2.0_f64.powi(exp as i32));
-        delay.min(BACKOFF_MAX)
+        backoff_delay_for(self.total_crashes)
     }
 
     /// #1701: self-orchestrator crash P0 gate. Unlike [`record_crash`]'s

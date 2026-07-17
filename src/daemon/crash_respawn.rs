@@ -16,7 +16,46 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, Sender};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
 use super::{run_dir, serve_agent_tui, AgentConfig, DaemonContext};
+
+#[cfg(test)]
+type TestWorkerGate = (Sender<()>, Receiver<()>, Sender<()>);
+
+#[cfg(test)]
+static TEST_WORKER_GATE: OnceLock<Mutex<Option<TestWorkerGate>>> = OnceLock::new();
+
+#[cfg(test)]
+fn install_test_worker_gate(gate: TestWorkerGate) {
+    *TEST_WORKER_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("test worker gate lock") = Some(gate);
+}
+
+#[cfg(test)]
+fn await_test_worker_gate() -> Option<Sender<()>> {
+    let gate = TEST_WORKER_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("test worker gate lock")
+        .take();
+    let (entered, release, done) = gate?;
+    let _ = entered.send(());
+    let _ = release.recv();
+    Some(done)
+}
+
+#[cfg(test)]
+fn signal_test_worker_done(done: &Option<Sender<()>>) {
+    if let Some(done) = done {
+        let _ = done.clone().send(());
+    }
+}
 
 /// Compatibility entry used by legacy tests and name-triggered internal call
 /// sites. Production PTY events use [`handle_crash_observation`] directly.
@@ -86,19 +125,11 @@ pub(super) fn handle_crash_observation(
     // leaderless page off an indeterminate read. (The no-peer hung/AuthError
     // paths fail the other way — they escalate on `Unknown`.)
     let self_orch = crate::teams::self_orch_status(home, crashed_name);
-    let is_self_orch = self_orch == crate::teams::SelfOrchStatus::Yes;
 
     enum RegistryOutcome {
         Deleted,
         Missing,
-        Healthy {
-            should_respawn: bool,
-            delay: std::time::Duration,
-            should_notify: bool,
-            fire_self_orch_p0: bool,
-            fire_terminal_p0: bool,
-            escalation_snapshot: crate::health::PersistedEscalation,
-        },
+        Healthy { delay: std::time::Duration },
     }
 
     // Snapshot health and the deleted/missing outcome while holding the
@@ -128,41 +159,11 @@ pub(super) fn handle_crash_observation(
                     );
                     RegistryOutcome::Deleted
                 } else {
-                    let mut core = handle.core.lock();
-                    // #1701: decide the self-orch P0 BEFORE record_crash (which may
-                    // itself stamp the crash cooldown on its recent>=2 path) — the
-                    // accessor reads+stamps the crash-class cooldown (#1744-H3:
-                    // distinct from the hung cooldown), and for a self-orchestrator we
-                    // use ONLY this gate, never the generic recent>=2 one. The `&&`
-                    // short-circuits for non-orchestrators, so their cooldown is
-                    // untouched.
-                    let fire_p0 = is_self_orch && core.health.self_orch_crash_should_notify();
-                    let (respawn, delay, notify) = core.health.record_crash();
-                    // #1744-H4: a terminal Failed (max-retries) self-orchestrator crash
-                    // is a PERMANENT leaderless death. record_crash returns notify=true
-                    // ("don't respawn, do notify"), but fire_p0 is cooldown-gated and
-                    // the generic notify branch below is `!is_self_orch` — so without
-                    // this it pages NEITHER. Fire a once-off, cooldown-EXEMPT terminal
-                    // P0, fail-closed (Yes|Unknown fire, No skip), latched via the
-                    // PERSISTED `failed_escalated` so a restart (which rehydrates the
-                    // crash budget but not `state`) doesn't re-page the same death.
-                    let fire_terminal =
-                        should_fire_terminal_p0(respawn, self_orch, core.health.failed_escalated);
-                    if fire_terminal {
-                        core.health.failed_escalated = true;
-                    }
-                    // #1744-H2: snapshot the (just-mutated) escalation state under the
-                    // lock; persisted lock-free below so the crash budget + cooldown
-                    // (+ #1744-H4 failed_escalated) survive a daemon restart.
-                    let snap = core.health.escalation_snapshot();
-                    RegistryOutcome::Healthy {
-                        should_respawn: respawn,
-                        delay,
-                        should_notify: notify,
-                        fire_self_orch_p0: fire_p0,
-                        fire_terminal_p0: fire_terminal,
-                        escalation_snapshot: snap,
-                    }
+                    // Project the backoff without mutating health.  Retry
+                    // accounting is committed only after the worker admits its
+                    // exact-generation execution permit.
+                    let delay = handle.core.lock().health.next_crash_delay();
+                    RegistryOutcome::Healthy { delay }
                 }
             }
             None => {
@@ -172,63 +173,15 @@ pub(super) fn handle_crash_observation(
         }
     };
 
-    let (
-        should_respawn,
-        delay,
-        should_notify,
-        fire_self_orch_p0,
-        fire_terminal_p0,
-        escalation_snapshot,
-    ) = match registry_outcome {
+    let delay = match registry_outcome {
         RegistryOutcome::Deleted | RegistryOutcome::Missing => {
             ledger.discard(key);
             return;
         }
-        RegistryOutcome::Healthy {
-            should_respawn,
-            delay,
-            should_notify,
-            fire_self_orch_p0,
-            fire_terminal_p0,
-            escalation_snapshot,
-        } => (
-            should_respawn,
-            delay,
-            should_notify,
-            fire_self_orch_p0,
-            fire_terminal_p0,
-            escalation_snapshot,
-        ),
+        RegistryOutcome::Healthy { delay } => delay,
     };
-
-    // #1744-H2: persist the crash budget + crash cooldown (lock released above).
-    crate::daemon::escalation_persist::persist(home, crashed_name, &escalation_snapshot);
-
-    // #1701: a self-orchestrator crash escalates to the operator on EVERY crash
-    // (cooldown-gated) — the team is leaderless until respawn and no peer can
-    // relay. A non-orchestrator agent keeps the generic recent>=2 crash notify.
-    if fire_terminal_p0 {
-        // #1744-H4: terminal-Failed self-orch — takes precedence over the
-        // per-crash page (its wording is "permanent, won't respawn", not "until
-        // respawn"). Once-off via the persisted `failed_escalated` latch.
-        notify_self_orch_terminal(crashed_name);
-    } else if fire_self_orch_p0 {
-        notify_self_orch_crash(crashed_name, &instance_id, &ctx.registry);
-    } else if !is_self_orch && should_notify {
-        notify_crash(crashed_name, &instance_id, &ctx.registry);
-    }
-
-    if !should_respawn {
-        tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
-        ledger.discard(key);
-        return;
-    }
 
     tracing::info!(agent = %crashed_name, ?delay, "respawning");
-    let saved_health = {
-        let r = agent::lock_registry(&ctx.registry);
-        r.get(&instance_id).map(|h| h.core.lock().health.clone())
-    };
 
     let reg = Arc::clone(&ctx.registry);
     let home = home.to_path_buf();
@@ -245,11 +198,13 @@ pub(super) fn handle_crash_observation(
                 &home,
                 config,
                 delay,
-                saved_health,
+                None,
                 &reg,
                 tx,
                 &shutdown_for_respawn,
                 Some(claim),
+                self_orch,
+                instance_id,
             );
         })
     {
@@ -324,6 +279,7 @@ fn notify_self_orch_crash(
 /// (fail-closed: `Yes`|`Unknown` fire, `No` skip — a leaderless death is too
 /// costly to miss on an indeterminate teams read), and it has not already been
 /// terminally paged (`failed_escalated`, persisted for cross-restart once-off).
+#[cfg(test)]
 fn should_fire_terminal_p0(
     should_respawn: bool,
     self_orch: crate::teams::SelfOrchStatus,
@@ -390,13 +346,30 @@ fn respawn_agent_worker(
     tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
     shutdown: &Arc<AtomicBool>,
     claim: Option<ClaimToken>,
+    self_orch: crate::teams::SelfOrchStatus,
+    instance_id: crate::types::InstanceId,
 ) {
+    #[cfg(test)]
+    let test_done = if claim.is_some() {
+        await_test_worker_gate()
+    } else {
+        None
+    };
+    #[cfg(not(test))]
+    let _test_done: Option<()> = None;
+    #[cfg(test)]
+    if test_done.is_none() {
+        std::thread::sleep(delay);
+    }
+    #[cfg(not(test))]
     std::thread::sleep(delay);
     if shutdown.load(Ordering::Relaxed) {
         if let Some(token) = claim {
             agent::crash_disposition::owner_ledger().discard(token.key());
         }
         tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
+        #[cfg(test)]
+        signal_test_worker_done(&test_done);
         return;
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -435,6 +408,8 @@ fn respawn_agent_worker(
             agent::crash_disposition::owner_ledger().discard(token.key());
         }
         tracing::info!(agent = %config.name, "shutdown before respawn execution admission, aborting");
+        #[cfg(test)]
+        signal_test_worker_done(&test_done);
         return;
     }
     let mut permit = match claim {
@@ -442,16 +417,72 @@ fn respawn_agent_worker(
             let Some(mut permit) = agent::crash_disposition::owner_ledger().begin_execute(token)
             else {
                 tracing::info!(agent = %config.name, "exact-generation recovery was discarded before execution");
+                #[cfg(test)]
+                signal_test_worker_done(&test_done);
                 return;
             };
             if !permit.admit_restarting() {
                 tracing::info!(agent = %config.name, "execution permit could not admit Restarting");
+                #[cfg(test)]
+                signal_test_worker_done(&test_done);
                 return;
             }
             Some(permit)
         }
         None => None,
     };
+    let mut saved_health = saved_health;
+    if permit.is_some() {
+        let attempt = permit
+            .as_mut()
+            .and_then(|permit| permit.debit_attempt(self_orch));
+        let Some(attempt) = attempt else {
+            tracing::warn!(agent = %config.name, "exact-generation recovery permit was already debited");
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
+            }
+            #[cfg(test)]
+            signal_test_worker_done(&test_done);
+            return;
+        };
+        let exact_core = permit
+            .as_ref()
+            .expect("permit remains after debit")
+            .exact_core();
+        saved_health = Some(exact_core.lock().health.clone());
+        tracing::debug!(
+            agent = %config.name,
+            ?attempt.delay,
+            "exact-generation crash attempt admitted"
+        );
+        crate::event_log::log(
+            home,
+            "crash_respawn_attempt",
+            &config.name,
+            "exact-generation recovery permit admitted one retry attempt",
+        );
+        crate::daemon::escalation_persist::persist(
+            home,
+            &config.name,
+            &attempt.escalation_snapshot,
+        );
+        if attempt.fire_terminal_p0 {
+            notify_self_orch_terminal(&config.name);
+        } else if attempt.fire_self_orch_p0 {
+            notify_self_orch_crash(&config.name, &instance_id, reg);
+        } else if self_orch != crate::teams::SelfOrchStatus::Yes && attempt.should_notify {
+            notify_crash(&config.name, &instance_id, reg);
+        }
+        if !attempt.should_respawn {
+            tracing::warn!(agent = %config.name, "max retries exceeded, not respawning");
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
+            }
+            #[cfg(test)]
+            signal_test_worker_done(&test_done);
+            return;
+        }
+    }
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
@@ -553,6 +584,8 @@ fn respawn_agent_worker(
             }
         }
     }
+    #[cfg(test)]
+    signal_test_worker_done(&test_done);
 }
 
 #[cfg(test)]
@@ -699,12 +732,20 @@ mod deleted_gate_tests_1913 {
             configs: Arc::new(Mutex::new(configs)),
             crash_tx,
             crash_rx,
-            // shutdown=true: for the deleted=false case the respawn worker thread
-            // aborts after its backoff WITHOUT a real `spawn_agent` — the test
-            // asserts the respawn PATH was entered (record_crash bumped
-            // total_crashes), not that a process actually launched.
             shutdown: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    fn worker_gate() -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        super::install_test_worker_gate((entered_tx, release_rx, done_tx));
+        (entered_rx, release_tx, done_rx)
     }
 
     fn total_crashes(reg: &AgentRegistry) -> u32 {
@@ -718,13 +759,15 @@ mod deleted_gate_tests_1913 {
     /// (a) An intentional delete (deleted=true) must NOT respawn: the gate
     /// returns before `record_crash`, so the crash budget is untouched.
     #[test]
+    #[serial_test::serial(crash_respawn_gate)]
     fn delete_does_not_respawn_1913() {
         let home = tmp_home("del");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock().insert(
-            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
-            make_handle(true),
-        );
+        let handle = make_handle(true);
+        crate::agent::crash_disposition::owner_ledger()
+            .register_generation(handle.id, handle.generation);
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
         let ctx = make_ctx(Arc::clone(&reg));
 
         handle_crash_respawn(&home, VICTIM, &ctx);
@@ -742,23 +785,195 @@ mod deleted_gate_tests_1913 {
     /// through to `record_crash` (crash budget bumped) — proving the #1913 gate
     /// is precise and did NOT blanket-disable crash recovery.
     #[test]
+    #[serial_test::serial(crash_respawn_gate)]
     fn real_crash_still_respawns_1913() {
         let home = tmp_home("crash");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock().insert(
-            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
-            make_handle(false),
-        );
-        let ctx = make_ctx(Arc::clone(&reg));
+        let handle = make_handle(false);
+        handle.core.lock().health.total_crashes = 3;
+        crate::agent::crash_disposition::owner_ledger()
+            .register_generation(handle.id, handle.generation);
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..make_ctx(Arc::clone(&reg))
+        };
+        ctx.configs
+            .lock()
+            .get_mut(VICTIM)
+            .expect("victim config")
+            .backend_command = "missing-real-crash-command".to_string();
+        let (entered_rx, release_tx, done_rx) = worker_gate();
 
         handle_crash_respawn(&home, VICTIM, &ctx);
 
+        let debit_deferred = total_crashes(&reg) == 3;
+        entered_rx.recv().expect("respawn worker entered gate");
+        release_tx.send(()).expect("release respawn worker");
+        done_rx.recv().expect("respawn worker completed");
+        assert!(
+            debit_deferred,
+            "RED: genuine crash debit must wait for admission; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Slice-3 RED: a replacement invalidated while the worker is in its
+    /// backoff must not consume the crash budget or write a persisted count.
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn superseded_before_execution_does_not_debit_attempt_budget_slice3_red() {
+        let home = tmp_home("superseded-before-execute");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        handle.core.lock().health.total_crashes = 3;
+        let id = handle.id;
+        let generation = handle.generation;
+        reg.lock().insert(id, handle);
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..make_ctx(Arc::clone(&reg))
+        };
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+        let observation = {
+            let r = reg.lock();
+            let h = r.get(&id).expect("handle");
+            crate::agent::crash_disposition::CrashObservation {
+                instance_id: id,
+                generation,
+                core: Arc::clone(&h.core),
+                deleted: Arc::clone(&h.deleted),
+                owner_shutdown: Some(Arc::clone(&ctx.shutdown)),
+                name: h.name.clone(),
+            }
+        };
+        let (entered_rx, release_tx, done_rx) = worker_gate();
+
+        handle_crash_observation(&home, &observation, &ctx);
+        let debit_deferred = total_crashes(&reg) == 3;
+
+        entered_rx.recv().expect("respawn worker entered gate");
+        let replacement = crate::agent::crash_disposition::owner_generation_source().next();
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, replacement);
+        release_tx.send(()).expect("release respawn worker");
+        done_rx.recv().expect("respawn worker completed");
+
+        assert!(
+            debit_deferred,
+            "RED: debit must wait for execution admission; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
+        assert!(
+            crate::daemon::escalation_persist::load_for(&home, VICTIM).is_none(),
+            "superseded recovery must not persist an attempt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Slice-3 RED: shutdown before exact execution admission is a rejected
+    /// recovery, not an accepted crash attempt.
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn shutdown_before_execution_does_not_debit_attempt_budget_slice3_red() {
+        let home = tmp_home("shutdown-before-execute");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        handle.core.lock().health.total_crashes = 3;
+        let id = handle.id;
+        let generation = handle.generation;
+        reg.lock().insert(id, handle);
+        let ctx = make_ctx(Arc::clone(&reg));
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+        let observation = {
+            let r = reg.lock();
+            let h = r.get(&id).expect("handle");
+            crate::agent::crash_disposition::CrashObservation {
+                instance_id: id,
+                generation,
+                core: Arc::clone(&h.core),
+                deleted: Arc::clone(&h.deleted),
+                owner_shutdown: None,
+                name: h.name.clone(),
+            }
+        };
+        let (entered_rx, release_tx, done_rx) = worker_gate();
+
+        handle_crash_observation(&home, &observation, &ctx);
+        let debit_deferred = total_crashes(&reg) == 3;
+        entered_rx.recv().expect("respawn worker entered gate");
+        release_tx.send(()).expect("release respawn worker");
+        done_rx.recv().expect("respawn worker completed");
+        assert!(
+            debit_deferred,
+            "RED: shutdown must reject before debit; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
+        assert!(crate::daemon::escalation_persist::load_for(&home, VICTIM).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Slice-3 RED: only an exact permit admitted for the old generation may
+    /// consume one attempt and persist the resulting count/audit event.
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn exact_admission_debits_and_persists_once_slice3_red() {
+        let home = tmp_home("exact-admission");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        handle.core.lock().health.total_crashes = 3;
+        let id = handle.id;
+        let generation = handle.generation;
+        reg.lock().insert(id, handle);
+        let ctx = make_ctx(Arc::clone(&reg));
+        ctx.configs
+            .lock()
+            .get_mut(VICTIM)
+            .expect("victim config")
+            .backend_command = "missing-exact-attempt-command".to_string();
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+        let observation = {
+            let r = reg.lock();
+            let h = r.get(&id).expect("handle");
+            crate::agent::crash_disposition::CrashObservation {
+                instance_id: id,
+                generation,
+                core: Arc::clone(&h.core),
+                deleted: Arc::clone(&h.deleted),
+                owner_shutdown: Some(Arc::clone(&ctx.shutdown)),
+                name: h.name.clone(),
+            }
+        };
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..ctx
+        };
+        let observation = crate::agent::crash_disposition::CrashObservation {
+            owner_shutdown: Some(Arc::clone(&ctx.shutdown)),
+            ..observation
+        };
+        let (entered_rx, release_tx, done_rx) = worker_gate();
+
+        handle_crash_observation(&home, &observation, &ctx);
+        let debit_deferred = total_crashes(&reg) == 3;
+        entered_rx.recv().expect("respawn worker entered gate");
+        release_tx.send(()).expect("release respawn worker");
+        done_rx.recv().expect("respawn worker completed");
+        assert!(
+            debit_deferred,
+            "debit is not raw-observation side effect; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
+        assert_eq!(total_crashes(&reg), 4);
+        let persisted = crate::daemon::escalation_persist::load_for(&home, VICTIM)
+            .expect("accepted attempt must persist escalation count");
+        assert_eq!(persisted.total_crashes, 4);
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
         assert_eq!(
-            total_crashes(&reg),
+            log.matches("crash_respawn_attempt").count(),
             1,
-            "#1913 regression guard: a real crash (deleted=false) must STILL enter \
-             the respawn path (record_crash runs) — the deleted-gate must not \
-             suppress normal crash recovery"
+            "one admitted permit must produce one accepted-attempt audit row"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -794,6 +1009,8 @@ mod deleted_gate_tests_1913 {
             crash_tx,
             &shutdown,
             None,
+            crate::teams::SelfOrchStatus::No,
+            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
         );
 
         // Verify 1: event-log.jsonl should have a crash_respawn_failed record
