@@ -632,7 +632,8 @@ mod tests {
                     .core,
             );
             drop(reg);
-            core.lock().state.get_state()
+            let state = core.lock().state.get_state();
+            state
         };
         assert_eq!(
             state,
