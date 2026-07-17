@@ -8,12 +8,13 @@ evidence for an item, but does not complete the item by itself.
 
 ## Snapshot and authority
 
-- Snapshot date: 2026-07-16
-- `agend-terminal` baseline: `31130f9324d42d3e699a7c560ffc0b07d5dc3776`
+- Snapshot date: 2026-07-17
+- `agend-terminal` baseline: `3f80ee5c75a087c5309dcb6d8d28ba7f3948edf5`
   on `main`
-- vendored `agentic-git` baseline: `5c02b1421beda6590e8ebdfd137df9b49ee0bd02`
+- vendored `agentic-git` baseline: `8e0fcafc25ec3e6844ca181014f6d9bb2ffbccb3`
 - GitHub state at the snapshot: PR #2818 is merged and included in this source
-  baseline; issue #2782 is closed after its exact-revoke acceptance scope landed
+  baseline; upstream agentic-git PR #37 is merged at `8e0fcafc` and issue #34 is
+  closed.
 - Program state: **0 done, 9 in progress, 5 pending, 0 blocked**
 
 Evidence is ranked in this order:
@@ -74,7 +75,7 @@ parallel, but the order must be re-evaluated after every exact-main close loop.
 | 7 | Ordered merge train | pending | No durable restart-resumable merge queue owns all gates. |
 | 8 | Notification routing and obligation settlement | in progress | All actionable notifications must share correlated delivery and settlement semantics. |
 | 9 | Session continuity | pending | Coherent checkpoint proof and exactly-once fresh-session resume are not implemented. |
-| 10 | Transactional worktree lifecycle | in progress | Managed release and branch retirement now fail closed; all destructive paths still need one permit/journal, and shared-directory deletion plus submodule writes remain open. |
+| 10 | Transactional worktree lifecycle | in progress | Managed release and branch retirement now fail closed; upstream agentic-git PR #37 is pinned for the narrow submodule-classification slice, while one permit/journal for all destructive paths and shared-directory deletion remain open. |
 | 11 | Shared `RuntimeCore` | in progress | App and headless modes still have duplicate ownership and local API loopbacks. |
 | 12 | Typed backend capability contract | pending | Partial model/resume types must become one complete per-backend capability matrix. |
 | 13 | Typed invariant migration | in progress | String/source guards still need a systematic proof-type replacement audit. |
@@ -354,14 +355,18 @@ review worktrees. These are foundations, not yet one durable lifecycle transacti
 remains: deletion captures fleet state before removal, but
 [`cleanup_working_dir`](../src/agent_ops.rs#L504) receives only home/name/path
 and trusts on-disk identity artifacts, so another live instance sharing the
-canonical directory is not always rejected. In vendored `agentic-git`,
-[issue #34](https://github.com/suzuke/agentic-git/issues/34) remains because
-`submodule` writes are not classified as mutating.
+canonical directory is not always rejected. Upstream
+[agentic-git PR #37](https://github.com/suzuke/agentic-git/pull/37)
+(`8e0fcafc25ec3e6844ca181014f6d9bb2ffbccb3`) is merged and pinned in the
+vendored gitlink, closing the narrow [issue #34](https://github.com/suzuke/agentic-git/issues/34)
+submodule-classification gap; the broader item-10 lifecycle invariant remains
+open.
 
 **Remaining invariant.** Migrate all mutation roots and leaves to the same typed
 permit/capability and durable journal, including janitor/retention/GC and branch
-creation; fix shared live-owner deletion and the upstream submodule
-classification before updating the gitlink.
+creation; finish shared live-owner deletion and the remaining permit/journal
+migration. The upstream submodule-classification slice is now pinned, but does
+not complete item 10.
 
 **Done/verification.** Race create/reuse/rebase/release/delete under aliases,
 symlinks, corrupt bindings, nested submodules, process death, and concurrent new
@@ -488,7 +493,7 @@ correctness outcomes.
 | [agend-terminal #2800](https://github.com/suzuke/agend-terminal/issues/2800) | Fixed on main; closed | — | #2806 creates exact-subject pending PR state before terminal CI; do not keep it on the critical path. |
 | [agentic-git #26](https://github.com/suzuke/agentic-git/issues/26) | Confirmed contract gap | 12, 13 | No machine-verifiable embedder/binding/event contract exists. |
 | [agentic-git #30](https://github.com/suzuke/agentic-git/issues/30) | Supporting refactor only | — | The library remains large, but a module split does not itself close an invariant. |
-| [agentic-git #34](https://github.com/suzuke/agentic-git/issues/34) | Confirmed current safety gap | 10, 13 | `submodule` and `submodule--helper` are absent from mutating-command classification. |
+| [agentic-git #34](https://github.com/suzuke/agentic-git/issues/34) | Fixed upstream; pinned | 10, 13 | Upstream PR #37 merged the fail-closed submodule classification and is pinned at `8e0fcafc25ec3e6844ca181014f6d9bb2ffbccb3`; the broader item-10 invariant remains open. |
 
 Dependency-only updates, formatting cleanup, optional CLI fallback (#2762),
 per-instance threshold configuration (#2779), the decimal-context P3 (#2781),
