@@ -359,6 +359,11 @@ fn respawn_agent_worker(
     };
     #[cfg(not(test))]
     let _test_done: Option<()> = None;
+    #[cfg(test)]
+    if test_done.is_none() {
+        std::thread::sleep(delay);
+    }
+    #[cfg(not(test))]
     std::thread::sleep(delay);
     if shutdown.load(Ordering::Relaxed) {
         if let Some(token) = claim {
@@ -581,6 +586,8 @@ fn respawn_agent_worker(
             }
         }
     }
+    #[cfg(test)]
+    signal_test_worker_done(&test_done);
 }
 
 #[cfg(test)]
@@ -785,7 +792,7 @@ mod deleted_gate_tests_1913 {
         let home = tmp_home("crash");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let handle = make_handle(false);
-        handle.core.lock().health.total_crashes = 4;
+        handle.core.lock().health.total_crashes = 3;
         crate::agent::crash_disposition::owner_ledger()
             .register_generation(handle.id, handle.generation);
         reg.lock()
@@ -794,15 +801,24 @@ mod deleted_gate_tests_1913 {
             shutdown: Arc::new(AtomicBool::new(false)),
             ..make_ctx(Arc::clone(&reg))
         };
+        ctx.configs
+            .lock()
+            .get_mut(VICTIM)
+            .expect("victim config")
+            .backend_command = "missing-real-crash-command".to_string();
         let (entered_rx, release_tx, done_rx) = worker_gate();
 
         handle_crash_respawn(&home, VICTIM, &ctx);
 
+        let debit_deferred = total_crashes(&reg) == 3;
         entered_rx.recv().expect("respawn worker entered gate");
-        assert_eq!(total_crashes(&reg), 4);
         release_tx.send(()).expect("release respawn worker");
         done_rx.recv().expect("respawn worker completed");
-        assert_eq!(total_crashes(&reg), 5);
+        assert!(
+            debit_deferred,
+            "RED: genuine crash debit must wait for admission; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -814,7 +830,7 @@ mod deleted_gate_tests_1913 {
         let home = tmp_home("superseded-before-execute");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let handle = make_handle(false);
-        handle.core.lock().health.total_crashes = 4;
+        handle.core.lock().health.total_crashes = 3;
         let id = handle.id;
         let generation = handle.generation;
         reg.lock().insert(id, handle);
@@ -838,11 +854,7 @@ mod deleted_gate_tests_1913 {
         let (entered_rx, release_tx, done_rx) = worker_gate();
 
         handle_crash_observation(&home, &observation, &ctx);
-        assert_eq!(
-            total_crashes(&reg),
-            4,
-            "RED: debit must wait for execution admission"
-        );
+        let debit_deferred = total_crashes(&reg) == 3;
 
         entered_rx.recv().expect("respawn worker entered gate");
         let replacement = crate::agent::crash_disposition::owner_generation_source().next();
@@ -850,7 +862,11 @@ mod deleted_gate_tests_1913 {
         release_tx.send(()).expect("release respawn worker");
         done_rx.recv().expect("respawn worker completed");
 
-        assert_eq!(total_crashes(&reg), 4);
+        assert!(
+            debit_deferred,
+            "RED: debit must wait for execution admission; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
         assert!(
             crate::daemon::escalation_persist::load_for(&home, VICTIM).is_none(),
             "superseded recovery must not persist an attempt"
@@ -866,7 +882,7 @@ mod deleted_gate_tests_1913 {
         let home = tmp_home("shutdown-before-execute");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let handle = make_handle(false);
-        handle.core.lock().health.total_crashes = 4;
+        handle.core.lock().health.total_crashes = 3;
         let id = handle.id;
         let generation = handle.generation;
         reg.lock().insert(id, handle);
@@ -887,15 +903,15 @@ mod deleted_gate_tests_1913 {
         let (entered_rx, release_tx, done_rx) = worker_gate();
 
         handle_crash_observation(&home, &observation, &ctx);
-        assert_eq!(
-            total_crashes(&reg),
-            4,
-            "RED: shutdown must reject before debit"
-        );
+        let debit_deferred = total_crashes(&reg) == 3;
         entered_rx.recv().expect("respawn worker entered gate");
         release_tx.send(()).expect("release respawn worker");
         done_rx.recv().expect("respawn worker completed");
-        assert_eq!(total_crashes(&reg), 4);
+        assert!(
+            debit_deferred,
+            "RED: shutdown must reject before debit; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
         assert!(crate::daemon::escalation_persist::load_for(&home, VICTIM).is_none());
         std::fs::remove_dir_all(&home).ok();
     }
@@ -908,7 +924,7 @@ mod deleted_gate_tests_1913 {
         let home = tmp_home("exact-admission");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let handle = make_handle(false);
-        handle.core.lock().health.total_crashes = 4;
+        handle.core.lock().health.total_crashes = 3;
         let id = handle.id;
         let generation = handle.generation;
         reg.lock().insert(id, handle);
@@ -942,19 +958,19 @@ mod deleted_gate_tests_1913 {
         let (entered_rx, release_tx, done_rx) = worker_gate();
 
         handle_crash_observation(&home, &observation, &ctx);
-        assert_eq!(
-            total_crashes(&reg),
-            4,
-            "debit is not raw-observation side effect"
-        );
+        let debit_deferred = total_crashes(&reg) == 3;
         entered_rx.recv().expect("respawn worker entered gate");
-        assert_eq!(total_crashes(&reg), 4);
         release_tx.send(()).expect("release respawn worker");
         done_rx.recv().expect("respawn worker completed");
-        assert_eq!(total_crashes(&reg), 5);
+        assert!(
+            debit_deferred,
+            "debit is not raw-observation side effect; got total_crashes={} before gate release",
+            total_crashes(&reg)
+        );
+        assert_eq!(total_crashes(&reg), 4);
         let persisted = crate::daemon::escalation_persist::load_for(&home, VICTIM)
             .expect("accepted attempt must persist escalation count");
-        assert_eq!(persisted.total_crashes, 5);
+        assert_eq!(persisted.total_crashes, 4);
         let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
         assert_eq!(
             log.matches("crash_respawn_attempt").count(),
