@@ -3,12 +3,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn git_in(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -152,7 +149,7 @@ fn prepend_path(stub_dir: &Path, old_path: &std::ffi::OsString) -> std::ffi::OsS
 
 #[test]
 fn real_sweep_remove_failure_preserves_final_status_and_stderr_2830_red() {
-    let _lock = ENV_LOCK.lock();
+    let _lock = super::tests::ENV_LOCK.lock();
     let repo = setup_repo();
     let home = std::env::temp_dir().join(format!(
         "agend-wt-diagnostics-home-{}-{}",
