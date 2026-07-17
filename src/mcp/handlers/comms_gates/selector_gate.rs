@@ -19,6 +19,13 @@ pub(crate) fn validate_selector_exclusivity(args: &Value) -> Option<Value> {
         }));
     }
 
+    if present.is_empty() {
+        return Some(json!({
+            "error": "missing recipient selector — specify exactly one of instance, instances, or team",
+            "code": "missing_selector"
+        }));
+    }
+
     if present == ["tags"] {
         return Some(json!({
             "error": "tag-based targeting is not supported — specify instance, instances, or team instead",

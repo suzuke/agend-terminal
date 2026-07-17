@@ -3747,8 +3747,13 @@ fn send_mixed_selectors_no_sidecar_side_effects() {
         "task_id": "t-selector-sidecar-test"
     });
     let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
-    assert!(result.get("error").is_some(), "must reject mixed selectors: {result}");
-    let progress = home.join("task-progress").join("t-selector-sidecar-test.json");
+    assert!(
+        result.get("error").is_some(),
+        "must reject mixed selectors: {result}"
+    );
+    let progress = home
+        .join("task-progress")
+        .join("t-selector-sidecar-test.json");
     assert!(
         !progress.exists(),
         "task-progress sidecar must not be created for a rejected mixed-selector send"
@@ -3770,7 +3775,10 @@ fn send_tags_only_no_sidecar_side_effects() {
         "task_id": "t-tags-sidecar-test"
     });
     let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
-    assert!(result.get("error").is_some(), "must reject tags-only: {result}");
+    assert!(
+        result.get("error").is_some(),
+        "must reject tags-only: {result}"
+    );
     let progress = home.join("task-progress").join("t-tags-sidecar-test.json");
     assert!(
         !progress.exists(),

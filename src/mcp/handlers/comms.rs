@@ -32,13 +32,13 @@ pub(super) use comms_delegate::dispatch_should_skip_auto_bind;
 /// → delegate, summary → report, question → query, default → send_to).
 pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let mut args = args.clone();
+    if let Some(err) = validate_selector_exclusivity(&args) {
+        return err;
+    }
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
         return err;
     }
     if let Some(err) = validate_request_kind(&args) {
-        return err;
-    }
-    if let Some(err) = validate_selector_exclusivity(&args) {
         return err;
     }
     // Broadcast mode: instances/team present (tags-only rejected above)
