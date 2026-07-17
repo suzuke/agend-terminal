@@ -364,27 +364,15 @@ fn test_crash_respawn_health() {
     let resp = daemon.api_call(&serde_json::json!({"method": "kill", "params": {"name": "shell"}}));
     assert_eq!(resp["ok"], true);
 
-    // During recovery backoff/setup the agent truthfully remains crashed;
-    // Restarting is published only immediately before the replacement spawn.
-    let _ = wait_until(
-        || {
-            let r = daemon.api_call(&serde_json::json!({"method": "list"}));
-            r["result"]["agents"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|a| a["agent_state"].as_str())
-                .map(|s| s == "crashed" || s == "restarting" || s == "starting")
-                .unwrap_or(false)
-        },
-        Duration::from_secs(5),
-    );
+    // KILL publishes the truthful crashed state synchronously. Restarting is
+    // published only immediately before the replacement spawn.
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
     let agents = resp["result"]["agents"].as_array().expect("a");
     if !agents.is_empty() {
         let state = agents[0]["agent_state"].as_str().unwrap_or("");
-        assert!(
-            state == "crashed" || state == "restarting" || state == "starting",
-            "expected crashed, restarting, or starting, got: {state}"
+        assert_eq!(
+            state, "crashed",
+            "expected crashed immediately after kill, got: {state}"
         );
     }
 
@@ -473,24 +461,20 @@ fn test_crash_respawn_health() {
 }
 
 #[test]
-fn test_inject_restarting() {
+fn test_inject_after_kill_reports_crashed() {
     let mut daemon = TestDaemon::start("inject_restart");
 
     // Kill then immediately inject
     daemon.api_call(&serde_json::json!({"method": "kill", "params": {"name": "shell"}}));
-    std::thread::sleep(Duration::from_millis(300));
 
     let resp = daemon.api_call(&serde_json::json!({
         "method": "inject",
         "params": {"name": "shell", "data": "hello"}
     }));
 
-    // Should get the truthful recovery-state error, not "not found".
+    // Should get the exact truthful crashed-state error, not "not found".
     let error = resp["error"].as_str().unwrap_or("");
-    assert!(
-        error.contains("crashed") || error.contains("restarting"),
-        "expected 'crashed' or 'restarting' error, got: {error}"
-    );
+    assert_eq!(error, "agent 'shell' is crashed, retry later");
 
     daemon.stop();
 }
