@@ -58,6 +58,7 @@ fn setup_repo() -> PathBuf {
     std::fs::create_dir_all(&repo).expect("repo directory");
     git_in(&repo, &["init", "-b", "main"]);
     std::fs::write(repo.join("README.md"), "init").expect("README");
+    std::fs::write(repo.join(".gitignore"), ".cleanup-lock\n").expect("gitignore");
     git_in(&repo, &["add", "."]);
     git_in(&repo, &["commit", "-m", "init"]);
     git_in(&repo, &["checkout", "-b", "feat/done"]);
@@ -137,10 +138,12 @@ fn install_failing_git(_stub_dir: &Path, _real_git: &Path) {}
 #[cfg(windows)]
 fn hold_exclusive_worktree_file(repo: &Path) -> std::fs::File {
     use std::os::windows::fs::OpenOptionsExt;
+    let lock_path = repo.join("wt-done").join(".cleanup-lock");
+    std::fs::write(&lock_path, "cleanup lock").expect("cleanup lock");
     std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
-        .open(repo.join("wt-done").join("feat.txt"))
+        .open(lock_path)
         .expect("exclusive worktree file handle")
 }
 
