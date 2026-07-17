@@ -312,16 +312,7 @@ pub(crate) struct ReconcileResult {
     pub preserved: usize,
 }
 
-pub(crate) fn reconcile_terminal_review_intents(_home: &Path, _dry_run: bool) -> ReconcileResult {
-    ReconcileResult {
-        candidates: Vec::new(),
-        settled: 0,
-        preserved: 0,
-    }
-}
-
-#[allow(dead_code)]
-fn reconcile_impl(home: &Path, dry_run: bool) -> ReconcileResult {
+pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> ReconcileResult {
     let dir = intents_dir(home);
     let mut result = ReconcileResult {
         candidates: Vec::new(),
