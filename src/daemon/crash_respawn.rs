@@ -707,6 +707,21 @@ mod deleted_gate_tests_1913 {
         }
     }
 
+    fn wait_for_total_crashes(reg: &AgentRegistry, expected: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if total_crashes(reg) == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for total_crashes={expected}, got {}",
+                total_crashes(reg)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn total_crashes(reg: &AgentRegistry) -> u32 {
         let id = InstanceId::parse(VICTIM_UUID).expect("valid uuid");
         let r = reg.lock();
@@ -718,13 +733,15 @@ mod deleted_gate_tests_1913 {
     /// (a) An intentional delete (deleted=true) must NOT respawn: the gate
     /// returns before `record_crash`, so the crash budget is untouched.
     #[test]
+    #[serial_test::serial(crash_respawn_gate)]
     fn delete_does_not_respawn_1913() {
         let home = tmp_home("del");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock().insert(
-            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
-            make_handle(true),
-        );
+        let handle = make_handle(true);
+        crate::agent::crash_disposition::owner_ledger()
+            .register_generation(handle.id, handle.generation);
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
         let ctx = make_ctx(Arc::clone(&reg));
 
         handle_crash_respawn(&home, VICTIM, &ctx);
@@ -742,13 +759,15 @@ mod deleted_gate_tests_1913 {
     /// through to `record_crash` (crash budget bumped) — proving the #1913 gate
     /// is precise and did NOT blanket-disable crash recovery.
     #[test]
+    #[serial_test::serial(crash_respawn_gate)]
     fn real_crash_still_respawns_1913() {
         let home = tmp_home("crash");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock().insert(
-            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
-            make_handle(false),
-        );
+        let handle = make_handle(false);
+        crate::agent::crash_disposition::owner_ledger()
+            .register_generation(handle.id, handle.generation);
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
         let ctx = make_ctx(Arc::clone(&reg));
 
         handle_crash_respawn(&home, VICTIM, &ctx);
@@ -759,6 +778,147 @@ mod deleted_gate_tests_1913 {
             "#1913 regression guard: a real crash (deleted=false) must STILL enter \
              the respawn path (record_crash runs) — the deleted-gate must not \
              suppress normal crash recovery"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Slice-3 RED: a replacement invalidated while the worker is in its
+    /// backoff must not consume the crash budget or write a persisted count.
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn superseded_before_execution_does_not_debit_attempt_budget_slice3_red() {
+        let home = tmp_home("superseded-before-execute");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        let id = handle.id;
+        let generation = handle.generation;
+        reg.lock().insert(id, handle);
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..make_ctx(Arc::clone(&reg))
+        };
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+        let observation = {
+            let r = reg.lock();
+            let h = r.get(&id).expect("handle");
+            crate::agent::crash_disposition::CrashObservation {
+                instance_id: id,
+                generation,
+                core: Arc::clone(&h.core),
+                deleted: Arc::clone(&h.deleted),
+                owner_shutdown: Some(Arc::clone(&ctx.shutdown)),
+                name: h.name.clone(),
+            }
+        };
+
+        handle_crash_observation(&home, &observation, &ctx);
+        assert_eq!(
+            total_crashes(&reg),
+            0,
+            "RED: debit must wait for execution admission"
+        );
+
+        let replacement = crate::agent::crash_disposition::owner_generation_source().next();
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, replacement);
+        std::thread::sleep(std::time::Duration::from_secs(6));
+
+        assert_eq!(total_crashes(&reg), 0);
+        assert!(
+            crate::daemon::escalation_persist::load_for(&home, VICTIM).is_none(),
+            "superseded recovery must not persist an attempt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Slice-3 RED: shutdown before exact execution admission is a rejected
+    /// recovery, not an accepted crash attempt.
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn shutdown_before_execution_does_not_debit_attempt_budget_slice3_red() {
+        let home = tmp_home("shutdown-before-execute");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        let id = handle.id;
+        let generation = handle.generation;
+        reg.lock().insert(id, handle);
+        let ctx = make_ctx(Arc::clone(&reg));
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+        let observation = {
+            let r = reg.lock();
+            let h = r.get(&id).expect("handle");
+            crate::agent::crash_disposition::CrashObservation {
+                instance_id: id,
+                generation,
+                core: Arc::clone(&h.core),
+                deleted: Arc::clone(&h.deleted),
+                owner_shutdown: None,
+                name: h.name.clone(),
+            }
+        };
+
+        handle_crash_observation(&home, &observation, &ctx);
+        assert_eq!(
+            total_crashes(&reg),
+            0,
+            "RED: shutdown must reject before debit"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        assert_eq!(total_crashes(&reg), 0);
+        assert!(crate::daemon::escalation_persist::load_for(&home, VICTIM).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Slice-3 RED: only an exact permit admitted for the old generation may
+    /// consume one attempt and persist the resulting count/audit event.
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn exact_admission_debits_and_persists_once_slice3_red() {
+        let home = tmp_home("exact-admission");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        let id = handle.id;
+        let generation = handle.generation;
+        reg.lock().insert(id, handle);
+        let ctx = make_ctx(Arc::clone(&reg));
+        ctx.configs.lock().get_mut(VICTIM).unwrap().backend_command =
+            "missing-exact-attempt-command".to_string();
+        crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+        let observation = {
+            let r = reg.lock();
+            let h = r.get(&id).expect("handle");
+            crate::agent::crash_disposition::CrashObservation {
+                instance_id: id,
+                generation,
+                core: Arc::clone(&h.core),
+                deleted: Arc::clone(&h.deleted),
+                owner_shutdown: Some(Arc::clone(&ctx.shutdown)),
+                name: h.name.clone(),
+            }
+        };
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..ctx
+        };
+        let observation = crate::agent::crash_disposition::CrashObservation {
+            owner_shutdown: Some(Arc::clone(&ctx.shutdown)),
+            ..observation
+        };
+
+        handle_crash_observation(&home, &observation, &ctx);
+        assert_eq!(
+            total_crashes(&reg),
+            0,
+            "debit is not raw-observation side effect"
+        );
+        wait_for_total_crashes(&reg, 1);
+        let persisted = crate::daemon::escalation_persist::load_for(&home, VICTIM)
+            .expect("accepted attempt must persist escalation count");
+        assert_eq!(persisted.total_crashes, 1);
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            log.matches("crash_respawn_attempt").count(),
+            1,
+            "one admitted permit must produce one accepted-attempt audit row"
         );
         std::fs::remove_dir_all(&home).ok();
     }
