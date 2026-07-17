@@ -1,4 +1,4 @@
-use crate::agent_ops::{list_agents, send_to};
+use crate::agent_ops::send_to;
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
 use crate::identity::Sender;
@@ -8,7 +8,8 @@ use std::path::Path;
 use super::send_envelope::SendEnvelope;
 use super::{
     comms_gates::{
-        enforce_send_invariants, record_triaged_if_present, validate_request_kind, validate_triaged,
+        enforce_send_invariants, record_triaged_if_present, validate_request_kind,
+        validate_selector_exclusivity, validate_triaged,
     },
     err_needs_identity, is_ok_result,
 };
@@ -37,8 +38,11 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
     if let Some(err) = validate_request_kind(&args) {
         return err;
     }
-    // Broadcast mode: targets/team/tags present
-    if args.get("instances").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
+    if let Some(err) = validate_selector_exclusivity(&args) {
+        return err;
+    }
+    // Broadcast mode: instances/team present (tags-only rejected above)
+    if args.get("instances").is_some() || args.get("team").is_some() {
         return handle_broadcast(home, &args, sender);
     }
 
@@ -351,6 +355,9 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
         Some(m) => m,
         None => return json!({"error": "missing 'message'"}),
     };
+    if let Some(err) = validate_selector_exclusivity(args) {
+        return err;
+    }
     let team_name = args["team"].as_str().map(String::from);
     let targets: Vec<String> = if let Some(team) = team_name.as_deref() {
         crate::teams::get_members(home, team)
@@ -359,7 +366,7 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
             .filter_map(|v| v.as_str().map(String::from))
             .collect()
     } else {
-        list_agents()
+        return json!({"error": "no valid recipient selector — specify instances or team", "code": "missing_selector"});
     };
     let targets: Vec<String> = targets
         .into_iter()
