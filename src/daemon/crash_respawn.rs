@@ -399,12 +399,6 @@ fn respawn_agent_worker(
         tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
         return;
     }
-    if let Some(token) = claim {
-        if !agent::crash_disposition::owner_ledger().begin_execute(token) {
-            tracing::info!(agent = %config.name, "exact-generation recovery was discarded before execution");
-            return;
-        }
-    }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     if let Some(ref wd) = config.working_dir {
         let skills_filter: Option<Vec<String>> =
@@ -432,6 +426,32 @@ fn respawn_agent_worker(
             tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
         }
     }
+
+    // Re-check shutdown after backoff/setup, then admit the exact-generation
+    // permit immediately before the replacement spawn.  Until this point the
+    // old core remains visibly Crashed rather than prematurely Restarting.
+    if shutdown.load(Ordering::Relaxed) {
+        if let Some(token) = claim {
+            agent::crash_disposition::owner_ledger().discard(token.key());
+        }
+        tracing::info!(agent = %config.name, "shutdown before respawn execution admission, aborting");
+        return;
+    }
+    let mut permit = match claim {
+        Some(token) => {
+            let Some(mut permit) = agent::crash_disposition::owner_ledger().begin_execute(token)
+            else {
+                tracing::info!(agent = %config.name, "exact-generation recovery was discarded before execution");
+                return;
+            };
+            if !permit.admit_restarting() {
+                tracing::info!(agent = %config.name, "execution permit could not admit Restarting");
+                return;
+            }
+            Some(permit)
+        }
+        None => None,
+    };
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
@@ -450,8 +470,8 @@ fn respawn_agent_worker(
         reg,
     ) {
         Ok(_) => {
-            if let Some(token) = claim {
-                let _ = agent::crash_disposition::owner_ledger().mark_live(token);
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_live(permit);
             }
             tracing::info!(agent = %config.name, "respawned");
             crate::event_log::log(home, "respawn", &config.name, "agent respawned");
@@ -506,8 +526,8 @@ fn respawn_agent_worker(
             }
         }
         Err(e) => {
-            if let Some(token) = claim {
-                let _ = agent::crash_disposition::owner_ledger().mark_failed(token);
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
             }
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
             crate::event_log::log(

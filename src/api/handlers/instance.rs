@@ -29,21 +29,21 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
                 // This diverges from raw only for a cross-coarse Hook/Stream correction (e.g.
                 // raw=Restarting + Hook=WaitingForUser/RateLimited — more relevant after #2466).
                 // Lock scoped + dropped before `from_handle` to preserve the single-acquisition order.
-                let is_restarting = {
+                let operated_state = {
                     let core = handle.core.lock();
                     crate::daemon::shadow::operated_state(
                         core.state.current,
                         core.observed_status.as_ref(),
                     )
-                    .is_unavailable()
                 };
-                (agent::InjectTarget::from_handle(handle), is_restarting)
+                (agent::InjectTarget::from_handle(handle), operated_state)
             })
     };
     match snap {
-        Some((tgt, is_restarting)) => {
-            if is_restarting {
-                json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
+        Some((tgt, operated_state)) => {
+            if operated_state.is_unavailable() {
+                let state_name = operated_state.display_name();
+                json!({"ok": false, "error": format!("agent '{name}' is {state_name}, retry later")})
             } else {
                 let result = if raw {
                     agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
@@ -78,19 +78,26 @@ pub(crate) fn handle_kill(params: &Value, ctx: &HandlerCtx) -> Value {
     // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
     match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(handle) => {
-            {
-                let mut core = handle.core.lock();
-                core.state.set_restarting();
-            }
-            let mut child = handle.child.lock();
+            let observation = crate::agent::crash_disposition::CrashObservation {
+                instance_id: handle.id,
+                generation: handle.generation,
+                core: std::sync::Arc::clone(&handle.core),
+                deleted: std::sync::Arc::clone(&handle.deleted),
+                owner_shutdown: None,
+                name: handle.name.clone(),
+            };
+            let child = std::sync::Arc::clone(&handle.child);
+            drop(reg);
+            crate::agent::crash_disposition::owner_ledger().publish_crashed(observation);
             // Kill the process group (not just the leader) to propagate to
             // child subprocesses (kiro-cli spawns bun/mcp/acp children).
-            if let Some(pid) = child.process_id() {
-                crate::process::kill_process_tree(pid);
+            {
+                let mut child = child.lock();
+                if let Some(pid) = child.process_id() {
+                    crate::process::kill_process_tree(pid);
+                }
+                let _ = child.kill(); // also kill via PTY handle as fallback
             }
-            let _ = child.kill(); // also kill via PTY handle as fallback
-            drop(child);
-            drop(reg);
             crate::event_log::log(ctx.home, "kill", name, "killed via API");
             json!({"ok": true})
         }
@@ -608,6 +615,69 @@ mod tests {
         if let Some(h) = reg.values().find(|h| h.name.as_str() == name) {
             let _ = h.child.lock().kill();
         }
+    }
+
+    /// Slice-2 RED: the API kill producer must publish Crashed before the PTY
+    /// exit path and later exact-generation admission, never Restarting itself.
+    #[test]
+    fn handle_kill_keeps_agent_crashed_until_execution_admission_slice2_red() {
+        let name = "slice2-kill-producer";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let response = handle_kill(&json!({"name": name}), &ctx);
+        assert_eq!(
+            response["ok"],
+            json!(true),
+            "kill must succeed: {response:?}"
+        );
+
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        let state = {
+            let reg = agent::lock_registry(ctx.registry);
+            let core = Arc::clone(
+                &reg.get(&id)
+                    .expect("kill does not remove the registry entry")
+                    .core,
+            );
+            drop(reg);
+            let state = core.lock().state.get_state();
+            state
+        };
+        assert_eq!(
+            state,
+            crate::state::AgentState::Crashed,
+            "API kill must not publish Restarting before permit admission"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    /// Slice-2 RED: Crashed has a distinct INJECT rejection message; calling
+    /// it "restarting" hides the fact that no execution permit was admitted.
+    #[test]
+    fn inject_rejection_names_crashed_state_slice2_red() {
+        let name = "slice2-inject-crashed";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        {
+            let reg = agent::lock_registry(ctx.registry);
+            reg.get(&id)
+                .expect("spawned handle")
+                .core
+                .lock()
+                .state
+                .current = crate::state::AgentState::Crashed;
+        }
+
+        let response = handle_inject(&json!({"name": name, "data": "x", "raw": true}), &ctx);
+        assert_eq!(response["ok"], json!(false));
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("crashed")),
+            "Crashed INJECT rejection must say crashed: {response:?}"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
     }
 
     /// Sibling of [`test_ctx_with_agent`]: spawns a REAL, permanently-wedged

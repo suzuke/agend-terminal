@@ -139,6 +139,33 @@ impl ClaimToken {
     }
 }
 
+/// Opaque authority for one exact-generation recovery execution.  The permit
+/// is intentionally non-`Copy`/non-`Clone`: once it is settled as Live or
+/// Failed it cannot be replayed for a second ledger transition.
+pub(crate) struct RecoveryExecutionPermit {
+    key: DispositionKey,
+    core: Arc<CoreMutex<AgentCore>>,
+    restarting_admitted: bool,
+}
+
+impl RecoveryExecutionPermit {
+    /// Publish Restarting on the exact old core immediately before spawning a
+    /// replacement.  This is idempotent only as a guarded one-shot operation;
+    /// callers cannot use the same permit to publish a second transition.
+    pub(crate) fn admit_restarting(&mut self) -> bool {
+        if self.restarting_admitted {
+            return false;
+        }
+        self.core.lock().state.set_restarting_with_permit(self);
+        self.restarting_admitted = true;
+        true
+    }
+
+    fn key(&self) -> DispositionKey {
+        self.key
+    }
+}
+
 struct Entry {
     observation: CrashObservation,
     disposition: Disposition,
@@ -245,36 +272,62 @@ impl CrashDispositionLedger {
     }
 
     pub(crate) fn mark_ready(&self, token: ClaimToken) -> bool {
-        self.transition(token, Disposition::Claimed, Disposition::Ready)
+        self.transition(token.key(), Disposition::Claimed, Disposition::Ready)
     }
 
     /// Revalidate the old handle's deleted/shutdown Arcs and current generation
     /// while holding the same ledger lock that performs Discard invalidation.
-    pub(crate) fn begin_execute(&self, token: ClaimToken) -> bool {
+    pub(crate) fn begin_execute(&self, token: ClaimToken) -> Option<RecoveryExecutionPermit> {
         let mut inner = self.inner.lock();
         let current = inner.current.get(&token.key.instance_id).copied();
-        let Some(entry) = inner.entries.get_mut(&token.key) else {
-            return false;
-        };
+        let entry = inner.entries.get_mut(&token.key)?;
         // Only Ready can enter execution.  In particular, a copied token or a
         // late invalidation must not rewrite an already Executing record.
         if entry.disposition != Disposition::Ready {
-            return false;
+            return None;
         }
         if !entry.observation.valid(current) {
             entry.disposition = Disposition::Discarded;
+            return None;
+        }
+        let core = Arc::clone(&entry.observation.core);
+        entry.disposition = Disposition::Executing;
+        Some(RecoveryExecutionPermit {
+            key: token.key,
+            core,
+            restarting_admitted: false,
+        })
+    }
+
+    pub(crate) fn mark_live(&self, permit: RecoveryExecutionPermit) -> bool {
+        if !permit.restarting_admitted {
             return false;
         }
-        entry.disposition = Disposition::Executing;
-        true
+        self.transition(permit.key(), Disposition::Executing, Disposition::Live)
     }
 
-    pub(crate) fn mark_live(&self, token: ClaimToken) -> bool {
-        self.transition(token, Disposition::Executing, Disposition::Live)
+    pub(crate) fn mark_failed(&self, permit: RecoveryExecutionPermit) -> bool {
+        if !permit.restarting_admitted {
+            return false;
+        }
+        let key = permit.key();
+        let core = Arc::clone(&permit.core);
+        let settled = self.transition(key, Disposition::Executing, Disposition::Failed);
+        if settled {
+            core.lock().state.set_crashed_from_recovery();
+        }
+        settled
     }
 
-    pub(crate) fn mark_failed(&self, token: ClaimToken) -> bool {
-        self.transition(token, Disposition::Executing, Disposition::Failed)
+    /// Publish a raw crash observation, then record Crashed outside the ledger
+    /// mutex.  This keeps producer state mutation separate from ledger locking
+    /// and makes the crash funnel explicit for PTY exits and API kills.
+    pub(crate) fn publish_crashed(&self, observation: CrashObservation) -> bool {
+        let published = self.publish(observation.clone());
+        if published {
+            observation.core.lock().state.set_crashed_from_observation();
+        }
+        published
     }
 
     pub(crate) fn discard(&self, key: DispositionKey) -> bool {
@@ -313,20 +366,19 @@ impl CrashDispositionLedger {
             .collect()
     }
 
-    fn transition(&self, token: ClaimToken, from: Disposition, to: Disposition) -> bool {
+    fn transition(&self, key: DispositionKey, from: Disposition, to: Disposition) -> bool {
         let mut inner = self.inner.lock();
-        let current = inner.current.get(&token.key.instance_id).copied();
-        let Some(entry) = inner.entries.get_mut(&token.key) else {
+        let current = inner.current.get(&key.instance_id).copied();
+        let Some(entry) = inner.entries.get_mut(&key) else {
             return false;
         };
         if entry.disposition != from {
             return false;
         }
         entry.disposition = to;
-        if matches!(to, Disposition::Live | Disposition::Failed)
-            && current != Some(token.key.generation)
+        if matches!(to, Disposition::Live | Disposition::Failed) && current != Some(key.generation)
         {
-            inner.entries.remove(&token.key);
+            inner.entries.remove(&key);
         }
         true
     }
@@ -385,6 +437,12 @@ mod tests {
         }
     }
 
+    fn admit(ledger: &CrashDispositionLedger, token: ClaimToken) -> RecoveryExecutionPermit {
+        let mut permit = ledger.begin_execute(token).expect("execution permit");
+        assert!(permit.admit_restarting());
+        permit
+    }
+
     #[test]
     fn replacement_removes_old_pending_before_execution() {
         let ledger = CrashDispositionLedger::new();
@@ -398,7 +456,7 @@ mod tests {
 
         ledger.register_generation(id, SpawnGeneration::new(2));
         assert_eq!(ledger.disposition(old.key()), None);
-        assert!(!ledger.begin_execute(token));
+        assert!(ledger.begin_execute(token).is_none());
         assert!(ledger.pending().is_empty());
     }
 
@@ -414,7 +472,7 @@ mod tests {
         let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(token));
         deleted.store(true, Ordering::SeqCst);
-        assert!(!ledger.begin_execute(token));
+        assert!(ledger.begin_execute(token).is_none());
         assert_eq!(ledger.disposition(obs.key()), Some(Disposition::Discarded));
 
         let id2 = InstanceId::new();
@@ -468,10 +526,9 @@ mod tests {
         assert!(ledger.publish(live.clone()));
         let live_token = ledger.claim(live.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(live_token));
-        assert!(ledger.begin_execute(live_token));
-        assert!(ledger.mark_live(live_token));
+        let live_permit = admit(&ledger, live_token);
+        assert!(ledger.mark_live(live_permit));
         assert_eq!(ledger.disposition(live.key()), Some(Disposition::Live));
-        assert!(!ledger.mark_failed(live_token));
 
         let id2 = InstanceId::new();
         let failed = observation(id2, SpawnGeneration::new(7), &deleted, None);
@@ -479,8 +536,8 @@ mod tests {
         assert!(ledger.publish(failed.clone()));
         let failed_token = ledger.claim(failed.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(failed_token));
-        assert!(ledger.begin_execute(failed_token));
-        assert!(ledger.mark_failed(failed_token));
+        let failed_permit = admit(&ledger, failed_token);
+        assert!(ledger.mark_failed(failed_permit));
         assert_eq!(ledger.disposition(failed.key()), Some(Disposition::Failed));
     }
 
@@ -497,7 +554,8 @@ mod tests {
             .claim(claim_obs.key(), Claimant::Crash)
             .expect("claim");
         assert!(ledger.mark_ready(claim_token));
-        assert!(ledger.begin_execute(claim_token));
+        let mut claim_permit = ledger.begin_execute(claim_token).expect("permit");
+        assert!(claim_permit.admit_restarting());
         ledger.register_generation(id_claim, SpawnGeneration::new(9));
         assert!(ledger
             .claim(claim_obs.key(), Claimant::RespawnWatchdog)
@@ -516,11 +574,12 @@ mod tests {
             .claim(begin_obs.key(), Claimant::Crash)
             .expect("claim");
         assert!(ledger.mark_ready(begin_token));
-        assert!(ledger.begin_execute(begin_token));
+        let mut begin_permit = ledger.begin_execute(begin_token).expect("permit");
+        assert!(begin_permit.admit_restarting());
         deleted_begin.store(true, Ordering::SeqCst);
         let copied_begin_token = begin_token;
-        assert!(!ledger.begin_execute(copied_begin_token));
-        assert!(!ledger.begin_execute(begin_token));
+        assert!(ledger.begin_execute(copied_begin_token).is_none());
+        assert!(ledger.begin_execute(begin_token).is_none());
         assert_eq!(
             ledger.disposition(begin_obs.key()),
             Some(Disposition::Executing)
@@ -535,13 +594,13 @@ mod tests {
             .claim(discard_obs.key(), Claimant::Crash)
             .expect("claim");
         assert!(ledger.mark_ready(discard_token));
-        assert!(ledger.begin_execute(discard_token));
+        let discard_permit = admit(&ledger, discard_token);
         assert!(!ledger.discard(discard_obs.key()));
         assert_eq!(
             ledger.disposition(discard_obs.key()),
             Some(Disposition::Executing)
         );
-        assert!(ledger.mark_live(discard_token));
+        assert!(ledger.mark_live(discard_permit));
         assert_eq!(
             ledger.disposition(discard_obs.key()),
             Some(Disposition::Live)
@@ -559,8 +618,8 @@ mod tests {
         assert!(ledger.publish(old.clone()));
         let token = ledger.claim(old.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(token));
-        assert!(ledger.begin_execute(token));
-        assert!(ledger.mark_failed(token));
+        let token_permit = admit(&ledger, token);
+        assert!(ledger.mark_failed(token_permit));
 
         ledger.register_generation(id, SpawnGeneration::new(13));
         drop(old);
@@ -578,6 +637,57 @@ mod tests {
             None
         );
         assert_eq!(ledger.entry_count(), 0);
+    }
+
+    /// Slice-2 RED: execution admission must return an opaque, one-use permit
+    /// rather than a copyable boolean.  The permit is the only authority that
+    /// may cross the ledger boundary into the Restarting transition.
+    #[test]
+    fn begin_execute_returns_typed_one_use_permit_slice2_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(90), &deleted, None);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let mut permit = ledger
+            .begin_execute(token)
+            .expect("exact-generation admission must mint a permit");
+        assert!(permit.admit_restarting());
+        assert!(ledger.mark_live(permit));
+    }
+
+    #[test]
+    fn execution_permit_admits_restarting_once_and_failed_returns_exact_core_to_crashed() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(91), &deleted, None);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish_crashed(obs.clone()));
+        assert_eq!(
+            obs.core.lock().state.get_state(),
+            crate::state::AgentState::Crashed
+        );
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let mut permit = ledger.begin_execute(token).expect("permit");
+        assert!(permit.admit_restarting());
+        assert!(!permit.admit_restarting());
+        assert_eq!(
+            obs.core.lock().state.get_state(),
+            crate::state::AgentState::Restarting
+        );
+        assert!(ledger.mark_failed(permit));
+        assert_eq!(
+            obs.core.lock().state.get_state(),
+            crate::state::AgentState::Crashed
+        );
+        assert_eq!(ledger.disposition(obs.key()), Some(Disposition::Failed));
     }
 
     #[test]
@@ -617,10 +727,10 @@ mod tests {
         assert!(ledger.publish(old.clone()));
         let token = ledger.claim(old.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(token));
-        assert!(ledger.begin_execute(token));
+        let permit = admit(&ledger, token);
         ledger.register_generation(id, SpawnGeneration::new(85));
         assert_eq!(ledger.entry_count(), 1, "Executing remains owned");
-        assert!(ledger.mark_live(token));
+        assert!(ledger.mark_live(permit));
         drop(old);
         assert_eq!(ledger.entry_count(), 0);
         assert!(weak_core.upgrade().is_none());
