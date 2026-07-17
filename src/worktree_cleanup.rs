@@ -2490,4 +2490,7 @@ mod lifecycle_r1_tests;
 mod protected_sweep_tests;
 
 #[cfg(test)]
+mod windows_cleanup_diagnostics_tests;
+
+#[cfg(test)]
 mod review_repro_worktree_git;
