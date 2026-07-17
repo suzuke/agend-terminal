@@ -296,7 +296,417 @@ pub(crate) fn has_intent(home: &Path, repo: &str, branch: &str) -> bool {
     intents_dir(home).join(format!("{key}.json")).exists()
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ReconcileCandidate {
+    pub candidate_id: String,
+    pub branch: String,
+    pub expected_head: String,
+    pub task_id: String,
+    pub outcome: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReconcileResult {
+    pub candidates: Vec<ReconcileCandidate>,
+    pub settled: usize,
+    pub preserved: usize,
+}
+
+fn is_branch_checked_out(repo: &Path, branch: &str) -> bool {
+    let output = match crate::git_helpers::git_bypass(repo, &["worktree", "list", "--porcelain"]) {
+        Ok(o) if o.status.success() => o,
+        _ => return true, // unknown → preserve (fail-closed)
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            if b == branch {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> ReconcileResult {
+    let dir = intents_dir(home);
+    let mut result = ReconcileResult {
+        candidates: Vec::new(),
+        settled: 0,
+        preserved: 0,
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&p) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let intent: CleanupIntent = match serde_json::from_str(&content) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        if !intent.branch.starts_with("review/") {
+            continue;
+        }
+        let cid = intent_key(&intent.repo, &intent.branch);
+
+        if intent.task_id.is_empty() {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:no_task_id".into(),
+            });
+            continue;
+        }
+
+        let task_terminal = match crate::tasks::load_routed(home, &intent.task_id) {
+            Ok(rt) => matches!(
+                rt.record().status,
+                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Verified
+            ),
+            Err(_) => false,
+        };
+        if !task_terminal {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:task_not_terminal".into(),
+            });
+            continue;
+        }
+
+        let repo_path = Path::new(&intent.repo);
+        if !repo_path.is_dir() {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:repo_missing".into(),
+            });
+            continue;
+        }
+
+        if crate::worktree_cleanup::branch_has_other_active_binding(
+            home,
+            repo_path,
+            &intent.branch,
+            None,
+        )
+        .unwrap_or(true)
+        {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:active_binding".into(),
+            });
+            continue;
+        }
+
+        // Typed branch-existence check (show-ref exit 0/1/other).
+        let full_ref = format!("refs/heads/{}", intent.branch);
+        match crate::git_helpers::git_bypass(
+            repo_path,
+            &["show-ref", "--verify", "--quiet", &full_ref],
+        ) {
+            Err(e) => {
+                result.preserved += 1;
+                result.candidates.push(ReconcileCandidate {
+                    candidate_id: cid,
+                    branch: intent.branch.clone(),
+                    expected_head: intent.expected_head.clone(),
+                    task_id: intent.task_id.clone(),
+                    outcome: format!("preserved:git_spawn_error:{e}"),
+                });
+                continue;
+            }
+            Ok(o) => match o.status.code() {
+                Some(0) => {} // branch exists
+                Some(1) => {
+                    // branch confirmed absent — remove intent
+                    if !dry_run {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                    result.settled += 1;
+                    result.candidates.push(ReconcileCandidate {
+                        candidate_id: cid,
+                        branch: intent.branch.clone(),
+                        expected_head: intent.expected_head.clone(),
+                        task_id: intent.task_id.clone(),
+                        outcome: "settled:branch_absent".into(),
+                    });
+                    continue;
+                }
+                other => {
+                    result.preserved += 1;
+                    result.candidates.push(ReconcileCandidate {
+                        candidate_id: cid,
+                        branch: intent.branch.clone(),
+                        expected_head: intent.expected_head.clone(),
+                        task_id: intent.task_id.clone(),
+                        outcome: format!(
+                            "preserved:git_show_ref_exit:{}",
+                            other.map_or("signal".into(), |c| c.to_string())
+                        ),
+                    });
+                    continue;
+                }
+            },
+        }
+
+        // Acquire branch lease lock — shared classifier for both dry-run and apply.
+        let _branch_lock =
+            match crate::binding::acquire_branch_lease_lock(home, &intent.repo, &intent.branch) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    result.preserved += 1;
+                    result.candidates.push(ReconcileCandidate {
+                        candidate_id: cid,
+                        branch: intent.branch.clone(),
+                        expected_head: intent.expected_head.clone(),
+                        task_id: intent.task_id.clone(),
+                        outcome: format!("preserved:lock_failed:{e}"),
+                    });
+                    continue;
+                }
+            };
+
+        // Under lock: re-verify all gates.
+        // Re-read intent from disk (concurrent modification).
+        let re_content = match std::fs::read_to_string(&p) {
+            Ok(c) => c,
+            Err(_) => {
+                result.preserved += 1;
+                result.candidates.push(ReconcileCandidate {
+                    candidate_id: cid,
+                    branch: intent.branch.clone(),
+                    expected_head: intent.expected_head.clone(),
+                    task_id: intent.task_id.clone(),
+                    outcome: "preserved:intent_gone_under_lock".into(),
+                });
+                continue;
+            }
+        };
+        let re_intent: CleanupIntent = match serde_json::from_str::<CleanupIntent>(&re_content) {
+            Ok(i) if i.branch == intent.branch && i.expected_head == intent.expected_head => i,
+            _ => {
+                result.preserved += 1;
+                result.candidates.push(ReconcileCandidate {
+                    candidate_id: cid,
+                    branch: intent.branch.clone(),
+                    expected_head: intent.expected_head.clone(),
+                    task_id: intent.task_id.clone(),
+                    outcome: "preserved:intent_changed_under_lock".into(),
+                });
+                continue;
+            }
+        };
+
+        // Re-verify task terminal under lock.
+        let still_terminal = crate::tasks::load_routed(home, &re_intent.task_id)
+            .map(|rt| {
+                matches!(
+                    rt.record().status,
+                    crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Verified
+                )
+            })
+            .unwrap_or(false);
+        if !still_terminal {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:task_no_longer_terminal".into(),
+            });
+            continue;
+        }
+
+        // Re-verify no binding under lock.
+        if crate::worktree_cleanup::branch_has_other_active_binding(
+            home,
+            repo_path,
+            &intent.branch,
+            None,
+        )
+        .unwrap_or(true)
+        {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:binding_appeared_under_lock".into(),
+            });
+            continue;
+        }
+
+        // Re-verify exact head under lock via typed show-ref + rev-parse.
+        let tip = match crate::git_helpers::git_cmd(repo_path, &["rev-parse", &intent.branch]) {
+            Ok(t) if !t.is_empty() => t.trim().to_string(),
+            _ => {
+                result.preserved += 1;
+                result.candidates.push(ReconcileCandidate {
+                    candidate_id: cid,
+                    branch: intent.branch.clone(),
+                    expected_head: intent.expected_head.clone(),
+                    task_id: intent.task_id.clone(),
+                    outcome: "preserved:head_unresolvable_under_lock".into(),
+                });
+                continue;
+            }
+        };
+        if tip != intent.expected_head {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: format!("preserved:head_drift:{tip}"),
+            });
+            continue;
+        }
+
+        // Worktree occupancy gate: refuse if the branch is checked out.
+        if is_branch_checked_out(repo_path, &intent.branch) {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:checked_out".into(),
+            });
+            continue;
+        }
+
+        // All gates passed under lock. Dry-run stops here.
+        if dry_run {
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "qualified:dry_run".into(),
+            });
+            continue;
+        }
+
+        // Create collision-safe recovery ref before delete.
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let short_head = if tip.len() >= 8 { &tip[..8] } else { &tip };
+        let recovery_ref = format!(
+            "refs/agend/recovery/{}/{}-{}",
+            intent.branch, short_head, epoch
+        );
+        // Check for existing recovery at this exact ref (don't overwrite).
+        if crate::git_helpers::git_ok(
+            repo_path,
+            &["show-ref", "--verify", "--quiet", &recovery_ref],
+        ) {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:recovery_ref_collision".into(),
+            });
+            continue;
+        }
+        if crate::git_helpers::git_cmd(repo_path, &["update-ref", &recovery_ref, &tip]).is_err() {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:recovery_ref_create_failed".into(),
+            });
+            continue;
+        }
+        // Verify recovery ref points to exact tip.
+        let ref_verified = crate::git_helpers::git_cmd(repo_path, &["rev-parse", &recovery_ref])
+            .map(|s| s.trim().to_string())
+            .is_ok_and(|s| s == tip);
+        if !ref_verified {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:recovery_ref_verify_failed".into(),
+            });
+            continue;
+        }
+
+        // Atomic CAS delete: update-ref -d with expected old SHA.
+        let full_ref = format!("refs/heads/{}", intent.branch);
+        match crate::git_helpers::git_bypass(
+            repo_path,
+            &["update-ref", "-d", &full_ref, &intent.expected_head],
+        ) {
+            Ok(o) if o.status.success() => {
+                let _ = std::fs::remove_file(&p);
+                result.settled += 1;
+                crate::event_log::log(
+                    home,
+                    "review_branch_reconciled",
+                    &intent.task_id,
+                    &format!(
+                        "candidate_id={} branch={} head={} recovery_ref={}",
+                        cid, intent.branch, tip, recovery_ref
+                    ),
+                );
+                result.candidates.push(ReconcileCandidate {
+                    candidate_id: cid,
+                    branch: intent.branch.clone(),
+                    expected_head: intent.expected_head.clone(),
+                    task_id: intent.task_id.clone(),
+                    outcome: format!("settled:deleted:recovery={recovery_ref}"),
+                });
+            }
+            _ => {
+                result.preserved += 1;
+                result.candidates.push(ReconcileCandidate {
+                    candidate_id: cid,
+                    branch: intent.branch.clone(),
+                    expected_head: intent.expected_head.clone(),
+                    task_id: intent.task_id.clone(),
+                    outcome: "preserved:delete_failed".into(),
+                });
+            }
+        }
+    }
+    result
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -695,5 +1105,366 @@ mod tests {
         assert_eq!(repos.len(), 2, "deduplication: {repos:?}");
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn seed_terminal_task(home: &Path, task_id: &str) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let tid = TaskId(task_id.to_string());
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        std::fs::create_dir_all(&board).ok();
+        let emitter = InstanceName::from("test");
+        let _ = crate::task_events::append(
+            &board,
+            &emitter,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "test".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                tags: Vec::new(),
+                owner: None,
+                depends_on: Vec::new(),
+                parent_id: None,
+                branch: None,
+                due_at: None,
+                routed_to: None,
+                bind: None,
+                eta_secs: None,
+            },
+        );
+        let _ = crate::task_events::append(
+            &board,
+            &emitter,
+            TaskEvent::Done {
+                task_id: tid,
+                by: emitter.clone(),
+                source: crate::task_events::DoneSource::ReportAutoClose {
+                    report_summary: "test done".into(),
+                    closed_at: chrono::Utc::now().to_rfc3339(),
+                },
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_terminal_review_intent_deletes_branch() {
+        let home = tmp_dir("reconcile-ok");
+        let repo = tmp_repo("reconcile-ok-repo");
+        let tip = make_branch(&repo, "review/pr-999-test");
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            "review/pr-999-test",
+            &tip,
+            "t-reconcile-ok",
+            None,
+            None,
+        )
+        .expect("persist");
+        seed_terminal_task(&home, "t-reconcile-ok");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(
+            result.settled, 1,
+            "terminal intent must be settled: {result:?}"
+        );
+        assert!(
+            !branch_exists(&repo, "review/pr-999-test"),
+            "review branch must be deleted"
+        );
+        assert!(
+            !has_intent(&home, &rs, "review/pr-999-test"),
+            "intent file must be removed"
+        );
+        // Recovery ref must exist.
+        let refs_out = crate::git_helpers::git_cmd(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/agend/recovery/review/pr-999-test/",
+            ],
+        )
+        .unwrap_or_default();
+        assert!(
+            refs_out.lines().any(|l| l.trim() == tip),
+            "recovery ref must point to deleted tip"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_preserves_non_terminal_task() {
+        let home = tmp_dir("reconcile-nt");
+        let repo = tmp_repo("reconcile-nt-repo");
+        let tip = make_branch(&repo, "review/pr-888-keep");
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, "review/pr-888-keep", &tip, "t-nt", None, None)
+            .expect("persist");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(
+            result.preserved, 1,
+            "non-terminal must be preserved: {result:?}"
+        );
+        assert!(branch_exists(&repo, "review/pr-888-keep"));
+        assert!(has_intent(&home, &rs, "review/pr-888-keep"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_preserves_head_drift() {
+        let home = tmp_dir("reconcile-drift");
+        let repo = tmp_repo("reconcile-drift-repo");
+        let _tip = make_branch(&repo, "review/pr-777-drift");
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            "review/pr-777-drift",
+            "deadbeef00",
+            "t-drift",
+            None,
+            None,
+        )
+        .expect("persist");
+        seed_terminal_task(&home, "t-drift");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(result.preserved, 1, "drift must preserve: {result:?}");
+        assert!(branch_exists(&repo, "review/pr-777-drift"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_idempotent_on_replay() {
+        let home = tmp_dir("reconcile-idem");
+        let repo = tmp_repo("reconcile-idem-repo");
+        let tip = make_branch(&repo, "review/pr-555-idem");
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, "review/pr-555-idem", &tip, "t-idem", None, None)
+            .expect("persist");
+        seed_terminal_task(&home, "t-idem");
+
+        let r1 = reconcile_terminal_review_intents(&home, false);
+        assert_eq!(r1.settled, 1);
+
+        let r2 = reconcile_terminal_review_intents(&home, false);
+        assert_eq!(r2.candidates.len(), 0, "no candidates on replay");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn reconcile_skips_non_review_branches() {
+        let home = tmp_dir("reconcile-nonreview");
+        persist_intent(
+            &home,
+            "/tmp/fake",
+            "feat/not-review",
+            "abc",
+            "t-x",
+            None,
+            None,
+        )
+        .expect("persist");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+        assert!(result.candidates.is_empty(), "non-review skipped");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_dry_run_does_not_mutate() {
+        let home = tmp_dir("reconcile-dryrun");
+        let repo = tmp_repo("reconcile-dryrun-repo");
+        let tip = make_branch(&repo, "review/pr-444-dry");
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, "review/pr-444-dry", &tip, "t-dry", None, None)
+            .expect("persist");
+        seed_terminal_task(&home, "t-dry");
+
+        let result = reconcile_terminal_review_intents(&home, true);
+
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.outcome.contains("dry_run")),
+            "dry-run must produce qualified candidate: {result:?}"
+        );
+        assert!(
+            branch_exists(&repo, "review/pr-444-dry"),
+            "branch must survive dry-run"
+        );
+        assert!(
+            has_intent(&home, &rs, "review/pr-444-dry"),
+            "intent must survive dry-run"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn reconcile_git_error_preserves_intent() {
+        let home = tmp_dir("reconcile-giterr");
+        let non_git = tmp_dir("reconcile-notgit");
+        let rs = non_git.display().to_string();
+        persist_intent(&home, &rs, "review/pr-333-err", "abc", "t-err", None, None)
+            .expect("persist");
+        seed_terminal_task(&home, "t-err");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.outcome.contains("preserved:git")),
+            "git error must preserve: {result:?}"
+        );
+        assert!(
+            has_intent(&home, &rs, "review/pr-333-err"),
+            "intent must survive git error"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&non_git).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_candidate_id_is_stable() {
+        let home = tmp_dir("reconcile-candid");
+        let repo = tmp_repo("reconcile-candid-repo");
+        let tip = make_branch(&repo, "review/pr-222-cid");
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, "review/pr-222-cid", &tip, "t-cid", None, None)
+            .expect("persist");
+        seed_terminal_task(&home, "t-cid");
+
+        let expected_cid = intent_key(&rs, "review/pr-222-cid");
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|c| c.candidate_id == expected_cid),
+            "candidate_id must be stable derived from intent identity: {result:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_dry_run_head_drift_preserved() {
+        let home = tmp_dir("dryrun-drift");
+        let repo = tmp_repo("dryrun-drift-repo");
+        let _tip = make_branch(&repo, "review/pr-333-drift");
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            "review/pr-333-drift",
+            "0000000000000000000000000000000000000000",
+            "t-dryrun-drift",
+            None,
+            None,
+        )
+        .unwrap();
+        seed_terminal_task(&home, "t-dryrun-drift");
+
+        let result = reconcile_terminal_review_intents(&home, true);
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|c| c.outcome.starts_with("qualified")),
+            "head-drift dry-run must be preserved, never qualified: {result:?}"
+        );
+        assert!(
+            branch_exists(&repo, "review/pr-333-drift"),
+            "branch must survive drift dry-run"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_cas_stale_ref_survives() {
+        let home = tmp_dir("cas-stale");
+        let repo = tmp_repo("cas-stale-repo");
+        let old_tip = make_branch(&repo, "review/pr-444-cas");
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            "review/pr-444-cas",
+            &old_tip,
+            "t-cas-stale",
+            None,
+            None,
+        )
+        .unwrap();
+        seed_terminal_task(&home, "t-cas-stale");
+
+        // Advance the branch head so the CAS expected_head is now stale.
+        git_in(&repo, &["checkout", "review/pr-444-cas"]);
+        std::fs::write(repo.join("new.txt"), "new content").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "advance",
+            ],
+        );
+        let new_tip = branch_tip(&repo, "review/pr-444-cas");
+        git_in(&repo, &["checkout", "main"]);
+        assert_ne!(old_tip, new_tip, "branch must have advanced");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(result.settled, 0, "stale CAS must not delete: {result:?}");
+        assert!(
+            branch_exists(&repo, "review/pr-444-cas"),
+            "branch with new head must survive stale CAS"
+        );
+        assert_eq!(
+            branch_tip(&repo, "review/pr-444-cas"),
+            new_tip,
+            "new head must be preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn reconcile_production_entry_wired() {
+        let source = include_str!("worktree_cleanup.rs");
+        assert!(
+            source.contains("reconcile_terminal_review_intents"),
+            "worktree_cleanup.rs must call reconcile_terminal_review_intents \
+             — if this fails, the reconciler was unwired from the periodic sweep"
+        );
     }
 }
