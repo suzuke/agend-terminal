@@ -343,6 +343,8 @@ pub fn sweep_from_registry(
         }
     }
 
+    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
+
     let mut removed = Vec::new();
 
     for repo in &repos {
@@ -540,7 +542,6 @@ pub fn sweep_from_registry(
     // a failed poller settlement or whose CI watch was removed before the
     // settlement succeeded.
     crate::cleanup_intents::sweep_settle_merged(home);
-    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
     removed
 }
 
