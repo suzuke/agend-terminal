@@ -90,6 +90,14 @@ impl SendEnvelope {
             provenance,
             branch,
         } = self;
+        // A task's lifecycle identity is its task_id. Ignore a stale or
+        // umbrella correlation before projecting the envelope so the daemon
+        // route and API-down fallback remain side-effect equivalent.
+        let correlation_id = if kind.as_deref() == Some("task") {
+            task_id
+        } else {
+            correlation_id
+        };
         let mut params = json!({
             "from": from,
             "target": target,
@@ -156,6 +164,14 @@ impl SendEnvelope {
             provenance: _,
             branch: _,
         } = self;
+        // Keep fallback delivery on the same canonical task correlation as the
+        // normal daemon SEND projection; non-task correlation semantics stay
+        // unchanged.
+        let correlation_id = if kind.as_deref() == Some("task") {
+            task_id
+        } else {
+            correlation_id
+        };
         let report_purpose = report_purpose
             .as_deref()
             .and_then(|p| {
@@ -357,6 +373,34 @@ mod tests {
         assert!(!obj.contains_key("force_meta"));
         assert!(!obj.contains_key("provenance"));
         assert!(!obj.contains_key("branch"));
+    }
+
+    /// RED: a task's lifecycle identity is its task_id, even when a stale
+    /// umbrella correlation_id is supplied. Both projections must carry the
+    /// same canonical correlation before either delivery path runs.
+    #[test]
+    fn task_projections_canonicalize_correlation_to_task_id() {
+        let env = SendEnvelope {
+            from: "lead".to_string(),
+            target: "reviewer".to_string(),
+            text: "[delegate_task] leaf".to_string(),
+            kind: Some("task".to_string()),
+            correlation_id: Some("t-umbrella".to_string()),
+            task_id: Some("t-leaf".to_string()),
+            ..SendEnvelope::default()
+        };
+
+        let params = env.to_send_params();
+        let fallback = env.to_inbox_message();
+        assert_eq!(params["task_id"], "t-leaf");
+        assert_eq!(params["correlation_id"], "t-leaf");
+        assert_eq!(fallback.task_id.as_deref(), Some("t-leaf"));
+        assert_eq!(fallback.correlation_id.as_deref(), Some("t-leaf"));
+        assert_eq!(
+            params["correlation_id"].as_str(),
+            fallback.correlation_id.as_deref(),
+            "normal API and API-down fallback must project the same canonical correlation"
+        );
     }
 
     /// `directives_from_args` reads the whole directive set from args (the read

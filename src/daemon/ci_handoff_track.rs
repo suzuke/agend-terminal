@@ -1027,6 +1027,11 @@ mod tests {
             text: format!("[dispatch] {kind}"),
             kind: Some(kind.into()),
             correlation_id: Some("o/r@feat".into()),
+            task_id: if kind == "task" {
+                Some("t-x".into())
+            } else {
+                None
+            },
             timestamp: "2026-07-06T00:00:00Z".into(),
             ..Default::default()
         };
@@ -1054,7 +1059,8 @@ mod tests {
             "a kind=query is not a delegation — the dispatcher's ci-ready track must survive"
         );
 
-        // kind=task with the same correlation IS the delegation → resolves it.
+        // kind=task with its canonical task_id IS the delegation → resolves it;
+        // the repo/branch correlation is display-only for task lifecycle.
         crate::api::handlers::messaging::track_dispatch(
             &home,
             &params,
