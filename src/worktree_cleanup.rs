@@ -343,6 +343,8 @@ pub fn sweep_from_registry(
         }
     }
 
+    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
+
     let mut removed = Vec::new();
 
     for repo in &repos {
@@ -540,7 +542,6 @@ pub fn sweep_from_registry(
     // a failed poller settlement or whose CI watch was removed before the
     // settlement succeeded.
     crate::cleanup_intents::sweep_settle_merged(home);
-    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
     removed
 }
 
@@ -976,7 +977,7 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_test_repo(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -2463,6 +2464,9 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+#[cfg(all(test, unix))]
+mod reconcile_ordering_tests;
 
 #[cfg(test)]
 mod lifecycle_r1_tests;
