@@ -132,12 +132,16 @@ fn install_failing_git(stub_dir: &Path, real_git: &Path) {
 }
 
 #[cfg(windows)]
-fn install_failing_git(stub_dir: &Path, real_git: &Path) {
-    let script = format!(
-        "@echo off\nif \"%~1 %~2\"==\"worktree remove\" (\n  echo cleanup-diagnostic-sentinel 1>&2\n  exit /b 23\n)\n\"{}\" %*\nexit /b %ERRORLEVEL%\n",
-        real_git.display()
-    );
-    std::fs::write(stub_dir.join("git.cmd"), script).expect("git stub");
+fn install_failing_git(_stub_dir: &Path, _real_git: &Path) {}
+
+#[cfg(windows)]
+fn hold_exclusive_worktree_file(repo: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(repo.join("wt-done").join("feat.txt"))
+        .expect("exclusive worktree file handle")
 }
 
 fn prepend_path(stub_dir: &Path, old_path: &std::ffi::OsString) -> std::ffi::OsString {
@@ -177,6 +181,8 @@ fn real_sweep_remove_failure_preserves_final_status_and_stderr_2830_red() {
     let old_cleanup = std::env::var_os("AGEND_WORKTREE_AUTO_CLEANUP");
     std::env::set_var("PATH", prepend_path(&stub_dir, &old_path));
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+    #[cfg(windows)]
+    let exclusive = hold_exclusive_worktree_file(&repo);
     let configs = HashMap::from([(String::from("other-agent"), Some(repo.join("other")))]);
     let removed = sweep_from_registry(&home, &configs, &[]);
     std::env::set_var("PATH", old_path);
@@ -193,14 +199,29 @@ fn real_sweep_remove_failure_preserves_final_status_and_stderr_2830_red() {
         .unwrap_or_else(|| panic!("expected hygiene task; removed={removed:?}, tasks={tasks:?}"));
     let reason = evidence["reason"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("status 23"),
+        reason.contains(if cfg!(windows) {
+            "status "
+        } else {
+            "status 23"
+        }),
         "final status was lost: {evidence}"
     );
     assert!(
-        reason.contains("cleanup-diagnostic-sentinel"),
+        reason.contains(if cfg!(windows) {
+            "stderr:"
+        } else {
+            "cleanup-diagnostic-sentinel"
+        }),
         "final stderr was lost: {evidence}"
     );
+    #[cfg(windows)]
+    assert!(
+        !reason.contains("stderr: <empty>"),
+        "native git failure should retain stderr bytes: {evidence}"
+    );
 
+    #[cfg(windows)]
+    drop(exclusive);
     std::fs::remove_dir_all(repo).ok();
     std::fs::remove_dir_all(home).ok();
     std::fs::remove_dir_all(stub_dir).ok();
