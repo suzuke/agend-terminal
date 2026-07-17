@@ -580,6 +580,26 @@ mod tests {
         assert_eq!(ledger.entry_count(), 0);
     }
 
+    /// Slice-2 RED: execution admission must return an opaque, one-use permit
+    /// rather than a copyable boolean.  The permit is the only authority that
+    /// may cross the ledger boundary into the Restarting transition.
+    #[test]
+    fn begin_execute_returns_typed_one_use_permit_slice2_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(90), &deleted, None);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let permit = ledger
+            .begin_execute(token)
+            .expect("exact-generation admission must mint a permit");
+        assert!(ledger.mark_live(permit));
+    }
+
     #[test]
     fn superseded_generations_are_removed_and_count_stays_bounded() {
         let ledger = CrashDispositionLedger::new();

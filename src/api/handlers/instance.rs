@@ -610,6 +610,68 @@ mod tests {
         }
     }
 
+    /// Slice-2 RED: the API kill producer must publish Crashed before the PTY
+    /// exit path and later exact-generation admission, never Restarting itself.
+    #[test]
+    fn handle_kill_keeps_agent_crashed_until_execution_admission_slice2_red() {
+        let name = "slice2-kill-producer";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let response = handle_kill(&json!({"name": name}), &ctx);
+        assert_eq!(
+            response["ok"],
+            json!(true),
+            "kill must succeed: {response:?}"
+        );
+
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        let state = {
+            let reg = agent::lock_registry(ctx.registry);
+            let core = Arc::clone(
+                &reg.get(&id)
+                    .expect("kill does not remove the registry entry")
+                    .core,
+            );
+            drop(reg);
+            core.lock().state.get_state()
+        };
+        assert_eq!(
+            state,
+            crate::state::AgentState::Crashed,
+            "API kill must not publish Restarting before permit admission"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    /// Slice-2 RED: Crashed has a distinct INJECT rejection message; calling
+    /// it "restarting" hides the fact that no execution permit was admitted.
+    #[test]
+    fn inject_rejection_names_crashed_state_slice2_red() {
+        let name = "slice2-inject-crashed";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        {
+            let reg = agent::lock_registry(ctx.registry);
+            reg.get(&id)
+                .expect("spawned handle")
+                .core
+                .lock()
+                .state
+                .current = crate::state::AgentState::Crashed;
+        }
+
+        let response = handle_inject(&json!({"name": name, "data": "x", "raw": true}), &ctx);
+        assert_eq!(response["ok"], json!(false));
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("crashed")),
+            "Crashed INJECT rejection must say crashed: {response:?}"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
     /// Sibling of [`test_ctx_with_agent`]: spawns a REAL, permanently-wedged
     /// agent (`stty raw -echo; sleep 30` — never drains stdin) instead of a
     /// healthy shell, so a caller can force a genuine PTY write failure

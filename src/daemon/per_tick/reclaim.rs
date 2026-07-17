@@ -653,6 +653,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn crashed_state_is_not_reclaimed_slice2_red() {
+        assert!(
+            !should_reclaim(
+                AgentState::Crashed,
+                true,
+                false,
+                Duration::from_secs(30 * 60),
+                RECLAIM_GRACE,
+            ),
+            "a Crashed agent must remain available for exact-generation recovery"
+        );
+    }
+
     /// (b) A genuine usage_limit with > grace remaining IS reclaimed: task → Open,
     /// owner cleared, work-stuck latch entry removed.
     #[test]

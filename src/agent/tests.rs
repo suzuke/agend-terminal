@@ -2095,6 +2095,39 @@ fn startup_failure_publication_carries_exact_generation_context_slice1() {
     assert!(Arc::ptr_eq(&observation.core, &handle.core));
 }
 
+/// Slice-2 RED: a crash observation is published as Crashed and must remain
+/// there until the daemon obtains an exact-generation execution permit.
+#[test]
+fn crash_observed_stays_crashed_until_execution_admission_slice2_red() {
+    let id = crate::types::InstanceId::new();
+    let generation = crate::agent::crash_disposition::owner_generation_source().next();
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observation = crate::agent::crash_disposition::CrashObservation {
+        instance_id: id,
+        generation,
+        core: Arc::clone(&core),
+        deleted,
+        owner_shutdown: None,
+        name: "slice2-crash-producer".into(),
+    };
+    crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
+
+    on_crash_exit(&observation, &None);
+
+    assert_eq!(
+        core.lock().state.get_state(),
+        crate::state::AgentState::Crashed
+    );
+}
+
 struct ChunkReader {
     chunks: Vec<&'static [u8]>,
     next: usize,
