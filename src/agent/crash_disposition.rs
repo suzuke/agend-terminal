@@ -146,6 +146,19 @@ pub(crate) struct RecoveryExecutionPermit {
     key: DispositionKey,
     core: Arc<CoreMutex<AgentCore>>,
     restarting_admitted: bool,
+    attempt_debited: bool,
+}
+
+/// The health/accounting result committed by one exact-generation permit.
+/// This value is produced only after [`RecoveryExecutionPermit::admit_restarting`]
+/// succeeds and therefore never represents a raw crash observation.
+pub(crate) struct RecoveryAttempt {
+    pub(crate) should_respawn: bool,
+    pub(crate) delay: std::time::Duration,
+    pub(crate) should_notify: bool,
+    pub(crate) fire_self_orch_p0: bool,
+    pub(crate) fire_terminal_p0: bool,
+    pub(crate) escalation_snapshot: crate::health::PersistedEscalation,
 }
 
 impl RecoveryExecutionPermit {
@@ -163,6 +176,42 @@ impl RecoveryExecutionPermit {
 
     fn key(&self) -> DispositionKey {
         self.key
+    }
+
+    pub(crate) fn exact_core(&self) -> Arc<CoreMutex<AgentCore>> {
+        Arc::clone(&self.core)
+    }
+
+    /// Debit the retry budget exactly once on the exact old core captured by
+    /// this permit.  A reused permit cannot issue another attempt or mutate
+    /// persistence/accounting a second time.
+    pub(crate) fn debit_attempt(
+        &mut self,
+        self_orch: crate::teams::SelfOrchStatus,
+    ) -> Option<RecoveryAttempt> {
+        if !self.restarting_admitted || self.attempt_debited {
+            return None;
+        }
+        self.attempt_debited = true;
+        let mut core = self.core.lock();
+        let fire_self_orch_p0 = self_orch == crate::teams::SelfOrchStatus::Yes
+            && core.health.self_orch_crash_should_notify();
+        let (should_respawn, delay, should_notify) = core.health.record_crash();
+        let fire_terminal_p0 = !should_respawn
+            && self_orch != crate::teams::SelfOrchStatus::No
+            && !core.health.failed_escalated;
+        if fire_terminal_p0 {
+            core.health.failed_escalated = true;
+        }
+        let escalation_snapshot = core.health.escalation_snapshot();
+        Some(RecoveryAttempt {
+            should_respawn,
+            delay,
+            should_notify,
+            fire_self_orch_p0,
+            fire_terminal_p0,
+            escalation_snapshot,
+        })
     }
 }
 
@@ -296,6 +345,7 @@ impl CrashDispositionLedger {
             key: token.key,
             core,
             restarting_admitted: false,
+            attempt_debited: false,
         })
     }
 
@@ -688,6 +738,30 @@ mod tests {
             crate::state::AgentState::Crashed
         );
         assert_eq!(ledger.disposition(obs.key()), Some(Disposition::Failed));
+    }
+
+    #[test]
+    fn admitted_permit_debits_exact_core_once() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(92), &deleted, None);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let mut permit = ledger.begin_execute(token).expect("permit");
+        assert!(permit.admit_restarting());
+        let attempt = permit
+            .debit_attempt(crate::teams::SelfOrchStatus::No)
+            .expect("first debit");
+        assert!(attempt.should_respawn);
+        assert!(permit
+            .debit_attempt(crate::teams::SelfOrchStatus::No)
+            .is_none());
+        assert_eq!(obs.core.lock().health.total_crashes, 1);
+        assert!(ledger.mark_live(permit));
     }
 
     #[test]

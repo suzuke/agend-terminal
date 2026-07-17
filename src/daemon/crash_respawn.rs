@@ -86,19 +86,11 @@ pub(super) fn handle_crash_observation(
     // leaderless page off an indeterminate read. (The no-peer hung/AuthError
     // paths fail the other way — they escalate on `Unknown`.)
     let self_orch = crate::teams::self_orch_status(home, crashed_name);
-    let is_self_orch = self_orch == crate::teams::SelfOrchStatus::Yes;
 
     enum RegistryOutcome {
         Deleted,
         Missing,
-        Healthy {
-            should_respawn: bool,
-            delay: std::time::Duration,
-            should_notify: bool,
-            fire_self_orch_p0: bool,
-            fire_terminal_p0: bool,
-            escalation_snapshot: crate::health::PersistedEscalation,
-        },
+        Healthy { delay: std::time::Duration },
     }
 
     // Snapshot health and the deleted/missing outcome while holding the
@@ -128,41 +120,11 @@ pub(super) fn handle_crash_observation(
                     );
                     RegistryOutcome::Deleted
                 } else {
-                    let mut core = handle.core.lock();
-                    // #1701: decide the self-orch P0 BEFORE record_crash (which may
-                    // itself stamp the crash cooldown on its recent>=2 path) — the
-                    // accessor reads+stamps the crash-class cooldown (#1744-H3:
-                    // distinct from the hung cooldown), and for a self-orchestrator we
-                    // use ONLY this gate, never the generic recent>=2 one. The `&&`
-                    // short-circuits for non-orchestrators, so their cooldown is
-                    // untouched.
-                    let fire_p0 = is_self_orch && core.health.self_orch_crash_should_notify();
-                    let (respawn, delay, notify) = core.health.record_crash();
-                    // #1744-H4: a terminal Failed (max-retries) self-orchestrator crash
-                    // is a PERMANENT leaderless death. record_crash returns notify=true
-                    // ("don't respawn, do notify"), but fire_p0 is cooldown-gated and
-                    // the generic notify branch below is `!is_self_orch` — so without
-                    // this it pages NEITHER. Fire a once-off, cooldown-EXEMPT terminal
-                    // P0, fail-closed (Yes|Unknown fire, No skip), latched via the
-                    // PERSISTED `failed_escalated` so a restart (which rehydrates the
-                    // crash budget but not `state`) doesn't re-page the same death.
-                    let fire_terminal =
-                        should_fire_terminal_p0(respawn, self_orch, core.health.failed_escalated);
-                    if fire_terminal {
-                        core.health.failed_escalated = true;
-                    }
-                    // #1744-H2: snapshot the (just-mutated) escalation state under the
-                    // lock; persisted lock-free below so the crash budget + cooldown
-                    // (+ #1744-H4 failed_escalated) survive a daemon restart.
-                    let snap = core.health.escalation_snapshot();
-                    RegistryOutcome::Healthy {
-                        should_respawn: respawn,
-                        delay,
-                        should_notify: notify,
-                        fire_self_orch_p0: fire_p0,
-                        fire_terminal_p0: fire_terminal,
-                        escalation_snapshot: snap,
-                    }
+                    // Project the backoff without mutating health.  Retry
+                    // accounting is committed only after the worker admits its
+                    // exact-generation execution permit.
+                    let delay = handle.core.lock().health.next_crash_delay();
+                    RegistryOutcome::Healthy { delay }
                 }
             }
             None => {
@@ -172,63 +134,15 @@ pub(super) fn handle_crash_observation(
         }
     };
 
-    let (
-        should_respawn,
-        delay,
-        should_notify,
-        fire_self_orch_p0,
-        fire_terminal_p0,
-        escalation_snapshot,
-    ) = match registry_outcome {
+    let delay = match registry_outcome {
         RegistryOutcome::Deleted | RegistryOutcome::Missing => {
             ledger.discard(key);
             return;
         }
-        RegistryOutcome::Healthy {
-            should_respawn,
-            delay,
-            should_notify,
-            fire_self_orch_p0,
-            fire_terminal_p0,
-            escalation_snapshot,
-        } => (
-            should_respawn,
-            delay,
-            should_notify,
-            fire_self_orch_p0,
-            fire_terminal_p0,
-            escalation_snapshot,
-        ),
+        RegistryOutcome::Healthy { delay } => delay,
     };
-
-    // #1744-H2: persist the crash budget + crash cooldown (lock released above).
-    crate::daemon::escalation_persist::persist(home, crashed_name, &escalation_snapshot);
-
-    // #1701: a self-orchestrator crash escalates to the operator on EVERY crash
-    // (cooldown-gated) — the team is leaderless until respawn and no peer can
-    // relay. A non-orchestrator agent keeps the generic recent>=2 crash notify.
-    if fire_terminal_p0 {
-        // #1744-H4: terminal-Failed self-orch — takes precedence over the
-        // per-crash page (its wording is "permanent, won't respawn", not "until
-        // respawn"). Once-off via the persisted `failed_escalated` latch.
-        notify_self_orch_terminal(crashed_name);
-    } else if fire_self_orch_p0 {
-        notify_self_orch_crash(crashed_name, &instance_id, &ctx.registry);
-    } else if !is_self_orch && should_notify {
-        notify_crash(crashed_name, &instance_id, &ctx.registry);
-    }
-
-    if !should_respawn {
-        tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
-        ledger.discard(key);
-        return;
-    }
 
     tracing::info!(agent = %crashed_name, ?delay, "respawning");
-    let saved_health = {
-        let r = agent::lock_registry(&ctx.registry);
-        r.get(&instance_id).map(|h| h.core.lock().health.clone())
-    };
 
     let reg = Arc::clone(&ctx.registry);
     let home = home.to_path_buf();
@@ -245,11 +159,13 @@ pub(super) fn handle_crash_observation(
                 &home,
                 config,
                 delay,
-                saved_health,
+                None,
                 &reg,
                 tx,
                 &shutdown_for_respawn,
                 Some(claim),
+                self_orch,
+                instance_id,
             );
         })
     {
@@ -324,6 +240,7 @@ fn notify_self_orch_crash(
 /// (fail-closed: `Yes`|`Unknown` fire, `No` skip — a leaderless death is too
 /// costly to miss on an indeterminate teams read), and it has not already been
 /// terminally paged (`failed_escalated`, persisted for cross-restart once-off).
+#[cfg(test)]
 fn should_fire_terminal_p0(
     should_respawn: bool,
     self_orch: crate::teams::SelfOrchStatus,
@@ -390,6 +307,8 @@ fn respawn_agent_worker(
     tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
     shutdown: &Arc<AtomicBool>,
     claim: Option<ClaimToken>,
+    self_orch: crate::teams::SelfOrchStatus,
+    instance_id: crate::types::InstanceId,
 ) {
     std::thread::sleep(delay);
     if shutdown.load(Ordering::Relaxed) {
@@ -452,6 +371,54 @@ fn respawn_agent_worker(
         }
         None => None,
     };
+    let mut saved_health = saved_health;
+    if permit.is_some() {
+        let attempt = permit
+            .as_mut()
+            .and_then(|permit| permit.debit_attempt(self_orch));
+        let Some(attempt) = attempt else {
+            tracing::warn!(agent = %config.name, "exact-generation recovery permit was already debited");
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
+            }
+            return;
+        };
+        let exact_core = permit
+            .as_ref()
+            .expect("permit remains after debit")
+            .exact_core();
+        saved_health = Some(exact_core.lock().health.clone());
+        tracing::debug!(
+            agent = %config.name,
+            ?attempt.delay,
+            "exact-generation crash attempt admitted"
+        );
+        crate::event_log::log(
+            home,
+            "crash_respawn_attempt",
+            &config.name,
+            "exact-generation recovery permit admitted one retry attempt",
+        );
+        crate::daemon::escalation_persist::persist(
+            home,
+            &config.name,
+            &attempt.escalation_snapshot,
+        );
+        if attempt.fire_terminal_p0 {
+            notify_self_orch_terminal(&config.name);
+        } else if attempt.fire_self_orch_p0 {
+            notify_self_orch_crash(&config.name, &instance_id, reg);
+        } else if self_orch != crate::teams::SelfOrchStatus::Yes && attempt.should_notify {
+            notify_crash(&config.name, &instance_id, reg);
+        }
+        if !attempt.should_respawn {
+            tracing::warn!(agent = %config.name, "max retries exceeded, not respawning");
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
+            }
+            return;
+        }
+    }
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
@@ -699,10 +666,6 @@ mod deleted_gate_tests_1913 {
             configs: Arc::new(Mutex::new(configs)),
             crash_tx,
             crash_rx,
-            // shutdown=true: for the deleted=false case the respawn worker thread
-            // aborts after its backoff WITHOUT a real `spawn_agent` — the test
-            // asserts the respawn PATH was entered (record_crash bumped
-            // total_crashes), not that a process actually launched.
             shutdown: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -768,17 +731,15 @@ mod deleted_gate_tests_1913 {
             .register_generation(handle.id, handle.generation);
         reg.lock()
             .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
-        let ctx = make_ctx(Arc::clone(&reg));
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..make_ctx(Arc::clone(&reg))
+        };
 
         handle_crash_respawn(&home, VICTIM, &ctx);
 
-        assert_eq!(
-            total_crashes(&reg),
-            1,
-            "#1913 regression guard: a real crash (deleted=false) must STILL enter \
-             the respawn path (record_crash runs) — the deleted-gate must not \
-             suppress normal crash recovery"
-        );
+        wait_for_total_crashes(&reg, 1);
+        assert_eq!(total_crashes(&reg), 1);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -880,7 +841,11 @@ mod deleted_gate_tests_1913 {
         let generation = handle.generation;
         reg.lock().insert(id, handle);
         let ctx = make_ctx(Arc::clone(&reg));
-        ctx.configs.lock().get_mut(VICTIM).unwrap().backend_command =
+        ctx.configs
+            .lock()
+            .get_mut(VICTIM)
+            .expect("victim config")
+            .backend_command =
             "missing-exact-attempt-command".to_string();
         crate::agent::crash_disposition::owner_ledger().register_generation(id, generation);
         let observation = {
@@ -911,8 +876,17 @@ mod deleted_gate_tests_1913 {
             "debit is not raw-observation side effect"
         );
         wait_for_total_crashes(&reg, 1);
-        let persisted = crate::daemon::escalation_persist::load_for(&home, VICTIM)
-            .expect("accepted attempt must persist escalation count");
+        let persist_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let persisted = loop {
+            if let Some(persisted) = crate::daemon::escalation_persist::load_for(&home, VICTIM) {
+                break persisted;
+            }
+            assert!(
+                std::time::Instant::now() < persist_deadline,
+                "accepted attempt must persist escalation count"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(persisted.total_crashes, 1);
         let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
         assert_eq!(
@@ -954,6 +928,8 @@ mod deleted_gate_tests_1913 {
             crash_tx,
             &shutdown,
             None,
+            crate::teams::SelfOrchStatus::No,
+            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
         );
 
         // Verify 1: event-log.jsonl should have a crash_respawn_failed record
