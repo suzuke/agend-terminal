@@ -2462,6 +2462,151 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// RED: review_branch_reconciled must precede any fetch-degraded hygiene
+    /// event produced by the same sweep. On current code, reconcile runs AFTER
+    /// the per-repo loop, so the hygiene task's created_at is earlier.
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_runs_before_fetch_loop_ordering() {
+        let _lock = ENV_LOCK.lock();
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let home = tmp_home("reconcile-order");
+        let repo = setup_test_repo("reconcile-order-repo");
+        // Add a deliberately failing remote so the fetch loop logs a hygiene task.
+        git_in(
+            &repo,
+            &["remote", "add", "origin", "/nonexistent/order-test-fixture"],
+        );
+        // Create a review/* branch and a terminal cleanup intent for it.
+        git_in(&repo, &["checkout", "-b", "review/pr-order-test"]);
+        std::fs::write(repo.join("f.txt"), "work").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "work",
+            ],
+        );
+        let tip = crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git_in(&repo, &["checkout", "main"]);
+        crate::cleanup_intents::persist_intent(
+            &home,
+            &repo.display().to_string(),
+            "review/pr-order-test",
+            &tip,
+            "t-order-test",
+            None,
+            None,
+        )
+        .unwrap();
+        // Seed a terminal task so reconcile qualifies this intent.
+        {
+            use crate::task_events::{InstanceName, TaskEvent, TaskId};
+            let tid = TaskId("t-order-test".into());
+            let board = crate::task_events::board_root(&home, crate::task_events::DEFAULT_PROJECT);
+            std::fs::create_dir_all(&board).ok();
+            let emitter = InstanceName::from("test");
+            let _ = crate::task_events::append(
+                &board,
+                &emitter,
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "order test".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    tags: Vec::new(),
+                    owner: None,
+                    depends_on: Vec::new(),
+                    parent_id: None,
+                    branch: None,
+                    due_at: None,
+                    routed_to: None,
+                    bind: None,
+                    eta_secs: None,
+                },
+            );
+            let _ = crate::task_events::append(
+                &board,
+                &emitter,
+                TaskEvent::Done {
+                    task_id: tid,
+                    by: emitter.clone(),
+                    source: crate::task_events::DoneSource::ReportAutoClose {
+                        report_summary: "done".into(),
+                        closed_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                },
+            );
+        }
+        let configs = HashMap::new();
+        let _ = sweep_from_registry(&home, &configs, &[]);
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+
+        // Read event log and find review_branch_reconciled line number.
+        let event_log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        let reconcile_line = event_log
+            .lines()
+            .position(|l| l.contains("review_branch_reconciled"));
+        // The hygiene task is created by upsert_hygiene inside the fetch loop.
+        // Its creation emits a task event (not event-log). We check that
+        // the reconcile event exists AND the hygiene task exists, then compare
+        // their timestamps.
+        let hygiene = hygiene_tasks(&home);
+        let fetch_degraded = hygiene.iter().find(|(k, _)| k.contains("fetch-degraded"));
+
+        assert!(
+            reconcile_line.is_some(),
+            "review_branch_reconciled must appear in event log"
+        );
+        assert!(
+            fetch_degraded.is_some(),
+            "fetch-degraded hygiene task must be created"
+        );
+        // Parse timestamps and compare: reconcile must precede hygiene.
+        let reconcile_ts: String = event_log
+            .lines()
+            .find(|l| l.contains("review_branch_reconciled"))
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .and_then(|v| v["timestamp"].as_str().map(String::from))
+            .expect("reconcile event must have timestamp");
+        // hygiene task created_at is the task's created event timestamp.
+        let task_list = crate::task_events::replay(&home).expect("replay tasks");
+        let hygiene_ts = task_list
+            .tasks
+            .values()
+            .filter_map(|t| {
+                let key = t
+                    .metadata
+                    .get(crate::daemon::hygiene_task::ALERT_KEY_META)?
+                    .as_str()?;
+                if key.contains("fetch-degraded") {
+                    Some(t.created_at.clone())
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("fetch-degraded task must have created_at");
+
+        assert!(
+            reconcile_ts <= hygiene_ts,
+            "RED: review_branch_reconciled ({reconcile_ts}) must precede \
+             fetch-degraded hygiene task ({hygiene_ts})"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]
