@@ -8,12 +8,13 @@ evidence for an item, but does not complete the item by itself.
 
 ## Snapshot and authority
 
-- Snapshot date: 2026-07-16
-- `agend-terminal` baseline: `31130f9324d42d3e699a7c560ffc0b07d5dc3776`
+- Snapshot date: 2026-07-17
+- `agend-terminal` baseline: `3f80ee5c75a087c5309dcb6d8d28ba7f3948edf5`
   on `main`
 - vendored `agentic-git` baseline: `8e0fcafc25ec3e6844ca181014f6d9bb2ffbccb3`
 - GitHub state at the snapshot: PR #2818 is merged and included in this source
-  baseline; issue #2782 is closed after its exact-revoke acceptance scope landed
+  baseline; upstream agentic-git PR #37 is merged at `8e0fcafc` and issue #34 is
+  closed.
 - Program state: **0 done, 9 in progress, 5 pending, 0 blocked**
 
 Evidence is ranked in this order:

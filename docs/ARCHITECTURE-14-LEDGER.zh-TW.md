@@ -8,12 +8,12 @@
 
 ## Snapshot 與權威
 
-- Snapshot 日期：2026-07-16
+- Snapshot 日期：2026-07-17
 - `agend-terminal` baseline：`main` 上的
-  `31130f9324d42d3e699a7c560ffc0b07d5dc3776`
+  `3f80ee5c75a087c5309dcb6d8d28ba7f3948edf5`
 - vendored `agentic-git` baseline：`8e0fcafc25ec3e6844ca181014f6d9bb2ffbccb3`
 - Snapshot 時的 GitHub state：PR #2818 已 merge 並納入此 source baseline；
-  issue #2782 在 exact-revoke acceptance scope 落地後已關閉
+  upstream agentic-git PR #37 已在 `8e0fcafc` merge，issue #34 已關閉
 - 計畫狀態：**0 done、9 in progress、5 pending、0 blocked**
 
 Evidence 依下列順序排序：
