@@ -10,6 +10,7 @@ mod anti_stall;
 mod dispatch;
 mod evidence_gate;
 mod request_kind_gate;
+mod selector_gate;
 mod sha_gate;
 mod triaged_gate;
 
@@ -24,6 +25,9 @@ pub(super) use anti_stall::enforce_send_invariants;
 // t-20260705005551919287-14440-22: request_kind enum validation
 // (handle_unified_send / handle_broadcast).
 pub(super) use request_kind_gate::validate_request_kind;
+
+// Architecture-14 item 4A: selector exclusivity + tags fail-closed.
+pub(super) use selector_gate::validate_selector_exclusivity;
 
 // Delegate-task pre-send gates (handle_delegate_task / comms_delegate).
 // #6: DispatchPreChecks promoted to pub(crate) so ci/review_workspace_tests can

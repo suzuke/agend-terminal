@@ -2649,25 +2649,15 @@ fn update_team_fallback_to_direct_when_daemon_unreachable() {
 // --- comms.rs broadcast ---
 
 #[test]
-fn broadcast_without_targets_sends_to_all() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("bcast-all");
-    std::env::set_var("AGEND_HOME", &home);
-    std::fs::write(
-        crate::fleet::fleet_yaml_path(&home),
-        "instances:\n  sender:\n    backend: claude\n  target1:\n    backend: claude\n",
-    )
-    .ok();
+fn broadcast_without_targets_rejects_no_selector() {
     let sender = crate::identity::Sender::new("sender").expect("valid sender");
     let args = json!({"message": "hello all"});
-    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
-    // Should attempt to send (may fail without daemon, but count/sent_to shape must exist)
+    let result = super::comms::handle_broadcast(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
-        result.get("sent_to").is_some() || result.get("count").is_some(),
-        "broadcast must return sent_to/count shape: {result}"
+        err.contains("selector") || err.contains("recipient"),
+        "broadcast with no selector must fail closed, not broadcast-all: {result}"
     );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
@@ -3624,4 +3614,192 @@ fn is_read_only_tool_allowlist() {
             "{t} must NOT be classified read-only"
         );
     }
+}
+
+// --- Architecture-14 item 4A: selector prevalidation ---
+
+#[test]
+fn send_mixed_selectors_instance_and_instances_rejected() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instance": "a", "instances": ["b", "c"], "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("selector") || err.contains("conflict"),
+        "mixed instance+instances must be rejected before routing: {result}"
+    );
+}
+
+#[test]
+fn send_mixed_selectors_instance_and_team_rejected() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instance": "a", "team": "myteam", "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("selector") || err.contains("conflict"),
+        "mixed instance+team must be rejected before routing: {result}"
+    );
+}
+
+#[test]
+fn send_mixed_selectors_instance_and_tags_rejected() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instance": "a", "tags": ["dev"], "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("selector") || err.contains("conflict"),
+        "mixed instance+tags must be rejected before routing: {result}"
+    );
+}
+
+#[test]
+fn send_mixed_selectors_instances_and_team_rejected() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instances": ["a"], "team": "myteam", "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("selector") || err.contains("conflict"),
+        "mixed instances+team must be rejected before routing: {result}"
+    );
+}
+
+#[test]
+fn send_mixed_selectors_instances_and_tags_rejected() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instances": ["a"], "tags": ["dev"], "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("selector") || err.contains("conflict"),
+        "mixed instances+tags must be rejected before routing: {result}"
+    );
+}
+
+#[test]
+fn send_mixed_selectors_team_and_tags_rejected() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"team": "myteam", "tags": ["dev"], "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("selector") || err.contains("conflict"),
+        "mixed team+tags must be rejected before routing: {result}"
+    );
+}
+
+#[test]
+fn send_tags_only_fail_closed() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"tags": ["dev"], "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        err.contains("tag") && (err.contains("not supported") || err.contains("not implemented")),
+        "tags-only must fail closed (not broadcast-all): {result}"
+    );
+}
+
+#[test]
+fn send_valid_selector_instance_only_no_selector_error() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instance": "target", "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !err.contains("selector") && !err.contains("conflict"),
+        "instance-only is a valid selector, must not get selector error: {result}"
+    );
+}
+
+#[test]
+fn send_valid_selector_instances_only_no_selector_error() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"instances": ["a", "b"], "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !err.contains("selector") && !err.contains("conflict"),
+        "instances-only is a valid selector, must not get selector error: {result}"
+    );
+}
+
+#[test]
+fn send_valid_selector_team_only_no_selector_error() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"team": "myteam", "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !err.contains("selector") && !err.contains("conflict"),
+        "team-only is a valid selector, must not get selector error: {result}"
+    );
+}
+
+#[test]
+fn send_mixed_selectors_no_sidecar_side_effects() {
+    let home = tmp_home("sel-mixed-se");
+    let sender = crate::identity::Sender::new("se-agent").expect("valid sender name");
+    let args = json!({
+        "instance": "a", "tags": ["dev"], "message": "hi",
+        "task_id": "t-selector-sidecar-test"
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    assert!(
+        result.get("error").is_some(),
+        "must reject mixed selectors: {result}"
+    );
+    let progress = home
+        .join("task-progress")
+        .join("t-selector-sidecar-test.json");
+    assert!(
+        !progress.exists(),
+        "task-progress sidecar must not be created for a rejected mixed-selector send"
+    );
+    let activity = home.join("agent-activity").join("se-agent.json");
+    assert!(
+        !activity.exists(),
+        "agent-activity sidecar must not be created for a rejected mixed-selector send"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_tags_only_no_sidecar_side_effects() {
+    let home = tmp_home("sel-tags-se");
+    let sender = crate::identity::Sender::new("se-agent2").expect("valid sender name");
+    let args = json!({
+        "tags": ["dev"], "message": "hi",
+        "task_id": "t-tags-sidecar-test"
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    assert!(
+        result.get("error").is_some(),
+        "must reject tags-only: {result}"
+    );
+    let progress = home.join("task-progress").join("t-tags-sidecar-test.json");
+    assert!(
+        !progress.exists(),
+        "task-progress sidecar must not be created for a rejected tags-only send"
+    );
+    let activity = home.join("agent-activity").join("se-agent2.json");
+    assert!(
+        !activity.exists(),
+        "agent-activity sidecar must not be created for a rejected tags-only send"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_zero_selectors_returns_typed_missing_selector() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(
+        code, "missing_selector",
+        "zero selectors must return typed missing_selector error from the unified gate: {result}"
+    );
 }
