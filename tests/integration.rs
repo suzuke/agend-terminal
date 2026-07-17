@@ -364,7 +364,8 @@ fn test_crash_respawn_health() {
     let resp = daemon.api_call(&serde_json::json!({"method": "kill", "params": {"name": "shell"}}));
     assert_eq!(resp["ok"], true);
 
-    // Wait for agent to enter restarting/starting state
+    // During recovery backoff/setup the agent truthfully remains crashed;
+    // Restarting is published only immediately before the replacement spawn.
     let _ = wait_until(
         || {
             let r = daemon.api_call(&serde_json::json!({"method": "list"}));
@@ -372,7 +373,7 @@ fn test_crash_respawn_health() {
                 .as_array()
                 .and_then(|a| a.first())
                 .and_then(|a| a["agent_state"].as_str())
-                .map(|s| s == "restarting" || s == "starting")
+                .map(|s| s == "crashed" || s == "restarting" || s == "starting")
                 .unwrap_or(false)
         },
         Duration::from_secs(5),
@@ -382,8 +383,8 @@ fn test_crash_respawn_health() {
     if !agents.is_empty() {
         let state = agents[0]["agent_state"].as_str().unwrap_or("");
         assert!(
-            state == "restarting" || state == "starting",
-            "expected restarting or starting, got: {state}"
+            state == "crashed" || state == "restarting" || state == "starting",
+            "expected crashed, restarting, or starting, got: {state}"
         );
     }
 
@@ -484,11 +485,11 @@ fn test_inject_restarting() {
         "params": {"name": "shell", "data": "hello"}
     }));
 
-    // Should get "restarting" error, not "not found"
+    // Should get the truthful recovery-state error, not "not found".
     let error = resp["error"].as_str().unwrap_or("");
     assert!(
-        error.contains("restarting"),
-        "expected 'restarting' error, got: {error}"
+        error.contains("crashed") || error.contains("restarting"),
+        "expected 'crashed' or 'restarting' error, got: {error}"
     );
 
     daemon.stop();
