@@ -237,24 +237,11 @@ fn is_worktree_dirty(worktree_path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Remove a worktree, and delete its branch ONLY when `delete_branch` is set.
+/// Remove a worktree; delete its branch only when `delete_branch` is set.
 ///
-/// CR-2026-06-14 (data-loss): the worktree-DIR removal and the `git branch -D`
-/// are DECOUPLED. Reclaiming the worktree directory is harmless, but deleting
-/// the branch ref is irreversible — a remote-gone branch carrying
-/// committed-but-unpushed local work would lose it. The caller passes
-/// `delete_branch = true` only when the work is preserved in the default branch
-/// (merged or squash-merged); otherwise the branch ref (and its unpushed
-/// commits) survives even though the stale worktree dir is reclaimed.
-///
-/// On Windows, retries up to 3 times with exponential backoff (200ms, 400ms)
-/// to absorb transient EACCES from file locks held by preceding git processes.
-///
-/// #2605: `dry_run` skips both git calls entirely and reports success (as if
-/// removed) so a caller's candidate list can reflect what WOULD happen. PR-D6:
-/// the runtime sweep always passes `false` now (gating is `AUTO_CLEANUP` only);
-/// the param is retained for the audit-style callers/tests that still exercise
-/// the compute-but-don't-mutate path.
+/// Worktree and branch deletion are decoupled so unpushed remote-gone work is
+/// preserved. Windows retries up to 3 times with 200/400ms backoff for locks;
+/// `dry_run` skips both git calls and reports success.
 fn remove_worktree(
     repo_root: &Path,
     worktree_path: &str,
@@ -272,36 +259,33 @@ fn remove_worktree(
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
         }
-        match crate::git_helpers::git_bypass(
+        let output = match crate::git_helpers::git_bypass(
             repo_root,
             &["worktree", "remove", "--force", worktree_path],
         ) {
-            Ok(output) if output.status.success() => {
-                wt_ok = true;
-                break;
-            }
-            Ok(output) => {
-                let status = output
-                    .status
-                    .code()
-                    .map(|code| format!("exit status {code}"))
-                    .unwrap_or_else(|| output.status.to_string());
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let stderr = if stderr.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    stderr
-                };
-                failure = Some(format!(
-                    "sweep worktree remove failed: {status}; stderr: {stderr}"
-                ));
-            }
+            Ok(output) => output,
             Err(error) => {
                 failure = Some(format!(
                     "sweep worktree remove failed: could not execute git: {error}"
                 ));
+                continue;
             }
+        };
+        if output.status.success() {
+            wt_ok = true;
+            break;
         }
+        let status = output.status.code().map(|c| format!("exit status {c}"));
+        let status = status.unwrap_or_else(|| output.status.to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        failure = Some(format!(
+            "sweep worktree remove failed: {status}; stderr: {}",
+            if stderr.is_empty() {
+                "<empty>"
+            } else {
+                &stderr
+            }
+        ));
     }
     if wt_ok && delete_branch {
         // W1.2: best-effort branch delete (result was already ignored).
@@ -512,13 +496,8 @@ pub fn sweep_from_registry(
                 delete_branch = branch_safe_to_delete,
                 "removing stale worktree"
             );
-            // PR-D·D5: route the dir-Delete through the shared `janitor::dispose`
-            // Delete arm — the sweep passes its OWN remover (`remove_worktree`:
-            // git_bypass + windows-retry + `branch -D`), so its deliberate wrapper is
-            // preserved (D5-Q3 ruling B). The remover returns its final command
-            // diagnostics directly as the janitor error. `agent`/`candidate` are
-            // inert on the Delete arm; the Err reason is unused here (the sweep
-            // skips, it does not archive-fallthrough).
+            // Route Delete through janitor with the caller-local remover, retaining
+            // retry behavior and final command diagnostics.
             let outcome = crate::daemon::janitor::dispose(
                 home,
                 crate::worktree::disposition::Disposition::Delete,
