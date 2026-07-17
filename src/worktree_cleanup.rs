@@ -112,12 +112,20 @@ fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, ()> {
         );
         return Err(());
     }
+    let canonical_repo = repo_root.canonicalize().ok();
     Ok(
         crate::git_worktree::parse_porcelain(&String::from_utf8_lossy(&out.stdout))
             .into_iter()
             .filter_map(|(path, branch)| {
                 let branch = branch?;
                 if branch == "main" || branch == "master" {
+                    return None;
+                }
+                let is_canonical_repo = canonical_repo
+                    .as_ref()
+                    .and_then(|repo| path.canonicalize().ok().map(|worktree| worktree == *repo))
+                    .unwrap_or(false);
+                if is_canonical_repo {
                     return None;
                 }
                 Some(WorktreeEntry {
@@ -132,6 +140,9 @@ fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, ()> {
 /// Check if a branch is merged into the default branch (local check, no API needed).
 fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     let default = crate::git_helpers::default_branch(repo_root);
+    if branch == default {
+        return false;
+    }
     // W1.2: git_ok = always-bypass + bounded, true iff exit-0 (the
     // `output().map(success).unwrap_or(false)` idiom, byte-for-byte).
     if !crate::git_helpers::git_ok(
@@ -814,7 +825,7 @@ fn prune_orphaned_branches_with_home(
         match crate::git_helpers::git_cmd(repo_root, &["branch", "--format=%(refname:short)"]) {
             Ok(stdout) => stdout
                 .lines()
-                .filter(|b| *b != default.as_str())
+                .filter(|b| *b != default.as_str() && !crate::protected_refs::is_protected_ref(b))
                 .map(String::from)
                 .collect(),
             _ => return Vec::new(),
@@ -980,6 +991,10 @@ mod tests {
     pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn setup_test_repo(tag: &str) -> PathBuf {
+        setup_test_repo_with_default(tag, "main")
+    }
+
+    pub(super) fn setup_test_repo_with_default(tag: &str, default_branch: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static C: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -989,14 +1004,14 @@ mod tests {
             C.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).ok();
-        git_in(&dir, &["init", "-b", "main"]);
+        git_in(&dir, &["init", "-b", default_branch]);
         std::fs::write(dir.join("README.md"), "init").ok();
         git_in(&dir, &["add", "."]);
         git_in(&dir, &["commit", "-m", "init"]);
         dir
     }
 
-    fn git_in(dir: &Path, args: &[&str]) {
+    pub(super) fn git_in(dir: &Path, args: &[&str]) {
         Command::new("git")
             .args(args)
             .current_dir(dir)
@@ -1822,7 +1837,7 @@ mod tests {
 
     /// Commit like `git_in`'s commit but with a fixed author+committer DATE, so
     /// `branch_tip_age` is deterministic regardless of wall-clock.
-    fn git_commit_dated(dir: &Path, msg: &str, date: &str) {
+    pub(super) fn git_commit_dated(dir: &Path, msg: &str, date: &str) {
         Command::new("git")
             .args(["commit", "-m", msg])
             .current_dir(dir)
@@ -2470,6 +2485,9 @@ mod reconcile_ordering_tests;
 
 #[cfg(test)]
 mod lifecycle_r1_tests;
+
+#[cfg(test)]
+mod protected_sweep_tests;
 
 #[cfg(test)]
 mod review_repro_worktree_git;
