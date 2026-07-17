@@ -385,6 +385,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -1001,6 +1002,7 @@ fn write_to_agent_typed_uses_timeout() {
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let result = write_to_agent_typed(&handle, b"x");
@@ -1841,6 +1843,7 @@ fn pty_read_error_triggers_cleanup() {
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
             spawn_mode: crate::backend::SpawnMode::Fresh,
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
@@ -1861,6 +1864,7 @@ fn pty_read_error_triggers_cleanup() {
         dismiss_patterns: Vec::new(),
         shutdown: Some(shutdown),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
     };
 
     let mut reader = FailingReader {
@@ -1887,11 +1891,9 @@ fn pty_read_error_triggers_cleanup() {
 //   `restart_instance` issues DELETE(no_wait) → SPAWN. The
 //   new instance is re-created under the SAME name (with a fresh
 //   `deleted=false` handle) BEFORE the OS reaps the old process and its death is
-//   classified. `AgentExitEvent::Crash` carries only the NAME (no PID /
-//   generation), so the #1913 crash-respawn SINK gates (config-by-name,
-//   deleted-by-name, registry-by-name in `daemon::crash_respawn`) all resolve to
-//   the NEW healthy handle — they would let the OLD process's death drive a
-//   respawn → a second, duplicate instance (double-spawn / zombie PTY).
+//   classified. The exact-generation ledger now fences that old observation;
+//   these source-side tests remain the first guard because a deleted handle must
+//   never publish a recovery wake in the first place.
 //
 //   The ONLY reliable protection is the SOURCE guard inside `handle_pty_close`:
 //   it checks the OLD handle's OWN `deleted` Arc — captured by Arc identity at
@@ -1902,8 +1904,8 @@ fn pty_read_error_triggers_cleanup() {
 //   SeqCst load reliably sees `true`.
 //
 //   If anyone ever moves the `deleted` check after `classify_exit`, or lets a
-//   path emit an exit event before it, these two tests MUST go RED — the
-//   name-keyed sink gates will silently fail to catch that regression.
+//   path emit an exit event before it, these two tests MUST go RED — source
+//   suppression remains the earliest and most precise teardown fence.
 
 /// Build an agent handle whose backend child exits with a CRASH-classified code
 /// (3 → `ExitKind::Crash`, distinct from 0/130 user-exit and 137/143
@@ -1912,7 +1914,8 @@ fn pty_read_error_triggers_cleanup() {
 /// real exit code.
 #[allow(clippy::unwrap_used)]
 fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::InstanceId) {
-    let id = crate::types::InstanceId::default();
+    let id = crate::types::InstanceId::new();
+    let generation = crate::agent::crash_disposition::owner_generation_source().next();
     let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
     let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
         vterm: VTerm::new(80, 24),
@@ -1962,6 +1965,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(deleted)),
     };
     (handle, id)
@@ -1982,6 +1986,7 @@ fn run_pty_close_capturing_crash(
     let core = Arc::clone(&handle.core);
     let pty_writer = Arc::clone(&handle.pty_writer);
     let deleted = Arc::clone(&handle.deleted);
+    let generation = handle.generation;
     registry.lock().insert(id, handle);
     let (tx, rx) = crossbeam_channel::unbounded();
     let ctx = PtyReadContext {
@@ -1995,6 +2000,7 @@ fn run_pty_close_capturing_crash(
         dismiss_patterns: Vec::new(),
         shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         deleted,
+        generation,
     };
     struct EofReader;
     impl std::io::Read for EofReader {
@@ -2043,6 +2049,50 @@ fn deleted_guard_is_precise_real_crash_still_emits_rank4() {
         "Rank4 precision: a live (deleted=false) handle's crash MUST still emit \
          Crash — the deleted-guard must not blanket-suppress real crashes; got {got:?}"
     );
+}
+
+/// Slice-1 RED: a production PTY crash publication must carry the exact
+/// generation/core/deleted context that belongs to the reaped handle.  The
+/// legacy name-only event cannot prove ABA safety at the recovery sink.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn crash_publication_carries_exact_generation_context_slice1_red() {
+    let (handle, id) = make_crash_exit_handle(false);
+    let expected_generation = handle.generation;
+    let rx = run_pty_close_capturing_crash(handle, id);
+    let got = rx.try_recv().unwrap();
+    let crate::agent::AgentExitEvent::Crash(observation) = got else {
+        panic!("real crash must publish a Crash observation");
+    };
+    assert_eq!(observation.instance_id, id);
+    assert_eq!(observation.generation, expected_generation);
+    assert!(std::sync::Arc::strong_count(&observation.core) >= 1);
+    assert!(!observation
+        .deleted
+        .load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn startup_failure_publication_carries_exact_generation_context_slice1() {
+    let (handle, id) = make_crash_exit_handle(false);
+    let observation = crate::agent::crash_disposition::CrashObservation {
+        instance_id: id,
+        generation: handle.generation,
+        core: Arc::clone(&handle.core),
+        deleted: Arc::clone(&handle.deleted),
+        owner_shutdown: None,
+        name: handle.name.clone(),
+    };
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    on_startup_failure(&observation, &None, &Some(tx));
+    let got = rx.try_recv().unwrap();
+    let crate::agent::AgentExitEvent::Crash(observation) = got else {
+        panic!("startup failure must publish a Crash observation");
+    };
+    assert_eq!(observation.instance_id, id);
+    assert_eq!(observation.generation, handle.generation);
+    assert!(Arc::ptr_eq(&observation.core, &handle.core));
 }
 
 struct ChunkReader {
@@ -2106,6 +2156,7 @@ fn run_pty_read_loop_for_r8(
         dismiss_patterns: dismiss::prepare_dismiss_patterns(&dismiss_patterns),
         shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
     };
     let mut reader = ChunkReader { chunks, next: 0 };
     let capture = crate::capture::make_capture_writer(None, "r8-dismiss-test", backend.name());
@@ -2305,6 +2356,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }

@@ -269,6 +269,14 @@ impl PerTickHandler for RespawnWatchdogHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
+        // The bounded crash channel is advisory only. Recover Pending exact
+        // generations first so a full/disconnected wake cannot strand a crash.
+        crate::daemon::crash_respawn::sweep_pending_dispositions(
+            ctx.home,
+            ctx.registry,
+            ctx.externals,
+            ctx.configs,
+        );
         // ON by default; operator kill-switch read each tick.
         if std::env::var(DISABLE_ENV_VAR)
             .map(|v| v == "0")
@@ -417,6 +425,37 @@ impl RespawnWatchdogHandler {
             name,
             &format!("auto-Fresh restart attempt {attempt}/{RESPAWN_MAX_RETRIES}"),
         );
+        // Snapshot the exact Resume handle before dropping the registry lock;
+        // crash and watchdog recovery then share one ledger claim for this
+        // `(InstanceId, generation)` and cannot both issue DELETE+SPAWN.
+        let observation = {
+            let reg = agent::lock_registry_tracked(ctx.registry, "respawn_watchdog_claim");
+            reg.values()
+                .find(|handle| handle.name.as_str() == name)
+                .map(|handle| agent::crash_disposition::CrashObservation {
+                    instance_id: handle.id,
+                    generation: handle.generation,
+                    core: std::sync::Arc::clone(&handle.core),
+                    deleted: std::sync::Arc::clone(&handle.deleted),
+                    owner_shutdown: None,
+                    name: handle.name.clone(),
+                })
+        };
+        let Some(observation) = observation else {
+            return;
+        };
+        let ledger = agent::crash_disposition::owner_ledger();
+        let key = observation.key();
+        if ledger.disposition(key).is_none() && !ledger.publish(observation.clone()) {
+            return;
+        }
+        let Some(claim) = ledger.claim(key, agent::crash_disposition::Claimant::RespawnWatchdog)
+        else {
+            return;
+        };
+        if !ledger.mark_ready(claim) {
+            return;
+        }
         let home = ctx.home.to_path_buf();
         let name_owned = name.to_string();
         // fire-and-forget: the restart round-trips DELETE+SPAWN over the api
@@ -424,7 +463,13 @@ impl RespawnWatchdogHandler {
         // is kept — the restart is self-contained, its outcome is reported via
         // tracing + the operator notify on failure, and progress is re-observed
         // by next-tick re-detection (the cap handles a persistent failure).
-        std::thread::spawn(move || {
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("{name}_watchdog_restart"))
+            .spawn(move || {
+            if !agent::crash_disposition::owner_ledger().begin_execute(claim) {
+                tracing::info!(target: TARGET, agent = %name_owned, "watchdog recovery discarded before execution");
+                return;
+            }
             let reason =
                 format!("respawn-stuck watchdog auto-Fresh (#t-777-3, attempt {attempt}/{RESPAWN_MAX_RETRIES})");
             let spawned = crate::mcp::handlers::instance_state::restart_instance_autonomic(
@@ -433,6 +478,7 @@ impl RespawnWatchdogHandler {
                 &reason,
             );
             if spawned {
+                let _ = agent::crash_disposition::owner_ledger().mark_live(claim);
                 tracing::info!(
                     target: TARGET,
                     agent = %name_owned,
@@ -440,6 +486,7 @@ impl RespawnWatchdogHandler {
                     "respawn-stuck watchdog: auto-Fresh restart issued"
                 );
             } else {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(claim);
                 tracing::error!(
                     target: TARGET,
                     agent = %name_owned,
@@ -449,6 +496,10 @@ impl RespawnWatchdogHandler {
                 notify_restart_failed(&name_owned);
             }
         });
+        if let Err(error) = spawn_result {
+            ledger.discard(key);
+            tracing::error!(target: TARGET, agent = %name, error = %error, "respawn watchdog worker failed to start");
+        }
     }
 
     /// (A) Terminal escalation after the retry cap: pause the agent

@@ -334,8 +334,8 @@ pub(crate) fn dispatch_exit_event_guarded(
         AgentExitEvent::CleanExit(ref name) => {
             super::handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
         }
-        AgentExitEvent::Crash(name) => {
-            super::crash_respawn::handle_crash_respawn(home, &name, ctx);
+        AgentExitEvent::Crash(observation) => {
+            super::crash_respawn::handle_crash_observation(home, &observation, ctx);
         }
     }));
     if let Err(payload) = guarded {
@@ -617,6 +617,7 @@ pub(crate) fn mock_live_agent_no_context(
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (handle, reader)
@@ -688,6 +689,7 @@ pub(crate) fn mock_live_agent_with_context(
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (handle, reader)

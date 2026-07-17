@@ -1096,6 +1096,7 @@ fn init_daemon_services(
 
     let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
     let (crash_tx, crash_rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(64);
+    crate::agent::crash_disposition::install_owner_crash_wake(crash_tx.clone());
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
 
