@@ -3737,3 +3737,61 @@ fn send_valid_selector_team_only_no_selector_error() {
         "team-only is a valid selector, must not get selector error: {result}"
     );
 }
+
+#[test]
+fn send_mixed_selectors_no_sidecar_side_effects() {
+    let home = tmp_home("sel-mixed-se");
+    let sender = crate::identity::Sender::new("se-agent").expect("valid sender name");
+    let args = json!({
+        "instance": "a", "tags": ["dev"], "message": "hi",
+        "task_id": "t-selector-sidecar-test"
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    assert!(result.get("error").is_some(), "must reject mixed selectors: {result}");
+    let progress = home.join("task-progress").join("t-selector-sidecar-test.json");
+    assert!(
+        !progress.exists(),
+        "task-progress sidecar must not be created for a rejected mixed-selector send"
+    );
+    let activity = home.join("agent-activity").join("se-agent.json");
+    assert!(
+        !activity.exists(),
+        "agent-activity sidecar must not be created for a rejected mixed-selector send"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_tags_only_no_sidecar_side_effects() {
+    let home = tmp_home("sel-tags-se");
+    let sender = crate::identity::Sender::new("se-agent2").expect("valid sender name");
+    let args = json!({
+        "tags": ["dev"], "message": "hi",
+        "task_id": "t-tags-sidecar-test"
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    assert!(result.get("error").is_some(), "must reject tags-only: {result}");
+    let progress = home.join("task-progress").join("t-tags-sidecar-test.json");
+    assert!(
+        !progress.exists(),
+        "task-progress sidecar must not be created for a rejected tags-only send"
+    );
+    let activity = home.join("agent-activity").join("se-agent2.json");
+    assert!(
+        !activity.exists(),
+        "agent-activity sidecar must not be created for a rejected tags-only send"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_zero_selectors_returns_typed_missing_selector() {
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({"message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(
+        code, "missing_selector",
+        "zero selectors must return typed missing_selector error from the unified gate: {result}"
+    );
+}
