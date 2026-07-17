@@ -112,12 +112,20 @@ fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, ()> {
         );
         return Err(());
     }
+    let canonical_repo = repo_root.canonicalize().ok();
     Ok(
         crate::git_worktree::parse_porcelain(&String::from_utf8_lossy(&out.stdout))
             .into_iter()
             .filter_map(|(path, branch)| {
                 let branch = branch?;
                 if branch == "main" || branch == "master" {
+                    return None;
+                }
+                let is_canonical_repo = canonical_repo
+                    .as_ref()
+                    .and_then(|repo| path.canonicalize().ok().map(|worktree| worktree == *repo))
+                    .unwrap_or(false);
+                if is_canonical_repo {
                     return None;
                 }
                 Some(WorktreeEntry {
@@ -132,6 +140,9 @@ fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, ()> {
 /// Check if a branch is merged into the default branch (local check, no API needed).
 fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     let default = crate::git_helpers::default_branch(repo_root);
+    if branch == default {
+        return false;
+    }
     // W1.2: git_ok = always-bypass + bounded, true iff exit-0 (the
     // `output().map(success).unwrap_or(false)` idiom, byte-for-byte).
     if !crate::git_helpers::git_ok(
@@ -814,7 +825,7 @@ fn prune_orphaned_branches_with_home(
         match crate::git_helpers::git_cmd(repo_root, &["branch", "--format=%(refname:short)"]) {
             Ok(stdout) => stdout
                 .lines()
-                .filter(|b| *b != default.as_str())
+                .filter(|b| *b != default.as_str() && !crate::protected_refs::is_protected_ref(b))
                 .map(String::from)
                 .collect(),
             _ => return Vec::new(),
