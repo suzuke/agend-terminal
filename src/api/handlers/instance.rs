@@ -29,21 +29,21 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
                 // This diverges from raw only for a cross-coarse Hook/Stream correction (e.g.
                 // raw=Restarting + Hook=WaitingForUser/RateLimited — more relevant after #2466).
                 // Lock scoped + dropped before `from_handle` to preserve the single-acquisition order.
-                let is_restarting = {
+                let operated_state = {
                     let core = handle.core.lock();
                     crate::daemon::shadow::operated_state(
                         core.state.current,
                         core.observed_status.as_ref(),
                     )
-                    .is_unavailable()
                 };
-                (agent::InjectTarget::from_handle(handle), is_restarting)
+                (agent::InjectTarget::from_handle(handle), operated_state)
             })
     };
     match snap {
-        Some((tgt, is_restarting)) => {
-            if is_restarting {
-                json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
+        Some((tgt, operated_state)) => {
+            if operated_state.is_unavailable() {
+                let state_name = operated_state.display_name();
+                json!({"ok": false, "error": format!("agent '{name}' is {state_name}, retry later")})
             } else {
                 let result = if raw {
                     agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
@@ -78,19 +78,26 @@ pub(crate) fn handle_kill(params: &Value, ctx: &HandlerCtx) -> Value {
     // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
     match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(handle) => {
-            {
-                let mut core = handle.core.lock();
-                core.state.set_restarting();
-            }
-            let mut child = handle.child.lock();
+            let observation = crate::agent::crash_disposition::CrashObservation {
+                instance_id: handle.id,
+                generation: handle.generation,
+                core: std::sync::Arc::clone(&handle.core),
+                deleted: std::sync::Arc::clone(&handle.deleted),
+                owner_shutdown: None,
+                name: handle.name.clone(),
+            };
+            let child = std::sync::Arc::clone(&handle.child);
+            drop(reg);
+            crate::agent::crash_disposition::owner_ledger().publish_crashed(observation);
             // Kill the process group (not just the leader) to propagate to
             // child subprocesses (kiro-cli spawns bun/mcp/acp children).
-            if let Some(pid) = child.process_id() {
-                crate::process::kill_process_tree(pid);
+            {
+                let mut child = child.lock();
+                if let Some(pid) = child.process_id() {
+                    crate::process::kill_process_tree(pid);
+                }
+                let _ = child.kill(); // also kill via PTY handle as fallback
             }
-            let _ = child.kill(); // also kill via PTY handle as fallback
-            drop(child);
-            drop(reg);
             crate::event_log::log(ctx.home, "kill", name, "killed via API");
             json!({"ok": true})
         }

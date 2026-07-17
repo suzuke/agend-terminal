@@ -2262,9 +2262,34 @@ impl StateTracker {
         self.maybe_expire_latched_state();
     }
 
-    /// Force state to Restarting (called by reaper on crash).
-    pub fn set_restarting(&mut self) {
+    /// Test-only/state-local escape hatch for asserting transition bookkeeping.
+    /// Production recovery must use the typed permit funnel below.
+    #[cfg(test)]
+    pub(crate) fn set_restarting(&mut self) {
         self.record_set(AgentState::Restarting); // #1527: also logs the transition
+    }
+
+    /// Record a raw crash observation.  This is deliberately distinct from
+    /// the recovery admission path: crash producers publish `Crashed` before
+    /// any exact-generation permit can authorize `Restarting`.
+    pub(crate) fn set_crashed_from_observation(&mut self) {
+        self.record_set(AgentState::Crashed);
+    }
+
+    /// The only production Restarting transition.  The caller must hold the
+    /// opaque exact-generation execution permit minted by the disposition
+    /// ledger after revalidation.
+    pub(crate) fn set_restarting_with_permit(
+        &mut self,
+        _permit: &crate::agent::crash_disposition::RecoveryExecutionPermit,
+    ) {
+        self.record_set(AgentState::Restarting); // #1527: also logs the transition
+    }
+
+    /// Return an admitted execution to the raw Crashed state after spawn
+    /// failure, using the same exact old core captured by the permit.
+    pub(crate) fn set_crashed_from_recovery(&mut self) {
+        self.record_set(AgentState::Crashed);
     }
 
     /// Force state to AwaitingOperator when the agent is stalled waiting on

@@ -2174,11 +2174,10 @@ fn on_crash_exit(
     crash_tx: &Option<CrashChannel>,
 ) {
     let name = observation.name.as_ref();
-    if !crash_disposition::owner_ledger().publish(observation.clone()) {
+    if !crash_disposition::owner_ledger().publish_crashed(observation.clone()) {
         return;
     }
-    tracing::info!(agent = name, "setting restarting state");
-    observation.core.lock().state.set_restarting();
+    tracing::info!(agent = name, "recorded crashed state");
     if let Some(ref tx) = crash_tx {
         if let Err(e) = tx.try_send(AgentExitEvent::Crash(observation.clone())) {
             tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");

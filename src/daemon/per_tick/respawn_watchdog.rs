@@ -466,8 +466,13 @@ impl RespawnWatchdogHandler {
         let spawn_result = std::thread::Builder::new()
             .name(format!("{name}_watchdog_restart"))
             .spawn(move || {
-            if !agent::crash_disposition::owner_ledger().begin_execute(claim) {
+            let Some(mut permit) = agent::crash_disposition::owner_ledger().begin_execute(claim)
+            else {
                 tracing::info!(target: TARGET, agent = %name_owned, "watchdog recovery discarded before execution");
+                return;
+            };
+            if !permit.admit_restarting() {
+                tracing::info!(target: TARGET, agent = %name_owned, "watchdog execution permit could not admit Restarting");
                 return;
             }
             let reason =
@@ -478,7 +483,7 @@ impl RespawnWatchdogHandler {
                 &reason,
             );
             if spawned {
-                let _ = agent::crash_disposition::owner_ledger().mark_live(claim);
+                let _ = agent::crash_disposition::owner_ledger().mark_live(permit);
                 tracing::info!(
                     target: TARGET,
                     agent = %name_owned,
@@ -486,7 +491,7 @@ impl RespawnWatchdogHandler {
                     "respawn-stuck watchdog: auto-Fresh restart issued"
                 );
             } else {
-                let _ = agent::crash_disposition::owner_ledger().mark_failed(claim);
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
                 tracing::error!(
                     target: TARGET,
                     agent = %name_owned,

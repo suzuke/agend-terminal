@@ -59,6 +59,7 @@ fn is_excluded_state(state: AgentState) -> bool {
             | AgentState::InteractivePrompt
             | AgentState::PermissionPrompt
             | AgentState::Starting
+            | AgentState::Crashed
             | AgentState::Restarting
     )
 }
