@@ -312,6 +312,22 @@ pub(crate) struct ReconcileResult {
     pub preserved: usize,
 }
 
+fn is_branch_checked_out(repo: &Path, branch: &str) -> bool {
+    let output = match crate::git_helpers::git_bypass(repo, &["worktree", "list", "--porcelain"]) {
+        Ok(o) if o.status.success() => o,
+        _ => return true, // unknown → preserve (fail-closed)
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            if b == branch {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> ReconcileResult {
     let dir = intents_dir(home);
     let mut result = ReconcileResult {
@@ -455,19 +471,7 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
             },
         }
 
-        if dry_run {
-            // Qualified candidate — would be settled in apply mode.
-            result.candidates.push(ReconcileCandidate {
-                candidate_id: cid,
-                branch: intent.branch.clone(),
-                expected_head: intent.expected_head.clone(),
-                task_id: intent.task_id.clone(),
-                outcome: "qualified:dry_run".into(),
-            });
-            continue;
-        }
-
-        // Acquire branch lease lock for the mutation section.
+        // Acquire branch lease lock — shared classifier for both dry-run and apply.
         let _branch_lock =
             match crate::binding::acquire_branch_lease_lock(home, &intent.repo, &intent.branch) {
                 Ok(lock) => lock,
@@ -583,6 +587,31 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
             continue;
         }
 
+        // Worktree occupancy gate: refuse if the branch is checked out.
+        if is_branch_checked_out(repo_path, &intent.branch) {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "preserved:checked_out".into(),
+            });
+            continue;
+        }
+
+        // All gates passed under lock. Dry-run stops here.
+        if dry_run {
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: "qualified:dry_run".into(),
+            });
+            continue;
+        }
+
         // Create collision-safe recovery ref before delete.
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -635,25 +664,12 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
             continue;
         }
 
-        // Final CAS: re-verify tip before delete.
-        let final_tip = crate::git_helpers::git_cmd(repo_path, &["rev-parse", &intent.branch])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if final_tip != intent.expected_head {
-            result.preserved += 1;
-            result.candidates.push(ReconcileCandidate {
-                candidate_id: cid,
-                branch: intent.branch.clone(),
-                expected_head: intent.expected_head.clone(),
-                task_id: intent.task_id.clone(),
-                outcome: format!("preserved:final_cas_drift:{final_tip}"),
-            });
-            continue;
-        }
-
-        // Delete.
-        match crate::git_helpers::git_bypass(repo_path, &["branch", "-D", &intent.branch]) {
+        // Atomic CAS delete: update-ref -d with expected old SHA.
+        let full_ref = format!("refs/heads/{}", intent.branch);
+        match crate::git_helpers::git_bypass(
+            repo_path,
+            &["update-ref", "-d", &full_ref, &intent.expected_head],
+        ) {
             Ok(o) if o.status.success() => {
                 let _ = std::fs::remove_file(&p);
                 result.settled += 1;
@@ -1350,5 +1366,105 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_dry_run_head_drift_preserved() {
+        let home = tmp_dir("dryrun-drift");
+        let repo = tmp_repo("dryrun-drift-repo");
+        let _tip = make_branch(&repo, "review/pr-333-drift");
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            "review/pr-333-drift",
+            "0000000000000000000000000000000000000000",
+            "t-dryrun-drift",
+            None,
+            None,
+        )
+        .unwrap();
+        seed_terminal_task(&home, "t-dryrun-drift");
+
+        let result = reconcile_terminal_review_intents(&home, true);
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|c| c.outcome.starts_with("qualified")),
+            "head-drift dry-run must be preserved, never qualified: {result:?}"
+        );
+        assert!(
+            branch_exists(&repo, "review/pr-333-drift"),
+            "branch must survive drift dry-run"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_cas_stale_ref_survives() {
+        let home = tmp_dir("cas-stale");
+        let repo = tmp_repo("cas-stale-repo");
+        let old_tip = make_branch(&repo, "review/pr-444-cas");
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            "review/pr-444-cas",
+            &old_tip,
+            "t-cas-stale",
+            None,
+            None,
+        )
+        .unwrap();
+        seed_terminal_task(&home, "t-cas-stale");
+
+        // Advance the branch head so the CAS expected_head is now stale.
+        git_in(&repo, &["checkout", "review/pr-444-cas"]);
+        std::fs::write(repo.join("new.txt"), "new content").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "advance",
+            ],
+        );
+        let new_tip = branch_tip(&repo, "review/pr-444-cas");
+        git_in(&repo, &["checkout", "main"]);
+        assert_ne!(old_tip, new_tip, "branch must have advanced");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(result.settled, 0, "stale CAS must not delete: {result:?}");
+        assert!(
+            branch_exists(&repo, "review/pr-444-cas"),
+            "branch with new head must survive stale CAS"
+        );
+        assert_eq!(
+            branch_tip(&repo, "review/pr-444-cas"),
+            new_tip,
+            "new head must be preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn reconcile_production_entry_wired() {
+        let source = include_str!("worktree_cleanup.rs");
+        assert!(
+            source.contains("reconcile_terminal_review_intents"),
+            "worktree_cleanup.rs must call reconcile_terminal_review_intents \
+             — if this fails, the reconciler was unwired from the periodic sweep"
+        );
     }
 }
