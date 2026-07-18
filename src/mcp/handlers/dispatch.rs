@@ -1387,4 +1387,81 @@ mod tests {
             "API move_pane must call the same shared neutral service"
         );
     }
+
+    // ── #2454 Slice 8: delayed async INJECT loopback RED ──────────────
+
+    /// Source invariant: the fire-and-forget INJECT thread in
+    /// instance_state/mod.rs (team_task_inject) must call
+    /// `agent_ops::inject_input`, not `api::call`.
+    #[test]
+    fn team_task_inject_thread_uses_inject_input_not_api_call_2454() {
+        let src = include_str!("instance_state/mod.rs");
+        let needle_start =
+            "thread::Builder::new()\n                        .name(\"team_task_inject\"";
+        let start = src.find(needle_start).expect("team_task_inject thread");
+        let region = &src[start..start + 500.min(src.len() - start)];
+        let has_api_call = region.contains(concat!("crate::", "api::", "call"));
+        let has_inject_input = region.contains(concat!("agent_ops::", "inject_input"));
+        assert!(
+            !has_api_call && has_inject_input,
+            "team_task_inject thread must use agent_ops::inject_input, not api::call; \
+             api_call={has_api_call}, inject_input={has_inject_input}"
+        );
+    }
+
+    /// Source invariant: the fire-and-forget INJECT thread in
+    /// instance_state/spawn.rs (task_inject) must call
+    /// `agent_ops::inject_input`, not `api::call`.
+    #[test]
+    fn spawn_task_inject_thread_uses_inject_input_not_api_call_2454() {
+        let src = include_str!("instance_state/spawn.rs");
+        let needle_start = "thread::Builder::new()\n                    .name(\"task_inject\"";
+        let start = src.find(needle_start).expect("task_inject thread");
+        let region = &src[start..start + 600.min(src.len() - start)];
+        let has_api_call = region.contains(concat!("crate::", "api::", "call"));
+        let has_inject_input = region.contains(concat!("agent_ops::", "inject_input"));
+        assert!(
+            !has_api_call && has_inject_input,
+            "task_inject thread must use agent_ops::inject_input, not api::call; \
+             api_call={has_api_call}, inject_input={has_inject_input}"
+        );
+    }
+
+    /// Baseline count: exactly 13 same-daemon api::call production sites
+    /// remain in src/mcp/handlers/ at this commit. Any addition without
+    /// a corresponding removal is a regression.
+    #[test]
+    fn production_api_call_baseline_is_13_2454() {
+        let needle_call = concat!("crate::", "api::", "call");
+        let needle_at = concat!("api::", "call_at");
+        let test_mod_marker = "#[cfg(test)]\nmod ";
+        let files: &[&str] = &[
+            include_str!("comms.rs"),
+            include_str!("comms_delegate/mod.rs"),
+            include_str!("task.rs"),
+            include_str!("restart.rs"),
+            include_str!("instance_state/mod.rs"),
+            include_str!("instance_state/spawn.rs"),
+            include_str!("instance_state/lifecycle.rs"),
+            include_str!("instance_metadata.rs"),
+        ];
+        let mut count = 0;
+        for src in files {
+            let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
+            let production = &src[..boundary];
+            for line in production.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                if line.contains(needle_call) && !line.contains(needle_at) {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            count, 13,
+            "production same-daemon api::call baseline must be exactly 13; got {count}"
+        );
+    }
 }
