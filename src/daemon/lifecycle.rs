@@ -337,6 +337,7 @@ mod tests {
         let reg = empty_registry();
         let cfg = crate::agent::SpawnConfig {
             name: "never-written",
+            backend: None,
             backend_command: "cat",
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,

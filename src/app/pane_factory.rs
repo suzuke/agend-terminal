@@ -340,6 +340,7 @@ fn spawn_and_subscribe(
     let instance_id = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: command,
             args,
             spawn_mode,

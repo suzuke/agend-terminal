@@ -1802,6 +1802,7 @@ fn spawn_and_register_agent(
     if let Err(e) = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: command,
             args,
             spawn_mode,

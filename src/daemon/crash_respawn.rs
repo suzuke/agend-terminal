@@ -486,6 +486,7 @@ fn respawn_agent_worker(
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
+            backend: None,
             backend_command: &config.backend_command,
             args: &config.args,
             spawn_mode: crate::backend::SpawnMode::Fresh,

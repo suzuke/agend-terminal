@@ -582,6 +582,7 @@ mod tests {
         // Spawn a real shell agent so the registry has an entry with a HealthTracker.
         let spawn_cfg = agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: crate::default_shell(),
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -713,6 +714,7 @@ mod tests {
         let wedge_args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
         let spawn_cfg = agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: "sh",
             args: &wedge_args,
             spawn_mode: crate::backend::SpawnMode::Fresh,

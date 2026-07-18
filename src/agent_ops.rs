@@ -853,6 +853,7 @@ pub fn spawn_one(
     agent::spawn_agent(
         &agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: backend,
             args,
             spawn_mode,
