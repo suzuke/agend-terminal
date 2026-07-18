@@ -899,12 +899,12 @@ mod kiro_decimal_pct_2781 {
     }
 
     #[test]
-    fn kiro_decimal_only_pct_idle() {
+    fn kiro_decimal_status_token_idle() {
         let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
         assert_eq!(
-            patterns.detect("  61.5%"),
+            patterns.detect("  ◔ 61.5%"),
             Some(AgentState::Idle),
-            "#2781: bare '61.5%' line must be Idle"
+            "#2781: Kiro status token '◔ 61.5%' must match Idle"
         );
     }
 
@@ -916,6 +916,29 @@ mod kiro_decimal_pct_2781 {
             patterns.detect(pane),
             Some(AgentState::Idle),
             "#2781: active Kiro with trailing percent must NOT be Idle"
+        );
+    }
+
+    #[test]
+    fn kiro_arbitrary_output_ending_in_pct_not_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        assert_ne!(
+            patterns.detect("  Processing files 4.0%"),
+            Some(AgentState::Idle),
+            "#2781: arbitrary output ending in percent must NOT match Idle"
+        );
+    }
+
+    #[test]
+    fn context_alert_renders_one_decimal() {
+        let msg = format!(
+            "[context_alert] pct={pct:.1}% threshold={threshold:.1}%",
+            pct = 61.0_f32,
+            threshold = 80.0_f32,
+        );
+        assert!(
+            msg.contains("61.0%") && msg.contains("80.0%"),
+            "#2781: context_alert must render one-decimal: {msg}"
         );
     }
 }
