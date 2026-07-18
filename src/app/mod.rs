@@ -1092,15 +1092,20 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // moved off the supervisor thread.
     let app_handlers = app_tick_handlers(Arc::clone(&daemon_binary_stale));
 
-    // PR4: opt-in out-of-band tick-stall diagnostics for the OWNED-app maintenance
-    // tick host. An attached app never ticks (tick_rx is `None` → never_rx), so it
-    // starts NO monitor. `_app_stall_monitor` lives across the render loop and
-    // stops+joins its thread on teardown; both are `None` when the env gate is off.
-    let (app_tick_progress, _app_stall_monitor) = if attached_mode {
-        (None, None)
-    } else {
-        crate::daemon::tick_stall::start_for_host("app-owned-tick", &app_handlers, &home)
-    };
+    // The attached app constructs no owned maintenance cycle. Owned mode keeps
+    // its profile handlers, owner-service witness, and optional stall monitor in
+    // one typed value; the tick producer and select arm remain host-local.
+    let app_cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new_for_role(
+        if attached_mode {
+            crate::daemon::owner_services::OwnerRole::Attached
+        } else {
+            crate::daemon::owner_services::OwnerRole::Owned
+        },
+        app_handlers,
+        owner_services,
+        "app-owned-tick",
+        &home,
+    );
 
     // #2057 milestone 3: just BEFORE the render loop. If this is < the baseline,
     // a startup phase shrank the controlling TTY; milestone 2 brackets whether
@@ -1585,25 +1590,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 //   core.state.tick()               → supervisor::spawn (runs in
                 //     owned mode too — supervisor.rs:tick; the old manual call here
                 //     was a benign idempotent double, now removed).
-                app_maintenance_tick(
-                    &home,
-                    &registry,
-                    &app_externals,
-                    &app_configs,
-                    &app_handlers,
-                    app_tick_progress.as_deref(),
-                    // #2737: owned tick only fires when `tick_rx` is Some (owned
-                    // mode), where `owner_services` is always `Some` (the seam ran
-                    // in the owned bootstrap block above).
-                    owner_services
-                        .as_ref()
-                        .expect("owned maintenance tick requires the owner-service witness"),
-                );
+                app_cycle
+                    .as_ref()
+                    .expect("owned maintenance tick requires the owned cycle")
+                    .run_once(&home, &registry, &app_externals, &app_configs);
                 // PR4: back to Waiting between maintenance ticks so the monitor
                 // never attributes render/idle time to the maintenance host.
-                if let Some(p) = app_tick_progress.as_deref() {
-                    p.enter_waiting();
-                }
+                app_cycle
+                    .as_ref()
+                    .expect("owned maintenance tick requires the owned cycle")
+                    .enter_waiting();
             }
             default(select_timeout) => {
                 // #t-84833-10: periodic idle refresh — mark dirty so the cap above
@@ -1797,33 +1793,6 @@ fn setup_app_bootstrap(
             }
         };
     (api_guard, telegram_state, telegram_status, attached_run_dir)
-}
-
-/// Periodic owned-mode maintenance: run the full daemon per-tick handler
-/// pipeline once. Extracted verbatim from `run_app`'s tick arm (#14 god-fn
-/// split) — byte-identical, no behaviour change.
-fn app_maintenance_tick(
-    home: &Path,
-    registry: &AgentRegistry,
-    externals: &crate::agent::ExternalRegistry,
-    configs: &crate::api::ConfigRegistry,
-    handlers: &[Box<dyn crate::daemon::per_tick::PerTickHandler>],
-    progress: Option<&crate::daemon::tick_stall::TickProgress>,
-    // #2737: proof the owner-service seam ran. This owned-only tick is the
-    // witness consumer that makes app's dual-host reach a COMPILE property
-    // (structural I2) — run_app cannot reach here without an OwnerServicesStarted,
-    // which only the seam can mint. Unused at runtime (it is a capability witness).
-    _owner_services: &crate::daemon::owner_services::OwnerServicesStarted,
-) {
-    let tick_ctx = crate::daemon::per_tick::TickContext {
-        home,
-        registry,
-        externals,
-        configs,
-    };
-    // PR4: `progress` is `Some` only for an owned app with diagnostics enabled;
-    // `None` (attached or gate-off) runs the untracked path, byte-identical.
-    crate::daemon::per_tick::run_handlers_with_progress(handlers, &tick_ctx, progress);
 }
 
 /// App exit teardown: persist the on-screen layout, then (Owned mode only) sync

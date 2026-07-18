@@ -167,6 +167,11 @@ impl TickProgress {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn phase_for_test(&self) -> Option<Phase> {
+        self.snapshot().map(|snapshot| snapshot.phase)
+    }
+
     /// The alert `handler` label for a phase: the stalled handler's name for
     /// `Handler`, else a phase descriptor.
     fn handler_label(&self, phase: Phase) -> &str {
@@ -1144,12 +1149,12 @@ mod tests {
         );
     }
 
-    // ── #6: attached app starts no monitor (structural source-pin) ─────────
+    // ── #6: attached app constructs no cycle (structural source-pin) ───────
 
-    /// An attached app never ticks, so it must never start a stall monitor. This
-    /// is a structural invariant of the app wiring (same idiom as
+    /// An attached app never ticks, so it must never construct an owned cycle.
+    /// This is a structural invariant of the app wiring (same idiom as
     /// `per_tick::tests::notification_handlers_wire_boot_grace`): a future edit
-    /// that drops the `attached_mode` gate would silently start a monitor on a
+    /// that drops the `attached_mode` gate would silently create owned state on a
     /// host that never ticks. Also pins the daemon `run_core` host wiring.
     #[test]
     fn hosts_wired_daemon_yes_attached_app_no() {
@@ -1157,28 +1162,28 @@ mod tests {
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("src/app/mod.rs must be readable");
         let anchor = app
-            .find("let (app_tick_progress, _app_stall_monitor)")
-            .expect("app must bind the owned-app stall monitor");
-        let region = &app[anchor..(anchor + 600).min(app.len())];
+            .find("let app_cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new_for_role(")
+            .expect("app must bind the owned maintenance cycle");
+        let region = &app[anchor..(anchor + 800).min(app.len())];
         assert!(
             region.contains("if attached_mode"),
-            "the app monitor must be gated on attached_mode"
+            "the app cycle must be gated on attached_mode"
         );
         assert!(
-            region.contains("(None, None)"),
-            "an attached app must resolve to (None, None) — no monitor"
+            region.contains("OwnerRole::Attached"),
+            "an attached app must select the attached role"
         );
         assert!(
-            region.contains("start_for_host(\"app-owned-tick\""),
-            "an owned app starts the app-owned-tick monitor"
+            region.contains("OwnerRole::Owned"),
+            "an owned app must select the owned role"
         );
 
         let daemon = std::fs::read_to_string("src/daemon/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/mod.rs"))
             .expect("src/daemon/mod.rs must be readable");
         assert!(
-            daemon.contains("start_for_host(\"daemon-tick\""),
-            "the daemon run_core host starts the daemon-tick monitor"
+            daemon.contains("OwnedMaintenanceCycle::new("),
+            "the daemon run_core host constructs the owned maintenance cycle"
         );
     }
 }

@@ -20,8 +20,8 @@
 //!   observers" a COMPILE dependency (you cannot call phase 2 without phase 1's token).
 //! - the five low-level spawns require a private `OwnerServicePermit`, so a host-body
 //!   direct spawn cannot compile (structural I4 — no host-local copy).
-//! - `OwnerServicesStarted` is retained by each owner host (app: required by the
-//!   owned-only `app_maintenance_tick`; daemon: held in `TickKeepalive`), so a host
+//! - `OwnerServicesStarted` is retained by each owner host (app: held by the
+//!   owned-only `OwnedMaintenanceCycle`; daemon: held in `TickKeepalive`), so a host
 //!   that skips the seam fails to compile (structural I2 — dual-host reach).
 
 use crate::agent::AgentRegistry;
@@ -57,7 +57,7 @@ pub(crate) struct OwnerServicePermit(());
 pub(crate) struct OwnerMonitoringStarted(());
 
 /// Final witness — proof that BOTH owner-service phases ran. Retained by each
-/// owner host (app: required by owned-only `app_maintenance_tick`; daemon: held
+/// owner host (app: held by the owned-only `OwnedMaintenanceCycle`; daemon: held
 /// in `TickKeepalive`), so a host that skips the seam fails to compile
 /// (structural I2 — the former `owner_services_called_by_both_hosts` guard).
 /// Ctor is private to this module.
