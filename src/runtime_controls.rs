@@ -47,27 +47,44 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Helper semantics: reload_runtime_controls loads operator_mode.
-    /// Missing/untrusted file on startup → lockdown (Away).
-    /// Once initialized, missing file preserves last-known-good.
+    /// Helper semantics: reload_runtime_controls loads a valid signed
+    /// operator_mode. Use the production set_mode API to create a real
+    /// HMAC-signed Sleep fixture, then verify reload picks it up.
     #[test]
-    fn reload_runtime_controls_loads_operator_mode() {
-        let home = tmp_home("loads-mode");
-        // Exercise the reload path — should not panic even with no
-        // operator-mode.json. The exact resulting mode depends on
-        // whether INITIALIZED is already set (global test ordering),
-        // so we verify reload completes without error rather than
-        // asserting a specific mode.
+    fn reload_runtime_controls_loads_signed_operator_mode() {
+        let home = tmp_home("loads-signed-mode");
+        // Use production API to write a valid signed Sleep mode.
+        crate::operator_mode::set_mode(
+            &home,
+            crate::operator_mode::OperatorMode::Sleep,
+            Some("delegate-agent".into()),
+            vec!["restart".into()],
+        )
+        .expect("set_mode must succeed");
+
+        // Reload through the shared seam.
         reload_runtime_controls(&home);
-        let mode = crate::operator_mode::get().mode;
-        assert!(
-            matches!(
-                mode,
-                crate::operator_mode::OperatorMode::Active
-                    | crate::operator_mode::OperatorMode::Away
-            ),
-            "reload must produce Active or Away (lockdown), not Sleep"
+
+        let state = crate::operator_mode::get();
+        assert_eq!(
+            state.mode,
+            crate::operator_mode::OperatorMode::Sleep,
+            "reload_runtime_controls must load the signed Sleep mode from disk"
         );
+        assert_eq!(
+            state.delegate_to.as_deref(),
+            Some("delegate-agent"),
+            "delegate_to must survive reload"
+        );
+
+        // Reset to Active for other tests.
+        crate::operator_mode::set_mode(
+            &home,
+            crate::operator_mode::OperatorMode::Active,
+            None,
+            Vec::new(),
+        )
+        .ok();
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -85,37 +102,50 @@ mod tests {
     }
 
     /// Startup ordering: reload_runtime_controls must be called BEFORE
-    /// setup_app_bootstrap. Verify by source inspection.
+    /// setup_app_bootstrap within the run_app function body.
     #[test]
     fn app_calls_reload_before_bootstrap() {
         let src = include_str!("app/mod.rs");
-        let reload_pos = src.find("reload_runtime_controls");
-        let bootstrap_pos = src.find("setup_app_bootstrap");
+        // Anchor within run_app function body — find its definition first.
+        let fn_start = src
+            .find("fn run_app(")
+            .expect("fn run_app must exist in app/mod.rs");
+        let body = &src[fn_start..];
+        let reload_pos = body
+            .find("reload_runtime_controls")
+            .expect("reload_runtime_controls must be called inside run_app");
+        let bootstrap_pos = body
+            .find("setup_app_bootstrap")
+            .expect("setup_app_bootstrap must be called inside run_app");
         assert!(
-            reload_pos.is_some() && bootstrap_pos.is_some(),
-            "both reload_runtime_controls and setup_app_bootstrap must exist in app/mod.rs"
-        );
-        assert!(
-            reload_pos.unwrap() < bootstrap_pos.unwrap(),
-            "reload_runtime_controls must appear before setup_app_bootstrap in app/mod.rs"
+            reload_pos < bootstrap_pos,
+            "reload_runtime_controls must appear before setup_app_bootstrap \
+             within the run_app function body"
         );
     }
 
     /// Startup ordering: reload_runtime_controls must be called BEFORE
-    /// init_daemon_services. Verify by source inspection.
+    /// init_daemon_services within the run_core function body.
     #[test]
     fn daemon_calls_reload_before_init_services() {
         let src = include_str!("daemon/mod.rs");
-        let reload_pos = src.find("reload_runtime_controls(home)");
-        let init_pos = src.find("init_daemon_services(home");
+        // Anchor within run_core function body.
+        let fn_start = src
+            .find("fn run_core(")
+            .expect("fn run_core must exist in daemon/mod.rs");
+        let body = &src[fn_start..];
+        let reload_pos = body
+            .find("reload_runtime_controls(home)")
+            .expect("reload_runtime_controls(home) call must exist inside run_core");
+        // Match the actual function call, not comment mentions.
+        let init_pos = body
+            .find("let ctx = init_daemon_services(")
+            .or_else(|| body.find("init_daemon_services(home"))
+            .expect("init_daemon_services call must exist inside run_core");
         assert!(
-            reload_pos.is_some() && init_pos.is_some(),
-            "both reload_runtime_controls(home) and init_daemon_services(home) calls \
-             must exist in daemon/mod.rs"
-        );
-        assert!(
-            reload_pos.unwrap() < init_pos.unwrap(),
-            "reload_runtime_controls must be called before init_daemon_services in daemon/mod.rs"
+            reload_pos < init_pos,
+            "reload_runtime_controls must be called before init_daemon_services \
+             within the run_core function body"
         );
     }
 }
