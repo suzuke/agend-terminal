@@ -4,131 +4,21 @@
 //! without mutating state.
 
 use super::HandlerCtx;
-use crate::agent::{self, AgentRegistry, ExternalRegistry};
+use crate::agent::{AgentRegistry, ExternalRegistry};
 use serde_json::{json, Value};
 
 pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
     list_response(ctx.home, ctx.registry, ctx.externals)
 }
 
+/// #2454 S3: thin wire adapter — delegates to the neutral
+/// `agent_ops::list_snapshot` service that owns the implementation.
 pub(crate) fn list_response(
     home: &std::path::Path,
     registry: &AgentRegistry,
     externals: &ExternalRegistry,
 ) -> Value {
-    // H9: snapshot each managed agent's fields UNDER the tier-1 registry lock,
-    // then drop(reg) BEFORE the per-agent dispatch_idle disk I/O. The original
-    // called `pending_for_instance` (→ `read_dir` + a `read_to_string` +
-    // `serde_json::from_str` per `.json` sidecar) inside the `.map()` while the
-    // lock was still held, so a LIST with N agents performed N dir scans +
-    // N*M file reads/parses entirely under the lock — blocking every other API
-    // handler, the supervisor tick, crash-respawn, hang-detection and the TUI
-    // render path on disk contention. Mirrors the external-agent loop below.
-    let reg = agent::lock_registry(registry);
-    let snapshot: Vec<(String, Value)> = reg
-        .values()
-        .map(|handle| {
-            let name = handle.name.to_string();
-            let (
-                agent_state,
-                health_state,
-                blocked_reason,
-                blocked_note,
-                context,
-                context_provider,
-                api_in_flight,
-                last_api_activity_at,
-                observed_status,
-            ) = {
-                let c = handle.core.lock();
-                (
-                    c.state.get_state().display_name().to_string(),
-                    c.health.state.display_name().to_string(),
-                    // #1933: surface the self-reported blocked reason + its
-                    // operator-readable note so an operator can see WHY an agent is
-                    // blocked and its free-text annotation (previously internal-only).
-                    c.health.current_reason.as_ref().map(|r| r.to_string()),
-                    c.health.current_note.clone(),
-                    // Context% telemetry: resolved usage + producing source
-                    // ("pattern" = the agent's own statusline, "transcript" =
-                    // token-usage estimate). Absent = honestly unknown.
-                    c.state.resolved_context(),
-                    // #2439: the backend's context-telemetry CAPABILITY (statusline
-                    // vs unavailable), derived from statusline-pattern presence.
-                    // Always present — distinct from context_source/context_pct above,
-                    // which are absent when there's no fresh reading.
-                    c.state.context_provider(),
-                    // #2413 Phase 1: out-of-path API-activity signal, read under the
-                    // SAME lock as agent_state so a consumer can reconcile the two
-                    // atomically (false-idle = agent_state=="idle" && api_in_flight).
-                    c.api_activity.in_flight,
-                    c.api_activity.last_active_epoch_ms,
-                    // #2413 Phase B: the reducer's fused status, read under the SAME
-                    // lock as agent_state so a consumer can diff them atomically (the
-                    // observed-vs-raw diff IS the quantification). None only if the per-tick
-                    // reduce didn't run (default-ON; off under AGEND_SHADOW_OBSERVER=0).
-                    c.observed_status.clone(),
-                )
-            };
-            let entry = json!({
-                "name": name.as_str(),
-                "backend": handle.backend_command,
-                "submit_key": handle.submit_key,
-                "inject_prefix": handle.inject_prefix,
-                "agent_state": agent_state,
-                "health_state": health_state,
-                "blocked_reason": blocked_reason,
-                "blocked_note": blocked_note,
-                "context_pct": context.map(|(pct, _)| pct),
-                // CONTRACT (#2439): keep emitting "pattern" here for the existing
-                // external-dashboard consumers — the new typed capability goes in the
-                // additive `context_provider` field below, NOT by renaming this.
-                "context_source": context.map(|(_, source)| source),
-                "context_provider": context_provider.source_name(),
-                // #2413 Phase 1: live LLM-socket activity (out-of-path lsof probe).
-                // api_in_flight=true while pattern-state is "idle" ⇒ false-idle.
-                "api_in_flight": api_in_flight,
-                "last_api_activity_at": last_api_activity_at,
-                // #2413 Phase B: additive reducer status (state/confidence/authority/
-                // evidence-trail/since_ms). null unless the Shadow Observer flag is on.
-                "observed_status": observed_status,
-                "kind": "managed",
-            });
-            (name, entry)
-        })
-        .collect();
-    drop(reg);
-
-    // Disk I/O now runs WITHOUT the registry lock held.
-    let mut agents: Vec<Value> = Vec::with_capacity(snapshot.len());
-    for (name, mut entry) in snapshot {
-        let (dispatched_waiting_for, pending_response_to) =
-            crate::daemon::dispatch_idle::pending_for_instance(home, &name);
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert(
-                "dispatched_waiting_for".into(),
-                json!(dispatched_waiting_for),
-            );
-            obj.insert("pending_response_to".into(), json!(pending_response_to));
-        }
-        agents.push(entry);
-    }
-    let ext = agent::lock_external(externals);
-    for (name, handle) in ext.iter() {
-        let (dispatched_waiting_for, pending_response_to) =
-            crate::daemon::dispatch_idle::pending_for_instance(home, name);
-        agents.push(json!({
-            "name": name,
-            "backend": handle.backend_command,
-            "agent_state": "external",
-            "health_state": "connected",
-            "kind": "external",
-            "pid": handle.pid,
-            "dispatched_waiting_for": dispatched_waiting_for,
-            "pending_response_to": pending_response_to,
-        }));
-    }
-    json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
+    crate::agent_ops::list_snapshot(home, registry, externals)
 }
 
 pub(crate) fn handle_status(_params: &Value, ctx: &HandlerCtx) -> Value {

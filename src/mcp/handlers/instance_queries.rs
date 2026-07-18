@@ -9,26 +9,16 @@ pub(super) fn handle_list_instances_with_runtime(
     instance_name: &str,
     runtime: Option<&RuntimeContext>,
 ) -> Value {
-    // If `instance` param is provided, return detailed info for that instance (replaces describe_instance)
     if let Some(target) = args["instance"].as_str().filter(|s| !s.is_empty()) {
-        return handle_describe_instance(home, &json!({"name": target}));
+        return describe_instance(home, target, runtime);
     }
-    // #2475: compact-by-default for routine polling. The API LIST response still
-    // carries full `observed_status.evidence` for dashboards / describe paths;
-    // the MCP `list_instances` read tool strips that evidence unless explicitly
-    // requested, because agents poll this often and the evidence array is noisy
-    // context ballast. Set `verbose:true` or `include_evidence:true` for detail.
     let include_evidence = args["verbose"].as_bool().unwrap_or(false)
         || args["include_evidence"].as_bool().unwrap_or(false);
     let Some(runtime) = runtime else {
         return with_operator_mode(json!({"instances": list_agents(), "compact": true}));
     };
-    let resp = crate::api::list_response(home, &runtime.registry, &runtime.externals);
+    let resp = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
     if let Some(agents) = resp["result"]["agents"].as_array() {
-        // #991 PR-C: load fleet.yaml ONCE for the whole batch (not per-agent)
-        // so operators can grep "which agents intentionally have no topic"
-        // via `list_instances` — previously only `describe_instance`
-        // (single-instance) exposed this field.
         let fleet_config =
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
         let instances: Vec<Value> = agents
@@ -44,8 +34,6 @@ pub(super) fn handle_list_instances_with_runtime(
                 if name == instance_name {
                     info["is_self"] = json!(true);
                 }
-                // Omit when unset (auto default) — matches describe_instance's
-                // existing omission convention, not an explicit "auto" value.
                 if let Some(mode) = fleet_config
                     .as_ref()
                     .and_then(|c| c.instances.get(name))
@@ -89,41 +77,36 @@ fn strip_observed_evidence(info: &mut Value) {
     }
 }
 
-pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
-    let name = args["name"].as_str().unwrap_or("");
+fn describe_instance(home: &Path, name: &str, runtime: Option<&RuntimeContext>) -> Value {
     crate::validate_name_or_err!(name);
-    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
-        Ok(resp) => {
-            match resp["result"]["agents"]
-                .as_array()
-                .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
-            {
-                Some(agent) => {
-                    let mut info = agent.clone();
-                    merge_metadata(home, name, &mut info);
-                    // Surface topic_id from topics.json + topic_binding_mode from fleet.yaml.
-                    if info.get("topic_id").is_none() {
-                        if let Some(tid) =
-                            crate::channel::telegram::lookup_topic_for_instance(home, name)
-                        {
-                            info["topic_id"] = json!(tid);
-                        }
-                    }
-                    if let Some(inst) =
-                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                            .ok()
-                            .and_then(|c| c.instances.get(name).cloned())
-                    {
-                        if let Some(ref mode) = inst.topic_binding_mode {
-                            info["topic_binding_mode"] = json!(mode);
-                        }
-                    }
-                    json!({"instance": info})
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime context unavailable — describe requires a live registry"});
+    };
+    let resp = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
+    match resp["result"]["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
+    {
+        Some(agent) => {
+            let mut info = agent.clone();
+            merge_metadata(home, name, &mut info);
+            if info.get("topic_id").is_none() {
+                if let Some(tid) = crate::channel::telegram::lookup_topic_for_instance(home, name) {
+                    info["topic_id"] = json!(tid);
                 }
-                None => json!({"error": format!("Instance '{name}' not found")}),
             }
+            if let Some(inst) =
+                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                    .ok()
+                    .and_then(|c| c.instances.get(name).cloned())
+            {
+                if let Some(ref mode) = inst.topic_binding_mode {
+                    info["topic_binding_mode"] = json!(mode);
+                }
+            }
+            json!({"instance": info})
         }
-        Err(e) => json!({"error": format!("API unavailable: {e}")}),
+        None => json!({"error": format!("Instance '{name}' not found")}),
     }
 }
 
@@ -305,5 +288,88 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 S3 RED: `describe_instance` (the `instance` param path in
+    /// `list_instances`) must use the supplied RuntimeContext and succeed
+    /// with NO daemon / API listener.  Currently it delegates to
+    /// `handle_describe_instance` which calls `api::call` — this test
+    /// fails until the in-process path is wired.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn describe_instance_uses_runtime_context_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-describe-runtime-2454-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let registry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("target-agent");
+        registry.lock().insert(handle.id, handle);
+        let externals = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let runtime = RuntimeContext {
+            registry,
+            externals,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: None,
+        };
+
+        let result = handle_list_instances_with_runtime(
+            &home,
+            &json!({"instance": "target-agent"}),
+            "caller",
+            Some(&runtime),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "describe via runtime must succeed without a daemon; got: {result}"
+        );
+        let inst = &result["instance"];
+        assert_eq!(
+            inst["name"].as_str(),
+            Some("target-agent"),
+            "describe must return the target instance from the runtime registry: {result}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 S3 RED source invariant: production code in this module must
+    /// contain ZERO references to the API query layer — neither socket
+    /// loopback (`api::call`) nor in-process API-layer calls
+    /// (`api::list_response`).  Instance queries must go through the
+    /// neutral agent_ops service, not the API wire layer.
+    #[test]
+    fn no_production_api_dependency_in_instance_queries_2454() {
+        let source = include_str!("instance_queries.rs");
+        let in_test_mod = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let production = &source[..in_test_mod];
+        let needles: &[&str] = &[
+            concat!("crate::", "api::", "call"),
+            concat!("api::", "call("),
+            concat!("crate::", "api::", "list_response"),
+            concat!("api::", "list_response("),
+        ];
+        let violations: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && !trimmed.starts_with("///")
+            })
+            .filter(|(_, line)| needles.iter().any(|n| line.contains(n)))
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "instance_queries.rs must contain zero production API-layer references \
+             (api::call OR api::list_response); found {}: {:?}",
+            violations.len(),
+            violations
+        );
     }
 }
