@@ -883,4 +883,107 @@ mod tests {
         }
         std::fs::remove_dir_all(home).ok();
     }
+
+    /// #2454 Slice 7 RED: exercise the real MCP `team action=update` ingress
+    /// with a supplied notifier and no API listener. The current MCP adapter
+    /// falls back to the direct teams store but drops the owned runtime
+    /// notifier, so effective add/remove events are absent until GREEN.
+    #[test]
+    fn update_team_mcp_ingress_preserves_effective_diff_events_2454() {
+        use crate::api::{ApiEvent, ApiNotifier};
+
+        struct RecordingNotifier {
+            events: parking_lot::Mutex<Vec<ApiEvent>>,
+        }
+
+        impl ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let _fleet_guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-mcp-update-team-ingress-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  t1:\n    members: [m1, m2]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
+        )
+        .expect("seed team");
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let notifier = std::sync::Arc::new(RecordingNotifier {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        let notifier_trait: std::sync::Arc<dyn ApiNotifier> = notifier.clone();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: Some(&notifier_trait),
+            home: &home,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        };
+
+        for arguments in [
+            json!({"action": "update", "name": "t1", "add": ["m3"]}),
+            json!({"action": "update", "name": "t1", "remove": ["m2"]}),
+            json!({"action": "update", "name": "t1", "add": ["m1"]}),
+        ] {
+            let response = handle_mcp_tool(&json!({"tool": "team", "arguments": arguments}), &ctx);
+            assert_eq!(
+                response["ok"], true,
+                "MCP team update outer response: {response}"
+            );
+            assert_eq!(
+                response["result"]["status"], "updated",
+                "MCP team update direct fallback response: {response}"
+            );
+        }
+
+        let events = std::mem::take(&mut *notifier.events.lock());
+        assert_eq!(
+            events.len(),
+            2,
+            "add/remove must emit events while noop emits none: {events:?}"
+        );
+        assert!(matches!(
+            &events[0],
+            ApiEvent::TeamMembersChanged { name, added, removed }
+                if name == "t1" && added == &["m3"] && removed.is_empty()
+        ));
+        assert!(matches!(
+            &events[1],
+            ApiEvent::TeamMembersChanged { name, added, removed }
+                if name == "t1" && added.is_empty() && removed == &["m2"]
+        ));
+
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn update_team_shared_service_and_no_api_call_invariants_2454() {
+        let source = include_str!("../../mcp/handlers/task.rs");
+        let update_start = source
+            .find("pub(super) fn handle_update_team(")
+            .expect("MCP update_team handler");
+        let update_region = &source[update_start..];
+        assert!(
+            !update_region.contains("api::call"),
+            "MCP handle_update_team production region must not self-IPC"
+        );
+    }
 }

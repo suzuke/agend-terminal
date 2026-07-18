@@ -674,6 +674,41 @@ pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Result of a team update together with its effective roster diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamUpdateOutcome {
+    pub result: Value,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// Apply a team update and return the original wire result plus the effective
+/// added/removed member diff. Callers own transport-specific response mapping
+/// and notification; this service owns the single roster mutation path.
+pub fn update_with_diff(home: &Path, args: &Value) -> TeamUpdateOutcome {
+    let team_name = args["name"].as_str().unwrap_or("");
+    let before = get_members(home, team_name);
+    let result = update(home, args);
+    let after = get_members(home, team_name);
+    let before_set: std::collections::HashSet<&String> = before.iter().collect();
+    let after_set: std::collections::HashSet<&String> = after.iter().collect();
+    let added = after
+        .iter()
+        .filter(|member| !before_set.contains(member))
+        .cloned()
+        .collect();
+    let removed = before
+        .iter()
+        .filter(|member| !after_set.contains(member))
+        .cloned()
+        .collect();
+    TeamUpdateOutcome {
+        result,
+        added,
+        removed,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1130,6 +1165,37 @@ mod tests {
         assert_eq!(r["status"], "updated");
         let listed = list(&home);
         assert_eq!(listed["teams"][0]["orchestrator"], "b");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_with_diff_reports_effective_changes_and_noop() {
+        let home = tmp_home("update_with_diff");
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["a"]}),
+        );
+        let added = update_with_diff(
+            &home,
+            &serde_json::json!({
+                "name": "devs",
+                "add": ["b"],
+            }),
+        );
+        assert_eq!(added.result["status"], "updated");
+        assert_eq!(added.added, vec!["b"]);
+        assert!(added.removed.is_empty());
+
+        let noop = update_with_diff(
+            &home,
+            &serde_json::json!({
+                "name": "devs",
+                "add": ["a"],
+            }),
+        );
+        assert_eq!(noop.result["status"], "updated");
+        assert!(noop.added.is_empty());
+        assert!(noop.removed.is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
 

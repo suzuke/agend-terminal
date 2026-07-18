@@ -9,39 +9,21 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(n) => n.to_string(),
         None => return json!({"ok": false, "error": "missing name"}),
     };
-    let before = crate::teams::get_members(ctx.home, &team_name);
-    // Snapshot the pre-mutation roster so the TUI event carries the
-    // *effective* diff (noop adds like re-adding an existing member
-    // must not trigger a pane move).
-    let result = crate::teams::update(ctx.home, params);
-    let after = crate::teams::get_members(ctx.home, &team_name);
-    let before_set: std::collections::HashSet<&String> = before.iter().collect();
-    let after_set: std::collections::HashSet<&String> = after.iter().collect();
-    let added: Vec<String> = after
-        .iter()
-        .filter(|m| !before_set.contains(m))
-        .cloned()
-        .collect();
-    let removed: Vec<String> = before
-        .iter()
-        .filter(|m| !after_set.contains(m))
-        .cloned()
-        .collect();
-    let diff_nonempty = !added.is_empty() || !removed.is_empty();
-    if let Some(n) = ctx.notifier {
-        if diff_nonempty {
-            tracing::info!(team = %team_name, added = ?added, removed = ?removed, "UPDATE_TEAM emitting TeamMembersChanged");
-            n.notify(ApiEvent::TeamMembersChanged {
-                name: team_name.clone(),
-                added: added.clone(),
-                removed: removed.clone(),
-            });
+    let outcome = crate::teams::update_with_diff(ctx.home, params);
+    if outcome.result.get("error").is_none() {
+        if let Some(n) = ctx.notifier {
+            let diff_nonempty = !outcome.added.is_empty() || !outcome.removed.is_empty();
+            if diff_nonempty {
+                tracing::info!(team = %team_name, added = ?outcome.added, removed = ?outcome.removed, "UPDATE_TEAM emitting TeamMembersChanged");
+                n.notify(ApiEvent::TeamMembersChanged {
+                    name: team_name.clone(),
+                    added: outcome.added.clone(),
+                    removed: outcome.removed.clone(),
+                });
+            }
         }
     }
-    // Same condition as the TUI notification: an empty diff means a
-    // noop update (e.g. `update_team add` with members already on the
-    // roster), no reason to broadcast anything either.
-    json!({"ok": true, "result": result})
+    json!({"ok": true, "result": outcome.result})
 }
 
 /// #1964 Bug 1: plan `count` member names for `team` as `<team>-N`. Names
@@ -507,6 +489,44 @@ mod tests {
             team.accept_from
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_team_error_preserves_outer_success_envelope_2454() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountNotifier(AtomicUsize);
+
+        impl crate::api::ApiNotifier for CountNotifier {
+            fn notify(&self, _event: crate::api::ApiEvent) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let home = tmp_home("update-error-envelope");
+        crate::teams::create(
+            &home,
+            &json!({
+                "name": "devs",
+                "members": ["lead"],
+                "orchestrator": "lead",
+            }),
+        );
+        let notifier = Arc::new(CountNotifier(AtomicUsize::new(0)));
+        let notifier_trait: Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let mut ctx = test_ctx(&home);
+        ctx.notifier = Some(&notifier_trait);
+        let response = handle_update_team(&json!({"name": "devs", "remove": ["lead"]}), &ctx);
+        assert_eq!(
+            response["ok"], true,
+            "API wire envelope changed: {response}"
+        );
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cannot remove orchestrator")));
+        assert_eq!(notifier.0.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(&home).ok();
     }
 }
