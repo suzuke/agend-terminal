@@ -55,7 +55,13 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                     "code": "notification_only_no_receipt",
                 });
             };
-            if !instance_name.is_empty() && receipt.task_assignee != instance_name {
+            if instance_name.is_empty() {
+                return json!({
+                    "error": "notification_only watch requires an identified caller (not operator/empty)",
+                    "code": "notification_only_empty_caller",
+                });
+            }
+            if receipt.task_assignee != instance_name {
                 return json!({
                     "error": format!(
                         "notification_only watch: caller '{}' is not the task assignee '{}'",
@@ -64,7 +70,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                     "code": "notification_only_unauthorized",
                 });
             }
-            if !instance_name.is_empty() {
+            {
                 let binding = crate::binding::read(home, instance_name);
                 let bound_task = binding
                     .as_ref()
@@ -279,9 +285,17 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["target_head_sha"] = json!(sha);
     }
     // #2812: notification-only watch — short TTL (1h), persisted flag.
+    // Only valid on protected refs (the gate above validates all guards).
     let notification_only = args["notification_only"].as_bool().unwrap_or(false);
     if notification_only {
+        if exact_head_sha.is_none() {
+            return json!({
+                "error": "notification_only watch is only valid on protected refs with an exact head_sha",
+                "code": "notification_only_non_protected",
+            });
+        }
         watch["notification_only"] = json!(true);
+        watch["next_after_ci"] = json!(null);
         let short_ttl = chrono::Utc::now()
             + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
         watch["expires_at"] = json!(short_ttl.to_rfc3339());

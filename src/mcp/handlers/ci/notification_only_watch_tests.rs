@@ -507,3 +507,112 @@ fn notification_only_pre_terminal_repeat_idempotent() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// notification_only on a non-protected branch must be rejected.
+#[test]
+fn notification_only_non_protected_ref_rejected() {
+    let home = tmp_home("non-protected");
+    seed_fleet(&home, &["dev"]);
+    let sha = "a".repeat(40);
+    seed_binding(&home, "dev", "t-np");
+    seed_receipt(&home, REPO, &sha, "t-np", "dev");
+    let r = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "feat/not-protected",
+            "head_sha": sha,
+            "task_id": "t-np",
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert!(
+        r.get("error").is_some(),
+        "non-protected must be rejected: {r}"
+    );
+    assert_eq!(
+        r["code"].as_str().unwrap_or(""),
+        "notification_only_non_protected",
+        "expected notification_only_non_protected code: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Empty/operator caller must not bypass notification_only assignee authority.
+#[test]
+fn notification_only_empty_caller_rejected() {
+    let home = tmp_home("empty-caller");
+    seed_fleet(&home, &["dev"]);
+    let sha = "b".repeat(40);
+    seed_binding(&home, "dev", "t-ec");
+    seed_receipt(&home, REPO, &sha, "t-ec", "dev");
+    let r = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "main",
+            "head_sha": sha,
+            "task_id": "t-ec",
+            "notification_only": true,
+        }),
+        "",
+    );
+    assert!(
+        r.get("error").is_some(),
+        "empty caller must be rejected: {r}"
+    );
+    assert_eq!(
+        r["code"].as_str().unwrap_or(""),
+        "notification_only_empty_caller",
+        "expected notification_only_empty_caller code: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// notification_only arming must clear stale next_after_ci from persisted watch.
+#[test]
+fn notification_only_clears_stale_next_after_ci() {
+    let home = tmp_home("clear-nac");
+    seed_fleet(&home, &["dev", "reviewer"]);
+    let sha = "c".repeat(40);
+    seed_binding(&home, "dev", "t-cn");
+    seed_receipt(&home, REPO, &sha, "t-cn", "dev");
+
+    // First arm a notification_only watch.
+    let r = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "main",
+            "head_sha": sha,
+            "task_id": "t-cn",
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert!(r.get("error").is_none(), "arm must succeed: {r}");
+
+    // Read the persisted watch and verify next_after_ci is absent/null.
+    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let mut found_nac = false;
+    if let Ok(entries) = std::fs::read_dir(&watch_dir) {
+        for entry in entries.flatten() {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                if content.contains("notification_only") {
+                    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+                    let nac = parsed.get("next_after_ci");
+                    assert!(
+                        nac.is_none()
+                            || nac.unwrap().is_null()
+                            || nac.unwrap().as_array().is_some_and(|a| a.is_empty()),
+                        "notification_only watch must have empty/null next_after_ci: {parsed}"
+                    );
+                    found_nac = true;
+                }
+            }
+        }
+    }
+    assert!(found_nac, "notification_only watch must exist in watch dir");
+    std::fs::remove_dir_all(&home).ok();
+}
