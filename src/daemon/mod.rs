@@ -758,6 +758,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
         FleetSource::HandoffDeferred { .. } => None,
     };
 
+    crate::runtime_controls::reload_runtime_controls(home);
     let ctx = init_daemon_services(home, telegram_pre)?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
@@ -899,10 +900,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             if let Some(p) = &tick_progress {
                 p.enter_preflight();
             }
-            crate::runtime_config::reload(home);
-            // #1339: operator-mode.json reloaded each tick — a mode change (via the
-            // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
-            crate::operator_mode::reload(home);
+            crate::runtime_controls::reload_runtime_controls(home);
             // PR4: the tracked runner publishes Handler(i) per handler and closes
             // with PostHandlers, which also covers the crash-dispatch below. When
             // diagnostics are OFF, `tick_progress` is None → untracked (byte-identical).

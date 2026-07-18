@@ -77,6 +77,7 @@ mod review_receipt;
 mod review_repro_test_util;
 mod runtime;
 pub mod runtime_config;
+pub(crate) mod runtime_controls;
 mod schedules;
 mod scm;
 mod sent_ledger;

@@ -204,6 +204,40 @@ impl AgendHarness {
                         std::thread::sleep(Duration::from_millis(50));
                     }
 
+                    // Daemon is running + ready. Establish Active mode via the
+                    // real operator CLI; this is the only supported path that
+                    // writes the signed mode state and updates the daemon's
+                    // in-memory global.
+                    let mode_output = Command::new(binary_path())
+                        .args(["mode", "active"])
+                        .env("AGEND_HOME", &home)
+                        .output()
+                        .map_err(|e| format!("mode active CLI spawn failed: {e}"))?;
+                    if !mode_output.status.success() {
+                        return Err(format!(
+                            "mode active CLI exited with {}: {}",
+                            mode_output.status,
+                            String::from_utf8_lossy(&mode_output.stderr).trim()
+                        ));
+                    }
+                    let mode_stdout = String::from_utf8(mode_output.stdout)
+                        .map_err(|e| format!("mode active CLI stdout was not UTF-8: {e}"))?;
+                    if mode_stdout.trim_end_matches(['\r', '\n']) != "Operator mode → active" {
+                        return Err(format!(
+                            "mode active CLI confirmation mismatch: {:?}",
+                            mode_stdout
+                        ));
+                    }
+                    let mode_path = home.join("operator-mode.json");
+                    let hmac_path = home.join("operator-mode.json.hmac");
+                    if !mode_path.is_file() || !hmac_path.is_file() {
+                        return Err(format!(
+                            "mode active CLI did not persist operator mode and sidecar: mode={}, hmac={}",
+                            mode_path.display(),
+                            hmac_path.display()
+                        ));
+                    }
+
                     return Ok(Self {
                         home,
                         api_port: port,
