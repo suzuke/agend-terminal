@@ -5,7 +5,8 @@ use super::message::{InboxMessage, MessageStatus};
 
 mod ci_handoff;
 pub(crate) use ci_handoff::{
-    protected_handoff_row_state, protected_settlement_identity, ProtectedHandoffRowState,
+    handoff_row_state, protected_settlement_identity, settle_ci_handoff_row_exact,
+    HandoffRowSettleOutcome, ProtectedHandoffRowState,
 };
 
 mod message_query;

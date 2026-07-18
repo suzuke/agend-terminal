@@ -1,5 +1,6 @@
 use super::{parse_inbox_messages, with_inbox_lock};
 use crate::inbox::message::{CiHandoffClass, InboxMessage};
+use std::io::Write;
 use std::path::Path;
 
 /// Exact row state used by the CI-handoff crash reconciler.
@@ -11,41 +12,122 @@ pub(crate) enum ProtectedHandoffRowState {
     Ambiguous,
 }
 
-/// Probe one target inbox under its flock for exactly one protected ci-ready
-/// row carrying the requested correlation + episode.
-pub(crate) fn protected_handoff_row_state(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoffRowSettleOutcome {
+    Settled,
+    AlreadySettled,
+    Missing,
+    Ambiguous,
+    WriteFailed,
+    LockFailed,
+}
+
+pub(crate) fn handoff_row_state(
     home: &Path,
     target: &str,
     correlation: &str,
     episode: &str,
+    class: CiHandoffClass,
 ) -> ProtectedHandoffRowState {
     let Ok(state) = with_inbox_lock(home, target, |path| {
         let Ok(content) = std::fs::read_to_string(path) else {
             return ProtectedHandoffRowState::Missing;
         };
-        let mut matches = 0usize;
-        let mut processed = false;
-        for msg in parse_inbox_messages(&content) {
-            if msg.kind.as_deref() != Some("ci-ready-for-action")
-                || msg.correlation_id.as_deref() != Some(correlation)
-                || msg.ci_handoff_episode.as_deref() != Some(episode)
-                || msg.ci_handoff_class != Some(CiHandoffClass::Protected)
-            {
-                continue;
+        let matches: Vec<InboxMessage> = parse_inbox_messages(&content)
+            .filter(|msg| {
+                msg.kind.as_deref() == Some("ci-ready-for-action")
+                    && msg.correlation_id.as_deref() == Some(correlation)
+                    && msg.ci_handoff_episode.as_deref() == Some(episode)
+                    && msg.ci_handoff_class == Some(class)
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => ProtectedHandoffRowState::Missing,
+            [msg] if msg.read_at.is_some() && msg.delivering_at.is_none() => {
+                ProtectedHandoffRowState::Processed
             }
-            matches += 1;
-            processed = msg.read_at.is_some() && msg.delivering_at.is_none();
-        }
-        match (matches, processed) {
-            (0, _) => ProtectedHandoffRowState::Missing,
-            (1, true) => ProtectedHandoffRowState::Processed,
-            (1, false) => ProtectedHandoffRowState::Pending,
-            (_, _) => ProtectedHandoffRowState::Ambiguous,
+            [_] => ProtectedHandoffRowState::Pending,
+            _ => ProtectedHandoffRowState::Ambiguous,
         }
     }) else {
         return ProtectedHandoffRowState::Missing;
     };
     state
+}
+
+/// Settle exactly one CI handoff row without touching the sidecar track.
+/// The caller performs the episode-CAS track delete only after this durable
+/// write completes, so the two file locks are never nested.
+pub(crate) fn settle_ci_handoff_row_exact(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    class: CiHandoffClass,
+) -> HandoffRowSettleOutcome {
+    with_inbox_lock(home, target, |path| {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return HandoffRowSettleOutcome::Missing;
+        };
+        let mut messages = Vec::new();
+        let mut raw_lines = Vec::new();
+        let mut match_indexes = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<InboxMessage>(line) {
+                Ok(msg) => {
+                    if msg.kind.as_deref() == Some("ci-ready-for-action")
+                        && msg.correlation_id.as_deref() == Some(correlation)
+                        && msg.ci_handoff_episode.as_deref() == Some(episode)
+                        && msg.ci_handoff_class == Some(class)
+                    {
+                        match_indexes.push(messages.len());
+                    }
+                    messages.push(msg);
+                }
+                Err(_) => raw_lines.push(line.to_string()),
+            }
+        }
+        let [index] = match_indexes.as_slice() else {
+            return if match_indexes.is_empty() {
+                HandoffRowSettleOutcome::Missing
+            } else {
+                HandoffRowSettleOutcome::Ambiguous
+            };
+        };
+        let msg = &mut messages[*index];
+        if msg.read_at.is_some() && msg.delivering_at.is_none() {
+            return HandoffRowSettleOutcome::AlreadySettled;
+        }
+        msg.read_at = Some(chrono::Utc::now().to_rfc3339());
+        msg.delivering_at = None;
+        let tmp = path.with_extension("jsonl.tmp");
+        let write = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            for message in messages {
+                writeln!(file, "{}", serde_json::to_string(&message)?)?;
+            }
+            for raw in raw_lines {
+                writeln!(file, "{raw}")?;
+            }
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            crate::store::fsync_parent_dir(path);
+            Ok(())
+        })();
+        if write.is_ok() {
+            HandoffRowSettleOutcome::Settled
+        } else {
+            HandoffRowSettleOutcome::WriteFailed
+        }
+    })
+    .unwrap_or(HandoffRowSettleOutcome::LockFailed)
 }
 
 /// Return the exact protected CI-handoff identity carried by a row.

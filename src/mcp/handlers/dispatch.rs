@@ -313,10 +313,11 @@ pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 action_adapter!(dispatch_ci, "ci", [
-    "watch"   => ci::handle_watch_ci,   hai;
-    "unwatch" => ci::handle_unwatch_ci, hai;
-    "status"  => ci::handle_status_ci,  hai;
-    "defer"   => ci::handle_defer_ci,   hai;
+    "watch"       => ci::handle_watch_ci,       hai;
+    "unwatch"     => ci::handle_unwatch_ci,     hai;
+    "status"      => ci::handle_status_ci,      hai;
+    "defer"       => ci::handle_defer_ci,       hai;
+    "ack_handoff" => ci::handle_ack_handoff_ci, hai;
 ]);
 
 action_adapter!(dispatch_decision, "decision", [

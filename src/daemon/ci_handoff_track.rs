@@ -746,6 +746,27 @@ pub(crate) fn resolve_protected_episode(
     episode: &str,
     reason: &str,
 ) -> usize {
+    resolve_exact_episode(
+        home,
+        target,
+        correlation,
+        episode,
+        crate::inbox::CiHandoffClass::Protected,
+        reason,
+    )
+}
+
+/// Resolve one current-schema handoff only when target, correlation, episode,
+/// and class all match. This is the neutral pickup-settlement primitive used by
+/// `ci action=ack_handoff`; it never mutates the watch subscription.
+pub(crate) fn resolve_exact_episode(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    class: crate::inbox::CiHandoffClass,
+    reason: &str,
+) -> usize {
     if episode.is_empty() {
         return 0;
     }
@@ -754,7 +775,7 @@ pub(crate) fn resolve_protected_episode(
         if track.target == target
             && track.correlation == correlation
             && track.ci_handoff_episode.as_deref() == Some(episode)
-            && track.ci_handoff_class == Some(crate::inbox::CiHandoffClass::Protected)
+            && track.ci_handoff_class == Some(class)
             && remove_if_episode_unchanged(
                 home,
                 &path,
@@ -766,12 +787,12 @@ pub(crate) fn resolve_protected_episode(
         {
             resolved += 1;
             tracing::info!(
-                tag = "#35896-11-track-resolved",
+                tag = "#2817-track-resolved",
                 agent = %target,
                 %correlation,
                 %episode,
                 reason,
-                "protected ci-handoff episode resolved"
+                "exact ci-handoff episode resolved"
             );
         }
     }
@@ -784,10 +805,10 @@ pub(crate) fn resolve_protected_episode(
 pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Utc>) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
-        if track.ci_handoff_class != Some(crate::inbox::CiHandoffClass::Protected) {
-            continue;
-        }
         let Some(episode) = track.ci_handoff_episode.as_deref() else {
+            continue;
+        };
+        let Some(class) = track.ci_handoff_class else {
             continue;
         };
         let Ok(sent_at) = chrono::DateTime::parse_from_rfc3339(&track.sent_at) else {
@@ -797,11 +818,12 @@ pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Ut
             continue;
         }
         if !matches!(
-            crate::inbox::storage::protected_handoff_row_state(
+            crate::inbox::storage::handoff_row_state(
                 home,
                 &track.target,
                 &track.correlation,
                 episode,
+                class,
             ),
             crate::inbox::storage::ProtectedHandoffRowState::Processed
         ) {
@@ -817,12 +839,12 @@ pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Ut
         ) {
             resolved += 1;
             tracing::info!(
-                tag = "#35896-11-track-reconciled",
+                tag = "#2817-track-reconciled",
                 agent = %track.target,
                 correlation = %track.correlation,
                 %episode,
                 reason = "ack_reconciled",
-                "processed protected ci-handoff episode reconciled"
+                "processed exact ci-handoff episode reconciled"
             );
         }
     }
@@ -2050,6 +2072,47 @@ mod tests {
             None,
             Some("ep-1"),
             Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn ack_handoff_reconciler_also_resolves_processed_feature_episode_2817() {
+        let home = tmp_home("2817-feature-reconcile");
+        let correlation = "o/r@feat/ack";
+        let episode = "ep-feature";
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:ci",
+            "ci-ready-for-action",
+            "feature handoff".to_string(),
+        )
+        .with_correlation_id(correlation.to_string());
+        msg.ci_handoff_episode = Some(episode.to_string());
+        msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Feature);
+        crate::inbox::enqueue(&home, "lead", msg).unwrap();
+        assert_eq!(
+            crate::inbox::storage::settle_ci_handoff_row_exact(
+                &home,
+                "lead",
+                correlation,
+                episode,
+                crate::inbox::CiHandoffClass::Feature,
+            ),
+            crate::inbox::storage::HandoffRowSettleOutcome::Settled
+        );
+        assert!(record_with_identity(
+            &home,
+            "lead",
+            correlation,
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some(episode),
+            Some(crate::inbox::CiHandoffClass::Feature)
         ));
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
             .unwrap()
