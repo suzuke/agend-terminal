@@ -22,9 +22,9 @@ pub(super) fn handle_restart_daemon(
     handle_restart_daemon_with_shutdown(home, capability, app_restart, post_flush, None)
 }
 
-/// #2454 Slice 9 RED: carries the API-owned shutdown authority through the
-/// daemon strategy. Phase 1 intentionally leaves the authority unused so the
-/// real-entry test records the pre-GREEN failure deterministically.
+/// #2454 Slice 9: carries the API-owned shutdown authority through the daemon
+/// strategy so the supervised legacy path can shut down the current daemon
+/// without a loopback API call.
 pub(super) fn handle_restart_daemon_with_shutdown(
     home: &Path,
     capability: Option<crate::api::RestartCapability>,
@@ -232,7 +232,7 @@ fn unsupported_fail_closed() -> Value {
 /// gate that used to precede it moved out to the capability dispatch above.
 fn daemon_restart_strategy(
     home: &Path,
-    _shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Value {
     // #1814: self-respawn is the DEFAULT (Stage 4). By default the daemon owns
     // its own respawn (spawn successor → Phase-1 health gate → abort-stay-alive
@@ -287,9 +287,16 @@ fn daemon_restart_strategy(
                       yet and stays fail-closed.)"
         });
     }
+    let Some(shutdown) = shutdown else {
+        return json!({
+            "ok": false,
+            "error": "restart_daemon requires an injected shutdown authority; refusing to mutate restart state"
+        });
+    };
     crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
     std::fs::write(home.join("restart-requested"), "").ok();
-    let _ = crate::api::call(home, &json!({"method": crate::api::method::SHUTDOWN}));
+    crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::ApiShutdown);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; supervisor restarts"})
 }
 

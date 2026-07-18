@@ -1086,10 +1086,8 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #2454 Slice 9 RED: drive the real MCP restart_daemon ingress with a
-    /// Daemon capability and an injected shutdown flag. The legacy handler
-    /// still self-IPC's SHUTDOWN, so the response is ok while the flag stays
-    /// false until GREEN wires the shared authority through.
+    /// #2454 Slice 9: drive the real MCP restart_daemon ingress with a Daemon
+    /// capability and an injected shutdown flag.
     #[test]
     #[allow(clippy::unwrap_used)]
     fn restart_daemon_real_entry_shutdown_flag_2454() {
@@ -1169,7 +1167,98 @@ mod tests {
         );
         assert!(
             shutdown_set,
-            "RED: production restart_daemon must set the injected shutdown flag: {response}"
+            "production restart_daemon must set the injected shutdown flag: {response}"
+        );
+    }
+
+    /// #2454 Slice 9: a supervised Daemon request without an injected shutdown
+    /// authority must fail closed before touching restart state.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restart_daemon_real_entry_without_shutdown_fails_closed_2454() {
+        use std::ffi::OsString;
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-s9-mcp-restart-no-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  operator:\n    role_kind: orchestrator\n",
+        )
+        .unwrap();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        let previous_handoff = std::env::var_os("AGEND_RESTART_HANDOFF");
+        let previous_supervised = std::env::var_os("AGEND_SUPERVISED");
+        std::env::set_var("AGEND_HOME", &home);
+        std::env::set_var("AGEND_RESTART_HANDOFF", OsString::from("0"));
+        std::env::set_var("AGEND_SUPERVISED", OsString::from("1"));
+
+        let previous_restart_pending = crate::daemon::RESTART_PENDING.load(Ordering::Acquire);
+        crate::daemon::RESTART_PENDING.store(false, Ordering::Release);
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &home,
+            capability: crate::api::RestartCapability::Daemon,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
+        };
+        let response = handle_mcp_tool(
+            &json!({
+                "tool": "restart_daemon",
+                "instance": "operator",
+                "arguments": {}
+            }),
+            &ctx,
+        );
+        let pending = crate::daemon::RESTART_PENDING.load(Ordering::Acquire);
+        let marker_exists = home.join("restart-requested").exists();
+
+        crate::daemon::RESTART_PENDING.store(previous_restart_pending, Ordering::Release);
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        match previous_handoff {
+            Some(value) => std::env::set_var("AGEND_RESTART_HANDOFF", value),
+            None => std::env::remove_var("AGEND_RESTART_HANDOFF"),
+        }
+        match previous_supervised {
+            Some(value) => std::env::set_var("AGEND_SUPERVISED", value),
+            None => std::env::remove_var("AGEND_SUPERVISED"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP ingress must return a response: {response}"
+        );
+        assert_eq!(
+            response["result"]["ok"], false,
+            "missing authority must fail closed: {response}"
+        );
+        assert!(
+            !pending,
+            "missing authority must not set RESTART_PENDING: {response}"
+        );
+        assert!(
+            !marker_exists,
+            "missing authority must not write restart-requested"
         );
     }
 }

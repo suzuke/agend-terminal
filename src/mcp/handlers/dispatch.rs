@@ -69,8 +69,8 @@ pub(crate) struct RuntimeContext {
     /// #2454: owner notifier forwarded from the API composition root so MCP
     /// move_pane emits the same TUI event as the direct API ingress.
     pub notifier: Option<Arc<dyn crate::api::ApiNotifier>>,
-    /// #2454 Slice 9 RED: optional shared daemon shutdown authority forwarded
-    /// from the API MCP ingress. Standalone bridge calls leave it absent.
+    /// #2454 Slice 9: optional shared daemon shutdown authority forwarded from
+    /// the API MCP ingress. Standalone bridge calls leave it absent.
     pub shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1448,13 +1448,13 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Baseline count: exactly 12 same-daemon api::call production sites
-    /// remain in src/mcp/handlers/ at this commit (was 13 pre-S8; the
+    /// Baseline count: exactly 11 same-daemon api::call production sites
+    /// remain in src/mcp/handlers/ at this commit (was 12 pre-S9; the
     /// team_task_inject thread's direct call consolidated into the shared
     /// inject_with_routing helper). Any addition without a corresponding
     /// removal is a regression.
     #[test]
-    fn production_api_call_baseline_is_12_2454() {
+    fn production_api_call_baseline_is_11_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
@@ -1483,8 +1483,8 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 12,
-            "production same-daemon api::call baseline must be exactly 12; got {count}"
+            count, 11,
+            "production same-daemon api::call baseline must be exactly 11; got {count}"
         );
     }
 
