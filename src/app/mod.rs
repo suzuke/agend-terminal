@@ -683,7 +683,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // (the TUI mouse copy-on-select mode) would reset to the compile-time default
     // on every restart. In-session changes update the in-process global directly
     // via `runtime_config::set` (the `Ctrl+B e` toggle and `:set`/`:config set`).
-    crate::runtime_config::reload(&home);
+    crate::runtime_controls::reload_runtime_controls(&home);
 
     // PR-D6/F1: fail LOUD if the retired `AGEND_WORKTREE_PRUNE_LIVE` is still set.
     // The LIVE fleet daemon runs THIS app-mode path — never `run_core` (see

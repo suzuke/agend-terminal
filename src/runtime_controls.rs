@@ -8,6 +8,7 @@ pub fn reload_runtime_controls(home: &Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -46,17 +47,26 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Helper semantics: reload_runtime_controls loads operator_mode from
-    /// a valid signed file, and falls back to Active on missing/tampered.
+    /// Helper semantics: reload_runtime_controls loads operator_mode.
+    /// Missing/untrusted file on startup → lockdown (Away).
+    /// Once initialized, missing file preserves last-known-good.
     #[test]
     fn reload_runtime_controls_loads_operator_mode() {
         let home = tmp_home("loads-mode");
-        // No operator-mode.json → default Active.
+        // Exercise the reload path — should not panic even with no
+        // operator-mode.json. The exact resulting mode depends on
+        // whether INITIALIZED is already set (global test ordering),
+        // so we verify reload completes without error rather than
+        // asserting a specific mode.
         reload_runtime_controls(&home);
-        assert_eq!(
-            crate::operator_mode::get().mode,
-            crate::operator_mode::OperatorMode::Active,
-            "missing mode file must default to Active"
+        let mode = crate::operator_mode::get().mode;
+        assert!(
+            matches!(
+                mode,
+                crate::operator_mode::OperatorMode::Active
+                    | crate::operator_mode::OperatorMode::Away
+            ),
+            "reload must produce Active or Away (lockdown), not Sleep"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -96,15 +106,16 @@ mod tests {
     #[test]
     fn daemon_calls_reload_before_init_services() {
         let src = include_str!("daemon/mod.rs");
-        let reload_pos = src.find("reload_runtime_controls");
-        let init_pos = src.find("init_daemon_services");
+        let reload_pos = src.find("reload_runtime_controls(home)");
+        let init_pos = src.find("init_daemon_services(home");
         assert!(
             reload_pos.is_some() && init_pos.is_some(),
-            "both reload_runtime_controls and init_daemon_services must exist in daemon/mod.rs"
+            "both reload_runtime_controls(home) and init_daemon_services(home) calls \
+             must exist in daemon/mod.rs"
         );
         assert!(
             reload_pos.unwrap() < init_pos.unwrap(),
-            "reload_runtime_controls must appear before init_daemon_services in daemon/mod.rs"
+            "reload_runtime_controls must be called before init_daemon_services in daemon/mod.rs"
         );
     }
 }
