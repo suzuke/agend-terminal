@@ -198,7 +198,7 @@ pub(crate) fn scan_and_emit_with<F, G>(
                         if matches!(
                             rt.record().status,
                             crate::task_events::TaskStatus::Done
-                                | crate::task_events::TaskStatus::Verified
+                                | crate::task_events::TaskStatus::Cancelled
                         ) {
                             crate::daemon::ci_handoff_track::reactivate_track(
                                 home,
@@ -1360,6 +1360,32 @@ mod tests {
         );
     }
 
+    fn seed_nonterminal_task(home: &Path, task_id: &str) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        std::fs::create_dir_all(&board).ok();
+        let emitter = InstanceName::from("test");
+        let _ = crate::task_events::append(
+            &board,
+            &emitter,
+            TaskEvent::Created {
+                task_id: TaskId(task_id.to_string()),
+                title: "test".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                tags: Vec::new(),
+                owner: None,
+                depends_on: Vec::new(),
+                parent_id: None,
+                branch: None,
+                due_at: None,
+                routed_to: None,
+                bind: None,
+                eta_secs: None,
+            },
+        );
+    }
+
     #[test]
     fn deferred_track_suppresses_renudge() {
         let home = tmp_home("defer-suppress");
@@ -1489,13 +1515,16 @@ mod tests {
         let home = tmp_home("defer-mcp");
         write_fleet(&home);
         seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-mcp");
+        seed_nonterminal_task(&home, "t-mcp-wake");
 
         let args = serde_json::json!({
             "action": "defer",
-            "correlation": "o/r@b",
+            "repository": "o/r",
+            "branch": "b",
             "episode": "ep-mcp",
             "wake_task_id": "t-mcp-wake",
             "reason": "busy with other task",
+            "defer_secs": 600,
         });
         let sender = None;
         let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
@@ -1507,6 +1536,101 @@ mod tests {
         };
         let result = crate::mcp::handlers::dispatch::dispatch_ci(&ctx);
         assert_eq!(result["ok"], true, "ci action=defer must succeed: {result}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn defer_rejects_nonexistent_wake_task() {
+        let home = tmp_home("defer-no-task");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-notask");
+
+        let args = serde_json::json!({
+            "action": "defer",
+            "repository": "o/r",
+            "branch": "b",
+            "episode": "ep-notask",
+            "wake_task_id": "t-nonexistent",
+            "reason": "test",
+            "defer_secs": 120,
+        });
+        let sender = None;
+        let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "reviewer",
+            sender: &sender,
+            runtime: None,
+        };
+        let result = crate::mcp::handlers::dispatch::dispatch_ci(&ctx);
+        assert_eq!(
+            result["code"], "wake_task_not_found",
+            "nonexistent wake_task_id must be rejected: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn defer_rejects_empty_reason() {
+        let home = tmp_home("defer-empty-reason");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-empty");
+        seed_nonterminal_task(&home, "t-er");
+
+        let args = serde_json::json!({
+            "action": "defer",
+            "repository": "o/r",
+            "branch": "b",
+            "episode": "ep-empty",
+            "wake_task_id": "t-er",
+            "reason": "",
+            "defer_secs": 120,
+        });
+        let sender = None;
+        let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "reviewer",
+            sender: &sender,
+            runtime: None,
+        };
+        let result = crate::mcp::handlers::dispatch::dispatch_ci(&ctx);
+        assert_eq!(
+            result["code"], "missing_reason",
+            "empty reason must be rejected: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn defer_rejects_invalid_defer_secs() {
+        let home = tmp_home("defer-bad-secs");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-badsecs");
+        seed_nonterminal_task(&home, "t-bs");
+
+        let args = serde_json::json!({
+            "action": "defer",
+            "repository": "o/r",
+            "branch": "b",
+            "episode": "ep-badsecs",
+            "wake_task_id": "t-bs",
+            "reason": "test",
+            "defer_secs": 10,
+        });
+        let sender = None;
+        let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "reviewer",
+            sender: &sender,
+            runtime: None,
+        };
+        let result = crate::mcp::handlers::dispatch::dispatch_ci(&ctx);
+        assert_eq!(
+            result["code"], "invalid_defer_secs",
+            "defer_secs outside 60..3600 must be rejected: {result}"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -1548,6 +1672,52 @@ mod tests {
         assert_eq!(h["state"], "deferred");
         assert_eq!(h["wake_task_id"], "t-wake");
         assert!(h["defer_expires_at"].is_string());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn corrupt_defer_expiry_reactivates_failsafe() {
+        let home = tmp_home("defer-corrupt");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 5, "ep-corrupt");
+
+        crate::daemon::ci_handoff_track::defer_track(
+            &home,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-corrupt",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 3600,
+            },
+        );
+        let tracks = crate::daemon::ci_handoff_track::list(&home);
+        let (track_path, track) = tracks
+            .iter()
+            .find(|(_, t)| t.correlation == "o/r@b")
+            .unwrap();
+        let mut t = track.clone();
+        t.defer_expires_at = Some("not-a-valid-date".into());
+        let body = serde_json::to_vec_pretty(&t).unwrap();
+        std::fs::write(track_path, body).unwrap();
+
+        let now = chrono::Utc::now();
+        let mut esc = HashMap::new();
+        let mut ren = HashMap::new();
+        let nudged = run_watchdog(&home, &now, &mut esc, &mut ren);
+        assert!(
+            !nudged.is_empty(),
+            "corrupt defer_expires_at must trigger fail-safe reactivation"
+        );
+        let tracks = crate::daemon::ci_handoff_track::list(&home);
+        let track = tracks.iter().find(|(_, t)| t.correlation == "o/r@b");
+        assert!(
+            track.is_some_and(|(_, t)| !t.is_deferred()),
+            "corrupt expiry must reactivate (fail-safe)"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 }

@@ -132,10 +132,14 @@ impl CiHandoffTrack {
     }
 
     pub fn is_defer_expired(&self, now: &chrono::DateTime<chrono::Utc>) -> bool {
-        self.defer_expires_at
+        match self
+            .defer_expires_at
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .is_some_and(|exp| *now >= exp.with_timezone(&chrono::Utc))
+        {
+            Some(exp) => *now >= exp.with_timezone(&chrono::Utc),
+            None => true, // missing/malformed → expired (fail-safe, never indefinite)
+        }
     }
 }
 

@@ -562,6 +562,26 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             let age_secs = chrono::DateTime::parse_from_rfc3339(&t.sent_at)
                 .ok()
                 .map(|s| now_secs - s.timestamp());
+            let message_id: Option<String> = t.ci_handoff_episode.as_deref().and_then(|ep| {
+                let inbox_path = crate::inbox::inbox_path_resolved(home, &t.target);
+                let content = std::fs::read_to_string(&inbox_path).ok()?;
+                let matches: Vec<String> = content
+                    .lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<crate::inbox::InboxMessage>(line).ok()
+                    })
+                    .filter(|m| {
+                        m.kind.as_deref() == Some("ci-ready-for-action")
+                            && m.ci_handoff_episode.as_deref() == Some(ep)
+                    })
+                    .filter_map(|m| m.id.clone())
+                    .collect();
+                if matches.len() == 1 {
+                    Some(matches.into_iter().next()?)
+                } else {
+                    None
+                }
+            });
             json!({
                 "target": t.target,
                 "correlation": t.correlation,
@@ -575,6 +595,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
                 "wake_task_id": t.wake_task_id,
                 "defer_expires_at": t.defer_expires_at,
                 "defer_reason": t.defer_reason,
+                "message_id": message_id,
             })
         })
         .collect();
@@ -586,12 +607,17 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
 }
 
 pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let correlation = match args["correlation"].as_str().filter(|s| !s.is_empty()) {
-        Some(c) => c,
+    let repository = match args["repository"].as_str().filter(|s| !s.is_empty()) {
+        Some(r) => r,
         None => {
-            return json!({"error": "missing required 'correlation'", "code": "missing_correlation"})
+            return json!({"error": "missing required 'repository'", "code": "missing_repository"})
         }
     };
+    let branch = match args["branch"].as_str().filter(|s| !s.is_empty()) {
+        Some(b) => b,
+        None => return json!({"error": "missing required 'branch'", "code": "missing_branch"}),
+    };
+    let correlation = format!("{repository}@{branch}");
     let episode = match args["episode"].as_str().filter(|s| !s.is_empty()) {
         Some(e) => e,
         None => return json!({"error": "missing required 'episode'", "code": "missing_episode"}),
@@ -602,12 +628,50 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
             return json!({"error": "missing required 'wake_task_id'", "code": "missing_wake_task_id"})
         }
     };
-    let reason = args["reason"].as_str().unwrap_or("deferred by agent");
-    let defer_secs = args["defer_secs"].as_i64().unwrap_or(600).clamp(60, 3600);
+    let reason = match args["reason"].as_str().filter(|s| !s.is_empty()) {
+        Some(r) => r,
+        None => {
+            return json!({"error": "missing required non-empty 'reason'", "code": "missing_reason"})
+        }
+    };
+    let defer_secs = match args["defer_secs"].as_i64() {
+        Some(s) if (60..=3600).contains(&s) => s,
+        Some(s) => {
+            return json!({
+                "error": format!("defer_secs {s} outside 60..3600"),
+                "code": "invalid_defer_secs"
+            })
+        }
+        None => {
+            return json!({
+                "error": "missing required 'defer_secs'",
+                "code": "missing_defer_secs"
+            })
+        }
+    };
+    match crate::tasks::load_routed(home, wake_task_id) {
+        Ok(rt) => {
+            if matches!(
+                rt.record().status,
+                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
+            ) {
+                return json!({
+                    "error": format!("wake_task_id '{wake_task_id}' is already terminal"),
+                    "code": "wake_task_terminal"
+                });
+            }
+        }
+        Err(_) => {
+            return json!({
+                "error": format!("wake_task_id '{wake_task_id}' not found"),
+                "code": "wake_task_not_found"
+            });
+        }
+    }
 
     let tracks = crate::daemon::ci_handoff_track::list(home);
     let track = tracks.iter().find(|(_, t)| {
-        t.correlation == correlation
+        t.correlation == correlation.as_str()
             && t.ci_handoff_episode.as_deref() == Some(episode)
             && (instance_name.is_empty() || t.target == instance_name)
     });
@@ -619,7 +683,7 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
     use crate::daemon::ci_handoff_track::{DeferOutcome, DeferRequest};
     let req = DeferRequest {
         target,
-        correlation,
+        correlation: &correlation,
         episode,
         deferred_by: if instance_name.is_empty() {
             "operator"

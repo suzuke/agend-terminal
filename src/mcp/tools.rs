@@ -1133,6 +1133,11 @@ mod tests {
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
             ("ci", "task_id", "ci/watch.rs:163 handle_watch_ci watch back-link (#1031)"),
             ("ci", "head_sha", "ci/watch.rs handle_watch_ci exact-head protected-branch pin (S1)"),
+            ("ci", "correlation", "ci/watch.rs:589 handle_defer_ci track lookup correlation"),
+            ("ci", "episode", "ci/watch.rs:595 handle_defer_ci exact-episode CAS identity"),
+            ("ci", "wake_task_id", "ci/watch.rs:599 handle_defer_ci task-wake predicate"),
+            ("ci", "reason", "ci/watch.rs:605 handle_defer_ci deferral reason"),
+            ("ci", "defer_secs", "ci/watch.rs:606 handle_defer_ci bounded expiry (60..3600)"),
             // ── repo ──
             ("repo", "action", "ci/mod.rs routing"),
             ("repo", "pr", "ci/mod.rs handle_merge_repo"),
