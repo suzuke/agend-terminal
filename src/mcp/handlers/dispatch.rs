@@ -1448,12 +1448,12 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Baseline count: exactly 11 same-daemon api::call production sites
-    /// remain in src/mcp/handlers/ at this commit (was 12 before Slice 9
-    /// removed the supervised restart SHUTDOWN loopback). Any addition without
-    /// a corresponding removal is a regression.
+    /// Baseline count: exactly 10 same-daemon api::call production sites
+    /// remain in src/mcp/handlers/ at the post-Slice-10 target (was 11 before
+    /// the managed DELETE loopback is removed). This RED expectation must move
+    /// only with the corresponding production deletion.
     #[test]
-    fn production_api_call_baseline_is_11_2454() {
+    fn production_api_call_baseline_is_10_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
@@ -1482,8 +1482,8 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 11,
-            "production same-daemon api::call baseline must be exactly 11; got {count}"
+            count, 10,
+            "production same-daemon api::call baseline must be exactly 10; got {count}"
         );
     }
 
