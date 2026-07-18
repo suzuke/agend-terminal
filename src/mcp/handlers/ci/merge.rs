@@ -6,25 +6,32 @@ use std::path::Path;
 /// Separated for testability — the merge handler calls this after
 /// `MergeVerdict::Confirmed`. Returns diagnostic fields to embed in the
 /// merge response. Merge success is truthful regardless of this outcome.
+///
+/// `pr_branch`: the PR's source branch (headRefName). Used to find the
+/// task assignee whose binding matches this branch — NOT the merge caller,
+/// because the merge caller is typically the orchestrator (unbound).
 pub(crate) fn post_merge_receipt_and_watch(
     home: &Path,
     repo: &str,
     merge_commit: &str,
     pr: u64,
-    instance_name: &str,
+    pr_branch: &str,
+    merge_authority: &str,
 ) -> Value {
-    let binding_task_id = crate::binding::read(home, instance_name)
-        .and_then(|b| b["task_id"].as_str().map(String::from));
-    let Some(task_id) = binding_task_id else {
-        return json!({"skipped": "no task-linked binding for caller"});
+    let Some((assignee, task_id)) = resolve_task_assignee_for_branch(home, repo, pr_branch) else {
+        return json!({"skipped": "no task-linked binding for PR branch"});
     };
+    let expiry =
+        chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
     let receipt = crate::merge_receipt::MergeReceipt {
         repo: repo.to_string(),
         merge_sha: merge_commit.to_string(),
         task_id: task_id.clone(),
-        requesting_agent: instance_name.to_string(),
+        task_assignee: assignee.clone(),
+        merge_authority: merge_authority.to_string(),
         pr_number: pr,
         created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: expiry.to_rfc3339(),
     };
     if let Err(e) = crate::merge_receipt::persist(home, &receipt) {
         return json!({"receipt_error": format!("receipt persist failed: {e}")});
@@ -38,18 +45,47 @@ pub(crate) fn post_merge_receipt_and_watch(
             "task_id": &task_id,
             "notification_only": true,
         }),
-        instance_name,
+        &assignee,
     );
     if watch_result.get("error").is_some() {
         json!({
             "receipt": "persisted",
+            "assignee": &assignee,
             "watch_error": watch_result["error"],
         })
     } else {
         json!({
             "receipt": "persisted",
+            "assignee": &assignee,
             "watch": "armed",
         })
+    }
+}
+
+/// Resolve the task assignee for a PR branch by scanning all bindings.
+/// Returns `(agent_name, task_id)` or `None` if no unique match.
+/// Fail-closed: ambiguity (multiple matches) or no match → None.
+fn resolve_task_assignee_for_branch(
+    home: &Path,
+    _repo: &str,
+    branch: &str,
+) -> Option<(String, String)> {
+    if branch.is_empty() {
+        return None;
+    }
+    let bindings = crate::binding::binding_scan_all(home);
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for (agent, binding) in &bindings {
+        let b_branch = binding["branch"].as_str().unwrap_or("");
+        let b_task = binding["task_id"].as_str().unwrap_or("");
+        if b_branch == branch && !b_task.is_empty() {
+            matches.push((agent.clone(), b_task.to_string()));
+        }
+    }
+    if matches.len() == 1 {
+        Some(matches.remove(0))
+    } else {
+        None
     }
 }
 
@@ -147,24 +183,18 @@ pub(crate) fn base_drift_refusal(merge_state_status: &str) -> Option<(&'static s
 /// `force`). `base_ref_oid` is the base BRANCH's current tip (it advances as the
 /// base moves), so comparing it gate-vs-pre-merge detects a base advance by EXACT
 /// identity — `mergeStateStatus` is derived + laggy and cannot prove base identity.
-fn acquire_head_base(repo: &str, pr: u64) -> Option<(String, String)> {
+fn acquire_head_base(repo: &str, pr: u64) -> Option<(String, String, String)> {
     let s = crate::scm::make_scm_provider(repo, None)
-        .pr_view(repo, pr, &["headRefOid", "baseRefOid"])
+        .pr_view(repo, pr, &["headRefOid", "baseRefOid", "headRefName"])
         .ok()?;
-    // Fail closed unless BOTH are FULL commit OIDs (40/64-hex). Non-empty is not
-    // a commit-identity invariant: an abbreviated/non-hex head would reach
-    // `--match-head-commit` ambiguously, and a malformed base returned identically
-    // across the gate+recheck reads would falsely satisfy the exact-base identity
-    // check. Reuses the canonical `is_full_commit_sha` (the same invariant that
-    // guards exact-head CI watches) so both acquire sites (gate + pre-merge
-    // recheck) and both paths (incl. force) enforce one unambiguous identity.
     let head = s
         .head_ref_oid
         .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
     let base = s
         .base_ref_oid
         .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
-    Some((head, base))
+    let branch = s.head_ref.unwrap_or_default();
+    Some((head, base, branch))
 }
 
 pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
@@ -191,7 +221,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // head+base it INTENDS; if either can't be read, fail closed (never merge a
     // head/base we cannot identify). `force` relaxes only the CI/verdict/freshness
     // POLICY below, never this acquisition nor the pre-merge identity recheck.
-    let (gated_head, gated_base) = match acquire_head_base(&repo, pr) {
+    let (gated_head, gated_base, pr_branch) = match acquire_head_base(&repo, pr) {
         Some(hb) => hb,
         None => {
             return json!({
@@ -318,7 +348,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // residual — true base atomicity awaits a merge-queue (separate spike). Note:
     // `verify_merge_landed` proves only that the PR LANDED, not that the merge was
     // free of a semantic phantom-reversion; it is NOT a base-race backstop.
-    let (head_now, base_now) = match acquire_head_base(&repo, pr) {
+    let (head_now, base_now, _) = match acquire_head_base(&repo, pr) {
         Some(hb) => hb,
         None => {
             return json!({
@@ -378,8 +408,14 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
                     "forced": force,
                     "mergeCommit": &merge_commit,
                 });
-                let diag =
-                    post_merge_receipt_and_watch(home, &repo, &merge_commit, pr, instance_name);
+                let diag = post_merge_receipt_and_watch(
+                    home,
+                    &repo,
+                    &merge_commit,
+                    pr,
+                    &pr_branch,
+                    instance_name,
+                );
                 if let Some(obj) = resp.as_object_mut() {
                     obj.insert("post_merge".into(), diag);
                 }

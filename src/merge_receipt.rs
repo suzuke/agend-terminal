@@ -6,9 +6,11 @@ pub(crate) struct MergeReceipt {
     pub repo: String,
     pub merge_sha: String,
     pub task_id: String,
-    pub requesting_agent: String,
+    pub task_assignee: String,
+    pub merge_authority: String,
     pub pr_number: u64,
     pub created_at: String,
+    pub expires_at: String,
 }
 
 fn receipts_dir(home: &Path) -> PathBuf {
@@ -45,9 +47,20 @@ pub(crate) fn find(
     let path = receipts_dir(home).join(format!("{key}.json"));
     let content = std::fs::read_to_string(path).ok()?;
     let receipt: MergeReceipt = serde_json::from_str(&content).ok()?;
-    if receipt.repo == repo && receipt.merge_sha == merge_sha && receipt.task_id == task_id {
-        Some(receipt)
-    } else {
-        None
+    if receipt.repo != repo || receipt.merge_sha != merge_sha || receipt.task_id != task_id {
+        return None;
     }
+    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&receipt.expires_at) {
+        if chrono::Utc::now() > exp {
+            return None;
+        }
+    }
+    Some(receipt)
+}
+
+#[allow(dead_code)]
+pub(crate) fn remove(home: &Path, repo: &str, merge_sha: &str, task_id: &str) {
+    let key = receipt_key(repo, merge_sha, task_id);
+    let path = receipts_dir(home).join(format!("{key}.json"));
+    let _ = std::fs::remove_file(path);
 }

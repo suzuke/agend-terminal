@@ -55,11 +55,11 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                     "code": "notification_only_no_receipt",
                 });
             };
-            if !instance_name.is_empty() && receipt.requesting_agent != instance_name {
+            if !instance_name.is_empty() && receipt.task_assignee != instance_name {
                 return json!({
                     "error": format!(
-                        "notification_only watch: caller '{}' is not the merge requester '{}'",
-                        instance_name, receipt.requesting_agent
+                        "notification_only watch: caller '{}' is not the task assignee '{}'",
+                        instance_name, receipt.task_assignee
                     ),
                     "code": "notification_only_unauthorized",
                 });
