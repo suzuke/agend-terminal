@@ -100,3 +100,26 @@ fn list_response_does_not_hold_registry_lock_across_dispatch_idle_io_api() {
         offenders.join("\n")
     );
 }
+
+/// #2454 S3 r2 RED: an indented/nested `fn list_snapshot(` decoy must NOT
+/// be selected by the extraction helper.  The current `trim_start`-based
+/// discovery accepts indented lines, so a nested decoy produces a
+/// non-empty body — this test fails until the helper requires column-0.
+#[test]
+fn indented_list_snapshot_decoy_must_not_be_selected() {
+    let decoy = "\
+        fn other() {\n\
+            fn list_snapshot(home: &Path) -> Value {\n\
+                lock_registry(r);\n\
+                drop(reg);\n\
+            }\n\
+        }\n";
+    let body = list_snapshot_body(decoy);
+    assert!(
+        body.is_empty(),
+        "an indented/nested list_snapshot must not be selected; \
+         got {} lines: {:?}",
+        body.len(),
+        body
+    );
+}
