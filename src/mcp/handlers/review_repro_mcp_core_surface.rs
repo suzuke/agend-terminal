@@ -69,6 +69,7 @@ fn create_instance_branch_main_rejected_e4_5_mcp_core_surface() {
         "lead",
         &json!({ "name": "f1-main-instance", "backend": "claude", "branch": "main" }),
         &spawn_fn,
+        None,
     );
 
     assert!(
@@ -102,6 +103,7 @@ fn create_instance_team_name_traversal_rejected_mcp_core_surface() {
         &home,
         &json!({ "team": "../../tmp/evil-mcp-core-surface", "count": 1 }),
         "lead",
+        None,
     );
 
     let err = error_str(&result).to_lowercase();
@@ -135,6 +137,7 @@ fn create_instance_team_count_capped_mcp_core_surface() {
         &home,
         &json!({ "team": "cap-team-mcp-core-surface", "count": 10000 }),
         "lead",
+        None,
     );
 
     let err = error_str(&result).to_lowercase();

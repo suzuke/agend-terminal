@@ -236,11 +236,11 @@ pub(crate) fn dispatch_instance(ctx: &HandlerCtx<'_>) -> Value {
         other => json!({"error": format!("unknown instance action: {other}")}),
     }
 }
-adapter!(
-    dispatch_create_instance,
-    hai,
-    instance::handle_create_instance
-);
+/// #2454 S8: custom dispatch so the delayed INJECT thread receives the
+/// runtime registry for in-process injection.
+pub(crate) fn dispatch_create_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_create_instance(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
+}
 /// #2454: custom (not `adapter!`) so `handle_interrupt` receives the
 /// `RuntimeContext` for its in-process best-effort snapshot (its INJECT stays a
 /// loopback). Mirrors `dispatch_instance`/`dispatch_list_instances`.
@@ -1390,48 +1390,63 @@ mod tests {
 
     // ── #2454 Slice 8: delayed async INJECT loopback RED ──────────────
 
-    /// Source invariant: the fire-and-forget INJECT thread in
-    /// instance_state/mod.rs (team_task_inject) must call
-    /// `agent_ops::inject_input`, not `api::call`.
+    /// #2454 S8: runtime=Some routes through inject_input (succeeds with
+    /// a live mock agent, no daemon needed).
     #[test]
-    fn team_task_inject_thread_uses_inject_input_not_api_call_2454() {
-        let src = include_str!("instance_state/mod.rs");
-        let needle_start =
-            "thread::Builder::new()\n                        .name(\"team_task_inject\"";
-        let start = src.find(needle_start).expect("team_task_inject thread");
-        let region = &src[start..start + 500.min(src.len() - start)];
-        let has_api_call = region.contains(concat!("crate::", "api::", "call"));
-        let has_inject_input = region.contains(concat!("agent_ops::", "inject_input"));
+    fn inject_with_routing_runtime_some_uses_inject_input_2454() {
+        use crate::mcp::handlers::instance_state::spawn::inject_with_routing;
+        let home =
+            std::env::temp_dir().join(format!("agend-inject-routing-some-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let registry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("agent-x");
+        let id = handle.id;
+        registry.lock().insert(id, handle);
+        let externals =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  agent-x:\n    id: {}\n", id.full()),
+        )
+        .unwrap();
+        let rt_arcs = (registry, externals);
+        let result = inject_with_routing(&home, "agent-x", b"hello", Some(&rt_arcs));
         assert!(
-            !has_api_call && has_inject_input,
-            "team_task_inject thread must use agent_ops::inject_input, not api::call; \
-             api_call={has_api_call}, inject_input={has_inject_input}"
+            result.is_ok(),
+            "runtime=Some must succeed in-process without a daemon: {result:?}"
         );
+        std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Source invariant: the fire-and-forget INJECT thread in
-    /// instance_state/spawn.rs (task_inject) must call
-    /// `agent_ops::inject_input`, not `api::call`.
+    /// #2454 S8: runtime=None falls back to legacy api::call (fails with
+    /// no daemon — proving it actually tries the socket path).
     #[test]
-    fn spawn_task_inject_thread_uses_inject_input_not_api_call_2454() {
-        let src = include_str!("instance_state/spawn.rs");
-        let needle_start = "thread::Builder::new()\n                    .name(\"task_inject\"";
-        let start = src.find(needle_start).expect("task_inject thread");
-        let region = &src[start..start + 600.min(src.len() - start)];
-        let has_api_call = region.contains(concat!("crate::", "api::", "call"));
-        let has_inject_input = region.contains(concat!("agent_ops::", "inject_input"));
+    fn inject_with_routing_runtime_none_uses_api_call_2454() {
+        use crate::mcp::handlers::instance_state::spawn::inject_with_routing;
+        let home =
+            std::env::temp_dir().join(format!("agend-inject-routing-none-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let result = inject_with_routing(&home, "any-agent", b"hello", None);
         assert!(
-            !has_api_call && has_inject_input,
-            "task_inject thread must use agent_ops::inject_input, not api::call; \
-             api_call={has_api_call}, inject_input={has_inject_input}"
+            result.is_err(),
+            "runtime=None must attempt api::call (fails with no daemon): {result:?}"
         );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("daemon") || err.contains("run dir"),
+            "runtime=None error must come from api::call path: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Baseline count: exactly 13 same-daemon api::call production sites
-    /// remain in src/mcp/handlers/ at this commit. Any addition without
-    /// a corresponding removal is a regression.
+    /// Baseline count: exactly 12 same-daemon api::call production sites
+    /// remain in src/mcp/handlers/ at this commit (was 13 pre-S8; the
+    /// team_task_inject thread's direct call consolidated into the shared
+    /// inject_with_routing helper). Any addition without a corresponding
+    /// removal is a regression.
     #[test]
-    fn production_api_call_baseline_is_13_2454() {
+    fn production_api_call_baseline_is_12_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
@@ -1460,8 +1475,38 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 13,
-            "production same-daemon api::call baseline must be exactly 13; got {count}"
+            count, 12,
+            "production same-daemon api::call baseline must be exactly 12; got {count}"
+        );
+    }
+
+    /// Wiring pin: both fire-and-forget thread bodies must call the shared
+    /// `inject_with_routing` helper (not inline api::call or inject_input).
+    #[test]
+    fn both_delayed_inject_threads_call_shared_helper_2454() {
+        let helper = concat!("inject_with_", "routing");
+        let mod_src = include_str!("instance_state/mod.rs");
+        let team_start = mod_src
+            .find("\"team_task_inject\"")
+            .expect("team_task_inject thread marker");
+        let team_end = team_start + 400.min(mod_src.len() - team_start);
+        let team_begin = team_start.saturating_sub(400);
+        let team_region = &mod_src[team_begin..team_end];
+        assert!(
+            team_region.contains(helper),
+            "team_task_inject region must call inject_with_routing"
+        );
+
+        let spawn_src = include_str!("instance_state/spawn.rs");
+        let task_start = spawn_src
+            .find("\"task_inject\"")
+            .expect("task_inject thread marker");
+        let task_end = task_start + 400.min(spawn_src.len() - task_start);
+        let task_begin = task_start.saturating_sub(1000);
+        let task_region = &spawn_src[task_begin..task_end];
+        assert!(
+            task_region.contains(helper),
+            "task_inject region must call inject_with_routing"
         );
     }
 }

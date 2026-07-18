@@ -12,8 +12,64 @@ use crate::agent_ops::validate_branch;
 use serde_json::{json, Value};
 use std::path::Path;
 
-pub(super) fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Value {
-    spawn_single_instance_impl(home, instance_name, args, &crate::api::call)
+/// #2454 S8 test seam: when Some(home), the delayed inject thread body
+/// runs inline (no spawn, no sleep) for that specific home only.
+#[cfg(test)]
+pub(crate) static INJECT_INLINE: parking_lot::Mutex<Option<std::path::PathBuf>> =
+    parking_lot::Mutex::new(None);
+
+/// #2454 S8 test seam: when Some, `spawn_single_instance` uses this
+/// instead of `crate::api::call` for the SPAWN RPC leaf only.
+#[cfg(test)]
+pub(crate) type SpawnRpcFn =
+    fn(&std::path::Path, &serde_json::Value) -> anyhow::Result<serde_json::Value>;
+
+#[cfg(test)]
+pub(crate) static SPAWN_OVERRIDE: parking_lot::Mutex<Option<(std::path::PathBuf, SpawnRpcFn)>> =
+    parking_lot::Mutex::new(None);
+
+/// #2454 S8: synchronous inject routing — the testable core shared by the
+/// fire-and-forget threads. Returns Ok(()) on success or Err(detail) on
+/// failure. Extracted so routing tests exercise the real branch without
+/// a 3s sleep.
+pub(in crate::mcp::handlers) fn inject_with_routing(
+    home: &Path,
+    target: &str,
+    data: &[u8],
+    rt_arcs: Option<&(crate::agent::AgentRegistry, crate::agent::ExternalRegistry)>,
+) -> Result<(), String> {
+    if let Some((reg, ext)) = rt_arcs {
+        crate::agent_ops::inject_input(reg, ext, home, target, data, false)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        let resp = crate::api::call(
+            home,
+            &json!({"method": crate::api::method::INJECT, "params": {"name": target, "data": String::from_utf8_lossy(data)}}),
+        );
+        match resp {
+            Ok(v) if v["ok"].as_bool() == Some(true) => Ok(()),
+            Ok(v) => Err(v.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+pub(super) fn spawn_single_instance(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    runtime: Option<&super::super::dispatch::RuntimeContext>,
+) -> Value {
+    #[cfg(test)]
+    {
+        if let Some((ref scope_home, f)) = *SPAWN_OVERRIDE.lock() {
+            if home == scope_home.as_path() {
+                return spawn_single_instance_impl(home, instance_name, args, &f, runtime);
+            }
+        }
+    }
+    spawn_single_instance_impl(home, instance_name, args, &crate::api::call, runtime)
 }
 
 /// Inner impl of [`spawn_single_instance`] parameterized on the SPAWN RPC for
@@ -23,6 +79,7 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
     instance_name: &str,
     args: &Value,
     spawn_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+    runtime: Option<&super::super::dispatch::RuntimeContext>,
 ) -> Value {
     let raw_name = match args["name"].as_str() {
         Some(n) => n,
@@ -259,41 +316,44 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
                 let h = home.to_path_buf();
                 let n = name.to_string();
                 // fire-and-forget: single-agent task injection (M5 §10.5).
-                std::thread::Builder::new()
-                    .name("task_inject".into())
-                    .spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        // #2004: a swallowed INJECT failure left a slow-starting
-                        // member idle with ZERO task context, invisibly. Pure
-                        // surfacing — the spawn itself already succeeded, so a
-                        // failed inject stays non-fatal (operator re-injects).
-                        let resp = crate::api::call(
-                            &h,
-                            &json!({"method": crate::api::method::INJECT, "params": {"name": n, "data": task_text}}),
+                let rt_arcs = runtime.map(|rt| {
+                    (
+                        std::sync::Arc::clone(&rt.registry),
+                        std::sync::Arc::clone(&rt.externals),
+                    )
+                });
+                #[cfg(test)]
+                let run_inline = INJECT_INLINE.lock().as_ref() == Some(&h);
+                #[cfg(not(test))]
+                let run_inline = false;
+                let inject_body = move || {
+                    if let Err(detail) =
+                        inject_with_routing(&h, &n, task_text.as_bytes(), rt_arcs.as_ref())
+                    {
+                        tracing::warn!(
+                            agent = %n,
+                            error = %detail,
+                            "team-spawn task INJECT failed — member started without its task text (re-inject manually)"
                         );
-                        let failed = match &resp {
-                            Ok(v) => v["ok"].as_bool() != Some(true),
-                            Err(_) => true,
-                        };
-                        if failed {
-                            let detail = match resp {
-                                Ok(v) => v.to_string(),
-                                Err(e) => e.to_string(),
-                            };
-                            tracing::warn!(
-                                agent = %n,
-                                error = %detail,
-                                "team-spawn task INJECT failed — member started without its task text (re-inject manually)"
-                            );
-                            crate::event_log::log(
-                                &h,
-                                "team_spawn_inject_failed",
-                                &n,
-                                &format!("task text inject failed after spawn: {detail}"),
-                            );
-                        }
-                    })
-                    .ok();
+                        crate::event_log::log(
+                            &h,
+                            "team_spawn_inject_failed",
+                            &n,
+                            &format!("task text inject failed after spawn: {detail}"),
+                        );
+                    }
+                };
+                if run_inline {
+                    inject_body();
+                } else {
+                    std::thread::Builder::new()
+                        .name("task_inject".into())
+                        .spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                            inject_body();
+                        })
+                        .ok();
+                }
             }
             let mut result = json!({"name": name, "backend": command});
             if let Some(tid) = topic_id {

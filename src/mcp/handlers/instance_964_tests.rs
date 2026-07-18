@@ -68,6 +68,7 @@ fn t1_create_instance_persists_topic_id() {
         "test-spawner",
         &json!({"name": "t1-instance", "backend": "claude"}),
         &spawn_fn,
+        None,
     );
 
     assert_eq!(
@@ -104,6 +105,7 @@ fn t2_spawn_failure_rolls_back_fleet_yaml_entry() {
         "test-spawner",
         &json!({"name": "t2-instance", "backend": "claude"}),
         &spawn_fn,
+        None,
     );
 
     assert!(
@@ -145,6 +147,7 @@ fn t2b_api_unavailable_rolls_back_fleet_yaml_entry() {
         "test-spawner",
         &json!({"name": "t2b-instance", "backend": "claude"}),
         &spawn_fn,
+        None,
     );
 
     assert!(
@@ -187,6 +190,7 @@ fn t3_topic_binding_skip_persists_to_fleet_yaml_and_spawn_params() {
         "test-spawner",
         &json!({"name": "t3-skip", "backend": "claude", "topic_binding": "skip"}),
         &spawn_fn,
+        None,
     );
     assert!(result.get("error").is_none(), "must succeed: {result}");
 
@@ -218,6 +222,7 @@ fn t4_topic_binding_omitted_defaults_to_auto() {
         "test-spawner",
         &json!({"name": "t4-auto", "backend": "claude"}),
         &spawn_fn,
+        None,
     );
     assert!(result.get("error").is_none(), "must succeed: {result}");
 
@@ -249,6 +254,7 @@ fn t5_topic_binding_deferred_persists_and_forwards() {
         "test-spawner",
         &json!({"name": "t5-deferred", "backend": "claude", "topic_binding": "deferred"}),
         &spawn_fn,
+        None,
     );
     assert!(result.get("error").is_none(), "must succeed: {result}");
 
@@ -276,6 +282,7 @@ fn t6_topic_binding_invalid_value_treated_as_auto() {
         "test-spawner",
         &json!({"name": "t6-invalid", "backend": "claude", "topic_binding": "bogus"}),
         &spawn_fn,
+        None,
     );
     assert!(result.get("error").is_none(), "must succeed: {result}");
 
@@ -311,6 +318,7 @@ fn create_instance_persists_args_and_model_for_restart_parity_1858() {
         "spawner",
         &json!({"name": "dev-x", "backend": "claude", "args": "--foo bar", "model": "opus"}),
         &spawn_fn,
+        None,
     );
 
     // The persisted entry (what a restart re-resolves) must carry args + model.
@@ -376,6 +384,7 @@ fn create_instance_routes_model_through_chokepoint_2744() {
             "spawner",
             &json!({"name": "seat", "backend": backend, "model": "legacy-or-real"}),
             &spawn_fn,
+            None,
         );
         assert!(
             r.get("error").is_none(),
@@ -411,6 +420,7 @@ fn create_instance_persists_model_tier_for_restart_parity_2477() {
         "spawner",
         &json!({"name": "dev-tier", "backend": "claude", "model_tier": "cheap"}),
         &spawn_fn,
+        None,
     );
 
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
@@ -444,6 +454,7 @@ fn create_instance_name_plus_team_count_conflict_errors_2037() {
         &home,
         &serde_json::json!({"name": "exact-name", "team": "squad", "count": 3}),
         "lead",
+        None,
     );
     assert!(
         resp["error"]
@@ -456,6 +467,7 @@ fn create_instance_name_plus_team_count_conflict_errors_2037() {
         &home,
         &serde_json::json!({"name": "exact-name", "team": "squad", "backends": ["claude", "codex"]}),
         "lead",
+        None,
     );
     assert!(
         resp["error"]
