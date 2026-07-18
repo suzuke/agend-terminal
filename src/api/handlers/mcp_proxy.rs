@@ -736,11 +736,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// #2454 Slice 6 RED correction: exercise the real mcp_tool ingress so the
-    /// notifier is part of the acceptance path, not only a direct API
-    /// characterization. The current RuntimeContext drops this borrowed
-    /// notifier and the MCP handler still self-IPC's, so both calls fail with
-    /// no API listener until GREEN threads the owned notifier through.
+    /// #2454 Slice 6: exercise the real mcp_tool ingress so notifier
+    /// propagation is covered as part of the acceptance contract, alongside
+    /// the direct API characterization. This regression test preserves the
+    /// no-loopback runtime path and ordered event-log/notifier semantics.
     #[test]
     fn move_pane_mcp_ingress_preserves_notifier_and_event_log_2454() {
         use crate::api::{ApiEvent, ApiNotifier, PaneMoveSplitDir};

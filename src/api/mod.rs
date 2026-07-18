@@ -71,16 +71,6 @@ pub enum PaneMoveSplitDir {
     Vertical,
 }
 
-impl PaneMoveSplitDir {
-    #[allow(dead_code)]
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "vertical" | "v" => Self::Vertical,
-            _ => Self::Horizontal,
-        }
-    }
-}
-
 /// Layout hint for newly created instances. Parsed at the API boundary so
 /// invalid values are caught early rather than silently defaulting downstream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
