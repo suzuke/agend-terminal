@@ -10,18 +10,17 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         None => return json!({"ok": false, "error": "missing name"}),
     };
     let outcome = crate::teams::update_with_diff(ctx.home, params);
-    if let Some(error) = outcome.result["error"].as_str() {
-        return json!({"ok": false, "error": error});
-    }
-    if let Some(n) = ctx.notifier {
-        let diff_nonempty = !outcome.added.is_empty() || !outcome.removed.is_empty();
-        if diff_nonempty {
-            tracing::info!(team = %team_name, added = ?outcome.added, removed = ?outcome.removed, "UPDATE_TEAM emitting TeamMembersChanged");
-            n.notify(ApiEvent::TeamMembersChanged {
-                name: team_name.clone(),
-                added: outcome.added.clone(),
-                removed: outcome.removed.clone(),
-            });
+    if outcome.result.get("error").is_none() {
+        if let Some(n) = ctx.notifier {
+            let diff_nonempty = !outcome.added.is_empty() || !outcome.removed.is_empty();
+            if diff_nonempty {
+                tracing::info!(team = %team_name, added = ?outcome.added, removed = ?outcome.removed, "UPDATE_TEAM emitting TeamMembersChanged");
+                n.notify(ApiEvent::TeamMembersChanged {
+                    name: team_name.clone(),
+                    added: outcome.added.clone(),
+                    removed: outcome.removed.clone(),
+                });
+            }
         }
     }
     json!({"ok": true, "result": outcome.result})
@@ -490,6 +489,32 @@ mod tests {
             team.accept_from
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_team_error_preserves_outer_success_envelope_2454() {
+        let home = tmp_home("update-error-envelope");
+        crate::teams::create(
+            &home,
+            &json!({
+                "name": "devs",
+                "members": ["lead"],
+                "orchestrator": "lead",
+            }),
+        );
+        let response = handle_update_team(
+            &json!({"name": "devs", "remove": ["lead"]}),
+            &test_ctx(&home),
+        );
+        assert_eq!(
+            response["ok"], true,
+            "API wire envelope changed: {response}"
+        );
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cannot remove orchestrator")));
         std::fs::remove_dir_all(&home).ok();
     }
 }
