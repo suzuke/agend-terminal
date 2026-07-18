@@ -228,10 +228,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["ci_provider_url"] = json!(u);
     }
     watch["subscribers"] = json!(subscribers_json);
-    // DEPRECATED: `instance` field kept as legacy alias for one release
-    // cycle so a daemon running pre-r0 binary against post-r0 watch
-    // files can still read SOMEONE. Set to first subscriber, removed
-    // Sprint 55. Post-r0 daemons read `subscribers` first.
+    // DEPRECATED: legacy alias; post-r0 daemons read `subscribers`.
     watch["instance"] = json!(subscribers.first().cloned().unwrap_or_default());
     // #1991: an explicit (re-)watch overrides a prior unwatch tombstone —
     // the human/agent decision to watch again clears the auto-arm optout.
@@ -256,24 +253,11 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             }
         }
     }
-    // #1031: persist dispatch task_id when supplied (by
-    // dispatch_auto_bind_lease) so the ci_check_repo emit site can
-    // populate `[ci-ready-for-action]` InboxMessage's task_id field,
-    // giving the reviewer a structured back-link to the originating
-    // dispatch. Manual `ci action=watch` callers may also pass
-    // task_id explicitly to bind the watch to a specific task.
+    // #1031: persist dispatch task_id as structured back-link.
     if let Some(tid) = args["task_id"].as_str().filter(|s| !s.is_empty()) {
         watch["task_id"] = json!(tid);
     }
-    // #972 reviewer-rejection fix: persist `review_class` so the
-    // pr_state aggregator can honor §3.5 dual-review at runtime. Accepted
-    // values: `"single"` (default — §3.6) or `"dual"` (§3.5). Other
-    // strings are tolerated and treated as Single at read time
-    // (see `daemon::ci_watch::poller::parse_review_class`). Without
-    // this field operator must currently `delete fleet.yaml` to
-    // remove the watch and re-arm with `--review-class dual` —
-    // documented as a workflow gap to close in a follow-up CLI/MCP
-    // exposure.
+    // #972: persist review_class for §3.5 dual-review gate.
     if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
         watch["review_class"] = json!(rc);
     }
@@ -329,7 +313,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // and emits `[ci-conflict-detected]` to every subscriber if the
     // PR is in DIRTY state. Fail-open on any provider error.
     let subscribers_for_alert: Vec<String> = crate::daemon::ci_watch::parse_subscribers(&watch);
-    if let Some(provider) = build_default_provider(repo) {
+    if let Some(provider) = super::build_default_provider(repo) {
         crate::daemon::ci_watch::watch_start_check_mergeable(
             home,
             &watch_path,
@@ -759,28 +743,6 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
 }
 
 /// #813: build the default `CiProvider` for a repo URL. Mirrors
-fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch::CiProvider>> {
-    use crate::daemon::ci_watch::{
-        detect_provider_from_remote, BitbucketCiProvider, CiProvider, GitHubCiProvider,
-        GitLabCiProvider,
-    };
-    let (kind, _is_custom) = detect_provider_from_remote(repo);
-    let provider: Option<Box<dyn CiProvider>> = match kind {
-        "gitlab" => GitLabCiProvider::with_base_url("https://gitlab.com".to_string())
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn CiProvider>),
-        "bitbucket_cloud" => {
-            BitbucketCiProvider::with_base_url("https://api.bitbucket.org".to_string())
-                .ok()
-                .map(|p| Box::new(p) as Box<dyn CiProvider>)
-        }
-        _ => GitHubCiProvider::with_base_url("https://api.github.com".to_string())
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn CiProvider>),
-    };
-    provider
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "watch_tests.rs"]

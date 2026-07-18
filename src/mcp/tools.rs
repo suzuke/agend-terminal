@@ -1162,6 +1162,7 @@ mod tests {
             ("ci", "wake_task_id", "ci/watch.rs:599 handle_defer_ci task-wake predicate"),
             ("ci", "reason", "ci/watch.rs:605 handle_defer_ci deferral reason"),
             ("ci", "defer_secs", "ci/watch.rs:606 handle_defer_ci bounded expiry (60..3600)"),
+            ("ci", "notification_only", "ci/watch.rs:33 handle_watch_ci #2812 notification-only exact-head watch"),
             // ── repo ──
             ("repo", "action", "ci/mod.rs routing"),
             ("repo", "pr", "ci/mod.rs handle_merge_repo"),
