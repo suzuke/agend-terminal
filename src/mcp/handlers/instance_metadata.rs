@@ -564,22 +564,23 @@ mod blocked_reason_runtime_2454_tests {
         );
     }
 
-    /// #2454 S4 RED (supplemental): `handle_interrupt` with a live
+    /// #2454 S4 immutable RED: `handle_interrupt` with a live
     /// RuntimeContext (seeded fleet.yaml/UUID) must succeed without a
-    /// daemon. Currently fails because the inject path uses `api::call`
-    /// (socket loopback) — the error must mention API/unavailable.
+    /// daemon. This test is IMMUTABLE — GREEN makes it pass without
+    /// editing this assertion.
     #[test]
     fn interrupt_uses_runtime_context_without_api_listener_2454() {
         let (rt, home) = runtime_with_agent("agent-x");
         let result = handle_interrupt(&home, &json!({"instance": "agent-x"}), Some(&rt));
-        let err = result["error"].as_str().unwrap_or("");
         assert!(
-            err.contains("API unavailable") || err.contains("not reachable"),
-            "RED: current interrupt must fail via api::call loopback; got: {result}"
+            result.get("error").is_none(),
+            "interrupt via runtime must succeed without a daemon; got: {result}"
         );
-        // GREEN expectation (uncomment after migration):
-        // assert!(result.get("error").is_none(), "interrupt via runtime must succeed: {result}");
-        // assert_eq!(result["ok"].as_bool(), Some(true), "ok:true expected: {result}");
+        assert_eq!(
+            result["ok"].as_bool(),
+            Some(true),
+            "interrupt must return ok:true on success: {result}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
