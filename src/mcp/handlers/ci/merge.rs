@@ -1,5 +1,57 @@
+use super::watch::handle_watch_ci;
 use serde_json::{json, Value};
 use std::path::Path;
+
+/// #2812: post-merge receipt persistence + notification-only watch auto-arm.
+/// Separated for testability — the merge handler calls this after
+/// `MergeVerdict::Confirmed`. Returns diagnostic fields to embed in the
+/// merge response. Merge success is truthful regardless of this outcome.
+pub(crate) fn post_merge_receipt_and_watch(
+    home: &Path,
+    repo: &str,
+    merge_commit: &str,
+    pr: u64,
+    instance_name: &str,
+) -> Value {
+    let binding_task_id = crate::binding::read(home, instance_name)
+        .and_then(|b| b["task_id"].as_str().map(String::from));
+    let Some(task_id) = binding_task_id else {
+        return json!({"skipped": "no task-linked binding for caller"});
+    };
+    let receipt = crate::merge_receipt::MergeReceipt {
+        repo: repo.to_string(),
+        merge_sha: merge_commit.to_string(),
+        task_id: task_id.clone(),
+        requesting_agent: instance_name.to_string(),
+        pr_number: pr,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = crate::merge_receipt::persist(home, &receipt) {
+        return json!({"receipt_error": format!("receipt persist failed: {e}")});
+    }
+    let watch_result = handle_watch_ci(
+        home,
+        &json!({
+            "repository": repo,
+            "branch": "main",
+            "head_sha": merge_commit,
+            "task_id": &task_id,
+            "notification_only": true,
+        }),
+        instance_name,
+    );
+    if watch_result.get("error").is_some() {
+        json!({
+            "receipt": "persisted",
+            "watch_error": watch_result["error"],
+        })
+    } else {
+        json!({
+            "receipt": "persisted",
+            "watch": "armed",
+        })
+    }
+}
 
 /// #1467: outcome of post-merge verification via `gh pr view`.
 pub(crate) enum MergeVerdict {
@@ -319,12 +371,20 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         // reported merged:true while still OPEN, commits unpushed). Verify the
         // post-condition with `gh pr view` before claiming success.
         Ok(crate::scm::MergeOutcome::Submitted) => match verify_merge_landed(&repo, pr) {
-            MergeVerdict::Confirmed(merge_commit) => json!({
-                "merged": true,
-                "pr": pr,
-                "forced": force,
-                "mergeCommit": merge_commit,
-            }),
+            MergeVerdict::Confirmed(merge_commit) => {
+                let mut resp = json!({
+                    "merged": true,
+                    "pr": pr,
+                    "forced": force,
+                    "mergeCommit": &merge_commit,
+                });
+                let diag =
+                    post_merge_receipt_and_watch(home, &repo, &merge_commit, pr, instance_name);
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("post_merge".into(), diag);
+                }
+                resp
+            }
             MergeVerdict::Unconfirmed {
                 state,
                 merge_state_status,

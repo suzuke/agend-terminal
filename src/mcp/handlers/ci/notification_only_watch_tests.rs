@@ -181,3 +181,102 @@ fn notification_only_valid_succeeds_and_idempotent() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── Production-seam tests for post_merge_receipt_and_watch ──
+
+/// Production seam: merge success with binding → receipt persisted + watch armed.
+#[test]
+fn post_merge_with_binding_persists_receipt_and_arms_watch() {
+    let home = tmp_home("post-merge-ok");
+    let sha = "1".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    seed_binding(&home, "dev", "t-merge");
+
+    let diag = super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 99, "dev");
+
+    assert_eq!(
+        diag["receipt"], "persisted",
+        "receipt must be persisted: {diag}"
+    );
+    assert_eq!(diag["watch"], "armed", "watch must be armed: {diag}");
+    let receipt = crate::merge_receipt::find(&home, REPO, &sha, "t-merge");
+    assert!(receipt.is_some(), "receipt must be findable on disk");
+    let r = receipt.unwrap();
+    assert_eq!(r.requesting_agent, "dev");
+    assert_eq!(r.pr_number, 99);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Production seam: merge success without binding → skipped gracefully.
+#[test]
+fn post_merge_without_binding_skips_gracefully() {
+    let home = tmp_home("post-merge-nobound");
+    let sha = "2".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    // No binding seeded.
+
+    let diag = super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 100, "dev");
+
+    assert!(
+        diag["skipped"].as_str().is_some(),
+        "no binding → must skip: {diag}"
+    );
+    assert!(
+        crate::merge_receipt::find(&home, REPO, &sha, "t-any").is_none(),
+        "no receipt without binding"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Production seam: merge success remains truthful even if watch arm fails.
+#[test]
+fn post_merge_watch_failure_still_persists_receipt() {
+    let home = tmp_home("post-merge-watchfail");
+    let sha = "3".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    seed_binding(&home, "dev", "t-watchfail");
+
+    // Make the watch arm fail by blocking the ci-watches dir as a file.
+    let watches_dir = home.join("ci-watches");
+    std::fs::write(&watches_dir, b"blocker").unwrap();
+
+    let diag = super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 101, "dev");
+
+    assert_eq!(
+        diag["receipt"], "persisted",
+        "receipt persisted despite watch fail: {diag}"
+    );
+    assert!(
+        diag["watch_error"].is_string(),
+        "watch error must be surfaced: {diag}"
+    );
+    let receipt = crate::merge_receipt::find(&home, REPO, &sha, "t-watchfail");
+    assert!(receipt.is_some(), "receipt survives watch failure");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Binding mismatch on manual notification_only → rejected.
+#[test]
+fn notification_only_binding_task_mismatch_rejected() {
+    let home = tmp_home("bind-mm");
+    let sha = "4".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    seed_binding(&home, "dev", "t-different");
+    seed_receipt(&home, REPO, &sha, "t-bind-mm", "dev");
+
+    let r = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO, "branch": "main",
+            "head_sha": sha, "task_id": "t-bind-mm",
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert!(
+        r.get("error").is_some(),
+        "binding task mismatch → reject: {r}"
+    );
+    assert_eq!(r["code"], "notification_only_binding_mismatch");
+    std::fs::remove_dir_all(&home).ok();
+}

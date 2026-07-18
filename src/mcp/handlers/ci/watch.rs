@@ -64,6 +64,21 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                     "code": "notification_only_unauthorized",
                 });
             }
+            if !instance_name.is_empty() {
+                let binding = crate::binding::read(home, instance_name);
+                let bound_task = binding
+                    .as_ref()
+                    .and_then(|b| b["task_id"].as_str())
+                    .unwrap_or("");
+                if bound_task != task_id {
+                    return json!({
+                        "error": format!(
+                            "notification_only watch: caller binding task_id '{bound_task}' does not match watch task_id '{task_id}'"
+                        ),
+                        "code": "notification_only_binding_mismatch",
+                    });
+                }
+            }
             // Passes all guards — fall through to arm the watch below.
         } else if !has_task_id || next_targets.is_empty() {
             return json!({
