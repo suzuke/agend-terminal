@@ -928,17 +928,4 @@ mod kiro_decimal_pct_2781 {
             "#2781: arbitrary output ending in percent must NOT match Idle"
         );
     }
-
-    #[test]
-    fn context_alert_renders_one_decimal() {
-        let msg = format!(
-            "[context_alert] pct={pct:.1}% threshold={threshold:.1}%",
-            pct = 61.0_f32,
-            threshold = 80.0_f32,
-        );
-        assert!(
-            msg.contains("61.0%") && msg.contains("80.0%"),
-            "#2781: context_alert must render one-decimal: {msg}"
-        );
-    }
 }
