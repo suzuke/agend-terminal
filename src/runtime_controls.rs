@@ -48,36 +48,76 @@ mod tests {
     }
 
     /// Helper semantics: reload_runtime_controls loads a valid signed
-    /// operator_mode. Use the production set_mode API to create a real
-    /// HMAC-signed Sleep fixture, then verify reload picks it up.
+    /// operator_mode. Use two distinct homes to prove the shared seam
+    /// reloads from the TARGET home, not from stale global state.
     #[test]
+    #[serial_test::serial]
     fn reload_runtime_controls_loads_signed_operator_mode() {
-        let home = tmp_home("loads-signed-mode");
-        // Use production API to write a valid signed Sleep mode.
+        let target_home = tmp_home("loads-signed-target");
+        let control_home = tmp_home("loads-signed-control");
+
+        // Write signed Sleep+delegate to the TARGET home.
         crate::operator_mode::set_mode(
-            &home,
+            &target_home,
             crate::operator_mode::OperatorMode::Sleep,
             Some("delegate-agent".into()),
             vec!["restart".into()],
         )
-        .expect("set_mode must succeed");
+        .expect("set_mode Sleep on target must succeed");
 
-        // Reload through the shared seam.
-        reload_runtime_controls(&home);
+        // Set global to Active via a DIFFERENT home so global is NOT Sleep.
+        crate::operator_mode::set_mode(
+            &control_home,
+            crate::operator_mode::OperatorMode::Active,
+            None,
+            Vec::new(),
+        )
+        .expect("set_mode Active on control must succeed");
+        // Reload control so global is Active.
+        crate::operator_mode::reload(&control_home);
+        let pre = crate::operator_mode::get();
+        assert_ne!(
+            pre.mode,
+            crate::operator_mode::OperatorMode::Sleep,
+            "precondition: global must NOT be Sleep before reload"
+        );
+
+        // Reload through the shared seam targeting the Sleep home.
+        reload_runtime_controls(&target_home);
 
         let state = crate::operator_mode::get();
         assert_eq!(
             state.mode,
             crate::operator_mode::OperatorMode::Sleep,
-            "reload_runtime_controls must load the signed Sleep mode from disk"
+            "reload_runtime_controls must load the signed Sleep mode from target_home"
         );
         assert_eq!(
             state.delegate_to.as_deref(),
             Some("delegate-agent"),
-            "delegate_to must survive reload"
+            "delegate_to must survive reload from target_home"
         );
 
         // Reset to Active for other tests.
+        crate::operator_mode::set_mode(
+            &control_home,
+            crate::operator_mode::OperatorMode::Active,
+            None,
+            Vec::new(),
+        )
+        .ok();
+        crate::operator_mode::reload(&control_home);
+        std::fs::remove_dir_all(&target_home).ok();
+        std::fs::remove_dir_all(&control_home).ok();
+    }
+
+    /// Shared-seam fail-closed: tampered/missing operator_mode file
+    /// must not crash and must preserve the current mode (fail-closed).
+    #[test]
+    #[serial_test::serial]
+    fn reload_runtime_controls_tampered_mode_fails_closed() {
+        let home = tmp_home("tampered-mode");
+
+        // Set global to Active first.
         crate::operator_mode::set_mode(
             &home,
             crate::operator_mode::OperatorMode::Active,
@@ -85,6 +125,28 @@ mod tests {
             Vec::new(),
         )
         .ok();
+        crate::operator_mode::reload(&home);
+        assert_eq!(
+            crate::operator_mode::get().mode,
+            crate::operator_mode::OperatorMode::Active,
+            "precondition: global is Active"
+        );
+
+        // Write garbage to the operator_mode file.
+        let mode_path = home.join("operator_mode.json");
+        std::fs::write(&mode_path, b"TAMPERED GARBAGE").unwrap();
+
+        // Reload through the shared seam — must not crash.
+        reload_runtime_controls(&home);
+
+        // Mode must remain Active (fail-closed).
+        let state = crate::operator_mode::get();
+        assert_eq!(
+            state.mode,
+            crate::operator_mode::OperatorMode::Active,
+            "tampered operator_mode must fail-closed and preserve current mode"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -102,50 +164,60 @@ mod tests {
     }
 
     /// Startup ordering: reload_runtime_controls must be called BEFORE
-    /// setup_app_bootstrap within the run_app function body.
+    /// setup_app_bootstrap within the run_app function body (bounded slice).
     #[test]
     fn app_calls_reload_before_bootstrap() {
         let src = include_str!("app/mod.rs");
-        // Anchor within run_app function body — find its definition first.
         let fn_start = src
-            .find("fn run_app(")
+            .find("\nfn run_app(")
+            .or_else(|| src.find("fn run_app("))
             .expect("fn run_app must exist in app/mod.rs");
-        let body = &src[fn_start..];
+        // End the body slice at the next top-level function definition.
+        let after_start = &src[fn_start + 1..];
+        let fn_end = after_start
+            .find("\nfn setup_app_bootstrap")
+            .or_else(|| after_start.find("\npub fn setup_app_bootstrap"))
+            .unwrap_or(after_start.len());
+        let body = &after_start[..fn_end];
         let reload_pos = body
             .find("reload_runtime_controls")
-            .expect("reload_runtime_controls must be called inside run_app");
+            .expect("reload_runtime_controls call must exist inside run_app body");
         let bootstrap_pos = body
             .find("setup_app_bootstrap")
-            .expect("setup_app_bootstrap must be called inside run_app");
+            .expect("setup_app_bootstrap call must exist inside run_app body");
         assert!(
             reload_pos < bootstrap_pos,
             "reload_runtime_controls must appear before setup_app_bootstrap \
-             within the run_app function body"
+             within the bounded run_app function body"
         );
     }
 
     /// Startup ordering: reload_runtime_controls must be called BEFORE
-    /// init_daemon_services within the run_core function body.
+    /// init_daemon_services within the run_core function body (bounded slice).
     #[test]
     fn daemon_calls_reload_before_init_services() {
         let src = include_str!("daemon/mod.rs");
-        // Anchor within run_core function body.
         let fn_start = src
-            .find("fn run_core(")
+            .find("\nfn run_core(")
+            .or_else(|| src.find("fn run_core("))
             .expect("fn run_core must exist in daemon/mod.rs");
-        let body = &src[fn_start..];
+        let after_start = &src[fn_start + 1..];
+        // End the body slice at the next top-level function definition.
+        let fn_end = after_start
+            .find("\nfn init_daemon_services")
+            .or_else(|| after_start.find("\npub fn init_daemon_services"))
+            .unwrap_or(after_start.len());
+        let body = &after_start[..fn_end];
         let reload_pos = body
             .find("reload_runtime_controls(home)")
-            .expect("reload_runtime_controls(home) call must exist inside run_core");
-        // Match the actual function call, not comment mentions.
+            .expect("reload_runtime_controls(home) call must exist inside run_core body");
         let init_pos = body
-            .find("let ctx = init_daemon_services(")
-            .or_else(|| body.find("init_daemon_services(home"))
-            .expect("init_daemon_services call must exist inside run_core");
+            .find("init_daemon_services(")
+            .expect("init_daemon_services call must exist inside run_core body");
         assert!(
             reload_pos < init_pos,
             "reload_runtime_controls must be called before init_daemon_services \
-             within the run_core function body"
+             within the bounded run_core function body"
         );
     }
 }
