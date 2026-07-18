@@ -81,7 +81,7 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
         externals: ctx.externals,
         notifier: ctx.notifier,
     };
-    crate::agent_ops::delete_instance(ctx.home, name, Some(&delete_context), skip_exit_wait);
+    crate::agent_ops::delete_instance(ctx.home, name, &delete_context, skip_exit_wait);
     json!({"ok": true})
 }
 

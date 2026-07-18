@@ -1453,19 +1453,14 @@ mod tests {
     }
 
     /// Baseline count: exactly 10 same-daemon api::call production sites
-    /// remain across MCP dispatch plus the shared neutral service at the
-    /// post-Slice-10 target (was 11 before the managed DELETE loopback is
-    /// removed). This RED expectation must move only with the corresponding
-    /// production deletion.
+    /// remain in src/mcp/handlers/ at the post-Slice-10 target (was 11 before
+    /// the managed DELETE loopback is removed). This RED expectation must move
+    /// only with the corresponding production deletion.
     #[test]
     fn production_api_call_baseline_is_10_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
-        let agent_ops = include_str!("../../agent_ops.rs");
-        let delete_service = &agent_ops[agent_ops
-            .find("// Instance deletion — shared API/MCP runtime service")
-            .expect("shared delete service marker")..];
         let files: &[&str] = &[
             include_str!("comms.rs"),
             include_str!("comms_delegate/mod.rs"),
@@ -1475,7 +1470,6 @@ mod tests {
             include_str!("instance_state/spawn.rs"),
             include_str!("instance_state/lifecycle.rs"),
             include_str!("instance_metadata.rs"),
-            delete_service,
         ];
         let mut count = 0;
         for src in files {

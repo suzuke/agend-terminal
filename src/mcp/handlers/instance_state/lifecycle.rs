@@ -16,6 +16,7 @@
 
 use crate::agent_ops::{cleanup_admission, cleanup_working_dir_admitted};
 use crate::channel::telegram;
+use serde_json::json;
 use std::path::Path;
 
 /// #1907: remove `dir` and any empty subdirectories bottom-up, stopping at any
@@ -32,6 +33,33 @@ fn remove_empty_dir_tree(dir: &Path) {
         }
     }
     let _ = std::fs::remove_dir(dir); // succeeds only if now-empty
+}
+
+/// Route the daemon-side DELETE through the neutral runtime service when the
+/// in-process API context exists.  Callers without that context retain the
+/// single legacy socket fallback for this slice; D4 and D7 both use this
+/// helper so the fallback cannot drift or be duplicated.
+pub(crate) fn delete_with_runtime_or_legacy(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    skip_exit_wait: bool,
+) {
+    if let Some(context) = delete_context {
+        crate::agent_ops::delete_instance(home, name, context, skip_exit_wait);
+    } else {
+        let mut params = json!({"name": name});
+        if skip_exit_wait {
+            params["no_wait"] = json!(true);
+        }
+        let _ = crate::api::call(
+            home,
+            &json!({
+                "method": crate::api::method::DELETE,
+                "params": params,
+            }),
+        );
+    }
 }
 
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
@@ -122,7 +150,7 @@ pub(crate) fn full_delete_instance_with_runtime(
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    crate::agent_ops::delete_instance(home, name, delete_context, false);
+    delete_with_runtime_or_legacy(home, name, delete_context, false);
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");

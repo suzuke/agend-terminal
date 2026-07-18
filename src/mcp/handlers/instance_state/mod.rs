@@ -596,7 +596,7 @@ pub(super) fn handle_restart_instance_with_runtime(
         externals: &runtime.externals,
         notifier: runtime.notifier.as_ref(),
     });
-    crate::agent_ops::delete_instance(home, name, delete_context.as_ref(), true);
+    lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
 
     let spawn_params = restart_spawn_params(
         name,
