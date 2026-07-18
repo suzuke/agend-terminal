@@ -856,13 +856,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     );
     tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
 
-    let (_keepalive, handlers, tick_rx) = build_tick_infrastructure(home, &ctx);
-
-    // PR4: opt-in out-of-band tick-stall diagnostics for the daemon tick host.
-    // `_stall_monitor` is `None` unless `AGEND_TICK_STALL_SECS` enables it; it
-    // lives for the whole `'serve` loop and stops+joins its thread on teardown.
-    let (tick_progress, _stall_monitor) =
-        crate::daemon::tick_stall::start_for_host("daemon-tick", &handlers, home);
+    let (keepalive, tick_rx) = build_tick_infrastructure(home, &ctx);
 
     // #1814 round-2: `'serve` wraps the tick loop + teardown so the final
     // recover-as-primary gate (below) can `continue 'serve` to resume serving if
@@ -881,9 +875,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             }
 
             // PR4: idle, blocked awaiting the next tick/crash/shutdown signal.
-            if let Some(p) = &tick_progress {
-                p.enter_waiting();
-            }
+            keepalive.maintenance.enter_waiting();
             let exit_event: Option<crate::agent::AgentExitEvent>;
             crossbeam_channel::select! {
                 recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
@@ -891,21 +883,11 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 recv(shutdown_rx) -> _ => { continue; }
             }
 
-            let tick_ctx = per_tick::TickContext {
-                home,
-                registry: &ctx.registry,
-                externals: &ctx.externals,
-                configs: &ctx.configs,
-            };
-            // PR4: Preflight — the per-tick config reloads run before the sweep.
-            if let Some(p) = &tick_progress {
-                p.enter_preflight();
-            }
-            crate::runtime_controls::reload_runtime_controls(home);
-            // PR4: the tracked runner publishes Handler(i) per handler and closes
-            // with PostHandlers, which also covers the crash-dispatch below. When
-            // diagnostics are OFF, `tick_progress` is None → untracked (byte-identical).
-            per_tick::run_handlers_with_progress(&handlers, &tick_ctx, tick_progress.as_deref());
+            // The cycle owns preflight, profile handlers, and optional progress;
+            // crash dispatch remains host-local while progress stays PostHandlers.
+            keepalive
+                .maintenance
+                .run_once(home, &ctx.registry, &ctx.externals, &ctx.configs);
 
             let exit_event = match exit_event {
                 Some(e) => e,
@@ -1236,21 +1218,13 @@ fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
 /// until the main loop exits.
 struct TickKeepalive {
     _task_sweep: crate::daemon::task_sweep::TaskSweep,
-    // #2737: owner-service witness held for daemon lifetime. build_tick_infrastructure
-    // cannot construct TickKeepalive without calling the two-phase seam, so run_core's
-    // dual-host reach is a COMPILE property (structural I2, replacing the old
-    // `owner_services_called_by_both_hosts` string-scan).
-    _owner_services: crate::daemon::owner_services::OwnerServicesStarted,
+    maintenance: crate::daemon::owned_maintenance::OwnedMaintenanceCycle,
 }
 
 fn build_tick_infrastructure(
     home: &Path,
     ctx: &DaemonContext,
-) -> (
-    TickKeepalive,
-    Vec<Box<dyn per_tick::PerTickHandler>>,
-    crossbeam_channel::Receiver<()>,
-) {
+) -> (TickKeepalive, crossbeam_channel::Receiver<()>) {
     let _task_sweep =
         crate::daemon::task_sweep::TaskSweep::spawn(home.to_path_buf(), Arc::clone(&ctx.shutdown));
 
@@ -1299,6 +1273,12 @@ fn build_tick_infrastructure(
     let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
         Arc::new(AtomicBool::new(false));
     let handlers = build_default_handlers(daemon_binary_stale);
+    let maintenance = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new(
+        handlers,
+        owner_services,
+        "daemon-tick",
+        home,
+    );
 
     let tick_rx = {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1319,9 +1299,8 @@ fn build_tick_infrastructure(
     (
         TickKeepalive {
             _task_sweep,
-            _owner_services: owner_services,
+            maintenance,
         },
-        handlers,
         tick_rx,
     )
 }
