@@ -616,3 +616,204 @@ fn notification_only_clears_stale_next_after_ci() {
     assert!(found_nac, "notification_only watch must exist in watch dir");
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Strengthened: first arm a privileged watch with non-empty next_after_ci,
+/// then re-arm as notification_only — persisted next_after_ci must be gone.
+#[test]
+fn notification_only_rearm_clears_preexisting_next_after_ci() {
+    let home = tmp_home("rearm-clears-nac");
+    seed_fleet(&home, &["dev", "reviewer"]);
+    let sha = "d".repeat(40);
+    seed_binding(&home, "dev", "t-rearm");
+    seed_receipt(&home, REPO, &sha, "t-rearm", "dev");
+
+    // First arm a privileged exact-head watch WITH next_after_ci.
+    let r1 = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "main",
+            "head_sha": sha,
+            "task_id": "t-rearm",
+            "next_after_ci": "reviewer",
+        }),
+        "", // operator/orchestrator
+    );
+    assert!(
+        r1.get("error").is_none(),
+        "privileged arm must succeed: {r1}"
+    );
+
+    // Verify next_after_ci is set.
+    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let watch_file = find_watch_with_sha(&watch_dir, &sha);
+    assert!(
+        watch_file.is_some(),
+        "watch must exist after privileged arm"
+    );
+    let content = std::fs::read_to_string(watch_file.as_ref().unwrap()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert!(
+        parsed.get("next_after_ci").is_some_and(|v| !v.is_null()),
+        "privileged watch must have next_after_ci: {parsed}"
+    );
+
+    // Re-arm as notification_only.
+    let r2 = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "main",
+            "head_sha": sha,
+            "task_id": "t-rearm",
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert!(
+        r2.get("error").is_none(),
+        "notification_only re-arm must succeed: {r2}"
+    );
+
+    // next_after_ci must now be absent/null.
+    let content2 = std::fs::read_to_string(watch_file.as_ref().unwrap()).unwrap();
+    let parsed2: serde_json::Value = serde_json::from_str(&content2).unwrap();
+    let nac = parsed2.get("next_after_ci");
+    assert!(
+        nac.is_none()
+            || nac.unwrap().is_null()
+            || nac.unwrap().as_array().is_some_and(|a| a.is_empty()),
+        "notification_only re-arm must clear pre-existing next_after_ci: {parsed2}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Poller defense: a WatchState with notification_only=true + stale
+/// next_after_ci cannot enqueue any privileged handoff.
+#[test]
+fn poller_ignores_stale_next_after_ci_when_notification_only() {
+    use crate::daemon::ci_watch::watch_state::WatchState;
+
+    let home = tmp_home("poller-defense");
+    seed_fleet(&home, &["dev", "reviewer"]);
+
+    // Write a watch JSON with notification_only=true AND a stale next_after_ci.
+    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    std::fs::create_dir_all(&watch_dir).ok();
+    let future = (chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap()).to_rfc3339();
+    let watch_json = json!({
+        "repo": REPO,
+        "branch": "main",
+        "interval_secs": 60,
+        "subscribers": [{"instance": "dev", "subscribed_at": chrono::Utc::now().to_rfc3339()}],
+        "target_head_sha": "e".repeat(40),
+        "notification_only": true,
+        "next_after_ci": ["reviewer"],
+        "task_id": "t-poller-defense",
+        "expires_at": future,
+    });
+    let filename =
+        crate::daemon::ci_watch::watch_filename_exact_head(REPO, "main", &"e".repeat(40));
+    std::fs::write(
+        watch_dir.join(&filename),
+        serde_json::to_string(&watch_json).unwrap(),
+    )
+    .unwrap();
+
+    // Parse as WatchState and verify targets are empty.
+    let content = std::fs::read_to_string(watch_dir.join(&filename)).unwrap();
+    let state: WatchState = serde_json::from_str(&content).unwrap();
+    assert!(
+        state.notification_only.unwrap_or(false),
+        "notification_only must be true"
+    );
+    let targets = if state.notification_only.unwrap_or(false) {
+        Vec::<String>::new()
+    } else {
+        state.next_after_ci_targets()
+    };
+    assert!(
+        targets.is_empty(),
+        "poller must ignore next_after_ci when notification_only=true; got: {targets:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Privileged reverse mode change: re-arming the same watch as privileged
+/// (notification_only=false) with authorized next_after_ci must CLEAR the
+/// old notification_only flag and allow the target.
+#[test]
+fn privileged_rearm_clears_notification_only_flag() {
+    let home = tmp_home("reverse-rearm");
+    seed_fleet(&home, &["dev", "reviewer"]);
+    let sha = "f".repeat(40);
+    seed_binding(&home, "dev", "t-reverse");
+    seed_receipt(&home, REPO, &sha, "t-reverse", "dev");
+
+    // First arm as notification_only.
+    let r1 = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "main",
+            "head_sha": sha,
+            "task_id": "t-reverse",
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert!(
+        r1.get("error").is_none(),
+        "notification_only arm must succeed: {r1}"
+    );
+
+    // Verify notification_only is set.
+    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let watch_file = find_watch_with_sha(&watch_dir, &sha);
+    let content = std::fs::read_to_string(watch_file.as_ref().unwrap()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["notification_only"], true);
+
+    // Re-arm as privileged with next_after_ci.
+    let r2 = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": REPO,
+            "branch": "main",
+            "head_sha": sha,
+            "task_id": "t-reverse",
+            "next_after_ci": "reviewer",
+        }),
+        "", // operator/orchestrator
+    );
+    assert!(
+        r2.get("error").is_none(),
+        "privileged re-arm must succeed: {r2}"
+    );
+
+    // notification_only must now be false/absent.
+    let content2 = std::fs::read_to_string(watch_file.as_ref().unwrap()).unwrap();
+    let parsed2: serde_json::Value = serde_json::from_str(&content2).unwrap();
+    let no = parsed2.get("notification_only");
+    assert!(
+        no.is_none() || no.unwrap().is_null() || no.unwrap() == false,
+        "privileged re-arm must clear notification_only flag: {parsed2}"
+    );
+    assert!(
+        parsed2.get("next_after_ci").is_some_and(|v| !v.is_null()),
+        "privileged re-arm must set next_after_ci: {parsed2}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn find_watch_with_sha(watch_dir: &std::path::Path, sha: &str) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(watch_dir).ok()?;
+    for entry in entries.flatten() {
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            if content.contains(sha) {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
