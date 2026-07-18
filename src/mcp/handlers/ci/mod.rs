@@ -144,6 +144,12 @@ mod exact_head_watch_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
 
+// #2812 notification-only watch — guard and contract tests in a sibling file.
+#[cfg(test)]
+#[path = "notification_only_watch_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod notification_only_watch_tests;
+
 // #2755 repo-checkout transactional submodule provisioning — real-entry tests in
 // a sibling file (test-named ⇒ file_size_invariant-exempt; keeps checkout.rs small).
 #[cfg(test)]
@@ -157,6 +163,27 @@ mod checkout_submodule_tests;
 #[path = "review_workspace_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_workspace_tests;
+
+fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch::CiProvider>> {
+    use crate::daemon::ci_watch::{
+        detect_provider_from_remote, BitbucketCiProvider, CiProvider, GitHubCiProvider,
+        GitLabCiProvider,
+    };
+    let (kind, _is_custom) = detect_provider_from_remote(repo);
+    match kind {
+        "gitlab" => GitLabCiProvider::with_base_url("https://gitlab.com".to_string())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn CiProvider>),
+        "bitbucket_cloud" => {
+            BitbucketCiProvider::with_base_url("https://api.bitbucket.org".to_string())
+                .ok()
+                .map(|p| Box::new(p) as Box<dyn CiProvider>)
+        }
+        _ => GitHubCiProvider::with_base_url("https://api.github.com".to_string())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn CiProvider>),
+    }
+}
 
 #[cfg(test)]
 #[path = "watch_status_tests.rs"]

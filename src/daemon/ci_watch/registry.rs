@@ -55,6 +55,17 @@ pub fn remove_watch(
     branch: &str,
     reason: &str,
 ) {
+    if let Ok(content) = std::fs::read_to_string(watch_path) {
+        if let Ok(ws) = serde_json::from_str::<super::watch_state::WatchState>(&content) {
+            if ws.notification_only == Some(true) {
+                if let (Some(sha), Some(tid)) =
+                    (ws.target_head_sha.as_deref(), ws.task_id.as_deref())
+                {
+                    crate::merge_receipt::remove(home, repo, sha, tid);
+                }
+            }
+        }
+    }
     let _ = std::fs::remove_file(watch_path);
     // #1750 A2: remove the sibling `<hash>.lock` too. The lock file is created by
     // `acquire_file_lock` on every poll/update and never had a deletion site, so
@@ -87,6 +98,17 @@ pub(crate) fn remove_watch_json_only(
     branch: &str,
     reason: &str,
 ) -> bool {
+    if let Ok(content) = std::fs::read_to_string(watch_path) {
+        if let Ok(ws) = serde_json::from_str::<super::watch_state::WatchState>(&content) {
+            if ws.notification_only == Some(true) {
+                if let (Some(sha), Some(tid)) =
+                    (ws.target_head_sha.as_deref(), ws.task_id.as_deref())
+                {
+                    crate::merge_receipt::remove(home, repo, sha, tid);
+                }
+            }
+        }
+    }
     match std::fs::remove_file(watch_path) {
         Ok(()) => {
             crate::event_log::log(

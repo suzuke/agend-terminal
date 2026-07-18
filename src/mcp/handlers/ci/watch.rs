@@ -1,15 +1,8 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// `ci watch` action: APPEND-idempotently subscribe `instance_name` to CI
-/// notifications for `repo@branch` (Sprint 54 P0-1: preserves other agents'
-/// subscriptions + existing poll state, vs the prior last-write-wins overwrite).
+/// `ci watch` — subscribe to CI notifications for repo@branch.
 pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
-    // Sprint 55 P0-B: when caller omits `repo` arg, auto-derive from
-    // sender's binding.json source_repo (set by `bind_self` /
-    // `dispatch_auto_bind_lease`). #1619: shared `resolve_repo_or_error`
-    // — explicit error when neither arg nor binding present (no silent
-    // cwd-derivation, no hardcoded fallback).
     let repo_owned = match super::resolve_repo_or_error(home, instance_name, args) {
         Ok(r) => r,
         Err(e) => return e,
@@ -18,16 +11,9 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);
 
-    // S1 exact-head protected-ref gate (decision d-20260712033954660984-4).
-    // A protected ref (main/master) is mutation-free to WATCH, but a GENERIC
-    // watch resolves on any later run and can falsely complete the wrong task —
-    // so it stays E4.5-rejected (via the shared `agent_ops::is_protected_ref`,
-    // same protected set as the worktree-lease gate). The ONLY allowed protected
-    // watch is an EXACT-HEAD post-merge watch: a full immutable target SHA +
-    // `task_id` + explicit `next_after_ci`, created by the target team
-    // orchestrator or operator, on a GitHub repo. The poller then resolves THAT
-    // SHA only (`poll_runs_for_sha`). Non-protected branches are unaffected;
-    // lease/bind/dispatch E4.5 gates are untouched.
+    // S1 exact-head protected-ref gate (d-20260712033954660984-4): protected
+    // refs are E4.5-rejected except exact-head post-merge watches (full SHA +
+    // task_id + next_after_ci/notification_only). #2812 adds notification_only.
     let exact_head_sha: Option<String> = if crate::agent_ops::is_protected_ref(branch) {
         let head_sha = match args["head_sha"].as_str().filter(|s| !s.is_empty()) {
             // Generic protected watch (no pinned SHA) → unchanged E4.5 rejection.
@@ -44,26 +30,79 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             });
         }
         let has_task_id = args["task_id"].as_str().is_some_and(|s| !s.is_empty());
+        let notification_only = args["notification_only"].as_bool().unwrap_or(false);
         let next_targets = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
             args.get("next_after_ci").unwrap_or(&Value::Null),
         );
-        if !has_task_id || next_targets.is_empty() {
+
+        if notification_only {
+            if !has_task_id {
+                return json!({
+                    "error": "notification_only watch requires `task_id`",
+                    "code": "notification_only_missing_task_id",
+                });
+            }
+            if !next_targets.is_empty() {
+                return json!({
+                    "error": "notification_only watch forbids `next_after_ci` — no privileged continuation allowed",
+                    "code": "notification_only_next_after_ci_forbidden",
+                });
+            }
+            let task_id = args["task_id"].as_str().unwrap_or("");
+            let Some(receipt) = crate::merge_receipt::find(home, repo, head_sha, task_id) else {
+                return json!({
+                    "error": "notification_only watch requires a matching merge receipt (repo + head_sha + task_id)",
+                    "code": "notification_only_no_receipt",
+                });
+            };
+            if instance_name.is_empty() {
+                return json!({
+                    "error": "notification_only watch requires an identified caller (not operator/empty)",
+                    "code": "notification_only_empty_caller",
+                });
+            }
+            if receipt.task_assignee != instance_name {
+                return json!({
+                    "error": format!(
+                        "notification_only watch: caller '{}' is not the task assignee '{}'",
+                        instance_name, receipt.task_assignee
+                    ),
+                    "code": "notification_only_unauthorized",
+                });
+            }
+            {
+                let binding = crate::binding::read(home, instance_name);
+                let bound_task = binding
+                    .as_ref()
+                    .and_then(|b| b["task_id"].as_str())
+                    .unwrap_or("");
+                if bound_task != task_id {
+                    return json!({
+                        "error": format!(
+                            "notification_only watch: caller binding task_id '{bound_task}' does not match watch task_id '{task_id}'"
+                        ),
+                        "code": "notification_only_binding_mismatch",
+                    });
+                }
+            }
+            // Passes all guards — fall through to arm the watch below.
+        } else if !has_task_id || next_targets.is_empty() {
             return json!({
                 "error": "exact-head protected watch requires BOTH `task_id` and an explicit `next_after_ci` target",
                 "code": "protected_watch_missing_requirements",
             });
-        }
-        // Authority: operator (anonymous CLI, empty caller) bypasses; otherwise
-        // the caller must be the orchestrator of EVERY next_after_ci target's team.
-        let authorized = instance_name.is_empty()
-            || next_targets
-                .iter()
-                .all(|m| crate::teams::is_orchestrator_of(home, instance_name, m));
-        if !authorized {
-            return json!({
-                "error": format!("'{instance_name}' may not arm a protected-branch exact-head watch — only the target team orchestrator or operator may"),
-                "code": "protected_watch_unauthorized",
-            });
+        } else {
+            // Privileged orchestrator/operator path (unchanged).
+            let authorized = instance_name.is_empty()
+                || next_targets
+                    .iter()
+                    .all(|m| crate::teams::is_orchestrator_of(home, instance_name, m));
+            if !authorized {
+                return json!({
+                    "error": format!("'{instance_name}' may not arm a protected-branch exact-head watch — only the target team orchestrator or operator may"),
+                    "code": "protected_watch_unauthorized",
+                });
+            }
         }
         // By-SHA resolution is GitHub-only this wave — fail loud rather than arm a
         // watch the poller could never resolve.
@@ -189,10 +228,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["ci_provider_url"] = json!(u);
     }
     watch["subscribers"] = json!(subscribers_json);
-    // DEPRECATED: `instance` field kept as legacy alias for one release
-    // cycle so a daemon running pre-r0 binary against post-r0 watch
-    // files can still read SOMEONE. Set to first subscriber, removed
-    // Sprint 55. Post-r0 daemons read `subscribers` first.
+    // DEPRECATED: legacy alias; post-r0 daemons read `subscribers`.
     watch["instance"] = json!(subscribers.first().cloned().unwrap_or_default());
     // #1991: an explicit (re-)watch overrides a prior unwatch tombstone —
     // the human/agent decision to watch again clears the auto-arm optout.
@@ -217,24 +253,11 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             }
         }
     }
-    // #1031: persist dispatch task_id when supplied (by
-    // dispatch_auto_bind_lease) so the ci_check_repo emit site can
-    // populate `[ci-ready-for-action]` InboxMessage's task_id field,
-    // giving the reviewer a structured back-link to the originating
-    // dispatch. Manual `ci action=watch` callers may also pass
-    // task_id explicitly to bind the watch to a specific task.
+    // #1031: persist dispatch task_id as structured back-link.
     if let Some(tid) = args["task_id"].as_str().filter(|s| !s.is_empty()) {
         watch["task_id"] = json!(tid);
     }
-    // #972 reviewer-rejection fix: persist `review_class` so the
-    // pr_state aggregator can honor §3.5 dual-review at runtime. Accepted
-    // values: `"single"` (default — §3.6) or `"dual"` (§3.5). Other
-    // strings are tolerated and treated as Single at read time
-    // (see `daemon::ci_watch::poller::parse_review_class`). Without
-    // this field operator must currently `delete fleet.yaml` to
-    // remove the watch and re-arm with `--review-class dual` —
-    // documented as a workflow gap to close in a follow-up CLI/MCP
-    // exposure.
+    // #972: persist review_class for §3.5 dual-review gate.
     if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
         watch["review_class"] = json!(rc);
     }
@@ -244,6 +267,24 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // exact-head gate above, so a non-protected watch never carries it.
     if let Some(sha) = exact_head_sha.as_deref() {
         watch["target_head_sha"] = json!(sha);
+    }
+    // #2812: notification-only watch — short TTL (1h), persisted flag.
+    // Only valid on protected refs (the gate above validates all guards).
+    let notification_only = args["notification_only"].as_bool().unwrap_or(false);
+    if notification_only {
+        if exact_head_sha.is_none() {
+            return json!({
+                "error": "notification_only watch is only valid on protected refs with an exact head_sha",
+                "code": "notification_only_non_protected",
+            });
+        }
+        watch["notification_only"] = json!(true);
+        watch["next_after_ci"] = json!(null);
+        let short_ttl = chrono::Utc::now()
+            + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
+        watch["expires_at"] = json!(short_ttl.to_rfc3339());
+    } else if let Some(obj) = watch.as_object_mut() {
+        obj.remove("notification_only");
     }
 
     // #779 P2 Piece 3 site B: atomic_write failure (disk full,
@@ -272,7 +313,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // and emits `[ci-conflict-detected]` to every subscriber if the
     // PR is in DIRTY state. Fail-open on any provider error.
     let subscribers_for_alert: Vec<String> = crate::daemon::ci_watch::parse_subscribers(&watch);
-    if let Some(provider) = build_default_provider(repo) {
+    if let Some(provider) = super::build_default_provider(repo) {
         crate::daemon::ci_watch::watch_start_check_mergeable(
             home,
             &watch_path,
@@ -312,12 +353,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     resp
 }
 
-/// `ci unwatch` action: unsubscribe the caller from `repo@branch`.
-/// Sprint 54 P0-1: only the caller is removed from the `subscribers`
-/// array. The watch file is deleted only when the array becomes empty
-/// (no other agent is still interested in this branch).
-// pub(crate): the #1991 auto-arm tombstone regression test (pr_state::auto_arm)
-// exercises the real unwatch → tombstone → no-re-arm chain.
+/// `ci unwatch` — unsubscribe caller from repo@branch.
 pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let repo = match args["repository"].as_str() {
         Some(r) => r,
@@ -450,14 +486,7 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
     })
 }
 
-/// `ci status` MCP action (Sprint 54 P0-5 sub-scope C). Returns a
-/// snapshot of every CI watch the caller subscribes to, with full
-/// health diagnostics inlined. Optional `repo` / `branch` args narrow
-/// the result; both must match when both are provided.
-///
-/// Caller filtering: agents only see watches they're subscribed to —
-/// avoids leaking lead's polling targets to every dev. The empty
-/// instance name (anonymous CLI) sees all watches.
+/// `ci status` — snapshot of CI watches the caller subscribes to.
 pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let filter_repo = args["repository"].as_str();
     let filter_branch = args["branch"].as_str();
@@ -714,34 +743,6 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
 }
 
 /// #813: build the default `CiProvider` for a repo URL. Mirrors
-/// `watcher.rs::check_ci_watches`'s factory but with the canonical
-/// host URLs (no per-watch URL override) — sufficient for the
-/// on-watch-start mergeable check at dispatch time. GitHub fully
-/// implemented; GitLab/Bitbucket return Unknown via the trait
-/// default (§3.7 cross-backend stance — promotion blocked behind
-/// real operator usage).
-fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch::CiProvider>> {
-    use crate::daemon::ci_watch::{
-        detect_provider_from_remote, BitbucketCiProvider, CiProvider, GitHubCiProvider,
-        GitLabCiProvider,
-    };
-    let (kind, _is_custom) = detect_provider_from_remote(repo);
-    let provider: Option<Box<dyn CiProvider>> = match kind {
-        "gitlab" => GitLabCiProvider::with_base_url("https://gitlab.com".to_string())
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn CiProvider>),
-        "bitbucket_cloud" => {
-            BitbucketCiProvider::with_base_url("https://api.bitbucket.org".to_string())
-                .ok()
-                .map(|p| Box::new(p) as Box<dyn CiProvider>)
-        }
-        _ => GitHubCiProvider::with_base_url("https://api.github.com".to_string())
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn CiProvider>),
-    };
-    provider
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "watch_tests.rs"]

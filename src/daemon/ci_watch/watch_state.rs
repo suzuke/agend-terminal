@@ -195,6 +195,9 @@ pub struct WatchState {
     /// so `earliest_subscribed_at` (the normal age anchor) is None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwatched_at: Option<String>,
+    /// #2812: notification-only watch — short-lived, no privileged continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_only: Option<bool>,
 }
 
 fn default_branch() -> String {
@@ -246,6 +249,13 @@ impl WatchState {
 
     pub fn next_after_ci_targets(&self) -> Vec<String> {
         self.next_after_ci.clone().unwrap_or_default()
+    }
+
+    pub fn actionable_next_after_ci_targets(&self) -> Vec<String> {
+        if self.notification_only == Some(true) {
+            return Vec::new();
+        }
+        self.next_after_ci_targets()
     }
 }
 
