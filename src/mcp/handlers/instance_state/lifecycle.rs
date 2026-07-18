@@ -16,7 +16,6 @@
 
 use crate::agent_ops::{cleanup_admission, cleanup_working_dir_admitted};
 use crate::channel::telegram;
-use serde_json::json;
 use std::path::Path;
 
 /// #1907: remove `dir` and any empty subdirectories bottom-up, stopping at any
@@ -123,14 +122,7 @@ pub(crate) fn full_delete_instance_with_runtime(
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    if let Some(context) = delete_context {
-        crate::agent_ops::delete_instance(home, name, Some(context), false);
-    } else {
-        let _ = crate::api::call(
-            home,
-            &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
-        );
-    }
+    crate::agent_ops::delete_instance(home, name, delete_context, false);
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
