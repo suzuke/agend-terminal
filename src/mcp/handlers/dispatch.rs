@@ -307,7 +307,30 @@ pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
-adapter!(dispatch_task, hai, task::handle_task);
+/// #2454 Slice 5: task health/sweep are runtime-backed reads.  They must use
+/// the live registry forwarded through the in-process MCP ingress and must
+/// fail closed when that runtime is absent; all other task actions preserve
+/// the existing public `tasks::handle` path.
+pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
+    let action = ctx.args["action"].as_str().unwrap_or("");
+    if !matches!(action, "health" | "sweep") {
+        return task::handle_task(ctx.home, ctx.args, ctx.instance_name);
+    }
+    let Some(runtime) = ctx.runtime else {
+        return json!({
+            "error": "runtime unavailable: task health/sweep requires the in-process daemon runtime"
+        });
+    };
+    let live_instances =
+        crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals)["result"]
+            ["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| agent["name"].as_str().map(String::from))
+            .collect::<std::collections::HashSet<_>>();
+    crate::tasks::handle_with_live_instances(ctx.home, ctx.instance_name, ctx.args, &live_instances)
+}
 pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
     usage_limit_takeover::handle_usage_limit_takeover(ctx)
 }
@@ -927,5 +950,158 @@ mod tests {
                 "{tool}: null '{field}' must be rejected like missing"
             );
         }
+    }
+
+    // #2454 Slice 5 RED: task health/sweep must consume the live registry
+    // forwarded through the real MCP task dispatcher.  The current handler
+    // still self-IPC's through the API (or reads runtime state from disk), so
+    // these tests deterministically fail with no daemon/socket listener.
+    fn runtime_with_external(name: &str) -> RuntimeContext {
+        RuntimeContext {
+            registry: std::sync::Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            externals: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::from([(
+                    name.to_string(),
+                    crate::agent::ExternalAgentHandle {
+                        backend_command: "codex".to_string(),
+                        pid: 4242,
+                    },
+                )]),
+            )),
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: None,
+        }
+    }
+
+    fn task_runtime_ctx<'a>(
+        home: &'a Path,
+        args: &'a Value,
+        runtime: &'a RuntimeContext,
+    ) -> HandlerCtx<'a> {
+        static EMPTY_SENDER: Option<Sender> = None;
+        HandlerCtx {
+            home,
+            args,
+            instance_name: "operator",
+            sender: &EMPTY_SENDER,
+            runtime: Some(runtime),
+        }
+    }
+
+    fn backdate_task(home: &Path, task_id: &str) {
+        let path = home.join("task_events.jsonl");
+        let old = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let content = std::fs::read_to_string(&path).expect("task event log");
+        let rewritten = content
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).expect("task event JSON");
+                if value["event"]["task_id"] == task_id {
+                    value["timestamp"] = json!(old);
+                }
+                serde_json::to_string(&value).expect("serialized task event")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, format!("{rewritten}\n")).expect("rewrite task event log");
+    }
+
+    #[test]
+    fn task_health_uses_supplied_runtime_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-task-health-runtime-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let created = crate::tasks::handle(
+            &home,
+            "operator",
+            &json!({
+                "action": "create",
+                "title": "runtime-owned task",
+                "assignee": "live-agent"
+            }),
+        );
+        let task_id = created["id"].as_str().expect("created task id");
+        backdate_task(&home, task_id);
+
+        let args = json!({"action": "health"});
+        let runtime = runtime_with_external("live-agent");
+        let ctx = task_runtime_ctx(&home, &args, &runtime);
+        let result = try_dispatch("task", &ctx).expect("task dispatch result");
+        assert_eq!(
+            result["live_agents_available"], true,
+            "health must use the supplied live RuntimeContext without API fallback: {result}"
+        );
+        let strict_owners = result["ghost_owners"]["strict_owners"]
+            .as_array()
+            .expect("strict owner list");
+        assert!(
+            !strict_owners.iter().any(|owner| owner == "live-agent"),
+            "a supplied live owner must not be classified as strict/ghost: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn task_sweep_uses_supplied_runtime_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-task-sweep-runtime-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let created = crate::tasks::handle(
+            &home,
+            "operator",
+            &json!({
+                "action": "create",
+                "title": "runtime-owned stale task",
+                "assignee": "live-agent"
+            }),
+        );
+        let task_id = created["id"].as_str().expect("created task id");
+        backdate_task(&home, task_id);
+
+        let args = json!({"action": "sweep"});
+        let runtime = runtime_with_external("live-agent");
+        let ctx = task_runtime_ctx(&home, &args, &runtime);
+        let result = try_dispatch("task", &ctx).expect("task dispatch result");
+        assert_eq!(
+            result["dry_run"], true,
+            "sweep must return a dry-run plan: {result}"
+        );
+        let disbanded = result["categories"]["team_disbanded"]
+            .as_array()
+            .expect("team_disbanded category");
+        assert!(
+            !disbanded.iter().any(|candidate| candidate["id"] == task_id),
+            "a supplied live owner must not be classified as team-disbanded: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn task_health_and_sweep_runtime_none_are_explicit_errors_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-task-runtime-none-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        for action in ["health", "sweep"] {
+            let args = json!({"action": action});
+            let ctx = ctx_for(&home, &args, "operator");
+            let result = try_dispatch("task", &ctx).expect("task dispatch result");
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("runtime unavailable"),
+                "task action={action} with runtime=None must fail explicitly, never socket-fallback: {result}"
+            );
+        }
+        std::fs::remove_dir_all(home).ok();
     }
 }
