@@ -694,49 +694,43 @@ fn notification_only_rearm_clears_preexisting_next_after_ci() {
 fn poller_ignores_stale_next_after_ci_when_notification_only() {
     use crate::daemon::ci_watch::watch_state::WatchState;
 
-    let home = tmp_home("poller-defense");
-    seed_fleet(&home, &["dev", "reviewer"]);
-
-    // Write a watch JSON with notification_only=true AND a stale next_after_ci.
-    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
-    std::fs::create_dir_all(&watch_dir).ok();
-    let future = (chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap()).to_rfc3339();
-    let watch_json = json!({
+    // notification_only=true + stale target → actionable returns empty
+    let state: WatchState = serde_json::from_value(json!({
         "repo": REPO,
         "branch": "main",
         "interval_secs": 60,
-        "subscribers": [{"instance": "dev", "subscribed_at": chrono::Utc::now().to_rfc3339()}],
+        "subscribers": [],
         "target_head_sha": "e".repeat(40),
         "notification_only": true,
         "next_after_ci": ["reviewer"],
         "task_id": "t-poller-defense",
-        "expires_at": future,
-    });
-    let filename =
-        crate::daemon::ci_watch::watch_filename_exact_head(REPO, "main", &"e".repeat(40));
-    std::fs::write(
-        watch_dir.join(&filename),
-        serde_json::to_string(&watch_json).unwrap(),
-    )
+        "expires_at": (chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap()).to_rfc3339(),
+    }))
     .unwrap();
+    assert!(
+        state.actionable_next_after_ci_targets().is_empty(),
+        "notification_only=true must suppress all next_after_ci targets"
+    );
+    assert_eq!(
+        state.next_after_ci_targets(),
+        vec!["reviewer"],
+        "raw next_after_ci_targets must still return the stored value"
+    );
 
-    // Parse as WatchState and verify targets are empty.
-    let content = std::fs::read_to_string(watch_dir.join(&filename)).unwrap();
-    let state: WatchState = serde_json::from_str(&content).unwrap();
-    assert!(
-        state.notification_only.unwrap_or(false),
-        "notification_only must be true"
+    // ordinary mode + target → actionable returns the target (regression)
+    let ordinary: WatchState = serde_json::from_value(json!({
+        "repo": REPO,
+        "branch": "main",
+        "interval_secs": 60,
+        "subscribers": [],
+        "next_after_ci": ["reviewer"],
+    }))
+    .unwrap();
+    assert_eq!(
+        ordinary.actionable_next_after_ci_targets(),
+        vec!["reviewer"],
+        "ordinary mode must return next_after_ci targets"
     );
-    let targets = if state.notification_only.unwrap_or(false) {
-        Vec::<String>::new()
-    } else {
-        state.next_after_ci_targets()
-    };
-    assert!(
-        targets.is_empty(),
-        "poller must ignore next_after_ci when notification_only=true; got: {targets:?}"
-    );
-    std::fs::remove_dir_all(&home).ok();
 }
 
 /// Privileged reverse mode change: re-arming the same watch as privileged

@@ -250,6 +250,13 @@ impl WatchState {
     pub fn next_after_ci_targets(&self) -> Vec<String> {
         self.next_after_ci.clone().unwrap_or_default()
     }
+
+    pub fn actionable_next_after_ci_targets(&self) -> Vec<String> {
+        if self.notification_only == Some(true) {
+            return Vec::new();
+        }
+        self.next_after_ci_targets()
+    }
 }
 
 pub(crate) fn normalize_next_after_ci(value: &Value) -> Vec<String> {

@@ -2023,7 +2023,7 @@ async fn fan_out_notifications(
             let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
             let supersede_token = format!("ci-{}-{}", run_id, sha);
             let action_targets_on_success = if matches!(outcome, CiOutcome::Success) {
-                state.next_after_ci_targets()
+                state.actionable_next_after_ci_targets()
             } else {
                 Vec::new()
             };
@@ -2197,11 +2197,7 @@ fn persist_watch_state(
             )),
             CiOutcome::Success
         ) {
-            let targets = if state.notification_only.unwrap_or(false) {
-                Vec::new()
-            } else {
-                state.next_after_ci_targets()
-            };
+            let targets = state.actionable_next_after_ci_targets();
             if !targets.is_empty() {
                 // The suppression decision is loop-INVARIANT (keyed on repo/branch/
                 // head, not the target), so load pr_state and decide ONCE rather than
