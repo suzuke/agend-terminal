@@ -563,4 +563,76 @@ mod blocked_reason_runtime_2454_tests {
             "INJECT failure must fail the interrupt: {failed}"
         );
     }
+
+    /// #2454 S4 RED: `handle_interrupt` with a RuntimeContext and a live
+    /// mock agent must succeed without a daemon / API listener. Currently
+    /// fails because the inject path calls `api::call` (socket loopback).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn interrupt_uses_runtime_context_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-interrupt-runtime-2454-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let registry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("target-agent");
+        registry.lock().insert(handle.id, handle);
+        let externals = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let runtime = RuntimeContext {
+            registry,
+            externals,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: None,
+        };
+
+        let result = handle_interrupt(&home, &json!({"name": "target-agent"}), Some(&runtime));
+        assert!(
+            result.get("error").is_none(),
+            "interrupt via runtime must succeed without a daemon; got: {result}"
+        );
+        assert_eq!(
+            result["ok"].as_bool(),
+            Some(true),
+            "interrupt must return ok:true on success: {result}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 S4 RED source invariant: production code in handle_interrupt
+    /// and handle_interrupt_impl must contain ZERO `api::call` references.
+    /// The inject path must use a neutral in-process service.
+    #[test]
+    fn no_production_api_call_in_interrupt_handler_2454() {
+        let source = include_str!("instance_metadata.rs");
+        let in_test_mod = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let production = &source[..in_test_mod];
+        let needle_a = concat!("crate::", "api::", "call");
+        let needle_b = concat!("api::", "call(");
+        let needle_c = concat!("api::", "call)");
+        let violations: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && !trimmed.starts_with("///")
+            })
+            .filter(|(_, line)| {
+                line.contains(needle_a) || line.contains(needle_b) || line.contains(needle_c)
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "instance_metadata.rs interrupt handlers must contain zero production \
+             api::call references; found {}: {:?}",
+            violations.len(),
+            violations
+        );
+    }
 }
