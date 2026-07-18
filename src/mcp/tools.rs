@@ -341,11 +341,10 @@ pub(crate) fn def_ci() -> Value {
             "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
             "task_id": {"type": "string", "description": "watch: optional task id to bind this watch to. Persisted on the watch sidecar as a back-link so the `[ci-ready-for-action]` the daemon emits on CI pass carries a structured reference to the originating task. Normally injected by the dispatch auto-watch (dispatch_auto_bind_lease); a manual `ci action=watch` caller may also pass it to bind the watch to a specific task (#1031)."},
             "head_sha": {"type": "string", "description": "watch: full immutable commit SHA (40- or 64-hex) for an EXACT-HEAD post-merge watch on a protected ref (`main`/`master`). Generic protected-branch watches stay E4.5-rejected; a protected watch is accepted ONLY with `head_sha` PLUS `task_id` and explicit `next_after_ci`, and only from the target team orchestrator or operator. The poller resolves runs for THIS SHA only (GitHub `?head_sha=` fetch), ignoring newer main runs, so a later push can't falsely complete the post-merge check. Ignored on non-protected branches. GitHub-only this wave."},
-            "correlation": {"type": "string", "description": "defer: the repo@branch correlation of the handoff track to defer."},
             "episode": {"type": "string", "description": "defer: exact episode identity for CAS."},
-            "wake_task_id": {"type": "string", "description": "defer: task_id whose terminal state (Done/Verified) will reactivate the track."},
+            "wake_task_id": {"type": "string", "description": "defer: task_id whose terminal state (Done|Cancelled) will reactivate the track."},
             "reason": {"type": "string", "description": "defer: human-readable reason for deferral."},
-            "defer_secs": {"type": "integer", "description": "defer: bounded expiry in seconds (60..3600, default 600)."}
+            "defer_secs": {"type": "integer", "description": "defer: bounded expiry in seconds (60..3600); required, no default."}
         }, "required": ["action"]}})
 }
 
@@ -1133,7 +1132,6 @@ mod tests {
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
             ("ci", "task_id", "ci/watch.rs:163 handle_watch_ci watch back-link (#1031)"),
             ("ci", "head_sha", "ci/watch.rs handle_watch_ci exact-head protected-branch pin (S1)"),
-            ("ci", "correlation", "ci/watch.rs:589 handle_defer_ci track lookup correlation"),
             ("ci", "episode", "ci/watch.rs:595 handle_defer_ci exact-episode CAS identity"),
             ("ci", "wake_task_id", "ci/watch.rs:599 handle_defer_ci task-wake predicate"),
             ("ci", "reason", "ci/watch.rs:605 handle_defer_ci deferral reason"),

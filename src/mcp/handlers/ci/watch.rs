@@ -565,6 +565,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             let message_id: Option<String> = t.ci_handoff_episode.as_deref().and_then(|ep| {
                 let inbox_path = crate::inbox::inbox_path_resolved(home, &t.target);
                 let content = std::fs::read_to_string(&inbox_path).ok()?;
+                let corr = &t.correlation;
                 let matches: Vec<String> = content
                     .lines()
                     .filter_map(|line| {
@@ -573,6 +574,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
                     .filter(|m| {
                         m.kind.as_deref() == Some("ci-ready-for-action")
                             && m.ci_handoff_episode.as_deref() == Some(ep)
+                            && m.correlation_id.as_deref() == Some(corr)
                     })
                     .filter_map(|m| m.id.clone())
                     .collect();
@@ -854,6 +856,106 @@ mod tests {
             resp_all["pending_handoffs"].as_array().unwrap().len(),
             2,
             "anonymous CLI sees every pending handoff: {resp_all}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn status_message_id_matches_by_target_correlation_episode() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-status-msgid-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let ep = "ep-match-test";
+        let corr = "org/repo@feat/x";
+        crate::daemon::ci_handoff_track::record_with_identity(
+            &home,
+            "lead",
+            corr,
+            "2026-07-18T00:00:00Z",
+            None,
+            Some("t-99"),
+            Some(ep),
+            None,
+        );
+
+        crate::inbox::enqueue(
+            &home,
+            "lead",
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-exact-match".into()),
+                from: "system:ci".into(),
+                text: "[ci-ready-for-action]".into(),
+                kind: Some("ci-ready-for-action".into()),
+                correlation_id: Some(corr.into()),
+                ci_handoff_episode: Some(ep.into()),
+                timestamp: "2026-07-18T00:00:00Z".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let resp = handle_status_ci(&home, &json!({}), "lead");
+        let pending = resp["pending_handoffs"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]["message_id"], "m-exact-match",
+            "message_id must match by target+correlation+episode: {resp}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn status_message_id_rejects_wrong_correlation() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-status-msgid-wrongcorr-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let ep = "ep-wrong-corr";
+        crate::daemon::ci_handoff_track::record_with_identity(
+            &home,
+            "lead",
+            "org/repo@feat/x",
+            "2026-07-18T00:00:00Z",
+            None,
+            Some("t-99"),
+            Some(ep),
+            None,
+        );
+
+        // Same episode but DIFFERENT correlation — must NOT match.
+        crate::inbox::enqueue(
+            &home,
+            "lead",
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-wrong-corr".into()),
+                from: "system:ci".into(),
+                text: "[ci-ready-for-action]".into(),
+                kind: Some("ci-ready-for-action".into()),
+                correlation_id: Some("org/repo@feat/WRONG".into()),
+                ci_handoff_episode: Some(ep.into()),
+                timestamp: "2026-07-18T00:00:00Z".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let resp = handle_status_ci(&home, &json!({}), "lead");
+        let pending = resp["pending_handoffs"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0]["message_id"].is_null(),
+            "same episode + different correlation must NOT match: {resp}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
