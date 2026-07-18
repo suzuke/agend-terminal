@@ -299,6 +299,8 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         let short_ttl = chrono::Utc::now()
             + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
         watch["expires_at"] = json!(short_ttl.to_rfc3339());
+    } else if let Some(obj) = watch.as_object_mut() {
+        obj.remove("notification_only");
     }
 
     // #779 P2 Piece 3 site B: atomic_write failure (disk full,
