@@ -306,4 +306,79 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #2454 S3 RED: `describe_instance` (the `instance` param path in
+    /// `list_instances`) must use the supplied RuntimeContext and succeed
+    /// with NO daemon / API listener.  Currently it delegates to
+    /// `handle_describe_instance` which calls `api::call` — this test
+    /// fails until the in-process path is wired.
+    #[test]
+    fn describe_instance_uses_runtime_context_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-describe-runtime-2454-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let registry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("target-agent");
+        registry.lock().insert(handle.id, handle);
+        let externals = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let runtime = RuntimeContext {
+            registry,
+            externals,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: None,
+        };
+
+        let result = handle_list_instances_with_runtime(
+            &home,
+            &json!({"instance": "target-agent"}),
+            "caller",
+            Some(&runtime),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "describe via runtime must succeed without a daemon; got: {result}"
+        );
+        let inst = &result["instance"];
+        assert_eq!(
+            inst["name"].as_str(),
+            Some("target-agent"),
+            "describe must return the target instance from the runtime registry: {result}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 S3 RED source invariant: production code in this module must
+    /// contain ZERO `crate::api::call` invocations.  Any loopback in the
+    /// instance-query path is a regression.
+    #[test]
+    fn no_production_api_call_in_instance_queries_2454() {
+        let source = include_str!("instance_queries.rs");
+        let needle_a = concat!("crate::", "api::", "call");
+        let needle_b = concat!("api::", "call(");
+        let in_test_mod = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let production = &source[..in_test_mod];
+        let production_calls: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && !trimmed.starts_with("///")
+            })
+            .filter(|(_, line)| line.contains(needle_a) || line.contains(needle_b))
+            .collect();
+        assert!(
+            production_calls.is_empty(),
+            "instance_queries.rs must contain zero production api::call sites; found {}: {:?}",
+            production_calls.len(),
+            production_calls
+        );
+    }
 }
