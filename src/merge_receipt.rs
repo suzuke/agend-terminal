@@ -24,6 +24,7 @@ fn receipt_key(repo: &str, merge_sha: &str, task_id: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+#[allow(dead_code)]
 pub(crate) fn persist(home: &Path, receipt: &MergeReceipt) -> Result<(), String> {
     let dir = receipts_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create merge-receipts dir: {e}"))?;
