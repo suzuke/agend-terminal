@@ -34,10 +34,7 @@ fn list_snapshot_body(src: &str) -> Vec<(usize, String)> {
     for (i, raw) in src.lines().enumerate() {
         let trimmed = raw.trim_start();
         if !in_fn {
-            if trimmed.starts_with("pub(crate) fn list_snapshot(")
-                || trimmed.starts_with("fn list_snapshot(")
-                || trimmed.starts_with("pub fn list_snapshot(")
-            {
+            if raw.starts_with("pub(crate) fn list_snapshot(") {
                 in_fn = true;
                 out.push((i + 1, raw.to_string()));
             }
