@@ -535,6 +535,12 @@ mod blocked_reason_runtime_2454_tests {
                 .contains("runtime"),
             "runtime=None must be an explicit error: {no_rt}"
         );
+        let missing = handle_interrupt(&home, &json!({"instance": "missing"}), Some(&rt));
+        assert_eq!(
+            missing["error"].as_str(),
+            Some("agent 'missing' not found"),
+            "unknown target must surface exact domain error: {missing}"
+        );
     }
 
     /// #2454 S4 immutable RED: `handle_interrupt` with a live
