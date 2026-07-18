@@ -1,6 +1,7 @@
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
 use crate::identity::Sender;
+use crate::mcp::handlers::dispatch::RuntimeContext;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -102,15 +103,23 @@ pub(super) fn handle_list_teams(home: &Path) -> Value {
     crate::teams::list(home)
 }
 
-pub(super) fn handle_update_team(home: &Path, args: &Value) -> Value {
-    match crate::api::call(
-        home,
-        &json!({"method": crate::api::method::UPDATE_TEAM, "params": args}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => resp["result"].clone(),
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("update_team failed")})
+pub(super) fn handle_update_team(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    let team_name = args["name"].as_str().unwrap_or("");
+    let outcome = crate::teams::update_with_diff(home, args);
+    if outcome.result.get("error").is_none() {
+        if let Some(notifier) = runtime.and_then(|runtime| runtime.notifier.as_ref()) {
+            if !outcome.added.is_empty() || !outcome.removed.is_empty() {
+                notifier.notify(crate::api::ApiEvent::TeamMembersChanged {
+                    name: team_name.to_string(),
+                    added: outcome.added.clone(),
+                    removed: outcome.removed.clone(),
+                });
+            }
         }
-        Err(_) => crate::teams::update(home, args),
     }
+    outcome.result
 }

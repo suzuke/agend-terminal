@@ -404,12 +404,18 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
     "description"  => instance::handle_set_description,  hai;
 ]);
 
-action_adapter!(dispatch_team, "team", [
-    "create" => task::handle_create_team,  ha;
-    "delete" => task::handle_delete_team,  ha;
-    "list"   => task::handle_list_teams,   h;
-    "update" => task::handle_update_team,  ha;
-]);
+/// #2454 Slice 7: team update carries the owned runtime notifier into the
+/// transport-neutral roster service; other team actions retain their legacy
+/// adapter shapes.
+pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "create" => task::handle_create_team(ctx.home, ctx.args),
+        "delete" => task::handle_delete_team(ctx.home, ctx.args),
+        "list" => task::handle_list_teams(ctx.home),
+        "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
+        other => json!({"error": format!("unknown team action: {other}")}),
+    }
+}
 
 // `inbox` — branch on `args["action"]` then arg presence:
 //   - `action=ack`  → confirm processed (#2299; delivering → processed)

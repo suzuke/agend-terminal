@@ -9,39 +9,22 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(n) => n.to_string(),
         None => return json!({"ok": false, "error": "missing name"}),
     };
-    let before = crate::teams::get_members(ctx.home, &team_name);
-    // Snapshot the pre-mutation roster so the TUI event carries the
-    // *effective* diff (noop adds like re-adding an existing member
-    // must not trigger a pane move).
-    let result = crate::teams::update(ctx.home, params);
-    let after = crate::teams::get_members(ctx.home, &team_name);
-    let before_set: std::collections::HashSet<&String> = before.iter().collect();
-    let after_set: std::collections::HashSet<&String> = after.iter().collect();
-    let added: Vec<String> = after
-        .iter()
-        .filter(|m| !before_set.contains(m))
-        .cloned()
-        .collect();
-    let removed: Vec<String> = before
-        .iter()
-        .filter(|m| !after_set.contains(m))
-        .cloned()
-        .collect();
-    let diff_nonempty = !added.is_empty() || !removed.is_empty();
+    let outcome = crate::teams::update_with_diff(ctx.home, params);
+    if let Some(error) = outcome.result["error"].as_str() {
+        return json!({"ok": false, "error": error});
+    }
     if let Some(n) = ctx.notifier {
+        let diff_nonempty = !outcome.added.is_empty() || !outcome.removed.is_empty();
         if diff_nonempty {
-            tracing::info!(team = %team_name, added = ?added, removed = ?removed, "UPDATE_TEAM emitting TeamMembersChanged");
+            tracing::info!(team = %team_name, added = ?outcome.added, removed = ?outcome.removed, "UPDATE_TEAM emitting TeamMembersChanged");
             n.notify(ApiEvent::TeamMembersChanged {
                 name: team_name.clone(),
-                added: added.clone(),
-                removed: removed.clone(),
+                added: outcome.added.clone(),
+                removed: outcome.removed.clone(),
             });
         }
     }
-    // Same condition as the TUI notification: an empty diff means a
-    // noop update (e.g. `update_team add` with members already on the
-    // roster), no reason to broadcast anything either.
-    json!({"ok": true, "result": result})
+    json!({"ok": true, "result": outcome.result})
 }
 
 /// #1964 Bug 1: plan `count` member names for `team` as `<team>-N`. Names
