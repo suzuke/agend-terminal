@@ -773,6 +773,97 @@ pub fn list_agents() -> Vec<String> {
     crate::runtime::list_agents_with_fallback(&crate::home_dir())
 }
 
+/// #2454 S3: neutral typed list-snapshot service.  Owns the lock-drop-
+/// before-disk-I/O ordering and the full/external agent serialisation.
+/// Both the API LIST wire handler and the MCP instance-query path call
+/// this — neither owns the logic.
+pub(crate) fn list_snapshot(
+    home: &Path,
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+) -> Value {
+    let reg = agent::lock_registry(registry);
+    let snapshot: Vec<(String, Value)> = reg
+        .values()
+        .map(|handle| {
+            let name = handle.name.to_string();
+            let (
+                agent_state,
+                health_state,
+                blocked_reason,
+                blocked_note,
+                context,
+                context_provider,
+                api_in_flight,
+                last_api_activity_at,
+                observed_status,
+            ) = {
+                let c = handle.core.lock();
+                (
+                    c.state.get_state().display_name().to_string(),
+                    c.health.state.display_name().to_string(),
+                    c.health.current_reason.as_ref().map(|r| r.to_string()),
+                    c.health.current_note.clone(),
+                    c.state.resolved_context(),
+                    c.state.context_provider(),
+                    c.api_activity.in_flight,
+                    c.api_activity.last_active_epoch_ms,
+                    c.observed_status.clone(),
+                )
+            };
+            let entry = json!({
+                "name": name.as_str(),
+                "backend": handle.backend_command,
+                "submit_key": handle.submit_key,
+                "inject_prefix": handle.inject_prefix,
+                "agent_state": agent_state,
+                "health_state": health_state,
+                "blocked_reason": blocked_reason,
+                "blocked_note": blocked_note,
+                "context_pct": context.map(|(pct, _)| pct),
+                "context_source": context.map(|(_, source)| source),
+                "context_provider": context_provider.source_name(),
+                "api_in_flight": api_in_flight,
+                "last_api_activity_at": last_api_activity_at,
+                "observed_status": observed_status,
+                "kind": "managed",
+            });
+            (name, entry)
+        })
+        .collect();
+    drop(reg);
+
+    let mut agents: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (name, mut entry) in snapshot {
+        let (dispatched_waiting_for, pending_response_to) =
+            crate::daemon::dispatch_idle::pending_for_instance(home, &name);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "dispatched_waiting_for".into(),
+                json!(dispatched_waiting_for),
+            );
+            obj.insert("pending_response_to".into(), json!(pending_response_to));
+        }
+        agents.push(entry);
+    }
+    let ext = agent::lock_external(externals);
+    for (name, handle) in ext.iter() {
+        let (dispatched_waiting_for, pending_response_to) =
+            crate::daemon::dispatch_idle::pending_for_instance(home, name);
+        agents.push(json!({
+            "name": name,
+            "backend": handle.backend_command,
+            "agent_state": "external",
+            "health_state": "connected",
+            "kind": "external",
+            "pid": handle.pid,
+            "dispatched_waiting_for": dispatched_waiting_for,
+            "pending_response_to": pending_response_to,
+        }));
+    }
+    json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
+}
+
 /// Spawn a single agent into `registry` and start its TUI-serve thread.
 /// Shared by the SPAWN and CREATE_TEAM API handlers.
 ///

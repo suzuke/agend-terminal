@@ -9,26 +9,16 @@ pub(super) fn handle_list_instances_with_runtime(
     instance_name: &str,
     runtime: Option<&RuntimeContext>,
 ) -> Value {
-    // If `instance` param is provided, return detailed info for that instance (replaces describe_instance)
     if let Some(target) = args["instance"].as_str().filter(|s| !s.is_empty()) {
-        return handle_describe_instance(home, &json!({"name": target}));
+        return describe_instance(home, target, runtime);
     }
-    // #2475: compact-by-default for routine polling. The API LIST response still
-    // carries full `observed_status.evidence` for dashboards / describe paths;
-    // the MCP `list_instances` read tool strips that evidence unless explicitly
-    // requested, because agents poll this often and the evidence array is noisy
-    // context ballast. Set `verbose:true` or `include_evidence:true` for detail.
     let include_evidence = args["verbose"].as_bool().unwrap_or(false)
         || args["include_evidence"].as_bool().unwrap_or(false);
     let Some(runtime) = runtime else {
         return with_operator_mode(json!({"instances": list_agents(), "compact": true}));
     };
-    let resp = crate::api::list_response(home, &runtime.registry, &runtime.externals);
+    let resp = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
     if let Some(agents) = resp["result"]["agents"].as_array() {
-        // #991 PR-C: load fleet.yaml ONCE for the whole batch (not per-agent)
-        // so operators can grep "which agents intentionally have no topic"
-        // via `list_instances` — previously only `describe_instance`
-        // (single-instance) exposed this field.
         let fleet_config =
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
         let instances: Vec<Value> = agents
@@ -44,8 +34,6 @@ pub(super) fn handle_list_instances_with_runtime(
                 if name == instance_name {
                     info["is_self"] = json!(true);
                 }
-                // Omit when unset (auto default) — matches describe_instance's
-                // existing omission convention, not an explicit "auto" value.
                 if let Some(mode) = fleet_config
                     .as_ref()
                     .and_then(|c| c.instances.get(name))
@@ -89,41 +77,36 @@ fn strip_observed_evidence(info: &mut Value) {
     }
 }
 
-pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
-    let name = args["name"].as_str().unwrap_or("");
+fn describe_instance(home: &Path, name: &str, runtime: Option<&RuntimeContext>) -> Value {
     crate::validate_name_or_err!(name);
-    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
-        Ok(resp) => {
-            match resp["result"]["agents"]
-                .as_array()
-                .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
-            {
-                Some(agent) => {
-                    let mut info = agent.clone();
-                    merge_metadata(home, name, &mut info);
-                    // Surface topic_id from topics.json + topic_binding_mode from fleet.yaml.
-                    if info.get("topic_id").is_none() {
-                        if let Some(tid) =
-                            crate::channel::telegram::lookup_topic_for_instance(home, name)
-                        {
-                            info["topic_id"] = json!(tid);
-                        }
-                    }
-                    if let Some(inst) =
-                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                            .ok()
-                            .and_then(|c| c.instances.get(name).cloned())
-                    {
-                        if let Some(ref mode) = inst.topic_binding_mode {
-                            info["topic_binding_mode"] = json!(mode);
-                        }
-                    }
-                    json!({"instance": info})
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime context unavailable — describe requires a live registry"});
+    };
+    let resp = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
+    match resp["result"]["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
+    {
+        Some(agent) => {
+            let mut info = agent.clone();
+            merge_metadata(home, name, &mut info);
+            if info.get("topic_id").is_none() {
+                if let Some(tid) = crate::channel::telegram::lookup_topic_for_instance(home, name) {
+                    info["topic_id"] = json!(tid);
                 }
-                None => json!({"error": format!("Instance '{name}' not found")}),
             }
+            if let Some(inst) =
+                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                    .ok()
+                    .and_then(|c| c.instances.get(name).cloned())
+            {
+                if let Some(ref mode) = inst.topic_binding_mode {
+                    info["topic_binding_mode"] = json!(mode);
+                }
+            }
+            json!({"instance": info})
         }
-        Err(e) => json!({"error": format!("API unavailable: {e}")}),
+        None => json!({"error": format!("Instance '{name}' not found")}),
     }
 }
 
