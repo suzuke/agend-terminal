@@ -8,6 +8,52 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Establish a signed Active operator-mode in the test home directory.
+/// Writes the key, mode JSON, and HMAC sidecar using the same crypto
+/// primitives as the production `config_integrity::sign` path.
+fn establish_signed_active_mode(home: &Path) -> Result<(), String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use std::io::Write as _;
+
+    let content = b"{\"mode\":\"Active\",\"delegate_to\":null,\"delegate_scope\":[]}";
+
+    let key_path = home.join(".config-integrity-key");
+    let key: [u8; 32] = if let Ok(bytes) = std::fs::read(&key_path) {
+        bytes
+            .try_into()
+            .map_err(|_| "existing key wrong length".to_string())?
+    } else {
+        let mut k = [0u8; 32];
+        getrandom::fill(&mut k).map_err(|e| format!("getrandom: {e}"))?;
+        #[cfg(unix)]
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&key_path)
+                .map_err(|e| format!("write key: {e}"))?;
+            f.write_all(&k).map_err(|e| format!("write key: {e}"))?;
+            f.sync_all().map_err(|e| format!("sync key: {e}"))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&key_path, &k).map_err(|e| format!("write key: {e}"))?;
+        k
+    };
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).map_err(|e| format!("hmac init: {e}"))?;
+    mac.update(content);
+    let tag = hex::encode(mac.finalize().into_bytes());
+
+    std::fs::write(home.join("operator-mode.json"), content)
+        .map_err(|e| format!("write mode: {e}"))?;
+    std::fs::write(home.join("operator-mode.json.hmac"), &tag)
+        .map_err(|e| format!("write hmac: {e}"))?;
+    Ok(())
+}
+
 /// A running daemon instance for integration testing.
 pub struct AgendHarness {
     pub home: PathBuf,
@@ -73,7 +119,6 @@ impl AgendHarness {
         std::fs::create_dir_all(&home).map_err(|e| format!("create home: {e}"))?;
         std::fs::write(home.join("fleet.yaml"), fleet_yaml)
             .map_err(|e| format!("write fleet.yaml: {e}"))?;
-
         let binary = binary_path();
         let mut cmd = Command::new(&binary);
         cmd.args(args)
@@ -203,6 +248,11 @@ impl AgendHarness {
                         }
                         std::thread::sleep(Duration::from_millis(50));
                     }
+
+                    // Daemon is running + ready. Establish Active
+                    // mode via the real CLI so fail-closed Away from
+                    // missing operator-mode.json is overridden.
+                    establish_signed_active_mode(&home)?;
 
                     return Ok(Self {
                         home,
