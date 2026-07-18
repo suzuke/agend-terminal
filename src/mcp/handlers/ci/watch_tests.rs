@@ -1,5 +1,146 @@
 use super::*;
 
+fn seed_ack_handoff(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    class: crate::inbox::CiHandoffClass,
+) {
+    let mut msg = crate::inbox::InboxMessage::new_system(
+        "system:ci",
+        "ci-ready-for-action",
+        format!("[ci-ready-for-action] {correlation}"),
+    )
+    .with_correlation_id(correlation.to_string());
+    msg.id = Some(format!("m-{target}-{episode}"));
+    msg.ci_handoff_episode = Some(episode.to_string());
+    msg.ci_handoff_class = Some(class);
+    crate::inbox::enqueue(home, target, msg).unwrap();
+    assert!(crate::daemon::ci_handoff_track::record_with_identity(
+        home,
+        target,
+        correlation,
+        "2026-07-18T00:00:00Z",
+        Some("0123456789abcdef0123456789abcdef01234567"),
+        Some("t-2817"),
+        Some(episode),
+        Some(class),
+    ));
+}
+
+fn ack_row(home: &Path, target: &str, episode: &str) -> crate::inbox::InboxMessage {
+    let content = std::fs::read_to_string(crate::inbox::inbox_path_resolved(home, target)).unwrap();
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<crate::inbox::InboxMessage>(line).ok())
+        .find(|msg| msg.ci_handoff_episode.as_deref() == Some(episode))
+        .expect("seeded ci-ready row")
+}
+
+#[test]
+fn ack_handoff_is_caller_scoped_non_noisy_and_preserves_watch_2817() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-2817-ack-scoped-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("ci-watches")).unwrap();
+    let watch = home.join("ci-watches").join("sentinel.json");
+    std::fs::write(&watch, b"watch-must-survive").unwrap();
+    let corr = "o/r@feat/ack";
+    seed_ack_handoff(
+        &home,
+        "lead",
+        corr,
+        "ep-lead",
+        crate::inbox::CiHandoffClass::Feature,
+    );
+    seed_ack_handoff(
+        &home,
+        "reviewer",
+        corr,
+        "ep-reviewer",
+        crate::inbox::CiHandoffClass::Feature,
+    );
+
+    let response = handle_ack_handoff_ci(
+        &home,
+        &json!({"repository": "o/r", "branch": "feat/ack", "episode": "ep-lead"}),
+        "lead",
+    );
+    assert_eq!(response["ok"], true, "ack must succeed: {response}");
+    assert_eq!(response["acked"], true, "ack must report settlement: {response}");
+    let tracks = crate::daemon::ci_handoff_track::list(&home);
+    assert_eq!(tracks.len(), 1, "only the caller's exact track is removed");
+    assert_eq!(tracks[0].1.target, "reviewer");
+    assert!(ack_row(&home, "lead", "ep-lead").read_at.is_some());
+    assert!(ack_row(&home, "reviewer", "ep-reviewer").read_at.is_none());
+    assert_eq!(std::fs::read(&watch).unwrap(), b"watch-must-survive");
+    let audit = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap();
+    assert!(audit.contains("ci_handoff_acknowledged"));
+    assert!(!audit.contains("channel_reply_discharged"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ack_handoff_wrong_episode_is_cas_rejected_2817() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-2817-ack-cas-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    seed_ack_handoff(
+        &home,
+        "lead",
+        "o/r@feat/ack",
+        "ep-current",
+        crate::inbox::CiHandoffClass::Feature,
+    );
+
+    let response = handle_ack_handoff_ci(
+        &home,
+        &json!({"repository": "o/r", "branch": "feat/ack", "episode": "ep-stale"}),
+        "lead",
+    );
+    assert_eq!(response["code"], "episode_mismatch", "{response}");
+    assert_eq!(crate::daemon::ci_handoff_track::list(&home).len(), 1);
+    assert!(ack_row(&home, "lead", "ep-current").read_at.is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ack_handoff_is_idempotent_and_handles_protected_episode_2817() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-2817-ack-protected-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    seed_ack_handoff(
+        &home,
+        "lead",
+        "o/r@main",
+        "ep-main",
+        crate::inbox::CiHandoffClass::Protected,
+    );
+    let args = json!({"repository": "o/r", "branch": "main", "episode": "ep-main"});
+
+    let first = handle_ack_handoff_ci(&home, &args, "lead");
+    assert_eq!(first["ok"], true, "first ack must succeed: {first}");
+    assert!(crate::daemon::ci_handoff_track::list(&home).is_empty());
+    assert!(ack_row(&home, "lead", "ep-main").read_at.is_some());
+
+    let repeated = handle_ack_handoff_ci(&home, &args, "lead");
+    assert_eq!(repeated["ok"], true, "repeated ack must succeed: {repeated}");
+    assert_eq!(repeated["already_acked"], true, "{repeated}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #t-92758 P2: `ci unwatch` is the lead's dismiss path for a stuck ci-ready —
 /// it must clear the caller's own ci-handoff track so the re-nudge watchdog
 /// stops. Runs even when no watch file exists (the dismiss intent stands).

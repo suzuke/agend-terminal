@@ -447,6 +447,31 @@ pub(crate) fn def_usage_limit_takeover() -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ci_schema_exposes_exact_handoff_ack_2817() {
+        let d = def_ci();
+        let actions = d["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("ci action enum");
+        assert!(
+            actions.iter().any(|v| v == "ack_handoff"),
+            "#2817: the neutral CI pickup settlement must be discoverable"
+        );
+        let props = &d["inputSchema"]["properties"];
+        for field in ["repository", "branch", "episode"] {
+            assert!(
+                props[field].is_object(),
+                "#2817: ack_handoff identity field '{field}' must be declared"
+            );
+        }
+        assert!(
+            d["description"]
+                .as_str()
+                .is_some_and(|s| s.contains("ack_handoff")),
+            "#2817: top-level CI description must name the settlement action"
+        );
+    }
+
     /// #2453 R2 P1: the restart_daemon schema must describe app-mode IN-PLACE re-exec
     /// (Unix) and its `prepared` reply — the pre-R2 text ("app mode has no in-process
     /// restart consumer; quit and relaunch") is now STALE and misleads operators/agents
