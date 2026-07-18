@@ -569,6 +569,12 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
                 "head_sha": t.head_sha,
                 "sent_at": t.sent_at,
                 "age_secs": age_secs,
+                "episode": t.ci_handoff_episode,
+                "class": t.ci_handoff_class,
+                "state": if t.is_deferred() { "deferred" } else { "active" },
+                "wake_task_id": t.wake_task_id,
+                "defer_expires_at": t.defer_expires_at,
+                "defer_reason": t.defer_reason,
             })
         })
         .collect();
@@ -577,6 +583,68 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         resp["setup_warning"] = json!(w);
     }
     resp
+}
+
+pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let correlation = match args["correlation"].as_str().filter(|s| !s.is_empty()) {
+        Some(c) => c,
+        None => {
+            return json!({"error": "missing required 'correlation'", "code": "missing_correlation"})
+        }
+    };
+    let episode = match args["episode"].as_str().filter(|s| !s.is_empty()) {
+        Some(e) => e,
+        None => return json!({"error": "missing required 'episode'", "code": "missing_episode"}),
+    };
+    let wake_task_id = match args["wake_task_id"].as_str().filter(|s| !s.is_empty()) {
+        Some(t) => t,
+        None => {
+            return json!({"error": "missing required 'wake_task_id'", "code": "missing_wake_task_id"})
+        }
+    };
+    let reason = args["reason"].as_str().unwrap_or("deferred by agent");
+    let defer_secs = args["defer_secs"].as_i64().unwrap_or(600).clamp(60, 3600);
+
+    let tracks = crate::daemon::ci_handoff_track::list(home);
+    let track = tracks.iter().find(|(_, t)| {
+        t.correlation == correlation
+            && t.ci_handoff_episode.as_deref() == Some(episode)
+            && (instance_name.is_empty() || t.target == instance_name)
+    });
+    let Some((_, track)) = track else {
+        return json!({"error": "no matching track found", "code": "track_not_found"});
+    };
+    let target = &track.target;
+
+    use crate::daemon::ci_handoff_track::DeferOutcome;
+    match crate::daemon::ci_handoff_track::defer_track(
+        home,
+        target,
+        correlation,
+        episode,
+        if instance_name.is_empty() {
+            "operator"
+        } else {
+            instance_name
+        },
+        wake_task_id,
+        reason,
+        defer_secs,
+    ) {
+        DeferOutcome::Deferred => json!({"ok": true, "deferred": true}),
+        DeferOutcome::AlreadyDeferred => {
+            json!({"ok": true, "deferred": true, "already_deferred": true})
+        }
+        DeferOutcome::EpisodeMismatch => {
+            json!({"error": "episode mismatch (CAS)", "code": "episode_mismatch"})
+        }
+        DeferOutcome::TrackNotFound => {
+            json!({"error": "track not found under lock", "code": "track_not_found"})
+        }
+        DeferOutcome::LockFailed => {
+            json!({"error": "lock acquisition failed", "code": "lock_failed"})
+        }
+    }
 }
 
 /// #813: build the default `CiProvider` for a repo URL. Mirrors

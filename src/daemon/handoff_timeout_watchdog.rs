@@ -184,6 +184,39 @@ pub(crate) fn scan_and_emit_with<F, G>(
             let key = (target.clone(), corr.clone());
             active.insert(key.clone());
 
+            // Deferred tracks: evaluate wake predicate, skip renudge/escalation.
+            if track.is_deferred() {
+                if track.is_defer_expired(now) {
+                    crate::daemon::ci_handoff_track::reactivate_track(
+                        home,
+                        target,
+                        &corr,
+                        track.ci_handoff_episode.as_deref().unwrap_or(""),
+                    );
+                } else if let Some(ref task_id) = track.wake_task_id {
+                    if let Ok(rt) = crate::tasks::load_routed(home, task_id) {
+                        if matches!(
+                            rt.record().status,
+                            crate::task_events::TaskStatus::Done
+                                | crate::task_events::TaskStatus::Verified
+                        ) {
+                            crate::daemon::ci_handoff_track::reactivate_track(
+                                home,
+                                target,
+                                &corr,
+                                track.ci_handoff_episode.as_deref().unwrap_or(""),
+                            );
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
             // #26795: a PR already known to be merge-blocked (REJECTED verdict /
             // Draft) is unactionable by the target no matter how many times we
             // re-nudge — resolve right here instead of relying on the SEPARATE
@@ -1296,6 +1329,194 @@ mod tests {
             1,
             "peer escalation to the lead inbox is preserved"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    fn seed_handoff_with_episode(
+        home: &Path,
+        target: &str,
+        corr: &str,
+        age_min: i64,
+        episode: &str,
+    ) {
+        let sent_at = (chrono::Utc::now() - chrono::Duration::minutes(age_min)).to_rfc3339();
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:ci",
+            HANDOFF_KIND,
+            format!("[ci-ready-for-action] {corr}: CI passed."),
+        )
+        .with_correlation_id(corr);
+        msg.timestamp = sent_at.clone();
+        crate::inbox::enqueue(home, target, msg).unwrap();
+        crate::daemon::ci_handoff_track::record_with_identity(
+            home,
+            target,
+            corr,
+            &sent_at,
+            None,
+            None,
+            Some(episode),
+            None,
+        );
+    }
+
+    #[test]
+    fn deferred_track_suppresses_renudge() {
+        let home = tmp_home("defer-suppress");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 5, "ep-1");
+
+        crate::daemon::ci_handoff_track::defer_track(
+            &home, "reviewer", "o/r@b", "ep-1", "reviewer", "t-wake", "busy", 600,
+        );
+
+        let now = chrono::Utc::now();
+        let mut esc = HashMap::new();
+        let mut ren = HashMap::new();
+        let nudged = run_watchdog(&home, &now, &mut esc, &mut ren);
+        assert!(
+            nudged.is_empty(),
+            "deferred track must suppress renudge: {nudged:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn deferred_track_expiry_reactivates() {
+        let home = tmp_home("defer-expire");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 5, "ep-2");
+
+        crate::daemon::ci_handoff_track::defer_track(
+            &home, "reviewer", "o/r@b", "ep-2", "reviewer", "t-wake", "busy", 1,
+        );
+
+        let now = chrono::Utc::now() + chrono::Duration::seconds(2);
+        let mut esc = HashMap::new();
+        let mut ren = HashMap::new();
+        let nudged = run_watchdog(&home, &now, &mut esc, &mut ren);
+        assert!(
+            !nudged.is_empty(),
+            "expired deferred track must reactivate and renudge"
+        );
+        let tracks = crate::daemon::ci_handoff_track::list(&home);
+        let track = tracks.iter().find(|(_, t)| t.correlation == "o/r@b");
+        assert!(
+            track.is_some_and(|(_, t)| !t.is_deferred()),
+            "track must be reactivated after expiry"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn defer_episode_mismatch_refused() {
+        let home = tmp_home("defer-cas");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-real");
+
+        let result = crate::daemon::ci_handoff_track::defer_track(
+            &home, "reviewer", "o/r@b", "ep-wrong", "reviewer", "t-wake", "busy", 600,
+        );
+        assert!(
+            matches!(
+                result,
+                crate::daemon::ci_handoff_track::DeferOutcome::EpisodeMismatch
+            ),
+            "episode mismatch must refuse defer"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn defer_survives_restart() {
+        let home = tmp_home("defer-restart");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-persist");
+
+        crate::daemon::ci_handoff_track::defer_track(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "ep-persist",
+            "reviewer",
+            "t-wake",
+            "busy",
+            600,
+        );
+
+        let tracks = crate::daemon::ci_handoff_track::list(&home);
+        let track = tracks.iter().find(|(_, t)| t.correlation == "o/r@b");
+        assert!(
+            track.is_some_and(|(_, t)| t.is_deferred()),
+            "deferred state must persist to disk and survive re-read"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn defer_via_mcp_entry() {
+        let home = tmp_home("defer-mcp");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-mcp");
+
+        let args = serde_json::json!({
+            "action": "defer",
+            "correlation": "o/r@b",
+            "episode": "ep-mcp",
+            "wake_task_id": "t-mcp-wake",
+            "reason": "busy with other task",
+        });
+        let sender = None;
+        let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "reviewer",
+            sender: &sender,
+            runtime: None,
+        };
+        let result = crate::mcp::handlers::dispatch::dispatch_ci(&ctx);
+        assert_eq!(result["ok"], true, "ci action=defer must succeed: {result}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn status_exposes_deferred_state() {
+        let home = tmp_home("defer-status");
+        write_fleet(&home);
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-status");
+
+        crate::daemon::ci_handoff_track::defer_track(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "ep-status",
+            "reviewer",
+            "t-wake",
+            "busy",
+            600,
+        );
+
+        let status_args = serde_json::json!({"action": "status"});
+        let sender = None;
+        let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args: &status_args,
+            instance_name: "reviewer",
+            sender: &sender,
+            runtime: None,
+        };
+        let status = crate::mcp::handlers::dispatch::dispatch_ci(&ctx);
+        let handoffs = status["pending_handoffs"]
+            .as_array()
+            .expect("pending_handoffs array");
+        let h = handoffs.iter().find(|h| h["correlation"] == "o/r@b");
+        assert!(h.is_some(), "deferred handoff must appear in status");
+        let h = h.unwrap();
+        assert_eq!(h["state"], "deferred");
+        assert_eq!(h["wake_task_id"], "t-wake");
+        assert!(h["defer_expires_at"].is_string());
         std::fs::remove_dir_all(home).ok();
     }
 }
