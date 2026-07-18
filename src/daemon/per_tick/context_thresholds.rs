@@ -127,8 +127,12 @@ mod test_hooks {
 mod tests {
     use super::*;
     use parking_lot::Mutex as PLMutex;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    use super::super::context_alert::ContextAlertHandler;
+    use super::super::context_handoff::{ContextHandoffHandler, Phase};
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -154,6 +158,41 @@ mod tests {
             Arc::new(PLMutex::new(HashMap::new())),
             Arc::new(PLMutex::new(HashMap::new())),
         )
+    }
+
+    fn reset_runtime_defaults(home: &std::path::Path) {
+        std::fs::write(
+            home.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
+        crate::runtime_config::reload(home);
+        for key in [
+            "AGEND_CONTEXT_ALERT_PCT",
+            "AGEND_CONTEXT_HANDOFF_PCT",
+            "AGEND_CONTEXT_HANDOFF_ESCALATE_PCT",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn add_context_agent(registry: &crate::agent::AgentRegistry, name: &str, pct: f32) {
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_context(name, pct);
+        registry.lock().insert(handle.id, handle);
+    }
+
+    fn context_ctx<'a>(
+        home: &'a std::path::Path,
+        registry: &'a crate::agent::AgentRegistry,
+        externals: &'a crate::agent::ExternalRegistry,
+        configs: &'a Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>>,
+    ) -> TickContext<'a> {
+        TickContext {
+            home,
+            registry,
+            externals,
+            configs,
+        }
     }
 
     #[test]
@@ -324,6 +363,154 @@ mod tests {
             "90% crosses the handoff threshold on an Idle mock agent — handoff \
              must have independently transitioned Armed → IdleMarked, got {:?}",
             handler.context_handoff.phase_of("watched")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn per_instance_alert_thresholds_are_isolated() {
+        let home = tmp_home("per-instance-alert-isolation");
+        reset_runtime_defaults(&home);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  low:\n    context_alert_pct: 70.0\n  high:\n    context_alert_pct: 90.0\n",
+        )
+        .unwrap();
+        let (registry, externals, configs) = empty_ctx_parts();
+        add_context_agent(&registry, "low", 82.0);
+        add_context_agent(&registry, "high", 82.0);
+        let handler = ContextAlertHandler::new(1);
+        handler.run(&context_ctx(&home, &registry, &externals, &configs));
+
+        assert_eq!(
+            handler.is_armed("low"),
+            Some(false),
+            "the low per-instance alert threshold must fire at 82%"
+        );
+        assert_eq!(
+            handler.is_armed("high"),
+            Some(true),
+            "the high per-instance alert threshold must remain armed at 82%"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn partial_instance_overlay_preserves_global_handoff_and_escalate() {
+        let home = tmp_home("partial-handoff-overlay");
+        reset_runtime_defaults(&home);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  partial:\n    context_handoff_pct: 88.0\n",
+        )
+        .unwrap();
+        let (registry, externals, configs) = empty_ctx_parts();
+        add_context_agent(&registry, "partial", 86.0);
+        let handler = ContextHandoffHandler::new(1);
+        handler.run(&context_ctx(&home, &registry, &externals, &configs));
+
+        assert_eq!(
+            handler.phase_of("partial"),
+            Some(Phase::Armed),
+            "partial overlay must use the per-instance handoff threshold while retaining the global escalate threshold"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn invalid_instance_triplet_falls_back_atomically_without_poisoning_other_agents() {
+        let home = tmp_home("invalid-instance-triplet");
+        reset_runtime_defaults(&home);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  invalid:\n    context_alert_pct: 95.0\n    context_handoff_pct: 90.0\n    context_handoff_escalate_pct: 92.0\n  valid:\n    context_alert_pct: 90.0\n",
+        )
+        .unwrap();
+        let (registry, externals, configs) = empty_ctx_parts();
+        add_context_agent(&registry, "invalid", 82.0);
+        add_context_agent(&registry, "valid", 82.0);
+        let handler = ContextAlertHandler::new(1);
+        handler.run(&context_ctx(&home, &registry, &externals, &configs));
+
+        assert_eq!(
+            handler.is_armed("invalid"),
+            Some(false),
+            "invalid per-instance composition must fall back to the complete global triplet"
+        );
+        assert_eq!(
+            handler.is_armed("valid"),
+            Some(true),
+            "one agent's invalid override must not poison another agent's valid override"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn missing_instance_falls_back_to_global_and_deleted_latch_is_pruned() {
+        let home = tmp_home("missing-instance-fallback");
+        reset_runtime_defaults(&home);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  watched:\n    context_alert_pct: 90.0\n",
+        )
+        .unwrap();
+        let (registry, externals, configs) = empty_ctx_parts();
+        add_context_agent(&registry, "watched", 82.0);
+        let handler = ContextAlertHandler::new(1);
+        let ctx = context_ctx(&home, &registry, &externals, &configs);
+        handler.run(&ctx);
+        assert_eq!(
+            handler.is_armed("watched"),
+            Some(true),
+            "the instance override must keep 82% below its 90% threshold"
+        );
+
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        handler.run(&ctx);
+        assert_eq!(
+            handler.is_armed("watched"),
+            Some(false),
+            "a missing instance entry must use the complete global threshold triplet"
+        );
+
+        registry.lock().clear();
+        handler.run(&ctx);
+        assert_eq!(handler.is_armed("watched"), None, "deleted agents must be pruned");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn fleet_reload_changes_per_instance_threshold_on_next_fired_tick() {
+        let home = tmp_home("fleet-reload-threshold");
+        reset_runtime_defaults(&home);
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            "instances:\n  watched:\n    context_alert_pct: 90.0\n",
+        )
+        .unwrap();
+        let (registry, externals, configs) = empty_ctx_parts();
+        add_context_agent(&registry, "watched", 82.0);
+        let handler = ContextAlertHandler::new(1);
+        let ctx = context_ctx(&home, &registry, &externals, &configs);
+        handler.run(&ctx);
+        assert_eq!(handler.is_armed("watched"), Some(true));
+
+        std::fs::write(
+            &fleet_path,
+            "instances:\n  watched:\n    context_alert_pct: 70\n",
+        )
+        .unwrap();
+        handler.run(&ctx);
+        assert_eq!(
+            handler.is_armed("watched"),
+            Some(false),
+            "the next fired tick must observe a changed fleet override"
         );
         std::fs::remove_dir_all(&home).ok();
     }
