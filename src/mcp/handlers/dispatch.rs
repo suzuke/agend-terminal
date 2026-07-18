@@ -1449,10 +1449,9 @@ mod tests {
     }
 
     /// Baseline count: exactly 11 same-daemon api::call production sites
-    /// remain in src/mcp/handlers/ at this commit (was 12 pre-S9; the
-    /// team_task_inject thread's direct call consolidated into the shared
-    /// inject_with_routing helper). Any addition without a corresponding
-    /// removal is a regression.
+    /// remain in src/mcp/handlers/ at this commit (was 12 before Slice 9
+    /// removed the supervised restart SHUTDOWN loopback). Any addition without
+    /// a corresponding removal is a regression.
     #[test]
     fn production_api_call_baseline_is_11_2454() {
         let needle_call = concat!("crate::", "api::", "call");
