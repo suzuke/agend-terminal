@@ -21,15 +21,66 @@
 
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Re-alert cadence while usage stays continuously above the threshold.
 const REALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 
+#[cfg(test)]
 fn alert_threshold() -> f32 {
     let (alert, _, _) = crate::runtime_config::resolve_effective_thresholds();
     alert
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ThresholdTriplet {
+    pub(super) alert: f32,
+    pub(super) handoff: f32,
+    pub(super) escalate: f32,
+}
+
+pub(super) type InvalidOverrideWarnings = Arc<Mutex<HashSet<String>>>;
+
+pub(super) fn resolve_instance_thresholds(
+    name: &str,
+    global: ThresholdTriplet,
+    fleet: &crate::fleet::FleetConfig,
+    warnings: &InvalidOverrideWarnings,
+) -> ThresholdTriplet {
+    let Some(instance) = fleet.instances.get(name) else {
+        warnings.lock().remove(name);
+        return global;
+    };
+    let composed = ThresholdTriplet {
+        alert: instance.context_alert_pct.unwrap_or(global.alert),
+        handoff: instance.context_handoff_pct.unwrap_or(global.handoff),
+        escalate: instance
+            .context_handoff_escalate_pct
+            .unwrap_or(global.escalate),
+    };
+    if crate::runtime_config::validate_thresholds(
+        composed.alert,
+        composed.handoff,
+        composed.escalate,
+    )
+    .is_ok()
+    {
+        warnings.lock().remove(name);
+        return composed;
+    }
+
+    if warnings.lock().insert(name.to_string()) {
+        tracing::warn!(
+            agent = %name,
+            alert = composed.alert,
+            handoff = composed.handoff,
+            escalate = composed.escalate,
+            "context thresholds invalid for instance; using complete global triplet"
+        );
+    }
+    global
 }
 
 /// Per-agent alert latch.
@@ -73,13 +124,23 @@ fn decide(state: &mut AlertState, pct: f32, threshold: f32, now: Instant) -> boo
 pub(crate) struct ContextAlertHandler {
     gate: crate::daemon::cadence_gate::CadenceGate,
     states: Mutex<HashMap<String, AlertState>>,
+    invalid_override_warnings: InvalidOverrideWarnings,
 }
 
 impl ContextAlertHandler {
+    #[cfg(test)]
     pub(crate) fn new(every_n_ticks: u64) -> Self {
+        Self::new_with_warnings(every_n_ticks, Arc::new(Mutex::new(HashSet::new())))
+    }
+
+    pub(super) fn new_with_warnings(
+        every_n_ticks: u64,
+        invalid_override_warnings: InvalidOverrideWarnings,
+    ) -> Self {
         Self {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
             states: Mutex::new(HashMap::new()),
+            invalid_override_warnings,
         }
     }
 
@@ -92,6 +153,11 @@ impl ContextAlertHandler {
     #[cfg(test)]
     pub(crate) fn is_armed(&self, name: &str) -> Option<bool> {
         self.states.lock().get(name).map(|s| s.armed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalid_warning_count(&self) -> usize {
+        self.invalid_override_warnings.lock().len()
     }
 }
 
@@ -125,13 +191,22 @@ impl PerTickHandler for ContextAlertHandler {
             live
         };
 
-        // Phase 2: threshold/hysteresis evaluation + orchestrator notify.
-        let threshold = alert_threshold();
+        // Phase 2: resolve one global snapshot, then overlay each instance's
+        // optional fields while evaluating its own latch.
+        let (alert, handoff, escalate) = crate::runtime_config::resolve_effective_thresholds();
+        let global = ThresholdTriplet {
+            alert,
+            handoff,
+            escalate,
+        };
         let now = Instant::now();
-        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-            .unwrap_or_default();
+        let fleet = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home))
+            .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
         let mut states = self.states.lock();
         for (name, pct, source) in resolved {
+            let threshold =
+                resolve_instance_thresholds(&name, global, &fleet, &self.invalid_override_warnings)
+                    .alert;
             let state = states.entry(name.clone()).or_default();
             if !decide(state, pct, threshold, now) {
                 continue;
@@ -170,6 +245,9 @@ impl PerTickHandler for ContextAlertHandler {
         // #latch-prune: drop latch entries for agents gone from the registry
         // (cleanup-on-delete) so a deleted agent leaves no stale state.
         states.retain(|name, _| live.contains(name));
+        self.invalid_override_warnings
+            .lock()
+            .retain(|name| live.contains(name));
     }
 }
 

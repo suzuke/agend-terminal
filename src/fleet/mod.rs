@@ -516,6 +516,18 @@ pub struct InstanceConfig {
     /// without hard-coding backend model IDs on every instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<String>,
+    /// Optional per-instance context-alert threshold override. When absent,
+    /// the effective global runtime threshold applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_alert_pct: Option<f32>,
+    /// Optional per-instance context-handoff threshold override. When absent,
+    /// the effective global runtime threshold applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_handoff_pct: Option<f32>,
+    /// Optional per-instance context-handoff escalation threshold override.
+    /// When absent, the effective global runtime threshold applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_handoff_escalate_pct: Option<f32>,
     /// Display name for UI/Telegram.
     pub display_name: Option<String>,
     /// Path to extra instructions file (relative to fleet.yaml dir).
