@@ -494,6 +494,16 @@ mod tests {
 
     #[test]
     fn update_team_error_preserves_outer_success_envelope_2454() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountNotifier(AtomicUsize);
+
+        impl crate::api::ApiNotifier for CountNotifier {
+            fn notify(&self, _event: crate::api::ApiEvent) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         let home = tmp_home("update-error-envelope");
         crate::teams::create(
             &home,
@@ -503,10 +513,11 @@ mod tests {
                 "orchestrator": "lead",
             }),
         );
-        let response = handle_update_team(
-            &json!({"name": "devs", "remove": ["lead"]}),
-            &test_ctx(&home),
-        );
+        let notifier = Arc::new(CountNotifier(AtomicUsize::new(0)));
+        let notifier_trait: Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let mut ctx = test_ctx(&home);
+        ctx.notifier = Some(&notifier_trait);
+        let response = handle_update_team(&json!({"name": "devs", "remove": ["lead"]}), &ctx);
         assert_eq!(
             response["ok"], true,
             "API wire envelope changed: {response}"
@@ -515,6 +526,7 @@ mod tests {
         assert!(response["result"]["error"]
             .as_str()
             .is_some_and(|error| error.contains("cannot remove orchestrator")));
+        assert_eq!(notifier.0.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(&home).ok();
     }
 }
