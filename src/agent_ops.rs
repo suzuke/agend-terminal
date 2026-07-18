@@ -295,6 +295,82 @@ pub fn move_pane(
 }
 
 // ---------------------------------------------------------------------------
+// Instance deletion — shared API/MCP runtime service (#2454 Slice 10)
+// ---------------------------------------------------------------------------
+
+/// Runtime-owned state required by the managed DELETE operation.  The wire
+/// adapters (API and MCP) build this value from their respective contexts;
+/// the service itself does not know which transport invoked it.
+pub struct DeleteContext<'a> {
+    pub registry: &'a AgentRegistry,
+    pub configs: &'a crate::api::ConfigRegistry,
+    pub externals: &'a agent::ExternalRegistry,
+    pub notifier: Option<&'a Arc<dyn crate::api::ApiNotifier>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Managed,
+    External,
+    /// The caller had no in-process runtime and the legacy API loopback was
+    /// used.  The result is intentionally not decoded here: legacy callers
+    /// historically treated the DELETE response as best-effort.
+    Legacy,
+}
+
+/// Perform the daemon-side portion of DELETE once, preserving the exact API
+/// semantics for managed and external agents.  Runtime callers use the
+/// registries directly; a `None` context keeps the one legacy loopback needed
+/// by TUI/team/test callers that have no in-process API owner.
+pub fn delete_instance(
+    home: &Path,
+    name: &str,
+    context: Option<&DeleteContext<'_>>,
+    skip_exit_wait: bool,
+) -> DeleteOutcome {
+    let Some(context) = context else {
+        let mut params = json!({"name": name});
+        if skip_exit_wait {
+            params["no_wait"] = json!(true);
+        }
+        let _ = crate::api::call(
+            home,
+            &json!({
+                "method": crate::api::method::DELETE,
+                "params": params,
+            }),
+        );
+        return DeleteOutcome::Legacy;
+    };
+
+    // Match the API adapter's external-first behavior.  External agents have
+    // no managed registry/config entry and therefore need no notifier event.
+    if agent::lock_external(context.externals)
+        .remove(name)
+        .is_some()
+    {
+        crate::event_log::log(home, "delete", name, "external agent deleted");
+        return DeleteOutcome::External;
+    }
+
+    crate::daemon::lifecycle::delete_transaction(
+        home,
+        name,
+        context.registry,
+        Some(context.configs),
+        skip_exit_wait,
+    );
+    crate::daemon::poll_reminder::remove_agent(name);
+    if let Some(notifier) = context.notifier {
+        tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
+        notifier.notify(crate::api::ApiEvent::InstanceDeleted {
+            name: name.to_string(),
+        });
+    }
+    DeleteOutcome::Managed
+}
+
+// ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 

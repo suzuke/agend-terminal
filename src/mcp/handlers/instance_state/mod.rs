@@ -176,10 +176,20 @@ pub(super) fn handle_create_instance(
     }
 }
 
+#[cfg(test)]
 pub(super) fn handle_delete_instance(
     home: &Path,
     args: &Value,
     sender: &Option<crate::identity::Sender>,
+) -> Value {
+    handle_delete_instance_with_runtime(home, args, sender, None)
+}
+
+pub(super) fn handle_delete_instance_with_runtime(
+    home: &Path,
+    args: &Value,
+    sender: &Option<crate::identity::Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
 ) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
@@ -300,7 +310,13 @@ pub(super) fn handle_delete_instance(
     }
     // Full multi-store teardown lives in the `lifecycle` submodule of this
     // `instance_state` concept (Sprint 54 P1-B Bug 1).
-    match lifecycle::full_delete_instance(home, name) {
+    let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
+        registry: &runtime.registry,
+        configs: &runtime.configs,
+        externals: &runtime.externals,
+        notifier: runtime.notifier.as_ref(),
+    });
+    match lifecycle::full_delete_instance_with_runtime(home, name, delete_context.as_ref()) {
         Ok(()) => json!({"name": name}),
         Err(detail) => json!({
             "name": name,
@@ -502,6 +518,14 @@ fn await_unsent_draft_or_grace(home: &Path, name: &str, force: bool) {
 }
 
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
+    handle_restart_instance_with_runtime(home, args, None)
+}
+
+pub(super) fn handle_restart_instance_with_runtime(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
@@ -566,10 +590,13 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         crate::inbox::settle_delivering_for_session_reset(home, name);
     }
 
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
-    );
+    let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
+        registry: &runtime.registry,
+        configs: &runtime.configs,
+        externals: &runtime.externals,
+        notifier: runtime.notifier.as_ref(),
+    });
+    crate::agent_ops::delete_instance(home, name, delete_context.as_ref(), true);
 
     let spawn_params = restart_spawn_params(
         name,

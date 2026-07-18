@@ -74,36 +74,14 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
     }
-    // Check external registry first
-    {
-        let mut ext = agent::lock_external(ctx.externals);
-        if ext.remove(name).is_some() {
-            crate::event_log::log(ctx.home, "delete", name, "external agent deleted");
-            return json!({"ok": true});
-        }
-    }
-    // delete_transaction kills the process tree, waits up to CHILD_EXIT_TIMEOUT
-    // for actual exit, then removes registry / drops Telegram binding /
-    // removes configs / removes IPC port / emits event log. Sprint 20 F2 fix:
-    // the previous implementation removed the registry entry before the OS
-    // had reaped the PID, exposing PID re-use + concurrent-spawn collision
-    // races.
     let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false);
-    crate::daemon::lifecycle::delete_transaction(
-        ctx.home,
-        name,
-        ctx.registry,
-        Some(ctx.configs),
-        skip_exit_wait,
-    );
-    // H3: clean up poll_reminder dedup state for deleted agent
-    crate::daemon::poll_reminder::remove_agent(name);
-    if let Some(n) = ctx.notifier {
-        tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
-        n.notify(ApiEvent::InstanceDeleted {
-            name: name.to_string(),
-        });
-    }
+    let delete_context = crate::agent_ops::DeleteContext {
+        registry: ctx.registry,
+        configs: ctx.configs,
+        externals: ctx.externals,
+        notifier: ctx.notifier,
+    };
+    crate::agent_ops::delete_instance(ctx.home, name, Some(&delete_context), skip_exit_wait);
     json!({"ok": true})
 }
 

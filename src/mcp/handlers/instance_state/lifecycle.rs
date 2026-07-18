@@ -67,6 +67,17 @@ fn remove_empty_dir_tree(dir: &Path) {
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
+    full_delete_instance_with_runtime(home, name, None)
+}
+
+/// Runtime-aware form used by the MCP API ingress.  The legacy wrapper above
+/// intentionally remains for TUI/team/test callers that do not own the live
+/// API registries in this slice.
+pub(crate) fn full_delete_instance_with_runtime(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+) -> Result<(), String> {
     let lifecycle_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
         name,
@@ -112,10 +123,14 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
-    );
+    if let Some(context) = delete_context {
+        crate::agent_ops::delete_instance(home, name, Some(context), false);
+    } else {
+        let _ = crate::api::call(
+            home,
+            &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+        );
+    }
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");

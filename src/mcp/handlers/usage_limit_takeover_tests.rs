@@ -160,6 +160,7 @@ fn fixture(tag: &str) -> Fixture {
     ])));
     let runtime = RuntimeContext {
         registry,
+        configs: Default::default(),
         externals: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         capability: crate::api::RestartCapability::Unsupported,
         app_restart: None,

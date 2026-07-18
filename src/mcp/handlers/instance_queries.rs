@@ -178,6 +178,7 @@ mod tests {
         )])));
         let runtime = RuntimeContext {
             registry,
+            configs: Default::default(),
             externals,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
@@ -202,6 +203,7 @@ mod tests {
     fn runtime_with_external_one() -> RuntimeContext {
         RuntimeContext {
             registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            configs: Default::default(),
             externals: Arc::new(parking_lot::Mutex::new(HashMap::from([(
                 "external-one".to_string(),
                 crate::agent::ExternalAgentHandle {
@@ -317,6 +319,7 @@ mod tests {
         let externals = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let runtime = RuntimeContext {
             registry,
+            configs: Default::default(),
             externals,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,

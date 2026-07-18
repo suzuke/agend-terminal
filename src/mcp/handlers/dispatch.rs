@@ -51,6 +51,9 @@ pub(crate) struct HandlerCtx<'a> {
 #[derive(Clone)]
 pub(crate) struct RuntimeContext {
     pub registry: crate::agent::AgentRegistry,
+    /// #2454 Slice 10: live managed-agent configuration registry shared by
+    /// direct API and MCP DELETE paths.
+    pub configs: crate::api::ConfigRegistry,
     pub externals: crate::agent::ExternalRegistry,
     /// #2453 Stage R1: the API-server owner's restart capability, injected at
     /// `crate::api::serve` and carried here from the API `HandlerCtx` so
@@ -250,18 +253,16 @@ pub(crate) fn dispatch_create_instance(ctx: &HandlerCtx<'_>) -> Value {
 pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_interrupt(ctx.home, ctx.args, ctx.runtime)
 }
-adapter!(
-    dispatch_delete_instance,
-    has,
-    instance::handle_delete_instance
-);
+/// #2454 Slice 10: pass the in-process runtime to the full managed teardown.
+pub(crate) fn dispatch_delete_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_delete_instance_with_runtime(ctx.home, ctx.args, ctx.sender, ctx.runtime)
+}
 adapter!(dispatch_start_instance, ha, instance::handle_start_instance);
 adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
-adapter!(
-    dispatch_restart_instance,
-    ha,
-    instance::handle_restart_instance
-);
+/// #2454 Slice 10: D7 restart DELETE uses the same runtime-owned service.
+pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_restart_instance_with_runtime(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_set_model,
     has,
@@ -510,6 +511,7 @@ mod tests {
             registry: std::sync::Arc::new(
                 parking_lot::Mutex::new(std::collections::HashMap::new()),
             ),
+            configs: Default::default(),
             externals: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -981,6 +983,7 @@ mod tests {
             registry: std::sync::Arc::new(
                 parking_lot::Mutex::new(std::collections::HashMap::new()),
             ),
+            configs: Default::default(),
             externals: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::from([(
                     name.to_string(),
@@ -1135,6 +1138,7 @@ mod tests {
             registry: std::sync::Arc::new(
                 parking_lot::Mutex::new(std::collections::HashMap::new()),
             ),
+            configs: Default::default(),
             externals: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),

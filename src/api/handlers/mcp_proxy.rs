@@ -146,6 +146,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
     let timeout = tool_timeout(tool);
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
         registry: ctx.registry.clone(),
+        configs: ctx.configs.clone(),
         externals: ctx.externals.clone(),
         capability: ctx.capability,
         app_restart: ctx.app_restart.cloned(),
