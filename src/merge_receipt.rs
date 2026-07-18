@@ -45,7 +45,9 @@ pub(crate) fn find(
 ) -> Option<MergeReceipt> {
     let key = receipt_key(repo, merge_sha, task_id);
     let path = receipts_dir(home).join(format!("{key}.json"));
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     let receipt: MergeReceipt = match serde_json::from_str(&content) {
         Ok(r) => r,
         Err(_) => {
