@@ -734,4 +734,136 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// #2454 Slice 6 RED correction: exercise the real mcp_tool ingress so the
+    /// notifier is part of the acceptance path, not only a direct API
+    /// characterization. The current RuntimeContext drops this borrowed
+    /// notifier and the MCP handler still self-IPC's, so both calls fail with
+    /// no API listener until GREEN threads the owned notifier through.
+    #[test]
+    fn move_pane_mcp_ingress_preserves_notifier_and_event_log_2454() {
+        use crate::api::{ApiEvent, ApiNotifier, PaneMoveSplitDir};
+
+        struct RecordingNotifier {
+            events: parking_lot::Mutex<Vec<ApiEvent>>,
+        }
+
+        impl RecordingNotifier {
+            fn take(&self) -> Vec<ApiEvent> {
+                std::mem::take(&mut *self.events.lock())
+            }
+        }
+
+        impl ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let _fleet_guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-mcp-move-pane-ingress-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let notifier = RecordingNotifier {
+            events: parking_lot::Mutex::new(Vec::new()),
+        };
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: Some(&notifier),
+            home: &home,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        };
+
+        let default = handle_mcp_tool(
+            &json!({
+                "tool": "move_pane",
+                "arguments": {"instance": "agent-a", "target_tab": "team-x"},
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            default["ok"], true,
+            "mcp_tool outer default must succeed: {default}"
+        );
+        assert_eq!(
+            default["result"]["ok"], true,
+            "mcp_tool inner default must succeed without an API listener: {default}"
+        );
+        assert_eq!(default["result"]["instance"], "agent-a");
+        assert_eq!(default["result"]["target_tab"], "team-x");
+
+        let vertical = handle_mcp_tool(
+            &json!({
+                "tool": "move_pane",
+                "arguments": {
+                    "instance": "agent-b",
+                    "target_tab": "team-y",
+                    "split_dir": "vertical",
+                },
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            vertical["ok"], true,
+            "mcp_tool outer vertical must succeed: {vertical}"
+        );
+        assert_eq!(
+            vertical["result"]["ok"], true,
+            "mcp_tool inner vertical must succeed without an API listener: {vertical}"
+        );
+        assert_eq!(vertical["result"]["instance"], "agent-b");
+        assert_eq!(vertical["result"]["target_tab"], "team-y");
+
+        let events = notifier.take();
+        assert_eq!(
+            events.len(),
+            2,
+            "default + vertical must emit two ordered events"
+        );
+        assert!(matches!(
+            &events[0],
+            ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir: PaneMoveSplitDir::Horizontal,
+            } if agent == "agent-a" && target_tab == "team-x"
+        ));
+        assert!(matches!(
+            &events[1],
+            ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir: PaneMoveSplitDir::Vertical,
+            } if agent == "agent-b" && target_tab == "team-y"
+        ));
+
+        let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+            .expect("MCP move_pane must emit event-log records");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two MCP calls must emit exactly two records"
+        );
+        assert!(lines[0].contains("\"kind\":\"move_pane\"") && lines[0].contains("Horizontal"));
+        assert!(lines[1].contains("\"kind\":\"move_pane\"") && lines[1].contains("Vertical"));
+
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
 }

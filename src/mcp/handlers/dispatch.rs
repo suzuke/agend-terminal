@@ -1309,9 +1309,29 @@ mod tests {
                 .contains("adapter!(dispatch_move_pane, ha, instance::handle_move_pane)"),
             "move_pane must use a runtime-aware custom dispatch adapter"
         );
+        let runtime_start = production_dispatch
+            .find("pub(crate) struct RuntimeContext {")
+            .expect("RuntimeContext declaration");
+        let runtime_end = production_dispatch[runtime_start..]
+            .find("/// One MCP tool's dispatcher")
+            .map(|offset| runtime_start + offset)
+            .expect("RuntimeContext end marker");
+        let runtime_region = &production_dispatch[runtime_start..runtime_end];
         assert!(
-            production_dispatch.contains("notifier"),
-            "RuntimeContext notifier must be forwarded into the MCP move_pane path"
+            runtime_region.contains("notifier"),
+            "RuntimeContext must own a notifier for MCP move_pane"
+        );
+        let move_start = production_dispatch
+            .find("pub(crate) fn dispatch_move_pane(")
+            .expect("runtime-aware dispatch_move_pane declaration");
+        let move_end = production_dispatch[move_start..]
+            .find("pub(crate) fn dispatch_usage_limit_takeover(")
+            .map(|offset| move_start + offset)
+            .expect("dispatch_move_pane end marker");
+        let move_region = &production_dispatch[move_start..move_end];
+        assert!(
+            move_region.contains("notifier"),
+            "dispatch_move_pane must forward RuntimeContext notifier"
         );
 
         let mcp = include_str!("instance_metadata.rs");
