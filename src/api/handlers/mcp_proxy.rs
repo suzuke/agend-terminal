@@ -986,4 +986,94 @@ mod tests {
             "MCP handle_update_team production region must not self-IPC"
         );
     }
+
+    /// #2454 S8 real-entry: drive handle_mcp_tool → dispatch_create_instance →
+    /// spawn_single_instance with SPAWN override + INJECT_INLINE. Proves
+    /// RuntimeContext Some propagation, in-process inject_input routing, and
+    /// actionable failure diagnostic detail in event-log.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn create_instance_delayed_inject_runtime_routing_2454() {
+        use crate::mcp::handlers::instance_state::spawn::{INJECT_INLINE, SPAWN_OVERRIDE};
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-s8-mcp-entry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  new-s8:\n    backend: claude\n",
+        )
+        .unwrap();
+        let prev_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+
+        fn spawn_ok(
+            _: &std::path::Path,
+            _: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": true, "result": {"topic_id": null}}))
+        }
+        *SPAWN_OVERRIDE.lock() = Some((home.clone(), spawn_ok));
+        *INJECT_INLINE.lock() = Some(home.clone());
+
+        let registry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let post_flush = crate::api::app_restart::PostFlushSlot::new();
+        let ctx = super::HandlerCtx {
+            home: &home,
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush,
+            notifier: None,
+        };
+        let result = handle_mcp_tool(
+            &serde_json::json!({
+                "tool": "create_instance",
+                "instance": "operator",
+                "arguments": {
+                    "name": "new-s8",
+                    "backend": "claude",
+                    "task": "do something"
+                }
+            }),
+            &ctx,
+        );
+
+        *INJECT_INLINE.lock() = None;
+        *SPAWN_OVERRIDE.lock() = None;
+        match prev_home {
+            Some(v) => std::env::set_var("AGEND_HOME", v),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+
+        let inner = result.get("result").unwrap_or(&result);
+        assert!(
+            inner.get("error").is_none(),
+            "spawn must succeed with override: {result}"
+        );
+        let event_log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            event_log.contains("team_spawn_inject_failed"),
+            "delayed inject failure must be logged: {event_log}"
+        );
+        assert!(
+            event_log.contains("not found"),
+            "event-log must contain inject_input detail ('not found'): {event_log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

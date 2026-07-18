@@ -382,6 +382,7 @@ fn r4_admission_rollback_preserves_preexisting_worktree() {
             "working_directory": wt_path.display().to_string()
         }),
         &spawn_fn,
+        None,
     );
 
     // The spawn must be refused (fleet.yaml write failure).
@@ -619,6 +620,7 @@ fn r5_branch_worktree_created_by_attempt_cleaned_on_rollback() {
             "branch": "feat/test"
         }),
         &spawn_fn,
+        None,
     );
 
     assert!(

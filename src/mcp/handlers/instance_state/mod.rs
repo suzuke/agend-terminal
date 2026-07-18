@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub(crate) mod lifecycle;
+#[cfg(not(test))]
 pub(super) mod spawn;
+#[cfg(test)]
+pub(crate) mod spawn;
 
 /// CR-2026-06-14 (resource-leak): upper bound on a team-mode spawn count. A
 /// caller-supplied `count` flows into `vec![backend; count]`, so an unbounded
@@ -13,7 +16,12 @@ pub(super) mod spawn;
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
 
-pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &str) -> Value {
+pub(super) fn handle_create_instance(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     // #2037 (6): name + team = spawn THIS name, then join the team — team-mode
     // used to silently rename to `<team>-N` (the fixup-1 incident). With
     // count>1/backends the names are generated, so an explicit name errors.
@@ -40,7 +48,7 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
             obj.remove("team");
             obj.remove("count");
         }
-        let mut spawned = handle_create_instance(home, &single, instance_name);
+        let mut spawned = handle_create_instance(home, &single, instance_name, runtime);
         if spawned.get("error").is_some() {
             return spawned;
         }
@@ -127,14 +135,22 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                     // fire-and-forget: team task injection waits 3s for agents to
                     // initialize, then injects task text. No JoinHandle needed —
                     // losing the injection on shutdown is acceptable (M5 §10.5).
+                    let rt_arcs = runtime.map(|rt| {
+                        (
+                            std::sync::Arc::clone(&rt.registry),
+                            std::sync::Arc::clone(&rt.externals),
+                        )
+                    });
                     std::thread::Builder::new()
                         .name("team_task_inject".into())
                         .spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(3));
                             for inst_name in &names {
-                                let _ = crate::api::call(
+                                let _ = spawn::inject_with_routing(
                                     &home,
-                                    &json!({"method": crate::api::method::INJECT, "params": {"name": inst_name, "data": task_text}}),
+                                    inst_name,
+                                    task_text.as_bytes(),
+                                    rt_arcs.as_ref(),
                                 );
                             }
                         })
@@ -156,7 +172,7 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
             Err(e) => json!({"error": format!("API unavailable: {e}")}),
         }
     } else {
-        spawn::spawn_single_instance(home, instance_name, args)
+        spawn::spawn_single_instance(home, instance_name, args, runtime)
     }
 }
 
