@@ -562,6 +562,28 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             let age_secs = chrono::DateTime::parse_from_rfc3339(&t.sent_at)
                 .ok()
                 .map(|s| now_secs - s.timestamp());
+            let message_id: Option<String> = t.ci_handoff_episode.as_deref().and_then(|ep| {
+                let inbox_path = crate::inbox::inbox_path_resolved(home, &t.target);
+                let content = std::fs::read_to_string(&inbox_path).ok()?;
+                let corr = &t.correlation;
+                let matches: Vec<String> = content
+                    .lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<crate::inbox::InboxMessage>(line).ok()
+                    })
+                    .filter(|m| {
+                        m.kind.as_deref() == Some("ci-ready-for-action")
+                            && m.ci_handoff_episode.as_deref() == Some(ep)
+                            && m.correlation_id.as_deref() == Some(corr)
+                    })
+                    .filter_map(|m| m.id.clone())
+                    .collect();
+                if matches.len() == 1 {
+                    Some(matches.into_iter().next()?)
+                } else {
+                    None
+                }
+            });
             json!({
                 "target": t.target,
                 "correlation": t.correlation,
@@ -569,6 +591,13 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
                 "head_sha": t.head_sha,
                 "sent_at": t.sent_at,
                 "age_secs": age_secs,
+                "episode": t.ci_handoff_episode,
+                "class": t.ci_handoff_class,
+                "state": if t.is_deferred() { "deferred" } else { "active" },
+                "wake_task_id": t.wake_task_id,
+                "defer_expires_at": t.defer_expires_at,
+                "defer_reason": t.defer_reason,
+                "message_id": message_id,
             })
         })
         .collect();
@@ -577,6 +606,111 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         resp["setup_warning"] = json!(w);
     }
     resp
+}
+
+pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let repository = match args["repository"].as_str().filter(|s| !s.is_empty()) {
+        Some(r) => r,
+        None => {
+            return json!({"error": "missing required 'repository'", "code": "missing_repository"})
+        }
+    };
+    let branch = match args["branch"].as_str().filter(|s| !s.is_empty()) {
+        Some(b) => b,
+        None => return json!({"error": "missing required 'branch'", "code": "missing_branch"}),
+    };
+    let correlation = format!("{repository}@{branch}");
+    let episode = match args["episode"].as_str().filter(|s| !s.is_empty()) {
+        Some(e) => e,
+        None => return json!({"error": "missing required 'episode'", "code": "missing_episode"}),
+    };
+    let wake_task_id = match args["wake_task_id"].as_str().filter(|s| !s.is_empty()) {
+        Some(t) => t,
+        None => {
+            return json!({"error": "missing required 'wake_task_id'", "code": "missing_wake_task_id"})
+        }
+    };
+    let reason = match args["reason"].as_str().filter(|s| !s.is_empty()) {
+        Some(r) => r,
+        None => {
+            return json!({"error": "missing required non-empty 'reason'", "code": "missing_reason"})
+        }
+    };
+    let defer_secs = match args["defer_secs"].as_i64() {
+        Some(s) if (60..=3600).contains(&s) => s,
+        Some(s) => {
+            return json!({
+                "error": format!("defer_secs {s} outside 60..3600"),
+                "code": "invalid_defer_secs"
+            })
+        }
+        None => {
+            return json!({
+                "error": "missing required 'defer_secs'",
+                "code": "missing_defer_secs"
+            })
+        }
+    };
+    match crate::tasks::load_routed(home, wake_task_id) {
+        Ok(rt) => {
+            if matches!(
+                rt.record().status,
+                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
+            ) {
+                return json!({
+                    "error": format!("wake_task_id '{wake_task_id}' is already terminal"),
+                    "code": "wake_task_terminal"
+                });
+            }
+        }
+        Err(_) => {
+            return json!({
+                "error": format!("wake_task_id '{wake_task_id}' not found"),
+                "code": "wake_task_not_found"
+            });
+        }
+    }
+
+    let tracks = crate::daemon::ci_handoff_track::list(home);
+    let track = tracks.iter().find(|(_, t)| {
+        t.correlation == correlation.as_str()
+            && t.ci_handoff_episode.as_deref() == Some(episode)
+            && (instance_name.is_empty() || t.target == instance_name)
+    });
+    let Some((_, track)) = track else {
+        return json!({"error": "no matching track found", "code": "track_not_found"});
+    };
+    let target = &track.target;
+
+    use crate::daemon::ci_handoff_track::{DeferOutcome, DeferRequest};
+    let req = DeferRequest {
+        target,
+        correlation: &correlation,
+        episode,
+        deferred_by: if instance_name.is_empty() {
+            "operator"
+        } else {
+            instance_name
+        },
+        wake_task_id,
+        reason,
+        defer_secs,
+    };
+    match crate::daemon::ci_handoff_track::defer_track(home, &req) {
+        DeferOutcome::Deferred => json!({"ok": true, "deferred": true}),
+        DeferOutcome::AlreadyDeferred => {
+            json!({"ok": true, "deferred": true, "already_deferred": true})
+        }
+        DeferOutcome::EpisodeMismatch => {
+            json!({"error": "episode mismatch (CAS)", "code": "episode_mismatch"})
+        }
+        DeferOutcome::TrackNotFound => {
+            json!({"error": "track not found under lock", "code": "track_not_found"})
+        }
+        DeferOutcome::LockFailed => {
+            json!({"error": "lock acquisition failed", "code": "lock_failed"})
+        }
+    }
 }
 
 /// #813: build the default `CiProvider` for a repo URL. Mirrors
@@ -610,119 +744,5 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// #t-92758 P2: `ci unwatch` is the lead's dismiss path for a stuck ci-ready —
-    /// it must clear the caller's own ci-handoff track so the re-nudge watchdog
-    /// stops. Runs even when no watch file exists (the dismiss intent stands).
-    #[test]
-    fn unwatch_resolves_callers_ci_handoff_track() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-92758-unwatch-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-
-        // A ci-ready obligation pointing at the caller, plus a co-subscriber's
-        // track on the same branch that must survive (precise dismiss).
-        crate::daemon::ci_handoff_track::record(
-            &home,
-            "lead",
-            "o/r@b",
-            "2026-06-10T00:00:00Z",
-            None,
-            None,
-        );
-        crate::daemon::ci_handoff_track::record(
-            &home,
-            "reviewer",
-            "o/r@b",
-            "2026-06-10T00:00:00Z",
-            None,
-            None,
-        );
-
-        let args = json!({"repository": "o/r", "branch": "b", "instance": "lead"});
-        let _ = handle_unwatch_ci(&home, &args, "lead");
-
-        let left = crate::daemon::ci_handoff_track::list(&home);
-        assert_eq!(left.len(), 1, "only the caller's track is cleared");
-        assert_eq!(
-            left[0].1.target, "reviewer",
-            "co-subscriber's track must survive unwatch dismiss"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #35896-11 ③: `ci action=status` must surface pending ci_handoff_track
-    /// sidecars (the renudge watchdog's source) so an agent can SEE why it's
-    /// renudged and what to discharge — pre-③ the sidecar was invisible even
-    /// when it drove a renudge (lead's 4.5h sample: empty `watches`, silent
-    /// renudge). Caller-scoped to the track TARGET: a named caller sees only its
-    /// OWN pending handoff; the anonymous CLI sees all. Crucially this holds with
-    /// NO ci-watches dir at all — the surface must not depend on a live watch.
-    #[test]
-    fn status_ci_surfaces_pending_handoffs_scoped_to_caller_35896_11() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-35896-status-handoffs-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-
-        // Two tracks on the same branch — the caller's + a co-subscriber's — and
-        // deliberately NO ci-watches dir (the sample scenario: watch gone, track live).
-        crate::daemon::ci_handoff_track::record(
-            &home,
-            "lead",
-            "o/r@b",
-            "2026-06-10T00:00:00Z",
-            None,
-            Some("t-42"),
-        );
-        crate::daemon::ci_handoff_track::record(
-            &home,
-            "reviewer",
-            "o/r@b",
-            "2026-06-10T00:00:00Z",
-            None,
-            None,
-        );
-
-        // Named caller sees ONLY its own pending handoff.
-        let resp = handle_status_ci(&home, &json!({}), "lead");
-        assert!(resp.get("error").is_none(), "status must not error: {resp}");
-        assert!(
-            resp["watches"].as_array().is_some_and(|w| w.is_empty()),
-            "no ci-watches dir ⟹ empty watches, but the call must still render: {resp}"
-        );
-        let pending = resp["pending_handoffs"]
-            .as_array()
-            .expect("pending_handoffs must be present even with zero watches");
-        assert_eq!(
-            pending.len(),
-            1,
-            "caller sees only its OWN pending handoff, not the co-subscriber's: {resp}"
-        );
-        assert_eq!(pending[0]["target"], "lead");
-        assert_eq!(pending[0]["correlation"], "o/r@b");
-        assert_eq!(pending[0]["task_id"], "t-42");
-        assert!(
-            pending[0]["age_secs"].as_i64().is_some(),
-            "age_secs must be derived from sent_at: {resp}"
-        );
-
-        // Anonymous CLI (empty instance) sees EVERY pending handoff.
-        let resp_all = handle_status_ci(&home, &json!({}), "");
-        assert_eq!(
-            resp_all["pending_handoffs"].as_array().unwrap().len(),
-            2,
-            "anonymous CLI sees every pending handoff: {resp_all}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-}
+#[path = "watch_tests.rs"]
+mod tests;

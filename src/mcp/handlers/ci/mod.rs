@@ -46,7 +46,7 @@ pub(super) use cleanup::handle_cleanup_init_commits;
 pub(crate) use cleanup::handle_cleanup_merged_branches;
 pub(super) use merge::handle_merge_repo;
 pub(super) use release::handle_release_repo;
-pub(crate) use watch::{handle_status_ci, handle_unwatch_ci, handle_watch_ci};
+pub(crate) use watch::{handle_defer_ci, handle_status_ci, handle_unwatch_ci, handle_watch_ci};
 // Test-facing helpers — re-exported under cfg(test) so a non-test build carries no
 // unused re-export (each is used WITHIN its own submodule in non-test builds).
 #[cfg(test)]

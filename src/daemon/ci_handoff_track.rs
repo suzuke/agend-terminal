@@ -114,6 +114,113 @@ pub(crate) struct CiHandoffTrack {
     pub last_renudged_at: Option<String>,
     #[serde(default)]
     pub last_escalated_at: Option<String>,
+    #[serde(default)]
+    pub deferred_by: Option<String>,
+    #[serde(default)]
+    pub deferred_at: Option<String>,
+    #[serde(default)]
+    pub wake_task_id: Option<String>,
+    #[serde(default)]
+    pub defer_reason: Option<String>,
+    #[serde(default)]
+    pub defer_expires_at: Option<String>,
+}
+
+impl CiHandoffTrack {
+    pub fn is_deferred(&self) -> bool {
+        self.deferred_at.is_some()
+    }
+
+    pub fn is_defer_expired(&self, now: &chrono::DateTime<chrono::Utc>) -> bool {
+        match self
+            .defer_expires_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            Some(exp) => *now >= exp.with_timezone(&chrono::Utc),
+            None => true, // missing/malformed → expired (fail-safe, never indefinite)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DeferOutcome {
+    Deferred,
+    EpisodeMismatch,
+    AlreadyDeferred,
+    TrackNotFound,
+    LockFailed,
+}
+
+pub(crate) struct DeferRequest<'a> {
+    pub target: &'a str,
+    pub correlation: &'a str,
+    pub episode: &'a str,
+    pub deferred_by: &'a str,
+    pub wake_task_id: &'a str,
+    pub reason: &'a str,
+    pub defer_secs: i64,
+}
+
+pub(crate) fn defer_track(home: &Path, req: &DeferRequest<'_>) -> DeferOutcome {
+    let path = file_for(home, req.target, req.correlation);
+    let lock_path = lock_for(home, req.target, req.correlation);
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+        return DeferOutcome::LockFailed;
+    };
+    let current = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    let Some(mut track) = current else {
+        return DeferOutcome::TrackNotFound;
+    };
+    if track.ci_handoff_episode.as_deref() != Some(req.episode) {
+        return DeferOutcome::EpisodeMismatch;
+    }
+    if track.is_deferred() {
+        return DeferOutcome::AlreadyDeferred;
+    }
+    let now = chrono::Utc::now();
+    track.deferred_by = Some(req.deferred_by.to_string());
+    track.deferred_at = Some(now.to_rfc3339());
+    track.wake_task_id = Some(req.wake_task_id.to_string());
+    track.defer_reason = Some(req.reason.to_string());
+    track.defer_expires_at = Some((now + chrono::Duration::seconds(req.defer_secs)).to_rfc3339());
+    if atomic_write_track(&path, &track).is_err() {
+        return DeferOutcome::LockFailed;
+    }
+    DeferOutcome::Deferred
+}
+
+pub(crate) fn reactivate_track(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+) -> bool {
+    let path = file_for(home, target, correlation);
+    let lock_path = lock_for(home, target, correlation);
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+        return false;
+    };
+    let current = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    let Some(mut track) = current else {
+        return false;
+    };
+    if track.ci_handoff_episode.as_deref() != Some(episode) {
+        return false;
+    }
+    if !track.is_deferred() {
+        return false;
+    }
+    track.deferred_by = None;
+    track.deferred_at = None;
+    track.wake_task_id = None;
+    track.defer_reason = None;
+    track.defer_expires_at = None;
+    atomic_write_track(&path, &track).is_ok()
 }
 
 fn dir(home: &Path) -> PathBuf {
@@ -308,6 +415,11 @@ pub(crate) fn record_with_identity(
         // handoff episode renudges/escalates on its own schedule.
         last_renudged_at: None,
         last_escalated_at: None,
+        deferred_by: None,
+        deferred_at: None,
+        wake_task_id: None,
+        defer_reason: None,
+        defer_expires_at: None,
     };
     let path = file_for(home, target, correlation);
     if let Err(e) = std::fs::create_dir_all(dir(home)) {
@@ -1602,6 +1714,11 @@ mod tests {
             ci_handoff_class: None,
             last_renudged_at: None,
             last_escalated_at: None,
+            deferred_by: None,
+            deferred_at: None,
+            wake_task_id: None,
+            defer_reason: None,
+            defer_expires_at: None,
         };
         std::fs::write(&old_path, serde_json::to_vec(&track).unwrap()).unwrap();
         assert_eq!(

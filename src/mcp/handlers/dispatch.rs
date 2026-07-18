@@ -316,6 +316,7 @@ action_adapter!(dispatch_ci, "ci", [
     "watch"   => ci::handle_watch_ci,   hai;
     "unwatch" => ci::handle_unwatch_ci, hai;
     "status"  => ci::handle_status_ci,  hai;
+    "defer"   => ci::handle_defer_ci,   hai;
 ]);
 
 action_adapter!(dispatch_decision, "decision", [
@@ -613,7 +614,7 @@ mod tests {
                     "create", "list", "claim", "update", "done", "sweep", "health", "activity",
                 ],
             ),
-            ("ci", &["watch", "unwatch", "status"]),
+            ("ci", &["watch", "unwatch", "status", "defer"]),
             ("decision", &["post", "list", "update"]),
             ("deployment", &["deploy", "teardown", "list"]),
             ("health", &["report", "clear"]),
