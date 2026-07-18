@@ -798,6 +798,7 @@ pub fn spawn_one(
     work_dir: &Path,
     size: (u16, u16),
     env: Option<&std::collections::HashMap<String, String>>,
+    declared_backend: Option<&crate::backend::Backend>,
 ) -> anyhow::Result<crate::backend::SpawnMode> {
     std::fs::create_dir_all(work_dir).ok();
     // #1080: skills auto-install for dynamically spawned instances.
@@ -815,8 +816,10 @@ pub fn spawn_one(
             .ok()
             .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
             .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
-    let backend_skill =
-        crate::backend::Backend::from_command(backend).and_then(|b| b.skill_dir_name());
+    let effective_backend = declared_backend
+        .cloned()
+        .or_else(|| crate::backend::Backend::from_command(backend));
+    let backend_skill = effective_backend.clone().and_then(|b| b.skill_dir_name());
     match crate::skills::install_for_agent_backend_with_source(
         home,
         work_dir,
@@ -841,7 +844,7 @@ pub fn spawn_one(
     // #1682: clear BOTH the legacy name file and the id-resolved file — post-#1680
     // readers use `<uuid>.json`, which the old name-only remove left stale.
     remove_metadata(home, name);
-    let preset_submit_key = crate::backend::Backend::from_command(backend)
+    let preset_submit_key = effective_backend
         .map(|b| b.preset().submit_key)
         .unwrap_or("\r");
     // No-op when caller already passed Fresh; downgrades Resume → Fresh when
@@ -853,7 +856,7 @@ pub fn spawn_one(
     agent::spawn_agent(
         &agent::SpawnConfig {
             name,
-            backend: None,
+            backend: declared_backend,
             backend_command: backend,
             args,
             spawn_mode,

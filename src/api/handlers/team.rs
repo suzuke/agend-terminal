@@ -216,14 +216,14 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             .as_ref()
             .map(|r| r.args.clone())
             .unwrap_or_default();
+        let declared_backend = resolved
+            .as_ref()
+            .map(|r| r.backend.clone())
+            .unwrap_or_else(|| crate::backend::Backend::parse_str(backend));
         if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
             // #2744: DECLARED identity — the resolved fleet entry's backend
             // (Phase 1 wrote it); fallback parses the declared member NAME,
             // never a command string.
-            let declared_backend = resolved
-                .as_ref()
-                .map(|r| r.backend.clone())
-                .unwrap_or_else(|| crate::backend::Backend::parse_str(backend));
             crate::backend::Backend::push_model_arg(&mut member_args, &declared_backend, model);
         }
         match crate::agent_ops::spawn_one(
@@ -236,6 +236,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             work_dir,
             size,
             resolved_env.as_ref(),
+            Some(&declared_backend),
         ) {
             Ok(_) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");

@@ -1108,11 +1108,7 @@ fn build_command_sets_git_editor_defaults() {
 fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
     let workspace = resolve_test_home("wrapper-2801");
     std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
-    std::fs::write(
-        workspace.join(".claude/agend.md"),
-        "fleet instructions",
-    )
-    .expect("agend.md");
+    std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
     std::fs::write(workspace.join("mcp-config.json"), "{}").expect("mcp-config.json");
 
     let config = SpawnConfig {
@@ -1154,6 +1150,38 @@ fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
         );
     }
     std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
+    let config = SpawnConfig {
+        name: "legacy-inference-2801",
+        backend: None,
+        backend_command: "claude",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+
+    let (cmd, detected) = build_command(&config).expect("build_command");
+    assert_eq!(detected, Some(Backend::ClaudeCode));
+    let argv: Vec<String> = cmd
+        .get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"),
+        "legacy callers without a declaration must retain command inference; argv={argv:?}"
+    );
 }
 
 /// #2106: an operator's per-instance `ANTHROPIC_AUTH_TOKEN` in fleet.yaml

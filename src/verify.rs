@@ -520,7 +520,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let spawn_result = agent::spawn_agent(
         &agent::SpawnConfig {
             name: &agent_name,
-            backend: None,
+            backend: Some(backend),
             backend_command: preset.command,
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,

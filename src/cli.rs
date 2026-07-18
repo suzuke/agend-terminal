@@ -50,7 +50,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
-            backend: None,
+            backend: Some(b),
             backend_command: preset.command,
             args: &[],
             spawn_mode: backend::SpawnMode::Fresh,

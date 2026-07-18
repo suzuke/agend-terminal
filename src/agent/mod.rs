@@ -759,7 +759,10 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         ..
     } = config;
 
-    let detected_backend = Backend::from_command(backend_command);
+    let detected_backend = config
+        .backend
+        .cloned()
+        .or_else(|| Backend::from_command(backend_command));
 
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.

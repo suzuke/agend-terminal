@@ -264,6 +264,7 @@ pub(crate) fn record_shutdown_reason(reason: ShutdownReason) {
 #[derive(Clone)]
 pub struct AgentConfig {
     pub name: String,
+    pub backend: Option<crate::backend::Backend>,
     pub backend_command: String,
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
@@ -495,6 +496,7 @@ pub type AgentDef = (
     Option<HashMap<String, String>>,
     Option<PathBuf>,
     String,
+    Option<crate::backend::Backend>,
 );
 
 /// Start daemon: do preflight (lock, run dir, cookie) then run the core loop.
@@ -1699,7 +1701,7 @@ fn spawn_and_register_agent(
     crash_tx: &crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
-    let (name, command, args, env, working_dir, submit_key) = def;
+    let (name, command, args, env, working_dir, submit_key, backend) = def;
     // #1915 chokepoint (boot path): skip an instance deleted mid-boot BEFORE the
     // skills-install below re-creates `workspace/<name>`. The boot loop iterates a
     // fleet snapshot with a ~500ms inter-spawn stagger; a delete in that window
@@ -1736,6 +1738,7 @@ fn spawn_and_register_agent(
         name.clone(),
         AgentConfig {
             name: name.clone(),
+            backend: backend.clone(),
             backend_command: command.clone(),
             args: args.clone(),
             env: env.clone(),
@@ -1772,8 +1775,10 @@ fn spawn_and_register_agent(
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
                 .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
-        let backend_skill =
-            crate::backend::Backend::from_command(command).and_then(|b| b.skill_dir_name());
+        let backend_skill = backend
+            .clone()
+            .or_else(|| crate::backend::Backend::from_command(command))
+            .and_then(|b| b.skill_dir_name());
         match crate::skills::install_for_agent_backend_with_source(
             home,
             wd,
@@ -1802,7 +1807,7 @@ fn spawn_and_register_agent(
     if let Err(e) = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
-            backend: None,
+            backend: backend.as_ref(),
             backend_command: command,
             args,
             spawn_mode,
@@ -2280,6 +2285,7 @@ mod tests {
             "agent-3".into(),
             AgentConfig {
                 name: "agent-3".into(),
+                backend: None,
                 backend_command: "claude".into(),
                 args: vec![],
                 env: None,
@@ -2578,6 +2584,7 @@ mod tests {
             None,
             None,
             "\r".into(),
+            None,
         )
     }
 
