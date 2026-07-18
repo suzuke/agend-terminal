@@ -37,6 +37,7 @@ pub(crate) mod checkout_txn;
 // ceiling (re-exported from checkout_txn so caller paths are unchanged).
 pub(crate) mod checkout_recovery;
 mod cleanup;
+mod handoff_ack;
 mod merge;
 mod release;
 mod watch;
@@ -44,6 +45,7 @@ mod watch;
 pub(super) use checkout::handle_checkout_repo;
 pub(super) use cleanup::handle_cleanup_init_commits;
 pub(crate) use cleanup::handle_cleanup_merged_branches;
+pub(crate) use handoff_ack::handle_ack_handoff_ci;
 pub(super) use merge::handle_merge_repo;
 pub(super) use release::handle_release_repo;
 pub(crate) use watch::{handle_defer_ci, handle_status_ci, handle_unwatch_ci, handle_watch_ci};

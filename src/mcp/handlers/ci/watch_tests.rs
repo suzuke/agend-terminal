@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp::handlers::ci::handle_ack_handoff_ci;
 
 fn seed_ack_handoff(
     home: &Path,
@@ -71,7 +72,10 @@ fn ack_handoff_is_caller_scoped_non_noisy_and_preserves_watch_2817() {
         "lead",
     );
     assert_eq!(response["ok"], true, "ack must succeed: {response}");
-    assert_eq!(response["acked"], true, "ack must report settlement: {response}");
+    assert_eq!(
+        response["acked"], true,
+        "ack must report settlement: {response}"
+    );
     let tracks = crate::daemon::ci_handoff_track::list(&home);
     assert_eq!(tracks.len(), 1, "only the caller's exact track is removed");
     assert_eq!(tracks[0].1.target, "reviewer");
@@ -136,7 +140,10 @@ fn ack_handoff_is_idempotent_and_handles_protected_episode_2817() {
     assert!(ack_row(&home, "lead", "ep-main").read_at.is_some());
 
     let repeated = handle_ack_handoff_ci(&home, &args, "lead");
-    assert_eq!(repeated["ok"], true, "repeated ack must succeed: {repeated}");
+    assert_eq!(
+        repeated["ok"], true,
+        "repeated ack must succeed: {repeated}"
+    );
     assert_eq!(repeated["already_acked"], true, "{repeated}");
     std::fs::remove_dir_all(&home).ok();
 }

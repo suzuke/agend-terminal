@@ -329,11 +329,11 @@ pub(crate) fn def_deployment() -> Value {
 }
 
 pub(crate) fn def_ci() -> Value {
-    json!({"name": "ci", "description": "Manage CI watching. Actions: watch, unwatch, status, defer.",
+    json!({"name": "ci", "description": "Manage CI watching and handoff pickup. Actions: watch, unwatch, status, defer, ack_handoff.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["watch", "unwatch", "status", "defer"]},
-            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Required for watch/unwatch; optional filter for status."},
-            "branch": {"type": "string", "description": "Branch to watch (default: main); optional filter for status."},
+            "action": {"type": "string", "enum": ["watch", "unwatch", "status", "defer", "ack_handoff"]},
+            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Required for watch/unwatch/ack_handoff; optional filter for status."},
+            "branch": {"type": "string", "description": "Branch to watch (default: main); required for ack_handoff; optional filter for status."},
             "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Instance or instances to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to each target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
@@ -341,7 +341,7 @@ pub(crate) fn def_ci() -> Value {
             "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
             "task_id": {"type": "string", "description": "watch: optional task id to bind this watch to. Persisted on the watch sidecar as a back-link so the `[ci-ready-for-action]` the daemon emits on CI pass carries a structured reference to the originating task. Normally injected by the dispatch auto-watch (dispatch_auto_bind_lease); a manual `ci action=watch` caller may also pass it to bind the watch to a specific task (#1031)."},
             "head_sha": {"type": "string", "description": "watch: full immutable commit SHA (40- or 64-hex) for an EXACT-HEAD post-merge watch on a protected ref (`main`/`master`). Generic protected-branch watches stay E4.5-rejected; a protected watch is accepted ONLY with `head_sha` PLUS `task_id` and explicit `next_after_ci`, and only from the target team orchestrator or operator. The poller resolves runs for THIS SHA only (GitHub `?head_sha=` fetch), ignoring newer main runs, so a later push can't falsely complete the post-merge check. Ignored on non-protected branches. GitHub-only this wave."},
-            "episode": {"type": "string", "description": "defer: exact episode identity for CAS."},
+            "episode": {"type": "string", "description": "defer/ack_handoff: exact episode identity for CAS. For ack_handoff, use the episode surfaced by `ci action=status`; the action settles only the caller's matching pickup without removing the watch."},
             "wake_task_id": {"type": "string", "description": "defer: task_id whose terminal state (Done|Cancelled) will reactivate the track."},
             "reason": {"type": "string", "description": "defer: human-readable reason for deferral."},
             "defer_secs": {"type": "integer", "description": "defer: bounded expiry in seconds (60..3600); required, no default."}

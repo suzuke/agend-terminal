@@ -2538,6 +2538,53 @@ fn watch_ci_valid_repo_returns_watching() {
 }
 
 #[test]
+fn ack_handoff_routes_through_public_ci_dispatch_2817() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ack-handoff-route");
+    std::env::set_var("AGEND_HOME", &home);
+    let correlation = "owner/repo@feat/ack";
+    let episode = "ep-dispatch";
+    let mut msg = crate::inbox::InboxMessage::new_system(
+        "system:ci",
+        "ci-ready-for-action",
+        "feature handoff".to_string(),
+    )
+    .with_correlation_id(correlation.to_string());
+    msg.ci_handoff_episode = Some(episode.to_string());
+    msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Feature);
+    crate::inbox::enqueue(&home, "sender", msg).unwrap();
+    assert!(crate::daemon::ci_handoff_track::record_with_identity(
+        &home,
+        "sender",
+        correlation,
+        "2026-07-18T00:00:00Z",
+        None,
+        Some("t-2817"),
+        Some(episode),
+        Some(crate::inbox::CiHandoffClass::Feature),
+    ));
+
+    let result = handle_tool(
+        "ci",
+        &json!({
+            "action": "ack_handoff",
+            "repository": "owner/repo",
+            "branch": "feat/ack",
+            "episode": episode,
+        }),
+        "sender",
+    );
+    assert_eq!(
+        result["ok"], true,
+        "public dispatch must route ack: {result}"
+    );
+    assert!(crate::daemon::ci_handoff_track::list(&home).is_empty());
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn checkout_repo_absolute_path_used_directly() {
     let _g = fleet_test_guard();
     let home = tmp_home("checkout-abs");
