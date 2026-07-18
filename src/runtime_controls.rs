@@ -133,7 +133,7 @@ mod tests {
         );
 
         // Write garbage to the operator_mode file.
-        let mode_path = home.join("operator_mode.json");
+        let mode_path = home.join("operator-mode.json");
         std::fs::write(&mode_path, b"TAMPERED GARBAGE").unwrap();
 
         // Reload through the shared seam — must not crash.
