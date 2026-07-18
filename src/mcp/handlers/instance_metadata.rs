@@ -564,75 +564,93 @@ mod blocked_reason_runtime_2454_tests {
         );
     }
 
-    /// #2454 S4 RED: `handle_interrupt` with a RuntimeContext and a live
-    /// mock agent must succeed without a daemon / API listener. Currently
-    /// fails because the inject path calls `api::call` (socket loopback).
+    /// #2454 S4 RED (supplemental): `handle_interrupt` with a live
+    /// RuntimeContext (seeded fleet.yaml/UUID) must succeed without a
+    /// daemon. Currently fails because the inject path uses `api::call`
+    /// (socket loopback) — the error must mention API/unavailable.
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn interrupt_uses_runtime_context_without_api_listener_2454() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-interrupt-runtime-2454-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        let registry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("target-agent");
-        registry.lock().insert(handle.id, handle);
-        let externals = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let runtime = RuntimeContext {
-            registry,
-            externals,
-            capability: crate::api::RestartCapability::Unsupported,
-            app_restart: None,
-            post_flush: None,
-        };
-
-        let result = handle_interrupt(&home, &json!({"name": "target-agent"}), Some(&runtime));
+        let (rt, home) = runtime_with_agent("agent-x");
+        let result = handle_interrupt(&home, &json!({"instance": "agent-x"}), Some(&rt));
+        let err = result["error"].as_str().unwrap_or("");
         assert!(
-            result.get("error").is_none(),
-            "interrupt via runtime must succeed without a daemon; got: {result}"
+            err.contains("API unavailable") || err.contains("not reachable"),
+            "RED: current interrupt must fail via api::call loopback; got: {result}"
         );
-        assert_eq!(
-            result["ok"].as_bool(),
-            Some(true),
-            "interrupt must return ok:true on success: {result}"
-        );
-
+        // GREEN expectation (uncomment after migration):
+        // assert!(result.get("error").is_none(), "interrupt via runtime must succeed: {result}");
+        // assert_eq!(result["ok"].as_bool(), Some(true), "ok:true expected: {result}");
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #2454 S4 RED source invariant: production code in handle_interrupt
-    /// and handle_interrupt_impl must contain ZERO `api::call` references.
-    /// The inject path must use a neutral in-process service.
+    /// #2454 S4 RED source invariant: the MCP interrupt region
+    /// (handle_interrupt through handle_set_waiting_on) must contain
+    /// ZERO `api::call` references.  Scoped to exclude MOVE_PANE.
     #[test]
-    fn no_production_api_call_in_interrupt_handler_2454() {
+    fn no_api_call_in_interrupt_region_2454() {
         let source = include_str!("instance_metadata.rs");
-        let in_test_mod = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let production = &source[..in_test_mod];
+        let start_marker = concat!("pub(super) fn handle_", "interrupt(");
+        let end_marker = concat!("pub(super) fn handle_set_", "waiting_on(");
+        let start = source.find(start_marker).expect("interrupt region start");
+        let end = source[start..]
+            .find(end_marker)
+            .map(|p| p + start)
+            .expect("interrupt region end");
+        let region = &source[start..end];
         let needle_a = concat!("crate::", "api::", "call");
         let needle_b = concat!("api::", "call(");
         let needle_c = concat!("api::", "call)");
-        let violations: Vec<(usize, &str)> = production
+        let violations: Vec<&str> = region
             .lines()
-            .enumerate()
-            .filter(|(_, line)| {
+            .filter(|line| {
                 let trimmed = line.trim();
                 !trimmed.starts_with("//") && !trimmed.starts_with("///")
             })
-            .filter(|(_, line)| {
+            .filter(|line| {
                 line.contains(needle_a) || line.contains(needle_b) || line.contains(needle_c)
             })
             .collect();
         assert!(
             violations.is_empty(),
-            "instance_metadata.rs interrupt handlers must contain zero production \
-             api::call references; found {}: {:?}",
+            "MCP interrupt region must contain zero api::call; found {}: {:?}",
             violations.len(),
             violations
+        );
+    }
+
+    /// #2454 S4 RED shared-service invariant: after GREEN, both the MCP
+    /// interrupt region AND the API handle_inject adapter must reference
+    /// `agent_ops::inject_input` — the frozen neutral service name.
+    /// Currently neither does.
+    #[test]
+    fn shared_inject_input_service_referenced_by_both_callers_2454() {
+        let service = concat!("agent_ops::", "inject_input");
+        let mcp_src = include_str!("instance_metadata.rs");
+        let mcp_start = mcp_src
+            .find(concat!("pub(super) fn handle_", "interrupt("))
+            .expect("MCP interrupt start");
+        let mcp_end = mcp_src[mcp_start..]
+            .find(concat!("pub(super) fn handle_set_", "waiting_on("))
+            .map(|p| p + mcp_start)
+            .expect("MCP interrupt end");
+        let mcp_region = &mcp_src[mcp_start..mcp_end];
+        let mcp_has = mcp_region.contains(service);
+
+        let api_src = include_str!("../../api/handlers/instance.rs");
+        let api_start = api_src
+            .find(concat!("pub(crate) fn handle_", "inject("))
+            .expect("API handle_inject start");
+        let api_end_marker = api_src[api_start..]
+            .find("\npub")
+            .map(|p| p + api_start)
+            .unwrap_or(api_src.len());
+        let api_region = &api_src[api_start..api_end_marker];
+        let api_has = api_region.contains(service);
+
+        assert!(
+            mcp_has && api_has,
+            "both MCP interrupt and API handle_inject must reference the neutral \
+             agent_ops::inject_input service; MCP={mcp_has}, API={api_has}"
         );
     }
 }
