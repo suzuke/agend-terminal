@@ -882,3 +882,40 @@ mod opencode_autherror_2524 {
         );
     }
 }
+
+#[cfg(test)]
+mod kiro_decimal_pct_2781 {
+    use super::*;
+
+    #[test]
+    fn kiro_decimal_pct_matches_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        let pane = "  ◔ 4.0%  ask a question or describe a task\n  4.0%";
+        assert_eq!(
+            patterns.detect(pane),
+            Some(AgentState::Idle),
+            "#2781: Kiro '4.0%' must match idle (decimal percent)"
+        );
+    }
+
+    #[test]
+    fn kiro_decimal_only_pct_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        assert_eq!(
+            patterns.detect("  61.5%"),
+            Some(AgentState::Idle),
+            "#2781: bare '61.5%' line must be Idle"
+        );
+    }
+
+    #[test]
+    fn kiro_active_with_trailing_pct_not_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        let pane = "  Kiro is working  ◔ 4.0%\n  Processing files...";
+        assert_ne!(
+            patterns.detect(pane),
+            Some(AgentState::Idle),
+            "#2781: active Kiro with trailing percent must NOT be Idle"
+        );
+    }
+}

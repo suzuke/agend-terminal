@@ -631,4 +631,26 @@ mod tests {
         assert!(handoff < escalate);
         std::fs::remove_dir_all(&temp_dir).ok();
     }
+
+    #[test]
+    fn handoff_payload_renders_one_decimal_2781() {
+        let msg = super::handoff_payload(61.0);
+        assert!(
+            msg.contains("61.0%"),
+            "#2781: handoff payload must render one-decimal '61.0%', got: {msg}"
+        );
+        assert!(
+            !msg.contains("61%") || msg.contains("61.0%"),
+            "#2781: must not render integer-only '61%'"
+        );
+    }
+
+    #[test]
+    fn handoff_payload_renders_fractional_decimal_2781() {
+        let msg = super::handoff_payload(85.3);
+        assert!(
+            msg.contains("85.3%"),
+            "#2781: handoff payload must render '85.3%', got: {msg}"
+        );
+    }
 }
