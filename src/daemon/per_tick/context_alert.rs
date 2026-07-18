@@ -147,8 +147,8 @@ impl PerTickHandler for ContextAlertHandler {
                 continue;
             }
             let text = format!(
-                "[context_alert] agent '{name}' context usage at {pct:.0}% \
-                 (source: {source}, threshold {threshold:.0}%). Handling is NOT \
+                "[context_alert] agent '{name}' context usage at {pct:.1}% \
+                 (source: {source}, threshold {threshold:.1}%). Handling is NOT \
                  automated — at a natural boundary consider a handoff + \
                  restart_instance to free the context. Re-alerts every 30min \
                  while it stays high."
@@ -363,5 +363,81 @@ mod tests {
         .unwrap();
         crate::runtime_config::reload(&temp_dir);
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// #2781: the PRODUCTION context_alert message must render usage and
+    /// threshold with one decimal place. Drives the real ContextAlertHandler
+    /// with a mock agent at 82.0% (above the 80.0% default threshold),
+    /// drains the orchestrator inbox, and asserts the rendered text contains
+    /// one-decimal values.
+    #[test]
+    #[serial(runtime_config)]
+    fn context_alert_production_renders_one_decimal() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-decimal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Save + clear env so default thresholds (alert=80.0) apply.
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Fleet with a team so alert routes to orchestrator.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  watched:\n    backend: claude\n\
+             teams:\n  test:\n    members: [lead, watched]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) =
+            crate::daemon::per_tick::mock_live_agent_with_context("watched", 82.0);
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+
+        // Drain orchestrator inbox and check the rendered message.
+        let msgs = crate::inbox::drain(&home, "lead");
+        let alert_msg = msgs
+            .iter()
+            .find(|m| m.text.contains("[context_alert]"))
+            .expect("#2781: context_alert must deliver an inbox message to the orchestrator");
+        assert!(
+            alert_msg.text.contains("82.0%"),
+            "#2781: usage must render one decimal: {}",
+            alert_msg.text
+        );
+        assert!(
+            alert_msg.text.contains("80.0%"),
+            "#2781: threshold must render one decimal: {}",
+            alert_msg.text
+        );
+
+        // Restore env + clean up.
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::fs::remove_dir_all(&home).ok();
     }
 }

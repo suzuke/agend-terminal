@@ -311,7 +311,7 @@ fn kirocli_profile() -> BackendProfile {
             (AgentState::Active, r"Kiro is working|esc to cancel"),
             (
                 AgentState::Idle,
-                r"\d+%\s*$|ask a question or describe a task",
+                r"◔\s*\d+(?:\.\d+)?%\s*$|ask a question or describe a task",
             ),
             (AgentState::Idle, r"Trust All Tools active|/quit to exit"),
         ],
@@ -879,6 +879,53 @@ mod opencode_autherror_2524 {
             patterns.detect(OPENCODE_KEY_PROSE_PANE),
             Some(AgentState::Idle),
             "#2524: an agent's own prose discussing API keys must NOT be misread as AuthError"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kiro_decimal_pct_2781 {
+    use super::*;
+
+    #[test]
+    fn kiro_decimal_pct_matches_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        let pane = "  ◔ 4.0%  ask a question or describe a task\n  4.0%";
+        assert_eq!(
+            patterns.detect(pane),
+            Some(AgentState::Idle),
+            "#2781: Kiro '4.0%' must match idle (decimal percent)"
+        );
+    }
+
+    #[test]
+    fn kiro_decimal_status_token_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        assert_eq!(
+            patterns.detect("  ◔ 61.5%"),
+            Some(AgentState::Idle),
+            "#2781: Kiro status token '◔ 61.5%' must match Idle"
+        );
+    }
+
+    #[test]
+    fn kiro_active_with_trailing_pct_not_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        let pane = "  Kiro is working  ◔ 4.0%\n  Processing files...";
+        assert_ne!(
+            patterns.detect(pane),
+            Some(AgentState::Idle),
+            "#2781: active Kiro with trailing percent must NOT be Idle"
+        );
+    }
+
+    #[test]
+    fn kiro_arbitrary_output_ending_in_pct_not_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::KiroCli);
+        assert_ne!(
+            patterns.detect("  Processing files 4.0%"),
+            Some(AgentState::Idle),
+            "#2781: arbitrary output ending in percent must NOT match Idle"
         );
     }
 }

@@ -156,7 +156,7 @@ fn decide(
 /// splitting into multiple submits.
 fn handoff_payload(pct: f32) -> String {
     format!(
-        "{marker} context usage at {pct:.0}% — before it runs out: (1) write {HANDOFF_FILENAME} \
+        "{marker} context usage at {pct:.1}% — before it runs out: (1) write {HANDOFF_FILENAME} \
          in your working directory (current task + state, key decisions, next steps, \
          open branches/PRs); (2) add a brief handoff note to your active task on the \
          board (task action=update); then continue working. One-shot reminder — the \
@@ -289,7 +289,7 @@ impl PerTickHandler for ContextHandoffHandler {
                             "context_handoff_injected",
                             &name,
                             &format!(
-                                "context at {pct:.0}% — handoff nudge injected (one per episode)"
+                                "context at {pct:.1}% — handoff nudge injected (one per episode)"
                             ),
                         );
                     } else {
@@ -305,15 +305,15 @@ impl PerTickHandler for ContextHandoffHandler {
                         "context_full_idle",
                         &name,
                         &format!(
-                            "context at {pct:.0}% while Idle — not injecting (idle context-full \
+                            "context at {pct:.1}% while Idle — not injecting (idle context-full \
                              is not urgent); injection fires if it wakes while still high"
                         ),
                     );
                 }
                 Some(Action::Escalate) => {
                     let msg = format!(
-                        "[context-handoff] agent '{name}' context at {pct:.0}% and no \
-                         {HANDOFF_FILENAME} update since the {handoff_pct:.0}% nudge — \
+                        "[context-handoff] agent '{name}' context at {pct:.1}% and no \
+                         {HANDOFF_FILENAME} update since the {handoff_pct:.1}% nudge — \
                          consider a manual handoff + restart_instance. (One-time notice.)"
                     );
                     crate::channel::notify_all_escalation_channels(
@@ -630,5 +630,27 @@ mod tests {
         // so the pair is ordered by construction.
         assert!(handoff < escalate);
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn handoff_payload_renders_one_decimal_2781() {
+        let msg = super::handoff_payload(61.0);
+        assert!(
+            msg.contains("61.0%"),
+            "#2781: handoff payload must render one-decimal '61.0%', got: {msg}"
+        );
+        assert!(
+            !msg.contains("61%") || msg.contains("61.0%"),
+            "#2781: must not render integer-only '61%'"
+        );
+    }
+
+    #[test]
+    fn handoff_payload_renders_fractional_decimal_2781() {
+        let msg = super::handoff_payload(85.3);
+        assert!(
+            msg.contains("85.3%"),
+            "#2781: handoff payload must render '85.3%', got: {msg}"
+        );
     }
 }
