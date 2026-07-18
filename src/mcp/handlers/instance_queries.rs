@@ -182,6 +182,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         };
 
         let result =
@@ -210,6 +211,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         }
     }
 
@@ -317,6 +319,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         };
 
         let result = handle_list_instances_with_runtime(

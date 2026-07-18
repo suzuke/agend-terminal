@@ -164,6 +164,7 @@ fn fixture(tag: &str) -> Fixture {
         capability: crate::api::RestartCapability::Unsupported,
         app_restart: None,
         post_flush: None,
+        notifier: None,
     };
     let _ = source_head;
     Fixture {

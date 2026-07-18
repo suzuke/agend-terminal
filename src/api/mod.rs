@@ -71,15 +71,6 @@ pub enum PaneMoveSplitDir {
     Vertical,
 }
 
-impl PaneMoveSplitDir {
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "vertical" | "v" => Self::Vertical,
-            _ => Self::Horizontal,
-        }
-    }
-}
-
 /// Layout hint for newly created instances. Parsed at the API boundary so
 /// invalid values are caught early rather than silently defaulting downstream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -424,7 +415,7 @@ pub fn serve(
                     &shutdown,
                     &cfgs,
                     &ext,
-                    ntf.as_deref(),
+                    ntf.as_ref(),
                     session_operator_token,
                     session_cookie,
                     session_host,
@@ -561,7 +552,7 @@ fn handle_session(
     shutdown: &Arc<AtomicBool>,
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
-    notifier: Option<&dyn ApiNotifier>,
+    notifier: Option<&Arc<dyn ApiNotifier>>,
     operator_token: crate::auth_cookie::Cookie,
     cookie: crate::auth_cookie::Cookie,
     host: RestartCapability,

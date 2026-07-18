@@ -411,32 +411,25 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
 /// notifier) is a no-op and still returns `{"ok": true}`, matching the
 /// semantics of other layout-affecting MCP methods.
 pub(crate) fn handle_move_pane(params: &Value, ctx: &HandlerCtx) -> Value {
-    let agent_name = match params["agent"].as_str() {
-        Some(n) => n,
-        None => return json!({"ok": false, "error": "missing agent"}),
+    let event = match crate::agent_ops::move_pane(
+        ctx.home,
+        params["agent"].as_str(),
+        params["target_tab"].as_str(),
+        params["split_dir"].as_str(),
+    ) {
+        Ok(event) => event,
+        Err(error) => return json!({"ok": false, "error": error}),
     };
-    if let Err(e) = agent::validate_name(agent_name) {
-        return json!({"ok": false, "error": e});
-    }
-    let target_tab = match params["target_tab"].as_str() {
-        Some(t) if !t.is_empty() => t,
-        _ => return json!({"ok": false, "error": "missing target_tab"}),
-    };
-    let split_dir = PaneMoveSplitDir::parse(params["split_dir"].as_str().unwrap_or("horizontal"));
-
-    if let Some(n) = ctx.notifier {
-        n.notify(ApiEvent::PaneMoved {
-            agent: agent_name.to_string(),
-            target_tab: target_tab.to_string(),
-            split_dir,
+    if let Some(notifier) = ctx.notifier {
+        notifier.notify(ApiEvent::PaneMoved {
+            agent: event.agent.clone(),
+            target_tab: event.target_tab.clone(),
+            split_dir: match event.split_dir {
+                crate::agent_ops::PaneMoveSplit::Horizontal => PaneMoveSplitDir::Horizontal,
+                crate::agent_ops::PaneMoveSplit::Vertical => PaneMoveSplitDir::Vertical,
+            },
         });
     }
-    crate::event_log::log(
-        ctx.home,
-        "move_pane",
-        agent_name,
-        &format!("target_tab={target_tab} split={split_dir:?}"),
-    );
     json!({"ok": true})
 }
 

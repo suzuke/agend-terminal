@@ -27,6 +27,7 @@
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::{
     binding_state, channel, ci, comms, instance, restart, review_assignment, schedule, task,
@@ -65,6 +66,9 @@ pub(crate) struct RuntimeContext {
     /// it flushes THIS response. `None` off the api `mcp_tool` ingress (no request to
     /// tie a flush to → the handler cannot arm the barrier and fails closed).
     pub post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+    /// #2454: owner notifier forwarded from the API composition root so MCP
+    /// move_pane emits the same TUI event as the direct API ingress.
+    pub notifier: Option<Arc<dyn crate::api::ApiNotifier>>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -260,7 +264,11 @@ adapter!(
     has,
     instance::set_model::handle_set_model
 );
-adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
+/// #2454: move_pane is a runtime-aware adapter over the neutral service.
+pub(crate) fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
+    // The owned notifier travels inside RuntimeContext to the MCP adapter.
+    instance::handle_move_pane(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_set_waiting_on,
     hais,
@@ -498,6 +506,7 @@ mod tests {
             capability: crate::api::RestartCapability::App,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         };
         let ctx = HandlerCtx {
             home: &home,
@@ -973,6 +982,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         }
     }
 
@@ -1103,5 +1113,272 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(home).ok();
+    }
+
+    // #2454 Slice 6 RED: move_pane must use the forwarded RuntimeContext
+    // directly. The current adapter still calls the daemon MOVE_PANE socket,
+    // so this real dispatch path deterministically fails without a listener.
+    fn move_pane_runtime() -> RuntimeContext {
+        RuntimeContext {
+            registry: std::sync::Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            externals: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: None,
+            notifier: None,
+        }
+    }
+
+    fn move_pane_runtime_ctx<'a>(
+        home: &'a Path,
+        args: &'a Value,
+        runtime: &'a RuntimeContext,
+    ) -> HandlerCtx<'a> {
+        static EMPTY_SENDER: Option<Sender> = None;
+        HandlerCtx {
+            home,
+            args,
+            instance_name: "operator",
+            sender: &EMPTY_SENDER,
+            runtime: Some(runtime),
+        }
+    }
+
+    #[test]
+    fn move_pane_uses_supplied_runtime_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-move-pane-runtime-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let args = json!({
+            "instance": "agent-a",
+            "target_tab": "team-x",
+        });
+        let runtime = move_pane_runtime();
+        let ctx = move_pane_runtime_ctx(&home, &args, &runtime);
+        let result = try_dispatch("move_pane", &ctx).expect("move_pane dispatch result");
+        assert_eq!(
+            result["ok"], true,
+            "move_pane must succeed through RuntimeContext without an API listener: {result}"
+        );
+        assert_eq!(
+            result["instance"], "agent-a",
+            "move_pane target must be echoed"
+        );
+        assert_eq!(
+            result["target_tab"], "team-x",
+            "move_pane tab must be echoed"
+        );
+
+        let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+            .expect("runtime move_pane must emit one event-log record");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "move_pane must emit exactly one event: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("\"kind\":\"move_pane\"")
+                && lines[0].contains("agent-a")
+                && lines[0].contains("team-x")
+                && lines[0].contains("Horizontal"),
+            "move_pane event must preserve default split semantics: {lines:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn move_pane_vertical_split_and_notifier_contract_2454() {
+        use crate::api::{ApiEvent, ApiNotifier, PaneMoveSplitDir};
+
+        struct RecordingNotifier {
+            events: parking_lot::Mutex<Vec<ApiEvent>>,
+        }
+
+        impl RecordingNotifier {
+            fn new() -> Self {
+                Self {
+                    events: parking_lot::Mutex::new(Vec::new()),
+                }
+            }
+
+            fn take(&self) -> Vec<ApiEvent> {
+                std::mem::take(&mut *self.events.lock())
+            }
+        }
+
+        impl ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-move-pane-notifier-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let notifier = std::sync::Arc::new(RecordingNotifier::new());
+        let notifier_trait: std::sync::Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let ctx = crate::api::handlers::HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: Some(&notifier_trait),
+            home: &home,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        };
+
+        let default = crate::api::handlers::instance::handle_move_pane(
+            &json!({"agent": "agent-a", "target_tab": "team-x"}),
+            &ctx,
+        );
+        assert_eq!(default["ok"], true, "API move_pane default must succeed");
+        let vertical = crate::api::handlers::instance::handle_move_pane(
+            &json!({
+                "agent": "agent-b",
+                "target_tab": "team-y",
+                "split_dir": "vertical",
+            }),
+            &ctx,
+        );
+        assert_eq!(vertical["ok"], true, "API move_pane vertical must succeed");
+
+        let events = notifier.take();
+        assert_eq!(events.len(), 2, "default + vertical must emit two events");
+        assert!(matches!(
+            &events[0],
+            ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir: PaneMoveSplitDir::Horizontal,
+            } if agent == "agent-a" && target_tab == "team-x"
+        ));
+        assert!(matches!(
+            &events[1],
+            ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir: PaneMoveSplitDir::Vertical,
+            } if agent == "agent-b" && target_tab == "team-y"
+        ));
+        let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+            .expect("API move_pane must emit event-log records");
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "two move_pane calls must emit two records"
+        );
+        assert!(log
+            .lines()
+            .all(|line| line.contains("\"kind\":\"move_pane\"")));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn move_pane_runtime_none_is_explicit_and_never_socket_fallback_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-move-pane-runtime-none-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let args = json!({
+            "instance": "agent-a",
+            "target_tab": "team-x",
+        });
+        let ctx = ctx_for(&home, &args, "operator");
+        let result = try_dispatch("move_pane", &ctx).expect("move_pane dispatch result");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("runtime unavailable"),
+            "runtime=None must fail explicitly rather than use socket fallback: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn move_pane_shared_service_and_no_api_call_invariants_2454() {
+        let dispatch = include_str!("dispatch.rs");
+        let production_dispatch = dispatch
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dispatch production source");
+        assert!(
+            !production_dispatch
+                .contains("adapter!(dispatch_move_pane, ha, instance::handle_move_pane)"),
+            "move_pane must use a runtime-aware custom dispatch adapter"
+        );
+        let runtime_start = production_dispatch
+            .find("pub(crate) struct RuntimeContext {")
+            .expect("RuntimeContext declaration");
+        let runtime_end = production_dispatch[runtime_start..]
+            .find("/// One MCP tool's dispatcher")
+            .map(|offset| runtime_start + offset)
+            .expect("RuntimeContext end marker");
+        let runtime_region = &production_dispatch[runtime_start..runtime_end];
+        assert!(
+            runtime_region.contains("notifier"),
+            "RuntimeContext must own a notifier for MCP move_pane"
+        );
+        let move_start = production_dispatch
+            .find("pub(crate) fn dispatch_move_pane(")
+            .expect("runtime-aware dispatch_move_pane declaration");
+        let move_end = production_dispatch[move_start..]
+            .find("pub(crate) fn dispatch_usage_limit_takeover(")
+            .map(|offset| move_start + offset)
+            .expect("dispatch_move_pane end marker");
+        let move_region = &production_dispatch[move_start..move_end];
+        assert!(
+            move_region.contains("notifier"),
+            "dispatch_move_pane must forward RuntimeContext notifier"
+        );
+
+        let mcp = include_str!("instance_metadata.rs");
+        let mcp_start = mcp
+            .find("pub(super) fn handle_move_pane(")
+            .expect("MCP move_pane handler");
+        let mcp_end = mcp[mcp_start..]
+            .find("pub(super) fn handle_pane_snapshot(")
+            .map(|offset| mcp_start + offset)
+            .expect("MCP pane_snapshot handler");
+        let mcp_region = &mcp[mcp_start..mcp_end];
+        assert!(
+            mcp_region.contains("agent_ops::move_pane"),
+            "MCP move_pane must call the shared neutral service"
+        );
+        assert!(
+            !mcp_region.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && trimmed.contains("api::call")
+            }),
+            "MCP move_pane production region must contain no api::call"
+        );
+
+        let api = include_str!("../../api/handlers/instance.rs");
+        let api_start = api
+            .find("pub(crate) fn handle_move_pane(")
+            .expect("API move_pane handler");
+        let api_end = api[api_start..]
+            .find("pub(crate) fn handle_set_blocked_reason(")
+            .map(|offset| api_start + offset)
+            .expect("API blocked-reason handler");
+        let api_region = &api[api_start..api_end];
+        assert!(
+            api_region.contains("agent_ops::move_pane"),
+            "API move_pane must call the same shared neutral service"
+        );
     }
 }
