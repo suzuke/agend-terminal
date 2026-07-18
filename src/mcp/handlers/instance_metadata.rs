@@ -418,6 +418,7 @@ mod blocked_reason_runtime_2454_tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         };
         (rt, home)
     }

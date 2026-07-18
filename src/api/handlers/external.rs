@@ -129,6 +129,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
         (ctx, home)
     }

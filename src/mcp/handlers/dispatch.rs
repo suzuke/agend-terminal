@@ -69,6 +69,9 @@ pub(crate) struct RuntimeContext {
     /// #2454: owner notifier forwarded from the API composition root so MCP
     /// move_pane emits the same TUI event as the direct API ingress.
     pub notifier: Option<Arc<dyn crate::api::ApiNotifier>>,
+    /// #2454 Slice 9 RED: optional shared daemon shutdown authority forwarded
+    /// from the API MCP ingress. Standalone bridge calls leave it absent.
+    pub shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -302,11 +305,12 @@ pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
 /// standalone bridge call that never traversed the api `mcp_tool` ingress) maps
 /// to `None` → default-deny in the handler.
 pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
-    restart::handle_restart_daemon(
+    restart::handle_restart_daemon_with_shutdown(
         ctx.home,
         ctx.runtime.map(|r| r.capability),
         ctx.runtime.and_then(|r| r.app_restart.clone()),
         ctx.runtime.and_then(|r| r.post_flush.clone()),
+        ctx.runtime.and_then(|r| r.shutdown.clone()),
     )
 }
 
@@ -513,6 +517,7 @@ mod tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         };
         let ctx = HandlerCtx {
             home: &home,
@@ -989,6 +994,7 @@ mod tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         }
     }
 
@@ -1136,6 +1142,7 @@ mod tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         }
     }
 
@@ -1244,6 +1251,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let default = crate::api::handlers::instance::handle_move_pane(

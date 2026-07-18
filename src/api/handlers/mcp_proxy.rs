@@ -153,6 +153,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         // register its commit-permission ack, run by `handle_session` after flush.
         post_flush: Some(ctx.post_flush.clone()),
         notifier: ctx.notifier.cloned(),
+        shutdown: ctx.shutdown.clone(),
     };
     handle_mcp_tool_inner(
         tool,
@@ -515,6 +516,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let full = crate::mcp::tools::tool_definitions()["tools"]
@@ -574,6 +576,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let resp = handle_mcp_tool(
@@ -621,6 +624,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let resp = handle_mcp_tool(
@@ -671,6 +675,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let resp = handle_mcp_tools_list(&json!({"instance": "bad"}), &ctx);
@@ -713,6 +718,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let full = crate::mcp::tools::tool_definitions()["tools"]
@@ -785,6 +791,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let default = handle_mcp_tool(
@@ -932,6 +939,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         for arguments in [
@@ -1039,6 +1047,7 @@ mod tests {
             app_restart: None,
             post_flush,
             notifier: None,
+            shutdown: None,
         };
         let result = handle_mcp_tool(
             &serde_json::json!({
@@ -1075,5 +1084,92 @@ mod tests {
             "event-log must contain inject_input detail ('not found'): {event_log}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 Slice 9 RED: drive the real MCP restart_daemon ingress with a
+    /// Daemon capability and an injected shutdown flag. The legacy handler
+    /// still self-IPC's SHUTDOWN, so the response is ok while the flag stays
+    /// false until GREEN wires the shared authority through.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restart_daemon_real_entry_shutdown_flag_2454() {
+        use std::ffi::OsString;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-s9-mcp-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  operator:\n    role_kind: orchestrator\n",
+        )
+        .unwrap();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        let previous_handoff = std::env::var_os("AGEND_RESTART_HANDOFF");
+        let previous_supervised = std::env::var_os("AGEND_SUPERVISED");
+        std::env::set_var("AGEND_HOME", &home);
+        std::env::set_var("AGEND_RESTART_HANDOFF", OsString::from("0"));
+        std::env::set_var("AGEND_SUPERVISED", OsString::from("1"));
+
+        let previous_restart_pending = crate::daemon::RESTART_PENDING.load(Ordering::Acquire);
+        crate::daemon::RESTART_PENDING.store(false, Ordering::Release);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &home,
+            capability: crate::api::RestartCapability::Daemon,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: Some(shutdown.clone()),
+        };
+        let response = handle_mcp_tool(
+            &json!({
+                "tool": "restart_daemon",
+                "instance": "operator",
+                "arguments": {}
+            }),
+            &ctx,
+        );
+        let response_ok = response["ok"] == true && response["result"]["ok"] == true;
+        let shutdown_set = shutdown.load(Ordering::Acquire);
+
+        crate::daemon::RESTART_PENDING.store(previous_restart_pending, Ordering::Release);
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        match previous_handoff {
+            Some(value) => std::env::set_var("AGEND_RESTART_HANDOFF", value),
+            None => std::env::remove_var("AGEND_RESTART_HANDOFF"),
+        }
+        match previous_supervised {
+            Some(value) => std::env::set_var("AGEND_SUPERVISED", value),
+            None => std::env::remove_var("AGEND_SUPERVISED"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert!(
+            response_ok,
+            "legacy restart_daemon response must remain ok: {response}"
+        );
+        assert!(
+            shutdown_set,
+            "RED: production restart_daemon must set the injected shutdown flag: {response}"
+        );
     }
 }

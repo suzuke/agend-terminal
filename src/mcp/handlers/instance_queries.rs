@@ -183,6 +183,7 @@ mod tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         };
 
         let result =
@@ -212,6 +213,7 @@ mod tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         }
     }
 
@@ -320,6 +322,7 @@ mod tests {
             app_restart: None,
             post_flush: None,
             notifier: None,
+            shutdown: None,
         };
 
         let result = handle_list_instances_with_runtime(

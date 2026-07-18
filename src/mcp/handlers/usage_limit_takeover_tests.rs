@@ -165,6 +165,7 @@ fn fixture(tag: &str) -> Fixture {
         app_restart: None,
         post_flush: None,
         notifier: None,
+        shutdown: None,
     };
     let _ = source_head;
     Fixture {
