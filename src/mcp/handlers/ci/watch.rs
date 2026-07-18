@@ -278,6 +278,14 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if let Some(sha) = exact_head_sha.as_deref() {
         watch["target_head_sha"] = json!(sha);
     }
+    // #2812: notification-only watch — short TTL (1h), persisted flag.
+    let notification_only = args["notification_only"].as_bool().unwrap_or(false);
+    if notification_only {
+        watch["notification_only"] = json!(true);
+        let short_ttl = chrono::Utc::now()
+            + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
+        watch["expires_at"] = json!(short_ttl.to_rfc3339());
+    }
 
     // #779 P2 Piece 3 site B: atomic_write failure (disk full,
     // permission, etc.) previously surfaced as `let _ = ...` silent

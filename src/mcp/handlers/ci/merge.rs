@@ -64,21 +64,36 @@ pub(crate) fn post_merge_receipt_and_watch(
 
 /// Resolve the task assignee for a PR branch by scanning all bindings.
 /// Returns `(agent_name, task_id)` or `None` if no unique match.
-/// Fail-closed: ambiguity (multiple matches) or no match → None.
+/// Fail-closed: ambiguity (multiple matches), no match, or repo
+/// mismatch → None. Requires canonical repo + branch + non-empty task_id.
 fn resolve_task_assignee_for_branch(
     home: &Path,
-    _repo: &str,
+    repo: &str,
     branch: &str,
 ) -> Option<(String, String)> {
-    if branch.is_empty() {
+    if branch.is_empty() || repo.is_empty() {
         return None;
     }
+    let repo_lower = repo.to_lowercase();
     let bindings = crate::binding::binding_scan_all(home);
     let mut matches: Vec<(String, String)> = Vec::new();
     for (agent, binding) in &bindings {
         let b_branch = binding["branch"].as_str().unwrap_or("");
         let b_task = binding["task_id"].as_str().unwrap_or("");
-        if b_branch == branch && !b_task.is_empty() {
+        if b_branch != branch || b_task.is_empty() {
+            continue;
+        }
+        let b_source = binding["source_repo"].as_str().unwrap_or("");
+        if b_source.is_empty() {
+            continue;
+        }
+        let b_slug = crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(
+            std::path::Path::new(b_source),
+        );
+        let repo_matches = b_slug
+            .as_deref()
+            .is_some_and(|s| s.to_lowercase() == repo_lower);
+        if repo_matches {
             matches.push((agent.clone(), b_task.to_string()));
         }
     }

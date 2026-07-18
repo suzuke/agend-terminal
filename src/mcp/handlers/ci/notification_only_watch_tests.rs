@@ -36,15 +36,49 @@ fn seed_fleet(home: &std::path::Path, instances: &[&str]) {
     std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
 }
 
+fn make_source_repo(home: &std::path::Path) -> std::path::PathBuf {
+    let source_repo = home.join("source-repo");
+    std::fs::create_dir_all(&source_repo).unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{REPO}.git"),
+        ])
+        .current_dir(&source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    source_repo
+}
+
 fn seed_binding(home: &std::path::Path, agent: &str, task_id: &str) {
+    let source_repo = make_source_repo(home);
+    seed_binding_with_source(home, agent, task_id, "fix/test", &source_repo);
+}
+
+fn seed_binding_with_source(
+    home: &std::path::Path,
+    agent: &str,
+    task_id: &str,
+    branch: &str,
+    source_repo: &std::path::Path,
+) {
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).unwrap();
     let binding = json!({
         "task_id": task_id,
-        "branch": "fix/test",
+        "branch": branch,
         "issued_at": "2026-07-18T00:00:00Z",
         "worktree": "/tmp/fake-wt",
-        "source_repo": "/tmp/fake-repo",
+        "source_repo": source_repo.display().to_string(),
     });
     std::fs::write(
         dir.join("binding.json"),
@@ -234,21 +268,8 @@ fn post_merge_orchestrator_merge_developer_bound_arms_watch() {
     let home = tmp_home("post-merge-topology");
     let sha = "1".repeat(40);
     seed_fleet(&home, &["lead", "dev"]);
-    // Developer bound to the PR branch with a task.
-    let dev_dir = crate::paths::runtime_dir(&home).join("dev");
-    std::fs::create_dir_all(&dev_dir).unwrap();
-    let binding = json!({
-        "task_id": "t-merge",
-        "branch": "fix/feature-x",
-        "issued_at": "2026-07-18T00:00:00Z",
-        "worktree": "/tmp/fake-wt",
-        "source_repo": "/tmp/fake-repo",
-    });
-    std::fs::write(
-        dev_dir.join("binding.json"),
-        serde_json::to_vec_pretty(&binding).unwrap(),
-    )
-    .unwrap();
+    let source_repo = make_source_repo(&home);
+    seed_binding_with_source(&home, "dev", "t-merge", "fix/feature-x", &source_repo);
     // Orchestrator (lead) has NO binding.
 
     // Orchestrator calls merge → post_merge resolves developer from PR branch.
@@ -307,21 +328,15 @@ fn post_merge_ambiguous_binding_skips() {
     let sha = "a1".repeat(20);
     seed_fleet(&home, &["lead", "dev1", "dev2"]);
     // Two developers bound to the same branch.
+    let source_repo = make_source_repo(&home);
     for agent in ["dev1", "dev2"] {
-        let dir = crate::paths::runtime_dir(&home).join(agent);
-        std::fs::create_dir_all(&dir).unwrap();
-        let binding = json!({
-            "task_id": format!("t-{agent}"),
-            "branch": "fix/shared",
-            "issued_at": "2026-07-18T00:00:00Z",
-            "worktree": "/tmp/fake-wt",
-            "source_repo": "/tmp/fake-repo",
-        });
-        std::fs::write(
-            dir.join("binding.json"),
-            serde_json::to_vec_pretty(&binding).unwrap(),
-        )
-        .unwrap();
+        seed_binding_with_source(
+            &home,
+            agent,
+            &format!("t-{agent}"),
+            "fix/shared",
+            &source_repo,
+        );
     }
 
     let diag =

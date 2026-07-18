@@ -195,6 +195,9 @@ pub struct WatchState {
     /// so `earliest_subscribed_at` (the normal age anchor) is None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwatched_at: Option<String>,
+    /// #2812: notification-only watch — short-lived, no privileged continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_only: Option<bool>,
 }
 
 fn default_branch() -> String {
