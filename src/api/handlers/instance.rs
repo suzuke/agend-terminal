@@ -5,67 +5,22 @@ use crate::agent;
 use crate::api::{ApiEvent, LayoutHint, PaneMoveSplitDir};
 use serde_json::{json, Value};
 
+/// #2454 S4: thin wire adapter — delegates to the neutral
+/// `agent_ops::inject_input` service that owns the implementation.
 pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
     let name = params["name"].as_str().unwrap_or("");
-    if let Err(e) = agent::validate_name(name) {
-        return json!({"ok": false, "error": e});
-    }
     let data = params["data"].as_str().unwrap_or("");
     let raw = params["raw"].as_bool().unwrap_or(false);
-    // #1530/F1: snapshot the inject target (+ the restarting check) under the
-    // registry lock, then RELEASE it before the (up to 5s + payload-scaled)
-    // blocking PTY write — never hold the registry across write/inject.
-    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
-    let snap = {
-        let reg = agent::lock_registry(ctx.registry);
-        crate::fleet::resolve_uuid(ctx.home, name)
-            .and_then(|id| reg.get(&id))
-            .map(|handle| {
-                // #2465: routed through operated_state for single-source consistency with the
-                // other decision consumers (#1493) — NOT a behavioral change here today.
-                // `is_unavailable` = Crashed|Restarting; the gate keeps Crashed raw (non-decisive
-                // screen) and only overrides on a COARSE disagreement (rule d), so a fresh Active
-                // hook AGREES with Restarting's Working baseline and does NOT flip is_unavailable.
-                // This diverges from raw only for a cross-coarse Hook/Stream correction (e.g.
-                // raw=Restarting + Hook=WaitingForUser/RateLimited — more relevant after #2466).
-                // Lock scoped + dropped before `from_handle` to preserve the single-acquisition order.
-                let operated_state = {
-                    let core = handle.core.lock();
-                    crate::daemon::shadow::operated_state(
-                        core.state.current,
-                        core.observed_status.as_ref(),
-                    )
-                };
-                (agent::InjectTarget::from_handle(handle), operated_state)
-            })
-    };
-    match snap {
-        Some((tgt, operated_state)) => {
-            if operated_state.is_unavailable() {
-                let state_name = operated_state.display_name();
-                json!({"ok": false, "error": format!("agent '{name}' is {state_name}, retry later")})
-            } else {
-                let result = if raw {
-                    agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
-                } else {
-                    // #1769: the api INJECT path carries operator/relay data (and
-                    // its own headers) — not a daemon auto-nudge → no marker.
-                    agent::inject_with_target_gated(&tgt, name, data.as_bytes(), true, None)
-                };
-                match result {
-                    Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
-                    Err(e) => json!({"ok": false, "error": format!("{e}")}),
-                }
-            }
-        }
-        None => {
-            let ext = agent::lock_external(ctx.externals);
-            if ext.contains_key(name) {
-                json!({"ok": false, "error": format!("agent '{name}' is external — use send instead of inject")})
-            } else {
-                json!({"ok": false, "error": format!("agent '{name}' not found")})
-            }
-        }
+    match crate::agent_ops::inject_input(
+        ctx.registry,
+        ctx.externals,
+        ctx.home,
+        name,
+        data.as_bytes(),
+        raw,
+    ) {
+        Ok(bytes) => json!({"ok": true, "result": {"bytes": bytes}}),
+        Err(e) => json!({"ok": false, "error": format!("{e}")}),
     }
 }
 

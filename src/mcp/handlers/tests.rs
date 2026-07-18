@@ -1923,20 +1923,6 @@ fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
 // ── interrupt tool tests ──
 
 #[test]
-fn test_interrupt_esc_params_contains_exact_esc_byte() {
-    let params = super::interrupt_esc_params("my-agent");
-    assert_eq!(params["method"], "inject");
-    assert_eq!(params["params"]["name"], "my-agent");
-    // Verify the data field is exactly the ESC byte (0x1b)
-    let data = params["params"]["data"]
-        .as_str()
-        .expect("data must be string");
-    assert_eq!(data.len(), 1, "ESC byte must be exactly 1 byte");
-    assert_eq!(data.as_bytes()[0], 0x1b, "data must be ESC byte (0x1b)");
-    assert_eq!(params["params"]["raw"], true, "must be raw inject");
-}
-
-#[test]
 fn test_interrupt_reason_header_format() {
     let header = crate::inbox::format_event_header("interrupt", &[("reason", "priority task")]);
     assert!(header.contains("[AGEND-MSG]"), "must have header prefix");
@@ -1965,12 +1951,12 @@ fn test_interrupt_handler_validates_target() {
     let r = handle_tool("interrupt", &json!({"instance": "../escape"}), "caller");
     assert!(r.get("error").is_some());
 
-    // Valid target but no daemon → reaches inject path
+    // Valid target but no runtime → explicit error (no api::call fallback)
     let r = handle_tool("interrupt", &json!({"instance": "valid-agent"}), "caller");
     let err = r["error"].as_str().unwrap_or("");
     assert!(
-        err.contains("not reachable") || err.contains("API unavailable"),
-        "valid target must reach inject path: {err}"
+        err.contains("runtime"),
+        "valid target without runtime must return explicit runtime error: {err}"
     );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();

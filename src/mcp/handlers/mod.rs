@@ -92,16 +92,6 @@ pub(super) fn require_instance(args: &Value) -> Result<&str, Value> {
     }
 }
 
-/// Build the INJECT API params for an interrupt ESC byte injection.
-/// Extracted for testability — unit tests verify the exact params
-/// without needing a running daemon.
-pub fn interrupt_esc_params(target: &str) -> Value {
-    json!({
-        "method": crate::api::method::INJECT,
-        "params": {"name": target, "data": "\x1b", "raw": true}
-    })
-}
-
 // Re-export for tests that use `use super::*`.
 #[cfg(test)]
 use instance::resolve_team_layout;

@@ -45,55 +45,45 @@ pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &
     set_string_attr(home, instance_name, desc, "description", 1024)
 }
 
+/// #2454 S4: MCP interrupt uses the neutral `agent_ops::inject_input`
+/// service in-process via RuntimeContext — no api::call loopback.
 pub(super) fn handle_interrupt(
     home: &Path,
     args: &Value,
     runtime: Option<&RuntimeContext>,
-) -> Value {
-    handle_interrupt_impl(home, args, runtime, &crate::api::call)
-}
-
-/// Inner impl parameterized on the INJECT RPC — the deterministic test seam
-/// (patterned on `spawn_single_instance_impl`). Production passes
-/// [`crate::api::call`]; a test injects a stub so the interrupt(snapshot=true)
-/// path can be exercised with no live daemon. #2454: the INJECT self-IPC stays a
-/// loopback (untouched, separate op), but the optional post-interrupt snapshot
-/// now runs IN-PROCESS via `agent_ops::pane_scrollback`.
-fn handle_interrupt_impl(
-    home: &Path,
-    args: &Value,
-    runtime: Option<&RuntimeContext>,
-    inject_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
 ) -> Value {
     let target = match super::require_instance(args) {
         Ok(t) => t,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
-    match inject_fn(home, &super::interrupt_esc_params(target)) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: interrupt requires the in-process daemon runtime"});
+    };
+    match crate::agent_ops::inject_input(
+        &runtime.registry,
+        &runtime.externals,
+        home,
+        target,
+        b"\x1b",
+        true,
+    ) {
+        Ok(_) => {
             if let Some(reason) = args["reason"].as_str() {
                 let header = crate::inbox::format_event_header("interrupt", &[("reason", reason)]);
                 crate::inbox::compose_aware_inject(home, target, &header);
             }
             let mut result = json!({"ok": true, "target": target});
             if args["snapshot"].as_bool() == Some(true) {
-                // #2454: best-effort in-process snapshot (no api::call). A missing
-                // runtime or a lookup miss simply OMITS the snapshot — it never
-                // turns a successful interrupt into a failure (same intent as the
-                // former `if let Ok(snap) = api::call { if snap.ok {…} }`).
-                if let Some(text) = runtime.and_then(|rt| {
-                    crate::agent_ops::pane_scrollback(&rt.registry, home, target, 40)
-                }) {
+                if let Some(text) =
+                    crate::agent_ops::pane_scrollback(&runtime.registry, home, target, 40)
+                {
                     result["snapshot"] = json!(text);
                 }
             }
             result
         }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("inject failed")}),
-        Err(e) => {
-            json!({"error": format!("interrupt failed — agent '{target}' not reachable (API unavailable: {e})")})
-        }
+        Err(e) => json!({"error": e.to_string()}),
     }
 }
 
@@ -403,7 +393,8 @@ mod blocked_reason_runtime_2454_tests {
             format!("instances:\n  {name}:\n    id: {}\n", id.full()),
         )
         .expect("seed fleet.yaml");
-        let handle = mk_test_handle(name, id);
+        let mut handle = mk_test_handle(name, id);
+        handle.pty_writer = Arc::new(Mutex::new(Box::new(std::io::sink())));
         let rt = RuntimeContext {
             registry: Arc::new(Mutex::new(HashMap::from([(id, handle)]))),
             externals: Arc::new(Mutex::new(HashMap::new())),
@@ -520,47 +511,126 @@ mod blocked_reason_runtime_2454_tests {
     }
 
     #[test]
-    fn interrupt_snapshot_runs_in_process_and_is_best_effort() {
+    fn interrupt_snapshot_runs_in_process_and_runtime_none_errors() {
         let (rt, home) = runtime_with_agent("agent-x");
-        let inject_ok = |_: &Path, _: &Value| -> anyhow::Result<Value> { Ok(json!({"ok": true})) };
-        // snapshot=true + runtime present → snapshot populated IN-PROCESS (no daemon).
-        let with_snap = handle_interrupt_impl(
+        let with_snap = handle_interrupt(
             &home,
             &json!({"instance": "agent-x", "snapshot": true}),
             Some(&rt),
-            &inject_ok,
         );
         assert_eq!(with_snap["ok"].as_bool(), Some(true), "{with_snap}");
         assert!(
             with_snap["snapshot"].is_string(),
             "snapshot must be populated in-process: {with_snap}"
         );
-        // runtime=None → snapshot OMITTED, interrupt still succeeds (best-effort).
-        let no_rt = handle_interrupt_impl(
+        let no_rt = handle_interrupt(
             &home,
             &json!({"instance": "agent-x", "snapshot": true}),
             None,
-            &inject_ok,
-        );
-        assert_eq!(no_rt["ok"].as_bool(), Some(true), "{no_rt}");
-        assert!(
-            no_rt.get("snapshot").is_none(),
-            "no runtime → snapshot omitted, interrupt still ok: {no_rt}"
-        );
-        // INJECT failure still fails the interrupt (unchanged).
-        let inject_err = |_: &Path, _: &Value| -> anyhow::Result<Value> { anyhow::bail!("boom") };
-        let failed = handle_interrupt_impl(
-            &home,
-            &json!({"instance": "agent-x", "snapshot": true}),
-            Some(&rt),
-            &inject_err,
         );
         assert!(
-            failed["error"]
+            no_rt["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("not reachable"),
-            "INJECT failure must fail the interrupt: {failed}"
+                .contains("runtime"),
+            "runtime=None must be an explicit error: {no_rt}"
+        );
+        let missing = handle_interrupt(&home, &json!({"instance": "missing"}), Some(&rt));
+        assert_eq!(
+            missing["error"].as_str(),
+            Some("agent 'missing' not found"),
+            "unknown target must surface exact domain error: {missing}"
+        );
+    }
+
+    /// #2454 S4 immutable RED: `handle_interrupt` with a live
+    /// RuntimeContext (seeded fleet.yaml/UUID) must succeed without a
+    /// daemon. This test is IMMUTABLE — GREEN makes it pass without
+    /// editing this assertion.
+    #[test]
+    fn interrupt_uses_runtime_context_without_api_listener_2454() {
+        let (rt, home) = runtime_with_agent("agent-x");
+        let result = handle_interrupt(&home, &json!({"instance": "agent-x"}), Some(&rt));
+        assert!(
+            result.get("error").is_none(),
+            "interrupt via runtime must succeed without a daemon; got: {result}"
+        );
+        assert_eq!(
+            result["ok"].as_bool(),
+            Some(true),
+            "interrupt must return ok:true on success: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 S4 RED source invariant: the MCP interrupt region
+    /// (handle_interrupt through handle_set_waiting_on) must contain
+    /// ZERO `api::call` references.  Scoped to exclude MOVE_PANE.
+    #[test]
+    fn no_api_call_in_interrupt_region_2454() {
+        let source = include_str!("instance_metadata.rs");
+        let start_marker = concat!("pub(super) fn handle_", "interrupt(");
+        let end_marker = concat!("pub(super) fn handle_set_", "waiting_on(");
+        let start = source.find(start_marker).expect("interrupt region start");
+        let end = source[start..]
+            .find(end_marker)
+            .map(|p| p + start)
+            .expect("interrupt region end");
+        let region = &source[start..end];
+        let needle_a = concat!("crate::", "api::", "call");
+        let needle_b = concat!("api::", "call(");
+        let needle_c = concat!("api::", "call)");
+        let violations: Vec<&str> = region
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && !trimmed.starts_with("///")
+            })
+            .filter(|line| {
+                line.contains(needle_a) || line.contains(needle_b) || line.contains(needle_c)
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "MCP interrupt region must contain zero api::call; found {}: {:?}",
+            violations.len(),
+            violations
+        );
+    }
+
+    /// #2454 S4 RED shared-service invariant: after GREEN, both the MCP
+    /// interrupt region AND the API handle_inject adapter must reference
+    /// `agent_ops::inject_input` — the frozen neutral service name.
+    /// Currently neither does.
+    #[test]
+    fn shared_inject_input_service_referenced_by_both_callers_2454() {
+        let service = concat!("agent_ops::", "inject_input");
+        let mcp_src = include_str!("instance_metadata.rs");
+        let mcp_start = mcp_src
+            .find(concat!("pub(super) fn handle_", "interrupt("))
+            .expect("MCP interrupt start");
+        let mcp_end = mcp_src[mcp_start..]
+            .find(concat!("pub(super) fn handle_set_", "waiting_on("))
+            .map(|p| p + mcp_start)
+            .expect("MCP interrupt end");
+        let mcp_region = &mcp_src[mcp_start..mcp_end];
+        let mcp_has = mcp_region.contains(service);
+
+        let api_src = include_str!("../../api/handlers/instance.rs");
+        let api_start = api_src
+            .find(concat!("pub(crate) fn handle_", "inject("))
+            .expect("API handle_inject start");
+        let api_end_marker = api_src[api_start..]
+            .find("\npub")
+            .map(|p| p + api_start)
+            .unwrap_or(api_src.len());
+        let api_region = &api_src[api_start..api_end_marker];
+        let api_has = api_region.contains(service);
+
+        assert!(
+            mcp_has && api_has,
+            "both MCP interrupt and API handle_inject must reference the neutral \
+             agent_ops::inject_input service; MCP={mcp_has}, API={api_has}"
         );
     }
 }

@@ -864,6 +864,87 @@ pub(crate) fn list_snapshot(
     json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
 }
 
+/// #2454 S4: neutral typed input-injection service.  Shared by the API
+/// INJECT wire handler and the MCP interrupt path — neither owns the
+/// registry lookup, operated-state gate, or PTY write logic.
+pub(crate) fn inject_input(
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+    home: &std::path::Path,
+    target: &str,
+    data: &[u8],
+    raw: bool,
+) -> Result<usize, InjectError> {
+    if let Err(e) = agent::validate_name(target) {
+        return Err(InjectError::Validation(e));
+    }
+    let snap = {
+        let reg = agent::lock_registry(registry);
+        crate::fleet::resolve_uuid(home, target)
+            .and_then(|id| reg.get(&id))
+            .map(|handle| {
+                let operated_state = {
+                    let core = handle.core.lock();
+                    crate::daemon::shadow::operated_state(
+                        core.state.current,
+                        core.observed_status.as_ref(),
+                    )
+                };
+                (agent::InjectTarget::from_handle(handle), operated_state)
+            })
+    };
+    match snap {
+        Some((tgt, operated_state)) => {
+            if operated_state.is_unavailable() {
+                let state_name = operated_state.display_name();
+                return Err(InjectError::Unavailable(format!(
+                    "agent '{target}' is {state_name}, retry later"
+                )));
+            }
+            let result = if raw {
+                agent::write_to_pty(&tgt.pty_writer, data)
+            } else {
+                agent::inject_with_target_gated(&tgt, target, data, true, None)
+            };
+            match result {
+                Ok(()) => Ok(data.len()),
+                Err(e) => Err(InjectError::Write(format!("{e}"))),
+            }
+        }
+        None => {
+            let ext = agent::lock_external(externals);
+            if ext.contains_key(target) {
+                Err(InjectError::External(format!(
+                    "agent '{target}' is external — use send instead of inject"
+                )))
+            } else {
+                Err(InjectError::NotFound(format!("agent '{target}' not found")))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum InjectError {
+    Validation(String),
+    Unavailable(String),
+    External(String),
+    NotFound(String),
+    Write(String),
+}
+
+impl std::fmt::Display for InjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(e)
+            | Self::Unavailable(e)
+            | Self::External(e)
+            | Self::NotFound(e)
+            | Self::Write(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Spawn a single agent into `registry` and start its TUI-serve thread.
 /// Shared by the SPAWN and CREATE_TEAM API handlers.
 ///
