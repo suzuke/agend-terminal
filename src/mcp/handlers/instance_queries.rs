@@ -356,29 +356,36 @@ mod tests {
     }
 
     /// #2454 S3 RED source invariant: production code in this module must
-    /// contain ZERO `crate::api::call` invocations.  Any loopback in the
-    /// instance-query path is a regression.
+    /// contain ZERO references to the API query layer — neither socket
+    /// loopback (`api::call`) nor in-process API-layer calls
+    /// (`api::list_response`).  Instance queries must go through the
+    /// neutral agent_ops service, not the API wire layer.
     #[test]
-    fn no_production_api_call_in_instance_queries_2454() {
+    fn no_production_api_dependency_in_instance_queries_2454() {
         let source = include_str!("instance_queries.rs");
-        let needle_a = concat!("crate::", "api::", "call");
-        let needle_b = concat!("api::", "call(");
         let in_test_mod = source.find("#[cfg(test)]").unwrap_or(source.len());
         let production = &source[..in_test_mod];
-        let production_calls: Vec<(usize, &str)> = production
+        let needles: &[&str] = &[
+            concat!("crate::", "api::", "call"),
+            concat!("api::", "call("),
+            concat!("crate::", "api::", "list_response"),
+            concat!("api::", "list_response("),
+        ];
+        let violations: Vec<(usize, &str)> = production
             .lines()
             .enumerate()
             .filter(|(_, line)| {
                 let trimmed = line.trim();
                 !trimmed.starts_with("//") && !trimmed.starts_with("///")
             })
-            .filter(|(_, line)| line.contains(needle_a) || line.contains(needle_b))
+            .filter(|(_, line)| needles.iter().any(|n| line.contains(n)))
             .collect();
         assert!(
-            production_calls.is_empty(),
-            "instance_queries.rs must contain zero production api::call sites; found {}: {:?}",
-            production_calls.len(),
-            production_calls
+            violations.is_empty(),
+            "instance_queries.rs must contain zero production API-layer references \
+             (api::call OR api::list_response); found {}: {:?}",
+            violations.len(),
+            violations
         );
     }
 }
