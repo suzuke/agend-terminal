@@ -34,7 +34,6 @@ pub(crate) fn handoff_row_state(
             return ProtectedHandoffRowState::Missing;
         };
         let matches: Vec<InboxMessage> = parse_inbox_messages(&content)
-            .into_iter()
             .filter(|msg| {
                 msg.kind.as_deref() == Some("ci-ready-for-action")
                     && msg.correlation_id.as_deref() == Some(correlation)
