@@ -350,7 +350,7 @@ impl CrashDispositionLedger {
     }
 
     pub(crate) fn mark_live(&self, permit: RecoveryExecutionPermit) -> bool {
-        if !permit.restarting_admitted {
+        if !permit.restarting_admitted || !permit.attempt_debited {
             return false;
         }
         self.transition(permit.key(), Disposition::Executing, Disposition::Live)
@@ -493,6 +493,17 @@ mod tests {
         permit
     }
 
+    fn admit_and_debit(
+        ledger: &CrashDispositionLedger,
+        token: ClaimToken,
+    ) -> RecoveryExecutionPermit {
+        let mut permit = admit(ledger, token);
+        assert!(permit
+            .debit_attempt(crate::teams::SelfOrchStatus::No)
+            .is_some());
+        permit
+    }
+
     #[test]
     fn replacement_removes_old_pending_before_execution() {
         let ledger = CrashDispositionLedger::new();
@@ -576,7 +587,7 @@ mod tests {
         assert!(ledger.publish(live.clone()));
         let live_token = ledger.claim(live.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(live_token));
-        let live_permit = admit(&ledger, live_token);
+        let live_permit = admit_and_debit(&ledger, live_token);
         assert!(ledger.mark_live(live_permit));
         assert_eq!(ledger.disposition(live.key()), Some(Disposition::Live));
 
@@ -644,7 +655,7 @@ mod tests {
             .claim(discard_obs.key(), Claimant::Crash)
             .expect("claim");
         assert!(ledger.mark_ready(discard_token));
-        let discard_permit = admit(&ledger, discard_token);
+        let discard_permit = admit_and_debit(&ledger, discard_token);
         assert!(!ledger.discard(discard_obs.key()));
         assert_eq!(
             ledger.disposition(discard_obs.key()),
@@ -707,6 +718,9 @@ mod tests {
             .begin_execute(token)
             .expect("exact-generation admission must mint a permit");
         assert!(permit.admit_restarting());
+        assert!(permit
+            .debit_attempt(crate::teams::SelfOrchStatus::No)
+            .is_some());
         assert!(ledger.mark_live(permit));
     }
 
@@ -817,7 +831,7 @@ mod tests {
         assert!(ledger.publish(old.clone()));
         let token = ledger.claim(old.key(), Claimant::Crash).expect("claim");
         assert!(ledger.mark_ready(token));
-        let permit = admit(&ledger, token);
+        let permit = admit_and_debit(&ledger, token);
         ledger.register_generation(id, SpawnGeneration::new(85));
         assert_eq!(ledger.entry_count(), 1, "Executing remains owned");
         assert!(ledger.mark_live(permit));
