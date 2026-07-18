@@ -443,13 +443,6 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
             crate::daemon::pr_state::is_branch_open(home, repo, branch)
         }) {
             Some(ExpiryReason::AbsoluteTtl) => {
-                if watch.notification_only == Some(true) {
-                    if let (Some(sha), Some(tid)) =
-                        (watch.target_head_sha.as_deref(), watch.task_id.as_deref())
-                    {
-                        crate::merge_receipt::remove(home, repo, sha, tid);
-                    }
-                }
                 remove_watch(
                     home,
                     &path,

@@ -402,3 +402,108 @@ fn notification_only_binding_task_mismatch_rejected() {
     assert_eq!(r["code"], "notification_only_binding_mismatch");
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Terminal removal of a notification-only watch must consume the receipt.
+/// After terminal: both watch + receipt absent. Stale replay after terminal
+/// must be rejected with notification_only_no_receipt.
+#[test]
+fn notification_only_terminal_removal_consumes_receipt() {
+    let home = tmp_home("terminal-consume");
+    let sha = "d".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    seed_binding(&home, "dev", "t-terminal");
+    seed_receipt(&home, REPO, &sha, "t-terminal", "dev");
+
+    // Arm the notification-only watch.
+    let args = json!({
+        "repository": REPO, "branch": "main",
+        "head_sha": sha, "task_id": "t-terminal",
+        "notification_only": true,
+    });
+    let r = handle_watch_ci(&home, &args, "dev");
+    assert!(r.get("error").is_none(), "arm must succeed: {r}");
+
+    // Verify both watch + receipt exist before terminal.
+    assert!(
+        crate::merge_receipt::find(&home, REPO, &sha, "t-terminal").is_some(),
+        "receipt must exist before terminal"
+    );
+    let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let watch_count = std::fs::read_dir(&watch_dir)
+        .map(|e| {
+            e.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(watch_count > 0, "watch must exist before terminal");
+
+    // Simulate terminal removal via shared remove_watch.
+    for entry in std::fs::read_dir(&watch_dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("json") {
+            crate::daemon::ci_watch::remove_watch(
+                &home,
+                &p,
+                "dev",
+                REPO,
+                "main",
+                "exact_head_terminal",
+            );
+        }
+    }
+
+    // After terminal: both watch + receipt must be absent.
+    assert!(
+        crate::merge_receipt::find(&home, REPO, &sha, "t-terminal").is_none(),
+        "receipt must be consumed by terminal removal"
+    );
+    let post_count = std::fs::read_dir(&watch_dir)
+        .map(|e| {
+            e.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(post_count, 0, "watch must be removed by terminal");
+
+    // Stale replay after terminal must fail — receipt is gone.
+    let stale = handle_watch_ci(&home, &args, "dev");
+    assert!(
+        stale.get("error").is_some(),
+        "stale replay after terminal must be rejected: {stale}"
+    );
+    assert_eq!(
+        stale["code"], "notification_only_no_receipt",
+        "rejection reason must be no_receipt"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pre-terminal repeat remains idempotent (receipt still live).
+#[test]
+fn notification_only_pre_terminal_repeat_idempotent() {
+    let home = tmp_home("pre-terminal-idem");
+    let sha = "e".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    seed_binding(&home, "dev", "t-idem");
+    seed_receipt(&home, REPO, &sha, "t-idem", "dev");
+
+    let args = json!({
+        "repository": REPO, "branch": "main",
+        "head_sha": sha, "task_id": "t-idem",
+        "notification_only": true,
+    });
+    let r1 = handle_watch_ci(&home, &args, "dev");
+    assert!(r1.get("error").is_none(), "first arm: {r1}");
+
+    let r2 = handle_watch_ci(&home, &args, "dev");
+    assert!(r2.get("error").is_none(), "pre-terminal repeat: {r2}");
+
+    // Receipt still exists (not consumed yet — no terminal removal).
+    assert!(
+        crate::merge_receipt::find(&home, REPO, &sha, "t-idem").is_some(),
+        "receipt must survive pre-terminal repeat"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
