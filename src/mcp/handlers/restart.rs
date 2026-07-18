@@ -12,15 +12,29 @@ use std::path::Path;
 /// both to a fail-closed response; a future staged app strategy becomes the
 /// `App` arm (decision d-20260712012329422433-1) with the compiler forcing every
 /// dispatch site to handle it — no god-object switch.
+#[cfg(test)]
 pub(super) fn handle_restart_daemon(
     home: &Path,
     capability: Option<crate::api::RestartCapability>,
     app_restart: Option<crate::api::app_restart::AppRestart>,
     post_flush: Option<crate::api::app_restart::PostFlushSlot>,
 ) -> Value {
+    handle_restart_daemon_with_shutdown(home, capability, app_restart, post_flush, None)
+}
+
+/// #2454 Slice 9: carries the API-owned shutdown authority through the daemon
+/// strategy so the supervised legacy path can shut down the current daemon
+/// without a loopback API call.
+pub(super) fn handle_restart_daemon_with_shutdown(
+    home: &Path,
+    capability: Option<crate::api::RestartCapability>,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
+    post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+    shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Value {
     use crate::api::RestartCapability;
     match capability {
-        Some(RestartCapability::Daemon) => daemon_restart_strategy(home),
+        Some(RestartCapability::Daemon) => daemon_restart_strategy(home, shutdown),
         Some(RestartCapability::App) => app_restart_strategy(app_restart, post_flush),
         Some(RestartCapability::Unsupported) | None => unsupported_fail_closed(),
     }
@@ -216,7 +230,10 @@ fn unsupported_fail_closed() -> Value {
 /// body below is the pre-Stage-R1 handler VERBATIM (self-respawn default /
 /// legacy exit(42) opt-out) — byte-semantically unchanged; only the app-mode
 /// gate that used to precede it moved out to the capability dispatch above.
-fn daemon_restart_strategy(home: &Path) -> Value {
+fn daemon_restart_strategy(
+    home: &Path,
+    shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Value {
     // #1814: self-respawn is the DEFAULT (Stage 4). By default the daemon owns
     // its own respawn (spawn successor → Phase-1 health gate → abort-stay-alive
     // on failure), so restart never hinges on an external supervisor being
@@ -270,9 +287,16 @@ fn daemon_restart_strategy(home: &Path) -> Value {
                       yet and stays fail-closed.)"
         });
     }
+    let Some(shutdown) = shutdown else {
+        return json!({
+            "ok": false,
+            "error": "restart_daemon requires an injected shutdown authority; refusing to mutate restart state"
+        });
+    };
     crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
     std::fs::write(home.join("restart-requested"), "").ok();
-    let _ = crate::api::call(home, &json!({"method": crate::api::method::SHUTDOWN}));
+    crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::ApiShutdown);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; supervisor restarts"})
 }
 

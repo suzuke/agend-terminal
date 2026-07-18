@@ -563,6 +563,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
         (ctx, home)
     }
@@ -698,6 +699,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
         (ctx, home)
     }
@@ -784,6 +786,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
 
         let resp = handle_spawn(&json!({"name": "twin", "backend": "claude"}), &ctx);
@@ -1178,6 +1181,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
         };
         (ctx, home)
     }

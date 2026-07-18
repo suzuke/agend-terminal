@@ -151,4 +151,8 @@ pub(crate) struct HandlerCtx<'a> {
     /// ack), and — after writing the response — calls `run_after_flush`. Cheap
     /// `Arc` clone; unused by non-restart tools.
     pub post_flush: crate::api::app_restart::PostFlushSlot,
+    /// #2454 Slice 9: shared daemon shutdown authority. Production API sessions
+    /// inject it; the inline SHUTDOWN path and MCP `restart_daemon` carry the
+    /// same authority. Ordinary helper/test contexts stay standalone.
+    pub shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }

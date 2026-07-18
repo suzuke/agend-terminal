@@ -306,6 +306,7 @@ fn g5_handle_spawn_rejects_workspace_identity_collision() {
         capability: crate::api::RestartCapability::Unsupported,
         app_restart: None,
         post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        shutdown: None,
     };
 
     let resp = handle_spawn(

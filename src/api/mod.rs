@@ -667,6 +667,7 @@ fn handle_session(
             capability: host,
             app_restart: app_restart.as_ref(),
             post_flush: post_flush.clone(),
+            shutdown: Some(Arc::clone(shutdown)),
         };
 
         // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
