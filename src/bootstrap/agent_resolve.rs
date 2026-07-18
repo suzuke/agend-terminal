@@ -18,6 +18,7 @@ pub type AgentDef = (
     Option<HashMap<String, String>>,
     Option<PathBuf>,
     String,
+    Option<backend::Backend>,
 );
 
 struct ResolveContext<'a> {
@@ -116,8 +117,9 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
             team: None,
             extra_instructions: extra_instructions.as_deref(),
         };
+        let behavior_command = resolved.backend.command_string();
         if let Err(e) =
-            crate::instructions::generate_with_context(dir, &resolved.backend_command, Some(&ctx))
+            crate::instructions::generate_with_context(dir, &behavior_command, Some(&ctx))
         {
             tracing::error!(instance = name, error = %e, "provisioning refused; skipping instance boot");
             return None;
@@ -139,6 +141,7 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
         Some(resolved.env),
         resolved.working_directory,
         resolved.submit_key,
+        Some(resolved.backend),
     ))
 }
 
@@ -280,7 +283,7 @@ mod tests {
             result.is_some(),
             "resolve_one must succeed with worktree:false"
         );
-        let (_, _, _, _, work_dir, _) = result.unwrap();
+        let (_, _, _, _, work_dir, _, _) = result.unwrap();
         // working_directory must be the original dir (not a .worktrees/ subdir)
         let wd = work_dir.unwrap();
         assert!(
@@ -322,7 +325,7 @@ mod tests {
         };
         let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some());
-        let (_, _, _, _, work_dir, _) = result.unwrap();
+        let (_, _, _, _, work_dir, _, _) = result.unwrap();
         let wd = work_dir.unwrap();
         // working_directory should be redirected to the new external
         // layout `$AGEND_HOME/worktrees/test-agent/<branch>/` per
@@ -401,7 +404,7 @@ mod tests {
             result.is_some(),
             "resolve_one must succeed for orchestrator"
         );
-        let (_, _, _, _, returned_work_dir, _) = result.unwrap();
+        let (_, _, _, _, returned_work_dir, _, _) = result.unwrap();
         let wd = returned_work_dir.unwrap();
 
         // #888 LOAD-BEARING: working_directory must NOT be redirected
@@ -608,7 +611,7 @@ mod tests {
         assert!(result.is_some(), "resolve_one must succeed after prune");
         // Verify prune was attempted — worktree dir should be removed
         // (or at minimum, resolve_one returned the base dir, not the worktree)
-        let (_, _, _, _, work_dir, _) = result.unwrap();
+        let (_, _, _, _, work_dir, _, _) = result.unwrap();
         let wd = work_dir.unwrap();
         let wd_str = wd.to_string_lossy();
         assert!(
@@ -651,7 +654,7 @@ mod tests {
         };
         let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some(), "resolve_one should succeed");
-        let (_, _, _, _, wd, _) = result.unwrap();
+        let (_, _, _, _, wd, _, _) = result.unwrap();
         let generated = std::fs::read_to_string(wd.unwrap().join(".claude/agend.md"))
             .expect("generated instructions file");
         assert!(

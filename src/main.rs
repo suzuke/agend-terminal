@@ -837,10 +837,20 @@ fn main() -> anyhow::Result<()> {
                         // `preset_spawn_args(spawn_mode)` — callers must NOT also
                         // stuff preset flags here or backends that reject
                         // duplicate flags (e.g. Grok `--always-approve`) exit 2.
-                        let submit_key = backend::Backend::from_command(&cmd)
+                        let declared_backend = backend::Backend::from_command(&cmd);
+                        let submit_key = declared_backend
+                            .as_ref()
                             .map(|b| b.preset().submit_key.to_string())
                             .unwrap_or_else(|| "\r".to_string());
-                        (name, cmd, Vec::new(), None, None, submit_key)
+                        (
+                            name,
+                            cmd,
+                            Vec::new(),
+                            None,
+                            None,
+                            submit_key,
+                            declared_backend,
+                        )
                     })
                     .collect();
                 // #1441: managed spawns fail-fast unless the instance is in
@@ -929,6 +939,7 @@ fn main() -> anyhow::Result<()> {
                         None,
                         None,
                         "\r".to_string(),
+                        Some(crate::backend::Backend::Shell),
                     )],
                 )?;
             }

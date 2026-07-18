@@ -3014,6 +3014,7 @@ fn srl_inject_failed_reachable_via_real_wedged_actor_writer_2620() {
     let wedge_args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
     let spawn_cfg = crate::agent::SpawnConfig {
         name,
+        backend: None,
         backend_command: "sh",
         args: &wedge_args,
         spawn_mode: crate::backend::SpawnMode::Fresh,

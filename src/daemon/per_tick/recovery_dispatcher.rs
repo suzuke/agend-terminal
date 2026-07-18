@@ -934,6 +934,7 @@ mod tests {
         let args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
         let cfg = agent::SpawnConfig {
             name: "wedged-esc-target",
+            backend: None,
             backend_command: "sh",
             args: &args,
             spawn_mode: crate::backend::SpawnMode::Fresh,

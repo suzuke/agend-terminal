@@ -387,7 +387,10 @@ fn respawn_agent_worker(
                         .and_then(|i| i.skills_path.clone())
                 })
                 .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
-        let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
+        let backend_skill = config
+            .backend
+            .clone()
+            .or_else(|| crate::backend::Backend::from_command(&config.backend_command))
             .and_then(|b| b.skill_dir_name());
         if let Err(e) = crate::skills::install_for_agent_backend_with_source(
             home,
@@ -486,6 +489,7 @@ fn respawn_agent_worker(
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
+            backend: config.backend.as_ref(),
             backend_command: &config.backend_command,
             args: &config.args,
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -718,6 +722,7 @@ mod deleted_gate_tests_1913 {
             VICTIM.to_string(),
             AgentConfig {
                 name: VICTIM.to_string(),
+                backend: None,
                 backend_command: "true".to_string(),
                 args: vec![],
                 env: None,
@@ -989,6 +994,7 @@ mod deleted_gate_tests_1913 {
 
         let config = AgentConfig {
             name: VICTIM.to_string(),
+            backend: None,
             backend_command: "nonexistent-command-12345".to_string(),
             args: vec![],
             env: None,

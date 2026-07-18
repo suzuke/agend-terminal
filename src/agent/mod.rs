@@ -613,6 +613,10 @@ pub type CrashChannel = crossbeam_channel::Sender<AgentExitEvent>;
 /// otherwise those flags get double-applied.
 pub struct SpawnConfig<'a> {
     pub name: &'a str,
+    /// Declared backend identity from fleet configuration. When present this
+    /// is authoritative even if `backend_command` is an arbitrary wrapper;
+    /// `None` preserves legacy command-basename inference.
+    pub backend: Option<&'a Backend>,
     pub backend_command: &'a str,
     pub args: &'a [String],
     pub spawn_mode: crate::backend::SpawnMode,
@@ -745,6 +749,7 @@ fn provision_opencode_data_dir(
 fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option<Backend>)> {
     let SpawnConfig {
         name,
+        backend: _,
         backend_command,
         args,
         spawn_mode,
@@ -754,7 +759,10 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         ..
     } = config;
 
-    let detected_backend = Backend::from_command(backend_command);
+    let detected_backend = config
+        .backend
+        .cloned()
+        .or_else(|| Backend::from_command(backend_command));
 
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.
@@ -1170,6 +1178,7 @@ pub fn spawn_agent(
 ) -> anyhow::Result<crate::types::InstanceId> {
     let SpawnConfig {
         name,
+        backend: _,
         backend_command,
         args: _,
         spawn_mode: _,
@@ -2127,6 +2136,7 @@ fn on_clean_exit_shell_fallback(
     let spawn_result = spawn_agent(
         &SpawnConfig {
             name,
+            backend: None,
             backend_command: shell,
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,

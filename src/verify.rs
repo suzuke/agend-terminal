@@ -48,6 +48,7 @@ impl TestResult {
 fn test_spawn_config<'a>(name: &'a str, home: Option<&'a Path>) -> agent::SpawnConfig<'a> {
     agent::SpawnConfig {
         name,
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -519,6 +520,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let spawn_result = agent::spawn_agent(
         &agent::SpawnConfig {
             name: &agent_name,
+            backend: Some(backend),
             backend_command: preset.command,
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,

@@ -187,6 +187,7 @@ fn test_send_to_active_registry_target_returns_pty() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "active-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -781,6 +782,7 @@ fn same_team_codex_update_absorbed() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "codex-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -860,6 +862,7 @@ fn cross_team_message_not_absorbed() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "codex-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -932,6 +935,7 @@ fn same_team_codex_update_orchestrator_not_skipped() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "codex-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -999,6 +1003,7 @@ fn same_team_codex_update_non_orchestrator_skipped() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "codex-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1067,6 +1072,7 @@ fn cross_team_codex_update_orchestrator_not_skipped() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "codex-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1670,6 +1676,7 @@ fn make_codex_ctx(
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: codex_agent,
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1940,6 +1947,7 @@ fn b6_non_codex_backend_pty_path_unchanged_by_override() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "claude-agent",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -2139,6 +2147,7 @@ fn kind_report_cross_team_codex_via_general_still_injects() {
         Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
     let spawn_cfg = crate::agent::SpawnConfig {
         name: "codex-rev",
+        backend: None,
         backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,

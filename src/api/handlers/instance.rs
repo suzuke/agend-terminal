@@ -241,6 +241,25 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     // usually resolve it through the fleet entry. push_model_arg enforces
     // the first tier by never duplicating an existing flag.
     let fleet_config_for_model = std::cell::OnceCell::new();
+    // #2801: keep declared backend identity independent from the executable
+    // command. A fleet entry may declare Claude while `command` is a wrapper.
+    let params_backend = params["backend"]
+        .as_str()
+        .map(crate::backend::Backend::parse_str);
+    let declared_backend = params_backend
+        .clone()
+        .filter(|b| !matches!(b, crate::backend::Backend::Raw(_)))
+        .or_else(|| fleet_resolved.as_ref().map(|r| r.backend.clone()))
+        .or_else(|| {
+            fleet_config_for_model
+                .get_or_init(|| {
+                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
+                })
+                .as_ref()
+                .and_then(|f| f.defaults.backend.clone())
+        })
+        .or(params_backend)
+        .unwrap_or(crate::backend::Backend::ClaudeCode);
     let tier_model = params["model_tier"]
         .as_str()
         .filter(|m| !m.is_empty())
@@ -266,24 +285,6 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         // Raw-parsed value is a command guess and must yield to the fleet
         // entry's declared backend. Params-Raw stands only when nothing else
         // declares — a genuinely raw backend.
-        let params_backend = params["backend"]
-            .as_str()
-            .map(crate::backend::Backend::parse_str);
-        let declared_backend = params_backend
-            .clone()
-            .filter(|b| !matches!(b, crate::backend::Backend::Raw(_)))
-            .or_else(|| fleet_resolved.as_ref().map(|r| r.backend.clone()))
-            .or_else(|| {
-                fleet_config_for_model
-                    .get_or_init(|| {
-                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-                            .ok()
-                    })
-                    .as_ref()
-                    .and_then(|f| f.defaults.backend.clone())
-            })
-            .or(params_backend)
-            .unwrap_or(crate::backend::Backend::ClaudeCode);
         crate::backend::Backend::push_model_arg(&mut args, &declared_backend, model);
     }
     let requested_work_dir = params["working_directory"]
@@ -318,7 +319,13 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     // #46776 fail-closed: a workspace-identity refusal (or provisioning I/O
     // failure) must ABORT the spawn — never fork an agent against foreign or
     // half-written provisioned state.
-    if let Err(e) = super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role) {
+    let behavior_command = match &declared_backend {
+        crate::backend::Backend::Shell | crate::backend::Backend::Raw(_) => command.to_string(),
+        _ => declared_backend.command_string(),
+    };
+    if let Err(e) =
+        super::prepare_instructions(ctx.home, name, &behavior_command, &work_dir, explicit_role)
+    {
         tracing::error!(agent = %name, error = %e, "SPAWN aborted: provisioning refused");
         return json!({"ok": false, "error": format!("provisioning refused: {e}")});
     }
@@ -348,6 +355,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         &work_dir,
         size,
         env_for_spawn,
+        Some(&declared_backend),
     ) {
         Ok(_spawn_mode) => {
             // fresh-restart self-kick: fire the first-turn recovery inject ONLY when
@@ -360,9 +368,9 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             // is harmless.
             if params["self_kick_on_ready"].as_bool().unwrap_or(false) {
                 if let Some(id) = crate::fleet::resolve_uuid(ctx.home, name) {
-                    let ready_timeout = crate::backend::Backend::from_command(command)
-                        .map(|b| b.preset().ready_timeout_secs)
-                        .unwrap_or(30)
+                    let ready_timeout = declared_backend
+                        .preset()
+                        .ready_timeout_secs
                         .saturating_add(15);
                     agent::spawn_self_kick_bootstrap(
                         std::sync::Arc::clone(ctx.registry),
@@ -582,6 +590,7 @@ mod tests {
         // Spawn a real shell agent so the registry has an entry with a HealthTracker.
         let spawn_cfg = agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: crate::default_shell(),
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -713,6 +722,7 @@ mod tests {
         let wedge_args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
         let spawn_cfg = agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: "sh",
             args: &wedge_args,
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1132,6 +1142,7 @@ mod tests {
             &work_dir,
             size,
             None,
+            None,
         );
         assert!(result.is_ok(), "spawn_one must succeed: {result:?}");
 
@@ -1472,7 +1483,10 @@ mod tests {
     /// Write a tiny shell script that captures its own argv (`$*`) to
     /// `sentinel_path` then sleeps so the agent stays alive long enough for
     /// cleanup_agent to reap it. The daemon-appended `--model <val>` lands in
-    /// the script's argv, so the sentinel content IS the spawned argv tail.
+    /// the script's argv, so the sentinel content IS the spawned argv tail. The
+    /// file is executable so it can stand in for a realistically named wrapper:
+    /// declared backend presets may precede caller args without `/bin/sh`
+    /// interpreting them as shell options (#2801).
     #[cfg(unix)]
     fn write_argv_capture_script(
         home: &std::path::Path,
@@ -1484,6 +1498,12 @@ mod tests {
             sentinel_path.display()
         );
         std::fs::write(&script, body).expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make script executable");
         script
     }
 
@@ -1507,8 +1527,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "model-fleet-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
                 // No --model in args, none in params — must come from fleet.yaml.
             }),
             &ctx,
@@ -1519,11 +1538,12 @@ mod tests {
         cleanup_agent(&ctx, "model-fleet-test");
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-fleet"),
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-fleet")),
             "fleet.yaml model MUST reach the spawned argv on a runtime SPAWN \
-             (restart_instance shape); pre-#2038 it was boot-only"
+             (restart_instance shape); pre-#2038 it was boot-only; got {actual:?}"
         );
     }
 
@@ -1547,8 +1567,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "shell-no-model-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
             }),
             &ctx,
         );
@@ -1602,8 +1621,7 @@ mod tests {
             let result = handle_spawn(
                 &json!({
                     "name": "seat",
-                    "backend": "/bin/sh",
-                    "args": script.display().to_string(),
+                    "backend": script.display().to_string(),
                 }),
                 &ctx,
             );
@@ -1614,10 +1632,9 @@ mod tests {
             let actual = await_sentinel_nonempty(&sentinel);
             cleanup_agent(&ctx, "seat");
             let _ = std::fs::remove_dir_all(&home);
-            assert_eq!(
-                actual.as_deref(),
-                Some(want),
-                "{backend}: persisted model must reach the spawned argv"
+            assert!(
+                actual.as_deref().is_some_and(|argv| argv.contains(want)),
+                "{backend}: persisted model must reach the spawned argv; got {actual:?}"
             );
         }
     }
@@ -1654,8 +1671,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "seat",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
             }),
             &ctx,
         );
@@ -1663,10 +1679,11 @@ mod tests {
         let actual = await_sentinel_nonempty(&sentinel);
         cleanup_agent(&ctx, "seat");
         let _ = std::fs::remove_dir_all(&home);
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-hand-edited"),
-            "the external edit must win on the next spawn (disk re-read)"
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-hand-edited")),
+            "the external edit must win on the next spawn (disk re-read); got {actual:?}"
         );
     }
 
@@ -1684,17 +1701,14 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            format!(
-                "instances:\n  args-fleet-test:\n    backend: claude\n    args:\n      - {}\n    model: model-2038-replace\n",
-                script.display()
-            ),
+            "instances:\n  args-fleet-test:\n    backend: claude\n    args:\n      - from-fleet\n    model: model-2038-replace\n",
         )
         .expect("write fleet.yaml");
 
         let result = handle_spawn(
             &json!({
                 "name": "args-fleet-test",
-                "backend": "/bin/sh",
+                "backend": script.display().to_string(),
                 // No "args" field at all — the deploy Phase 3 (args-less SPAWN) wire shape.
             }),
             &ctx,
@@ -1707,11 +1721,12 @@ mod tests {
 
         // The script itself ran (proving fleet args fallback) and saw the
         // appended model flag (proving model fallback).
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-replace"),
+        assert!(
+            actual.as_deref().is_some_and(|argv| {
+                argv.contains("from-fleet") && argv.contains("--model model-2038-replace")
+            }),
             "an args-less SPAWN (deploy Phase 3 shape) MUST respawn with the \
-             fleet entry's args + model"
+             fleet entry's args + model; got {actual:?}"
         );
     }
 
@@ -1734,8 +1749,8 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "model-prec-test",
-                "backend": "/bin/sh",
-                "args": format!("{} --model model-2038-explicit", script.display()),
+                "backend": script.display().to_string(),
+                "args": "--model model-2038-explicit",
             }),
             &ctx,
         );
@@ -1747,8 +1762,13 @@ mod tests {
 
         let argv = actual.expect("sentinel must have content");
         assert_eq!(
-            argv, "--model model-2038-explicit",
-            "caller-passed --model MUST win over fleet.yaml model with no duplicate flag"
+            argv.matches("--model").count(),
+            1,
+            "caller-passed --model MUST win over fleet.yaml model with no duplicate flag; got {argv}"
+        );
+        assert!(
+            argv.contains("--model model-2038-explicit"),
+            "caller model value must be preserved; got {argv}"
         );
     }
 
@@ -1773,8 +1793,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "params-model-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
                 "model": "model-2038-params",
             }),
             &ctx,
@@ -1785,10 +1804,11 @@ mod tests {
         cleanup_agent(&ctx, "params-model-test");
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-params"),
-            "params.model MUST be honoured and win over the fleet entry's model"
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-params")),
+            "params.model MUST be honoured and win over the fleet entry's model; got {actual:?}"
         );
     }
 
@@ -1812,8 +1832,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "inst-model-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
             }),
             &ctx,
         );
@@ -1823,10 +1842,11 @@ mod tests {
         cleanup_agent(&ctx, "inst-model-test");
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-inst-wins"),
-            "per-instance model MUST override defaults.model at the SPAWN entry"
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-inst-wins")),
+            "per-instance model MUST override defaults.model at the SPAWN entry; got {actual:?}"
         );
     }
 
