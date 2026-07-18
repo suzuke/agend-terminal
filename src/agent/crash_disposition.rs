@@ -765,6 +765,22 @@ mod tests {
     }
 
     #[test]
+    fn mark_live_requires_attempt_debit_slice4_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(93), &deleted, None);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let mut permit = ledger.begin_execute(token).expect("permit");
+        assert!(permit.admit_restarting());
+        assert!(!ledger.mark_live(permit));
+    }
+
+    #[test]
     fn superseded_generations_are_removed_and_count_stays_bounded() {
         let ledger = CrashDispositionLedger::new();
         let id = InstanceId::new();
