@@ -296,6 +296,7 @@ mod tests {
     /// `handle_describe_instance` which calls `api::call` — this test
     /// fails until the in-process path is wired.
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn describe_instance_uses_runtime_context_without_api_listener_2454() {
         let home = std::env::temp_dir().join(format!(
             "agend-describe-runtime-2454-{}-{}",
