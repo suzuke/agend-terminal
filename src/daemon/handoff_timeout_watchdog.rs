@@ -1368,7 +1368,16 @@ mod tests {
         seed_handoff_with_episode(&home, "reviewer", "o/r@b", 5, "ep-1");
 
         crate::daemon::ci_handoff_track::defer_track(
-            &home, "reviewer", "o/r@b", "ep-1", "reviewer", "t-wake", "busy", 600,
+            &home,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-1",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 600,
+            },
         );
 
         let now = chrono::Utc::now();
@@ -1390,7 +1399,16 @@ mod tests {
         seed_handoff_with_episode(&home, "reviewer", "o/r@b", 5, "ep-2");
 
         crate::daemon::ci_handoff_track::defer_track(
-            &home, "reviewer", "o/r@b", "ep-2", "reviewer", "t-wake", "busy", 1,
+            &home,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-2",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 1,
+            },
         );
 
         let now = chrono::Utc::now() + chrono::Duration::seconds(2);
@@ -1417,7 +1435,16 @@ mod tests {
         seed_handoff_with_episode(&home, "reviewer", "o/r@b", 3, "ep-real");
 
         let result = crate::daemon::ci_handoff_track::defer_track(
-            &home, "reviewer", "o/r@b", "ep-wrong", "reviewer", "t-wake", "busy", 600,
+            &home,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-wrong",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 600,
+            },
         );
         assert!(
             matches!(
@@ -1437,13 +1464,15 @@ mod tests {
 
         crate::daemon::ci_handoff_track::defer_track(
             &home,
-            "reviewer",
-            "o/r@b",
-            "ep-persist",
-            "reviewer",
-            "t-wake",
-            "busy",
-            600,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-persist",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 600,
+            },
         );
 
         let tracks = crate::daemon::ci_handoff_track::list(&home);
@@ -1489,13 +1518,15 @@ mod tests {
 
         crate::daemon::ci_handoff_track::defer_track(
             &home,
-            "reviewer",
-            "o/r@b",
-            "ep-status",
-            "reviewer",
-            "t-wake",
-            "busy",
-            600,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-status",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 600,
+            },
         );
 
         let status_args = serde_json::json!({"action": "status"});

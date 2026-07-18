@@ -616,13 +616,12 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
     };
     let target = &track.target;
 
-    use crate::daemon::ci_handoff_track::DeferOutcome;
-    match crate::daemon::ci_handoff_track::defer_track(
-        home,
+    use crate::daemon::ci_handoff_track::{DeferOutcome, DeferRequest};
+    let req = DeferRequest {
         target,
         correlation,
         episode,
-        if instance_name.is_empty() {
+        deferred_by: if instance_name.is_empty() {
             "operator"
         } else {
             instance_name
@@ -630,7 +629,8 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
         wake_task_id,
         reason,
         defer_secs,
-    ) {
+    };
+    match crate::daemon::ci_handoff_track::defer_track(home, &req) {
         DeferOutcome::Deferred => json!({"ok": true, "deferred": true}),
         DeferOutcome::AlreadyDeferred => {
             json!({"ok": true, "deferred": true, "already_deferred": true})

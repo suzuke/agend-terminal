@@ -148,18 +148,19 @@ pub(crate) enum DeferOutcome {
     LockFailed,
 }
 
-pub(crate) fn defer_track(
-    home: &Path,
-    target: &str,
-    correlation: &str,
-    episode: &str,
-    deferred_by: &str,
-    wake_task_id: &str,
-    reason: &str,
-    defer_secs: i64,
-) -> DeferOutcome {
-    let path = file_for(home, target, correlation);
-    let lock_path = lock_for(home, target, correlation);
+pub(crate) struct DeferRequest<'a> {
+    pub target: &'a str,
+    pub correlation: &'a str,
+    pub episode: &'a str,
+    pub deferred_by: &'a str,
+    pub wake_task_id: &'a str,
+    pub reason: &'a str,
+    pub defer_secs: i64,
+}
+
+pub(crate) fn defer_track(home: &Path, req: &DeferRequest<'_>) -> DeferOutcome {
+    let path = file_for(home, req.target, req.correlation);
+    let lock_path = lock_for(home, req.target, req.correlation);
     let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
         return DeferOutcome::LockFailed;
     };
@@ -169,18 +170,18 @@ pub(crate) fn defer_track(
     let Some(mut track) = current else {
         return DeferOutcome::TrackNotFound;
     };
-    if track.ci_handoff_episode.as_deref() != Some(episode) {
+    if track.ci_handoff_episode.as_deref() != Some(req.episode) {
         return DeferOutcome::EpisodeMismatch;
     }
     if track.is_deferred() {
         return DeferOutcome::AlreadyDeferred;
     }
     let now = chrono::Utc::now();
-    track.deferred_by = Some(deferred_by.to_string());
+    track.deferred_by = Some(req.deferred_by.to_string());
     track.deferred_at = Some(now.to_rfc3339());
-    track.wake_task_id = Some(wake_task_id.to_string());
-    track.defer_reason = Some(reason.to_string());
-    track.defer_expires_at = Some((now + chrono::Duration::seconds(defer_secs)).to_rfc3339());
+    track.wake_task_id = Some(req.wake_task_id.to_string());
+    track.defer_reason = Some(req.reason.to_string());
+    track.defer_expires_at = Some((now + chrono::Duration::seconds(req.defer_secs)).to_rfc3339());
     if atomic_write_track(&path, &track).is_err() {
         return DeferOutcome::LockFailed;
     }
