@@ -379,9 +379,11 @@ mod tests {
 
         let home =
             std::env::temp_dir().join(format!("agend-ctxalert-decimal-{}", std::process::id()));
-        std::fs::create_dir_all(&home).ok();
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
 
-        // Ensure default thresholds (alert=80.0).
+        // Save + clear env so default thresholds (alert=80.0) apply.
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
         std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
         crate::runtime_config::reload(&home);
         std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
@@ -428,7 +430,12 @@ mod tests {
             alert_msg.text
         );
 
-        // Clean up.
+        // Restore env + clean up.
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
         std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
         crate::runtime_config::reload(&home);
         std::fs::remove_dir_all(&home).ok();
