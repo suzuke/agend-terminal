@@ -144,6 +144,12 @@ mod exact_head_watch_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
 
+// #2812 notification-only watch — guard and contract tests in a sibling file.
+#[cfg(test)]
+#[path = "notification_only_watch_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod notification_only_watch_tests;
+
 // #2755 repo-checkout transactional submodule provisioning — real-entry tests in
 // a sibling file (test-named ⇒ file_size_invariant-exempt; keeps checkout.rs small).
 #[cfg(test)]
