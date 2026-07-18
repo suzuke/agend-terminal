@@ -83,7 +83,10 @@ mod tests {
 
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(cycle.handler_names(), ["recording"]);
-        assert_eq!(cycle.phase_for_test(), Some(crate::daemon::tick_stall::Phase::PostHandlers));
+        assert_eq!(
+            cycle.phase_for_test(),
+            Some(crate::daemon::tick_stall::Phase::PostHandlers)
+        );
     }
 
     #[test]
