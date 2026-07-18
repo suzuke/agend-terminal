@@ -307,7 +307,30 @@ pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
-adapter!(dispatch_task, hai, task::handle_task);
+/// #2454 Slice 5: task health/sweep are runtime-backed reads.  They must use
+/// the live registry forwarded through the in-process MCP ingress and must
+/// fail closed when that runtime is absent; all other task actions preserve
+/// the existing public `tasks::handle` path.
+pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
+    let action = ctx.args["action"].as_str().unwrap_or("");
+    if !matches!(action, "health" | "sweep") {
+        return task::handle_task(ctx.home, ctx.args, ctx.instance_name);
+    }
+    let Some(runtime) = ctx.runtime else {
+        return json!({
+            "error": "runtime unavailable: task health/sweep requires the in-process daemon runtime"
+        });
+    };
+    let live_instances =
+        crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals)["result"]
+            ["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| agent["name"].as_str().map(String::from))
+            .collect::<std::collections::HashSet<_>>();
+    crate::tasks::handle_with_live_instances(ctx.home, ctx.instance_name, ctx.args, &live_instances)
+}
 pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
     usage_limit_takeover::handle_usage_limit_takeover(ctx)
 }

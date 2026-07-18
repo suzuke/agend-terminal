@@ -56,6 +56,23 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
     }
 }
 
+/// #2454 Slice 5: MCP task health/sweep adapter with an already-captured live
+/// registry set.  The public [`handle`] signature remains the compatibility
+/// boundary for every non-MCP caller; only the two runtime-backed read arms
+/// are overridden here.
+pub(crate) fn handle_with_live_instances(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    live_instances: &std::collections::HashSet<String>,
+) -> Value {
+    match args["action"].as_str() {
+        Some("sweep") => handle_sweep_with_live_instances(home, args, live_instances),
+        Some("health") => handle_health_with_live_instances(home, Some(live_instances)),
+        _ => handle(home, instance_name, args),
+    }
+}
+
 /// #2037 (3): `id` is canonical, `task_id` accepted as alias — `send` calls it
 /// `task_id`, so the most common cross-tool slip is forgiving. Error messages
 /// name both.
@@ -1677,6 +1694,29 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
     // `Closes t-XXX-N` PR markers). This action is operator-
     // triggered, scans for 4 stale categories, returns a
     // dry-run plan, then applies on a confirm round-trip.
+    let live_instances: std::collections::HashSet<String> = crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    )
+    .ok()
+    .and_then(|r| {
+        r["result"]["agents"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|a| a["name"].as_str().map(String::from))
+                .collect()
+        })
+    })
+    .unwrap_or_default();
+    handle_sweep_with_live_instances(home, args, &live_instances)
+}
+
+fn handle_sweep_with_live_instances(
+    home: &Path,
+    args: &Value,
+    live_instances: &std::collections::HashSet<String>,
+) -> Value {
+    // #2454: the MCP adapter supplies this set from the in-process runtime;
+    // the public `handle` wrapper above retains its API-derived behavior.
     let apply = args["apply"].as_bool().unwrap_or(false);
     let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
         .as_array()
@@ -1693,25 +1733,12 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
         .as_str()
         .map(String::from)
         .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
-    let live_instances: std::collections::HashSet<String> = crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    )
-    .ok()
-    .and_then(|r| {
-        r["result"]["agents"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|a| a["name"].as_str().map(String::from))
-                .collect()
-        })
-    })
-    .unwrap_or_default();
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
     let categories = super::sweep::scan_categories(
         home,
-        &live_instances,
+        live_instances,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
@@ -1762,6 +1789,15 @@ fn handle_health(home: &Path) -> Value {
     // diagnosis: "is the board clean?" + recommended next
     // actions surfaced as a structured `recommendations` array.
     let live = crate::runtime::list_live_agents(home);
+    handle_health_with_live_instances(home, live.as_ref())
+}
+
+fn handle_health_with_live_instances(
+    home: &Path,
+    live: Option<&std::collections::HashSet<String>>,
+) -> Value {
+    // #2454: the MCP adapter supplies `Some(live)` from the in-process
+    // RuntimeContext; the public `handle` wrapper above retains its API path.
     let fleet_instances: std::collections::HashSet<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
@@ -1779,7 +1815,7 @@ fn handle_health(home: &Path) -> Value {
             });
         }
     };
-    build_health_response(&state, live.as_ref(), &fleet_instances)
+    build_health_response(&state, live, &fleet_instances)
 }
 
 fn handle_activity(home: &Path, args: &Value) -> Value {

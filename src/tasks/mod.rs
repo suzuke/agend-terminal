@@ -45,6 +45,7 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
 }
 
 pub use handler::handle;
+pub(crate) use handler::handle_with_live_instances;
 pub use handler::register_subscriber as register_cascade_subscriber;
 // #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch
 // auto-create (target board) and the per-board task sweep (project id from a
