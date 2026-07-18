@@ -147,8 +147,8 @@ impl PerTickHandler for ContextAlertHandler {
                 continue;
             }
             let text = format!(
-                "[context_alert] agent '{name}' context usage at {pct:.0}% \
-                 (source: {source}, threshold {threshold:.0}%). Handling is NOT \
+                "[context_alert] agent '{name}' context usage at {pct:.1}% \
+                 (source: {source}, threshold {threshold:.1}%). Handling is NOT \
                  automated — at a natural boundary consider a handoff + \
                  restart_instance to free the context. Re-alerts every 30min \
                  while it stays high."

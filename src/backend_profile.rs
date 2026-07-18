@@ -311,7 +311,7 @@ fn kirocli_profile() -> BackendProfile {
             (AgentState::Active, r"Kiro is working|esc to cancel"),
             (
                 AgentState::Idle,
-                r"\d+%\s*$|ask a question or describe a task",
+                r"\d+(?:\.\d+)?%\s*$|ask a question or describe a task",
             ),
             (AgentState::Idle, r"Trust All Tools active|/quit to exit"),
         ],
