@@ -27,6 +27,7 @@
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::{
     binding_state, channel, ci, comms, instance, restart, review_assignment, schedule, task,
@@ -65,6 +66,9 @@ pub(crate) struct RuntimeContext {
     /// it flushes THIS response. `None` off the api `mcp_tool` ingress (no request to
     /// tie a flush to → the handler cannot arm the barrier and fails closed).
     pub post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+    /// #2454: owner notifier forwarded from the API composition root so MCP
+    /// move_pane emits the same TUI event as the direct API ingress.
+    pub notifier: Option<Arc<dyn crate::api::ApiNotifier>>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -260,7 +264,11 @@ adapter!(
     has,
     instance::set_model::handle_set_model
 );
-adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
+/// #2454: move_pane is a runtime-aware adapter over the neutral service.
+pub(crate) fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
+    // The owned notifier travels inside RuntimeContext to the MCP adapter.
+    instance::handle_move_pane(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_set_waiting_on,
     hais,
@@ -498,6 +506,7 @@ mod tests {
             capability: crate::api::RestartCapability::App,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         };
         let ctx = HandlerCtx {
             home: &home,
@@ -973,6 +982,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         }
     }
 
@@ -1119,6 +1129,7 @@ mod tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         }
     }
 
@@ -1216,12 +1227,13 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Default::default();
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
-        let notifier = RecordingNotifier::new();
+        let notifier = std::sync::Arc::new(RecordingNotifier::new());
+        let notifier_trait: std::sync::Arc<dyn crate::api::ApiNotifier> = notifier.clone();
         let ctx = crate::api::handlers::HandlerCtx {
             registry: &registry,
             configs: &configs,
             externals: &externals,
-            notifier: Some(&notifier),
+            notifier: Some(&notifier_trait),
             home: &home,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,

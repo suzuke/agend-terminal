@@ -236,6 +236,65 @@ pub fn pane_scrollback(
 }
 
 // ---------------------------------------------------------------------------
+// Pane relocation (move_pane) — #2454 in-process service
+// ---------------------------------------------------------------------------
+
+/// Direction used by the transport-neutral pane relocation service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneMoveSplit {
+    Horizontal,
+    Vertical,
+}
+
+impl PaneMoveSplit {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "vertical" | "v" => Self::Vertical,
+            _ => Self::Horizontal,
+        }
+    }
+}
+
+/// Validated move request returned to API and MCP adapters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneMoveEvent {
+    pub agent: String,
+    pub target_tab: String,
+    pub split_dir: PaneMoveSplit,
+}
+
+/// Validate a pane relocation request and append its audit event.
+///
+/// Layout mutation remains owned by the notifier/TUI event loop; this service
+/// owns the shared validation, split parsing, and event-log side effect.
+pub fn move_pane(
+    home: &Path,
+    agent_name: Option<&str>,
+    target_tab: Option<&str>,
+    split_dir: Option<&str>,
+) -> Result<PaneMoveEvent, String> {
+    let agent_name = agent_name.ok_or_else(|| "missing agent".to_string())?;
+    let agent_name = agent::validate_name(agent_name)?.to_string();
+    let target_tab = match target_tab {
+        Some(tab) if !tab.is_empty() => tab.to_string(),
+        _ => return Err("missing target_tab".to_string()),
+    };
+    let split_dir = PaneMoveSplit::parse(split_dir.unwrap_or("horizontal"));
+
+    crate::event_log::log(
+        home,
+        "move_pane",
+        &agent_name,
+        &format!("target_tab={target_tab} split={split_dir:?}"),
+    );
+    Ok(PaneMoveEvent {
+        agent: agent_name,
+        target_tab,
+        split_dir,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 
@@ -1082,6 +1141,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn move_pane_validates_parses_and_logs_2454() {
+        let home = tmp_home("move-pane-service-2454");
+        let event = move_pane(&home, Some("agent-a"), Some("team-x"), Some("vertical")).unwrap();
+        assert_eq!(event.agent, "agent-a");
+        assert_eq!(event.target_tab, "team-x");
+        assert_eq!(event.split_dir, PaneMoveSplit::Vertical);
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap();
+        assert!(log.contains("\"kind\":\"move_pane\""));
+        assert!(log.contains("target_tab=team-x split=Vertical"));
+        assert_eq!(
+            move_pane(&home, None, Some("team-x"), None),
+            Err("missing agent".into())
+        );
+        assert_eq!(
+            move_pane(&home, Some("agent-a"), None, None),
+            Err("missing target_tab".into())
+        );
     }
 
     #[test]

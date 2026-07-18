@@ -129,24 +129,40 @@ pub(super) fn handle_set_waiting_on(
     }
 }
 
-pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
-    // MCP arg is `instance`; the daemon RPC contract names the field `agent`.
-    let instance = args["instance"].as_str().unwrap_or("");
-    let params = json!({
-        "agent": instance,
-        "target_tab": args["target_tab"],
-        "split_dir": args["split_dir"],
-    });
-    match crate::api::call(
+pub(super) fn handle_move_pane(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: move_pane requires the in-process daemon runtime"});
+    };
+    let event = match crate::agent_ops::move_pane(
         home,
-        &json!({"method": crate::api::method::MOVE_PANE, "params": params}),
+        args["instance"].as_str(),
+        args["target_tab"].as_str(),
+        args["split_dir"].as_str(),
     ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
-        }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("move_pane failed")}),
-        Err(e) => json!({"error": format!("move_pane: {e}")}),
+        Ok(event) => event,
+        Err(error) => return json!({"error": error}),
+    };
+    if let Some(notifier) = runtime.notifier.as_ref() {
+        notifier.notify(crate::api::ApiEvent::PaneMoved {
+            agent: event.agent.clone(),
+            target_tab: event.target_tab.clone(),
+            split_dir: match event.split_dir {
+                crate::agent_ops::PaneMoveSplit::Horizontal => {
+                    crate::api::PaneMoveSplitDir::Horizontal
+                }
+                crate::agent_ops::PaneMoveSplit::Vertical => crate::api::PaneMoveSplitDir::Vertical,
+            },
+        });
     }
+    json!({
+        "ok": true,
+        "instance": event.agent,
+        "target_tab": event.target_tab,
+    })
 }
 
 pub(super) fn handle_pane_snapshot(
@@ -401,6 +417,7 @@ mod blocked_reason_runtime_2454_tests {
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
             post_flush: None,
+            notifier: None,
         };
         (rt, home)
     }

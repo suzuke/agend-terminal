@@ -152,6 +152,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         // #2453 R2 flush barrier: carry THIS request's slot so `restart_daemon` can
         // register its commit-permission ack, run by `handle_session` after flush.
         post_flush: Some(ctx.post_flush.clone()),
+        notifier: ctx.notifier.cloned(),
     };
     handle_mcp_tool_inner(
         tool,
@@ -772,14 +773,15 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Default::default();
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
-        let notifier = RecordingNotifier {
+        let notifier = std::sync::Arc::new(RecordingNotifier {
             events: parking_lot::Mutex::new(Vec::new()),
-        };
+        });
+        let notifier_trait: std::sync::Arc<dyn ApiNotifier> = notifier.clone();
         let ctx = HandlerCtx {
             registry: &registry,
             configs: &configs,
             externals: &externals,
-            notifier: Some(&notifier),
+            notifier: Some(&notifier_trait),
             home: &home,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
@@ -825,6 +827,22 @@ mod tests {
         );
         assert_eq!(vertical["result"]["instance"], "agent-b");
         assert_eq!(vertical["result"]["target_tab"], "team-y");
+
+        let invalid = handle_mcp_tool(
+            &json!({
+                "tool": "move_pane",
+                "arguments": {
+                    "instance": "bad/name",
+                    "target_tab": "team-z",
+                },
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            invalid["result"]["error"],
+            "instance name 'bad/name' contains invalid characters (only a-z, 0-9, -, _ allowed)",
+            "MCP move_pane must preserve the legacy API validation-error payload"
+        );
 
         let events = notifier.take();
         assert_eq!(

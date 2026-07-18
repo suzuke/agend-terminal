@@ -14,6 +14,7 @@ pub(crate) mod team;
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::{ApiNotifier, ConfigRegistry};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Write `agend.md` / `GEMINI.md` and the MCP config into `work_dir` before
 /// the child process is spawned. Centralises the fleet-aware instruction
@@ -135,7 +136,7 @@ pub(crate) struct HandlerCtx<'a> {
     pub registry: &'a AgentRegistry,
     pub configs: &'a ConfigRegistry,
     pub externals: &'a ExternalRegistry,
-    pub notifier: Option<&'a dyn ApiNotifier>,
+    pub notifier: Option<&'a Arc<dyn ApiNotifier>>,
     pub home: &'a Path,
     /// #2453 Stage R1: the API-server owner's restart capability, injected at
     /// [`crate::api::serve`] from the composition root and carried into the MCP

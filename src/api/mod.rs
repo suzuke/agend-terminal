@@ -72,6 +72,7 @@ pub enum PaneMoveSplitDir {
 }
 
 impl PaneMoveSplitDir {
+    #[allow(dead_code)]
     pub fn parse(s: &str) -> Self {
         match s {
             "vertical" | "v" => Self::Vertical,
@@ -424,7 +425,7 @@ pub fn serve(
                     &shutdown,
                     &cfgs,
                     &ext,
-                    ntf.as_deref(),
+                    ntf.as_ref(),
                     session_operator_token,
                     session_cookie,
                     session_host,
@@ -561,7 +562,7 @@ fn handle_session(
     shutdown: &Arc<AtomicBool>,
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
-    notifier: Option<&dyn ApiNotifier>,
+    notifier: Option<&Arc<dyn ApiNotifier>>,
     operator_token: crate::auth_cookie::Cookie,
     cookie: crate::auth_cookie::Cookie,
     host: RestartCapability,
