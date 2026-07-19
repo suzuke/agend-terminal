@@ -303,6 +303,9 @@ impl AppState {
                 let attach_tx = attach_tx.clone();
                 let registry = Arc::clone(registry);
                 let home = home.clone();
+                // Not fire-and-forget: the JoinHandle is stored in
+                // attach_workers below and joined at teardown BEFORE the
+                // registry drain, so every worker-spawned child is reaped.
                 let handle = std::thread::Builder::new()
                     .name(format!("attach_worker_{w}"))
                     .spawn(move || {
