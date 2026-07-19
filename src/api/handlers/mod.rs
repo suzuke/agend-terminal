@@ -35,6 +35,7 @@ use std::sync::Arc;
 /// Must be called *before* the backend process starts: `backend::spawn_flags`
 /// checks the file's presence at flag-build time and silently drops
 /// `--append-system-prompt-file` when the instructions file is missing.
+#[cfg(test)]
 pub(crate) fn prepare_instructions(
     home: &Path,
     name: &str,
