@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn production_tail_preserves_utf8_crlf_boundary_2454() {
-        let source = "pub fn first() {\r\n    let marker = \"—\";\r\n}\r\n#[cfg(test)]\r\nmod tests {\r\n    fn ignored() {}\r\n}\r\n";
+        let source = "pub fn first() {\r\n    let marker = \"—\";\r\n} // —\r\n#[cfg(test)]\r\nmod tests {\r\n    fn ignored() {}\r\n}\r\n";
         let production = production_tail(source);
         assert!(production.contains("let marker = \"—\""));
         assert!(!production.contains("mod tests"));
