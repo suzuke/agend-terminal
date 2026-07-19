@@ -989,9 +989,9 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
 
     // Dispatch should NOT carry the lease-rejection error path.
     if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
-        // The api::call(SEND) returns Err in test (no daemon), but
-        // fallback_deliver writes to inbox and the wrapper still reports OK
-        // via the dispatch_tracking branch. The lease itself must succeed.
+        // The in-process runtime send may fail in test (empty registry), but
+        // the lease/board invariant is what matters here: the lease itself
+        // must succeed regardless of downstream delivery outcome.
         assert!(
             !err.contains("dispatch rejected"),
             "lease must not reject in this scenario: {err}"
@@ -1182,8 +1182,8 @@ teams:
         // no task_id → auto-create; no branch → skip the lease/CI-watch path.
     });
     let sender = Some(Sender::new("devA").expect("sender"));
-    // `api::call(SEND)` errors in-test (no daemon) but only AFTER the auto-create
-    // commit — we assert which board the task was BORN on, not the send result.
+    // Delivery may fail in-test (empty runtime registry) but only AFTER the
+    // auto-create commit — we assert which board the task was BORN on.
     let _ = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     // Query each board via the P1 `_at` reader (avoids the task_events anti-bypass
