@@ -1,6 +1,21 @@
 // ── Sprint 53 P0-1: dispatch_auto_bind_lease tests ───────────────
 // These call the PRODUCTION function directly (§1.4 compliance).
 
+use crate::mcp::handlers::dispatch::RuntimeContext;
+
+fn minimal_runtime() -> RuntimeContext {
+    RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: None,
+        shutdown: None,
+    }
+}
+
 /// #2745 R3: create a real board task tagged `review_class=<class>` and return its
 /// id. Under R3 finding 2 an EXISTING-task dispatch must reference a task that
 /// carries durable review_class metadata (a send arg can NOT fill a missing one), so
@@ -565,7 +580,7 @@ fn delegate_task_main_branch_rejects_without_delivering() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert!(
         result.get("error").is_some(),
@@ -627,7 +642,7 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert!(
         result.get("error").is_some(),
@@ -747,7 +762,7 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
         "branch": "feat/B",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert!(
         result.get("error").is_some(),
@@ -970,7 +985,7 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     // Dispatch should NOT carry the lease-rejection error path.
     if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
@@ -1039,7 +1054,7 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
         }
         let sender = Some(Sender::new("lead").expect("sender"));
 
-        let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+        let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
         // Structured atomic rejection with the distinguishing code.
         assert_eq!(
@@ -1106,7 +1121,7 @@ fn existing_tagged_task_contradictory_send_rejects_2745() {
         "review_class": "dual",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert_eq!(
         result.get("code").and_then(|v| v.as_str()),
@@ -1169,7 +1184,7 @@ teams:
     let sender = Some(Sender::new("devA").expect("sender"));
     // `api::call(SEND)` errors in-test (no daemon) but only AFTER the auto-create
     // commit — we assert which board the task was BORN on, not the send result.
-    let _ = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
+    let _ = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     // Query each board via the P1 `_at` reader (avoids the task_events anti-bypass
     // invariant on the literal log path). The auto-created task must be on the

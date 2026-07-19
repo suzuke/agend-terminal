@@ -546,14 +546,6 @@ pub(crate) fn handle_delegate_task(
         None
     };
 
-    // #2454 atomicity: runtime=None + branch → fail closed BEFORE any
-    // durable mutations (bind/task-create). The daemon's own handler runs
-    // with runtime=Some and handles these atomically; the MCP-layer bridge
-    // cannot guarantee rollback on delivery failure.
-    if runtime.is_none() && args["branch"].as_str().is_some() {
-        return json!({"error": "branch dispatch requires in-process runtime (#2454)"});
-    }
-
     if !checks.review_assignment && runtime.is_some() {
         if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
             return e;
@@ -564,6 +556,18 @@ pub(crate) fn handle_delegate_task(
         return review_assignment::dispatch_review_assignment_via_store(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
+    }
+
+    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
+    // durable mutations (task-create/delivery). Placed after the
+    // review_assignment early-return to preserve that path byte-for-byte.
+    if runtime.is_none() && args["branch"].as_str().is_some_and(|b| !b.is_empty()) {
+        return json!({
+            "ok": false,
+            "error": "branch dispatch requires in-process runtime",
+            "code": "runtime_unavailable_branch_2454",
+            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
+        });
     }
 
     let (effective_task_id, auto_created_task_id) = if runtime.is_some() {

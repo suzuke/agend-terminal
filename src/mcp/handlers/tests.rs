@@ -1994,10 +1994,19 @@ fn delegate_task_no_runtime_branch_dispatch_fails_before_mutation_2454() {
         }),
         "sender",
     );
+    assert_eq!(
+        result["ok"].as_bool(),
+        Some(false),
+        "#2454: branch dispatch must return ok:false: {result}"
+    );
     let err = result["error"].as_str().unwrap_or("");
     assert!(
-        err.contains("runtime") || err.contains("#2454"),
+        err.contains("runtime"),
         "#2454: branch dispatch must fail with a pre-mutation error, got: {err}"
+    );
+    assert!(
+        result["code"].as_str().is_some(),
+        "#2454: structured error must include code: {result}"
     );
     // No binding must exist — the error fired BEFORE maybe_auto_bind_lease.
     assert!(
