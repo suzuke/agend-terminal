@@ -2093,7 +2093,7 @@ fn fn_body<'a>(prod: &'a str, sig: &str) -> &'a str {
 #[test]
 fn deploy_api_calls_not_under_flock() {
     let prod = prod_src();
-    let body = fn_body(prod, "pub fn deploy(home");
+    let body = fn_body(prod, "pub(crate) fn deploy_with_runtime(");
     assert!(
         body.contains("runtime"),
         "deploy must receive the deployments-owned runtime capability so runtime-present MCP calls cannot use the legacy transport"
@@ -2124,7 +2124,7 @@ fn deploy_api_calls_not_under_flock() {
 #[test]
 fn teardown_api_calls_not_under_flock() {
     let prod = prod_src();
-    let body = fn_body(prod, "pub fn teardown(home");
+    let body = fn_body(prod, "pub(crate) fn teardown_with_runtime(");
     assert!(
         body.contains("runtime"),
         "teardown must receive the deployments-owned runtime capability so runtime-present MCP calls cannot use the legacy transport"

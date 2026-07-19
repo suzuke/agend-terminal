@@ -21,6 +21,16 @@ struct DeploymentStore {
     deployments: Vec<Deployment>,
 }
 
+/// Runtime-owned state forwarded by the in-process MCP adapter.  The
+/// deployments owner deliberately knows only these neutral registries and the
+/// lifecycle notifier; MCP transport context stays at the adapter boundary.
+pub(crate) struct DeploymentRuntime<'a> {
+    pub registry: &'a crate::agent::AgentRegistry,
+    pub configs: &'a crate::api::ConfigRegistry,
+    pub externals: &'a crate::agent::ExternalRegistry,
+    pub notifier: Option<&'a std::sync::Arc<dyn crate::api::ApiNotifier>>,
+}
+
 impl crate::store::SchemaVersioned for DeploymentStore {
     const CURRENT: u32 = 1;
     fn version_mut(&mut self) -> &mut u32 {
@@ -396,6 +406,51 @@ fn spawn_instances(
     home: &Path,
     yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
     directory: &str,
+    runtime: Option<&DeploymentRuntime<'_>>,
+) {
+    if let Some(runtime) = runtime {
+        for (inst_name, entry) in yaml_entries {
+            let args = entry.args.as_ref().map(|values| values.join(" "));
+            let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
+            let working_directory = std::path::Path::new(work_dir);
+            let backend = entry.command.as_deref().or(entry.backend.as_deref());
+            let params = crate::agent_ops::spawn::SpawnParams {
+                name: inst_name,
+                backend,
+                args: args.as_deref(),
+                model: entry.model.as_deref(),
+                model_tier: entry.model_tier.as_deref(),
+                working_directory: Some(working_directory),
+                env: entry.env.as_ref(),
+                mode: crate::backend::SpawnMode::Fresh,
+                explicit_role: entry.role.as_deref(),
+                self_kick_on_ready: false,
+                topic_binding: entry.topic_binding_mode.as_deref().unwrap_or("auto"),
+                layout: "tab",
+                spawner: None,
+                target_pane: None,
+            };
+            let request = crate::agent_ops::spawn::resolve_spawn_request(home, &params);
+            let context = crate::agent_ops::spawn::SpawnContext {
+                home,
+                registry: runtime.registry,
+                externals: runtime.externals,
+                notifier: runtime.notifier,
+            };
+            if let Err(error) = crate::agent_ops::spawn::spawn_instance(&context, &request) {
+                tracing::error!(instance = %inst_name, error = %error, "deploy: Phase 3 spawn failed");
+            }
+        }
+        return;
+    }
+
+    spawn_instances_legacy(home, yaml_entries, directory);
+}
+
+fn spawn_instances_legacy(
+    home: &Path,
+    yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
+    directory: &str,
 ) {
     for (inst_name, entry) in yaml_entries {
         let backend_name = resolve_spawn_backend(home, inst_name, entry);
@@ -450,29 +505,77 @@ fn create_deployment_team(
     template_def: &serde_yaml_ng::Value,
     template_source_repo: &Option<String>,
     created: &[String],
+    runtime: Option<&DeploymentRuntime<'_>>,
 ) -> bool {
     if created.len() <= 1 {
         return false;
     }
+    let description = format!("Template deployment: {template}");
+    let orchestrator = template_def
+        .get("orchestrator")
+        .and_then(|value| value.as_str())
+        .and_then(|suffix| {
+            let full = format!("{deploy_name}-{suffix}");
+            if created.contains(&full) {
+                Some(full)
+            } else {
+                tracing::warn!(
+                    template,
+                    suffix,
+                    "template orchestrator not among spawned instances; team created without one"
+                );
+                None
+            }
+        });
+    if let Some(runtime) = runtime {
+        let request = crate::team_ops::CreateTeamRequest {
+            name: deploy_name.to_string(),
+            per_member_backends: Vec::new(),
+            existing_members: created.to_vec(),
+            topic_binding_mode: None,
+            orchestrator,
+            description: Some(description),
+            repository_path: template_source_repo.clone(),
+            project_id: None,
+            accept_from: Vec::new(),
+        };
+        let result = crate::team_ops::create(
+            home,
+            request,
+            runtime.registry,
+            runtime.notifier.map(|notifier| notifier.as_ref()),
+        );
+        return result.get("ok").and_then(Value::as_bool) == Some(true);
+    }
+
+    create_deployment_team_legacy(
+        home,
+        deploy_name,
+        template_source_repo,
+        created,
+        &description,
+        orchestrator.as_deref(),
+    )
+}
+
+fn create_deployment_team_legacy(
+    home: &Path,
+    deploy_name: &str,
+    template_source_repo: &Option<String>,
+    created: &[String],
+    description: &str,
+    orchestrator: Option<&str>,
+) -> bool {
     let mut team_args = serde_json::json!({
         "name": deploy_name,
-        "members": &created,
-        "description": format!("Template deployment: {template}"),
+        "members": created,
+        "description": description,
     });
     if let Some(ref sr) = template_source_repo {
         team_args["repository_path"] = serde_json::Value::String(sr.clone());
     }
-    if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
-        let full = format!("{deploy_name}-{suffix}");
-        if created.contains(&full) {
-            team_args["orchestrator"] = serde_json::Value::String(full);
-        } else {
-            tracing::warn!(
-                template,
-                suffix,
-                "template orchestrator not among spawned instances; team created without one"
-            );
-        }
+    if let Some(orchestrator) = orchestrator {
+        team_args["orchestrator"] = serde_json::Value::String(orchestrator.to_string());
     }
     // H15 (CR-2026-06-14): a daemon REJECTION comes back as `Ok(v)` with
     // `v["ok"] == false`, NOT as `Err` — the old catch-all Ok no-op arm swallowed
@@ -496,7 +599,17 @@ fn create_deployment_team(
     }
 }
 
+#[allow(dead_code)]
 pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
+    deploy_with_runtime(home, instance_name, args, None)
+}
+
+pub(crate) fn deploy_with_runtime(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    runtime: Option<&DeploymentRuntime<'_>>,
+) -> Value {
     let params = match validate_deploy_args(home, args) {
         Ok(p) => p,
         Err(e) => return e,
@@ -527,7 +640,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         return e;
     }
 
-    spawn_instances(home, &yaml_entries, &params.directory);
+    spawn_instances(home, &yaml_entries, &params.directory, runtime);
 
     let team_created = create_deployment_team(
         home,
@@ -536,6 +649,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         &params.template_def,
         &params.template_source_repo,
         &created,
+        runtime,
     );
 
     let deployment = Deployment {
@@ -594,7 +708,16 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     serde_json::json!({"status": "deployed", "name": params.deploy_name, "instances": created})
 }
 
+#[allow(dead_code)]
 pub fn teardown(home: &Path, args: &Value) -> Value {
+    teardown_with_runtime(home, args, None)
+}
+
+pub(crate) fn teardown_with_runtime(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&DeploymentRuntime<'_>>,
+) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n,
         None => return serde_json::json!({"error": "missing 'name'"}),
@@ -610,11 +733,18 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
     };
 
     // Delete all instances (full cleanup via DELETE instead of KILL — #456).
-    for inst in &deployment.instances {
-        let _ = crate::api::call(
-            home,
-            &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": inst}}),
-        );
+    if let Some(runtime) = runtime {
+        let delete_context = crate::agent_ops::DeleteContext {
+            registry: runtime.registry,
+            configs: runtime.configs,
+            externals: runtime.externals,
+            notifier: runtime.notifier,
+        };
+        for inst in &deployment.instances {
+            let _ = crate::agent_ops::delete_instance(home, inst, &delete_context, false);
+        }
+    } else {
+        delete_instances_legacy(home, &deployment.instances);
     }
 
     // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
@@ -658,6 +788,15 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
     }
 
     serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
+}
+
+fn delete_instances_legacy(home: &Path, instances: &[String]) {
+    for inst in instances {
+        let _ = crate::api::call(
+            home,
+            &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": inst}}),
+        );
+    }
 }
 
 pub fn list(home: &Path) -> Value {

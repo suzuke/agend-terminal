@@ -17,12 +17,21 @@ pub(super) fn handle_delete_schedule(home: &Path, args: &Value) -> Value {
     crate::schedules::delete(home, args)
 }
 
-pub(super) fn handle_deploy_template(home: &Path, args: &Value, instance_name: &str) -> Value {
-    crate::deployments::deploy(home, instance_name, args)
+pub(super) fn handle_deploy_template(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<&crate::deployments::DeploymentRuntime<'_>>,
+) -> Value {
+    crate::deployments::deploy_with_runtime(home, instance_name, args, runtime)
 }
 
-pub(super) fn handle_teardown_deployment(home: &Path, args: &Value) -> Value {
-    crate::deployments::teardown(home, args)
+pub(super) fn handle_teardown_deployment(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&crate::deployments::DeploymentRuntime<'_>>,
+) -> Value {
+    crate::deployments::teardown_with_runtime(home, args, runtime)
 }
 
 pub(super) fn handle_list_deployments(home: &Path) -> Value {
