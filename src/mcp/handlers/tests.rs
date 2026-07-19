@@ -1899,7 +1899,7 @@ fn test_interrupt_handler_validates_target() {
     assert!(r.get("error").is_some());
 
     // Valid target but no runtime → explicit error (no api::call fallback)
-    let r = handle_tool("interrupt", &json!({"instance": "valid-agent"}), "caller");
+    let r = super::handle_tool_with_runtime("interrupt", &json!({"instance": "valid-agent"}), "caller", None);
     let err = r["error"].as_str().unwrap_or("");
     assert!(
         err.contains("runtime"),

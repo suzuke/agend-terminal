@@ -900,6 +900,18 @@ mod tests {
                 "done_source",
                 "internal: daemon-set audit source; agent-forgeable = integrity risk (#1933)",
             ),
+            (
+                "delivery_nonce",
+                "internal: reviewer-assignment outbox nonce, set by delegate_task re-marshal",
+            ),
+            (
+                "force_meta",
+                "internal: delegate_task force metadata, set by dispatch path",
+            ),
+            (
+                "provenance",
+                "internal: delegate_task provenance metadata, set by dispatch path",
+            ),
             // NOTE: bind_self's `task_id` (mcp/handlers/worktree.rs) is dispatch-path-
             // set and intentionally NOT a bind_self schema field; it needs no entry
             // here because `task_id` IS declared on the `task`/`send` tools, so the
