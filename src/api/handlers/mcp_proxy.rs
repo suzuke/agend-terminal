@@ -1825,4 +1825,172 @@ mod tests {
             "rejected cross-team send must not produce a delivery side-effect in the target inbox"
         );
     }
+
+    // ── #2454 Slice 12 supplemental RED ───────────────────────────────
+
+    /// #2454 Slice 12 supplemental RED (1/3): RuntimeContext=None (standalone
+    /// mode) with daemon unreachable must NOT silently succeed via inbox
+    /// fallback. The _with_runtime_or_legacy bridge must surface the failure.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn send_runtime_none_no_silent_fallback_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let tag = format!(
+            "send-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(format!("agend-s12-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  none-target:\n    backend: claude\n",
+        )
+        .unwrap();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = crate::mcp::handlers::handle_tool_with_runtime(
+            "send",
+            &json!({
+                "instance": "none-target",
+                "message": "hello from runtime=None test",
+            }),
+            "test-sender",
+            None,
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        let dm = response["delivery_mode"].as_str().unwrap_or_default();
+        assert_ne!(
+            dm, "inbox_fallback",
+            "runtime=None send must NOT silently succeed via inbox_fallback — \
+             daemon-unreachable must be an honest failure: {response}"
+        );
+    }
+
+    /// #2454 Slice 12 supplemental RED (2/3): a report (request_kind=report)
+    /// via MCP ingress with RuntimeContext=Some must deliver through the
+    /// neutral service, not the socket fallback. Proves the report path's
+    /// API-level logic (authorize_report, process_verdicts, track_dispatch)
+    /// runs through the in-process path.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn send_report_through_service_not_fallback_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let tag = format!(
+            "send-rpt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(format!("agend-s12-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  rpt-target:\n    backend: claude\n",
+        )
+        .unwrap();
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "send",
+            "rpt-sender",
+            json!({
+                "instance": "rpt-target",
+                "request_kind": "report",
+                "message": "report summary text",
+                "correlation_id": "t-test-rpt-corr",
+            }),
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        let dm = response["result"]["delivery_mode"]
+            .as_str()
+            .or_else(|| response["result"]["note"].as_str())
+            .unwrap_or_default();
+        assert!(
+            !dm.contains("inbox_fallback") && !dm.contains("API unavailable"),
+            "report via MCP must deliver through the neutral service, \
+             not the socket fallback: {response}"
+        );
+    }
+
+    /// #2454 Slice 12 supplemental RED (3/3): a delegate (request_kind=task)
+    /// via MCP ingress with RuntimeContext=Some must deliver through the
+    /// neutral service. Proves dispatch tracking, auto-bind, and task
+    /// correlation fire through the in-process path.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn send_delegate_through_service_not_fallback_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let tag = format!(
+            "send-del-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(format!("agend-s12-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  del-target:\n    backend: claude\n",
+        )
+        .unwrap();
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "send",
+            "del-sender",
+            json!({
+                "instance": "del-target",
+                "request_kind": "task",
+                "message": "test task delegation",
+                "task_id": "t-test-delegate-001",
+            }),
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        let result_str = response["result"].to_string();
+        assert!(
+            !result_str.contains("inbox_fallback") && !result_str.contains("API unavailable"),
+            "delegate via MCP must deliver through the neutral service, \
+             not the socket fallback: {response}"
+        );
+    }
 }
