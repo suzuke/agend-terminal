@@ -80,19 +80,56 @@ pub(super) fn handle_task(home: &Path, args: &Value, instance_name: &str) -> Val
     crate::tasks::handle(home, instance_name, args)
 }
 
-pub(super) fn handle_create_team(home: &Path, args: &Value) -> Value {
-    match crate::api::call(
+/// #2454 Slice 13: thin MCP adapter — delegates to `team_ops::create`
+/// via the in-process RuntimeContext when available, or returns a
+/// structured transport failure when the runtime is absent.
+pub(super) fn handle_create_team(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
+    let Some(rt) = runtime else {
+        return json!({
+            "error": "runtime unavailable: team creation requires an in-process runtime"
+        });
+    };
+    let name = match args["name"].as_str() {
+        Some(n) => n.to_string(),
+        None => return json!({"error": "missing 'name'"}),
+    };
+    let existing_members: Vec<String> = args["members"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let accept_from: Vec<String> = args["accept_from"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    crate::team_ops::create(
         home,
-        &json!({"method": crate::api::method::CREATE_TEAM, "params": args}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            resp.get("result").cloned().unwrap_or_default()
-        }
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("create_team failed")})
-        }
-        Err(_) => crate::teams::create(home, args),
-    }
+        crate::team_ops::CreateTeamRequest {
+            name,
+            per_member_backends: Vec::new(),
+            existing_members,
+            topic_binding_mode: None,
+            orchestrator: args["orchestrator"].as_str().map(String::from),
+            description: args["description"].as_str().map(String::from),
+            repository_path: args["repository_path"].as_str().map(String::from),
+            project_id: args["project_id"].as_str().map(String::from),
+            accept_from,
+        },
+        &rt.registry,
+        rt.notifier.as_deref(),
+    )
 }
 
 pub(super) fn handle_delete_team(home: &Path, args: &Value) -> Value {

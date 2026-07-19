@@ -413,12 +413,12 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
     "description"  => instance::handle_set_description,  hai;
 ]);
 
-/// #2454 Slice 7: team update carries the owned runtime notifier into the
-/// transport-neutral roster service; other team actions retain their legacy
+/// #2454 Slice 7+13: team create and update carry the owned runtime into
+/// the transport-neutral service; other team actions retain their legacy
 /// adapter shapes.
 pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
-        "create" => task::handle_create_team(ctx.home, ctx.args),
+        "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
         "delete" => task::handle_delete_team(ctx.home, ctx.args),
         "list" => task::handle_list_teams(ctx.home),
         "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
@@ -1456,8 +1456,8 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Frozen Slice-12 target: exactly 5 same-daemon api::call production sites
-    /// remain in src/mcp/handlers/ after SEND migration to typed runtime service.
+    /// Frozen Slice-12 baseline (pre-Slice-13): exactly 5 same-daemon
+    /// api::call production sites remain in src/mcp/handlers/.
     #[test]
     fn production_api_call_baseline_is_5_2454() {
         let needle_call = concat!("crate::", "api::", "call");
@@ -1488,8 +1488,180 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 5,
-            "production same-daemon api::call post-Slice-12 must be exactly 5; got {count}"
+            count, 4,
+            "production same-daemon api::call post-Slice-13 must be exactly 4; got {count}"
+        );
+    }
+
+    /// #2454 Slice 13 RED: after CREATE_TEAM migration, exactly 4
+    /// same-daemon api::call production sites remain (down from 5).
+    #[test]
+    fn production_api_call_post_create_team_is_4_2454() {
+        let needle_call = concat!("crate::", "api::", "call");
+        let needle_at = concat!("api::", "call_at");
+        let test_mod_marker = "#[cfg(test)]\nmod ";
+        let files: &[&str] = &[
+            include_str!("comms.rs"),
+            include_str!("comms_delegate/mod.rs"),
+            include_str!("task.rs"),
+            include_str!("restart.rs"),
+            include_str!("instance_state/mod.rs"),
+            include_str!("instance_state/spawn.rs"),
+            include_str!("instance_state/lifecycle.rs"),
+            include_str!("instance_metadata.rs"),
+        ];
+        let mut count = 0;
+        for src in files {
+            let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
+            let production = &src[..boundary];
+            for line in production.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                if line.contains(needle_call) && !line.contains(needle_at) {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            count, 4,
+            "production same-daemon api::call post-Slice-13 must be exactly 4; got {count}"
+        );
+    }
+
+    /// #2454 Slice 13 RED: the neutral typed CREATE_TEAM service must own
+    /// the team-creation logic, and both MCP and API handlers must route
+    /// through thin adapters to it — not call teams::create directly.
+    #[test]
+    fn create_team_neutral_service_owns_logic_2454() {
+        let task_src = include_str!("task.rs");
+        let test_boundary = task_src
+            .rfind("#[cfg(test)]\nmod ")
+            .unwrap_or(task_src.len());
+        let production = &task_src[..test_boundary];
+        let create_fn_start = production
+            .find("fn handle_create_team(")
+            .expect("MCP handle_create_team must exist");
+        let create_fn_end = production[create_fn_start..]
+            .find("\n}\n")
+            .map(|o| create_fn_start + o)
+            .unwrap_or(production.len());
+        let create_fn = &production[create_fn_start..create_fn_end];
+        assert!(
+            !create_fn.contains("api::call"),
+            "#2454: MCP handle_create_team must not contain api::call: \
+             it must route through the neutral typed service"
+        );
+        assert!(
+            !create_fn.contains("teams::create("),
+            "#2454: MCP handle_create_team must not call teams::create directly: \
+             it must route through the neutral typed service"
+        );
+    }
+
+    /// #2454 Slice 13 RED: both API and MCP CREATE_TEAM handlers must route
+    /// through one shared neutral typed service. The neutral service must NOT
+    /// take HandlerCtx or raw serde_json::Value as its primary boundary type
+    /// — it must own a typed domain interface. Wrapping old logic behind a
+    /// same-named raw-Value helper cannot pass this guard.
+    #[test]
+    fn create_team_both_adapters_share_neutral_typed_owner_2454() {
+        let neutral_marker = "team_ops::create";
+
+        // ── Adapter convergence: both MCP and API must call the same owner ──
+
+        let mcp_src = include_str!("task.rs");
+        let mcp_boundary = mcp_src.rfind("#[cfg(test)]\nmod ").unwrap_or(mcp_src.len());
+        let mcp_prod = &mcp_src[..mcp_boundary];
+        let mcp_fn_start = mcp_prod
+            .find("fn handle_create_team(")
+            .expect("MCP handle_create_team");
+        let mcp_fn_end = mcp_prod[mcp_fn_start..]
+            .find("\n}\n")
+            .map(|o| mcp_fn_start + o)
+            .unwrap_or(mcp_prod.len());
+        let mcp_fn = &mcp_prod[mcp_fn_start..mcp_fn_end];
+
+        let api_src = include_str!("../../api/handlers/team.rs");
+        let api_boundary = api_src
+            .rfind("#[cfg(test)]\n#[allow")
+            .unwrap_or(api_src.len());
+        let api_prod = &api_src[..api_boundary];
+        let api_fn_start = api_prod
+            .find("fn handle_create_team(")
+            .expect("API handle_create_team");
+        let api_fn_end = api_prod[api_fn_start..]
+            .find("\n}\n")
+            .map(|o| api_fn_start + o)
+            .unwrap_or(api_prod.len());
+        let api_fn = &api_prod[api_fn_start..api_fn_end];
+
+        assert!(
+            mcp_fn.contains(neutral_marker),
+            "#2454: MCP handle_create_team must call neutral typed service \
+             `{neutral_marker}`, not own the logic"
+        );
+        assert!(
+            api_fn.contains(neutral_marker),
+            "#2454: API handle_create_team must call neutral typed service \
+             `{neutral_marker}`, not own the logic"
+        );
+        assert!(
+            !mcp_fn.contains("HandlerCtx"),
+            "#2454: MCP CREATE_TEAM adapter must not pass HandlerCtx to the service"
+        );
+
+        // ── Owner boundary: the neutral service's definition must be typed ──
+        // Scan the module that should own the neutral service. Its `pub fn
+        // create` (or `pub(crate) fn create`) signature must NOT accept
+        // `HandlerCtx` or raw `Value`/`&Value` as a parameter — the boundary
+        // must be typed domain types. A same-named helper that just wraps
+        // teams::create with a raw Value interface cannot pass.
+
+        // team_ops module must exist as a file
+        let team_ops_exists =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")).exists()
+                || std::path::Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/team_ops/mod.rs"
+                ))
+                .exists();
+        assert!(
+            team_ops_exists,
+            "#2454: neutral typed service module `team_ops` must exist as src/team_ops.rs or src/team_ops/mod.rs"
+        );
+
+        // Read the module and inspect the create function signature
+        let team_ops_path =
+            if std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs"))
+                .exists()
+            {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")
+            } else {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops/mod.rs")
+            };
+        let team_ops_src =
+            std::fs::read_to_string(team_ops_path).expect("read team_ops module source");
+        let create_fn_start = team_ops_src
+            .find("fn create(")
+            .or_else(|| team_ops_src.find("fn create_team("))
+            .expect("team_ops must define a create/create_team function");
+        // Extract the signature line (up to the opening brace)
+        let sig_end = team_ops_src[create_fn_start..]
+            .find('{')
+            .map(|o| create_fn_start + o)
+            .unwrap_or(team_ops_src.len());
+        let signature = &team_ops_src[create_fn_start..sig_end];
+        assert!(
+            !signature.contains("HandlerCtx"),
+            "#2454: team_ops::create signature must not accept HandlerCtx \
+             (framework-coupled boundary): {signature}"
+        );
+        assert!(
+            !signature.contains("&Value") && !signature.contains(": Value"),
+            "#2454: team_ops::create signature must not accept raw serde_json::Value \
+             (untyped boundary — wrapping old logic behind a same-named helper): {signature}"
         );
     }
 

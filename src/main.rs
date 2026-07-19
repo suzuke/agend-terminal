@@ -91,6 +91,7 @@ mod store;
 mod sync_audit;
 mod task_events;
 mod tasks;
+mod team_ops;
 mod teams;
 mod thread_census;
 mod token_cost;

@@ -1,4 +1,8 @@
 //! Team handlers: UPDATE_TEAM (Slice C1), CREATE_TEAM (Slice C2).
+//!
+//! #2454 Slice 13: CREATE_TEAM logic moved to `crate::team_ops` (neutral
+//! typed owner). This file retains the API adapter (param parsing +
+//! delegation) and UPDATE_TEAM (unchanged).
 
 use super::HandlerCtx;
 use crate::api::ApiEvent;
@@ -26,78 +30,13 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
     json!({"ok": true, "result": outcome.result})
 }
 
-/// #1964 Bug 1: plan `count` member names for `team` as `<team>-N`. Names
-/// were index-based (`{team}-{i+1}`), restarting at 1 on EVERY call — a second
-/// `create_instance(team=X)` re-picked X-1 and failed "agent already exists"
-/// instead of incrementing. Numbering starts at one past the max existing
-/// `<team>-N` in fleet.yaml (never re-filling gaps, so a freed number is not
-/// resurrected) and skips any candidate still held by fleet.yaml (an entry
-/// that exists but is not running would be silently overwritten by
-/// `add_instances_to_yaml`) or by the live registry (`taken`, #1441
-/// UUID-keyed).
-fn plan_member_names(
-    fleet: &crate::fleet::FleetConfig,
-    team: &str,
-    count: usize,
-    taken: impl Fn(&str) -> bool,
-) -> Vec<String> {
-    let prefix = format!("{team}-");
-    let mut next_n: u64 = fleet
-        .instances
-        .keys()
-        .filter_map(|k| k.strip_prefix(&prefix)?.parse::<u64>().ok())
-        .max()
-        .map_or(1, |m| m + 1);
-    let mut names = Vec::with_capacity(count);
-    while names.len() < count {
-        let candidate = format!("{team}-{next_n}");
-        next_n += 1;
-        if fleet.instances.contains_key(&candidate) || taken(&candidate) {
-            tracing::info!(
-                team,
-                member = %candidate,
-                "CREATE_TEAM: name taken — advancing to the next number (#1964)"
-            );
-            continue;
-        }
-        names.push(candidate);
-    }
-    names
-}
-
-/// #991 PR-B: build each planned member's fleet.yaml entry — extracted from
-/// `handle_create_team`'s Phase 1 so `topic_binding_mode` propagation is
-/// unit-testable without going through Phase 2's real PTY spawn (`spawn_one`
-/// has no direct test coverage anywhere in this codebase — it forks a real
-/// process).
-fn build_member_entries(
-    planned: &[(String, String, std::path::PathBuf)],
-    topic_binding_mode: Option<&str>,
-) -> Vec<(String, crate::fleet::InstanceYamlEntry)> {
-    planned
-        .iter()
-        .map(|(name, be, wd)| {
-            (
-                name.clone(),
-                crate::fleet::InstanceYamlEntry {
-                    backend: Some(be.clone()),
-                    working_directory: Some(wd.display().to_string()),
-                    topic_binding_mode: topic_binding_mode.map(String::from),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect()
-}
-
-#[allow(clippy::too_many_lines)]
+/// #2454 Slice 13: thin API adapter — parses transport-specific params and
+/// delegates to the neutral typed `team_ops::create` owner.
 pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
-    let team_name = match params["name"].as_str() {
-        Some(n) => n,
+    let name = match params["name"].as_str() {
+        Some(n) => n.to_string(),
         None => return json!({"ok": false, "error": "missing name"}),
     };
-    // `backends: [..]` — per-member backend (heterogeneous team).
-    // Falls back to repeating `backend` `count` times when absent.
     let per_member_backends: Vec<String> = if let Some(arr) = params["backends"].as_array() {
         arr.iter()
             .filter_map(|v| v.as_str().map(String::from))
@@ -107,174 +46,11 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         let backend = params["backend"].as_str().unwrap_or("claude").to_string();
         vec![backend; count]
     };
-    let count = per_member_backends.len();
-    // #991 PR-B: team-level default, shared by every spawned member — same
-    // "skip"/"deferred" filter as the single-instance create_instance path
-    // (mcp/handlers/instance_state/spawn.rs); anything else (including
-    // "auto") stays None (unchanged auto-create default).
     let topic_binding_mode: Option<String> = params["topic_binding"]
         .as_str()
         .filter(|s| matches!(*s, "skip" | "deferred"))
         .map(String::from);
-    tracing::info!(
-        team = team_name,
-        count,
-        backends = ?per_member_backends,
-        topic_binding_mode = ?topic_binding_mode,
-        "CREATE_TEAM begin"
-    );
-
-    // #1964: snapshot fleet.yaml once — Bug-1 numbering scans its instance
-    // names, Bug-2 roster routing checks team existence against it.
-    let fleet_snapshot = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-        .unwrap_or_default();
-    let team_already_exists = fleet_snapshot.teams.contains_key(team_name);
-
-    // Phase 1 — plan every member's fleet.yaml entry (name, backend, dir)
-    // before any spawn happens. The full list is written to fleet.yaml
-    // before Phase 2 so prepare_instructions sees the complete peer set
-    // when generating each member's agend.md.
-    //
-    // #1964 Bug 1: member names were index-based (`{team}-{i+1}`), restarting
-    // at 1 on EVERY call — a second `create_instance(team=X)` re-picked X-1
-    // and failed "agent already exists" instead of incrementing. Start from
-    // (max existing `<team>-N` in fleet.yaml) + 1 and skip any name still
-    // held by fleet.yaml (an entry that exists but isn't running would be
-    // silently overwritten by add_instances_to_yaml) or by the live registry
-    // (#1441: UUID-keyed, resolve via fleet.yaml).
-    let names = plan_member_names(&fleet_snapshot, team_name, per_member_backends.len(), |c| {
-        crate::fleet::resolve_uuid(ctx.home, c)
-            .is_some_and(|id| crate::agent::lock_registry(ctx.registry).contains_key(&id))
-    });
-    let mut planned: Vec<(String, String, std::path::PathBuf)> = Vec::new(); // (name, backend, work_dir)
-    let mut failed: Vec<String> = Vec::new();
-    for (inst_name, backend) in names.into_iter().zip(per_member_backends.iter()) {
-        let work_dir = crate::paths::workspace_dir(ctx.home).join(&inst_name);
-        planned.push((inst_name, backend.clone(), work_dir));
-    }
-
-    if !planned.is_empty() {
-        let entries = build_member_entries(&planned, topic_binding_mode.as_deref());
-        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
-            entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
-        if let Err(e) = crate::fleet::add_instances_to_yaml(ctx.home, &refs) {
-            tracing::warn!(error = %e, "failed to persist team to fleet.yaml");
-        }
-    }
-
-    // Phase 2 — generate instructions and spawn each planned member. The
-    // helper reads fleet.yaml (now complete) for the peer list, so every
-    // member boots with a full Identity/Peers block in its agend.md.
-    let mut spawned: Vec<(String, String)> = Vec::new();
-    let size = crossterm::terminal::size().unwrap_or((120, 40));
-    for (inst_name, backend, work_dir) in &planned {
-        // #46776 fail-closed: skip (do not spawn) a member whose provisioning is
-        // refused — a workspace-identity conflict or I/O failure — rather than
-        // fork it against foreign or half-written provisioned state.
-        if let Err(e) = super::prepare_instructions(ctx.home, inst_name, backend, work_dir, None) {
-            tracing::error!(agent = %inst_name, error = %e,
-                "team spawn: provisioning refused — skipping member");
-            continue;
-        }
-        // #900: resolve the just-written fleet.yaml entry so any
-        // operator-supplied `env:` (or `defaults.env`) reaches the
-        // spawned process. The entry is in fleet.yaml at this point
-        // (Phase 1 above wrote it), so resolve_instance returns the
-        // merged defaults+instance map. CREATE_TEAM-time team members
-        // currently have env: None at write-time (line 110), but
-        // operator hand-edits and downstream restart flows can populate
-        // env on the entry between the write and this re-read — we
-        // honour whatever the disk says.
-        let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-            .ok()
-            .and_then(|f| f.resolve_instance(inst_name));
-        let resolved_env = resolved.as_ref().map(|r| r.env.clone());
-        // #2038: boot parity for args + model, same rule as handle_spawn's
-        // fleet fallback. CREATE_TEAM-time entries are written with
-        // args/model: None (Phase 1 above), but `defaults.args` /
-        // `defaults.model` and operator hand-edits between the write and
-        // this re-read merge in via resolve_instance.
-        let mut member_args = resolved
-            .as_ref()
-            .map(|r| r.args.clone())
-            .unwrap_or_default();
-        let declared_backend = resolved
-            .as_ref()
-            .map(|r| r.backend.clone())
-            .unwrap_or_else(|| crate::backend::Backend::parse_str(backend));
-        if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
-            // #2744: DECLARED identity — the resolved fleet entry's backend
-            // (Phase 1 wrote it); fallback parses the declared member NAME,
-            // never a command string.
-            crate::backend::Backend::push_model_arg(&mut member_args, &declared_backend, model);
-        }
-        match crate::agent_ops::spawn_one(
-            ctx.home,
-            ctx.registry,
-            inst_name,
-            backend,
-            &member_args,
-            crate::backend::SpawnMode::Fresh,
-            work_dir,
-            size,
-            resolved_env.as_ref(),
-            Some(&declared_backend),
-        ) {
-            Ok(_) => {
-                tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
-                // #966: Every successful spawn gets a channel topic via
-                // the hub `ensure_topic_for`. NoChannel is the happy path
-                // when no channel is configured; Failed is surfaced via
-                // warn (Pushback B: prior `let _ = ch.create_topic()`
-                // swallowed errors, same antipattern as pre-#962 silent
-                // persist).
-                // #991 PR-B: skip/deferred opts the whole team out — mirrors
-                // the single-instance gate in api/handlers/instance.rs
-                // (handle_spawn). Without this, topic_binding_mode was
-                // correctly persisted to fleet.yaml above but a topic got
-                // created anyway (this path calls agent_ops::spawn_one
-                // directly, bypassing handle_spawn's existing gate).
-                if let Some(mode) = topic_binding_mode.as_deref() {
-                    tracing::info!(
-                        team = team_name,
-                        member = %inst_name,
-                        topic_binding_mode = mode,
-                        "CREATE_TEAM: skipping topic creation (opted out)"
-                    );
-                } else {
-                    match crate::channel::ensure_topic_for(inst_name) {
-                        crate::channel::TopicOutcome::Created(_)
-                        | crate::channel::TopicOutcome::NoChannel => {}
-                        crate::channel::TopicOutcome::Failed(err) => {
-                            tracing::warn!(
-                                team = team_name,
-                                member = %inst_name,
-                                error = %err,
-                                "CREATE_TEAM: channel exists but create_topic failed; \
-                                 member spawn proceeds without topic"
-                            );
-                        }
-                    }
-                }
-                spawned.push((inst_name.clone(), backend.clone()));
-            }
-            Err(e) => {
-                tracing::warn!(team = team_name, member = %inst_name, backend = %backend, error = %e, "CREATE_TEAM spawn failed");
-                failed.push(format!("{inst_name}: {e}"));
-            }
-        }
-    }
-    tracing::info!(
-        team = team_name,
-        spawned = spawned.len(),
-        failed = failed.len(),
-        "CREATE_TEAM spawn phase done"
-    );
-    if count > 0 && spawned.is_empty() {
-        return json!({"ok": false, "error": format!("all {} spawns failed: {}", count, failed.join("; "))});
-    }
-
-    let existing: Vec<String> = params["members"]
+    let existing_members: Vec<String> = params["members"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -282,117 +58,31 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                 .collect()
         })
         .unwrap_or_default();
-    let spawned_names: Vec<String> = spawned.iter().map(|(n, _)| n.clone()).collect();
-    let all_members: Vec<String> = existing
-        .into_iter()
-        .chain(spawned_names.iter().cloned())
-        .collect();
+    let accept_from: Vec<String> = params["accept_from"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // Preserve orchestrator from the caller. Without this, routing
-    // deploy_template / MCP create_team through CREATE_TEAM would silently
-    // drop the orchestrator designation — teams::create accepts it but
-    // this handler never forwarded the field.
-    let mut team_params = json!({
-        "name": team_name,
-        "members": all_members,
-        "description": params["description"],
-    });
-    if let Some(orch) = params.get("orchestrator").and_then(|v| v.as_str()) {
-        team_params["orchestrator"] = json!(orch);
-    }
-    // #1833: forward `repository_path` (team source_repo) — same allowlist-drop
-    // class as the orchestrator preservation above. #1329 made `deployments.rs`
-    // set `team_args["repository_path"]` and route through CREATE_TEAM, but this
-    // handler re-marshals `params` into a fresh `team_params` and dropped the
-    // field, so every deploy/`api::call(CREATE_TEAM)` produced a team with
-    // `source_repo=null` regardless of the template/caller (`teams::create`
-    // reads `repository_path`, teams.rs).
-    if let Some(repo) = params.get("repository_path").and_then(|v| v.as_str()) {
-        team_params["repository_path"] = json!(repo);
-    }
-    // #1837 (reviewer-2): `accept_from` is the SAME re-marshal allowlist-drop —
-    // a documented CREATE_TEAM param (mcp/tools.rs cross-team allowlist, "empty =
-    // deny all") that `teams::create` reads from `args["accept_from"]` (teams.rs)
-    // but this handler never forwarded. The main path `team(action=create,
-    // accept_from=[...])` → `api::call(CREATE_TEAM)` → here → dropped → the
-    // operator's cross-team allowlist was silently emptied (fail-closed, but a
-    // real functional loss). Forward it to close the root-cause pattern entirely.
-    if let Some(af) = params.get("accept_from") {
-        team_params["accept_from"] = af.clone();
-    }
-    // #1964 Bug 2: when the team ALREADY exists (the create_instance(team=X)
-    // grow-the-team use case), `teams::create` errors "team already exists" —
-    // and that error was swallowed into `result` while the members had ALREADY
-    // spawned: named `X-N` but never written to the roster, so
-    // `find_team_for` read team=None and the send policy cross-team-blocked
-    // same-team traffic. Route the roster write through `teams::update(add)`
-    // instead (same fleet.yaml `teams:` store the send policy reads — one
-    // write path, one read path). New-team creation is unchanged.
-    let result = if team_already_exists {
-        tracing::info!(
-            team = team_name,
-            adding = ?all_members,
-            "CREATE_TEAM: team exists — extending roster (#1964)"
-        );
-        let mut update_params = json!({
-            "name": team_name,
-            "add": all_members,
-        });
-        if let Some(orch) = params.get("orchestrator").and_then(|v| v.as_str()) {
-            update_params["orchestrator"] = json!(orch);
-        }
-        // #2525: same allowlist-drop class as the orchestrator/repository_path/
-        // accept_from forwarding above (#1833/#1837) — this branch re-marshals
-        // into a fresh update_params too, and repository_path was never added
-        // here. teams::update reads args["repository_path"] (set-or-preserve),
-        // so without this a second create_instance(team=X, repository_path=Y)
-        // on an existing team silently drops Y.
-        if let Some(repo) = params.get("repository_path").and_then(|v| v.as_str()) {
-            update_params["repository_path"] = json!(repo);
-        }
-        crate::teams::update(ctx.home, &update_params)
-    } else {
-        crate::teams::create(ctx.home, &team_params)
-    };
-    // Surface a roster-write failure honestly: the members are spawned but
-    // team-less (the exact #1964 silent shape) — ok:false lets the caller see
-    // it instead of a fake success.
-    if let Some(err) = result.get("error").and_then(|e| e.as_str()) {
-        tracing::warn!(team = team_name, error = %err, "CREATE_TEAM roster write failed — spawned members are NOT on the team roster");
-        return json!({
-            "ok": false,
-            "error": format!("members spawned but roster write failed: {err}"),
-            "spawned": &spawned_names,
-        });
-    }
-
-    if let Some(n) = ctx.notifier {
-        if team_already_exists {
-            if !spawned_names.is_empty() {
-                tracing::info!(team = team_name, added = ?spawned_names, "CREATE_TEAM emitting TeamMembersChanged (extend)");
-                n.notify(ApiEvent::TeamMembersChanged {
-                    name: team_name.to_string(),
-                    added: spawned_names.clone(),
-                    removed: Vec::new(),
-                });
-            }
-        } else if !all_members.is_empty() {
-            tracing::info!(team = team_name, members = ?all_members, "CREATE_TEAM emitting TeamCreated");
-            n.notify(ApiEvent::TeamCreated {
-                name: team_name.to_string(),
-                members: all_members.clone(),
-            });
-        }
-    }
-    // Broadcast team context to every member so their running prompts
-    // learn about the team's name / orchestrator / roster without a
-    // respawn. Guard on the same empty-members condition as the TUI
-    // event — an empty team would have no targets anyway.
-    let mut resp = json!({"ok": true, "result": result, "spawned": &spawned_names});
-    if !failed.is_empty() {
-        resp["failed"] = json!(failed);
-    }
-    resp
+    crate::team_ops::create(
+        ctx.home,
+        crate::team_ops::CreateTeamRequest {
+            name,
+            per_member_backends,
+            existing_members,
+            topic_binding_mode,
+            orchestrator: params["orchestrator"].as_str().map(String::from),
+            description: params["description"].as_str().map(String::from),
+            repository_path: params["repository_path"].as_str().map(String::from),
+            project_id: params["project_id"].as_str().map(String::from),
+            accept_from,
+        },
+        ctx.registry,
+        ctx.notifier.map(|n| n.as_ref()),
+    )
 }
 
 #[cfg(test)]
@@ -585,15 +275,15 @@ mod tests_1964 {
         }
         // Consecutive two-member plan: 8, 9 (max=7 → +1; the gap 2-6 is NOT
         // reused; "sqd-lead"/"other-3" don't poison the parse).
-        let names = plan_member_names(&fleet, "sqd", 2, |_| false);
+        let names = crate::team_ops::plan_member_names(&fleet, "sqd", 2, |_| false);
         assert_eq!(names, vec!["sqd-8".to_string(), "sqd-9".to_string()]);
 
         // A registry-held (running but yaml-less) candidate is skipped too.
-        let names = plan_member_names(&fleet, "sqd", 1, |c| c == "sqd-8");
+        let names = crate::team_ops::plan_member_names(&fleet, "sqd", 1, |c| c == "sqd-8");
         assert_eq!(names, vec!["sqd-9".to_string()]);
 
         // Fresh team: starts at 1 and increments WITHIN one call.
-        let names = plan_member_names(&fleet, "fresh", 2, |_| false);
+        let names = crate::team_ops::plan_member_names(&fleet, "fresh", 2, |_| false);
         assert_eq!(names, vec!["fresh-1".to_string(), "fresh-2".to_string()]);
     }
 
@@ -615,13 +305,13 @@ mod tests_1964 {
             ),
         ];
 
-        let skip_entries = build_member_entries(&planned, Some("skip"));
+        let skip_entries = crate::team_ops::build_member_entries(&planned, Some("skip"));
         assert_eq!(skip_entries.len(), 2);
         for (_, e) in &skip_entries {
             assert_eq!(e.topic_binding_mode.as_deref(), Some("skip"));
         }
 
-        let auto_entries = build_member_entries(&planned, None);
+        let auto_entries = crate::team_ops::build_member_entries(&planned, None);
         for (_, e) in &auto_entries {
             assert!(
                 e.topic_binding_mode.is_none(),

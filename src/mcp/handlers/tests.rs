@@ -2744,23 +2744,243 @@ fn checkout_repo_agent_name_source_with_agent_not_found() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// --- task.rs fallback paths ---
+// --- #2454 Slice 13: team(action=create) typed runtime migration ---
 
+/// #2454 Slice 13 RED: runtime=None must return an explicit structured
+/// transport failure — never silently fall back to teams::create.
+/// Retargets the pre-migration create_team_fallback_to_direct_when_daemon_unreachable.
 #[test]
-fn create_team_fallback_to_direct_when_daemon_unreachable() {
+fn create_team_runtime_none_returns_structured_error_2454() {
     let _g = fleet_test_guard();
-    let home = tmp_home("team-fallback");
+    let home = tmp_home("team-rt-none");
     std::env::set_var("AGEND_HOME", &home);
-    // No daemon running → API call fails → falls back to teams::create
     let result = handle_tool(
         "team",
-        &json!({"action": "create", "name": "test-team", "members": ["a", "b"]}),
+        &json!({"action": "create", "name": "no-rt-team", "members": ["a", "b"]}),
         "sender",
     );
-    // Should succeed via direct fallback (or return structured error, not panic)
     assert!(
-        result.get("error").is_none() || result.get("name").is_some(),
-        "create_team fallback must not panic: {result}"
+        result.get("error").is_some(),
+        "#2454: runtime=None CREATE_TEAM must return structured error, not fallback success: {result}"
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("runtime")),
+        "#2454: error must mention runtime unavailability: {result}"
+    );
+    // Zero side effects: no team created in fleet.yaml
+    let fleet_path = home.join("fleet.yaml");
+    let fleet_content = std::fs::read_to_string(&fleet_path).unwrap_or_default();
+    assert!(
+        !fleet_content.contains("no-rt-team"),
+        "#2454: runtime=None must not create team as a side effect: {fleet_content}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 13 RED: runtime=Some must succeed in-process without
+/// an API listener, through the neutral typed CREATE_TEAM service —
+/// not teams::create fallback.
+#[test]
+fn create_team_runtime_some_succeeds_without_api_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-some");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "rt-team", "members": ["alice"]}),
+        "sender",
+    );
+    // API-equivalent result shape: must have ok:true (not raw teams::create output)
+    assert_eq!(
+        result.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "#2454: runtime=Some CREATE_TEAM must return API-equivalent ok:true, \
+         not teams::create fallback shape: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 13 RED: runtime=Some result must carry `spawned` field
+/// with API-equivalent event semantics (members spawned in-process).
+#[test]
+fn create_team_runtime_some_has_spawned_field_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-spawned");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "sp-team", "members": ["bob"]}),
+        "sender",
+    );
+    assert!(
+        result.get("spawned").is_some(),
+        "#2454: runtime=Some CREATE_TEAM must include spawned field \
+         (API-equivalent semantics): {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 13 RED: runtime=Some with a recording notifier must emit
+/// exactly one TeamCreated event with correct name+members, zero
+/// InstanceCreated events, and return API-equivalent ok/result/spawned.
+#[test]
+fn create_team_runtime_some_emits_team_created_event_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-event");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances: {}\nteams: {}\n",
+    )
+    .unwrap();
+    struct EventRecorder {
+        events: parking_lot::Mutex<Vec<crate::api::ApiEvent>>,
+    }
+    impl EventRecorder {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+        fn take(&self) -> Vec<crate::api::ApiEvent> {
+            std::mem::take(&mut *self.events.lock())
+        }
+    }
+    impl crate::api::ApiNotifier for EventRecorder {
+        fn notify(&self, event: crate::api::ApiEvent) {
+            self.events.lock().push(event);
+        }
+    }
+    let recorder = EventRecorder::new();
+    let notifier: std::sync::Arc<dyn crate::api::ApiNotifier> = recorder.clone();
+    let runtime = super::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: Some(notifier),
+        shutdown: None,
+    };
+    let result = super::handle_tool_with_runtime(
+        "team",
+        &json!({"action": "create", "name": "ev-team", "members": ["alice", "bob"]}),
+        "sender",
+        Some(runtime),
+    );
+    // API-equivalent response shape: ok + result{status,name} + spawned=[]
+    assert_eq!(
+        result.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "#2454: runtime=Some+notifier CREATE_TEAM must return ok:true: {result}"
+    );
+    assert_eq!(
+        result["result"]["status"].as_str(),
+        Some("created"),
+        "#2454: result.status must be \"created\": {result}"
+    );
+    assert_eq!(
+        result["result"]["name"].as_str(),
+        Some("ev-team"),
+        "#2454: result.name must be exact: {result}"
+    );
+    // Pre-listed members (no count/backends) → zero spawns
+    assert_eq!(
+        result.get("spawned").and_then(|v| v.as_array()),
+        Some(&vec![]),
+        "#2454: spawned must be exactly []: {result}"
+    );
+
+    // Roster on disk must contain exactly the declared members
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team_cfg = fleet
+        .teams
+        .get("ev-team")
+        .expect("#2454: team must be persisted to fleet.yaml");
+    let mut roster = team_cfg.members.clone();
+    roster.sort();
+    assert_eq!(
+        roster,
+        vec!["alice", "bob"],
+        "#2454: persisted team roster must equal exactly [alice, bob]: {:?}",
+        team_cfg.members
+    );
+
+    // Event assertions: exactly one event total, and it is TeamCreated
+    let events = recorder.take();
+    assert_eq!(
+        events.len(),
+        1,
+        "#2454: exactly one event expected (no InstanceCreated, no other variants): {events:?}"
+    );
+    let crate::api::ApiEvent::TeamCreated { name, members } = &events[0] else {
+        panic!(
+            "#2454: sole event must be TeamCreated, got: {:?}",
+            events[0]
+        );
+    };
+    assert_eq!(name, "ev-team", "#2454: TeamCreated name must be exact");
+    let mut sorted_members = members.clone();
+    sorted_members.sort();
+    assert_eq!(
+        sorted_members,
+        vec!["alice", "bob"],
+        "#2454: TeamCreated members must equal exactly [alice, bob]: {members:?}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 13 RED: runtime CREATE_TEAM with `project_id` must persist
+/// the exact project_id to the team roster on disk. The neutral typed
+/// service must forward project_id through to teams::create so that
+/// teams::list surfaces it — same as the API handler path.
+#[test]
+fn create_team_runtime_some_persists_project_id_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-pid");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances: {}\nteams: {}\n",
+    )
+    .unwrap();
+    let result = handle_tool_rt(
+        "team",
+        &json!({
+            "action": "create",
+            "name": "pid-team",
+            "members": ["dev-1"],
+            "project_id": "custom-board-42"
+        }),
+        "sender",
+    );
+    assert_eq!(
+        result.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "#2454: runtime CREATE_TEAM with project_id must succeed: {result}"
+    );
+
+    // Reload fleet.yaml and verify project_id was persisted
+    let listed = crate::teams::list(&home);
+    let team = listed["teams"]
+        .as_array()
+        .expect("teams array")
+        .iter()
+        .find(|t| t["name"] == "pid-team")
+        .expect("#2454: team 'pid-team' must be present in list");
+    assert_eq!(
+        team["project_id"].as_str(),
+        Some("custom-board-42"),
+        "#2454: runtime CREATE_TEAM must persist exact project_id \
+         through the neutral typed service to disk; got: {}",
+        team["project_id"]
     );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
