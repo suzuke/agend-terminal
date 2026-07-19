@@ -1646,27 +1646,11 @@ mod tests {
             "dispatch_send must be a custom fn threading RuntimeContext, not adapter!"
         );
 
-        // (c) agent_ops::send_to must have zero api::call (MCP bypasses it)
+        // (c) agent_ops::send_to retired — no longer exists.
         let ops_src = include_str!("../../agent_ops.rs");
-        let fn_start = ops_src
-            .find("pub fn send_to(")
-            .expect("agent_ops::send_to must exist");
-        let fn_region = &ops_src[fn_start..];
-        let fn_end = fn_region
-            .find("\npub ")
-            .or_else(|| fn_region.find("\n// -----"))
-            .unwrap_or(fn_region.len());
-        let fn_body = &fn_region[..fn_end];
-        let ops_count = fn_body
-            .lines()
-            .filter(|line| {
-                let t = line.trim();
-                !t.starts_with("//") && !t.starts_with("///") && line.contains(needle_call)
-            })
-            .count();
-        assert_eq!(
-            ops_count, 0,
-            "agent_ops::send_to must have zero api::call after migration; got {ops_count}"
+        assert!(
+            !ops_src.contains("pub fn send_to("),
+            "agent_ops::send_to must be retired after Slice 12 migration"
         );
 
         // (d) SEND production region (comms + comms_delegate + agent_ops) must

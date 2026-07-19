@@ -24,44 +24,6 @@ pub(crate) mod spawn;
 // Messaging
 // ---------------------------------------------------------------------------
 
-/// Centralised daemon-unavailable fallback: validate target in fleet.yaml,
-/// enqueue inbox message, notify agent. Returns fallback JSON response.
-/// Extracted from 3 duplicated sites in comms.rs (Sprint 40 T-7 B4).
-pub fn fallback_deliver(
-    home: &Path,
-    from: &str,
-    target: &str,
-    text: &str,
-    msg: crate::inbox::InboxMessage,
-    api_error: &anyhow::Error,
-) -> Value {
-    let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .map(|c| c.instances.contains_key(target))
-        .unwrap_or(false);
-    if !in_fleet {
-        return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {api_error})")});
-    }
-    // Capture the answered parent before `msg` is moved into enqueue below.
-    let parent_id = msg.parent_id.clone();
-    // #bughunt2: this is the last-resort path (the daemon API is already down),
-    // so the inbox is the SOLE channel. A swallowed enqueue here is total,
-    // unrecoverable message loss reported as success — surface it instead.
-    if let Err(e) = crate::inbox::enqueue(home, target, msg) {
-        return json!({
-            "error": format!(
-                "inbox fallback delivery to '{target}' failed — message lost (API unavailable: {api_error}): {e}"
-            )
-        });
-    }
-    // Confirmed-successful fallback delivery: settle the SENDER's own parent row
-    // so an answered obligation stops re-nagging via poll-reminder. No-ops when
-    // parent_id is None; the failed-enqueue early return above skips it.
-    crate::inbox::settle_parent_after_successful_send(home, from, parent_id.as_deref());
-    crate::inbox::notify_agent(home, target, &crate::inbox::NotifySource::Agent(from), text);
-    json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {api_error}")})
-}
-
 pub(crate) fn send_via_api_bridge(home: &Path, request: &messaging::SendRequest) -> Value {
     let mut params = json!({
         "from": request.from,
@@ -149,46 +111,6 @@ pub(crate) fn send_via_api_bridge(home: &Path, request: &messaging::SendRequest)
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => json!({"error": format!("daemon API unavailable: {e}")}),
     }
-}
-
-/// Send a message to a target instance via API, falling back to direct
-/// inbox delivery when the daemon is unreachable.
-///
-/// `from: &Sender` guarantees a non-empty originator; callers cannot
-/// accidentally stamp messages with `[from:]` (see `src/identity.rs`).
-///
-/// Sprint 54 layer-5: `broadcast_context` is `Some` only when the call
-/// originates from `handle_broadcast` per-target loop — it surfaces in the
-/// recipient's `[AGEND-MSG]` header (`broadcast=N team=NAME`) and inbox
-/// JSON metadata so broadcast is distinguishable from unicast at agent
-/// vantage. Routing behavior is unaffected.
-pub fn send_to(
-    home: &Path,
-    from: &Sender,
-    target: &str,
-    text: &str,
-    kind: &str,
-    broadcast_context: Option<&crate::inbox::BroadcastContext>,
-) -> Value {
-    let from_str = from.as_str();
-    let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .map(|c| c.instances.contains_key(target))
-        .unwrap_or(false);
-    if !in_fleet {
-        return json!({"error": format!("target instance '{target}' not found in fleet.yaml")});
-    }
-    let submit_key = get_submit_key(home, target);
-    crate::inbox::deliver(
-        home,
-        target,
-        &crate::inbox::NotifySource::Agent(from_str),
-        text,
-        &submit_key,
-        Some(kind.to_string()),
-        broadcast_context.cloned(),
-    );
-    json!({"target": target, "delivery_mode": "inbox_fallback"})
 }
 
 // ---------------------------------------------------------------------------
@@ -590,21 +512,6 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
         ),
         "save_metadata_batch"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Fleet
-// ---------------------------------------------------------------------------
-
-/// Look up submit_key for a target instance from fleet config.
-pub fn get_submit_key(home: &Path, target: &str) -> String {
-    let fleet_path = crate::fleet::fleet_yaml_path(home);
-    if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
-        if let Some(resolved) = config.resolve_instance(target) {
-            return resolved.submit_key;
-        }
-    }
-    "\r".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,162 +1320,6 @@ mod tests {
         );
     }
 
-    /// #bughunt2: the last-resort delivery path must surface a dropped enqueue
-    /// (the inbox is the SOLE channel when the API is down) instead of reporting
-    /// `inbox_fallback` success for a silently-lost message.
-    #[test]
-    fn fallback_deliver_surfaces_enqueue_failure_not_fake_success() {
-        let home = tmp_home("fallback-enqueue-fail");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  worker:\n    backend: claude\n",
-        )
-        .unwrap();
-        // Force the inbox enqueue to fail: `home/inbox` as a FILE makes
-        // `create_dir_all(home/inbox)` error inside with_inbox_lock.
-        std::fs::write(home.join("inbox"), b"blocker").unwrap();
-        let msg = crate::inbox::InboxMessage::new_system("sender", "update", "body");
-        let api_error = anyhow::anyhow!("daemon API unavailable");
-        let result = fallback_deliver(&home, "sender", "worker", "hi", msg, &api_error);
-        assert!(
-            result.get("error").and_then(|e| e.as_str()).is_some(),
-            "a dropped enqueue must surface as an error, not inbox_fallback success: {result}"
-        );
-        assert_ne!(
-            result.get("delivery_mode").and_then(|d| d.as_str()),
-            Some("inbox_fallback"),
-            "must NOT report success when the message was lost"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2730: the API-down fallback fork must NOT settle the sender's parent row
-    /// when the fallback enqueue itself fails. Mirror of the normal-fork test
-    /// (`messaging/tests.rs::failed_parented_send_does_not_settle_sender_parent`)
-    /// through `fallback_deliver`: the settle seam is wired only past the enqueue
-    /// Ok, so a lost fallback message must leave the parent unprocessed.
-    #[test]
-    fn failed_fallback_delivery_does_not_settle_sender_parent() {
-        let home = tmp_home("fallback-fail-no-settle");
-        let (sender, target) = ("ffns-worker", "ffns-peer");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            format!("instances:\n  {target}:\n    backend: claude\n"),
-        )
-        .unwrap();
-        // Seed + drain a real delivering parent row in the SENDER's own inbox.
-        let pid = "m-ffns-parent";
-        crate::inbox::enqueue(
-            &home,
-            sender,
-            crate::inbox::InboxMessage {
-                schema_version: 1,
-                id: Some(pid.to_string()),
-                from: "codex".to_string(),
-                text: "q".to_string(),
-                kind: Some("query".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        crate::inbox::drain(&home, sender); // parent: unread → delivering
-
-        // Break ONLY the target's RESOLVED inbox path (dir) so the fallback
-        // enqueue fails. Must be the RESOLVED (not raw-name) path — on Windows
-        // inbox_path_resolved migrates name→UUID, so a raw-name-path directory is
-        // bypassed and the UUID path succeeds (#2730 r2 Windows failure). Breaking
-        // the resolved path makes enqueue hit the id_path-exists branch on BOTH
-        // platforms (no symlink/copy migration divergence).
-        let target_path = crate::inbox::storage::inbox_path_resolved(&home, target);
-        std::fs::create_dir_all(&target_path).unwrap();
-
-        let reply = crate::inbox::InboxMessage {
-            schema_version: 1,
-            id: Some("m-ffns-reply".to_string()),
-            from: sender.to_string(),
-            text: "answered".to_string(),
-            kind: Some("report".to_string()),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            parent_id: Some(pid.to_string()),
-            ..Default::default()
-        };
-        let resp = fallback_deliver(
-            &home,
-            sender,
-            target,
-            "answered",
-            reply,
-            &anyhow::anyhow!("api down"),
-        );
-        assert!(
-            resp.get("error").is_some(),
-            "the fallback enqueue must fail when the target inbox is broken: {resp}"
-        );
-
-        // The sender's parent row must remain unprocessed — settle must NOT fire.
-        let path = crate::inbox::storage::inbox_path_resolved(&home, sender);
-        let body = std::fs::read_to_string(&path).unwrap();
-        let row = body
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(pid))
-            .expect("sender parent row must still exist");
-        assert!(
-            row.get("read_at").is_none_or(|r| r.is_null()),
-            "a FAILED fallback delivery must not settle the sender parent: {row}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// t-20260705005551919287-14440-22: `send_to`'s API-down fallback hardcoded
-    /// `kind: None` when handing off to `inbox::deliver` — losing the ORIGINAL
-    /// message kind (`"query"`/`"task"`/etc, threaded through fine on the
-    /// API-reachable path via the `"kind": kind` param) the instant the daemon
-    /// API is unreachable. Real production callers pass a real kind here
-    /// (`handle_request_information` → `"query"`; `handle_broadcast` → the
-    /// caller's `request_kind`, which can be `"task"`/`"query"`) — a query/task
-    /// silently landing as kind=None means its obligation classification is
-    /// lost (poll-reminder doesn't re-arm for it), not just cosmetic.
-    ///
-    /// No live daemon exists in this test's fresh `tmp_home`, so `api::call`
-    /// fails deterministically and `send_to` takes the fallback path for real
-    /// — not a mocked substitute for it.
-    #[test]
-    fn send_to_fallback_preserves_original_kind_not_none_2620() {
-        let home = tmp_home("send-to-fallback-kind");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  sf2620t:\n    backend: claude\n",
-        )
-        .unwrap();
-        let from = Sender::new("sender").expect("valid sender");
-
-        // t-20260705005551919287-14440-22 (dev3 heartbeat_pair sweep): NOT the
-        // generic "worker" fixture name — this fallback path writes
-        // `heartbeat_pair["worker"]`, colliding under plain `cargo test`'s
-        // shared process with dispatch_idle's #1516 tests reading that same
-        // process-global (non-`home`-scoped) registry entry.
-        let result = send_to(&home, &from, "sf2620t", "hello", "query", None);
-        assert_eq!(
-            result.get("delivery_mode").and_then(|d| d.as_str()),
-            Some("inbox_fallback"),
-            "test invariant: no daemon running in this tmp_home, must hit the \
-             fallback path (not skip past it): {result}"
-        );
-
-        let msgs = crate::inbox::drain(&home, "sf2620t");
-        assert_eq!(msgs.len(), 1, "fallback must still enqueue the message");
-        assert_eq!(
-            msgs[0].kind.as_deref(),
-            Some("query"),
-            "the fallback delivery must preserve the ORIGINAL kind passed to \
-             send_to, not silently drop it to None: {:?}",
-            msgs[0]
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
     // --- validate_branch (3 from ops.rs + 5 from mcp/handlers.rs) ---
 
     #[test]
@@ -1826,15 +1577,6 @@ mod tests {
         assert_eq!(v["team"], "dev", "unrelated `team` must survive batch");
         assert_eq!(v["waiting_on"], "review");
         assert_eq!(v["waiting_on_since"], "2026-04-27T00:00:00Z");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // --- get_submit_key (1 from ops.rs) ---
-
-    #[test]
-    fn submit_key_default() {
-        let home = tmp_home("sk");
-        assert_eq!(get_submit_key(&home, "x"), "\r");
         std::fs::remove_dir_all(&home).ok();
     }
 

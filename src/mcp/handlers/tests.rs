@@ -128,34 +128,6 @@ fn save_metadata_creates_dir() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// get_submit_key tests
-use crate::agent_ops::get_submit_key;
-
-#[test]
-fn get_submit_key_default() {
-    let home = tmp_home("submit_key");
-    // No fleet.yaml → default \r
-    let key = get_submit_key(&home, "agent1");
-    assert_eq!(key, "\r");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn get_submit_key_from_fleet() {
-    let home = tmp_home("submit_key_fleet");
-    let yaml = r#"defaults:
-  backend: claude
-instances:
-  dev:
-    role: "Developer"
-"#;
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
-    let key = get_submit_key(&home, "dev");
-    // Claude Code preset submit_key is "\r" or similar
-    assert!(!key.is_empty());
-    std::fs::remove_dir_all(&home).ok();
-}
-
 // --- cleanup_working_dir ---
 
 #[test]
