@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) mod cleanup_admission;
+pub(crate) mod spawn;
 
 // ---------------------------------------------------------------------------
 // Messaging

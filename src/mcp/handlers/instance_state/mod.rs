@@ -372,7 +372,11 @@ pub(super) fn handle_bind_topic(home: &Path, args: &Value) -> Value {
     }
 }
 
-pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_start_instance_with_runtime(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
@@ -398,14 +402,17 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
             // fallback in handle_spawn, which keeps this RPC the
             // single-source-of-truth for the instance start.
             let env_json = serde_json::to_value(&resolved.env).unwrap_or(serde_json::Value::Null);
-            match crate::api::call(
+            let spawn_request = json!({"method": crate::api::method::SPAWN, "params": {
+                "name": name, "backend": resolved.backend_command, "args": cmd_args,
+                "mode": "resume",
+                "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
+                "env": env_json,
+            }});
+            match spawn::spawn_runtime_or_legacy(
                 home,
-                &json!({"method": crate::api::method::SPAWN, "params": {
-                    "name": name, "backend": resolved.backend_command, "args": cmd_args,
-                    "mode": "resume",
-                    "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
-                    "env": env_json,
-                }}),
+                &spawn_request,
+                runtime,
+                &spawn::legacy_spawn,
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"name": name}),
                 Ok(resp) => {
@@ -607,10 +614,12 @@ pub(super) fn handle_restart_instance_with_runtime(
         mode,
     );
 
-    let spawn_result = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
-    );
+    let spawn_request = json!({
+        "method": crate::api::method::SPAWN,
+        "params": spawn_params,
+    });
+    let spawn_result =
+        spawn::spawn_runtime_or_legacy(home, &spawn_request, runtime, &spawn::legacy_spawn);
     let spawned = spawn_result
         .as_ref()
         .map(|r| r["ok"].as_bool() == Some(true))
