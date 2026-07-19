@@ -68,11 +68,11 @@ fn protocol_dispatch_matches_the_per_path_response_contract() {
         "protocol must not promise a message ID that send does not return"
     );
     assert!(
-        COMMS_HANDLER.contains(r#"json!({"target": target, "delivery_mode": dm})"#),
+        COMMS_HANDLER.contains(r#"json!({"target": target, "delivery_mode": delivery_mode})"#),
         "ordinary send must expose its routing mode"
     );
     assert!(
-        COMMS_HANDLER.contains("handle_delegate_task(home, &args, sender)"),
+        COMMS_HANDLER.contains("handle_delegate_task(home, &args, sender, runtime)"),
         "request_kind=task must route through the task wrapper"
     );
     assert!(
