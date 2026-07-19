@@ -4523,3 +4523,71 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #2454 closure RED: exercise real MCP RuntimeContext=Some read/compatibility
+/// entries with no API listener.  The list/delete team cases are included in
+/// the matrix because their current adapters still discard the supplied
+/// runtime; the companion structural guard in `dispatch.rs` keeps that gap
+/// visible without asserting a repo-wide textual zero.
+#[test]
+fn runtime_present_mcp_no_listener_matrix_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("runtime-present-no-listener-matrix");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  matrix-agent:\n    backend: shell\nteams:\n  matrix:\n    members: [matrix-agent]\n",
+    )
+    .unwrap();
+
+    let cases = [
+        ("task", json!({"action": "health"})),
+        ("task", json!({"action": "sweep", "apply": false})),
+        ("deployment", json!({"action": "list"})),
+        ("team", json!({"action": "list"})),
+    ];
+    for (tool, args) in cases {
+        let result = handle_tool_rt(tool, &args, "matrix-operator");
+        let rendered = result.to_string();
+        assert!(
+            !rendered.contains("daemon API unavailable")
+                && !rendered.contains("runtime unavailable"),
+            "RuntimeContext=Some {tool} {args} must not require an API listener: {result}"
+        );
+    }
+
+    struct EventRecorder {
+        events: parking_lot::Mutex<Vec<crate::api::ApiEvent>>,
+    }
+    impl crate::api::ApiNotifier for EventRecorder {
+        fn notify(&self, event: crate::api::ApiEvent) {
+            self.events.lock().push(event);
+        }
+    }
+    let recorder = std::sync::Arc::new(EventRecorder {
+        events: parking_lot::Mutex::new(Vec::new()),
+    });
+    let notifier: std::sync::Arc<dyn crate::api::ApiNotifier> = recorder.clone();
+    let mut runtime = super::minimal_test_runtime();
+    runtime.notifier = Some(notifier);
+    let result = super::handle_tool_with_runtime(
+        "team",
+        &json!({"action": "delete", "name": "matrix"}),
+        "matrix-operator",
+        Some(runtime),
+    );
+    assert!(
+        !result.to_string().contains("daemon API unavailable"),
+        "RuntimeContext=Some team delete must not use a daemon listener: {result}"
+    );
+    assert!(
+        recorder.events.lock().iter().any(|event| matches!(
+            event,
+            crate::api::ApiEvent::InstanceDeleted { name } if name == "matrix-agent"
+        )),
+        "RuntimeContext=Some team delete must cascade through the typed DELETE owner: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
