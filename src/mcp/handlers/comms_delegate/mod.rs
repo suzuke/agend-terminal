@@ -8,7 +8,7 @@
 //! 3. **compose** — message body + force_meta
 //! 4. **lease** — optional `dispatch_auto_bind_lease` when `branch` set
 //! 5. **create** — optional auto board task after all rejectable checks
-//! 6. **send** — API SEND / inbox fallback via [`SendEnvelope`]
+//! 6. **send** — `execute_send` via neutral typed service (or API bridge fallback)
 //! 7. **track** — dispatch_tracking + UX + `auto_created_task_id` on success
 //!
 //! Loaded as a child of `comms` so `file_size_invariant` keeps `comms.rs` under

@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use super::message::{BroadcastContext, InboxMessage, NotifySource};
+#[cfg(test)]
+use super::message::BroadcastContext;
+use super::message::{InboxMessage, NotifySource};
 use super::storage;
 
 /// Returns true when the `AGEND_POINTER_ONLY_INJECT` feature flag is set to "1".
@@ -138,7 +140,7 @@ pub fn format_event_header(kind: &str, fields: &[(&str, &str)]) -> String {
 
 /// Deliver a message: always enqueue to inbox JSONL for persistence,
 /// then inject to PTY (inline or pointer-only depending on feature flag).
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn deliver(
     home: &Path,
     agent_name: &str,

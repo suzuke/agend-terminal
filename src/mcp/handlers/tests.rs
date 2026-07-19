@@ -1242,31 +1242,6 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
 // --- Sprint 6: delivery_mode ---
 
 #[test]
-fn test_send_to_inbox_fallback_mode() {
-    // Daemon down → fallback path → delivery_mode = "inbox_fallback"
-    let _g = fleet_test_guard();
-    let home = tmp_home("delivery-fallback");
-    std::fs::write(
-        crate::fleet::fleet_yaml_path(&home),
-        "instances:\n  receiver:\n    backend: claude\n",
-    )
-    .ok();
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
-        "send",
-        &json!({"instance": "receiver", "message": "test"}),
-        "sender",
-    );
-    assert_eq!(
-        result["delivery_mode"].as_str(),
-        Some("inbox_fallback"),
-        "daemon-down path must set delivery_mode=inbox_fallback: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
 // TODO(#701): DI refactor 後可移除 #[serial]
 #[serial]
 fn test_describe_message_shows_delivery_mode() {
