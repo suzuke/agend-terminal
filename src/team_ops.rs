@@ -18,6 +18,7 @@ pub(crate) struct CreateTeamRequest {
     pub orchestrator: Option<String>,
     pub description: Option<String>,
     pub repository_path: Option<String>,
+    pub project_id: Option<String>,
     pub accept_from: Vec<String>,
 }
 
@@ -222,6 +223,9 @@ pub(crate) fn create(
     if let Some(ref repo) = request.repository_path {
         team_params["repository_path"] = json!(repo);
     }
+    if let Some(ref pid) = request.project_id {
+        team_params["project_id"] = json!(pid);
+    }
     if !request.accept_from.is_empty() {
         team_params["accept_from"] = json!(request.accept_from);
     }
@@ -241,6 +245,9 @@ pub(crate) fn create(
         }
         if let Some(ref repo) = request.repository_path {
             update_params["repository_path"] = json!(repo);
+        }
+        if let Some(ref pid) = request.project_id {
+            update_params["project_id"] = json!(pid);
         }
         crate::teams::update(home, &update_params)
     } else {

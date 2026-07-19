@@ -77,6 +77,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             orchestrator: params["orchestrator"].as_str().map(String::from),
             description: params["description"].as_str().map(String::from),
             repository_path: params["repository_path"].as_str().map(String::from),
+            project_id: params["project_id"].as_str().map(String::from),
             accept_from,
         },
         ctx.registry,

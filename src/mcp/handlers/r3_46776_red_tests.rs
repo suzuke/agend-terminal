@@ -72,7 +72,7 @@ fn g1_prepare_instructions_contextless_fallback_refuses_foreign_identity() {
 
     seed_agents_owned_by(&ws, "existing-owner");
 
-    let result = crate::api::handlers::prepare_instructions(
+    let result = crate::agent_ops::spawn::prepare_instructions(
         &home,
         "new-agent",
         "codex",
@@ -476,7 +476,7 @@ fn r4_malformed_fleet_refuses_prepare_instructions() {
     let fleet_path = crate::fleet::fleet_yaml_path(&home);
     std::fs::write(&fleet_path, "{{{{invalid yaml nonsense!!!!").unwrap();
 
-    let result = crate::api::handlers::prepare_instructions(&home, "agent", "codex", &ws, None);
+    let result = crate::agent_ops::spawn::prepare_instructions(&home, "agent", "codex", &ws, None);
 
     assert!(
         result.is_err(),
@@ -509,7 +509,7 @@ fn r4_ensure_project_root_failure_propagates() {
     std::fs::write(ws.join(".git"), "invalid content — not a valid gitlink").unwrap();
 
     // No fleet.yaml → NotFound fallback (legitimate), reaches generate_with_context.
-    let result = crate::api::handlers::prepare_instructions(&home, "agent", "codex", &ws, None);
+    let result = crate::agent_ops::spawn::prepare_instructions(&home, "agent", "codex", &ws, None);
 
     assert!(
         result.is_err(),
@@ -536,7 +536,7 @@ fn r4_migrate_claude_old_rules_failure_propagates() {
     std::fs::create_dir_all(&old_rules).unwrap();
 
     // No fleet.yaml → NotFound fallback. Backend = "claude" triggers migrate.
-    let result = crate::api::handlers::prepare_instructions(&home, "agent", "claude", &ws, None);
+    let result = crate::agent_ops::spawn::prepare_instructions(&home, "agent", "claude", &ws, None);
 
     assert!(
         result.is_err(),
@@ -715,7 +715,7 @@ fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
     let fleet_path = crate::fleet::fleet_yaml_path(&home);
     std::fs::write(&fleet_path, "{{invalid yaml!!").unwrap();
 
-    let result = crate::api::handlers::prepare_instructions(&home, "agent", "codex", &ws, None);
+    let result = crate::agent_ops::spawn::prepare_instructions(&home, "agent", "codex", &ws, None);
 
     assert!(result.is_err(), "precondition: malformed fleet must refuse");
     assert!(
@@ -753,7 +753,7 @@ fn r5_claude_migration_opaque_io_propagates() {
     std::fs::set_permissions(&rules_dir, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     // No fleet.yaml → NotFound fallback. Backend = "claude" triggers migrate.
-    let result = crate::api::handlers::prepare_instructions(&home, "agent", "claude", &ws, None);
+    let result = crate::agent_ops::spawn::prepare_instructions(&home, "agent", "claude", &ws, None);
 
     // Restore for cleanup.
     std::fs::set_permissions(&rules_dir, std::fs::Permissions::from_mode(0o755)).ok();

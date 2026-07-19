@@ -97,19 +97,6 @@ pub(super) fn handle_create_team(
         Some(n) => n.to_string(),
         None => return json!({"error": "missing 'name'"}),
     };
-    let per_member_backends: Vec<String> = if let Some(arr) = args["backends"].as_array() {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect()
-    } else {
-        let count = args["count"].as_u64().unwrap_or(0) as usize;
-        let backend = args["backend"].as_str().unwrap_or("claude").to_string();
-        vec![backend; count]
-    };
-    let topic_binding_mode: Option<String> = args["topic_binding"]
-        .as_str()
-        .filter(|s| matches!(*s, "skip" | "deferred"))
-        .map(String::from);
     let existing_members: Vec<String> = args["members"]
         .as_array()
         .map(|a| {
@@ -131,12 +118,13 @@ pub(super) fn handle_create_team(
         home,
         crate::team_ops::CreateTeamRequest {
             name,
-            per_member_backends,
+            per_member_backends: Vec::new(),
             existing_members,
-            topic_binding_mode,
+            topic_binding_mode: None,
             orchestrator: args["orchestrator"].as_str().map(String::from),
             description: args["description"].as_str().map(String::from),
             repository_path: args["repository_path"].as_str().map(String::from),
+            project_id: args["project_id"].as_str().map(String::from),
             accept_from,
         },
         &rt.registry,

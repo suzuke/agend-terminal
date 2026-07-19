@@ -16,36 +16,6 @@ use crate::api::{ApiNotifier, ConfigRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Write `agend.md` / `GEMINI.md` and the MCP config into `work_dir` before
-/// the child process is spawned. Centralises the fleet-aware instruction
-/// generation that every API-level spawn should perform.
-///
-/// Role resolution order:
-///   1. `explicit_role` — caller passes it directly (SPAWN/CREATE_TEAM
-///      params). Used when the caller has the role in-hand and doesn't
-///      want to depend on fleet.yaml read order.
-///   2. `fleet.yaml` entry under `name` — used by deploy_template which
-///      persists the entry before calling SPAWN.
-///   3. None — ad-hoc spawn (verify, shell pane). Identity block still
-///      emits name + peers, just no Role line.
-///
-/// Peers always come from `fleet.yaml`, so any combination of spawn
-/// callers produces a coherent peer list.
-///
-/// Must be called *before* the backend process starts: `backend::spawn_flags`
-/// checks the file's presence at flag-build time and silently drops
-/// `--append-system-prompt-file` when the instructions file is missing.
-#[cfg(test)]
-pub(crate) fn prepare_instructions(
-    home: &Path,
-    name: &str,
-    command: &str,
-    work_dir: &Path,
-    explicit_role: Option<&str>,
-) -> Result<(), String> {
-    crate::agent_ops::spawn::prepare_instructions(home, name, command, work_dir, explicit_role)
-}
-
 /// Shared context passed to extracted handler functions.
 ///
 /// Bundles the session-scoped references that `handle_session` holds.
