@@ -2937,6 +2937,55 @@ fn create_team_runtime_some_emits_team_created_event_2454() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2454 Slice 13 RED: runtime CREATE_TEAM with `project_id` must persist
+/// the exact project_id to the team roster on disk. The neutral typed
+/// service must forward project_id through to teams::create so that
+/// teams::list surfaces it — same as the API handler path.
+#[test]
+fn create_team_runtime_some_persists_project_id_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-pid");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances: {}\nteams: {}\n",
+    )
+    .unwrap();
+    let result = handle_tool_rt(
+        "team",
+        &json!({
+            "action": "create",
+            "name": "pid-team",
+            "members": ["dev-1"],
+            "project_id": "custom-board-42"
+        }),
+        "sender",
+    );
+    assert_eq!(
+        result.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "#2454: runtime CREATE_TEAM with project_id must succeed: {result}"
+    );
+
+    // Reload fleet.yaml and verify project_id was persisted
+    let listed = crate::teams::list(&home);
+    let team = listed["teams"]
+        .as_array()
+        .expect("teams array")
+        .iter()
+        .find(|t| t["name"] == "pid-team")
+        .expect("#2454: team 'pid-team' must be present in list");
+    assert_eq!(
+        team["project_id"].as_str(),
+        Some("custom-board-42"),
+        "#2454: runtime CREATE_TEAM must persist exact project_id \
+         through the neutral typed service to disk; got: {}",
+        team["project_id"]
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn update_team_fallback_to_direct_when_daemon_unreachable() {
     let _g = fleet_test_guard();
