@@ -1501,11 +1501,16 @@ mod tests {
                 break;
             }
         }
-        let mut end = 0;
-        for line in lines.into_iter().take(boundary) {
-            end += line.len() + 1;
-        }
-        &source[..end.min(source.len())]
+        // Reconstruct the byte boundary from the original source chunks so
+        // CRLF checkouts and non-ASCII lines cannot drift into the middle of a
+        // UTF-8 code point. `str::len()` is byte-based, and each inclusive
+        // chunk carries its exact newline width (`\n` or `\r\n`).
+        let end: usize = source
+            .split_inclusive('\n')
+            .take(boundary)
+            .map(str::len)
+            .sum();
+        &source[..end]
     }
 
     fn code_without_strings_or_comments(line: &str) -> String {
@@ -1892,6 +1897,14 @@ mod tests {
         assert!(first.contains("AFTER_COMMENT"));
         assert!(first.contains("FIRST_SENTINEL"));
         assert!(!first.contains("SECOND_SENTINEL"));
+    }
+
+    #[test]
+    fn production_tail_preserves_utf8_crlf_boundary_2454() {
+        let source = "pub fn first() {\r\n    let marker = \"—\";\r\n}\r\n#[cfg(test)]\r\nmod tests {\r\n    fn ignored() {}\r\n}\r\n";
+        let production = production_tail(source);
+        assert!(production.contains("let marker = \"—\""));
+        assert!(!production.contains("mod tests"));
     }
 
     /// All team actions are part of the MCP runtime-present closure.  The
