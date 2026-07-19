@@ -1594,7 +1594,7 @@ mod tests {
     // ── #2454 Slice 12: SEND runtime contract RED tests ─────────────
 
     /// #2454 Slice 12 RED (1/3): structural budget + reachability guard.
-    /// (a) cumulative handler api::call == 6, (b) dispatch_send not adapter!,
+    /// (a) cumulative handler api::call == 5, (b) dispatch_send not adapter!,
     /// (c) agent_ops::send_to zero api::call, (d) SEND region bridge == 1.
     #[test]
     fn send_structural_budget_and_reachability_2454() {
@@ -1602,7 +1602,9 @@ mod tests {
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
 
-        // (a) cumulative budget: 8 → 6
+        // (a) cumulative budget: 8 → 5
+        // Three handler-local sites to eliminate: SEND (comms.rs),
+        // REPORT (comms.rs), DELEGATE (comms_delegate/mod.rs).
         let files: &[&str] = &[
             include_str!("../../mcp/handlers/comms.rs"),
             include_str!("../../mcp/handlers/comms_delegate/mod.rs"),
@@ -1628,8 +1630,8 @@ mod tests {
             }
         }
         assert_eq!(
-            handler_count, 6,
-            "Slice-12 cumulative api::call budget must be 6; got {handler_count}"
+            handler_count, 5,
+            "Slice-12 cumulative api::call budget must be 5; got {handler_count}"
         );
 
         // (b) dispatch_send must NOT be adapter! — custom fn threads RuntimeContext
@@ -2709,5 +2711,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// d-...-4 invariant 4: typed shared service boundary guard.
+    /// The neutral typed SendRequest/SendOutcome service must live in
+    /// src/agent_ops/messaging.rs, with a typed (non-raw-Value) entry point.
+    /// Both the thin API SEND adapter (messaging.rs) and the MCP runtime
+    /// SEND family must converge on this module. The neutral module must
+    /// NOT depend on API-layer types (HandlerCtx, ConfigRegistry,
+    /// ExternalRegistry, raw serde_json::Value service entry, crate::api).
+    /// RED while the neutral service source is absent.
+    #[test]
+    fn send_typed_shared_service_boundary_guard_2454() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let neutral_path = std::path::Path::new(manifest_dir)
+            .join("src/agent_ops/messaging.rs");
+
+        // Gate: neutral service source must exist.
+        assert!(
+            neutral_path.exists(),
+            "neutral typed service source src/agent_ops/messaging.rs must exist; \
+             d-...-4 requires a typed SendRequest/SendOutcome service below \
+             both the API and MCP adapters"
+        );
+
+        let src = std::fs::read_to_string(&neutral_path).unwrap();
+        let test_mod_marker = "#[cfg(test)]\nmod ";
+        let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
+        let production = &src[..boundary];
+
+        // Must expose typed request/outcome boundary (not raw Value).
+        assert!(
+            production.contains("SendRequest"),
+            "neutral service must define SendRequest typed boundary"
+        );
+        assert!(
+            production.contains("SendOutcome"),
+            "neutral service must define SendOutcome typed boundary"
+        );
+
+        // Must have a typed service entry function (not raw Value → Value).
+        let has_typed_entry = production.lines().any(|line| {
+            let t = line.trim();
+            !t.starts_with("//") && !t.starts_with("///")
+                && (t.contains("SendRequest") && t.contains("SendOutcome")
+                    && (t.contains("fn ") || t.contains("-> ")))
+        });
+        assert!(
+            has_typed_entry,
+            "neutral service must have a typed entry fn(SendRequest) -> SendOutcome; \
+             a raw-Value send_with_runtime_or_legacy approach must not pass"
+        );
+
+        // Forbidden API-layer types — the neutral service must be
+        // dependency-free from the API adapter layer.
+        let forbidden = [
+            "HandlerCtx",
+            "ConfigRegistry",
+            "ExternalRegistry",
+            "crate::api",
+        ];
+        for needle in &forbidden {
+            for (ln, line) in production.lines().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") || t.starts_with("///") {
+                    continue;
+                }
+                assert!(
+                    !line.contains(needle),
+                    "neutral service src/agent_ops/messaging.rs:{} contains \
+                     forbidden API-layer dependency `{needle}` — the neutral \
+                     service must be below both API and MCP adapters",
+                    ln + 1
+                );
+            }
+        }
+
+        // Forbidden: raw serde_json::Value as service entry parameter.
+        let has_raw_value_entry = production.lines().any(|line| {
+            let t = line.trim();
+            !t.starts_with("//") && !t.starts_with("///")
+                && t.contains("fn ")
+                && (t.contains("Value") || t.contains("&serde_json"))
+                && !t.contains("SendRequest") && !t.contains("SendOutcome")
+        });
+        assert!(
+            !has_raw_value_entry,
+            "neutral service must not have a raw Value / serde_json service \
+             entry — use typed SendRequest/SendOutcome boundary"
+        );
     }
 }
