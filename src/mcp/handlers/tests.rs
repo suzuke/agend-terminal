@@ -4262,6 +4262,179 @@ templates:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2454 Slice 14 RED: a real runtime-present deployment must reach the typed
+/// SPAWN owner, while retaining the deployment field projection in fleet.yaml.
+/// The generic shell backend resolves to the platform shell; `topic_binding:
+/// skip` keeps this transport-free and the teardown below removes the registry
+/// entry once the GREEN implementation starts spawning in-process.
+#[test]
+fn deployment_runtime_some_deploy_reaches_typed_spawn_owner_slice14() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("deployment-runtime-spawn-slice14");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+templates:
+  spawn-slice14:
+    instances:
+      lead:
+        backend: shell
+        args: ["--fixture", "value"]
+        model: sonnet
+        env:
+          SLICE14_MARKER: present
+        topic_binding: skip
+"#,
+    )
+    .unwrap();
+
+    struct EventRecorder {
+        events: parking_lot::Mutex<Vec<crate::api::ApiEvent>>,
+    }
+    impl EventRecorder {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+    impl crate::api::ApiNotifier for EventRecorder {
+        fn notify(&self, event: crate::api::ApiEvent) {
+            self.events.lock().push(event);
+        }
+    }
+
+    let recorder = EventRecorder::new();
+    let notifier: std::sync::Arc<dyn crate::api::ApiNotifier> = recorder.clone();
+    let runtime = super::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: Some(notifier),
+        shutdown: None,
+    };
+
+    let result = super::handle_tool_with_runtime(
+        "deployment",
+        &json!({
+            "action": "deploy",
+            "template": "spawn-slice14",
+            "directory": home.join("workspace").display().to_string(),
+        }),
+        "sender",
+        Some(runtime.clone()),
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let instance = fleet
+        .instances
+        .get("spawn-slice14-lead")
+        .expect("deploy must persist the typed SPAWN field projection");
+    let projected_args = instance.args.clone();
+    let projected_model = instance.model.clone();
+    let projected_marker = instance.env.get("SLICE14_MARKER").cloned();
+    let projected_topic_binding = instance.topic_binding_mode.clone();
+    let spawn_event_before_teardown = recorder.events.lock().iter().any(|event| {
+        matches!(
+            event,
+            crate::api::ApiEvent::InstanceCreated { name, .. }
+                if name == "spawn-slice14-lead"
+        )
+    });
+
+    // Keep GREEN runs hygienic once the in-process owner actually creates a
+    // registry entry; the current runtime-blind RED path has nothing to delete.
+    let teardown = super::handle_tool_with_runtime(
+        "deployment",
+        &json!({"action": "teardown", "name": "spawn-slice14"}),
+        "sender",
+        Some(runtime),
+    );
+
+    assert_eq!(
+        result["status"].as_str(),
+        Some("deployed"),
+        "deployment must retain its durable success projection: {result}"
+    );
+    assert_eq!(projected_args, vec!["--fixture", "value"]);
+    assert_eq!(projected_model.as_deref(), Some("sonnet"));
+    assert_eq!(projected_marker.as_deref(), Some("present"));
+    assert_eq!(projected_topic_binding.as_deref(), Some("skip"));
+    assert_eq!(
+        teardown["status"].as_str(),
+        Some("torn_down"),
+        "deployment teardown must clean up the real SPAWN entry: {teardown}"
+    );
+    assert!(
+        spawn_event_before_teardown,
+        "runtime-present deployment must emit the typed InstanceCreated event"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 14 characterization: RuntimeContext=None keeps the legacy
+/// api::call/fallback deployment path and its existing team projection.
+#[test]
+fn deployment_runtime_none_preserves_legacy_transport_slice14() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("deployment-runtime-none-slice14");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+templates:
+  legacy-slice14:
+    instances:
+      lead:
+        backend: /definitely/not-an-agent-command
+      worker:
+        backend: /definitely/not-an-agent-command
+"#,
+    )
+    .unwrap();
+
+    let result = super::handle_tool(
+        "deployment",
+        &json!({"action": "deploy", "template": "legacy-slice14"}),
+        "sender",
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team = fleet
+        .teams
+        .get("legacy-slice14")
+        .expect("legacy deployment must retain its fallback team projection");
+    let mut members = team.members.clone();
+    members.sort();
+    assert_eq!(
+        members,
+        vec!["legacy-slice14-lead", "legacy-slice14-worker"]
+    );
+
+    let teardown = super::handle_tool(
+        "deployment",
+        &json!({"action": "teardown", "name": "legacy-slice14"}),
+        "sender",
+    );
+    assert_eq!(
+        result["status"].as_str(),
+        Some("deployed"),
+        "RuntimeContext=None must preserve the legacy deployment result: {result}"
+    );
+    assert_eq!(
+        teardown["status"].as_str(),
+        Some("torn_down"),
+        "RuntimeContext=None must preserve legacy teardown: {teardown}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2454 Slice 14 RED: teardown through the real MCP entry must invoke the
 /// typed DELETE owner before cleanup, even with no API listener. The current
 /// runtime-blind schedule adapter calls the legacy transport and therefore

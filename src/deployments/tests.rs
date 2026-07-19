@@ -2133,12 +2133,32 @@ fn teardown_api_calls_not_under_flock() {
         .find(&["acquire_file", "_lock"].concat())
         .expect("teardown locks the record removal");
     let delete_at = body
-        .find(&["crate::api::", "call"].concat())
-        .expect("teardown DELETEs instances via api::call");
+        .find("delete_instance(")
+        .expect("teardown invokes the typed DELETE owner");
     assert!(
         delete_at < lock_at,
         "the typed DELETE owner must run BEFORE the record-removal flock (#1617 class)"
     );
+}
+
+fn source_function_containing<'a>(source: &'a str, needle: &str) -> &'a str {
+    let needle_at = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("source is missing typed owner needle `{needle}`"));
+    let before = &source[..needle_at];
+    let start = ["\npub(crate) fn ", "\npub fn ", "\nfn "]
+        .into_iter()
+        .filter_map(|marker| before.rfind(marker))
+        .max()
+        .expect("typed owner needle must be inside a function");
+    let after = &source[needle_at..];
+    let end = ["\npub(crate) fn ", "\npub fn ", "\nfn "]
+        .into_iter()
+        .filter_map(|marker| after.find(marker))
+        .min()
+        .map(|offset| needle_at + offset)
+        .unwrap_or(source.len());
+    &source[start..end]
 }
 
 #[test]
@@ -2171,5 +2191,20 @@ fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
     assert!(
         deployments.contains("DeploymentRuntime"),
         "deployments owner must define/accept a neutral runtime capability rather than MCP HandlerCtx"
+    );
+    assert!(
+        !deployments.contains("HandlerCtx") && !deployments.contains("RuntimeContext"),
+        "deployments owner must not depend on MCP HandlerCtx/RuntimeContext"
+    );
+    for needle in ["spawn_instance(", "team_ops::create", "delete_instance("] {
+        let body = source_function_containing(deployments, needle);
+        assert!(
+            !body.contains("crate::api::call"),
+            "typed runtime owner `{needle}` must not contain the legacy api::call transport"
+        );
+    }
+    assert!(
+        deployments.contains("crate::api::call"),
+        "RuntimeContext=None compatibility must retain an explicit legacy api::call path"
     );
 }
