@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) mod cleanup_admission;
+pub(crate) mod messaging;
 pub(crate) mod spawn;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,95 @@ pub fn fallback_deliver(
     json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {api_error}")})
 }
 
+pub(crate) fn send_via_api_bridge(home: &Path, request: &messaging::SendRequest) -> Value {
+    let mut params = json!({
+        "from": request.from,
+        "target": request.target,
+        "text": request.text,
+    });
+    let Some(obj) = params.as_object_mut() else {
+        unreachable!()
+    };
+    if let Some(ref k) = request.kind {
+        obj.insert("kind".into(), json!(k));
+    }
+    if let Some(ref v) = request.thread_id {
+        obj.insert("thread_id".into(), json!(v));
+    }
+    if let Some(ref v) = request.parent_id {
+        obj.insert("parent_id".into(), json!(v));
+    }
+    if let Some(ref v) = request.correlation_id {
+        obj.insert("correlation_id".into(), json!(v));
+    }
+    if let Some(ref v) = request.reviewed_head {
+        obj.insert("reviewed_head".into(), json!(v));
+    }
+    if let Some(ref v) = request.report_purpose {
+        obj.insert("report_purpose".into(), json!(v));
+    }
+    if let Some(ref v) = request.code_review {
+        obj.insert("code_review".into(), v.clone());
+    }
+    if let Some(v) = request.eta_minutes {
+        obj.insert("eta_minutes".into(), json!(v));
+    }
+    if let Some(ref v) = request.reporting_cadence {
+        obj.insert("reporting_cadence".into(), json!(v));
+    }
+    if let Some(v) = request.worktree_binding_required {
+        obj.insert("worktree_binding_required".into(), json!(v));
+    }
+    if let Some(v) = request.expect_reply_within_secs {
+        obj.insert("expect_reply_within_secs".into(), json!(v));
+    }
+    if let Some(v) = request.terminal {
+        obj.insert("terminal".into(), json!(v));
+    }
+    if let Some(v) = request.no_report_expected {
+        obj.insert("no_report_expected".into(), json!(v));
+    }
+    if let Some(ref v) = request.delivery_nonce {
+        obj.insert("delivery_nonce".into(), json!(v));
+    }
+    if let Some(ref v) = request.task_id {
+        obj.insert("task_id".into(), json!(v));
+    }
+    if let Some(ref v) = request.force_meta {
+        obj.insert("force_meta".into(), v.clone());
+    }
+    if let Some(ref v) = request.provenance {
+        obj.insert("provenance".into(), v.clone());
+    }
+    if let Some(ref v) = request.branch {
+        obj.insert("branch".into(), json!(v));
+    }
+    if let Some(ref v) = request.priority {
+        obj.insert("priority".into(), json!(v));
+    }
+    if let Some(ref v) = request.broadcast_context {
+        obj.insert(
+            "broadcast_context".into(),
+            serde_json::to_value(v).unwrap_or_default(),
+        );
+    }
+    match crate::api::call(
+        home,
+        &json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "method": crate::api::method::SEND,
+            "params": params,
+        }),
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
+            json!({"target": request.target, "delivery_mode": dm})
+        }
+        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
+        Err(e) => json!({"error": format!("daemon API unavailable: {e}")}),
+    }
+}
+
 /// Send a message to a target instance via API, falling back to direct
 /// inbox delivery when the daemon is unreachable.
 ///
@@ -81,55 +171,24 @@ pub fn send_to(
     broadcast_context: Option<&crate::inbox::BroadcastContext>,
 ) -> Value {
     let from_str = from.as_str();
-    let mut params = json!({
-        "from": from_str,
-        "target": target,
-        "text": text,
-        "kind": kind,
-    });
-    if let Some(ctx) = broadcast_context {
-        params["broadcast_context"] = serde_json::to_value(ctx).unwrap_or(Value::Null);
+    let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .map(|c| c.instances.contains_key(target))
+        .unwrap_or(false);
+    if !in_fleet {
+        return json!({"error": format!("target instance '{target}' not found in fleet.yaml")});
     }
-    match crate::api::call(
+    let submit_key = get_submit_key(home, target);
+    crate::inbox::deliver(
         home,
-        &json!({
-            "method": crate::api::method::SEND,
-            "params": params,
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
-            json!({"target": target, "delivery_mode": dm})
-        }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-        Err(e) => {
-            // Validate target exists in fleet.yaml before writing to inbox.
-            let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                .ok()
-                .map(|c| c.instances.contains_key(target))
-                .unwrap_or(false);
-            if !in_fleet {
-                return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {e})")});
-            }
-            let submit_key = get_submit_key(home, target);
-            // t-20260705005551919287-14440-22: preserve the ORIGINAL `kind`
-            // on the fallback path — it was hardcoded to `None` here even
-            // though the API-reachable path above threads it through via
-            // `"kind": kind`. A task/query silently landing as kind=None
-            // loses its obligation classification (poll-reminder doesn't
-            // re-arm for it).
-            crate::inbox::deliver(
-                home,
-                target,
-                &crate::inbox::NotifySource::Agent(from_str),
-                text,
-                &submit_key,
-                Some(kind.to_string()),
-                broadcast_context.cloned(),
-            );
-            json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {e}")})
-        }
-    }
+        target,
+        &crate::inbox::NotifySource::Agent(from_str),
+        text,
+        &submit_key,
+        Some(kind.to_string()),
+        broadcast_context.cloned(),
+    );
+    json!({"target": target, "delivery_mode": "inbox_fallback"})
 }
 
 // ---------------------------------------------------------------------------

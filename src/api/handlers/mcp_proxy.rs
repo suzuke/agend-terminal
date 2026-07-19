@@ -2078,33 +2078,46 @@ mod tests {
         // Check full directive set on BOTH targets.
         for (label, msg) in [("target-a", &msgs_a[0]), ("target-b", &msgs_b[0])] {
             assert_eq!(
-                msg.thread_id.as_deref(), Some("thread-bc-001"),
-                "{label}: broadcast must preserve thread_id; got {:?}", msg.thread_id
+                msg.thread_id.as_deref(),
+                Some("thread-bc-001"),
+                "{label}: broadcast must preserve thread_id; got {:?}",
+                msg.thread_id
             );
             assert_eq!(
-                msg.parent_id.as_deref(), Some("parent-bc-001"),
-                "{label}: broadcast must preserve parent_id; got {:?}", msg.parent_id
+                msg.parent_id.as_deref(),
+                Some("parent-bc-001"),
+                "{label}: broadcast must preserve parent_id; got {:?}",
+                msg.parent_id
             );
             assert_eq!(
-                msg.correlation_id.as_deref(), Some("corr-bc-001"),
-                "{label}: broadcast must preserve correlation_id; got {:?}", msg.correlation_id
+                msg.correlation_id.as_deref(),
+                Some("corr-bc-001"),
+                "{label}: broadcast must preserve correlation_id; got {:?}",
+                msg.correlation_id
             );
             assert_eq!(
-                msg.eta_minutes, Some(30),
-                "{label}: broadcast must preserve eta_minutes; got {:?}", msg.eta_minutes
+                msg.eta_minutes,
+                Some(30),
+                "{label}: broadcast must preserve eta_minutes; got {:?}",
+                msg.eta_minutes
             );
             assert_eq!(
-                msg.reporting_cadence.as_deref(), Some("per-pr"),
-                "{label}: broadcast must preserve reporting_cadence; got {:?}", msg.reporting_cadence
+                msg.reporting_cadence.as_deref(),
+                Some("per-pr"),
+                "{label}: broadcast must preserve reporting_cadence; got {:?}",
+                msg.reporting_cadence
             );
             assert_eq!(
-                msg.worktree_binding_required, Some(true),
+                msg.worktree_binding_required,
+                Some(true),
                 "{label}: broadcast must preserve worktree_binding_required; got {:?}",
                 msg.worktree_binding_required
             );
             assert_eq!(
-                msg.terminal, Some(true),
-                "{label}: broadcast must preserve terminal; got {:?}", msg.terminal
+                msg.terminal,
+                Some(true),
+                "{label}: broadcast must preserve terminal; got {:?}",
+                msg.terminal
             );
         }
     }
@@ -2169,33 +2182,46 @@ mod tests {
         assert!(!msgs.is_empty(), "query must deliver to q-target");
         let msg = &msgs[0];
         assert_eq!(
-            msg.thread_id.as_deref(), Some("thread-q-001"),
-            "query must preserve thread_id; got {:?}", msg.thread_id
+            msg.thread_id.as_deref(),
+            Some("thread-q-001"),
+            "query must preserve thread_id; got {:?}",
+            msg.thread_id
         );
         assert_eq!(
-            msg.parent_id.as_deref(), Some("parent-q-001"),
-            "query must preserve parent_id; got {:?}", msg.parent_id
+            msg.parent_id.as_deref(),
+            Some("parent-q-001"),
+            "query must preserve parent_id; got {:?}",
+            msg.parent_id
         );
         assert_eq!(
-            msg.correlation_id.as_deref(), Some("corr-q-001"),
-            "query must preserve correlation_id; got {:?}", msg.correlation_id
+            msg.correlation_id.as_deref(),
+            Some("corr-q-001"),
+            "query must preserve correlation_id; got {:?}",
+            msg.correlation_id
         );
         assert_eq!(
-            msg.eta_minutes, Some(15),
-            "query must preserve eta_minutes; got {:?}", msg.eta_minutes
+            msg.eta_minutes,
+            Some(15),
+            "query must preserve eta_minutes; got {:?}",
+            msg.eta_minutes
         );
         assert_eq!(
-            msg.reporting_cadence.as_deref(), Some("both"),
-            "query must preserve reporting_cadence; got {:?}", msg.reporting_cadence
+            msg.reporting_cadence.as_deref(),
+            Some("both"),
+            "query must preserve reporting_cadence; got {:?}",
+            msg.reporting_cadence
         );
         assert_eq!(
-            msg.worktree_binding_required, Some(true),
+            msg.worktree_binding_required,
+            Some(true),
             "query must preserve worktree_binding_required; got {:?}",
             msg.worktree_binding_required
         );
         assert_eq!(
-            msg.terminal, Some(true),
-            "query must preserve terminal; got {:?}", msg.terminal
+            msg.terminal,
+            Some(true),
+            "query must preserve terminal; got {:?}",
+            msg.terminal
         );
     }
 
@@ -2245,7 +2271,11 @@ mod tests {
         )
         .unwrap();
         let pre_drain = crate::inbox::drain(&home, "fx-sender");
-        assert_eq!(pre_drain.len(), 1, "pre-seeded dispatch drained → delivering");
+        assert_eq!(
+            pre_drain.len(),
+            1,
+            "pre-seeded dispatch drained → delivering"
+        );
 
         // Register UX Recorder — must record 0 events on failure.
         use crate::channel::sink_registry::registry as ux_sink_registry;
@@ -2253,7 +2283,9 @@ mod tests {
         let rec = {
             struct Rec(parking_lot::Mutex<Vec<UxEvent>>);
             impl UxEventSink for Rec {
-                fn emit(&self, event: &UxEvent) { self.0.lock().push(event.clone()); }
+                fn emit(&self, event: &UxEvent) {
+                    self.0.lock().push(event.clone());
+                }
             }
             std::sync::Arc::new(Rec(parking_lot::Mutex::new(Vec::new())))
         };
@@ -2283,25 +2315,23 @@ mod tests {
         // (a) Response must indicate failure explicitly.
         let resp_str = response.to_string();
         assert!(
-            resp_str.contains("error") || resp_str.contains("fail")
-                || resp_str.contains("unavailable") || response["ok"] == false,
+            resp_str.contains("error")
+                || resp_str.contains("fail")
+                || resp_str.contains("unavailable")
+                || response["ok"] == false,
             "runtime=None must return an explicit failure response; got: {response}"
         );
 
         // (b) No inbox entry for the target.
         let target_msgs = crate::inbox::drain(&home, "fx-target");
         // (c) No dispatch tracking record for the target.
-        let has_tracking =
-            crate::dispatch_tracking::has_for_instance(&home, "fx-target");
+        let has_tracking = crate::dispatch_tracking::has_for_instance(&home, "fx-target");
         // (d) No dispatch-idle sidecar.
-        let has_idle =
-            crate::daemon::dispatch_idle::has_pending_for_instance(&home, "fx-target");
+        let has_idle = crate::daemon::dispatch_idle::has_pending_for_instance(&home, "fx-target");
         // (e) Sender's pre-seeded parent remains unsettled (Delivering, not
         // ReadAt). describe_message is the direct status probe — drain would
         // miss a delivering row because drain only returns unread messages.
-        let parent_status = crate::inbox::describe_message(
-            &home, "m-fx-parent", "fx-sender",
-        );
+        let parent_status = crate::inbox::describe_message(&home, "m-fx-parent", "fx-sender");
         // (f) No task auto-created on the board for the sent task_id.
         let board = crate::tasks::handle(&home, "fx-sender", &json!({"action": "list"}));
         let has_auto_task = board["tasks"]
@@ -2337,7 +2367,10 @@ mod tests {
             "runtime=None failure must not create a dispatch-idle sidecar"
         );
         assert!(
-            matches!(parent_status, crate::inbox::MessageStatus::Delivering { .. }),
+            matches!(
+                parent_status,
+                crate::inbox::MessageStatus::Delivering { .. }
+            ),
             "runtime=None failure must not settle the pre-seeded parent — \
              expected Delivering, got {:?}",
             parent_status
@@ -2438,7 +2471,9 @@ mod tests {
         let rec = {
             struct Rec(parking_lot::Mutex<Vec<UxEvent>>);
             impl UxEventSink for Rec {
-                fn emit(&self, event: &UxEvent) { self.0.lock().push(event.clone()); }
+                fn emit(&self, event: &UxEvent) {
+                    self.0.lock().push(event.clone());
+                }
             }
             std::sync::Arc::new(Rec(parking_lot::Mutex::new(Vec::new())))
         };
@@ -2477,20 +2512,26 @@ mod tests {
         // (c) ack_by_correlation must have settled the sender's dispatch row.
         // describe_message is the direct status probe — drain would miss a
         // delivering row. ReadAt = settled.
-        let parent_status = crate::inbox::describe_message(
-            &home, "m-dispatch-fx", "rpt-fx-sender",
-        );
+        let parent_status = crate::inbox::describe_message(&home, "m-dispatch-fx", "rpt-fx-sender");
         // (d) mark_completed must have cleared the seeded DispatchEntry.
         let remaining_tracking =
             crate::dispatch_tracking::take_pending_dispatchers_to(&home, "rpt-fx-sender");
         // (e) UX: exactly one total event, and it must be ReportResult.
         let ux_events = rec.0.lock().clone();
-        let report_events: Vec<_> = ux_events.iter().filter(|e| {
-            matches!(e, UxEvent::Fleet(crate::channel::ux_event::FleetEvent::ReportResult { .. }))
-        }).collect();
+        let report_events: Vec<_> = ux_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    UxEvent::Fleet(crate::channel::ux_event::FleetEvent::ReportResult { .. })
+                )
+            })
+            .collect();
         // (f) record_triaged_if_present must have written a discharge ledger entry.
         let has_discharge = crate::daemon::discharge_ledger::lookup_discharge(
-            &home, "rpt-fx-head-sha", "rpt-fx-job",
+            &home,
+            "rpt-fx-head-sha",
+            "rpt-fx-job",
         )
         .is_some();
         std::fs::remove_dir_all(&home).ok();
@@ -2502,7 +2543,8 @@ mod tests {
              track_dispatch), not the socket fallback (delivery_mode={dm}): {response}"
         );
         assert_eq!(
-            target_msgs.len(), 1,
+            target_msgs.len(),
+            1,
             "report must produce exactly 1 inbox message for the target; got {}",
             target_msgs.len()
         );
@@ -2519,12 +2561,14 @@ mod tests {
             remaining_tracking.len()
         );
         assert_eq!(
-            ux_events.len(), 1,
+            ux_events.len(),
+            1,
             "report must emit exactly 1 total UX event; got {}",
             ux_events.len()
         );
         assert_eq!(
-            report_events.len(), 1,
+            report_events.len(),
+            1,
             "the single UX event must be ReportResult; got {} ReportResult events",
             report_events.len()
         );
@@ -2570,7 +2614,9 @@ mod tests {
         let rec = {
             struct Rec(parking_lot::Mutex<Vec<UxEvent>>);
             impl UxEventSink for Rec {
-                fn emit(&self, event: &UxEvent) { self.0.lock().push(event.clone()); }
+                fn emit(&self, event: &UxEvent) {
+                    self.0.lock().push(event.clone());
+                }
             }
             std::sync::Arc::new(Rec(parking_lot::Mutex::new(Vec::new())))
         };
@@ -2608,9 +2654,15 @@ mod tests {
             crate::dispatch_tracking::take_pending_dispatchers_to(&home, "del-fx-target");
         // (d) UX: exactly one DelegateTask event.
         let ux_events = rec.0.lock().clone();
-        let delegate_events: Vec<_> = ux_events.iter().filter(|e| {
-            matches!(e, UxEvent::Fleet(crate::channel::ux_event::FleetEvent::DelegateTask { .. }))
-        }).collect();
+        let delegate_events: Vec<_> = ux_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    UxEvent::Fleet(crate::channel::ux_event::FleetEvent::DelegateTask { .. })
+                )
+            })
+            .collect();
         std::fs::remove_dir_all(&home).ok();
 
         assert!(
@@ -2619,22 +2671,26 @@ mod tests {
              (handle_send → track_dispatch), not the socket fallback: {response}"
         );
         assert_eq!(
-            target_msgs.len(), 1,
+            target_msgs.len(),
+            1,
             "delegate must produce exactly 1 inbox message for the target; got {}",
             target_msgs.len()
         );
         assert_eq!(
-            tracking_rows.len(), 1,
+            tracking_rows.len(),
+            1,
             "delegate must create exactly 1 dispatch tracking row for the target; got {}",
             tracking_rows.len()
         );
         assert_eq!(
-            ux_events.len(), 1,
+            ux_events.len(),
+            1,
             "delegate must emit exactly 1 total UX event; got {}",
             ux_events.len()
         );
         assert_eq!(
-            delegate_events.len(), 1,
+            delegate_events.len(),
+            1,
             "the single UX event must be DelegateTask; got {} DelegateTask events",
             delegate_events.len()
         );
@@ -2670,7 +2726,10 @@ mod tests {
         // Check: MCP adapters do NOT call service-level functions.
         let adapter_sources: &[(&str, &str)] = &[
             ("comms.rs", include_str!("../../mcp/handlers/comms.rs")),
-            ("comms_delegate/mod.rs", include_str!("../../mcp/handlers/comms_delegate/mod.rs")),
+            (
+                "comms_delegate/mod.rs",
+                include_str!("../../mcp/handlers/comms_delegate/mod.rs"),
+            ),
         ];
         for (file, src) in adapter_sources {
             let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
@@ -2724,8 +2783,7 @@ mod tests {
     #[test]
     fn send_typed_shared_service_boundary_guard_2454() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let neutral_path = std::path::Path::new(manifest_dir)
-            .join("src/agent_ops/messaging.rs");
+        let neutral_path = std::path::Path::new(manifest_dir).join("src/agent_ops/messaging.rs");
 
         // Gate: neutral service source must exist.
         assert!(
@@ -2751,12 +2809,28 @@ mod tests {
         );
 
         // Must have a typed service entry function (not raw Value → Value).
-        let has_typed_entry = production.lines().any(|line| {
-            let t = line.trim();
-            !t.starts_with("//") && !t.starts_with("///")
-                && (t.contains("SendRequest") && t.contains("SendOutcome")
-                    && (t.contains("fn ") || t.contains("-> ")))
-        });
+        // Handles multiline signatures: scan for fn...SendRequest blocks
+        // ending with -> SendOutcome within a bounded window.
+        let has_typed_entry = {
+            let lines: Vec<&str> = production.lines().collect();
+            let mut found = false;
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") || t.starts_with("///") {
+                    continue;
+                }
+                if !t.contains("fn ") {
+                    continue;
+                }
+                let window_end = (i + 6).min(lines.len());
+                let window: String = lines[i..window_end].join(" ");
+                if window.contains("SendRequest") && window.contains("SendOutcome") {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
         assert!(
             has_typed_entry,
             "neutral service must have a typed entry fn(SendRequest) -> SendOutcome; \
@@ -2790,10 +2864,12 @@ mod tests {
         // Forbidden: raw serde_json::Value as service entry parameter.
         let has_raw_value_entry = production.lines().any(|line| {
             let t = line.trim();
-            !t.starts_with("//") && !t.starts_with("///")
+            !t.starts_with("//")
+                && !t.starts_with("///")
                 && t.contains("fn ")
                 && (t.contains("Value") || t.contains("&serde_json"))
-                && !t.contains("SendRequest") && !t.contains("SendOutcome")
+                && !t.contains("SendRequest")
+                && !t.contains("SendOutcome")
         });
         assert!(
             !has_raw_value_entry,
@@ -2811,8 +2887,10 @@ mod tests {
         let ops_production = &ops_src[..ops_boundary];
         let has_mod_decl = ops_production.lines().any(|line| {
             let t = line.trim();
-            !t.starts_with("//") && !t.starts_with("///")
-                && (t == "mod messaging;" || t == "pub mod messaging;"
+            !t.starts_with("//")
+                && !t.starts_with("///")
+                && (t == "mod messaging;"
+                    || t == "pub mod messaging;"
                     || t == "pub(crate) mod messaging;")
         });
         assert!(
@@ -2824,12 +2902,13 @@ mod tests {
         // (b) API SEND adapter (src/api/handlers/messaging.rs) must
         // reference the neutral owner.
         let api_svc_src = include_str!("messaging.rs");
-        let api_boundary = api_svc_src.rfind(test_mod_marker).unwrap_or(api_svc_src.len());
+        let api_boundary = api_svc_src
+            .rfind(test_mod_marker)
+            .unwrap_or(api_svc_src.len());
         let api_production = &api_svc_src[..api_boundary];
         let api_refs_neutral = api_production.lines().any(|line| {
             let t = line.trim();
-            !t.starts_with("//") && !t.starts_with("///")
-                && line.contains(neutral_mod)
+            !t.starts_with("//") && !t.starts_with("///") && line.contains(neutral_mod)
         });
         assert!(
             api_refs_neutral,
@@ -2842,8 +2921,14 @@ mod tests {
         // paths, so this is a structural convergence check only).
         let mcp_adapter_sources: &[(&str, &str)] = &[
             ("comms.rs", include_str!("../../mcp/handlers/comms.rs")),
-            ("comms_delegate/mod.rs", include_str!("../../mcp/handlers/comms_delegate/mod.rs")),
-            ("dispatch.rs", include_str!("../../mcp/handlers/dispatch.rs")),
+            (
+                "comms_delegate/mod.rs",
+                include_str!("../../mcp/handlers/comms_delegate/mod.rs"),
+            ),
+            (
+                "dispatch.rs",
+                include_str!("../../mcp/handlers/dispatch.rs"),
+            ),
         ];
         let mut mcp_refs_neutral = false;
         for (_file, src) in mcp_adapter_sources {
@@ -2851,8 +2936,7 @@ mod tests {
             let prod = &src[..b];
             if prod.lines().any(|line| {
                 let t = line.trim();
-                !t.starts_with("//") && !t.starts_with("///")
-                    && line.contains(neutral_mod)
+                !t.starts_with("//") && !t.starts_with("///") && line.contains(neutral_mod)
             }) {
                 mcp_refs_neutral = true;
                 break;

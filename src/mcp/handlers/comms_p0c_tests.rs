@@ -7,7 +7,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::dispatch_should_skip_auto_bind;
+use crate::mcp::handlers::dispatch::RuntimeContext;
 use serde_json::json;
+
+fn minimal_runtime() -> RuntimeContext {
+    RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: None,
+        shutdown: None,
+    }
+}
 
 #[test]
 fn skip_auto_bind_when_bind_false() {
@@ -88,6 +102,7 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
 
     // Report back WITHOUT ack_inbox — ⑤ must still settle the reporter's row.
     let sender = crate::identity::Sender::new(reporter);
+    let rt = minimal_runtime();
     let result = super::handle_report_result(
         &home,
         &json!({
@@ -96,6 +111,7 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
             "correlation_id": "t-x"
         }),
         &sender,
+        Some(&rt),
     );
     assert_eq!(
         result["inbox_settled"], 1,
@@ -130,7 +146,7 @@ fn analysis_report_with_pr_artifact_does_not_enter_review_gate_2760() {
     .unwrap();
 
     let sender = crate::identity::Sender::new(reporter);
-    // Verdict prefix in `summary` (no URL); the PR URL lives ONLY in `artifacts`.
+    let rt = minimal_runtime();
     let result = super::handle_report_result(
         &home,
         &json!({
@@ -141,6 +157,7 @@ fn analysis_report_with_pr_artifact_does_not_enter_review_gate_2760() {
             "report_purpose": "analysis_decision",
         }),
         &sender,
+        Some(&rt),
     );
     assert!(
         result.get("error").is_none(),
@@ -168,6 +185,7 @@ fn analysis_report_with_bare_pr_number_is_not_semantic_review_2760() {
     .unwrap();
 
     let sender = crate::identity::Sender::new(reporter);
+    let rt = minimal_runtime();
     let result = super::handle_report_result(
         &home,
         &json!({
@@ -178,6 +196,7 @@ fn analysis_report_with_bare_pr_number_is_not_semantic_review_2760() {
             "report_purpose": "analysis_decision",
         }),
         &sender,
+        Some(&rt),
     );
     assert!(
         result.get("error").is_none(),
@@ -241,6 +260,7 @@ fn ordinary_correlated_report_does_not_ack_assignment_2760() {
         &home,
         &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
         &sender,
+        None,
     );
 
     let rec = authority::get(&home, "o/r", "feat/x", reporter).expect("assignment present");
@@ -270,6 +290,7 @@ fn ordinary_correlated_report_does_not_ack_assignment_2760() {
         &home,
         &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
         &sender,
+        None,
     );
     assert!(
         authority::get(&home, "o/r", "feat/x", "reviewer-c9a")
@@ -295,6 +316,7 @@ fn c9_ack_ambiguity_fails_closed_end_to_end_t15() {
         &home,
         &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
         &sender,
+        None,
     );
 
     assert!(

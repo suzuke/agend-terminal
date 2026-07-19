@@ -161,6 +161,12 @@ const REVIEW_REQUEST_KEYS: &[&str] = &[
     "validated_code_review",
 ];
 
+pub(crate) fn has_flat_review_smuggling_fields(params: &Value) -> bool {
+    REVIEW_REQUEST_KEYS[1..]
+        .iter()
+        .any(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+}
+
 /// Authoritative API-sink validation. Must run before delivery.
 pub(crate) fn authorize_report(
     home: &Path,

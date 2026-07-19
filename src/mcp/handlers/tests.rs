@@ -2217,7 +2217,8 @@ fn create_instance_explicit_working_directory_used() {
 fn send_kind_task_maps_message_field_to_task() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "do X", "request_kind": "task", "task_id": "t-test-fixture"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     // Whatever error/success we observe, it must NOT be the field-name bug:
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
@@ -2233,7 +2234,8 @@ fn send_kind_task_maps_message_field_to_task() {
 fn send_kind_query_maps_message_field_to_question() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "what?", "request_kind": "query"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
         err, "missing 'question'",
@@ -2250,7 +2252,8 @@ fn send_kind_query_maps_message_field_to_question() {
 fn send_unknown_request_kind_rejected_2620() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi", "request_kind": "bogus"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2270,7 +2273,7 @@ fn broadcast_unknown_request_kind_rejected_2620() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let home = std::env::temp_dir();
     let args = json!({"instances": ["a", "b"], "message": "hi", "request_kind": "bogus"});
-    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
+    let result = super::comms::handle_broadcast(&home, &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2288,7 +2291,8 @@ fn send_valid_request_kinds_pass_validation_2620() {
     for kind in ["task", "report", "query", "update"] {
         let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
         let args = json!({"instance": "dev", "message": "hi", "request_kind": kind, "task_id": "t-test-fixture"});
-        let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+        let result =
+            super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
         let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             !err.contains("unknown request_kind"),
@@ -2306,7 +2310,8 @@ fn send_valid_request_kinds_pass_validation_2620() {
 fn send_non_string_request_kind_rejected_2639() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi", "request_kind": 123});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2324,7 +2329,8 @@ fn send_non_string_request_kind_rejected_2639() {
 fn send_null_request_kind_rejected_2639() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi", "request_kind": null});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2342,7 +2348,8 @@ fn send_null_request_kind_rejected_2639() {
 fn send_absent_request_kind_still_passes_2639() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("request_kind"),
@@ -2689,7 +2696,7 @@ fn update_team_fallback_to_direct_when_daemon_unreachable() {
 fn broadcast_without_targets_rejects_no_selector() {
     let sender = crate::identity::Sender::new("sender").expect("valid sender");
     let args = json!({"message": "hello all"});
-    let result = super::comms::handle_broadcast(&std::env::temp_dir(), &args, &Some(sender));
+    let result = super::comms::handle_broadcast(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("recipient"),
@@ -2712,7 +2719,7 @@ fn broadcast_with_team_filter_targets_team_members() {
     .ok();
     let sender = crate::identity::Sender::new("sender").expect("valid sender");
     let args = json!({"message": "team msg", "team": "dev2"});
-    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
+    let result = super::comms::handle_broadcast(&home, &args, &Some(sender), None);
     let sent = result["sent_to"].as_array();
     if let Some(sent) = sent {
         let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
@@ -3659,7 +3666,8 @@ fn is_read_only_tool_allowlist() {
 fn send_mixed_selectors_instance_and_instances_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "a", "instances": ["b", "c"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3671,7 +3679,8 @@ fn send_mixed_selectors_instance_and_instances_rejected() {
 fn send_mixed_selectors_instance_and_team_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "a", "team": "myteam", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3683,7 +3692,8 @@ fn send_mixed_selectors_instance_and_team_rejected() {
 fn send_mixed_selectors_instance_and_tags_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "a", "tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3695,7 +3705,8 @@ fn send_mixed_selectors_instance_and_tags_rejected() {
 fn send_mixed_selectors_instances_and_team_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instances": ["a"], "team": "myteam", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3707,7 +3718,8 @@ fn send_mixed_selectors_instances_and_team_rejected() {
 fn send_mixed_selectors_instances_and_tags_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instances": ["a"], "tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3719,7 +3731,8 @@ fn send_mixed_selectors_instances_and_tags_rejected() {
 fn send_mixed_selectors_team_and_tags_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"team": "myteam", "tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3731,7 +3744,8 @@ fn send_mixed_selectors_team_and_tags_rejected() {
 fn send_tags_only_fail_closed() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("tag") && (err.contains("not supported") || err.contains("not implemented")),
@@ -3743,7 +3757,8 @@ fn send_tags_only_fail_closed() {
 fn send_valid_selector_instance_only_no_selector_error() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "target", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("selector") && !err.contains("conflict"),
@@ -3755,7 +3770,8 @@ fn send_valid_selector_instance_only_no_selector_error() {
 fn send_valid_selector_instances_only_no_selector_error() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instances": ["a", "b"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("selector") && !err.contains("conflict"),
@@ -3767,7 +3783,8 @@ fn send_valid_selector_instances_only_no_selector_error() {
 fn send_valid_selector_team_only_no_selector_error() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"team": "myteam", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("selector") && !err.contains("conflict"),
@@ -3783,7 +3800,7 @@ fn send_mixed_selectors_no_sidecar_side_effects() {
         "instance": "a", "tags": ["dev"], "message": "hi",
         "task_id": "t-selector-sidecar-test"
     });
-    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
     assert!(
         result.get("error").is_some(),
         "must reject mixed selectors: {result}"
@@ -3811,7 +3828,7 @@ fn send_tags_only_no_sidecar_side_effects() {
         "tags": ["dev"], "message": "hi",
         "task_id": "t-tags-sidecar-test"
     });
-    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
     assert!(
         result.get("error").is_some(),
         "must reject tags-only: {result}"
@@ -3833,7 +3850,8 @@ fn send_tags_only_no_sidecar_side_effects() {
 fn send_zero_selectors_returns_typed_missing_selector() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
     assert_eq!(
         code, "missing_selector",
