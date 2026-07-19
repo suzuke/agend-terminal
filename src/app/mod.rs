@@ -16,6 +16,10 @@ mod overlay;
 mod pane_factory;
 mod ui_state;
 use ui_state::{UiDeps, UiState};
+// #2453: root AppState/RestartState owners, re-homed to a sibling module
+// (src/app/mod.rs sits under the grandfathered anti-monolith ratchet).
+mod app_state;
+use app_state::{AppState, RestartState};
 mod session;
 mod telegram_hooks;
 mod tui_events;
@@ -829,15 +833,35 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             None
         };
 
-    // #2453: the five cohesive key/UI-interaction fields, owned by one type.
-    // `name_counter` counts auto-dedup agent names.
-    let mut ui = UiState {
-        layout: Layout::new(),
-        last_tab: 0,
-        name_counter: HashMap::new(),
-        overlay: Overlay::None,
-        key_handler: KeyHandler::new(),
-        mouse_state: mouse::MouseState::default(),
+    // #2453: root AppState construction, hoisted here because every
+    // initializer is context-free — the setup code below already works on
+    // owned fields. Field semantics are documented on the struct.
+    let mut state = AppState {
+        ui: UiState {
+            layout: Layout::new(),
+            last_tab: 0,
+            name_counter: HashMap::new(),
+            overlay: Overlay::None,
+            key_handler: KeyHandler::new(),
+            mouse_state: mouse::MouseState::default(),
+        },
+        known_remote_agents: std::collections::HashSet::new(),
+        pending_fwd: HashMap::new(),
+        needs_resize: true,
+        last_remote_sync: std::time::Instant::now(),
+        last_session_save: std::time::Instant::now(),
+        last_session_json: None,
+        last_draw: None,
+        dirty: true,
+        last_notif_sync: None,
+        last_decision_sync: None,
+        pending_decisions_total: 0,
+        booting: true,
+        restart: RestartState {
+            restart_outcome: RunOutcome::Normal,
+            restart_probe: None,
+            restart_commit_pending: None,
+        },
     };
 
     let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
@@ -853,12 +877,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     trace_tty_size(size_debug, "startup-baseline");
     let pane_rows = rows.saturating_sub(4);
     let pane_cols = cols.saturating_sub(2);
-
-    // Remote agent roster (Attached mode). Mirrors `*.port` files the daemon
-    // publishes for each live agent; periodic sync below diffs this against
-    // the filesystem so hot-reload-added agents auto-materialize as tabs.
-    let mut known_remote_agents: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
 
     // restart-freeze RCA (t-…55279): anchor for the boot critical path the
     // operator sees freeze on daemon restart — session restore + the
@@ -893,16 +911,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             &home,
             &fleet_path,
             run_dir,
-            &mut ui.layout,
+            &mut state.ui.layout,
             &wakeup_tx,
             pane_cols,
             pane_rows,
         );
         // Populate the remote-agent roster from the placed tabs so the periodic
         // sync (lines 615-665) tracks them correctly.
-        for tab in &ui.layout.tabs {
+        for tab in &state.ui.layout.tabs {
             for name in tab.root().agent_names() {
-                known_remote_agents.insert(name);
+                state.known_remote_agents.insert(name);
             }
         }
         if !started {
@@ -916,15 +934,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         let started = session::restore_with_reconciliation(
             &home,
             &fleet_path,
-            &mut ui.layout,
-            &mut ui.name_counter,
+            &mut state.ui.layout,
+            &mut state.ui.name_counter,
             &mut attach_jobs,
             pane_cols,
             pane_rows,
         );
         if !started {
             pane_factory::spawn_pane_tab(
-                &mut ui.layout,
+                &mut state.ui.layout,
                 &registry,
                 &home,
                 "shell",
@@ -937,7 +955,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 pane_cols,
                 pane_rows,
                 &wakeup_tx,
-                &mut ui.name_counter,
+                &mut state.ui.name_counter,
                 pane_factory::SpawnIdentity::UnmanagedLocalShell,
             )?;
         }
@@ -972,9 +990,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // `recv(attach_rx)` BLOCKS instead of busy-spinning once every worker exits
     // and drops its sender clone (the #BLOCKER must-resolve).
     let (attach_tx, attach_rx) = crossbeam_channel::unbounded::<pane_factory::AttachOutcome>();
-    // Placeholder forwarder senders, keyed by pane id, retained until the matching
-    // AttachOutcome is applied (or the pane is closed before it arrives).
-    let mut pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>> = HashMap::new();
     // Stored JoinHandles — joined at teardown BEFORE the registry drain so every
     // worker-spawned child is reaped (not fire-and-forget).
     let mut attach_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -1005,7 +1020,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 fwd_tx,
                 spec,
             } = job;
-            pending_fwd.insert(pane_id, fwd_tx);
+            state.pending_fwd.insert(pane_id, fwd_tx);
             let _ = job_tx.send((pane_id, spec));
         }
         // Drop job_tx → workers exit once the queue drains (after each spawn or an
@@ -1013,22 +1028,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         drop(job_tx);
     }
 
-    // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
-    // Start true so restored split panes get correct sizes before first draw.
-    let mut needs_resize = true;
-
-    // Throttle for Attached-mode remote agent discovery. 2s is short enough
-    // that a fleet.yaml reload (daemon tick is 10s) feels timely but long
-    // enough that the readdir cost is trivial.
-    let mut last_remote_sync = std::time::Instant::now();
-
-    // #1479: throttled, change-gated session.json persistence. Graceful exit
-    // already saves (so a hard crash kept the OLD layout); this periodically
-    // persists the current layout (incl. move_pane / split / close) so a
-    // kill -9 / power loss preserves what's on screen. `last_session_json`
-    // caches the last write to skip no-op rewrites.
-    let mut last_session_save = std::time::Instant::now();
-    let mut last_session_json: Option<String> = None;
+    // #2453 ownership-move fix: re-stamp the sync/save throttle baselines at
+    // the former declaration seam. Restore + deferred-attach scheduling above
+    // can exceed the 2s/10s intervals, and the pre-ownership code observed
+    // its baselines from HERE — without this, the first loop iteration could
+    // trigger an immediate remote sync / session save the old code never did.
+    state.last_remote_sync = std::time::Instant::now();
+    state.last_session_save = std::time::Instant::now();
 
     // fire-and-forget: blocks in crossterm::event::read(); terminated by process exit.
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
@@ -1125,34 +1131,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         "pre-render-loop: entering render loop (first draw imminent)"
     );
 
-    // #t-84833-10 redraw-storm frame cap: `last_draw` rate-limits `terminal.draw`
-    // to ≤1/FRAME_INTERVAL; `dirty` tracks whether anything changed since the last
-    // draw (set by every select! arm) so an idle loop keeps the cheap ~50ms
-    // refresh cadence instead of busy-drawing at 30 fps.
-    let mut last_draw: Option<std::time::Instant> = None;
-    let mut dirty = true;
-    // #84833-15 R2 perf: stamps the last notification-queue disk scan so it runs at
-    // most once per `NOTIF_SYNC_INTERVAL` instead of once per wakeup (see
-    // `should_sync_notifications`). Mirrors `last_draw`'s frame-cap state.
-    let mut last_notif_sync: Option<std::time::Instant> = None;
-    // #2524 P2b / #2313: mirrors `last_notif_sync` for the decision-badge throttle.
-    let mut last_decision_sync: Option<std::time::Instant> = None;
-    // #2524 P2b / #2313: fleet-wide pending-decision total, refreshed alongside
-    // `last_decision_sync` below; read at render time by both `render()` call
-    // sites (mirrors how `binary_stale` is snapshotted once per draw).
-    let mut pending_decisions_total: usize = 0;
-
-    // #freeze-4 (t-…2324) restart-flood boot phase: at restart every pane carries a
-    // pre-restart backlog (its dump enqueues via #freeze-4 A1, plus the post-subscribe
-    // burst). Until that flood is drained, the loop runs a bounded "loading" phase —
-    // a TIME-capped drain ([`render::drain_all_panes_until`]) that clears the flood
-    // fast while still yielding to input every frame, shown as a loading indicator —
-    // instead of letting the steady-state 64 KiB/frame cap trickle it out over ~1s of
-    // interactive freeze. Exits to the steady path once all deferred attaches are
-    // applied AND every pane's rx is drained, or after `MAX_BOOT_CATCHUP`.
+    // #freeze-4 boot phase anchors (see `AppState::booting` for the mechanism).
     let boot_start = std::time::Instant::now();
-    let attaches_expected = pending_fwd.len();
-    let mut booting = true;
+    let attaches_expected = state.pending_fwd.len();
 
     // #2453: loop-stable shared deps for handle_key_event/handle_mouse_event,
     // built once.
@@ -1163,16 +1144,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         wakeup_tx: &wakeup_tx,
     };
 
-    // #2453 R2: app owner-restart in-flight state. At most one probe at a time
-    // (the gate CAS-serializes at the handler). `restart_outcome` is read after
-    // the loop to drive the in-place re-exec in `run()`.
-    let mut restart_outcome = RunOutcome::Normal;
-    let mut restart_probe: Option<RestartProbe> = None;
-    // #2453 R2 P0-2: the commit-pending state after a passing probe. The loop NEVER
-    // blocks on the transport ack (that would freeze the UI on a wedged API writer —
-    // codex R3): it parks the `flush_ack` receiver here and polls it each tick.
-    let mut restart_commit_pending: Option<CommitPending> = None;
-
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
@@ -1180,9 +1151,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
         // #2453 R2: poll the in-flight restart preflight probe (non-blocking) each
         // loop tick so the TUI never freezes on it.
-        if restart_probe.is_some() {
+        if state.restart.restart_probe.is_some() {
             use crate::api::app_restart::AppRestartVerdict;
-            match poll_restart_probe(&mut restart_probe, &app_restart_gate) {
+            match poll_restart_probe(&mut state.restart.restart_probe, &app_restart_gate) {
                 ProbePoll::Prepared(reply, flush_ack) => {
                     // Probe passed; the gate is still Probing. Reply PREPARED, then park
                     // the transport ack (do NOT block): the handler returns the
@@ -1192,7 +1163,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     // UI stays responsive even if the API writer wedges. If the handler
                     // is already gone (send fails), roll the gate back now.
                     if reply.send(AppRestartVerdict::Prepared).is_ok() {
-                        restart_commit_pending = Some(CommitPending {
+                        state.restart.restart_commit_pending = Some(CommitPending {
                             flush_ack,
                             deadline: std::time::Instant::now() + RESTART_COMMIT_WATCHDOG,
                         });
@@ -1211,19 +1182,21 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // exec. A disconnect (reply not flushed) or the watchdog deadline aborts the
         // restart with the app intact and an observable log; the `prepared` reply is
         // an honest indeterminate attempt, so a watchdog abort stays truthful.
-        if restart_commit_pending.is_some() {
+        if state.restart.restart_commit_pending.is_some() {
             let now = std::time::Instant::now();
             let poll = poll_commit_pending(
-                restart_commit_pending
+                state
+                    .restart
+                    .restart_commit_pending
                     .as_ref()
                     .expect("commit-pending present (checked above)"),
                 now,
             );
             match poll {
                 CommitPoll::Commit => {
-                    restart_commit_pending = None;
+                    state.restart.restart_commit_pending = None;
                     if app_restart_gate.to_committing() {
-                        restart_outcome = RunOutcome::RestartRequested;
+                        state.restart.restart_outcome = RunOutcome::RestartRequested;
                         break;
                     }
                     // Could not advance Probing→Committing (should not happen for the
@@ -1231,7 +1204,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     app_restart_gate.abort_to_serving();
                 }
                 CommitPoll::Abort(reason) => {
-                    restart_commit_pending = None;
+                    state.restart.restart_commit_pending = None;
                     app_restart_gate.abort_to_serving();
                     tracing::warn!(
                         target: "handoff",
@@ -1247,35 +1220,35 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
         // 50ms `default` arm of the main `select!` below guarantees this
         // runs at least every 50ms even without new PTY output.
-        if let Overlay::ScratchShell { pane } = &ui.overlay {
+        if let Overlay::ScratchShell { pane } = &state.ui.overlay {
             if !agent_is_alive(&registry, &pane.agent_name) {
                 let name = pane.agent_name.clone();
-                ui.overlay = Overlay::None;
+                state.ui.overlay = Overlay::None;
                 kill_agent(&home, &registry, &name);
             }
         }
-        if needs_resize {
+        if state.needs_resize {
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
             let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
-            crate::layout::resize_panes(pane_area, &mut ui.layout, &registry);
+            crate::layout::resize_panes(pane_area, &mut state.ui.layout, &registry);
             // #1140: force full redraw to clear wide-char ghost artifacts.
             // ratatui's Buffer::diff() can leave stale spacer cells when
             // wide chars are replaced by narrow chars across frames.
             let _ = terminal.clear();
-            needs_resize = false;
+            state.needs_resize = false;
         }
         // #84833-15 R2 perf: throttle the per-wakeup notification-queue disk scan to
         // ≥1s (the badge it feeds tolerates staleness); see `should_sync_notifications`.
         let notif_now = std::time::Instant::now();
-        if should_sync_notifications(last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
-            last_notif_sync = Some(notif_now);
-            sync_notification_state(&home, &mut ui.layout);
+        if should_sync_notifications(state.last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
+            state.last_notif_sync = Some(notif_now);
+            sync_notification_state(&home, &mut state.ui.layout);
         }
         // #2524 P2b / #2313: same throttle idiom, separate cadence state — the
         // decision-badge scan is independent of the notification scan above.
-        if should_sync_notifications(last_decision_sync, notif_now, DECISION_SYNC_INTERVAL) {
-            last_decision_sync = Some(notif_now);
-            pending_decisions_total = sync_decision_badge_state(&home, &mut ui.layout);
+        if should_sync_notifications(state.last_decision_sync, notif_now, DECISION_SYNC_INTERVAL) {
+            state.last_decision_sync = Some(notif_now);
+            state.pending_decisions_total = sync_decision_badge_state(&home, &mut state.ui.layout);
         }
         // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm).
         // std::sync::Mutex is fine here: only the main thread touches this,
@@ -1294,14 +1267,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 })
                 .unwrap_or(true);
             if should_flush {
-                flush_idle_notifications(&home, &mut ui.layout);
+                flush_idle_notifications(&home, &mut state.ui.layout);
                 if let Ok(mut guard) = LAST_FLUSH.lock() {
                     *guard = Some(now);
                 }
             }
         }
 
-        let repeat_mode = ui.key_handler.in_repeat();
+        let repeat_mode = state.ui.key_handler.in_repeat();
 
         // #2057 instrumentation (env-gated, AGEND_TUI_SIZE_DEBUG=1): the
         // operator sees ~3 blank rows below the status bar (frame shorter than
@@ -1319,35 +1292,35 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 crossterm_cols = cross.0,
                 crossterm_rows = cross.1,
                 terminal_size = ?term_sz,
-                tabs = ui.layout.tabs.len(),
+                tabs = state.ui.layout.tabs.len(),
                 "TUI draw size probe"
             );
         }
 
         // #t-84833-10 redraw-storm frame cap: draw at most once per FRAME_INTERVAL
-        // and only when something changed (`dirty`). Input is NOT throttled — the
+        // and only when something changed (`state.dirty`). Input is NOT throttled — the
         // `event_rx` arm below processes keystrokes immediately; only the (expensive)
         // full-TUI redraw is rate-limited, which is what the boot flood saturated.
         let frame_now = std::time::Instant::now();
-        if dirty && should_draw(last_draw, frame_now, FRAME_INTERVAL) {
-            last_draw = Some(frame_now);
-            dirty = false;
+        if state.dirty && should_draw(state.last_draw, frame_now, FRAME_INTERVAL) {
+            state.last_draw = Some(frame_now);
+            state.dirty = false;
             // #freeze-4: during the bounded boot catch-up phase, drain the restart
             // flood with a per-frame TIME-capped drain — it clears the backlog fast
             // as a "loading" phase while still yielding to input every frame. Exit
             // to the steady path once all deferred attaches are applied AND every
             // pane's rx is drained, or after MAX_BOOT_CATCHUP (so boot can't hang).
-            if booting {
+            if state.booting {
                 let backlog_remains =
-                    render::drain_all_panes_until(&mut ui.layout, BOOT_FRAME_TIME_CAP);
+                    render::drain_all_panes_until(&mut state.ui.layout, BOOT_FRAME_TIME_CAP);
                 let timed_out = boot_start.elapsed() >= MAX_BOOT_CATCHUP;
-                if (pending_fwd.is_empty() && !backlog_remains) || timed_out {
-                    booting = false;
+                if (state.pending_fwd.is_empty() && !backlog_remains) || timed_out {
+                    state.booting = false;
                     tracing::info!(
                         phase = "boot-catchup-complete",
                         elapsed_ms = boot_start.elapsed().as_millis() as u64,
                         attaches_expected = attaches_expected,
-                        attaches_pending = pending_fwd.len(),
+                        attaches_pending = state.pending_fwd.len(),
                         timed_out = timed_out,
                         "#freeze-4: restart-flood boot catch-up drained"
                     );
@@ -1359,7 +1332,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // backgrounded busy tab's `rx` stays bounded instead of replaying a
                 // multi-second catch-up when switched to. Background panes are drained
                 // but not redrawn; only the active tab is painted below.
-                render::drain_all_panes(&mut ui.layout);
+                render::drain_all_panes(&mut state.ui.layout);
             }
             terminal.draw(|frame| {
                 // #1027: snapshot the shared daemon-binary-stale flag once
@@ -1382,37 +1355,43 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
                 render::render(
                     frame,
-                    &mut ui.layout,
+                    &mut state.ui.layout,
                     repeat_mode,
                     &registry,
                     telegram_status,
                     binary_stale,
-                    pending_decisions_total,
+                    state.pending_decisions_total,
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
-                render_active_overlay(frame, &mut ui.overlay, &ui.layout, &registry, &home);
+                render_active_overlay(
+                    frame,
+                    &mut state.ui.overlay,
+                    &state.ui.layout,
+                    &registry,
+                    &home,
+                );
                 // #freeze-4: loading indicator while the boot catch-up phase absorbs
                 // the restart flood (so it reads as loading-with-progress, not a freeze).
-                if booting {
+                if state.booting {
                     render::render_boot_indicator(
                         frame,
-                        attaches_expected.saturating_sub(pending_fwd.len()),
+                        attaches_expected.saturating_sub(state.pending_fwd.len()),
                         attaches_expected,
                     );
                 }
             })?;
-            // #freeze-4: while booting, keep cycling at frame cadence so the
+            // #freeze-4: while state.booting, keep cycling at frame cadence so the
             // time-capped catch-up runs every frame until the restart flood clears.
             // #freeze-2/#freeze-3: otherwise the budget-capped `drain_all_panes`
             // above may have left a backlog in a VISIBLE pane's channel — re-arm
-            // `dirty` so the next frame continues the active tab's catch-up (the
-            // select-timeout below shrinks to the frame boundary when dirty), clearing
+            // `state.dirty` so the next frame continues the active tab's catch-up (the
+            // select-timeout below shrinks to the frame boundary when state.dirty), clearing
             // over a few frames instead of one input-stalling mega-draw. Background
             // backlog needs no redraw: the loop's ≤50ms idle cadence + per-output
             // wakeups guarantee `drain_all_panes` runs again to bound every pane's `rx`.
-            if booting || render::active_tab_has_pending_output(&ui.layout) {
-                dirty = true;
+            if state.booting || render::active_tab_has_pending_output(&state.ui.layout) {
+                state.dirty = true;
             }
         }
 
@@ -1420,8 +1399,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // pending but throttled (so it never stays stale beyond one frame), else
         // keep the cheap ~50ms idle refresh cadence (catches non-wakeup state like
         // status-bar / notification updates).
-        let select_timeout = if dirty {
-            match last_draw {
+        let select_timeout = if state.dirty {
+            match state.last_draw {
                 Some(t) => FRAME_INTERVAL
                     .saturating_sub(t.elapsed())
                     .max(std::time::Duration::from_millis(1)),
@@ -1439,7 +1418,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             recv(app_restart_rx) -> req => {
                 if let Ok(req) = req {
                     use crate::api::app_restart::AppRestartVerdict;
-                    if restart_probe.is_some() {
+                    if state.restart.restart_probe.is_some() {
                         // Defensive: the gate should prevent this. Reject without
                         // disturbing the in-flight probe's claim.
                         let _ = req.reply.send(AppRestartVerdict::Aborted(
@@ -1448,7 +1427,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     } else {
                         match spawn_restart_probe() {
                             Ok(child) => {
-                                restart_probe = Some(RestartProbe {
+                                state.restart.restart_probe = Some(RestartProbe {
                                     child,
                                     reply: req.reply,
                                     flush_ack: req.flush_ack,
@@ -1467,7 +1446,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(event_rx) -> ev => {
-                dirty = true; // input may change the display → redraw next due frame
+                state.dirty = true; // input may change the display → redraw next due frame
                 let ev = match ev {
                     Ok(e) => e,
                     Err(_) => break,
@@ -1479,9 +1458,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     Event::Key(key) if key.kind != KeyEventKind::Press => {}
                     Event::Key(key) => {
                         // #2453: former inline overlay/dispatch branch, now behind UiState.
-                        let out = ui.handle_key_event(key, &ui_deps);
+                        let out = state.ui.handle_key_event(key, &ui_deps);
                         if out.needs_resize {
-                            needs_resize = true;
+                            state.needs_resize = true;
                         }
                         if out.should_break {
                             break;
@@ -1495,12 +1474,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     // panes. The modal-swallow guard + mouse routing now live in
                     // UiState::handle_mouse_event (mirrors the Event::Key branch).
                     Event::Mouse(mouse_evt) => {
-                        if ui.handle_mouse_event(mouse_evt, &ui_deps) {
-                            needs_resize = true;
+                        if state.ui.handle_mouse_event(mouse_evt, &ui_deps) {
+                            state.needs_resize = true;
                         }
                     }
                     Event::Paste(text) => {
-                        match &mut ui.overlay {
+                        match &mut state.ui.overlay {
                             Overlay::RenameTab { ref mut input }
                             | Overlay::RenamePane { ref mut input } => {
                                 input.push_str(&text);
@@ -1520,18 +1499,18 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 pane.write_input(&registry, text.as_bytes());
                             }
                             Overlay::None => {
-                                write_to_focused(&home, &mut ui.layout, &registry, text.as_bytes());
+                                write_to_focused(&home, &mut state.ui.layout, &registry, text.as_bytes());
                             }
                             _ => {} // ignore paste in non-input overlays
                         }
                     }
                     Event::Resize(cols, rows) => {
                         let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
-                        crate::layout::resize_panes(pane_area, &mut ui.layout, &registry);
+                        crate::layout::resize_panes(pane_area, &mut state.ui.layout, &registry);
                         // #1140: an interactive terminal resize reflows pane widths
                         // (the wide→narrow transition that leaves stale wide-char
                         // spacer cells in ratatui's Buffer::diff), so force the same
-                        // full clear the needs_resize path performs — otherwise the
+                        // full clear the state.needs_resize path performs — otherwise the
                         // ghost artifacts reappear after the resize.
                         let _ = terminal.clear();
                     }
@@ -1539,15 +1518,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(wakeup_rx) -> _ => {
-                // Wakeup from PTY output — drain the whole burst (11 booting agents
+                // Wakeup from PTY output — drain the whole burst (11 state.booting agents
                 // flood this channel, one wakeup per output chunk) so N chunks
                 // coalesce into ONE redraw, not N iterations. The frame cap above
                 // then bounds the actual redraw rate.
                 while wakeup_rx.try_recv().is_ok() {}
-                dirty = true;
+                state.dirty = true;
             }
             recv(attach_rx) -> outcome => {
-                dirty = true;
+                state.dirty = true;
                 // #render-first phase-(b): a background worker finished a deferred
                 // attach. Apply it to its placeholder pane (instance id + dump +
                 // forwarder on Ready, or a visible "failed to start" banner on
@@ -1556,8 +1535,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // busy-spinning after all workers exit.
                 if let Ok(outcome) = outcome {
                     let pane_id = outcome.pane_id();
-                    if let Some(fwd_tx) = pending_fwd.remove(&pane_id) {
-                        if let Some(pane) = ui.layout.find_pane_mut(pane_id) {
+                    if let Some(fwd_tx) = state.pending_fwd.remove(&pane_id) {
+                        if let Some(pane) = state.ui.layout.find_pane_mut(pane_id) {
                             pane_factory::apply_attach_outcome(
                                 pane, &registry, outcome, fwd_tx, &wakeup_tx,
                             );
@@ -1572,14 +1551,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(tui_event_rx) -> ev => {
-                dirty = true;
+                state.dirty = true;
                 if let Ok(event) = ev {
-                    tui_events::handle_tui_event(event, &mut ui.layout, &registry, &wakeup_tx);
-                    needs_resize = true;
+                    tui_events::handle_tui_event(event, &mut state.ui.layout, &registry, &wakeup_tx);
+                    state.needs_resize = true;
                 }
             }
             recv(tick_rx_ref) -> _ => {
-                dirty = true;
+                state.dirty = true;
                 // #1726: owned-mode periodic maintenance now runs the FULL daemon
                 // per-tick pipeline (build_default_handlers minus APP_TICK_ALLOWLIST)
                 // instead of a hand-picked subset. Gated to owned mode via tick_rx
@@ -1602,16 +1581,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     .enter_waiting();
             }
             default(select_timeout) => {
-                // #t-84833-10: periodic idle refresh — mark dirty so the cap above
+                // #t-84833-10: periodic idle refresh — mark state.dirty so the cap above
                 // redraws (catches non-wakeup state changes; ~50ms cadence when idle).
-                dirty = true;
+                state.dirty = true;
                 // #1479: throttled, change-gated session persistence (every
                 // 10s). Cheap when the layout is unchanged (no write); on a
                 // change it preserves the on-screen layout against a hard
                 // crash. Graceful exit still saves unconditionally below.
-                if last_session_save.elapsed() >= std::time::Duration::from_secs(10) {
-                    last_session_save = std::time::Instant::now();
-                    session::save_session_if_changed(&home, &ui.layout, &mut last_session_json);
+                if state.last_session_save.elapsed() >= std::time::Duration::from_secs(10) {
+                    state.last_session_save = std::time::Instant::now();
+                    session::save_session_if_changed(&home, &state.ui.layout, &mut state.last_session_json);
                 }
                 // Periodic redraw for state updates. In Attached mode, also
                 // poll the daemon's `*.port` directory every 2s and open a
@@ -1620,7 +1599,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // agents are logged but their panes stay put so the user's
                 // scrollback isn't destroyed mid-session.
                 if attached_run_dir.is_some()
-                    && last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
+                    && state.last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
                 {
                     {
                         // #910 PR3 of 4: daemon-registry truth via runtime
@@ -1634,7 +1613,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 .into_iter()
                                 .collect();
                         let mut to_add: Vec<String> = current
-                            .difference(&known_remote_agents)
+                            .difference(&state.known_remote_agents)
                             .cloned()
                             .collect();
                         to_add.sort();
@@ -1644,14 +1623,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 name,
                                 &home,
                                 &fleet_path,
-                                &mut ui.layout,
+                                &mut state.ui.layout,
                                 dc.saturating_sub(2),
                                 dr.saturating_sub(4),
                                 &wakeup_tx,
                             ) {
                                 Ok(pane) => {
                                     let tab_name = pane.agent_name.clone();
-                                    known_remote_agents.insert(tab_name.to_string());
+                                    state.known_remote_agents.insert(tab_name.to_string());
                                     // #1591: this sync is add-only — a gone
                                     // agent's tab is RETAINED (stale output) so
                                     // scrollback survives. If a same-named agent
@@ -1663,9 +1642,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     // instead of appending a DUPLICATE tab.
                                     // Preserves tab position + focus.
                                     if let Some(idx) =
-                                        ui.layout.single_pane_tab_index_for_agent(&tab_name)
+                                        state.ui.layout.single_pane_tab_index_for_agent(&tab_name)
                                     {
-                                        ui.layout.tabs[idx] = crate::layout::Tab::new(
+                                        state.ui.layout.tabs[idx] = crate::layout::Tab::new(
                                             tab_name.to_string(),
                                             pane,
                                         );
@@ -1674,7 +1653,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             "reused retained tab for re-appeared remote agent (no duplicate)"
                                         );
                                     } else {
-                                        ui.layout.push_tab_preserve_focus(
+                                        state.ui.layout.push_tab_preserve_focus(
                                             crate::layout::Tab::new(tab_name.to_string(), pane),
                                         );
                                         tracing::info!(
@@ -1682,7 +1661,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             "opened tab for newly-appeared remote agent"
                                         );
                                     }
-                                    needs_resize = true;
+                                    state.needs_resize = true;
                                 }
                                 Err(e) => tracing::warn!(
                                     agent = %name,
@@ -1691,7 +1670,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 ),
                             }
                         }
-                        let gone: Vec<String> = known_remote_agents
+                        let gone: Vec<String> = state.known_remote_agents
                             .difference(&current)
                             .cloned()
                             .collect();
@@ -1700,9 +1679,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 agent = %name,
                                 "daemon-side agent gone; pane retained with stale output",
                             );
-                            known_remote_agents.remove(name);
+                            state.known_remote_agents.remove(name);
                         }
-                        last_remote_sync = std::time::Instant::now();
+                        state.last_remote_sync = std::time::Instant::now();
                     }
                 }
             }
@@ -1722,9 +1701,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // same reconciliation path Owned mode uses (parameterized over agent
     // source: fleet.yaml for Owned, `runtime::list_agents_with_fallback`
     // for Attached — see #910 for the registry-truth migration).
-    app_teardown(&home, &ui.layout, &registry, attached_mode, attach_workers);
+    app_teardown(
+        &home,
+        &state.ui.layout,
+        &registry,
+        attached_mode,
+        attach_workers,
+    );
 
-    Ok(restart_outcome)
+    Ok(state.restart.restart_outcome)
 }
 
 /// App startup bootstrap: prepare the fleet (issuing `api.cookie` BEFORE any API
@@ -3410,3 +3395,10 @@ mod review_repro_app_tui;
 // private `CommitPending` / `CommitPoll` / `poll_commit_pending`.
 #[cfg(test)]
 mod commit_pending_tests;
+
+// #2453: AppState ownership structural guards, re-homed to a sibling
+// `*_tests.rs` file (exempt from the src file-size invariant) mirroring
+// `commit_pending_tests` above — src/app/mod.rs sits under a grandfathered
+// anti-monolith ratchet and may not grow.
+#[cfg(test)]
+mod appstate_2453_tests;
