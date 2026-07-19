@@ -146,6 +146,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
     let timeout = tool_timeout(tool);
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
         registry: ctx.registry.clone(),
+        configs: ctx.configs.clone(),
         externals: ctx.externals.clone(),
         capability: ctx.capability,
         app_restart: ctx.app_restart.cloned(),
@@ -1084,6 +1085,115 @@ mod tests {
             "event-log must contain inject_input detail ('not found'): {event_log}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2454 Slice 10 RED: drive the real MCP delete_instance ingress with no
+    /// API listener. A managed fleet/config entry must be removed in-process
+    /// and the supplied notifier must receive InstanceDeleted; the current
+    /// adapter still falls back to the lifecycle helper's DELETE loopback.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn delete_instance_real_entry_removes_managed_state_and_notifies_2454() {
+        use crate::api::{ApiEvent, ApiNotifier};
+
+        struct RecordingNotifier {
+            events: parking_lot::Mutex<Vec<ApiEvent>>,
+        }
+
+        impl ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-s10-mcp-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let id = crate::types::InstanceId::new().full();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  victim:\n    id: {id}\n    backend: claude\n    created_by: s10-delete-caller-2454\n"),
+        )
+        .unwrap();
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        configs.lock().insert(
+            "victim".to_string(),
+            crate::daemon::AgentConfig {
+                name: "victim".to_string(),
+                backend: None,
+                backend_command: crate::default_shell().to_string(),
+                args: Vec::new(),
+                env: None,
+                working_dir: None,
+                submit_key: "\r".to_string(),
+            },
+        );
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let notifier = std::sync::Arc::new(RecordingNotifier {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        let notifier_trait: std::sync::Arc<dyn ApiNotifier> = notifier.clone();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: Some(&notifier_trait),
+            home: &home,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
+        };
+        let response = handle_mcp_tool(
+            &json!({
+                "tool": "delete_instance",
+                "instance": "s10-delete-caller-2454",
+                "arguments": {"instance": "victim"}
+            }),
+            &ctx,
+        );
+        let fleet_has_victim =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+                .ok()
+                .and_then(|fleet| fleet.instances.get("victim").map(|_| ()))
+                .is_some();
+        let config_present = configs.lock().contains_key("victim");
+        let events = std::mem::take(&mut *notifier.events.lock());
+
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP delete ingress must return a response: {response}"
+        );
+        assert_eq!(
+            response["result"].get("error"),
+            None,
+            "managed delete must complete without residual error: {response}"
+        );
+        assert!(
+            !fleet_has_victim
+                && !config_present
+                && matches!(events.as_slice(), [ApiEvent::InstanceDeleted { name }] if name == "victim"),
+            "managed delete must remove fleet/config state and emit InstanceDeleted; got \
+             fleet_has_victim={fleet_has_victim}, config_present={config_present}, \
+             events={events:?}, response={response}"
+        );
     }
 
     /// #2454 Slice 9: drive the real MCP restart_daemon ingress with a Daemon

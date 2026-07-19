@@ -295,6 +295,62 @@ pub fn move_pane(
 }
 
 // ---------------------------------------------------------------------------
+// Instance deletion — shared API/MCP runtime service (#2454 Slice 10)
+// ---------------------------------------------------------------------------
+
+/// Runtime-owned state required by the managed DELETE operation.  The wire
+/// adapters (API and MCP) build this value from their respective contexts;
+/// the service itself does not know which transport invoked it.
+pub struct DeleteContext<'a> {
+    pub registry: &'a AgentRegistry,
+    pub configs: &'a crate::api::ConfigRegistry,
+    pub externals: &'a agent::ExternalRegistry,
+    pub notifier: Option<&'a Arc<dyn crate::api::ApiNotifier>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Managed,
+    External,
+}
+
+/// Perform the daemon-side portion of DELETE once, preserving the exact API
+/// semantics for managed and external agents. Runtime callers use the live
+/// registries directly; transport fallback belongs to the MCP routing layer.
+pub fn delete_instance(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+) -> DeleteOutcome {
+    // Match the API adapter's external-first behavior.  External agents have
+    // no managed registry/config entry and therefore need no notifier event.
+    if agent::lock_external(context.externals)
+        .remove(name)
+        .is_some()
+    {
+        crate::event_log::log(home, "delete", name, "external agent deleted");
+        return DeleteOutcome::External;
+    }
+
+    crate::daemon::lifecycle::delete_transaction(
+        home,
+        name,
+        context.registry,
+        Some(context.configs),
+        skip_exit_wait,
+    );
+    crate::daemon::poll_reminder::remove_agent(name);
+    if let Some(notifier) = context.notifier {
+        tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
+        notifier.notify(crate::api::ApiEvent::InstanceDeleted {
+            name: name.to_string(),
+        });
+    }
+    DeleteOutcome::Managed
+}
+
+// ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 
