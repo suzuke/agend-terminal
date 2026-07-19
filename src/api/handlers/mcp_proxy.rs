@@ -1087,6 +1087,213 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Build a no-listener fixture with a live external name collision. The
+    /// runtime registries are deliberately supplied through the real MCP
+    /// ingress so the RED proves the current socket fallback drops them.
+    #[allow(clippy::unwrap_used)]
+    fn spawn_runtime_external_fixture(
+        tag: &str,
+        fleet_yaml: &str,
+    ) -> (
+        std::path::PathBuf,
+        crate::agent::AgentRegistry,
+        crate::api::ConfigRegistry,
+        crate::agent::ExternalRegistry,
+    ) {
+        let home = std::env::temp_dir().join(format!(
+            "agend-s11-mcp-spawn-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), fleet_yaml).unwrap();
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        externals.lock().insert(
+            "collision".to_string(),
+            crate::agent::ExternalAgentHandle {
+                backend_command: "claude".to_string(),
+                pid: 4242,
+            },
+        );
+        (home, registry, configs, externals)
+    }
+
+    fn invoke_runtime_mcp_tool(
+        home: &std::path::Path,
+        registry: &crate::agent::AgentRegistry,
+        configs: &crate::api::ConfigRegistry,
+        externals: &crate::agent::ExternalRegistry,
+        tool: &str,
+        instance: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
+        };
+        handle_mcp_tool(
+            &json!({"tool": tool, "instance": instance, "arguments": arguments}),
+            &ctx,
+        )
+    }
+
+    /// #2454 Slice 11 RED D6: the real MCP start ingress must use the live
+    /// external registry and return the typed collision before any SPAWN RPC.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn start_instance_real_entry_runtime_external_collision_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let (home, registry, configs, externals) =
+            spawn_runtime_external_fixture("d6", "instances:\n  collision:\n    backend: claude\n");
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "start_instance",
+            "operator",
+            json!({"instance": "collision"}),
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP start must return a response: {response}"
+        );
+        let error = response["result"]["error"].as_str().unwrap_or_default();
+        assert_eq!(
+            error, "agent 'collision' already exists (external)",
+            "D6 must surface the typed external collision, not the socket fallback: {response}"
+        );
+    }
+
+    /// #2454 Slice 11 RED D10: the real MCP create ingress must use the live
+    /// external registry and reject the seeded name before issuing SPAWN.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn create_instance_real_entry_runtime_external_collision_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let (home, registry, configs, externals) =
+            spawn_runtime_external_fixture("d10", "instances: {}\n");
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "create_instance",
+            "operator",
+            json!({
+                "name": "collision",
+                "backend": "claude",
+                "topic_binding": "skip"
+            }),
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP create must return a response: {response}"
+        );
+        let error = response["result"]["error"].as_str().unwrap_or_default();
+        assert_eq!(
+            error, "agent 'collision' already exists (external)",
+            "D10 must surface the typed external collision, not the socket fallback: {response}"
+        );
+    }
+
+    /// #2454 Slice 11 D8 characterization: restart keeps its runtime-owned
+    /// delete path, but its final SPAWN still falls back to the absent socket.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restart_instance_real_entry_runtime_spawn_no_listener_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let (home, registry, configs, externals) = spawn_runtime_external_fixture(
+            "d8",
+            "instances:\n  restart-target:\n    backend: claude\n",
+        );
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "restart_instance",
+            "operator",
+            json!({"instance": "restart-target", "mode": "resume"}),
+        );
+        let external_survived = externals.lock().contains_key("collision");
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP restart must return a response: {response}"
+        );
+        assert_eq!(
+            response["result"]["spawned"], false,
+            "the no-listener characterization must terminate at the legacy SPAWN socket path: {response}"
+        );
+        assert!(
+            external_survived,
+            "unrelated external fixture must remain untouched by restart: {response}"
+        );
+    }
+
+    /// #2454 Slice 11 RED D8: the runtime-present restart SPAWN leaf must not
+    /// self-IPC. This source/reachability pin is deterministic and keeps the
+    /// real-ingress characterization above free of a flaky PTY seam.
+    #[test]
+    fn restart_instance_runtime_spawn_is_not_socket_fallback_2454() {
+        let source = include_str!("../../mcp/handlers/instance_state/mod.rs");
+        let restart_start = source
+            .find("pub(super) fn handle_restart_instance_with_runtime(")
+            .expect("runtime-aware restart handler");
+        let restart_end = source[restart_start..]
+            .find("/// #t-777-3")
+            .map(|offset| restart_start + offset)
+            .expect("restart handler end marker");
+        let restart_region = &source[restart_start..restart_end];
+        let spawn_start = restart_region
+            .find("let spawn_result")
+            .expect("restart SPAWN leaf");
+        let spawn_region = &restart_region[spawn_start..];
+        assert!(
+            !spawn_region.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && line.contains("crate::api::call")
+            }),
+            "D8 runtime-present SPAWN must use the shared runtime service, not crate::api::call"
+        );
+    }
+
     /// #2454 Slice 10 RED: drive the real MCP delete_instance ingress with no
     /// API listener. A managed fleet/config entry must be removed in-process
     /// and the supplied notifier must receive InstanceDeleted; the current
