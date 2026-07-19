@@ -1226,7 +1226,8 @@ mod tests {
     }
 
     /// #2454 Slice 11 D8 characterization: restart keeps its runtime-owned
-    /// delete path, but its final SPAWN still falls back to the absent socket.
+    /// delete path, and its final SPAWN uses the shared runtime service. The
+    /// colliding survivor makes the service result deterministic without a PTY.
     #[test]
     #[allow(clippy::unwrap_used)]
     fn restart_instance_real_entry_runtime_spawn_no_listener_2454() {
@@ -1235,6 +1236,17 @@ mod tests {
             "d8",
             "instances:\n  restart-target:\n    backend: claude\n",
         );
+        let shared_work_dir = home.join("shared-workdir");
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            format!(
+                "instances:\n  restart-target:\n    backend: claude\n    working_directory: {}\n  restart-collider:\n    backend: claude\n    working_directory: {}\n",
+                shared_work_dir.display(),
+                shared_work_dir.display()
+            ),
+        )
+        .unwrap();
         let previous_home = std::env::var_os("AGEND_HOME");
         std::env::set_var("AGEND_HOME", &home);
         let response = invoke_runtime_mcp_tool(
@@ -1259,7 +1271,7 @@ mod tests {
         );
         assert_eq!(
             response["result"]["spawned"], false,
-            "the no-listener characterization must terminate at the legacy SPAWN socket path: {response}"
+            "the runtime service must reject the surviving workspace collision: {response}"
         );
         assert!(
             external_survived,

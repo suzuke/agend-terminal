@@ -2,7 +2,7 @@
 
 use super::HandlerCtx;
 use crate::agent;
-use crate::api::{ApiEvent, LayoutHint, PaneMoveSplitDir};
+use crate::api::{ApiEvent, PaneMoveSplitDir};
 use serde_json::{json, Value};
 
 /// #2454 S4: thin wire adapter — delegates to the neutral
@@ -109,271 +109,50 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
     }
-    // t-90 (direction-b of the register-external/managed-spawn name collision):
-    // reject a name already held by an EXTERNAL agent before spawning a managed
-    // one. The external lock is taken and RELEASED here (the guard drops on this
-    // statement) — BEFORE any registry lock and before the spawn — so this never
-    // nests registry-inside-external, which would be the AB-BA partner of
-    // #2213's external→registry order and could silently deadlock (lock_external
-    // is an in-mem Mutex, not an fs flock, so the #1535 self-IPC guard would not
-    // catch a spawn_agent path that needed it).
-    //
-    // Option B (narrows, does NOT fully close — chosen over holding lock_external
-    // across the ~100ms spawn, which would serialize the spawn choke point and
-    // carry that deadlock-audit risk): a concurrent register_external landing
-    // AFTER this check but before spawn_agent's registry insert still
-    // double-books (the same #2127-class rare window). Low severity (needs
-    // concurrent register-external + spawn-managed of the SAME name).
-    if agent::lock_external(ctx.externals).contains_key(name) {
-        return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
-    }
-    if crate::fleet::resolve_uuid(ctx.home, name)
-        .is_some_and(|id| agent::lock_registry(ctx.registry).contains_key(&id))
-    {
-        return json!({"ok": false, "error": format!("agent '{name}' already exists")});
-    }
-    let command = params["backend"]
-        .as_str()
-        .map(|s| crate::backend::Backend::parse_str(s).command_string())
-        .unwrap_or_else(|| {
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-                .ok()
-                .and_then(|f| f.defaults.backend.map(|b| b.preset().command.to_string()))
-                .unwrap_or_else(|| "claude".to_string())
-        });
-    let command = command.as_str();
-    let mut args: Vec<String> = params["args"]
-        .as_str()
-        .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_default();
-    // #2038: fleet.yaml's per-instance `model` (and, for arg-less callers,
-    // `args`) only applied at the daemon-boot spawn — the runtime respawn
-    // flows (restart_instance / start_instance, deploy Phase 3) issue SPAWN
-    // without them, so the written config silently didn't apply until the
-    // next full daemon restart. Same class as the #900 env fix: re-resolve
-    // from fleet.yaml at this handler boundary (single resolve, shared with
-    // the env fallback below).
-    let fleet_resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-        .ok()
-        .and_then(|f| f.resolve_instance(name));
-    // deploy Phase 3 sends no `args` key at all when the fleet template entry
-    // defines none — fall back to the fleet entry's resolved args (boot
-    // parity). A present-but-empty `args` ("") means the caller already
-    // resolved them as empty (restart path), which matches what the
-    // fallback would yield.
-    if params["args"].as_str().is_none() {
-        if let Some(r) = &fleet_resolved {
-            args = r.args.clone();
-        }
-    }
-    // Model precedence: an explicit `--model` in args (create_instance
-    // pre-formats it there) > `params.model` (deploy Phase 3 sends the
-    // template's model on the wire — pre-#2038 this field was silently
-    // ignored) > the fleet entry's resolved model. `params.model_tier` is
-    // accepted for direct SPAWN callers, but persisted create/deploy paths
-    // usually resolve it through the fleet entry. push_model_arg enforces
-    // the first tier by never duplicating an existing flag.
-    let fleet_config_for_model = std::cell::OnceCell::new();
-    // #2801: keep declared backend identity independent from the executable
-    // command. A fleet entry may declare Claude while `command` is a wrapper.
-    let params_backend = params["backend"]
-        .as_str()
-        .map(crate::backend::Backend::parse_str);
-    let declared_backend = params_backend
-        .clone()
-        .filter(|b| !matches!(b, crate::backend::Backend::Raw(_)))
-        .or_else(|| fleet_resolved.as_ref().map(|r| r.backend.clone()))
-        .or_else(|| {
-            fleet_config_for_model
-                .get_or_init(|| {
-                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
-                })
-                .as_ref()
-                .and_then(|f| f.defaults.backend.clone())
-        })
-        .or(params_backend)
-        .unwrap_or(crate::backend::Backend::ClaudeCode);
-    let tier_model = params["model_tier"]
-        .as_str()
-        .filter(|m| !m.is_empty())
-        .and_then(|tier| {
-            let fleet = fleet_config_for_model.get_or_init(|| {
-                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
-            });
-            fleet
-                .as_ref()
-                .and_then(|f| f.model_tiers.get(tier).map(String::as_str))
-        });
-    if let Some(model) = params["model"]
-        .as_str()
-        .filter(|m| !m.is_empty())
-        .or(tier_model)
-        .or_else(|| fleet_resolved.as_ref().and_then(|r| r.model.as_deref()))
-    {
-        // #2744: capability keys off the DECLARED identity, never the command
-        // string (wrapper basenames misclassify). The `backend` param is
-        // dual-semantic on the wire: create paths send a declared NAME, but
-        // restart_spawn_params sends the RESOLVED COMMAND (possibly a custom
-        // path). A known name parses exactly and is a declaration; a
-        // Raw-parsed value is a command guess and must yield to the fleet
-        // entry's declared backend. Params-Raw stands only when nothing else
-        // declares — a genuinely raw backend.
-        crate::backend::Backend::push_model_arg(&mut args, &declared_backend, model);
-    }
-    let requested_work_dir = params["working_directory"]
-        .as_str()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::paths::workspace_dir(ctx.home).join(name));
-    let work_dir = match crate::api::validate_working_directory(&requested_work_dir, ctx.home) {
-        Ok(p) => p,
-        Err(e) => return json!({"ok": false, "error": format!("{e}")}),
-    };
-    if let Some(collider) =
-        crate::fleet::persist::workspace_identity_collision(ctx.home, name, &work_dir)
-    {
-        return json!({"ok": false, "error": format!(
-            "workspace identity collision: '{name}' would share the working directory with existing instance '{collider}' ({})",
-            work_dir.display()
-        )});
-    }
-    let size = crossterm::terminal::size().unwrap_or((120, 40));
-    let spawn_mode = match params["mode"].as_str() {
-        Some("resume") => crate::backend::SpawnMode::Resume,
-        _ => crate::backend::SpawnMode::Fresh,
-    };
-
-    // Generate instructions before spawn — see api::handlers::prepare_instructions
-    // for why ordering matters (backend flag-build time file presence check).
-    let explicit_role = params
-        .get("role")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    // #46776 fail-closed: a workspace-identity refusal (or provisioning I/O
-    // failure) must ABORT the spawn — never fork an agent against foreign or
-    // half-written provisioned state.
-    let behavior_command = match &declared_backend {
-        crate::backend::Backend::Shell | crate::backend::Backend::Raw(_) => command.to_string(),
-        _ => declared_backend.command_string(),
-    };
-    if let Err(e) =
-        super::prepare_instructions(ctx.home, name, &behavior_command, &work_dir, explicit_role)
-    {
-        tracing::error!(agent = %name, error = %e, "SPAWN aborted: provisioning refused");
-        return json!({"ok": false, "error": format!("provisioning refused: {e}")});
-    }
-
-    // #900 hybrid (b)+(c): env precedence is params.env > fleet.yaml
-    // resolved env > none. `params.env` lets the SPAWN caller pass an
-    // explicit override (MCP start_instance forwards the already-resolved
-    // env from its own fleet load; future explicit-env spawners do too);
-    // the fleet fallback covers deploy_template Phase 3 + operator
-    // hand-edited fleet.yaml entries where the wire payload omits env.
     let env_from_params = parse_env_object(params.get("env"));
-    let env_from_fleet = if env_from_params.is_none() {
-        // #2038: reuses the single fleet resolve from the args/model block above.
-        fleet_resolved.as_ref().map(|r| r.env.clone())
-    } else {
-        None
-    };
-    let env_for_spawn = env_from_params.as_ref().or(env_from_fleet.as_ref());
-
-    match crate::agent_ops::spawn_one(
-        ctx.home,
-        ctx.registry,
+    let spawn_params = crate::agent_ops::spawn::SpawnParams {
         name,
-        command,
-        &args,
-        spawn_mode,
-        &work_dir,
-        size,
-        env_for_spawn,
-        Some(&declared_backend),
+        backend: params["backend"].as_str(),
+        args: params["args"].as_str(),
+        model: params["model"].as_str(),
+        model_tier: params["model_tier"].as_str(),
+        working_directory: params["working_directory"]
+            .as_str()
+            .map(std::path::Path::new),
+        env: env_from_params.as_ref(),
+        mode: match params["mode"].as_str() {
+            Some("resume") => crate::backend::SpawnMode::Resume,
+            _ => crate::backend::SpawnMode::Fresh,
+        },
+        explicit_role: params
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        self_kick_on_ready: params["self_kick_on_ready"].as_bool().unwrap_or(false),
+        topic_binding: params["topic_binding"].as_str().unwrap_or("auto"),
+        layout: params["layout"].as_str().unwrap_or("tab"),
+        spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
+        target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
+    };
+    let request = crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params);
+    match crate::agent_ops::spawn::spawn_instance(
+        &crate::agent_ops::spawn::SpawnContext {
+            home: ctx.home,
+            registry: ctx.registry,
+            externals: ctx.externals,
+            notifier: ctx.notifier,
+        },
+        &request,
     ) {
-        Ok(_spawn_mode) => {
-            // fresh-restart self-kick: fire the first-turn recovery inject ONLY when
-            // the caller (restart_spawn_params, mode=fresh) explicitly armed this
-            // INDEPENDENT flag. NEVER derived from spawn_mode — a missing/garbled
-            // flag yields `false` (fail-safe: no inject), and initial fleet spawns /
-            // create_instance / team-spawn (which also map to SpawnMode::Fresh but
-            // never set this flag) are correctly excluded. The bootstrap thread
-            // polls the new session to Idle before injecting, so an early fire here
-            // is harmless.
-            if params["self_kick_on_ready"].as_bool().unwrap_or(false) {
-                if let Some(id) = crate::fleet::resolve_uuid(ctx.home, name) {
-                    let ready_timeout = declared_backend
-                        .preset()
-                        .ready_timeout_secs
-                        .saturating_add(15);
-                    agent::spawn_self_kick_bootstrap(
-                        std::sync::Arc::clone(ctx.registry),
-                        id,
-                        name.to_string(),
-                        std::time::Duration::from_secs(ready_timeout),
-                        None,
-                    );
-                } else {
-                    tracing::warn!(
-                        agent = name,
-                        "self_kick_on_ready set but instance UUID unresolved — skipping self-kick"
-                    );
-                }
-            }
-            // #991: skip topic creation when caller opts out.
-            let topic_binding = params["topic_binding"].as_str().unwrap_or("auto");
-            let topic_id = if matches!(topic_binding, "skip" | "deferred") {
-                None
-            } else {
-                match crate::channel::ensure_topic_for(name) {
-                    crate::channel::TopicOutcome::Created(tid) => Some(tid),
-                    crate::channel::TopicOutcome::NoChannel => None,
-                    crate::channel::TopicOutcome::Failed(err) => {
-                        tracing::warn!(
-                            agent = name,
-                            error = %err,
-                            "SPAWN: channel exists but create_topic failed; \
-                             instance created without topic"
-                        );
-                        None
-                    }
-                }
-            };
-            if let Some(n) = ctx.notifier {
-                let layout_hint = LayoutHint::parse(params["layout"].as_str().unwrap_or("tab"));
-                let spawner = params["spawner"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
-                let target_pane = params["target_pane"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
-                tracing::info!(
-                    agent = name,
-                    layout = ?layout_hint,
-                    spawner = ?spawner,
-                    target_pane = ?target_pane,
-                    "SPAWN emitting InstanceCreated"
-                );
-                n.notify(ApiEvent::InstanceCreated {
-                    name: name.to_string(),
-                    layout: layout_hint,
-                    spawner,
-                    target_pane,
-                });
-            }
-            // Tell every other running agent about the new member, unless
-            // this was a Resume spawn (returning agent, not a brand-new
-            // fleet joiner — peers already know about it from their own
-            // agend.md snapshots, so broadcasting would just generate
-            // noise on every daemon restart).
+        Ok(outcome) => {
             let mut result = json!({"name": name});
-            if let Some(tid) = topic_id {
+            if let Some(tid) = outcome.topic_id {
                 result["topic_id"] = json!(tid);
             }
             json!({"ok": true, "result": result})
         }
-        Err(e) => json!({"ok": false, "error": format!("{e}")}),
+        Err(e) => json!({"ok": false, "error": e}),
     }
 }
 

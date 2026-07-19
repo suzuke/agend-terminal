@@ -257,7 +257,9 @@ pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
 pub(crate) fn dispatch_delete_instance(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_delete_instance_with_runtime(ctx.home, ctx.args, ctx.sender, ctx.runtime)
 }
-adapter!(dispatch_start_instance, ha, instance::handle_start_instance);
+pub(crate) fn dispatch_start_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_start_instance_with_runtime(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
 /// #2454 Slice 10: D7 restart DELETE uses the same runtime-owned service.
 pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {

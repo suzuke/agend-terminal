@@ -55,6 +55,76 @@ pub(in crate::mcp::handlers) fn inject_with_routing(
     }
 }
 
+pub(super) fn legacy_spawn(home: &Path, request: &Value) -> anyhow::Result<Value> {
+    crate::api::call(home, request)
+}
+
+/// Route the SPAWN leaf through the live runtime when available. Standalone
+/// bridge calls retain one compatibility fallback to the legacy API socket.
+pub(super) fn spawn_runtime_or_legacy(
+    home: &Path,
+    request: &Value,
+    runtime: Option<&super::super::dispatch::RuntimeContext>,
+    legacy: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
+    let Some(runtime) = runtime else {
+        return legacy(home, request);
+    };
+    let params = &request["params"];
+    let name = params["name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+    let env_from_params = params.get("env").and_then(|v| {
+        v.as_object().map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+    });
+    let spawn_params = crate::agent_ops::spawn::SpawnParams {
+        name,
+        backend: params["backend"].as_str(),
+        args: params["args"].as_str(),
+        model: params["model"].as_str(),
+        model_tier: params["model_tier"].as_str(),
+        working_directory: params["working_directory"].as_str().map(Path::new),
+        env: env_from_params.as_ref(),
+        mode: match params["mode"].as_str() {
+            Some("resume") => crate::backend::SpawnMode::Resume,
+            _ => crate::backend::SpawnMode::Fresh,
+        },
+        explicit_role: params["role"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        self_kick_on_ready: params["self_kick_on_ready"].as_bool().unwrap_or(false),
+        topic_binding: params["topic_binding"].as_str().unwrap_or("auto"),
+        layout: params["layout"].as_str().unwrap_or("tab"),
+        spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
+        target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
+    };
+    let spawn_request = crate::agent_ops::spawn::resolve_spawn_request(home, &spawn_params);
+    let outcome = crate::agent_ops::spawn::spawn_instance(
+        &crate::agent_ops::spawn::SpawnContext {
+            home,
+            registry: &runtime.registry,
+            externals: &runtime.externals,
+            notifier: runtime.notifier.as_ref(),
+        },
+        &spawn_request,
+    );
+    Ok(match outcome {
+        Ok(outcome) => {
+            let mut result = json!({"name": name});
+            if let Some(topic_id) = outcome.topic_id {
+                result["topic_id"] = json!(topic_id);
+            }
+            json!({"ok": true, "result": result})
+        }
+        Err(error) => json!({"ok": false, "error": error}),
+    })
+}
+
 pub(super) fn spawn_single_instance(
     home: &Path,
     instance_name: &str,
@@ -65,21 +135,40 @@ pub(super) fn spawn_single_instance(
     {
         if let Some((ref scope_home, f)) = *SPAWN_OVERRIDE.lock() {
             if home == scope_home.as_path() {
-                return spawn_single_instance_impl(home, instance_name, args, &f, runtime);
+                return spawn_single_instance_impl_inner(
+                    home,
+                    instance_name,
+                    args,
+                    &f,
+                    runtime,
+                    false,
+                );
             }
         }
     }
-    spawn_single_instance_impl(home, instance_name, args, &crate::api::call, runtime)
+    spawn_single_instance_impl_inner(home, instance_name, args, &legacy_spawn, runtime, true)
 }
 
 /// Inner impl of [`spawn_single_instance`] parameterized on the SPAWN RPC for
-/// `instance_964_tests`. Production passes [`crate::api::call`].
+/// `instance_964_tests`.
+#[cfg(test)]
 pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
     home: &Path,
     instance_name: &str,
     args: &Value,
     spawn_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
     runtime: Option<&super::super::dispatch::RuntimeContext>,
+) -> Value {
+    spawn_single_instance_impl_inner(home, instance_name, args, spawn_fn, runtime, false)
+}
+
+fn spawn_single_instance_impl_inner(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    spawn_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+    runtime: Option<&super::super::dispatch::RuntimeContext>,
+    use_runtime_service: bool,
 ) -> Value {
     let raw_name = match args["name"].as_str() {
         Some(n) => n,
@@ -306,10 +395,16 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
     if let Some(tb) = args.get("topic_binding").and_then(|v| v.as_str()) {
         spawn_params["topic_binding"] = json!(tb);
     }
-    match spawn_fn(
-        home,
-        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
-    ) {
+    let spawn_request = json!({
+        "method": crate::api::method::SPAWN,
+        "params": spawn_params,
+    });
+    let spawn_response = if use_runtime_service {
+        spawn_runtime_or_legacy(home, &spawn_request, runtime, spawn_fn)
+    } else {
+        spawn_fn(home, &spawn_request)
+    };
+    match spawn_response {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             let topic_id = resp["result"]["topic_id"].as_i64();
             if let Some(task_text) = task {
