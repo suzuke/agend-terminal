@@ -2093,7 +2093,11 @@ fn fn_body<'a>(prod: &'a str, sig: &str) -> &'a str {
 #[test]
 fn deploy_api_calls_not_under_flock() {
     let prod = prod_src();
-    let body = fn_body(prod, "pub fn deploy(home");
+    let body = fn_body(prod, "pub(crate) fn deploy_with_runtime(");
+    assert!(
+        body.contains("runtime"),
+        "deploy must receive the deployments-owned runtime capability so runtime-present MCP calls cannot use the legacy transport"
+    );
     // H14: deploy's duplicate-name guard is a plain `load()` READ (no flock)
     // before spawn — #1629 forbids holding ANY flock across the self-IPC
     // spawn/team. So the ONLY `acquire_file_lock` in deploy is still the store
@@ -2120,15 +2124,112 @@ fn deploy_api_calls_not_under_flock() {
 #[test]
 fn teardown_api_calls_not_under_flock() {
     let prod = prod_src();
-    let body = fn_body(prod, "pub fn teardown(home");
+    let body = fn_body(prod, "pub(crate) fn teardown_with_runtime(");
+    assert!(
+        body.contains("runtime"),
+        "teardown must receive the deployments-owned runtime capability so runtime-present MCP calls cannot use the legacy transport"
+    );
     let lock_at = body
         .find(&["acquire_file", "_lock"].concat())
         .expect("teardown locks the record removal");
     let delete_at = body
-        .find(&["crate::api::", "call"].concat())
-        .expect("teardown DELETEs instances via api::call");
+        .find("delete_instance(")
+        .expect("teardown invokes the typed DELETE owner");
     assert!(
         delete_at < lock_at,
-        "the DELETE api::call loop must run BEFORE the record-removal flock (#1617 class)"
+        "the typed DELETE owner must run BEFORE the record-removal flock (#1617 class)"
+    );
+}
+
+fn source_function_containing<'a>(source: &'a str, needle: &str) -> &'a str {
+    let needle_at = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("source is missing typed owner needle `{needle}`"));
+    let before = &source[..needle_at];
+    let start = ["\npub(crate) fn ", "\npub fn ", "\nfn "]
+        .into_iter()
+        .filter_map(|marker| before.rfind(marker))
+        .max()
+        .expect("typed owner needle must be inside a function");
+    let after = &source[needle_at..];
+    let end = ["\npub(crate) fn ", "\npub fn ", "\nfn "]
+        .into_iter()
+        .filter_map(|marker| after.find(marker))
+        .min()
+        .map(|offset| needle_at + offset)
+        .unwrap_or(source.len());
+    &source[start..end]
+}
+
+#[test]
+fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
+    let dispatch = include_str!("../mcp/handlers/dispatch.rs");
+    let dispatch_start = dispatch
+        .find("pub(crate) fn dispatch_deployment")
+        .expect("deployment dispatcher must exist");
+    let dispatch_tail = &dispatch[dispatch_start..];
+    let dispatch_body = dispatch_tail
+        .split_once("\n///")
+        .map(|(body, _)| body)
+        .unwrap_or(dispatch_tail);
+    assert!(
+        dispatch_body.contains("ctx.runtime"),
+        "deployment dispatcher must forward RuntimeContext into the deployments-owned adapter"
+    );
+    assert!(
+        !dispatch_body.contains("action_adapter!(dispatch_deployment"),
+        "deployment dispatch must not use the runtime-blind action_adapter"
+    );
+
+    let schedule = include_str!("../mcp/handlers/schedule.rs");
+    assert!(
+        schedule.contains("DeploymentRuntime"),
+        "schedule adapter must carry the neutral deployments-owned runtime capability"
+    );
+
+    let deployments = prod_src();
+    assert!(
+        deployments.contains("DeploymentRuntime"),
+        "deployments owner must define/accept a neutral runtime capability rather than MCP HandlerCtx"
+    );
+    assert!(
+        !deployments.contains("HandlerCtx") && !deployments.contains("RuntimeContext"),
+        "deployments owner must not depend on MCP HandlerCtx/RuntimeContext"
+    );
+    for needle in ["spawn_instance(", "team_ops::create", "delete_instance("] {
+        let body = source_function_containing(deployments, needle);
+        assert!(
+            !body.contains("crate::api::call"),
+            "typed runtime owner `{needle}` must not contain the legacy api::call transport"
+        );
+        if needle == "spawn_instance(" {
+            assert!(
+                body.contains("resolve_spawn_request("),
+                "typed SPAWN wrapper must resolve the persisted deployment fields before spawn"
+            );
+            for field in [
+                "entry.backend",
+                "entry.args",
+                "entry.model",
+                "entry.env",
+                "entry.topic_binding_mode",
+                "entry.working_directory",
+            ] {
+                assert!(
+                    body.contains(field),
+                    "typed SPAWN wrapper must map InstanceYamlEntry field `{field}` into the request"
+                );
+            }
+        }
+        if needle == "team_ops::create" {
+            assert!(
+                !body.contains("crate::teams::create") && !body.contains("teams::create"),
+                "runtime-present typed CREATE_TEAM wrapper must not retain a direct teams::create fallback"
+            );
+        }
+    }
+    assert!(
+        deployments.contains("crate::api::call"),
+        "RuntimeContext=None compatibility must retain an explicit legacy api::call path"
     );
 }

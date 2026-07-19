@@ -24,6 +24,7 @@
 //! `unknown tool` branch in that match still handles fully-unknown
 //! names.
 
+use crate::deployments::DeploymentRuntime;
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -367,11 +368,27 @@ action_adapter!(dispatch_decision, "decision", [
     "answer" => task::handle_answer_decision,  hais;
 ]);
 
-action_adapter!(dispatch_deployment, "deployment", [
-    "deploy"   => schedule::handle_deploy_template,      hai;
-    "teardown" => schedule::handle_teardown_deployment,   ha;
-    "list"     => schedule::handle_list_deployments,      h;
-]);
+/// #2454 Slice 14: deployment actions need the in-process daemon registries,
+/// while standalone bridge calls retain the legacy transport/fallback path.
+pub(crate) fn dispatch_deployment(ctx: &HandlerCtx<'_>) -> Value {
+    let runtime = ctx.runtime.map(|runtime| DeploymentRuntime {
+        registry: &runtime.registry,
+        configs: &runtime.configs,
+        externals: &runtime.externals,
+        notifier: runtime.notifier.as_ref(),
+    });
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "deploy" => schedule::handle_deploy_template(
+            ctx.home,
+            ctx.args,
+            ctx.instance_name,
+            runtime.as_ref(),
+        ),
+        "teardown" => schedule::handle_teardown_deployment(ctx.home, ctx.args, runtime.as_ref()),
+        "list" => schedule::handle_list_deployments(ctx.home),
+        other => json!({"error": format!("unknown deployment action: {other}")}),
+    }
+}
 
 /// #2454: custom (not `action_adapter!`) because the health WRITE actions now
 /// call the in-process `agent_ops` blocked-reason service and so need the
