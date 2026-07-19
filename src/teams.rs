@@ -184,6 +184,25 @@ pub fn create(home: &Path, args: &Value) -> Value {
     // routing without touching worktree/dispatch identity.
     let project_id = args["project_id"].as_str().map(String::from);
 
+    // #2855: fail-closed identifier validation before any membership check or
+    // roster write — validation semantics must win over membership-shaped
+    // errors so a traversal orchestrator is reported as invalid, not missing.
+    for candidate in std::iter::once(name.as_str())
+        .chain(members.iter().map(String::as_str))
+        .chain(orchestrator.as_deref())
+        .chain(
+            args["accept_from"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str()),
+        )
+    {
+        if let Err(e) = crate::agent::validate_name(candidate) {
+            return serde_json::json!({"error": e});
+        }
+    }
+
     // Validate orchestrator
     if let Some(ref orch) = orchestrator {
         if !members.contains(orch) {
@@ -338,6 +357,11 @@ pub(crate) fn delete_with_runtime(
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
+    // #2855: reject an invalid team-name argument with validation semantics
+    // before any lookup — never let a traversal name shape later behavior.
+    if let Err(e) = crate::agent::validate_name(&name) {
+        return serde_json::json!({"error": e, "members_cleaned": 0});
+    }
 
     // Snapshot existence + members BEFORE cascade. The cascade itself
     // may auto-delete the team (when `remove_member_from_all` removes
@@ -351,6 +375,18 @@ pub(crate) fn delete_with_runtime(
         });
     }
     let members = list_team_members(home, &name);
+    // #2855: prevalidate the COMPLETE persisted roster before the FIRST
+    // cascade side effect. A poisoned entry (pre-existing/manual fleet.yaml
+    // contamination) must abort the disband atomically and loudly — the
+    // cascade's per-member cleanup derives filesystem paths from raw names.
+    for member in &members {
+        if let Err(e) = crate::agent::validate_name(member) {
+            return serde_json::json!({
+                "error": format!("team '{name}' roster prevalidation failed for '{member}': {e}"),
+                "members_cleaned": 0,
+            });
+        }
+    }
     let members_count = members.len();
     let mut cascade_warnings: Vec<String> = Vec::new();
     for member in &members {
@@ -489,6 +525,28 @@ pub fn update(home: &Path, args: &Value) -> Value {
         })
         .unwrap_or_default();
     let new_orchestrator = args["orchestrator"].as_str().map(String::from);
+
+    // #2855: fail-closed identifier validation before lookup or any roster
+    // mutation. Only args-provided identifiers are validated — the persisted
+    // current roster/accept_from are not re-validated here so an unrelated
+    // update cannot be bricked by pre-existing contamination (delete's roster
+    // prevalidation owns that surface).
+    for candidate in std::iter::once(name.as_str())
+        .chain(to_add.iter().map(String::as_str))
+        .chain(to_remove.iter().map(String::as_str))
+        .chain(new_orchestrator.as_deref())
+        .chain(
+            args["accept_from"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str()),
+        )
+    {
+        if let Err(e) = crate::agent::validate_name(candidate) {
+            return serde_json::json!({"error": e});
+        }
+    }
 
     let fleet = load_fleet(home);
     let Some(current) = fleet.teams.get(&name).cloned() else {
@@ -1995,5 +2053,181 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2855: identifier validation in the neutral team owners ──
+
+    /// #2855 gate 2 (create): the roster owner must reject traversal/invalid
+    /// identifiers in the team name and member list BEFORE any fleet.yaml
+    /// write, using canonical `agent::validate_name` semantics.
+    #[test]
+    fn create_owner_rejects_invalid_identifiers_before_write_2855() {
+        let home = tmp_home("create_invalid_2855");
+
+        let bad_name = super::create(
+            &home,
+            &serde_json::json!({"name": "../t2855", "members": ["t2855-m"]}),
+        );
+        assert!(
+            bad_name["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid characters")),
+            "traversal team name must be rejected with validate_name semantics: {bad_name}"
+        );
+
+        let bad_member = super::create(
+            &home,
+            &serde_json::json!({"name": "t2855-ok", "members": ["good-m", "../evil-m"]}),
+        );
+        assert!(
+            bad_member["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid characters")),
+            "traversal member must be rejected with validate_name semantics: {bad_member}"
+        );
+
+        let fleet = load_fleet(&home);
+        assert!(
+            fleet.teams.is_empty(),
+            "rejected creates must leave zero roster mutation: {:?}",
+            fleet.teams.keys().collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2855 gate 2 (update): the roster owner must reject an invalid member
+    /// add (and invalid orchestrator identifier) BEFORE mutating the roster.
+    #[test]
+    fn update_owner_rejects_invalid_add_before_write_2855() {
+        let home = tmp_home("update_invalid_2855");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  u2855-a:\n    backend: claude\nteams:\n  u2855:\n    members:\n      - u2855-a\n",
+        )
+        .unwrap();
+
+        let res = super::update(
+            &home,
+            &serde_json::json!({"name": "u2855", "add": ["../evil-add"]}),
+        );
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid characters")),
+            "traversal member add must be rejected with validate_name semantics: {res}"
+        );
+
+        let roster = list_team_members(&home, "u2855");
+        assert_eq!(
+            roster,
+            vec!["u2855-a".to_string()],
+            "rejected update must leave the roster unchanged"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2855 gate 2 (delete): the delete owner must reject an invalid team
+    /// name argument with validation semantics (not a lookup-shaped error and
+    /// never a cascade).
+    #[test]
+    fn delete_owner_rejects_invalid_team_name_arg_2855() {
+        let home = tmp_home("delete_invalid_arg_2855");
+        let res = super::delete(&home, &serde_json::json!({"name": "../d2855"}));
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid characters")),
+            "traversal team-name arg must be rejected with validate_name semantics: {res}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2855 gate 3: delete must prevalidate the COMPLETE persisted roster
+    /// before the FIRST cascade side effect. A poisoned second member must
+    /// abort the disband atomically: the healthy first member's fleet entry
+    /// and the team roster itself stay untouched, and the failure is loud.
+    #[test]
+    fn delete_prevalidates_full_roster_before_first_cascade_side_effect_2855() {
+        let home = tmp_home("delete_prevalidate_2855");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  p2855-good:\n    backend: claude\nteams:\n  p2855:\n    members:\n      - p2855-good\n      - \"../p2855-evil\"\n",
+        )
+        .unwrap();
+
+        let res = super::delete(&home, &serde_json::json!({"name": "p2855"}));
+
+        let fleet = load_fleet(&home);
+        assert!(
+            fleet.instances.contains_key("p2855-good"),
+            "poisoned roster must abort BEFORE the first member cascade — \
+             healthy member 'p2855-good' was deleted: {res}"
+        );
+        assert!(
+            fleet.teams.contains_key("p2855"),
+            "poisoned roster delete must be atomic — team entry removed: {res}"
+        );
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid characters")),
+            "poisoned roster must fail loudly with validate_name semantics: {res}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2855 gate 5: a poisoned pre-existing fleet.yaml roster entry must not
+    /// be able to delete an adjacent sentinel directory through the cascade's
+    /// raw-name path derivation (`workspace_dir(home)/join(name)` with a
+    /// traversal name resolves next to the workspace), and the disband must
+    /// fail loudly instead of reporting success.
+    #[test]
+    fn poisoned_roster_cannot_delete_adjacent_sentinel_2855() {
+        let home = tmp_home("delete_sentinel_2855");
+        let sentinel_dir = crate::paths::workspace_dir(&home).join("../s2855-victim");
+        std::fs::create_dir_all(&sentinel_dir).unwrap();
+        let marker = sentinel_dir.join("marker.txt");
+        std::fs::write(&marker, "sentinel").unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances: {}\nteams:\n  v2855:\n    members:\n      - \"../s2855-victim\"\n",
+        )
+        .unwrap();
+
+        let res = super::delete(&home, &serde_json::json!({"name": "v2855"}));
+
+        assert!(
+            marker.exists(),
+            "poisoned roster member must not reach the adjacent sentinel: {res}"
+        );
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid characters")),
+            "poisoned roster disband must fail loudly, not report success: {res}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2855 gate 6 control: a clean roster still disbands exactly as before
+    /// — validation must not regress the valid-name path.
+    #[test]
+    fn delete_clean_roster_still_works_2855() {
+        let home = tmp_home("delete_clean_control_2855");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  c2855-m:\n    backend: claude\nteams:\n  c2855:\n    members:\n      - c2855-m\n",
+        )
+        .unwrap();
+        let res = super::delete(&home, &serde_json::json!({"name": "c2855"}));
+        assert_eq!(
+            res["status"], "deleted",
+            "valid-name disband must remain green: {res}"
+        );
+        assert!(
+            !load_fleet(&home).teams.contains_key("c2855"),
+            "clean disband must still remove the team"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 }

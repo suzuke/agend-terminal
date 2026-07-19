@@ -2986,6 +2986,123 @@ fn create_team_runtime_some_persists_project_id_2454() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── #2855: MCP team create must reject traversal/invalid identifiers ──
+
+/// #2855 gate 1: a traversal team name must be rejected at the real MCP
+/// runtime-present entry with canonical `validate_name` semantics BEFORE any
+/// runtime/spawn/roster mutation.
+#[test]
+fn create_team_rejects_traversal_team_name_before_mutation_2855() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-name-2855");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "../esc2855", "members": ["ok-m"]}),
+        "sender",
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("invalid characters")),
+        "#2855: traversal team name must be rejected before mutation: {result}"
+    );
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        fleet.teams.is_empty() && fleet.instances.is_empty(),
+        "#2855: rejected create must leave fleet.yaml untouched: teams={:?} instances={:?}",
+        fleet.teams.keys().collect::<Vec<_>>(),
+        fleet.instances.keys().collect::<Vec<_>>()
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2855 gate 1: a traversal identifier inside `members` must be rejected
+/// before the roster write — no team entry may materialize.
+#[test]
+fn create_team_rejects_invalid_existing_member_before_mutation_2855() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-member-2855");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "g1b-team", "members": ["good-a", "../evil-b"]}),
+        "sender",
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("invalid characters")),
+        "#2855: traversal member must be rejected before roster write: {result}"
+    );
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        !fleet.teams.contains_key("g1b-team"),
+        "#2855: rejected create must not write the team roster"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2855 gate 1: a traversal `orchestrator` identifier must be rejected with
+/// validation semantics (not a membership-shaped error) before mutation.
+#[test]
+fn create_team_rejects_invalid_orchestrator_before_mutation_2855() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-orch-2855");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "g1c-team", "members": ["good-a"], "orchestrator": "../orch"}),
+        "sender",
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("invalid characters")),
+        "#2855: traversal orchestrator must be rejected with validate_name semantics: {result}"
+    );
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        !fleet.teams.contains_key("g1c-team"),
+        "#2855: rejected create must not write the team roster"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2855 gate 1: a traversal identifier inside `accept_from` must be rejected
+/// before mutation.
+#[test]
+fn create_team_rejects_invalid_accept_from_before_mutation_2855() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-af-2855");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "g1d-team", "members": ["good-a"], "accept_from": ["../af-evil"]}),
+        "sender",
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("invalid characters")),
+        "#2855: traversal accept_from must be rejected before mutation: {result}"
+    );
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        !fleet.teams.contains_key("g1d-team"),
+        "#2855: rejected create must not write the team roster"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn update_team_fallback_to_direct_when_daemon_unreachable() {
     let _g = fleet_test_guard();

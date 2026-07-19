@@ -87,6 +87,18 @@ pub(crate) fn create(
     registry: &crate::agent::AgentRegistry,
     notifier: Option<&dyn crate::api::ApiNotifier>,
 ) -> Value {
+    // #2855: fail-closed identifier validation before any runtime/spawn/roster
+    // mutation — every identifier that later reaches a path join or the
+    // persisted roster must satisfy canonical `agent::validate_name`.
+    for candidate in std::iter::once(request.name.as_str())
+        .chain(request.existing_members.iter().map(String::as_str))
+        .chain(request.orchestrator.as_deref())
+        .chain(request.accept_from.iter().map(String::as_str))
+    {
+        if let Err(e) = crate::agent::validate_name(candidate) {
+            return json!({"ok": false, "error": e});
+        }
+    }
     let team_name = &request.name;
     let count = request.per_member_backends.len();
     tracing::info!(

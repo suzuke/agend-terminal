@@ -105,6 +105,10 @@ pub(crate) fn full_delete_instance_with_runtime(
     name: &str,
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
 ) -> Result<(), String> {
+    // #2855: reject an invalid (traversal) name BEFORE the lifecycle permit,
+    // the deleting-mark, and every name-derived path removal below — this fn
+    // joins the raw name into workspace/runtime/backend-data paths.
+    crate::agent::validate_name(name)?;
     let lifecycle_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
         name,
