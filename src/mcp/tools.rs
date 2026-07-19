@@ -1230,6 +1230,7 @@ mod tests {
             ("create_instance", "count", "mcp/handlers/instance.rs team-mode count"),
             ("create_instance", "team", "mcp/handlers/instance.rs team-mode prefix"),
             ("create_instance", "backends", "mcp/handlers/instance.rs per-member backends"),
+            ("create_instance", "description", "instance_state/mod.rs team-mode description"),
             ("create_instance", "command", "instance_state/spawn.rs deprecated backend alias"),
             ("create_instance", "role", "instance_state/spawn.rs fleet.yaml role"),
             ("create_instance", "env", "instance_state/spawn.rs per-instance env (#900)"),
