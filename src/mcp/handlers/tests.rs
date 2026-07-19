@@ -1918,6 +1918,104 @@ fn test_interrupt_handler_validates_target() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// --- #2454 atomicity regression: runtime=None fail-closed ---
+
+/// #2454 regression: kind=task without task_id + no runtime (daemon unavailable)
+/// must NOT leave an orphaned auto-created task on the board.
+#[test]
+fn delegate_task_no_runtime_no_task_id_leaves_board_unchanged_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("2454-no-runtime-no-tid");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let board_before = crate::tasks::handle(&home, "sender", &json!({"action": "list"}));
+    let count_before = board_before["tasks"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    // handle_tool passes runtime=None → bridge → daemon unavailable
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "something",
+            "message": "something",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_some(),
+        "#2454: no-runtime send must fail: {result}"
+    );
+
+    let board_after = crate::tasks::handle(&home, "sender", &json!({"action": "list"}));
+    let count_after = board_after["tasks"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count_before, count_after,
+        "#2454: board must be unchanged after failed no-runtime send (no orphaned auto-task)"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 regression: branch dispatch + no runtime must fail closed BEFORE
+/// any durable side effects (binding, ci-watch arming, task creation).
+#[test]
+fn delegate_task_no_runtime_branch_dispatch_fails_before_mutation_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("2454-no-runtime-branch");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "implement feature",
+            "message": "implement feature",
+            "request_kind": "task",
+            "task_id": "t-test-fixture",
+            "branch": "feat/something",
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("runtime") || err.contains("#2454"),
+        "#2454: branch dispatch must fail with a pre-mutation error, got: {err}"
+    );
+    // No binding must exist — the error fired BEFORE maybe_auto_bind_lease.
+    assert!(
+        crate::binding::read(&home, "target").is_none(),
+        "#2454: no binding must be created on failed branch dispatch"
+    );
+    // No task auto-created.
+    let board = crate::tasks::handle(&home, "sender", &json!({"action": "list"}));
+    let count = board["tasks"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "#2454: no task must be auto-created on failed branch dispatch"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // --- Sprint 10: backwards-compat for old interrupt/reason names ---
 
 #[test]

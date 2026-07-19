@@ -546,7 +546,15 @@ pub(crate) fn handle_delegate_task(
         None
     };
 
-    if !checks.review_assignment {
+    // #2454 atomicity: runtime=None + branch → fail closed BEFORE any
+    // durable mutations (bind/task-create). The daemon's own handler runs
+    // with runtime=Some and handles these atomically; the MCP-layer bridge
+    // cannot guarantee rollback on delivery failure.
+    if runtime.is_none() && args["branch"].as_str().is_some() {
+        return json!({"error": "branch dispatch requires in-process runtime (#2454)"});
+    }
+
+    if !checks.review_assignment && runtime.is_some() {
         if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
             return e;
         }
@@ -558,8 +566,13 @@ pub(crate) fn handle_delegate_task(
         );
     }
 
-    let (effective_task_id, auto_created_task_id) =
-        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required);
+    let (effective_task_id, auto_created_task_id) = if runtime.is_some() {
+        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required)
+    } else {
+        // runtime=None: let the daemon auto-create atomically via the
+        // API bridge — pass the original (possibly missing) task_id through.
+        (args["task_id"].as_str().map(String::from), None)
+    };
     let task_id_str = effective_task_id.as_deref();
     let mut msg = composed.msg;
     if let Some(tid) = task_id_str {

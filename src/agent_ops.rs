@@ -105,7 +105,11 @@ pub(crate) fn send_via_api_bridge(home: &Path, request: &messaging::SendRequest)
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
-            json!({"target": request.target, "delivery_mode": dm})
+            let mut result = json!({"target": request.target, "delivery_mode": dm});
+            if let Some(tid) = resp["task_id"].as_str() {
+                result["auto_created_task_id"] = json!(tid);
+            }
+            result
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => json!({"error": format!("daemon API unavailable: {e}")}),
