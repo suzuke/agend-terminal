@@ -249,8 +249,8 @@ pub(crate) fn dispatch_create_instance(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_create_instance(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
 }
 /// #2454: custom (not `adapter!`) so `handle_interrupt` receives the
-/// `RuntimeContext` for its in-process best-effort snapshot (its INJECT stays a
-/// loopback). Mirrors `dispatch_instance`/`dispatch_list_instances`.
+/// `RuntimeContext` for its in-process best-effort snapshot and injection.
+/// Mirrors `dispatch_instance`/`dispatch_list_instances`.
 pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_interrupt(ctx.home, ctx.args, ctx.runtime)
 }
@@ -430,14 +430,14 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
     "description"  => instance::handle_set_description,  hai;
 ]);
 
-/// #2454 Slice 7+13: team create and update carry the owned runtime into
-/// the transport-neutral service; other team actions retain their legacy
-/// adapter shapes.
+/// #2454 Slice 7+13: every team action carries the owned runtime into the
+/// transport-neutral service; public legacy wrappers remain for callers that
+/// do not have an in-process daemon context.
 pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
-        "delete" => task::handle_delete_team(ctx.home, ctx.args),
-        "list" => task::handle_list_teams(ctx.home),
+        "delete" => task::handle_delete_team(ctx.home, ctx.args, ctx.runtime),
+        "list" => task::handle_list_teams(ctx.home, ctx.runtime),
         "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
         other => json!({"error": format!("unknown team action: {other}")}),
     }
@@ -1473,40 +1473,472 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #2454 residual RED: after the create_instance(team=...) migration,
-    /// exactly 3 same-daemon api::call production sites should remain.
-    #[test]
-    fn production_api_call_post_create_instance_team_is_3_2454() {
-        let needle_call = concat!("crate::", "api::", "call");
-        let needle_at = concat!("api::", "call_at");
-        let test_mod_marker = "#[cfg(test)]\nmod ";
-        let files: &[&str] = &[
-            include_str!("comms.rs"),
-            include_str!("comms_delegate/mod.rs"),
-            include_str!("task.rs"),
-            include_str!("restart.rs"),
-            include_str!("instance_state/mod.rs"),
-            include_str!("instance_state/spawn.rs"),
-            include_str!("instance_state/lifecycle.rs"),
-            include_str!("instance_metadata.rs"),
-        ];
-        let mut count = 0;
-        for src in files {
-            let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
-            let production = &src[..boundary];
-            for line in production.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                    continue;
+    /// Strip the test-only tail from a source file without treating `#[cfg(test)]`
+    /// helper statics as the boundary.  The inventory below is intentionally
+    /// generated from the checked-out production sources rather than a fixed
+    /// syntax budget: compatibility transports are valid when their runtime
+    /// branch is absent, and the successor STATUS call is cross-daemon.
+    fn production_tail(source: &str) -> &str {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut boundary = lines.len();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let next = lines
+                .iter()
+                .skip(index + 1)
+                .take(4)
+                .map(|line| line.trim())
+                .find(|line| !line.starts_with('#'))
+                .unwrap_or("");
+            let module_name = next
+                .strip_prefix("mod ")
+                .and_then(|name| name.split_whitespace().next())
+                .unwrap_or("");
+            if module_name == "tests" || module_name.ends_with("_tests") {
+                boundary = index;
+                break;
+            }
+        }
+        // Reconstruct the byte boundary from the original source chunks so
+        // CRLF checkouts and non-ASCII lines cannot drift into the middle of a
+        // UTF-8 code point. `str::len()` is byte-based, and each inclusive
+        // chunk carries its exact newline width (`\n` or `\r\n`).
+        let end: usize = source
+            .split_inclusive('\n')
+            .take(boundary)
+            .map(str::len)
+            .sum();
+        &source[..end]
+    }
+
+    fn code_without_strings_or_comments(line: &str) -> String {
+        let mut result = String::with_capacity(line.len());
+        let mut quoted = false;
+        let mut escaped = false;
+        let bytes = line.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
                 }
-                if line.contains(needle_call) && !line.contains(needle_at) {
-                    count += 1;
+                result.push(' ');
+            } else if byte == b'"' {
+                quoted = true;
+                result.push(' ');
+            } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                break;
+            } else {
+                result.push(byte as char);
+            }
+            index += 1;
+        }
+        result
+    }
+
+    fn function_name(line: &str) -> Option<String> {
+        let marker = line.find("fn ")? + 3;
+        let name: String = line[marker..]
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn source_region<'a>(source: &'a str, function: &str) -> &'a str {
+        let marker = format!("fn {function}");
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing source function {function}"));
+        let body_start = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("missing body for source function {function}"));
+        let bytes = source.as_bytes();
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut char_literal = false;
+        let mut raw_hashes = None;
+        let mut line_comment = false;
+        let mut block_comment_depth = 0usize;
+        let mut index = body_start;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let next = bytes.get(index + 1).copied();
+            if line_comment {
+                if byte == b'\n' {
+                    line_comment = false;
+                }
+            } else if block_comment_depth > 0 {
+                if byte == b'/' && next == Some(b'*') {
+                    block_comment_depth += 1;
+                    index += 1;
+                } else if byte == b'*' && next == Some(b'/') {
+                    block_comment_depth -= 1;
+                    index += 1;
+                }
+            } else if let Some(hashes) = raw_hashes {
+                if byte == b'"'
+                    && bytes[index + 1..]
+                        .iter()
+                        .take_while(|candidate| **candidate == b'#')
+                        .count()
+                        == hashes
+                {
+                    raw_hashes = None;
+                    index += hashes;
+                }
+            } else if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else if char_literal {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'\'' {
+                    char_literal = false;
+                }
+            } else if byte == b'/' && next == Some(b'/') {
+                line_comment = true;
+                index += 1;
+            } else if byte == b'/' && next == Some(b'*') {
+                block_comment_depth = 1;
+                index += 1;
+            } else if let Some((quote_index, hashes)) = {
+                let (prefix_index, prefix_len) = if byte == b'r' {
+                    (index, 1)
+                } else if byte == b'b' && next == Some(b'r') {
+                    (index, 2)
+                } else {
+                    (index, 0)
+                };
+                if prefix_len == 0 {
+                    None
+                } else {
+                    let mut cursor = prefix_index + prefix_len;
+                    while bytes.get(cursor) == Some(&b'#') {
+                        cursor += 1;
+                    }
+                    (bytes.get(cursor) == Some(&b'"'))
+                        .then_some((cursor, cursor - prefix_index - prefix_len))
+                }
+            } {
+                raw_hashes = Some(hashes);
+                index = quote_index;
+            } else if byte == b'\'' && (next == Some(b'\\') || bytes.get(index + 2) == Some(&b'\''))
+            {
+                char_literal = true;
+            } else if byte == b'"' {
+                quoted = true;
+            } else if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &source[start..=index];
+                }
+            }
+            index += 1;
+        }
+        panic!("unterminated body for source function {function}");
+    }
+
+    fn transport_inventory() -> Vec<(String, usize, String, String)> {
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    files.push(path);
                 }
             }
         }
-        assert_eq!(
-            count, 3,
-            "production same-daemon api::call after create_instance(team=...) must be exactly 3; got {count}"
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
+        let mut inventory = Vec::new();
+        for path in files {
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production = production_tail(&source);
+            let relative = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let mut current_function = String::from("<module>");
+            for (line_number, line) in production.lines().enumerate() {
+                let code = code_without_strings_or_comments(line);
+                if let Some(name) = function_name(&code) {
+                    current_function = name;
+                }
+                let kind = if code.contains("api::call_at(") {
+                    "call_at"
+                } else if code.contains("api::call(") {
+                    "call"
+                } else if code.contains("request_local(") {
+                    "request_local"
+                } else {
+                    continue;
+                };
+                inventory.push((
+                    relative.clone(),
+                    line_number + 1,
+                    current_function.clone(),
+                    kind.to_string(),
+                ));
+            }
+        }
+        inventory
+    }
+
+    fn classify_transport(path: &str, function: &str, kind: &str) -> &'static str {
+        if path == "src/mcp/handlers/restart.rs" && function == "phase1_gate" && kind == "call_at" {
+            return "cross_daemon_successor_status";
+        }
+        if path == "src/mcp/handlers/instance_state/lifecycle.rs"
+            && function == "delete_with_runtime_or_legacy"
+        {
+            return "runtime_none_instance_delete";
+        }
+        if path == "src/mcp/handlers/instance_state/spawn.rs" && function == "inject_with_routing" {
+            return "runtime_none_instance_inject";
+        }
+        if path == "src/mcp/handlers/instance_state/spawn.rs" && function == "legacy_spawn" {
+            return "runtime_none_instance_spawn";
+        }
+        if path == "src/deployments.rs" && function == "spawn_instances_legacy" {
+            return "runtime_none_deployment_spawn";
+        }
+        if path == "src/deployments.rs" && function == "create_deployment_team_legacy" {
+            return "runtime_none_deployment_create_team";
+        }
+        if path == "src/deployments.rs" && function == "delete_instances_legacy" {
+            return "runtime_none_deployment_delete";
+        }
+        if path == "src/agent_ops.rs" && function == "send_via_api_bridge" {
+            return "runtime_none_send_bridge";
+        }
+        if path == "src/tasks/handler.rs" && function == "handle_sweep" {
+            return "runtime_none_task_sweep_wrapper";
+        }
+        if path == "src/runtime.rs" && function == "list_live_agents" {
+            return "shared_runtime_none_list_wrapper";
+        }
+        if path == "src/inbox/notify.rs" && function == "inject_with_submit_direct" {
+            return "async_delivery_worker_inject";
+        }
+        if path == "src/agent/mod.rs" {
+            return "agent_lifecycle_shell_fallback";
+        }
+        if path.starts_with("src/channel/telegram/") {
+            return "telegram_channel_caller";
+        }
+        if matches!(
+            path,
+            "src/connect.rs"
+                | "src/bugreport.rs"
+                | "src/main.rs"
+                | "src/tray/mod.rs"
+                | "src/verify.rs"
+        ) {
+            return "standalone_or_operator_client";
+        }
+        panic!("unclassified production transport candidate: {path}:{function} ({kind})");
+    }
+
+    /// #2454 closure RED: generated inventory must classify every production
+    /// transport candidate by runtime/process reachability.  The counts are
+    /// derived from the scan; only the six compatibility sites and the one
+    /// explicitly cross-daemon call are pinned by disposition.
+    #[test]
+    fn generated_production_transport_inventory_is_classified_2454() {
+        let inventory = transport_inventory();
+        assert!(
+            !inventory.is_empty(),
+            "production transport inventory is empty"
+        );
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for (path, _line, function, kind) in &inventory {
+            *counts
+                .entry(classify_transport(path, function, kind))
+                .or_default() += 1;
+        }
+        assert_eq!(counts.get("cross_daemon_successor_status"), Some(&1));
+        assert_eq!(counts.get("runtime_none_instance_delete"), Some(&1));
+        assert_eq!(counts.get("runtime_none_instance_inject"), Some(&1));
+        assert_eq!(counts.get("runtime_none_instance_spawn"), Some(&1));
+        assert_eq!(counts.get("runtime_none_deployment_spawn"), Some(&1));
+        assert_eq!(counts.get("runtime_none_deployment_create_team"), Some(&1));
+        assert_eq!(counts.get("runtime_none_deployment_delete"), Some(&1));
+        assert_eq!(counts.get("runtime_none_send_bridge"), Some(&1));
+        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), Some(&1));
+        assert_eq!(counts.get("shared_runtime_none_list_wrapper"), Some(&1));
+    }
+
+    /// The in-process MCP task adapter must never call the public LIST wrappers
+    /// (which retain a socket fallback).  This also covers helper indirection:
+    /// it must snapshot the injected registries and call the typed task entry.
+    #[test]
+    fn runtime_present_task_health_and_sweep_bypass_public_api_wrappers_2454() {
+        let source = include_str!("dispatch.rs");
+        let dispatch = source
+            .split("pub(crate) fn dispatch_task")
+            .nth(1)
+            .and_then(|region| {
+                region
+                    .split("pub(crate) fn dispatch_usage_limit_takeover")
+                    .next()
+            })
+            .expect("dispatch_task source region");
+        assert!(dispatch.contains("agent_ops::list_snapshot"));
+        assert!(dispatch.contains("tasks::handle_with_live_instances"));
+        assert!(!dispatch.contains("tasks::handle_sweep("));
+        assert!(!dispatch.contains("tasks::handle_health("));
+    }
+
+    /// Pin the branch/function-pointer/delayed-closure seams that sit between
+    /// a real RuntimeContext=Some MCP ingress and the compatibility transports.
+    /// This is deliberately structural: the generated inventory above records
+    /// that the legacy calls exist, while this guard proves their owner branch
+    /// is selected only when the runtime value is absent.
+    #[test]
+    fn runtime_present_compatibility_branches_are_structurally_unreachable_2454() {
+        let spawn = include_str!("instance_state/spawn.rs");
+        let inject = source_region(spawn, "inject_with_routing");
+        assert!(inject.contains("if let Some((reg, ext))"));
+        assert!(inject.contains("agent_ops::inject_input"));
+        assert!(inject.contains("crate::api::call"));
+        let spawn_route = source_region(spawn, "spawn_runtime_or_legacy");
+        assert!(spawn_route.contains("let Some(runtime) = runtime else"));
+        assert!(spawn_route.contains("return legacy(home, request)"));
+        assert!(spawn_route.contains("spawn_instance"));
+
+        let lifecycle = include_str!("instance_state/lifecycle.rs");
+        let delete = source_region(lifecycle, "delete_with_runtime_or_legacy");
+        assert!(delete.contains("if let Some(context)"));
+        assert!(delete.contains("agent_ops::delete_instance"));
+        assert!(delete.contains("crate::api::call"));
+
+        let deployments = include_str!("../../deployments.rs");
+        for (typed, legacy) in [
+            ("spawn_instances", "spawn_instances_legacy"),
+            ("create_deployment_team", "create_deployment_team_legacy"),
+            ("teardown_with_runtime", "delete_instances_legacy"),
+        ] {
+            let typed_region = source_region(deployments, typed);
+            let legacy_region = source_region(deployments, legacy);
+            assert!(
+                typed_region.contains("if let Some(runtime)")
+                    || typed_region.contains("if let Some(context)"),
+                "typed deployment owner {typed} must branch on runtime"
+            );
+            assert!(
+                legacy_region.contains("crate::api::call"),
+                "legacy deployment adapter {legacy} must retain the compatibility transport"
+            );
+        }
+
+        let comms = include_str!("comms.rs");
+        let send = source_region(comms, "handle_send_to_instance");
+        assert!(send.contains("messaging::execute_send"));
+        assert!(send.contains("send_via_api_bridge"));
+        let delegate = include_str!("comms_delegate/mod.rs");
+        assert!(delegate.contains("messaging::execute_send"));
+
+        let state = include_str!("instance_state/mod.rs");
+        assert!(state.contains("inject_with_routing"));
+        assert!(state.contains("Arc::clone(&rt.registry)"));
+        assert!(state.contains("Arc::clone(&rt.externals)"));
+        assert!(
+            source_region(include_str!("dispatch.rs"), "dispatch_deployment")
+                .contains("ctx.runtime")
+        );
+    }
+
+    #[test]
+    fn source_region_is_brace_bounded_2454() {
+        let source = concat!(
+            "fn first() {\n",
+            " let char_brace = '}';\n",
+            " let after_char = \"AFTER_CHAR\";\n",
+            " let raw = r###\"{ raw }\"###;\n",
+            " let after_raw = \"AFTER_RAW\";\n",
+            " /* outer { /* nested } */ still } */\n",
+            " let after_comment = \"AFTER_COMMENT\";\n",
+            " let sentinel = \"FIRST_SENTINEL\";\n",
+            "}\n",
+            "pub async fn second() { panic!(\"SECOND_SENTINEL\") }\n"
+        );
+        let first = source_region(source, "first");
+        assert!(first.contains("AFTER_CHAR"));
+        assert!(first.contains("AFTER_RAW"));
+        assert!(first.contains("AFTER_COMMENT"));
+        assert!(first.contains("FIRST_SENTINEL"));
+        assert!(!first.contains("SECOND_SENTINEL"));
+    }
+
+    #[test]
+    fn production_tail_preserves_utf8_crlf_boundary_2454() {
+        let source = "pub fn first() {\r\n    let marker = \"—\";\r\n} // —\r\n#[cfg(test)]\r\nmod tests {\r\n    fn ignored() {}\r\n}\r\n";
+        let production = production_tail(source);
+        assert!(production.contains("let marker = \"—\""));
+        assert!(!production.contains("mod tests"));
+    }
+
+    /// All team actions are part of the MCP runtime-present closure.  The
+    /// current exact-main adapters drop RuntimeContext for list/delete; this
+    /// guard intentionally stays RED until those two synchronous paths are
+    /// routed through typed owners as well.
+    #[test]
+    fn runtime_present_team_actions_forward_runtime_2454() {
+        let source = include_str!("dispatch.rs");
+        let dispatch = source
+            .split("pub(crate) fn dispatch_team")
+            .nth(1)
+            .and_then(|region| region.split("// `inbox` —").next())
+            .expect("dispatch_team source region");
+        assert!(
+            dispatch.contains("handle_delete_team(ctx.home, ctx.args, ctx.runtime)"),
+            "team delete must retain runtime context for the in-process cascade"
+        );
+        assert!(
+            dispatch.contains("handle_list_teams(ctx.home, ctx.runtime)"),
+            "team list must retain runtime context for the in-process live snapshot"
+        );
+    }
+
+    /// The stale dispatch_interrupt comment must describe the typed injection
+    /// route, not claim that INJECT remains a loopback after runtime forwarding.
+    #[test]
+    fn dispatch_interrupt_comment_matches_runtime_inject_route_2454() {
+        let source = include_str!("dispatch.rs");
+        let obsolete = ["its INJECT", " stays a loopback"].concat();
+        assert!(
+            !source.contains(&obsolete),
+            "dispatch_interrupt still documents an obsolete INJECT loopback"
         );
     }
 
