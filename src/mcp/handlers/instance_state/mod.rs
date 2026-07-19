@@ -113,7 +113,10 @@ pub(super) fn handle_create_instance(
                     name: team_name.to_string(),
                     per_member_backends: per_member_backends.clone(),
                     existing_members: Vec::new(),
-                    topic_binding_mode: args["topic_binding"].as_str().map(String::from),
+                    topic_binding_mode: args["topic_binding"]
+                        .as_str()
+                        .filter(|s| matches!(*s, "skip" | "deferred"))
+                        .map(String::from),
                     orchestrator: None,
                     description: args["description"].as_str().map(String::from),
                     repository_path: None,
