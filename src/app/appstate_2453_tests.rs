@@ -178,6 +178,114 @@ fn run_app_and_run_core_remain_separate_2453() {
     );
 }
 
+// ── #2453 Slice 2: method-extraction / thin-loop guards ──
+//
+// Same scanning discipline as Slice 1: prod-region only, literal needles are
+// safe here because this sibling test file is never part of a scanned region.
+
+/// `run_app`'s source region: from its `fn` line to the next top-level item
+/// (`fn setup_app_bootstrap`). Matches root's measurement boundary.
+fn run_app_region() -> String {
+    let source = std::fs::read_to_string("src/app/mod.rs")
+        .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+        .expect("source file must be readable from test cwd");
+    let start = source
+        .find("fn run_app(")
+        .expect("fn run_app must exist in src/app/mod.rs");
+    let end = source[start..]
+        .find("\nfn setup_app_bootstrap(")
+        .map(|offset| start + offset)
+        .expect("fn setup_app_bootstrap must follow run_app");
+    source[start..end].to_string()
+}
+
+/// Inline-logic witnesses that currently live inside `run_app`'s loop and
+/// must migrate into cohesive `AppState` methods: boot catch-up drain,
+/// throttled session persistence, remote-agent discovery, notification/badge
+/// sync, and the restart commit poll.
+const LOOP_LOGIC_WITNESSES_2453S2: [&str; 5] = [
+    "render::drain_all_panes_until",
+    "session::save_session_if_changed",
+    "pane_factory::create_remote_pane",
+    "should_sync_notifications",
+    "poll_commit_pending",
+];
+
+/// #2453 Slice 2 RED 1/3: run_app must become genuine thin orchestration —
+/// construction/dispatch/render/select/teardown around AppState methods.
+/// Closure criterion is ~80 lines (root contract tightening); 90 gives
+/// honest comment headroom and is anti-gaming-guarded by the witness and
+/// impl pins below.
+#[test]
+fn run_app_is_thin_orchestration_2453s2() {
+    let region = run_app_region();
+    let lines = region.lines().count();
+    assert!(
+        lines <= 90,
+        "#2453 Slice 2: run_app must be thin orchestration (~80 lines, cap 90); \
+         currently {lines} lines"
+    );
+}
+
+/// #2453 Slice 2 RED 2/3: the extracted loop logic must live in cohesive
+/// `impl AppState` methods — not free helper functions (laundering).
+#[test]
+fn loop_logic_lives_in_app_state_methods_2453s2() {
+    let prod = app_prod_region();
+    let impl_start = prod.find("impl AppState").unwrap_or_else(|| {
+        panic!(
+            "#2453 Slice 2: `impl AppState` must exist in the app production \
+             region — the loop logic has not been extracted into methods"
+        )
+    });
+    let impl_end = prod[impl_start..]
+        .find("\n}")
+        .map(|offset| impl_start + offset)
+        .expect("unterminated impl AppState body");
+    let body = &prod[impl_start..impl_end];
+    for witness in LOOP_LOGIC_WITNESSES_2453S2 {
+        assert!(
+            body.contains(witness),
+            "#2453 Slice 2: loop logic `{witness}` must live inside an \
+             AppState method, not a free helper (laundering) or inline in run_app"
+        );
+    }
+}
+
+/// #2453 Slice 2 RED 3/3: the witnesses must actually LEAVE run_app — a
+/// copy kept inline would satisfy the impl pin while thinning nothing.
+#[test]
+fn run_app_witnesses_moved_out_2453s2() {
+    let region = run_app_region();
+    let still_inline: Vec<&str> = LOOP_LOGIC_WITNESSES_2453S2
+        .into_iter()
+        .filter(|witness| region.contains(witness))
+        .collect();
+    assert!(
+        still_inline.is_empty(),
+        "#2453 Slice 2: loop logic must move out of run_app into AppState \
+         methods; still inline: {still_inline:?}"
+    );
+}
+
+/// #2453 Slice 2 control (green today, pins GREEN): the orchestration
+/// skeleton STAYS in run_app — AppState construction, the select! loop, and
+/// teardown are the orchestrator's job and may not be laundered away.
+#[test]
+fn run_app_keeps_orchestration_skeleton_2453s2() {
+    let region = run_app_region();
+    for anchor in [
+        "let mut state = AppState",
+        "crossbeam_channel::select!",
+        "app_teardown(",
+    ] {
+        assert!(
+            region.contains(anchor),
+            "#2453 Slice 2: run_app must keep the orchestration anchor `{anchor}`"
+        );
+    }
+}
+
 /// #2453 control (green today, pins GREEN): ownership must move by real
 /// restructuring — RefCell/mem::take evasion may not enter the production
 /// region (both are absent today).
