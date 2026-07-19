@@ -461,39 +461,6 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// F: same as Q but the reply is delivered through the API-down
-    /// `fallback_deliver` entry.
-    #[test]
-    fn answered_query_parent_not_nagged_via_fallback_deliver() {
-        let home = tmp_home("psf");
-        let (a, b) = ("psf-worker", "psf-peer");
-        write_fleet(&home, &[b]);
-        let qid = "m-psf-query";
-        crate::inbox::enqueue(&home, a, inbox_msg(qid, "codex", "query", None)).unwrap();
-        crate::inbox::drain(&home, a);
-        let registry = mock_registry(a, AgentState::Idle);
-        let reply = inbox_msg("m-psf-reply", a, "report", Some(qid));
-        let resp = crate::agent_ops::fallback_deliver(
-            &home,
-            a,
-            b,
-            "answered",
-            reply,
-            &anyhow::anyhow!("api down"),
-        );
-        assert!(
-            resp.get("error").is_none(),
-            "fallback delivery must succeed: {resp}"
-        );
-        crate::inbox::storage::set_row_delivering_at_for_test(&home, a, qid, &aged_601s());
-        crate::inbox::reclaim_stale_delivering(&home);
-        assert!(
-            !sender_is_nagged(&home, &registry, a),
-            "answered query parent (fallback path) must not re-nag"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
     /// T: a REAL task send (handle_send kind=task) creates BOTH the task inbox
     /// row on the worker AND the PendingDispatch sidecar. After the worker
     /// answers with a parented `handle_send` (kind=update, parent_id=D), the

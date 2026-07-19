@@ -1123,7 +1123,7 @@ mod tests {
         (home, registry, configs, externals)
     }
 
-    fn invoke_runtime_mcp_tool(
+    pub(super) fn invoke_runtime_mcp_tool(
         home: &std::path::Path,
         registry: &crate::agent::AgentRegistry,
         configs: &crate::api::ConfigRegistry,
@@ -1591,3 +1591,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "mcp_proxy_2454_tests.rs"]
+mod mcp_proxy_2454_tests;

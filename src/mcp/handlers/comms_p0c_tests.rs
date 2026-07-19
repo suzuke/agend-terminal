@@ -7,7 +7,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::dispatch_should_skip_auto_bind;
+use crate::mcp::handlers::dispatch::RuntimeContext;
 use serde_json::json;
+
+fn minimal_runtime() -> RuntimeContext {
+    RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: None,
+        shutdown: None,
+    }
+}
 
 #[test]
 fn skip_auto_bind_when_bind_false() {
@@ -29,18 +43,11 @@ fn proceed_auto_bind_when_bind_absent() {
     assert!(!dispatch_should_skip_auto_bind(&args));
 }
 
-// #1024 (closes #1002 ROOT 2): the reviewed_head-forwarding regression is now a
-// BEHAVIORAL test — `send_envelope::tests::reviewed_head_from_args_reaches_send_params_1024`
-// (plus the fixed-gap fallback pin `to_inbox_message_carries_full_directive_set_fixed_gap_1024_1833`)
-// — replacing this brittle source-text grep, which broke on the smells#2
-// SendEnvelope refactor though the behavior was preserved (source-grep tests
-// are themselves a flagged de2eb8 smell / Pattern A).
-
 /// #35896-11 ⑤ (Q2 vet): a kind=report carrying a correlation_id auto-settles the
 /// SENDER's own delivering dispatch row EVEN WITHOUT `ack_inbox` — the gate was
 /// removed so poll-reminder stops nagging a dispatch the reporter already
-/// answered. End-to-end through the real `handle_report_result`: `api::call(SEND)`
-/// fails in-test (no daemon) → `fallback_deliver` returns a no-error result →
+/// answered. End-to-end through `handle_report_result` with a minimal
+/// `RuntimeContext` → `execute_send` delivers via the neutral service →
 /// `is_ok_result` true → the settle block runs. Sender-scoped, so only the
 /// reporter's row is touched (isolation unit-tested in
 /// `inbox::tests::ack_by_correlation_isolates_across_agents_35896_11`).
@@ -53,10 +60,7 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
     ));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    // Minimal fleet so the report's in-test fallback delivery to `lead` resolves
-    // (api::call has no daemon → fallback_deliver, which validates the target
-    // against fleet.yaml; without this the send returns an error result and the
-    // settle block is correctly skipped).
+    // Minimal fleet so the neutral service's target validation resolves `lead`.
     let reporter = "reporter-35896";
     std::fs::write(
         home.join("fleet.yaml"),
@@ -88,6 +92,7 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
 
     // Report back WITHOUT ack_inbox — ⑤ must still settle the reporter's row.
     let sender = crate::identity::Sender::new(reporter);
+    let rt = minimal_runtime();
     let result = super::handle_report_result(
         &home,
         &json!({
@@ -96,6 +101,7 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
             "correlation_id": "t-x"
         }),
         &sender,
+        Some(&rt),
     );
     assert_eq!(
         result["inbox_settled"], 1,
@@ -130,7 +136,7 @@ fn analysis_report_with_pr_artifact_does_not_enter_review_gate_2760() {
     .unwrap();
 
     let sender = crate::identity::Sender::new(reporter);
-    // Verdict prefix in `summary` (no URL); the PR URL lives ONLY in `artifacts`.
+    let rt = minimal_runtime();
     let result = super::handle_report_result(
         &home,
         &json!({
@@ -141,6 +147,7 @@ fn analysis_report_with_pr_artifact_does_not_enter_review_gate_2760() {
             "report_purpose": "analysis_decision",
         }),
         &sender,
+        Some(&rt),
     );
     assert!(
         result.get("error").is_none(),
@@ -168,6 +175,7 @@ fn analysis_report_with_bare_pr_number_is_not_semantic_review_2760() {
     .unwrap();
 
     let sender = crate::identity::Sender::new(reporter);
+    let rt = minimal_runtime();
     let result = super::handle_report_result(
         &home,
         &json!({
@@ -178,6 +186,7 @@ fn analysis_report_with_bare_pr_number_is_not_semantic_review_2760() {
             "report_purpose": "analysis_decision",
         }),
         &sender,
+        Some(&rt),
     );
     assert!(
         result.get("error").is_none(),
@@ -241,6 +250,7 @@ fn ordinary_correlated_report_does_not_ack_assignment_2760() {
         &home,
         &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
         &sender,
+        None,
     );
 
     let rec = authority::get(&home, "o/r", "feat/x", reporter).expect("assignment present");
@@ -270,6 +280,7 @@ fn ordinary_correlated_report_does_not_ack_assignment_2760() {
         &home,
         &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
         &sender,
+        None,
     );
     assert!(
         authority::get(&home, "o/r", "feat/x", "reviewer-c9a")
@@ -295,6 +306,7 @@ fn c9_ack_ambiguity_fails_closed_end_to_end_t15() {
         &home,
         &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
         &sender,
+        None,
     );
 
     assert!(

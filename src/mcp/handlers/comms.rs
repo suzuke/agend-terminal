@@ -1,11 +1,10 @@
-use crate::agent_ops::send_to;
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::send_envelope::SendEnvelope;
+use super::dispatch::RuntimeContext;
 use super::{
     comms_gates::{
         enforce_send_invariants, record_triaged_if_present, validate_request_kind,
@@ -30,7 +29,12 @@ pub(super) use comms_delegate::dispatch_should_skip_auto_bind;
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
 /// → delegate, summary → report, question → query, default → send_to).
-pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_unified_send(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let mut args = args.clone();
     if let Some(err) = validate_selector_exclusivity(&args) {
         return err;
@@ -43,7 +47,7 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
     }
     // Broadcast mode: instances/team present (tags-only rejected above)
     if args.get("instances").is_some() || args.get("team").is_some() {
-        return handle_broadcast(home, &args, sender);
+        return handle_broadcast(home, &args, sender, runtime);
     }
 
     fn lift_message(args: &mut Value, dst: &str) {
@@ -56,17 +60,17 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
     match args["request_kind"].as_str().unwrap_or("") {
         "task" => {
             lift_message(&mut args, "task");
-            handle_delegate_task(home, &args, sender)
+            handle_delegate_task(home, &args, sender, runtime)
         }
         "report" => {
             lift_message(&mut args, "summary");
-            handle_report_result(home, &args, sender)
+            handle_report_result(home, &args, sender, runtime)
         }
         "query" => {
             lift_message(&mut args, "question");
-            handle_request_information(home, &args, sender)
+            handle_request_information(home, &args, sender, runtime)
         }
-        _ => handle_send_to_instance(home, &args, "send", sender),
+        _ => handle_send_to_instance(home, &args, "send", sender, runtime),
     }
 }
 
@@ -75,6 +79,7 @@ pub(super) fn handle_send_to_instance(
     args: &Value,
     tool: &str,
     sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
 ) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity(tool);
@@ -87,16 +92,10 @@ pub(super) fn handle_send_to_instance(
     if *sender == target {
         return json!({"error": "cannot send to self — use a different instance"});
     }
-    // #2537/#2524 P6: validated up front so a malformed `triaged` rejects
-    // before a message goes out.
     let triaged = match validate_triaged(args) {
         Ok(t) => t,
         Err(e) => return e,
     };
-    // #1602: `message` only — the legacy `text` alias is dropped (reply's
-    // text→message rename removed the last schema that declared `text`, and the
-    // dispatch validator now rejects a message-less `send` before this handler
-    // runs anyway). `send`/`reply`/`schedule` are all `message` now.
     let text = match args["message"].as_str() {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"error": "missing or empty 'message'"}),
@@ -104,57 +103,20 @@ pub(super) fn handle_send_to_instance(
     let kind = args["request_kind"]
         .as_str()
         .or_else(|| args["kind"].as_str());
-    let thread_id = args["thread_id"].as_str();
     let parent_id = args["parent_id"].as_str();
 
-    // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; the
-    // SendEnvelope projection carries it (+ the rest of the directive set) into
-    // BOTH `params` and the fallback, so they cannot drift (smells#2).
-    let env = SendEnvelope {
-        from: sender.as_str().to_string(),
-        target: target.to_string(),
-        text: text.to_string(),
-        // MED-5: carry `kind` (else a fallback `kind=query` lands kind=None and
-        // `inbox clear` swallows it) — now via the shared envelope.
-        kind: kind.map(String::from),
-        thread_id: thread_id.map(String::from),
-        parent_id: parent_id.map(String::from),
-        ..SendEnvelope::directives_from_args(args)
-    };
-    let result = match crate::api::call(
-        home,
-        &json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "method": crate::api::method::SEND,
-            "params": env.to_send_params(),
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
-            json!({"target": target, "delivery_mode": dm})
-        }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-        Err(e) => {
-            // Centralised fallback (Sprint 40 T-7 B4). #1024/#1833 fix: the
-            // fallback now carries the SAME directive set as `params` (shared
-            // SendEnvelope projection) — it previously dropped reviewed_head +
-            // eta/cadence/worktree_binding, a latent verdict-correlation
-            // gap when a verdict send hit the API-down path.
-            let mut resolved_thread = thread_id.map(String::from);
-            let resolved_parent = parent_id.map(String::from);
-            if resolved_thread.is_none() {
-                if let Some(ref pid) = resolved_parent {
-                    if let Some(parent_msg) = crate::inbox::find_message(home, pid) {
-                        resolved_thread = parent_msg.thread_id.or_else(|| parent_msg.id.clone());
-                    }
-                }
+    let req = send_request_from_args(sender.as_str(), target, text, kind, args);
+    let result = if let Some(rt) = runtime {
+        match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
+            crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
+                json!({"target": target, "delivery_mode": delivery_mode})
             }
-            let mut fb = env.clone();
-            fb.thread_id = resolved_thread;
-            fb.parent_id = resolved_parent;
-            let msg = fb.to_inbox_message();
-            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
+            crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
+                json!({"error": error})
+            }
         }
+    } else {
+        crate::agent_ops::send_via_api_bridge(home, &req)
     };
     let mut result = result;
     if kind == Some("report") && parent_id.is_none() {
@@ -164,6 +126,42 @@ pub(super) fn handle_send_to_instance(
         record_triaged_if_present(home, sender.as_str(), triaged);
     }
     result
+}
+
+fn send_request_from_args(
+    from: &str,
+    target: &str,
+    text: &str,
+    kind: Option<&str>,
+    args: &Value,
+) -> crate::agent_ops::messaging::SendRequest {
+    crate::agent_ops::messaging::SendRequest {
+        from: from.to_string(),
+        target: target.to_string(),
+        text: text.to_string(),
+        kind: kind.map(String::from),
+        thread_id: args["thread_id"].as_str().map(String::from),
+        parent_id: args["parent_id"].as_str().map(String::from),
+        correlation_id: args["correlation_id"].as_str().map(String::from),
+        reviewed_head: args["reviewed_head"].as_str().map(String::from),
+        report_purpose: args["report_purpose"].as_str().map(String::from),
+        code_review: args.get("code_review").filter(|v| !v.is_null()).cloned(),
+        eta_minutes: args["eta_minutes"].as_u64(),
+        reporting_cadence: args["reporting_cadence"].as_str().map(String::from),
+        worktree_binding_required: args["worktree_binding_required"].as_bool(),
+        expect_reply_within_secs: args["expect_reply_within_secs"].as_i64(),
+        terminal: args["terminal"].as_bool(),
+        no_report_expected: args["no_report_expected"].as_bool(),
+        delivery_nonce: args["delivery_nonce"].as_str().map(String::from),
+        task_id: args["task_id"].as_str().map(String::from),
+        force_meta: args.get("force_meta").filter(|v| !v.is_null()).cloned(),
+        provenance: args.get("provenance").filter(|v| !v.is_null()).cloned(),
+        branch: args["branch"].as_str().map(String::from),
+        broadcast_context: args
+            .get("broadcast_context")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        priority: args["priority"].as_str().map(String::from),
+    }
 }
 
 /// #2050 simplify PR-B (⑫): attach the "parent_id recommended" warning to a
@@ -180,7 +178,12 @@ fn attach_report_parent_warning(result: &mut Value) {
     }
 }
 
-pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_report_result(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("report_result");
     };
@@ -193,7 +196,6 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         Some(s) => s,
         None => return json!({"error": "missing 'summary'"}),
     };
-    // #2537/#2524 P6: same pre-send gate as handle_send_to_instance.
     let triaged = match validate_triaged(args) {
         Ok(t) => t,
         Err(e) => return e,
@@ -206,9 +208,6 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     let result = {
         let is_code_review = args["report_purpose"].as_str() == Some("code_review");
 
-        // UX-only evidence checks are scoped by the caller's typed purpose. The
-        // API sink validates again and is the sole trust boundary; reviewed_head
-        // is display-only and never drives an MCP SHA/PR lookup.
         let scan_body = super::comms_gates::report_scan_body(summary, args["artifacts"].as_str());
         if is_code_review {
             let Some(verdict) = super::comms_gates::detect_verdict(summary) else {
@@ -218,8 +217,6 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 return json!({"error": e});
             }
 
-            // #1666 Phase B (WARN-first): cross-check the checkable evidence and
-            // LOG (never reject) — measures the false-positive rate. See the fn.
             super::comms_gates::cross_check_and_log(
                 home,
                 sender.as_str(),
@@ -229,75 +226,34 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             );
         }
 
-        // smells#2: report carries {correlation_id, reviewed_head, terminal}
-        // (a reply needs no dispatch directives); the shared SendEnvelope reads
-        // the directive set from args (the rest stay None → emitted as inert null
-        // keys, read as absent) and projects to BOTH params and the fallback.
-        let env = SendEnvelope {
-            from: sender.as_str().to_string(),
-            target: target.to_string(),
-            text: msg.clone(),
-            kind: Some("report".to_string()),
-            thread_id: args["thread_id"].as_str().map(String::from),
-            parent_id: args["parent_id"].as_str().map(String::from),
-            ..SendEnvelope::directives_from_args(args)
-        };
-        match crate::api::call(
-            home,
-            &json!({
-                "request_id": uuid::Uuid::new_v4().to_string(),
-                "method": crate::api::method::SEND,
-                "params": env.to_send_params(),
-            }),
-        ) {
-            Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
-            Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-            Err(e) => {
-                // Centralised fallback (Sprint 40 T-7 B4) — shared SendEnvelope
-                // projection keeps the fallback aligned with params.
-                let inbox_msg = env.to_inbox_message();
-                crate::agent_ops::fallback_deliver(
-                    home,
-                    sender.as_str(),
-                    target,
-                    &msg,
-                    inbox_msg,
-                    &e,
-                )
+        let req = send_request_from_args(sender.as_str(), target, &msg, Some("report"), args);
+        if let Some(rt) = runtime {
+            match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
+                crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
+                    json!({"target": target, "delivery_mode": delivery_mode})
+                }
+                crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
+                    json!({"error": error})
+                }
             }
+        } else {
+            crate::agent_ops::send_via_api_bridge(home, &req)
         }
     };
-    // Add warning for report kind without parent_id
     let mut result = result;
     if args["parent_id"].as_str().is_none() {
         attach_report_parent_warning(&mut result);
     }
     if is_ok_result(&result) {
-        // Mark dispatch as completed so timeout sweep doesn't false-warn.
         let cid = args["correlation_id"].as_str();
         crate::dispatch_tracking::mark_completed(home, cid, sender.as_str());
-        // #35896-11 ⑤ (Q2 vet): any kind=report+correlation auto-settles the
-        // SENDER's own delivering dispatch row (was gated on ack_inbox=true);
-        // sender-scoped via ack_by_correlation (#2647 isolation), ack_inbox now a
-        // no-op. The sender-scoped correlation prevents another agent's row
-        // from being settled by the same report.
         if let Some(cid) = cid.filter(|s| !s.is_empty()) {
             let settled = crate::inbox::ack_by_correlation(home, sender.as_str(), cid);
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("inbox_settled".to_string(), json!(settled));
             }
         }
-        // #2537/#2524 P6 PR-1: best-effort — a ledger write failure doesn't
-        // fail the report (it already landed).
         record_triaged_if_present(home, sender.as_str(), triaged);
-        // Sprint 53 P0-Y: do NOT auto-unbind here. Every kind=report reply
-        // (progress update OR final done) landed in this handler, so the
-        // prior auto-unbind tore down the binding on the first progress
-        // update — Phase 1 trailer stopped firing on subsequent commits,
-        // P0-X release_worktree refused ("no binding"), Phase 4 GC saw
-        // zero candidates (unbind doesn't write released_at; only
-        // release()/release_full() do), and orphan worktrees accumulated.
-        // `release_worktree` MCP tool is now the single source of truth
         // for binding lifecycle. Sprint 54 candidates: explicit `task_done`
         // flag in report envelope, or lifecycle rework with auto
         // release_full on that explicit signal.
@@ -321,6 +277,7 @@ pub(super) fn handle_request_information(
     home: &Path,
     args: &Value,
     sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
 ) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("request_information");
@@ -338,16 +295,30 @@ pub(super) fn handle_request_information(
     if let Some(ctx) = args["context"].as_str() {
         msg.push_str(&format!("\n\nContext: {ctx}"));
     }
-    send_to(home, sender, target, &msg, "query", None)
+    let req = send_request_from_args(sender.as_str(), target, &msg, Some("query"), args);
+    if let Some(rt) = runtime {
+        match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
+            crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
+                json!({"target": target, "delivery_mode": delivery_mode})
+            }
+            crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
+                json!({"error": error})
+            }
+        }
+    } else {
+        crate::agent_ops::send_via_api_bridge(home, &req)
+    }
 }
 
-pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_broadcast(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("broadcast");
     };
-    // Also validated in `handle_unified_send` before routing here — repeated
-    // so a direct call to this handler (bypassing the unified dispatch) is
-    // still covered.
     if let Some(err) = validate_request_kind(args) {
         return err;
     }
@@ -381,7 +352,20 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
     let mut sent = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
     for target in &targets {
-        let result = send_to(home, sender, target, message, kind, Some(&broadcast_ctx));
+        let mut req = send_request_from_args(sender.as_str(), target, message, Some(kind), args);
+        req.broadcast_context = Some(broadcast_ctx.clone());
+        let result = if let Some(rt) = runtime {
+            match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
+                crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
+                    json!({"target": target, "delivery_mode": delivery_mode})
+                }
+                crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
+                    json!({"error": error})
+                }
+            }
+        } else {
+            crate::agent_ops::send_via_api_bridge(home, &req)
+        };
         if result.get("error").is_some() {
             failed.push(json!({"target": target, "error": result["error"]}));
         } else {

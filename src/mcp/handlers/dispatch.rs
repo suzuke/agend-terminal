@@ -280,7 +280,9 @@ adapter!(
     hais,
     instance::handle_set_waiting_on
 );
-adapter!(dispatch_send, has, comms::handle_unified_send);
+pub(crate) fn dispatch_send(ctx: &HandlerCtx<'_>) -> Value {
+    comms::handle_unified_send(ctx.home, ctx.args, ctx.sender, ctx.runtime)
+}
 adapter!(dispatch_bind_self, has, worktree::handle_bind_self);
 adapter!(
     dispatch_binding_state,
@@ -1454,11 +1456,10 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Frozen Slice-11 target: exactly 8 same-daemon api::call production sites
-    /// remain in src/mcp/handlers/ after the runtime SPAWN leaves are extracted
-    /// (current production is still at 10, so this immutable RED must fail).
+    /// Frozen Slice-12 target: exactly 5 same-daemon api::call production sites
+    /// remain in src/mcp/handlers/ after SEND migration to typed runtime service.
     #[test]
-    fn production_api_call_baseline_is_8_2454() {
+    fn production_api_call_baseline_is_5_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
@@ -1487,8 +1488,8 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 8,
-            "production same-daemon api::call Slice-11 target must be exactly 8; got {count}"
+            count, 5,
+            "production same-daemon api::call post-Slice-12 must be exactly 5; got {count}"
         );
     }
 

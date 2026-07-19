@@ -8,7 +8,7 @@
 //! 3. **compose** — message body + force_meta
 //! 4. **lease** — optional `dispatch_auto_bind_lease` when `branch` set
 //! 5. **create** — optional auto board task after all rejectable checks
-//! 6. **send** — API SEND / inbox fallback via [`SendEnvelope`]
+//! 6. **send** — `execute_send` via neutral typed service (or API bridge fallback)
 //! 7. **track** — dispatch_tracking + UX + `auto_created_task_id` on success
 //!
 //! Loaded as a child of `comms` so `file_size_invariant` keeps `comms.rs` under
@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::super::comms_gates::{self, DispatchPreChecks};
+use super::super::dispatch::RuntimeContext;
 use super::super::dispatch_hook;
-use super::super::send_envelope::SendEnvelope;
 use super::super::{err_needs_identity, is_ok_result, require_instance};
 
 // #6: pub(crate) so ci/review_workspace_tests.rs can drive the validation
@@ -441,9 +441,9 @@ struct DeliveryCtx<'a> {
     auto_created_task_id: Option<String>,
 }
 
-/// Phase 6 — SEND via API with envelope fallback.
-fn deliver_delegate(ctx: &DeliveryCtx<'_>) -> Value {
-    let env = SendEnvelope {
+/// Phase 6 — SEND via neutral service (runtime=Some) or API bridge (runtime=None).
+fn deliver_delegate(ctx: &DeliveryCtx<'_>, runtime: Option<&RuntimeContext>) -> Value {
+    let req = crate::agent_ops::messaging::SendRequest {
         from: ctx.sender.as_str().to_string(),
         target: ctx.target.to_string(),
         text: ctx.msg.to_string(),
@@ -454,57 +454,41 @@ fn deliver_delegate(ctx: &DeliveryCtx<'_>) -> Value {
         force_meta: ctx.force_meta_json.clone(),
         provenance: Some(json!({ "from": ctx.sender.as_str(), "task": ctx.task })),
         branch: ctx.args["branch"].as_str().map(String::from),
-        ..SendEnvelope::directives_from_args(ctx.args)
+        correlation_id: ctx.args["correlation_id"].as_str().map(String::from),
+        reviewed_head: ctx.args["reviewed_head"].as_str().map(String::from),
+        report_purpose: ctx.args["report_purpose"].as_str().map(String::from),
+        code_review: ctx
+            .args
+            .get("code_review")
+            .filter(|v| !v.is_null())
+            .cloned(),
+        eta_minutes: ctx.args["eta_minutes"].as_u64(),
+        reporting_cadence: ctx.args["reporting_cadence"].as_str().map(String::from),
+        worktree_binding_required: ctx.args["worktree_binding_required"].as_bool(),
+        expect_reply_within_secs: ctx.args["expect_reply_within_secs"].as_i64(),
+        terminal: ctx.args["terminal"].as_bool(),
+        no_report_expected: ctx.args["no_report_expected"].as_bool(),
+        delivery_nonce: ctx.args["delivery_nonce"].as_str().map(String::from),
+        broadcast_context: None,
+        priority: ctx.args["priority"].as_str().map(String::from),
     };
-    match crate::api::call(
-        ctx.home,
-        &json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "method": crate::api::method::SEND,
-            "params": env.to_send_params(),
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": ctx.target}),
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-        Err(e) => {
-            let inbox_msg = env.to_inbox_message();
-            crate::agent_ops::fallback_deliver(
-                ctx.home,
-                ctx.sender.as_str(),
-                ctx.target,
-                ctx.msg,
-                inbox_msg,
-                &e,
-            )
+    if let Some(rt) = runtime {
+        match crate::agent_ops::messaging::execute_send(ctx.home, &rt.registry, req) {
+            crate::agent_ops::messaging::SendOutcome::Success { .. } => {
+                json!({"target": ctx.target})
+            }
+            crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
+                json!({"error": error})
+            }
         }
+    } else {
+        crate::agent_ops::send_via_api_bridge(ctx.home, &req)
     }
 }
 
-/// Phase 7 — post-success tracking / UX / auto_created_task_id.
+/// Phase 7 — post-success UX / auto_created_task_id.
 fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
     if is_ok_result(&result) {
-        let task_id = ctx.task_id.map(str::to_string);
-        let status = if ctx.args["no_report_expected"].as_bool().unwrap_or(false) {
-            "no_report_expected"
-        } else {
-            "pending"
-        };
-        crate::dispatch_tracking::track_dispatch(
-            ctx.home,
-            crate::dispatch_tracking::DispatchEntry {
-                task_id: task_id.clone(),
-                from: ctx.sender.as_str().to_string(),
-                to: ctx.target.to_string(),
-                from_id: crate::agent::resolve_instance(ctx.home, ctx.sender.as_str())
-                    .ok()
-                    .map(|(id, _)| id.full()),
-                to_id: crate::agent::resolve_instance(ctx.home, ctx.target)
-                    .ok()
-                    .map(|(id, _)| id.full()),
-                delegated_at: chrono::Utc::now().to_rfc3339(),
-                status: status.to_string(),
-            },
-        );
         if let Some(branch) = ctx.args["branch"].as_str() {
             tracing::info!(
                 target = %ctx.target,
@@ -517,7 +501,7 @@ fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
             from: ctx.sender.as_str().to_string(),
             to: ctx.target.to_string(),
             summary: ctx.task.to_string(),
-            task_id,
+            task_id: ctx.task_id.map(str::to_string),
         }));
     }
     if let Some(tid) = ctx.auto_created_task_id.as_ref() {
@@ -529,7 +513,12 @@ fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
 }
 
 /// Ordered choreography for MCP `delegate_task` / unified send kind=task.
-pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(crate) fn handle_delegate_task(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let resolved = match resolve_delegate(home, args, sender) {
         Ok(r) => r,
         Err(e) => return e,
@@ -546,10 +535,6 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
 
     let composed = compose_delegate_message(task, args, &checks);
 
-    // t-…-17 reviewer-assignment marker gate — fail-closed, BEFORE any bind/create/
-    // deliver side effect. A dispatch WITHOUT the marker skips this entirely and is
-    // byte-identical to the legacy path. On success it yields the validated canonical
-    // repo slug, which the store dispatch (A1) keys the record on.
     let review_assignment_repo = if checks.review_assignment {
         match review_assignment::validate_review_assignment_marker(
             home, sender, target, args, &checks,
@@ -561,24 +546,37 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         None
     };
 
-    if !checks.review_assignment {
+    if !checks.review_assignment && runtime.is_some() {
         if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
             return e;
         }
     }
 
-    // t-…-17 C11: the marker path delivers via the DURABLE outbox store (A1→A2→A3),
-    // NOT `deliver_delegate`, and bypasses `maybe_auto_create_task` (the store owns
-    // the assignment record). Returns here; the legacy path below is untouched
-    // (byte-identical) for a non-marker dispatch.
     if let Some(repo_slug) = review_assignment_repo {
         return review_assignment::dispatch_review_assignment_via_store(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
     }
 
-    let (effective_task_id, auto_created_task_id) =
-        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required);
+    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
+    // durable mutations (task-create/delivery). Placed after the
+    // review_assignment early-return to preserve that path byte-for-byte.
+    if runtime.is_none() && args["branch"].as_str().is_some_and(|b| !b.is_empty()) {
+        return json!({
+            "ok": false,
+            "error": "branch dispatch requires in-process runtime",
+            "code": "runtime_unavailable_branch_2454",
+            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
+        });
+    }
+
+    let (effective_task_id, auto_created_task_id) = if runtime.is_some() {
+        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required)
+    } else {
+        // runtime=None: let the daemon auto-create atomically via the
+        // API bridge — pass the original (possibly missing) task_id through.
+        (args["task_id"].as_str().map(String::from), None)
+    };
     let task_id_str = effective_task_id.as_deref();
     let mut msg = composed.msg;
     if let Some(tid) = task_id_str {
@@ -596,7 +594,7 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         force_meta_json: composed.force_meta_json,
         auto_created_task_id,
     };
-    let result = deliver_delegate(&ctx);
+    let result = deliver_delegate(&ctx, runtime);
     track_delegate_success(&ctx, result)
 }
 

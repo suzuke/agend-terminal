@@ -18,6 +18,7 @@ pub enum NotifySource<'a> {
     /// Message from a channel user (Telegram, Discord, etc.).
     Channel(&'a str, crate::channel::ChannelKind),
     /// Message from another agent instance (e.g., "dev").
+    #[cfg(test)]
     Agent(&'a str),
     /// System message (e.g., "replace", "ci").
     System(&'a str),
@@ -33,6 +34,7 @@ impl fmt::Display for NotifySource<'_> {
                 };
                 write!(f, "user:{user} via {kind_str}")
             }
+            #[cfg(test)]
             Self::Agent(name) => write!(f, "from:{name}"),
             Self::System(label) => write!(f, "system:{label}"),
         }
@@ -45,6 +47,7 @@ impl NotifySource<'_> {
             Self::Channel(_, _) => {
                 "\n(Reply using the reply tool — do NOT respond with direct text)".into()
             }
+            #[cfg(test)]
             Self::Agent(sender) => {
                 format!("\n(Reply using the send tool with instance=\"{sender}\")").into()
             }

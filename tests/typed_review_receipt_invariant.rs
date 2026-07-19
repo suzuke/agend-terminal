@@ -17,7 +17,7 @@ fn read_source_file(path: impl AsRef<Path>) -> String {
 
 #[test]
 fn validated_receipt_is_the_single_pr_effect_funnel_2760() {
-    let messaging = read_source_file("src/api/handlers/messaging.rs");
+    let messaging = read_source_file("src/agent_ops/messaging.rs");
     let pr_state = read_source_file("src/daemon/pr_state/mod.rs");
     let buffer = read_source_file("src/daemon/pr_state/verdict_buffer.rs");
     let auto_release = read_source_file("src/daemon/auto_release.rs");
@@ -70,7 +70,6 @@ fn validated_receipt_is_the_single_pr_effect_funnel_2760() {
     let bridge = messaging
         .split("fn bridge_verdict_to_review_task")
         .nth(1)
-        .and_then(|tail| tail.split("// ── Orchestrator").next())
         .expect("bridge body");
     assert!(bridge.contains("msg.validated_code_review.as_ref()"));
     for forbidden in [

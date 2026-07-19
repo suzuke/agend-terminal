@@ -525,6 +525,7 @@ mod review_assignment_marker_tests {
                 "reviewed_head": EXACT_HEAD,
             }),
             &sender,
+            None,
         );
         assert_eq!(out["code"], "review_assignment_missing_task_id", "{out}");
         // ZERO side effects: no task auto-created on the board.
@@ -562,7 +563,7 @@ mod review_assignment_marker_tests {
             if !pr.is_null() {
                 args["pr_number"] = pr;
             }
-            let out = handle_delegate_task(&home, &args, &sender);
+            let out = handle_delegate_task(&home, &args, &sender, None);
             assert_eq!(
                 out["code"], "review_assignment_missing_pr_number",
                 "pr_number {label} must atomically reject: {out}"
@@ -630,6 +631,7 @@ mod review_assignment_marker_tests {
                 "reviewed_head": EXACT_HEAD,
             }),
             &sender,
+            None,
         );
         assert_eq!(
             out["code"], "review_assignment_missing_review_author",

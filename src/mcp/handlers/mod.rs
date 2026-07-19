@@ -23,7 +23,6 @@ mod instance_queries;
 pub(crate) mod instance_state;
 mod restart;
 mod schedule;
-mod send_envelope;
 mod task;
 mod usage_limit_takeover;
 #[cfg(test)]
@@ -95,6 +94,20 @@ pub(super) fn require_instance(args: &Value) -> Result<&str, Value> {
 // Re-export for tests that use `use super::*`.
 #[cfg(test)]
 use instance::resolve_team_layout;
+
+#[cfg(test)]
+pub fn minimal_test_runtime() -> dispatch::RuntimeContext {
+    dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: None,
+        shutdown: None,
+    }
+}
 
 #[cfg(test)]
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {

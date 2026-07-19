@@ -2,6 +2,15 @@ use super::*;
 use serde_json::json;
 use serial_test::serial;
 
+fn handle_tool_rt(tool: &str, args: &Value, instance_name: &str) -> Value {
+    super::handle_tool_with_runtime(
+        tool,
+        args,
+        instance_name,
+        Some(super::minimal_test_runtime()),
+    )
+}
+
 fn tmp_home(name: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -125,34 +134,6 @@ fn save_metadata_creates_dir() {
     assert!(!home.join("metadata").exists());
     save_metadata(&home, "agent1", "key", json!("value"));
     assert!(home.join("metadata").exists());
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// get_submit_key tests
-use crate::agent_ops::get_submit_key;
-
-#[test]
-fn get_submit_key_default() {
-    let home = tmp_home("submit_key");
-    // No fleet.yaml → default \r
-    let key = get_submit_key(&home, "agent1");
-    assert_eq!(key, "\r");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn get_submit_key_from_fleet() {
-    let home = tmp_home("submit_key_fleet");
-    let yaml = r#"defaults:
-  backend: claude
-instances:
-  dev:
-    role: "Developer"
-"#;
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
-    let key = get_submit_key(&home, "dev");
-    // Claude Code preset submit_key is "\r" or similar
-    assert!(!key.is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -285,7 +266,7 @@ fn delegate_task_emits_fleet_event() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_delegate");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
@@ -333,7 +314,7 @@ fn report_result_emits_with_correlation_id() {
     // Pin: task_id must source from the `correlation_id` arg, not
     // any other string field. Use a distinctive value so a stray
     // field aliasing bug would fail the assert below.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -398,7 +379,7 @@ fn bind_persists_across_kind_report_reply() {
 
     // Issue a kind=report reply — handle_report_result is the same path
     // production lands in via handle_unified_send.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -442,7 +423,7 @@ fn report_result_empty_correlation_id_maps_to_none() {
     // Pin: empty `correlation_id` must collapse to None so the
     // renderer omits the id rather than showing "()" — filter-empty
     // is the specified normalization.
-    let _ = handle_tool(
+    let _ = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -590,7 +571,7 @@ fn broadcast_emits_with_resolved_recipients() {
     // `sender` out before computing the recipient set. Pin: the
     // emitted `recipients` field comes from the filtered `sent`
     // vec, NOT from the raw `args["instances"]`.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "message": "heads up",
@@ -632,7 +613,7 @@ fn broadcast_empty_targets_does_not_emit() {
     // `instances: ["sender"]` — all recipients are the sender itself,
     // so the self-filter leaves `sent` empty. Pin: skip-emit on
     // empty fan-out so fleet_binding isn't spammed with "a → *0".
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "message": "alone",
@@ -663,7 +644,7 @@ fn send_to_instance_does_not_emit_fleet_event() {
 
     // send_to_instance takes `instance` — use the real arg shape so the
     // negative pin actually exercises the success path.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "message": "hi"}),
         "sender",
@@ -738,7 +719,7 @@ fn delegate_task_main_response_clean_when_provenance_fails() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_prov_main_clean");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
@@ -804,7 +785,7 @@ fn delegate_task_provenance_failure_logs_tracing_warn() {
     // the warn fires inside handle_send when provenance params are
     // present but no active channel exists. The MCP layer passes
     // provenance via SEND params; API layer handles injection.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
@@ -1205,7 +1186,7 @@ fn test_send_to_nonexistent_target_returns_error_and_no_inbox() {
     let home = tmp_home("send-nonexist");
     std::env::set_var("AGEND_HOME", &home);
     // No fleet.yaml → target doesn't exist anywhere.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "ghost-agent", "message": "hello"}),
         "sender",
@@ -1240,7 +1221,7 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "dev", "task": "test task", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture"}),
         "dev-impl",
@@ -1268,31 +1249,6 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
 }
 
 // --- Sprint 6: delivery_mode ---
-
-#[test]
-fn test_send_to_inbox_fallback_mode() {
-    // Daemon down → fallback path → delivery_mode = "inbox_fallback"
-    let _g = fleet_test_guard();
-    let home = tmp_home("delivery-fallback");
-    std::fs::write(
-        crate::fleet::fleet_yaml_path(&home),
-        "instances:\n  receiver:\n    backend: claude\n",
-    )
-    .ok();
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
-        "send",
-        &json!({"instance": "receiver", "message": "test"}),
-        "sender",
-    );
-    assert_eq!(
-        result["delivery_mode"].as_str(),
-        Some("inbox_fallback"),
-        "daemon-down path must set delivery_mode=inbox_fallback: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
 
 #[test]
 // TODO(#701): DI refactor 後可移除 #[serial]
@@ -1383,7 +1339,7 @@ fn test_delegate_task_busy_returns_structured_response() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "new work", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
@@ -1418,7 +1374,7 @@ fn delegate_task_no_report_expected_records_terminal_status_2099() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
 
-    let flagged = handle_tool(
+    let flagged = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "fire and forget", "message": "fire and forget", "request_kind": "task", "task_id": "t-ff", "no_report_expected": true}),
         "sender",
@@ -1428,7 +1384,7 @@ fn delegate_task_no_report_expected_records_terminal_status_2099() {
         "flagged dispatch must succeed: {flagged}"
     );
 
-    let normal = handle_tool(
+    let normal = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-normal"}),
         "sender",
@@ -1486,7 +1442,7 @@ fn test_delegate_task_enriching_same_task_id_bypasses_busy_gate_1496() {
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": &tid}));
 
     // Enriching dispatch: same task_id AND same branch as the target's active task.
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "full context", "message": "full context", "request_kind": "task", "branch": "feat/x", "task_id": tid}),
         "sender",
@@ -1526,7 +1482,7 @@ fn test_delegate_task_force_true_bypasses_busy_gate() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true, "force_reason": "critical bug"}),
         "sender",
@@ -1568,7 +1524,7 @@ fn delegate_task_forwards_dispatch_directives_high1() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("delegate-directives");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -1632,7 +1588,7 @@ fn test_delegate_task_force_true_without_reason_rejected() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true}),
         "sender",
@@ -1666,7 +1622,7 @@ fn test_dispatch_dedup_rejects_same_branch() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -1705,7 +1661,7 @@ fn test_dispatch_dedup_force_bypasses_branch_gate() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -1747,7 +1703,7 @@ fn test_dispatch_dedup_different_branch_passes() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -1789,7 +1745,7 @@ fn test_dispatch_dedup_query_kind_not_affected() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -1822,7 +1778,7 @@ fn test_delegate_task_idle_target_normal_delivery() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
     // No claimed tasks for target
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
@@ -1847,7 +1803,7 @@ fn test_delegate_task_second_reviewer_flag_requires_reason() {
     )
     .ok();
     std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "review PR", "message": "review PR", "request_kind": "task", "task_id": "t-test-fixture", "second_reviewer": true}),
         "sender",
@@ -1873,7 +1829,7 @@ fn test_delegate_task_second_reviewer_with_reason_ok() {
     )
     .ok();
     std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -1905,7 +1861,7 @@ fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
     )
     .ok();
     std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
@@ -1962,6 +1918,151 @@ fn test_interrupt_handler_validates_target() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// --- #2454 atomicity regression: runtime=None fail-closed ---
+
+/// #2454 regression: kind=task without task_id + no runtime (daemon unavailable)
+/// must NOT leave an orphaned auto-created task on the board.
+#[test]
+fn delegate_task_no_runtime_no_task_id_leaves_board_unchanged_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("2454-no-runtime-no-tid");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let board_before = crate::tasks::handle(&home, "sender", &json!({"action": "list"}));
+    let count_before = board_before["tasks"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    // handle_tool passes runtime=None → bridge → daemon unavailable
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "something",
+            "message": "something",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_some(),
+        "#2454: no-runtime send must fail: {result}"
+    );
+
+    let board_after = crate::tasks::handle(&home, "sender", &json!({"action": "list"}));
+    let count_after = board_after["tasks"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(
+        count_before, count_after,
+        "#2454: board must be unchanged after failed no-runtime send (no orphaned auto-task)"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 regression: branch dispatch + no runtime must fail closed BEFORE
+/// any durable side effects (binding, ci-watch arming, task creation).
+#[test]
+fn delegate_task_no_runtime_branch_dispatch_fails_before_mutation_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("2454-no-runtime-branch");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "implement feature",
+            "message": "implement feature",
+            "request_kind": "task",
+            "task_id": "t-test-fixture",
+            "branch": "feat/something",
+        }),
+        "sender",
+    );
+    assert_eq!(
+        result["ok"].as_bool(),
+        Some(false),
+        "#2454: branch dispatch must return ok:false: {result}"
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("runtime"),
+        "#2454: branch dispatch must fail with a pre-mutation error, got: {err}"
+    );
+    assert_eq!(
+        result["code"].as_str(),
+        Some("runtime_unavailable_branch_2454"),
+        "#2454: structured error must carry exact code: {result}"
+    );
+    // No binding must exist — the error fired BEFORE maybe_auto_bind_lease.
+    assert!(
+        crate::binding::read(&home, "target").is_none(),
+        "#2454: no binding must be created on failed branch dispatch"
+    );
+    // No task auto-created.
+    let board = crate::tasks::handle(&home, "sender", &json!({"action": "list"}));
+    let count = board["tasks"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "#2454: no task must be auto-created on failed branch dispatch"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 regression: empty branch + no runtime must NOT hit the branch guard —
+/// it falls through to the bridge path (which fails for its own reason: no
+/// daemon). This pins that the guard is branch-specific, not a blanket block.
+#[test]
+fn delegate_task_no_runtime_empty_branch_bypasses_guard_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("2454-no-runtime-empty-branch");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "implement feature",
+            "message": "implement feature",
+            "request_kind": "task",
+            "task_id": "t-test-fixture",
+            "branch": "",
+        }),
+        "sender",
+    );
+    // Must NOT carry the branch guard code — bridge failure is acceptable.
+    assert_ne!(
+        result["code"].as_str(),
+        Some("runtime_unavailable_branch_2454"),
+        "#2454: empty branch must not trigger the branch guard: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // --- Sprint 10: backwards-compat for old interrupt/reason names ---
 
 #[test]
@@ -1983,7 +2084,7 @@ fn test_delegate_task_old_interrupt_field_no_longer_bypasses_busy_gate() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({"instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "interrupt": true, "reason": "legacy caller"}),
         "sender",
@@ -2217,7 +2318,8 @@ fn create_instance_explicit_working_directory_used() {
 fn send_kind_task_maps_message_field_to_task() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "do X", "request_kind": "task", "task_id": "t-test-fixture"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     // Whatever error/success we observe, it must NOT be the field-name bug:
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
@@ -2233,7 +2335,8 @@ fn send_kind_task_maps_message_field_to_task() {
 fn send_kind_query_maps_message_field_to_question() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "what?", "request_kind": "query"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
         err, "missing 'question'",
@@ -2250,7 +2353,8 @@ fn send_kind_query_maps_message_field_to_question() {
 fn send_unknown_request_kind_rejected_2620() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi", "request_kind": "bogus"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2270,7 +2374,7 @@ fn broadcast_unknown_request_kind_rejected_2620() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let home = std::env::temp_dir();
     let args = json!({"instances": ["a", "b"], "message": "hi", "request_kind": "bogus"});
-    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
+    let result = super::comms::handle_broadcast(&home, &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2288,7 +2392,8 @@ fn send_valid_request_kinds_pass_validation_2620() {
     for kind in ["task", "report", "query", "update"] {
         let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
         let args = json!({"instance": "dev", "message": "hi", "request_kind": kind, "task_id": "t-test-fixture"});
-        let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+        let result =
+            super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
         let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             !err.contains("unknown request_kind"),
@@ -2306,7 +2411,8 @@ fn send_valid_request_kinds_pass_validation_2620() {
 fn send_non_string_request_kind_rejected_2639() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi", "request_kind": 123});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2324,7 +2430,8 @@ fn send_non_string_request_kind_rejected_2639() {
 fn send_null_request_kind_rejected_2639() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi", "request_kind": null});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result
         .get("error")
         .and_then(|v| v.as_str())
@@ -2342,7 +2449,8 @@ fn send_null_request_kind_rejected_2639() {
 fn send_absent_request_kind_still_passes_2639() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("request_kind"),
@@ -2689,7 +2797,7 @@ fn update_team_fallback_to_direct_when_daemon_unreachable() {
 fn broadcast_without_targets_rejects_no_selector() {
     let sender = crate::identity::Sender::new("sender").expect("valid sender");
     let args = json!({"message": "hello all"});
-    let result = super::comms::handle_broadcast(&std::env::temp_dir(), &args, &Some(sender));
+    let result = super::comms::handle_broadcast(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("recipient"),
@@ -2712,7 +2820,7 @@ fn broadcast_with_team_filter_targets_team_members() {
     .ok();
     let sender = crate::identity::Sender::new("sender").expect("valid sender");
     let args = json!({"message": "team msg", "team": "dev2"});
-    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
+    let result = super::comms::handle_broadcast(&home, &args, &Some(sender), None);
     let sent = result["sent_to"].as_array();
     if let Some(sent) = sent {
         let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
@@ -2927,7 +3035,7 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
                 orchestrator: lead\n    created_at: \"2026-04-30T00:00:00Z\"\n";
     std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "dev",
@@ -2968,7 +3076,7 @@ fn m5_regression_via_id_routing() {
     );
     std::fs::write(crate::fleet::fleet_yaml_path(&home), &yaml).ok();
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "dev",
@@ -3061,7 +3169,7 @@ fn send_kind_task_auto_create_puts_task_on_board() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-no-id");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -3092,7 +3200,7 @@ fn send_kind_task_missing_target_no_orphan_task() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("no-orphan-missing");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "message": "do",
@@ -3118,7 +3226,7 @@ fn send_kind_task_self_send_no_orphan_task() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("no-orphan-self");
 
-    let _result = handle_tool(
+    let _result = handle_tool_rt(
         "send",
         &json!({
             "instance": "sender",
@@ -3141,7 +3249,7 @@ fn send_kind_task_invalid_target_no_orphan_task() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("no-orphan-invalid");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "///bad-name///",
@@ -3168,7 +3276,7 @@ fn send_kind_task_with_task_id_succeeds() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-with-id");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -3198,7 +3306,7 @@ fn send_non_task_kinds_without_task_id_still_work() {
     ];
     for (kind, message) in cases {
         let (_rec, home) = setup_recorder(&format!("anti-stall-{kind}-ok"));
-        let result = handle_tool(
+        let result = handle_tool_rt(
             "send",
             &json!({
                 "instance": "target",
@@ -3235,7 +3343,7 @@ fn send_with_invalid_task_id_format_rejects() {
         "x",             // too short
     ];
     for bad in &bad_ids {
-        let result = handle_tool(
+        let result = handle_tool_rt(
             "send",
             &json!({
                 "instance": "target",
@@ -3264,7 +3372,7 @@ fn send_kind_task_without_task_id_auto_creates_board_task() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-hint");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -3297,7 +3405,7 @@ fn send_kind_task_broadcast_path_also_requires_task_id() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-broadcast");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instances": ["alpha", "beta"],
@@ -3325,7 +3433,7 @@ fn send_default_kind_without_task_id_still_works() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-default-kind");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "instance": "target",
@@ -3351,7 +3459,7 @@ fn task_id_required_stable_code_on_team_broadcast() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-stable-code");
 
-    let result = handle_tool(
+    let result = handle_tool_rt(
         "send",
         &json!({
             "team": "dev",
@@ -3500,7 +3608,7 @@ fn fallback_send_preserves_query_kind_survives_clear_med5() {
     let (_rec, home) = setup_recorder("med5-fallback-kind");
     // No daemon in tests → api::call fails → handle_send_to_instance's inbox
     // fallback (the fixed path). `kind` (not `request_kind`) routes here.
-    let r = handle_tool(
+    let r = handle_tool_rt(
         "send",
         &json!({"instance": "target", "message": "are you there?", "kind": "query"}),
         "sender",
@@ -3659,7 +3767,8 @@ fn is_read_only_tool_allowlist() {
 fn send_mixed_selectors_instance_and_instances_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "a", "instances": ["b", "c"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3671,7 +3780,8 @@ fn send_mixed_selectors_instance_and_instances_rejected() {
 fn send_mixed_selectors_instance_and_team_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "a", "team": "myteam", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3683,7 +3793,8 @@ fn send_mixed_selectors_instance_and_team_rejected() {
 fn send_mixed_selectors_instance_and_tags_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "a", "tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3695,7 +3806,8 @@ fn send_mixed_selectors_instance_and_tags_rejected() {
 fn send_mixed_selectors_instances_and_team_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instances": ["a"], "team": "myteam", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3707,7 +3819,8 @@ fn send_mixed_selectors_instances_and_team_rejected() {
 fn send_mixed_selectors_instances_and_tags_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instances": ["a"], "tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3719,7 +3832,8 @@ fn send_mixed_selectors_instances_and_tags_rejected() {
 fn send_mixed_selectors_team_and_tags_rejected() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"team": "myteam", "tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("selector") || err.contains("conflict"),
@@ -3731,7 +3845,8 @@ fn send_mixed_selectors_team_and_tags_rejected() {
 fn send_tags_only_fail_closed() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"tags": ["dev"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         err.contains("tag") && (err.contains("not supported") || err.contains("not implemented")),
@@ -3743,7 +3858,8 @@ fn send_tags_only_fail_closed() {
 fn send_valid_selector_instance_only_no_selector_error() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instance": "target", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("selector") && !err.contains("conflict"),
@@ -3755,7 +3871,8 @@ fn send_valid_selector_instance_only_no_selector_error() {
 fn send_valid_selector_instances_only_no_selector_error() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"instances": ["a", "b"], "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("selector") && !err.contains("conflict"),
@@ -3767,7 +3884,8 @@ fn send_valid_selector_instances_only_no_selector_error() {
 fn send_valid_selector_team_only_no_selector_error() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"team": "myteam", "message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !err.contains("selector") && !err.contains("conflict"),
@@ -3783,7 +3901,7 @@ fn send_mixed_selectors_no_sidecar_side_effects() {
         "instance": "a", "tags": ["dev"], "message": "hi",
         "task_id": "t-selector-sidecar-test"
     });
-    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
     assert!(
         result.get("error").is_some(),
         "must reject mixed selectors: {result}"
@@ -3811,7 +3929,7 @@ fn send_tags_only_no_sidecar_side_effects() {
         "tags": ["dev"], "message": "hi",
         "task_id": "t-tags-sidecar-test"
     });
-    let result = super::comms::handle_unified_send(&home, &args, &Some(sender));
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
     assert!(
         result.get("error").is_some(),
         "must reject tags-only: {result}"
@@ -3833,7 +3951,8 @@ fn send_tags_only_no_sidecar_side_effects() {
 fn send_zero_selectors_returns_typed_missing_selector() {
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({"message": "hi"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
     assert_eq!(
         code, "missing_selector",

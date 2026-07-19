@@ -2023,37 +2023,24 @@ fn b6_non_codex_backend_pty_path_unchanged_by_override() {
 // empirically reliable 4/4 fire+execute). Both paths emit the SAME short
 // `[AGEND-MSG-PENDING]` hint. Body stays in inbox JSONL (durable).
 
-/// T1 (#1065 RED): structural pin — handle_send must route the PTY
-/// delivery path through `enqueue_with_idle_hint` (NOT
-/// `compose_aware_send`). Pre-fix code contains `compose_aware_send(`
-/// at the inject site; post-fix code uses `enqueue_with_idle_hint`.
+/// T1 (#1065 RED): structural pin — the SEND delivery path must route
+/// through `enqueue_with_idle_hint` (NOT `compose_aware_send`).
+/// Post-#2454 the routing logic lives in the neutral service
+/// (`agent_ops/messaging.rs`), not in the thin API adapter.
 #[test]
 fn handle_send_routes_through_enqueue_with_idle_hint() {
-    let source = include_str!("../messaging.rs");
-    // Strip the test module so we only inspect the production handler.
-    // Tests pin the GREEN-side wiring; the structural-pin assertion
-    // applies to handle_send's body, not to test fixture code.
-    let prod_end = source
-        .find("#[cfg(test)]")
-        .expect("messaging.rs must have a #[cfg(test)] tests module");
+    let source = include_str!("../../../agent_ops/messaging.rs");
+    let prod_end = source.find("#[cfg(test)]").unwrap_or(source.len());
     let prod_src = &source[..prod_end];
-    // #t-3 audit: require the CALL form (trailing `(`) so a mere comment
-    // or doc mention of the symbol can't satisfy the invariant — the
-    // production handler must actually invoke it. Behavioral coverage of
-    // the body persistence lives in `kind_task_body_persisted_in_inbox_jsonl`;
-    // the [AGEND-MSG-PENDING] vs [AGEND-MSG] header difference can't be
-    // observed in a unit test (needs a live PTY agent handle), so this
-    // structural call-form pin is the honest scope here.
     assert!(
         prod_src.contains("enqueue_with_idle_hint("),
-        "#1065 invariant: handle_send must CALL enqueue_with_idle_hint( \
+        "#1065 invariant: neutral service must CALL enqueue_with_idle_hint( \
              (same path as daemon auto-wake), not merely mention it"
     );
     assert!(
         !prod_src.contains("compose_aware_send("),
-        "#1065 invariant: handle_send must NOT use compose_aware_send \
-             for the inject site post-#1065 — the unified routing emits \
-             [AGEND-MSG-PENDING] hint instead of [AGEND-MSG] header"
+        "#1065 invariant: neutral service must NOT use compose_aware_send \
+             for the inject site post-#1065"
     );
 }
 
@@ -3683,6 +3670,62 @@ fn empty_reporter_refresh_issued_at_leaves_sidecar_unchanged() {
     assert_eq!(
         original, current,
         "empty reporter must NOT refresh issued_at"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn flat_review_fields_rejected_before_typed_conversion_2454() {
+    let home = tmp_home("2454-flat-smuggle");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let flat_keys = [
+        "assignment_id",
+        "verdict",
+        "evidence_digest",
+        "receipt_id",
+        "source_id",
+        "source_ids",
+        "review_receipt",
+        "validated_code_review",
+    ];
+    for kind in ["report", "task", "query", "update"] {
+        for key in flat_keys {
+            let mut params = json!({
+                "from": "alice",
+                "target": "bob",
+                "text": "hello",
+                "kind": kind,
+            });
+            params[key] = json!("smuggled");
+            let result = handle_send(&params, &test_ctx(&home));
+            assert_eq!(
+                result["ok"], false,
+                "kind={kind} with flat {key} must reject: {result}"
+            );
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("inside the typed code_review object"),
+                "flat {key} must cite typed object restriction: {result}"
+            );
+        }
+    }
+    let valid_nested = json!({
+        "from": "alice",
+        "target": "bob",
+        "text": "hello",
+        "kind": "report",
+        "code_review": {"assignment_id": "a-1", "verdict": "verified", "evidence_digest": "x"},
+    });
+    let result = handle_send(&valid_nested, &test_ctx(&home));
+    assert!(
+        !result
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("inside the typed code_review object")),
+        "nested code_review must NOT be rejected as flat smuggling: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
