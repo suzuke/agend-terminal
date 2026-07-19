@@ -51,16 +51,18 @@ fn agent_is_alive_doc_drops_parking_lot_poison_claim_app_tui() {
 /// the deferral nor the clear.
 #[test]
 fn terminal_resize_arm_performs_ghost_clear_app_tui() {
-    let src = include_str!("mod.rs");
+    // #2453 Slice 2: the event match moved into
+    // `AppState::handle_crossterm_event` (app_state.rs); same arm, same pin.
+    let src = include_str!("app_state.rs");
 
     let start = src
         .find("Event::Resize(cols, rows) => {")
-        .expect("Event::Resize arm must exist in the TUI event loop");
-    // The unique `recv(wakeup_rx)` crossbeam select branch sits just after the
-    // event-match block and cleanly bounds the Resize arm body.
+        .expect("Event::Resize arm must exist in handle_crossterm_event");
+    // The method's tail `LoopFlow::Continue` follows the event-match block and
+    // cleanly bounds the Resize arm body.
     let rel_end = src[start..]
-        .find("recv(wakeup_rx)")
-        .expect("recv(wakeup_rx) branch must follow and bound the Resize arm");
+        .find("LoopFlow::Continue")
+        .expect("LoopFlow::Continue tail must follow and bound the Resize arm");
     let arm = &src[start..start + rel_end];
 
     // Sanity: the buggy arm still calls resize_panes inline; if not, drift.
