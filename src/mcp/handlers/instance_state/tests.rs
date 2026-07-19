@@ -153,6 +153,42 @@ fn create_instance_team_delayed_injection_captures_runtime_and_spawned_2454() {
     }
 }
 
+/// #2855 gate 4: `full_delete_instance_with_runtime` must reject an invalid
+/// (traversal) name with canonical `validate_name` semantics BEFORE the
+/// LifecyclePermit / deleting-mark / any filesystem or store mutation. The
+/// adjacent sentinel derived from `workspace_dir(home)/join(name)` must stay
+/// intact.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn full_delete_rejects_invalid_name_before_permit_or_mutation_2855() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("full-delete-invalid-2855");
+    let sentinel_dir = crate::paths::workspace_dir(&home).join("../g4v-2855");
+    std::fs::create_dir_all(&sentinel_dir).unwrap();
+    let marker = sentinel_dir.join("marker.txt");
+    std::fs::write(&marker, "sentinel").unwrap();
+
+    let result = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+        &home,
+        "../g4v-2855",
+        None,
+    );
+
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("invalid characters")),
+        "#2855: traversal name must be rejected with validate_name semantics \
+         before any permit/mutation; got {result:?}"
+    );
+    assert!(
+        marker.exists(),
+        "#2855: rejected delete must not touch the adjacent sentinel"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn delete_instance_denies_non_owner_non_orchestrator_audit2_002() {
