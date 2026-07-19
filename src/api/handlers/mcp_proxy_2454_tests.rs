@@ -40,8 +40,8 @@ fn send_structural_budget_and_reachability_2454() {
         }
     }
     assert_eq!(
-        handler_count, 5,
-        "Slice-12 cumulative api::call budget must be 5; got {handler_count}"
+        handler_count, 4,
+        "Slice-13 cumulative api::call budget must be 4; got {handler_count}"
     );
 
     // (b) dispatch_send must NOT be adapter! — custom fn threads RuntimeContext

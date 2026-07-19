@@ -80,19 +80,68 @@ pub(super) fn handle_task(home: &Path, args: &Value, instance_name: &str) -> Val
     crate::tasks::handle(home, instance_name, args)
 }
 
-pub(super) fn handle_create_team(home: &Path, args: &Value) -> Value {
-    match crate::api::call(
+/// #2454 Slice 13: thin MCP adapter — delegates to `team_ops::create`
+/// via the in-process RuntimeContext when available, or returns a
+/// structured transport failure when the runtime is absent.
+pub(super) fn handle_create_team(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
+    let Some(rt) = runtime else {
+        return json!({
+            "error": "runtime unavailable: team creation requires an in-process runtime"
+        });
+    };
+    let name = match args["name"].as_str() {
+        Some(n) => n.to_string(),
+        None => return json!({"error": "missing 'name'"}),
+    };
+    let per_member_backends: Vec<String> = if let Some(arr) = args["backends"].as_array() {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    } else {
+        let count = args["count"].as_u64().unwrap_or(0) as usize;
+        let backend = args["backend"].as_str().unwrap_or("claude").to_string();
+        vec![backend; count]
+    };
+    let topic_binding_mode: Option<String> = args["topic_binding"]
+        .as_str()
+        .filter(|s| matches!(*s, "skip" | "deferred"))
+        .map(String::from);
+    let existing_members: Vec<String> = args["members"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let accept_from: Vec<String> = args["accept_from"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    crate::team_ops::create(
         home,
-        &json!({"method": crate::api::method::CREATE_TEAM, "params": args}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            resp.get("result").cloned().unwrap_or_default()
-        }
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("create_team failed")})
-        }
-        Err(_) => crate::teams::create(home, args),
-    }
+        crate::team_ops::CreateTeamRequest {
+            name,
+            per_member_backends,
+            existing_members,
+            topic_binding_mode,
+            orchestrator: args["orchestrator"].as_str().map(String::from),
+            description: args["description"].as_str().map(String::from),
+            repository_path: args["repository_path"].as_str().map(String::from),
+            accept_from,
+        },
+        &rt.registry,
+        rt.notifier.as_deref(),
+    )
 }
 
 pub(super) fn handle_delete_team(home: &Path, args: &Value) -> Value {

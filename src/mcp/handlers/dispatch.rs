@@ -413,12 +413,12 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
     "description"  => instance::handle_set_description,  hai;
 ]);
 
-/// #2454 Slice 7: team update carries the owned runtime notifier into the
-/// transport-neutral roster service; other team actions retain their legacy
+/// #2454 Slice 7+13: team create and update carry the owned runtime into
+/// the transport-neutral service; other team actions retain their legacy
 /// adapter shapes.
 pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
-        "create" => task::handle_create_team(ctx.home, ctx.args),
+        "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
         "delete" => task::handle_delete_team(ctx.home, ctx.args),
         "list" => task::handle_list_teams(ctx.home),
         "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
@@ -1488,8 +1488,8 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 5,
-            "production same-daemon api::call post-Slice-12 must be exactly 5; got {count}"
+            count, 4,
+            "production same-daemon api::call post-Slice-13 must be exactly 4; got {count}"
         );
     }
 
