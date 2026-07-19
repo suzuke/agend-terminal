@@ -2825,6 +2825,91 @@ fn create_team_runtime_some_has_spawned_field_2454() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2454 Slice 13 RED: runtime=Some with a recording notifier must emit
+/// exactly one TeamCreated event with correct name+members, zero
+/// InstanceCreated events, and return API-equivalent ok/result/spawned.
+#[test]
+fn create_team_runtime_some_emits_team_created_event_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-event");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances: {}\nteams: {}\n",
+    )
+    .unwrap();
+    struct EventRecorder {
+        events: parking_lot::Mutex<Vec<crate::api::ApiEvent>>,
+    }
+    impl EventRecorder {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+        fn take(&self) -> Vec<crate::api::ApiEvent> {
+            std::mem::take(&mut *self.events.lock())
+        }
+    }
+    impl crate::api::ApiNotifier for EventRecorder {
+        fn notify(&self, event: crate::api::ApiEvent) {
+            self.events.lock().push(event);
+        }
+    }
+    let recorder = EventRecorder::new();
+    let notifier: std::sync::Arc<dyn crate::api::ApiNotifier> = recorder.clone();
+    let runtime = super::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: Some(notifier),
+        shutdown: None,
+    };
+    let result = super::handle_tool_with_runtime(
+        "team",
+        &json!({"action": "create", "name": "ev-team", "members": ["alice", "bob"]}),
+        "sender",
+        Some(runtime),
+    );
+    assert_eq!(
+        result.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "#2454: runtime=Some+notifier CREATE_TEAM must return ok:true: {result}"
+    );
+    let events = recorder.take();
+    let team_created_count = events
+        .iter()
+        .filter(|e| matches!(e, crate::api::ApiEvent::TeamCreated { .. }))
+        .count();
+    assert_eq!(
+        team_created_count, 1,
+        "#2454: exactly one TeamCreated event expected, got {team_created_count}: {events:?}"
+    );
+    if let Some(crate::api::ApiEvent::TeamCreated { name, members }) = events
+        .iter()
+        .find(|e| matches!(e, crate::api::ApiEvent::TeamCreated { .. }))
+    {
+        assert_eq!(name, "ev-team", "#2454: TeamCreated name mismatch");
+        assert!(
+            members.contains(&"alice".to_string()) && members.contains(&"bob".to_string()),
+            "#2454: TeamCreated members must include alice and bob: {members:?}"
+        );
+    }
+    let instance_created_count = events
+        .iter()
+        .filter(|e| matches!(e, crate::api::ApiEvent::InstanceCreated { .. }))
+        .count();
+    assert_eq!(
+        instance_created_count, 0,
+        "#2454: zero InstanceCreated events expected for team(action=create) with pre-listed members: {events:?}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn update_team_fallback_to_direct_when_daemon_unreachable() {
     let _g = fleet_test_guard();

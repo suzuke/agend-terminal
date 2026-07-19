@@ -1560,6 +1560,60 @@ mod tests {
         );
     }
 
+    /// #2454 Slice 13 RED: both API and MCP CREATE_TEAM handlers must route
+    /// through one shared neutral typed service. The neutral service must NOT
+    /// take HandlerCtx or raw serde_json::Value as its primary boundary type
+    /// — it must own a typed domain interface.
+    #[test]
+    fn create_team_both_adapters_share_neutral_typed_owner_2454() {
+        let mcp_src = include_str!("task.rs");
+        let mcp_boundary = mcp_src.rfind("#[cfg(test)]\nmod ").unwrap_or(mcp_src.len());
+        let mcp_prod = &mcp_src[..mcp_boundary];
+        let mcp_fn_start = mcp_prod
+            .find("fn handle_create_team(")
+            .expect("MCP handle_create_team");
+        let mcp_fn_end = mcp_prod[mcp_fn_start..]
+            .find("\n}\n")
+            .map(|o| mcp_fn_start + o)
+            .unwrap_or(mcp_prod.len());
+        let mcp_fn = &mcp_prod[mcp_fn_start..mcp_fn_end];
+
+        let api_src = include_str!("../../api/handlers/team.rs");
+        let api_boundary = api_src
+            .rfind("#[cfg(test)]\n#[allow")
+            .unwrap_or(api_src.len());
+        let api_prod = &api_src[..api_boundary];
+        let api_fn_start = api_prod
+            .find("fn handle_create_team(")
+            .expect("API handle_create_team");
+        let api_fn_end = api_prod[api_fn_start..]
+            .find("\n}\n")
+            .map(|o| api_fn_start + o)
+            .unwrap_or(api_prod.len());
+        let api_fn = &api_prod[api_fn_start..api_fn_end];
+
+        // Both adapters must reference the same neutral service identifier
+        // (not teams::create, not api::call, not inline logic).
+        let neutral_marker = "team_ops::create";
+        assert!(
+            mcp_fn.contains(neutral_marker),
+            "#2454: MCP handle_create_team must call neutral typed service \
+             `{neutral_marker}`, not own the logic"
+        );
+        assert!(
+            api_fn.contains(neutral_marker),
+            "#2454: API handle_create_team must call neutral typed service \
+             `{neutral_marker}`, not own the logic"
+        );
+
+        // The neutral service must not take HandlerCtx as a parameter
+        // (its boundary must be typed, not framework-coupled).
+        assert!(
+            !mcp_fn.contains("HandlerCtx"),
+            "#2454: MCP CREATE_TEAM adapter must not pass HandlerCtx to the service"
+        );
+    }
+
     /// Wiring pin: both fire-and-forget thread bodies must call the shared
     /// `inject_with_routing` helper (not inline api::call or inject_input).
     #[test]
