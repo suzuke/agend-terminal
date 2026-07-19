@@ -138,6 +138,7 @@ pub fn format_event_header(kind: &str, fields: &[(&str, &str)]) -> String {
 
 /// Deliver a message: always enqueue to inbox JSONL for persistence,
 /// then inject to PTY (inline or pointer-only depending on feature flag).
+#[allow(dead_code)]
 pub fn deliver(
     home: &Path,
     agent_name: &str,

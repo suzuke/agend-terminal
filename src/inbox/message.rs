@@ -18,6 +18,7 @@ pub enum NotifySource<'a> {
     /// Message from a channel user (Telegram, Discord, etc.).
     Channel(&'a str, crate::channel::ChannelKind),
     /// Message from another agent instance (e.g., "dev").
+    #[allow(dead_code)]
     Agent(&'a str),
     /// System message (e.g., "replace", "ci").
     System(&'a str),

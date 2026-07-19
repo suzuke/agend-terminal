@@ -3721,11 +3721,10 @@ fn flat_review_fields_rejected_before_typed_conversion_2454() {
     });
     let result = handle_send(&valid_nested, &test_ctx(&home));
     assert!(
-        result.get("error").map_or(true, |e| {
-            !e.as_str()
-                .unwrap_or("")
-                .contains("inside the typed code_review object")
-        }),
+        !result
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|s| s.contains("inside the typed code_review object")),
         "nested code_review must NOT be rejected as flat smuggling: {result}"
     );
     std::fs::remove_dir_all(&home).ok();

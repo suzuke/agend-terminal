@@ -1640,7 +1640,7 @@ mod tests {
             .rfind(test_mod_marker)
             .unwrap_or(dispatch_src.len());
         let dispatch_prod = &dispatch_src[..dispatch_boundary];
-        let adapter_send = concat!("adapter!(dispatch_send");
+        let adapter_send = "adapter!(dispatch_send";
         assert!(
             !dispatch_prod.contains(adapter_send),
             "dispatch_send must be a custom fn threading RuntimeContext, not adapter!"
@@ -2777,7 +2777,8 @@ mod tests {
              both the API and MCP adapters"
         );
 
-        let src = std::fs::read_to_string(&neutral_path).unwrap();
+        let src = std::fs::read_to_string(&neutral_path)
+            .expect("neutral service source must be readable");
         let test_mod_marker = "#[cfg(test)]\nmod ";
         let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
         let production = &src[..boundary];

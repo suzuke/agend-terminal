@@ -41,8 +41,10 @@ pub use storage::{
 pub(crate) use storage::inbox_path_resolved;
 
 // Notification & PTY injection (pub)
+#[allow(unused_imports)]
+pub use notify::deliver;
 pub use notify::{
-    compose_aware_inject, deliver, enqueue_with_idle_hint, format_event_header,
+    compose_aware_inject, enqueue_with_idle_hint, format_event_header,
     inject_notification_with_submit, notify_agent, notify_agent_with_attachments, notify_system,
     stamp_message_id, wake_persisted_pointer, AGENT_MSG_PREFIX, SYSTEM_MSG_PREFIX,
 };

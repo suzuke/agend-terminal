@@ -11,7 +11,6 @@
 //! point the drift is automatically fixed for MCP callers.
 
 use crate::agent::{self, AgentRegistry};
-use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
