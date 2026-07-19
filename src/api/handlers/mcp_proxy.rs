@@ -1590,4 +1590,239 @@ mod tests {
             "missing authority must not write restart-requested"
         );
     }
+
+    // ── #2454 Slice 12: SEND runtime contract RED tests ─────────────
+
+    /// #2454 Slice 12 RED (1/3): structural budget + reachability guard.
+    /// (a) cumulative handler api::call == 6, (b) dispatch_send not adapter!,
+    /// (c) agent_ops::send_to zero api::call, (d) SEND region bridge == 1.
+    #[test]
+    fn send_structural_budget_and_reachability_2454() {
+        let needle_call = concat!("crate::", "api::", "call");
+        let needle_at = concat!("api::", "call_at");
+        let test_mod_marker = "#[cfg(test)]\nmod ";
+
+        // (a) cumulative budget: 8 → 6
+        let files: &[&str] = &[
+            include_str!("../../mcp/handlers/comms.rs"),
+            include_str!("../../mcp/handlers/comms_delegate/mod.rs"),
+            include_str!("../../mcp/handlers/task.rs"),
+            include_str!("../../mcp/handlers/restart.rs"),
+            include_str!("../../mcp/handlers/instance_state/mod.rs"),
+            include_str!("../../mcp/handlers/instance_state/spawn.rs"),
+            include_str!("../../mcp/handlers/instance_state/lifecycle.rs"),
+            include_str!("../../mcp/handlers/instance_metadata.rs"),
+        ];
+        let mut handler_count = 0;
+        for src in files {
+            let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
+            let production = &src[..boundary];
+            for line in production.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                if line.contains(needle_call) && !line.contains(needle_at) {
+                    handler_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            handler_count, 6,
+            "Slice-12 cumulative api::call budget must be 6; got {handler_count}"
+        );
+
+        // (b) dispatch_send must NOT be adapter! — custom fn threads RuntimeContext
+        let dispatch_src = include_str!("../../mcp/handlers/dispatch.rs");
+        let dispatch_boundary = dispatch_src
+            .rfind(test_mod_marker)
+            .unwrap_or(dispatch_src.len());
+        let dispatch_prod = &dispatch_src[..dispatch_boundary];
+        let adapter_send = concat!("adapter!(dispatch_send");
+        assert!(
+            !dispatch_prod.contains(adapter_send),
+            "dispatch_send must be a custom fn threading RuntimeContext, not adapter!"
+        );
+
+        // (c) agent_ops::send_to must have zero api::call (MCP bypasses it)
+        let ops_src = include_str!("../../agent_ops.rs");
+        let fn_start = ops_src
+            .find("pub fn send_to(")
+            .expect("agent_ops::send_to must exist");
+        let fn_region = &ops_src[fn_start..];
+        let fn_end = fn_region
+            .find("\npub ")
+            .or_else(|| fn_region.find("\n// -----"))
+            .unwrap_or(fn_region.len());
+        let fn_body = &fn_region[..fn_end];
+        let ops_count = fn_body
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                !t.starts_with("//") && !t.starts_with("///") && line.contains(needle_call)
+            })
+            .count();
+        assert_eq!(
+            ops_count, 0,
+            "agent_ops::send_to must have zero api::call after migration; got {ops_count}"
+        );
+
+        // (d) SEND production region (comms + comms_delegate + agent_ops) must
+        // have exactly 1 remaining api::call bridge (the compatibility fallback).
+        let send_region_files: &[&str] = &[
+            include_str!("../../mcp/handlers/comms.rs"),
+            include_str!("../../mcp/handlers/comms_delegate/mod.rs"),
+            ops_src,
+        ];
+        let mut send_region_count = 0;
+        for src in send_region_files {
+            let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
+            let production = &src[..boundary];
+            for line in production.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                if line.contains(needle_call) && !line.contains(needle_at) {
+                    send_region_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            send_region_count, 1,
+            "SEND production region must have exactly 1 api::call bridge; got {send_region_count}"
+        );
+    }
+
+    /// #2454 Slice 12 RED (2/3): real MCP ingress — a send with
+    /// RuntimeContext=Some must deliver via the neutral in-process service,
+    /// not the socket fallback. Currently api::call fails in test (no daemon)
+    /// → fallback_deliver → delivery_mode="inbox_fallback".
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn send_real_entry_runtime_delivery_not_fallback_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let tag = format!(
+            "send-rt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(format!("agend-s12-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  send-target:\n    backend: claude\n",
+        )
+        .unwrap();
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "send",
+            "test-sender",
+            json!({
+                "instance": "send-target",
+                "message": "hello from Slice 12 RED",
+            }),
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP send ingress must return a response: {response}"
+        );
+        let dm = response["result"]["delivery_mode"]
+            .as_str()
+            .unwrap_or_default();
+        assert_ne!(
+            dm, "inbox_fallback",
+            "SEND with RuntimeContext must deliver via the neutral service, \
+             not the socket fallback (delivery_mode={dm}): {response}"
+        );
+    }
+
+    /// #2454 Slice 12 RED (3/3): real MCP ingress — the neutral service's
+    /// team-isolation gate must reject a cross-team send with no delivery
+    /// side-effect. Currently api::call fails → fallback_deliver bypasses
+    /// the API's policy gates → message silently delivered.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn send_real_entry_runtime_team_isolation_gate_2454() {
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let tag = format!(
+            "send-xteam-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(format!("agend-s12-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+               alpha-1:\n    backend: claude\n  \
+               beta-1:\n    backend: claude\n\
+             teams:\n  \
+               alpha:\n    members: [alpha-1]\n  \
+               beta:\n    members: [beta-1]\n",
+        )
+        .unwrap();
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "send",
+            "alpha-1",
+            json!({
+                "instance": "beta-1",
+                "message": "cross-team probe",
+            }),
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+
+        // Verify no delivery side-effect: inbox must be empty for the target
+        let inbox_dir = home.join("inbox").join("beta-1");
+        let inbox_has_message = inbox_dir.exists()
+            && std::fs::read_dir(&inbox_dir)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false);
+        std::fs::remove_dir_all(&home).ok();
+
+        let result_str = response.to_string();
+        assert!(
+            result_str.contains("cross") && result_str.contains("team"),
+            "cross-team send must be rejected by the neutral service's team-isolation \
+             gate, not silently delivered via the socket fallback: {response}"
+        );
+        assert!(
+            !inbox_has_message,
+            "rejected cross-team send must not produce a delivery side-effect in the target inbox"
+        );
+    }
 }
