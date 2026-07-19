@@ -249,8 +249,8 @@ pub(crate) fn dispatch_create_instance(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_create_instance(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
 }
 /// #2454: custom (not `adapter!`) so `handle_interrupt` receives the
-/// `RuntimeContext` for its in-process best-effort snapshot (its INJECT stays a
-/// loopback). Mirrors `dispatch_instance`/`dispatch_list_instances`.
+/// `RuntimeContext` for its in-process best-effort snapshot and injection.
+/// Mirrors `dispatch_instance`/`dispatch_list_instances`.
 pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_interrupt(ctx.home, ctx.args, ctx.runtime)
 }
@@ -430,14 +430,14 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
     "description"  => instance::handle_set_description,  hai;
 ]);
 
-/// #2454 Slice 7+13: team create and update carry the owned runtime into
-/// the transport-neutral service; other team actions retain their legacy
-/// adapter shapes.
+/// #2454 Slice 7+13: every team action carries the owned runtime into the
+/// transport-neutral service; public legacy wrappers remain for callers that
+/// do not have an in-process daemon context.
 pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
-        "delete" => task::handle_delete_team(ctx.home, ctx.args),
-        "list" => task::handle_list_teams(ctx.home),
+        "delete" => task::handle_delete_team(ctx.home, ctx.args, ctx.runtime),
+        "list" => task::handle_list_teams(ctx.home, ctx.runtime),
         "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
         other => json!({"error": format!("unknown team action: {other}")}),
     }
@@ -1921,8 +1921,9 @@ mod tests {
     #[test]
     fn dispatch_interrupt_comment_matches_runtime_inject_route_2454() {
         let source = include_str!("dispatch.rs");
+        let obsolete = ["its INJECT", " stays a loopback"].concat();
         assert!(
-            !source.contains("its INJECT stays a loopback"),
+            !source.contains(&obsolete),
             "dispatch_interrupt still documents an obsolete INJECT loopback"
         );
     }

@@ -11,7 +11,20 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
+
+/// Runtime-owned state required by the in-process MCP team operations.
+/// Keeping this neutral owner context separate from `RuntimeContext` lets the
+/// public legacy `list`/`delete` wrappers retain their standalone transport
+/// behavior without making the team domain depend on MCP handler plumbing.
+pub(crate) struct TeamRuntime<'a> {
+    pub registry: &'a crate::agent::AgentRegistry,
+    pub configs: &'a crate::api::ConfigRegistry,
+    pub externals: &'a crate::agent::ExternalRegistry,
+    pub notifier: Option<&'a Arc<dyn crate::api::ApiNotifier>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Team {
@@ -313,6 +326,14 @@ fn list_team_members(home: &Path, team_name: &str) -> Vec<String> {
 /// - `members_cleaned: N` (always emitted, even N=0)
 /// - `cascade_warnings: [..]` when any per-member cascade returned Err
 pub fn delete(home: &Path, args: &Value) -> Value {
+    delete_with_runtime(home, args, None)
+}
+
+pub(crate) fn delete_with_runtime(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&TeamRuntime<'_>>,
+) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
@@ -351,9 +372,19 @@ pub fn delete(home: &Path, args: &Value) -> Value {
                 "#1903: task cancel failed during team disband"
             );
         }
-        if let Err(e) =
-            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(home, member)
-        {
+        let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
+            registry: runtime.registry,
+            configs: runtime.configs,
+            externals: runtime.externals,
+            notifier: runtime.notifier,
+        });
+        let delete_result =
+            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                home,
+                member,
+                delete_context.as_ref(),
+            );
+        if let Err(e) = delete_result {
             cascade_warnings.push(format!("{member}: {e}"));
             tracing::warn!(
                 team = %name,
@@ -407,9 +438,15 @@ pub fn list(home: &Path) -> Value {
     //
     // #830: routed through the canonical `runtime::list_live_agents`
     // helper that #827/#829/#830 share (the original copy lived here).
-    let live_agents: std::collections::HashSet<String> =
-        crate::runtime::list_live_agents(home).unwrap_or_default();
+    let live_agents = crate::runtime::list_live_agents(home).unwrap_or_default();
+    list_with_live_instances(home, &live_agents)
+}
 
+/// Render teams against an already-owned live-agent snapshot. Runtime-present
+/// MCP callers supply this from `agent_ops::list_snapshot`, avoiding the
+/// public `runtime::list_live_agents` API bridge; standalone callers continue
+/// through `list` above.
+pub(crate) fn list_with_live_instances(home: &Path, live_agents: &HashSet<String>) -> Value {
     let teams: Vec<Value> = list_all(home)
         .iter_mut()
         .map(|t| {

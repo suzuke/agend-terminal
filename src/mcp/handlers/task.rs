@@ -132,12 +132,32 @@ pub(super) fn handle_create_team(
     )
 }
 
-pub(super) fn handle_delete_team(home: &Path, args: &Value) -> Value {
-    crate::teams::delete(home, args)
+pub(super) fn handle_delete_team(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    let team_runtime = runtime.map(|runtime| crate::teams::TeamRuntime {
+        registry: &runtime.registry,
+        configs: &runtime.configs,
+        externals: &runtime.externals,
+        notifier: runtime.notifier.as_ref(),
+    });
+    crate::teams::delete_with_runtime(home, args, team_runtime.as_ref())
 }
 
-pub(super) fn handle_list_teams(home: &Path) -> Value {
-    crate::teams::list(home)
+pub(super) fn handle_list_teams(home: &Path, runtime: Option<&RuntimeContext>) -> Value {
+    let Some(runtime) = runtime else {
+        return crate::teams::list(home);
+    };
+    let snapshot = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
+    let live_agents: std::collections::HashSet<String> = snapshot["result"]["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| agent["name"].as_str().map(String::from))
+        .collect();
+    crate::teams::list_with_live_instances(home, &live_agents)
 }
 
 pub(super) fn handle_update_team(
