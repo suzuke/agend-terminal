@@ -2744,23 +2744,82 @@ fn checkout_repo_agent_name_source_with_agent_not_found() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// --- task.rs fallback paths ---
+// --- #2454 Slice 13: team(action=create) typed runtime migration ---
 
+/// #2454 Slice 13 RED: runtime=None must return an explicit structured
+/// transport failure — never silently fall back to teams::create.
+/// Retargets the pre-migration create_team_fallback_to_direct_when_daemon_unreachable.
 #[test]
-fn create_team_fallback_to_direct_when_daemon_unreachable() {
+fn create_team_runtime_none_returns_structured_error_2454() {
     let _g = fleet_test_guard();
-    let home = tmp_home("team-fallback");
+    let home = tmp_home("team-rt-none");
     std::env::set_var("AGEND_HOME", &home);
-    // No daemon running → API call fails → falls back to teams::create
     let result = handle_tool(
         "team",
-        &json!({"action": "create", "name": "test-team", "members": ["a", "b"]}),
+        &json!({"action": "create", "name": "no-rt-team", "members": ["a", "b"]}),
         "sender",
     );
-    // Should succeed via direct fallback (or return structured error, not panic)
     assert!(
-        result.get("error").is_none() || result.get("name").is_some(),
-        "create_team fallback must not panic: {result}"
+        result.get("error").is_some(),
+        "#2454: runtime=None CREATE_TEAM must return structured error, not fallback success: {result}"
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("runtime")),
+        "#2454: error must mention runtime unavailability: {result}"
+    );
+    // Zero side effects: no team created in fleet.yaml
+    let fleet_path = home.join("fleet.yaml");
+    let fleet_content = std::fs::read_to_string(&fleet_path).unwrap_or_default();
+    assert!(
+        !fleet_content.contains("no-rt-team"),
+        "#2454: runtime=None must not create team as a side effect: {fleet_content}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 13 RED: runtime=Some must succeed in-process without
+/// an API listener, through the neutral typed CREATE_TEAM service —
+/// not teams::create fallback.
+#[test]
+fn create_team_runtime_some_succeeds_without_api_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-some");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "rt-team", "members": ["alice"]}),
+        "sender",
+    );
+    // API-equivalent result shape: must have ok:true (not raw teams::create output)
+    assert_eq!(
+        result.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "#2454: runtime=Some CREATE_TEAM must return API-equivalent ok:true, \
+         not teams::create fallback shape: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 13 RED: runtime=Some result must carry `spawned` field
+/// with API-equivalent event semantics (members spawned in-process).
+#[test]
+fn create_team_runtime_some_has_spawned_field_2454() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-rt-spawned");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool_rt(
+        "team",
+        &json!({"action": "create", "name": "sp-team", "members": ["bob"]}),
+        "sender",
+    );
+    assert!(
+        result.get("spawned").is_some(),
+        "#2454: runtime=Some CREATE_TEAM must include spawned field \
+         (API-equivalent semantics): {result}"
     );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
