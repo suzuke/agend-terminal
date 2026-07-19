@@ -2874,37 +2874,64 @@ fn create_team_runtime_some_emits_team_created_event_2454() {
         "sender",
         Some(runtime),
     );
+    // API-equivalent response shape: ok + result{status,name} + spawned=[]
     assert_eq!(
         result.get("ok").and_then(|v| v.as_bool()),
         Some(true),
         "#2454: runtime=Some+notifier CREATE_TEAM must return ok:true: {result}"
     );
-    let events = recorder.take();
-    let team_created_count = events
-        .iter()
-        .filter(|e| matches!(e, crate::api::ApiEvent::TeamCreated { .. }))
-        .count();
     assert_eq!(
-        team_created_count, 1,
-        "#2454: exactly one TeamCreated event expected, got {team_created_count}: {events:?}"
+        result["result"]["status"].as_str(),
+        Some("created"),
+        "#2454: result.status must be \"created\": {result}"
     );
-    if let Some(crate::api::ApiEvent::TeamCreated { name, members }) = events
-        .iter()
-        .find(|e| matches!(e, crate::api::ApiEvent::TeamCreated { .. }))
-    {
-        assert_eq!(name, "ev-team", "#2454: TeamCreated name mismatch");
-        assert!(
-            members.contains(&"alice".to_string()) && members.contains(&"bob".to_string()),
-            "#2454: TeamCreated members must include alice and bob: {members:?}"
-        );
-    }
-    let instance_created_count = events
-        .iter()
-        .filter(|e| matches!(e, crate::api::ApiEvent::InstanceCreated { .. }))
-        .count();
     assert_eq!(
-        instance_created_count, 0,
-        "#2454: zero InstanceCreated events expected for team(action=create) with pre-listed members: {events:?}"
+        result["result"]["name"].as_str(),
+        Some("ev-team"),
+        "#2454: result.name must be exact: {result}"
+    );
+    // Pre-listed members (no count/backends) → zero spawns
+    assert_eq!(
+        result.get("spawned").and_then(|v| v.as_array()),
+        Some(&vec![]),
+        "#2454: spawned must be exactly []: {result}"
+    );
+
+    // Roster on disk must contain exactly the declared members
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team_cfg = fleet
+        .teams
+        .get("ev-team")
+        .expect("#2454: team must be persisted to fleet.yaml");
+    let mut roster = team_cfg.members.clone();
+    roster.sort();
+    assert_eq!(
+        roster,
+        vec!["alice", "bob"],
+        "#2454: persisted team roster must equal exactly [alice, bob]: {:?}",
+        team_cfg.members
+    );
+
+    // Event assertions: exactly one event total, and it is TeamCreated
+    let events = recorder.take();
+    assert_eq!(
+        events.len(),
+        1,
+        "#2454: exactly one event expected (no InstanceCreated, no other variants): {events:?}"
+    );
+    let crate::api::ApiEvent::TeamCreated { name, members } = &events[0] else {
+        panic!(
+            "#2454: sole event must be TeamCreated, got: {:?}",
+            events[0]
+        );
+    };
+    assert_eq!(name, "ev-team", "#2454: TeamCreated name must be exact");
+    let mut sorted_members = members.clone();
+    sorted_members.sort();
+    assert_eq!(
+        sorted_members,
+        vec!["alice", "bob"],
+        "#2454: TeamCreated members must equal exactly [alice, bob]: {members:?}"
     );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();

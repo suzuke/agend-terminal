@@ -1563,9 +1563,14 @@ mod tests {
     /// #2454 Slice 13 RED: both API and MCP CREATE_TEAM handlers must route
     /// through one shared neutral typed service. The neutral service must NOT
     /// take HandlerCtx or raw serde_json::Value as its primary boundary type
-    /// — it must own a typed domain interface.
+    /// — it must own a typed domain interface. Wrapping old logic behind a
+    /// same-named raw-Value helper cannot pass this guard.
     #[test]
     fn create_team_both_adapters_share_neutral_typed_owner_2454() {
+        let neutral_marker = "team_ops::create";
+
+        // ── Adapter convergence: both MCP and API must call the same owner ──
+
         let mcp_src = include_str!("task.rs");
         let mcp_boundary = mcp_src.rfind("#[cfg(test)]\nmod ").unwrap_or(mcp_src.len());
         let mcp_prod = &mcp_src[..mcp_boundary];
@@ -1592,9 +1597,6 @@ mod tests {
             .unwrap_or(api_prod.len());
         let api_fn = &api_prod[api_fn_start..api_fn_end];
 
-        // Both adapters must reference the same neutral service identifier
-        // (not teams::create, not api::call, not inline logic).
-        let neutral_marker = "team_ops::create";
         assert!(
             mcp_fn.contains(neutral_marker),
             "#2454: MCP handle_create_team must call neutral typed service \
@@ -1605,12 +1607,61 @@ mod tests {
             "#2454: API handle_create_team must call neutral typed service \
              `{neutral_marker}`, not own the logic"
         );
-
-        // The neutral service must not take HandlerCtx as a parameter
-        // (its boundary must be typed, not framework-coupled).
         assert!(
             !mcp_fn.contains("HandlerCtx"),
             "#2454: MCP CREATE_TEAM adapter must not pass HandlerCtx to the service"
+        );
+
+        // ── Owner boundary: the neutral service's definition must be typed ──
+        // Scan the module that should own the neutral service. Its `pub fn
+        // create` (or `pub(crate) fn create`) signature must NOT accept
+        // `HandlerCtx` or raw `Value`/`&Value` as a parameter — the boundary
+        // must be typed domain types. A same-named helper that just wraps
+        // teams::create with a raw Value interface cannot pass.
+
+        // team_ops module must exist as a file
+        let team_ops_exists =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")).exists()
+                || std::path::Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/team_ops/mod.rs"
+                ))
+                .exists();
+        assert!(
+            team_ops_exists,
+            "#2454: neutral typed service module `team_ops` must exist as src/team_ops.rs or src/team_ops/mod.rs"
+        );
+
+        // Read the module and inspect the create function signature
+        let team_ops_path =
+            if std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs"))
+                .exists()
+            {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")
+            } else {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops/mod.rs")
+            };
+        let team_ops_src =
+            std::fs::read_to_string(team_ops_path).expect("read team_ops module source");
+        let create_fn_start = team_ops_src
+            .find("fn create(")
+            .or_else(|| team_ops_src.find("fn create_team("))
+            .expect("team_ops must define a create/create_team function");
+        // Extract the signature line (up to the opening brace)
+        let sig_end = team_ops_src[create_fn_start..]
+            .find('{')
+            .map(|o| create_fn_start + o)
+            .unwrap_or(team_ops_src.len());
+        let signature = &team_ops_src[create_fn_start..sig_end];
+        assert!(
+            !signature.contains("HandlerCtx"),
+            "#2454: team_ops::create signature must not accept HandlerCtx \
+             (framework-coupled boundary): {signature}"
+        );
+        assert!(
+            !signature.contains("&Value") && !signature.contains(": Value"),
+            "#2454: team_ops::create signature must not accept raw serde_json::Value \
+             (untyped boundary — wrapping old logic behind a same-named helper): {signature}"
         );
     }
 
