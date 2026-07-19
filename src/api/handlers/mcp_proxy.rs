@@ -2800,5 +2800,69 @@ mod tests {
             "neutral service must not have a raw Value / serde_json service \
              entry — use typed SendRequest/SendOutcome boundary"
         );
+
+        // ── Convergence proof: both adapters reference this neutral owner ──
+
+        let neutral_mod = concat!("crate::agent_ops::", "messaging");
+
+        // (a) agent_ops.rs must register the messaging submodule.
+        let ops_src = include_str!("../../agent_ops.rs");
+        let ops_boundary = ops_src.rfind(test_mod_marker).unwrap_or(ops_src.len());
+        let ops_production = &ops_src[..ops_boundary];
+        let has_mod_decl = ops_production.lines().any(|line| {
+            let t = line.trim();
+            !t.starts_with("//") && !t.starts_with("///")
+                && (t == "mod messaging;" || t == "pub mod messaging;"
+                    || t == "pub(crate) mod messaging;")
+        });
+        assert!(
+            has_mod_decl,
+            "src/agent_ops.rs must register `mod messaging` submodule \
+             to expose the neutral typed service"
+        );
+
+        // (b) API SEND adapter (src/api/handlers/messaging.rs) must
+        // reference the neutral owner.
+        let api_svc_src = include_str!("messaging.rs");
+        let api_boundary = api_svc_src.rfind(test_mod_marker).unwrap_or(api_svc_src.len());
+        let api_production = &api_svc_src[..api_boundary];
+        let api_refs_neutral = api_production.lines().any(|line| {
+            let t = line.trim();
+            !t.starts_with("//") && !t.starts_with("///")
+                && line.contains(neutral_mod)
+        });
+        assert!(
+            api_refs_neutral,
+            "API SEND adapter (api/handlers/messaging.rs) must reference \
+             {neutral_mod} — both adapters must converge on the neutral owner"
+        );
+
+        // (c) MCP runtime SEND adapter sources must reference the neutral
+        // owner at least once (behavioral REDs already prove report/delegate
+        // paths, so this is a structural convergence check only).
+        let mcp_adapter_sources: &[(&str, &str)] = &[
+            ("comms.rs", include_str!("../../mcp/handlers/comms.rs")),
+            ("comms_delegate/mod.rs", include_str!("../../mcp/handlers/comms_delegate/mod.rs")),
+            ("dispatch.rs", include_str!("../../mcp/handlers/dispatch.rs")),
+        ];
+        let mut mcp_refs_neutral = false;
+        for (_file, src) in mcp_adapter_sources {
+            let b = src.rfind(test_mod_marker).unwrap_or(src.len());
+            let prod = &src[..b];
+            if prod.lines().any(|line| {
+                let t = line.trim();
+                !t.starts_with("//") && !t.starts_with("///")
+                    && line.contains(neutral_mod)
+            }) {
+                mcp_refs_neutral = true;
+                break;
+            }
+        }
+        assert!(
+            mcp_refs_neutral,
+            "MCP SEND adapter sources (comms.rs, comms_delegate/mod.rs, dispatch.rs) \
+             must reference {neutral_mod} at least once — both adapters must converge \
+             on the neutral owner"
+        );
     }
 }
