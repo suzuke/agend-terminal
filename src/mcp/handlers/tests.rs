@@ -4179,3 +4179,174 @@ fn send_zero_selectors_returns_typed_missing_selector() {
         "zero selectors must return typed missing_selector error from the unified gate: {result}"
     );
 }
+
+/// #2454 Slice 14 RED: the real deployment MCP entry must forward a present
+/// RuntimeContext into the typed team owner without an API listener. The
+/// current runtime-blind schedule adapter falls back to teams::create, which
+/// creates the team but emits no in-process TeamCreated event.
+#[test]
+fn deployment_runtime_some_deploy_reaches_typed_team_owner_slice14() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("deployment-runtime-deploy-slice14");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+templates:
+  slice14:
+    instances:
+      lead:
+        backend: /definitely/not-an-agent-command
+      worker:
+        backend: /definitely/not-an-agent-command
+"#,
+    )
+    .unwrap();
+
+    struct EventRecorder {
+        events: parking_lot::Mutex<Vec<crate::api::ApiEvent>>,
+    }
+    impl EventRecorder {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+    impl crate::api::ApiNotifier for EventRecorder {
+        fn notify(&self, event: crate::api::ApiEvent) {
+            self.events.lock().push(event);
+        }
+    }
+
+    let recorder = EventRecorder::new();
+    let notifier: std::sync::Arc<dyn crate::api::ApiNotifier> = recorder.clone();
+    let runtime = super::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: Some(notifier),
+        shutdown: None,
+    };
+
+    let result = super::handle_tool_with_runtime(
+        "deployment",
+        &json!({
+            "action": "deploy",
+            "template": "slice14",
+            "directory": home.join("workspace").display().to_string(),
+        }),
+        "sender",
+        Some(runtime),
+    );
+    assert_eq!(
+        result["status"].as_str(),
+        Some("deployed"),
+        "deployment must complete its durable record even when member spawn commands fail: {result}"
+    );
+    let events = recorder.events.lock();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            crate::api::ApiEvent::TeamCreated { name, members }
+                if name == "slice14"
+                    && members == &vec!["slice14-lead".to_string(), "slice14-worker".to_string()]
+        )),
+        "runtime-present deployment must emit the typed TeamCreated event: {events:?}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 Slice 14 RED: teardown through the real MCP entry must invoke the
+/// typed DELETE owner before cleanup, even with no API listener. The current
+/// runtime-blind schedule adapter calls the legacy transport and therefore
+/// emits no InstanceDeleted event.
+#[test]
+fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("deployment-runtime-teardown-slice14");
+    std::env::set_var("AGEND_HOME", &home);
+    let working_directory = home.join("workspace").join("slice14-lead");
+    std::fs::create_dir_all(&working_directory).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  slice14-lead:\n    backend: shell\n    working_directory: {}\nteams:\n  slice14:\n    members: [slice14-lead]\n    created_at: now\n",
+            working_directory.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("deployments.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "deployments": [{
+                "name": "slice14",
+                "template": "slice14",
+                "instances": ["slice14-lead"],
+                "team": "slice14",
+                "directory": home.join("workspace").display().to_string(),
+                "created_at": "now"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    struct EventRecorder {
+        events: parking_lot::Mutex<Vec<crate::api::ApiEvent>>,
+    }
+    impl EventRecorder {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+    impl crate::api::ApiNotifier for EventRecorder {
+        fn notify(&self, event: crate::api::ApiEvent) {
+            self.events.lock().push(event);
+        }
+    }
+
+    let recorder = EventRecorder::new();
+    let notifier: std::sync::Arc<dyn crate::api::ApiNotifier> = recorder.clone();
+    let runtime = super::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: Some(notifier),
+        shutdown: None,
+    };
+
+    let result = super::handle_tool_with_runtime(
+        "deployment",
+        &json!({"action": "teardown", "name": "slice14"}),
+        "sender",
+        Some(runtime),
+    );
+    assert_eq!(
+        result["status"].as_str(),
+        Some("torn_down"),
+        "teardown should preserve the existing successful cleanup projection: {result}"
+    );
+    let events = recorder.events.lock();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            crate::api::ApiEvent::InstanceDeleted { name } if name == "slice14-lead"
+        )),
+        "runtime-present teardown must invoke typed DELETE and emit InstanceDeleted: {events:?}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}

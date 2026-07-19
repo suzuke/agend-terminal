@@ -2094,6 +2094,10 @@ fn fn_body<'a>(prod: &'a str, sig: &str) -> &'a str {
 fn deploy_api_calls_not_under_flock() {
     let prod = prod_src();
     let body = fn_body(prod, "pub fn deploy(home");
+    assert!(
+        body.contains("runtime"),
+        "deploy must receive the deployments-owned runtime capability so runtime-present MCP calls cannot use the legacy transport"
+    );
     // H14: deploy's duplicate-name guard is a plain `load()` READ (no flock)
     // before spawn — #1629 forbids holding ANY flock across the self-IPC
     // spawn/team. So the ONLY `acquire_file_lock` in deploy is still the store
@@ -2121,6 +2125,10 @@ fn deploy_api_calls_not_under_flock() {
 fn teardown_api_calls_not_under_flock() {
     let prod = prod_src();
     let body = fn_body(prod, "pub fn teardown(home");
+    assert!(
+        body.contains("runtime"),
+        "teardown must receive the deployments-owned runtime capability so runtime-present MCP calls cannot use the legacy transport"
+    );
     let lock_at = body
         .find(&["acquire_file", "_lock"].concat())
         .expect("teardown locks the record removal");
@@ -2129,6 +2137,39 @@ fn teardown_api_calls_not_under_flock() {
         .expect("teardown DELETEs instances via api::call");
     assert!(
         delete_at < lock_at,
-        "the DELETE api::call loop must run BEFORE the record-removal flock (#1617 class)"
+        "the typed DELETE owner must run BEFORE the record-removal flock (#1617 class)"
+    );
+}
+
+#[test]
+fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
+    let dispatch = include_str!("../mcp/handlers/dispatch.rs");
+    let dispatch_start = dispatch
+        .find("pub(crate) fn dispatch_deployment")
+        .expect("deployment dispatcher must exist");
+    let dispatch_tail = &dispatch[dispatch_start..];
+    let dispatch_body = dispatch_tail
+        .split_once("\n///")
+        .map(|(body, _)| body)
+        .unwrap_or(dispatch_tail);
+    assert!(
+        dispatch_body.contains("ctx.runtime"),
+        "deployment dispatcher must forward RuntimeContext into the deployments-owned adapter"
+    );
+    assert!(
+        !dispatch_body.contains("action_adapter!(dispatch_deployment"),
+        "deployment dispatch must not use the runtime-blind action_adapter"
+    );
+
+    let schedule = include_str!("../mcp/handlers/schedule.rs");
+    assert!(
+        schedule.contains("DeploymentRuntime"),
+        "schedule adapter must carry the neutral deployments-owned runtime capability"
+    );
+
+    let deployments = prod_src();
+    assert!(
+        deployments.contains("DeploymentRuntime"),
+        "deployments owner must define/accept a neutral runtime capability rather than MCP HandlerCtx"
     );
 }
