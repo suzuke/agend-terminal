@@ -118,7 +118,10 @@ pub(super) fn handle_create_instance(
                         .filter(|s| matches!(*s, "skip" | "deferred"))
                         .map(String::from),
                     orchestrator: None,
-                    description: args["description"].as_str().map(String::from),
+                    description: args
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                     repository_path: None,
                     project_id: None,
                     accept_from: Vec::new(),

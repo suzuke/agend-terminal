@@ -123,6 +123,7 @@ pub(crate) fn def_create_instance() -> Value {
         "count": {"type": "integer", "description": "Number of instances to spawn (requires team; ignored when `backends` is set)"},
         "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
         "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
+        "description": {"type": "string", "description": "Optional description recorded for a created team (team mode only)."},
         "command": {"type": "string", "description": "Deprecated: use 'backend' instead"},
         "role": {"type": "string", "description": "Agent role label (e.g. `reviewer`) recorded on the spawned instance's fleet.yaml entry."},
         "env": {"type": "object", "description": "#900: environment variables (object of string→string) injected into the spawned backend process and persisted to the fleet.yaml entry so replace/restart flows re-apply them."},
