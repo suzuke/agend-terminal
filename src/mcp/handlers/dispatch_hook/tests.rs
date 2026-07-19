@@ -580,7 +580,8 @@ fn delegate_task_main_branch_rejects_without_delivering() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert!(
         result.get("error").is_some(),
@@ -642,7 +643,8 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert!(
         result.get("error").is_some(),
@@ -762,7 +764,8 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
         "branch": "feat/B",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert!(
         result.get("error").is_some(),
@@ -985,7 +988,8 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     // Dispatch should NOT carry the lease-rejection error path.
     if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
@@ -1054,7 +1058,12 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
         }
         let sender = Some(Sender::new("lead").expect("sender"));
 
-        let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+        let result = super::super::comms::handle_delegate_task(
+            &home,
+            &args,
+            &sender,
+            Some(&minimal_runtime()),
+        );
 
         // Structured atomic rejection with the distinguishing code.
         assert_eq!(
@@ -1121,7 +1130,8 @@ fn existing_tagged_task_contradictory_send_rejects_2745() {
         "review_class": "dual",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert_eq!(
         result.get("code").and_then(|v| v.as_str()),
@@ -1184,7 +1194,8 @@ teams:
     let sender = Some(Sender::new("devA").expect("sender"));
     // Delivery may fail in-test (empty runtime registry) but only AFTER the
     // auto-create commit — we assert which board the task was BORN on.
-    let _ = super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    let _ =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     // Query each board via the P1 `_at` reader (avoids the task_events anti-bypass
     // invariant on the literal log path). The auto-created task must be on the
