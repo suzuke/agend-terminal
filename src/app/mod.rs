@@ -19,7 +19,7 @@ use ui_state::{UiDeps, UiState};
 // #2453: root AppState/RestartState owners, re-homed to a sibling module
 // (src/app/mod.rs sits under the grandfathered anti-monolith ratchet).
 mod app_state;
-use app_state::{AppState, RestartState};
+use app_state::{AppDeps, AppState, LoopFlow};
 mod session;
 mod telegram_hooks;
 mod tui_events;
@@ -681,59 +681,15 @@ fn poll_commit_pending(cp: &CommitPending, now: std::time::Instant) -> CommitPol
 
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<RunOutcome> {
     let home = crate::home_dir();
-    // #2325: the app process (unlike the daemon's `run_core`, the only other
-    // `runtime_config::reload` caller) never tick-reloads runtime config, so load
-    // the persisted values once at startup. Otherwise a persisted `copy_on_select`
-    // (the TUI mouse copy-on-select mode) would reset to the compile-time default
-    // on every restart. In-session changes update the in-process global directly
-    // via `runtime_config::set` (the `Ctrl+B e` toggle and `:set`/`:config set`).
-    crate::runtime_controls::reload_runtime_controls(&home);
-
-    // PR-D6/F1: fail LOUD if the retired `AGEND_WORKTREE_PRUNE_LIVE` is still set.
-    // The LIVE fleet daemon runs THIS app-mode path — never `run_core` (see
-    // `main.rs`'s subcommand dispatch: `App` → `app::run` → here, vs `Start` →
-    // `daemon::run`/`run_core`; the two are mutually exclusive per process). So
-    // the run_core:764 boot-warn is DEAD in production without this call. Fired
-    // ONCE per app boot here: `run_app` is invoked exactly once (from `run`, not
-    // in any retry loop) and this sits before the sweep/TUI event loop. Mirrors
-    // run_core's placement — a single startup warn so an operator carrying the
-    // stale flag learns it is ignored (not silent).
-    crate::worktree_cleanup::warn_if_prune_live_retired();
-
-    let fleet_path = fleet_override
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
-
+    app_boot_preflight(&home);
+    let fleet_path =
+        fleet_override.map_or_else(|| crate::fleet::fleet_yaml_path(&home), Path::to_path_buf);
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-    // #1027: shared TUI status-bar flag. supervisor's mcp_registry_watcher
-    // flips it true on post-startup binary refresh; the render loop reads
-    // it every frame to surface a warning. Sticky-true — clears only on
-    // process restart (fresh tracker = fresh `started_at`).
+    // #1027: shared TUI status-bar flag — supervisor flips it, render reads it.
     let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Default::default();
     let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
-
-    // Preflight via the shared bootstrap seam so `api.cookie` is issued before
-    // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
-    // from Telegram's router would silently fail.
-    //
-    // `Attached` means another daemon owns the fleet; the TUI connects as a
-    // client (Stage 3.4). `attached_mode` gates every operation that would
-    // conflict with the live daemon — session persistence, fleet.yaml sync,
-    // supervisor spawn, and agent kill on exit.
-    // #2453 R2: the app owner-restart gate + bounded(1) request channel. The
-    // Sender + gate are injected into the API server (owned mode); this loop owns
-    // the Receiver + gate and drives the probe → re-exec commit. In Attached mode
-    // the daemon owns restart, so the api server isn't started and the injected
-    // Sender is dropped inside `setup_app_bootstrap` — the loop treats the
-    // receiver as never-ready (see the select! arm).
-    let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
-    let (app_restart_tx, app_restart_rx) =
-        crossbeam_channel::bounded::<crate::api::app_restart::AppRestartRequest>(1);
-    let app_restart_inject = crate::api::app_restart::AppRestart {
-        tx: app_restart_tx,
-        gate: app_restart_gate.clone(),
-    };
+    let (app_restart_gate, app_restart_inject, app_restart_rx) = build_app_restart_wiring();
     let (_api_guard, telegram_state, telegram_status, attached_run_dir) = setup_app_bootstrap(
         &home,
         &fleet_path,
@@ -742,965 +698,58 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         Some(app_restart_inject),
     );
     let attached_mode = attached_run_dir.is_some();
-    // #2453 R2: in Attached mode the daemon owns restart — never listen for app
-    // restart requests (the injected Sender was dropped in setup_app_bootstrap).
-    let app_restart_rx = if attached_mode {
-        crossbeam_channel::never::<crate::api::app_restart::AppRestartRequest>()
-    } else {
-        app_restart_rx
-    };
-
-    // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
-    // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
-    // mode), and SIGHUP's default "kill the process group" keeps shell-exit
-    // semantics intact. SIGTERM is the only signal the app intercepts, and
-    // only in the Owned branch — see `install_term_only` above.
-
-    // Per-agent AwaitingOperator supervisor: watches for stdout silence during
-    // Starting (or recently-entered Idle — some backends like codex match
-    // ready_pattern against the startup banner that precedes the update menu)
-    // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
-    // the daemon already runs its own supervisor against the real registry, so
-    // the app must not also poll a disjoint (empty) registry.
-    // #2737: the owner-service composition is now a typed two-phase seam. This
-    // owned-only block yields the `OwnerServicesStarted` witness (None when
-    // attached); the owned-only maintenance tick REQUIRES it, so a run_app that
-    // skips the seam fails to compile (structural I2, replacing the old
-    // `owner_services_called_by_both_hosts` string-scan).
-    let owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted> =
-        if !attached_mode {
-            crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
-            // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
-            // api_activity_probe) via the typed phase-1 seam — identical position/args
-            // in run_core's build_tick_infrastructure, so a service can't be wired in
-            // one host and silently dead in the other (#982/#1002/#1720/#2434). The
-            // returned OwnerMonitoringStarted token is required by phase 2 below, so
-            // monitoring is compile-forced to precede the stream observers (exact
-            // order preserved: monitoring → shadow::start → stream).
-            let monitoring = crate::daemon::owner_services::start_owner_monitoring(
-                crate::daemon::owner_services::OwnerRole::Owned,
-                &home,
-                &registry,
-                &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
-            );
-            // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
-            // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
-            // only other caller), so without this the whole Shadow Observer plane was dead in
-            // production (observed_status null on every agent under the flag — #1720/#685
-            // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
-            // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
-            // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
-            // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
-            // detached accept loop that exits with the process; the stale socket is cleared on
-            // next bind (start_unix removes it before binding).
-            crate::daemon::shadow::start(&home);
-            // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout
-            // + opencode + kiro) via the typed phase-2 seam. Requires the phase-1
-            // OwnerMonitoringStarted token (compile-enforced order). #2434: the live
-            // fleet daemon is app mode, so these must be app-wired (not run_core-only)
-            // or each backend's observer source is dead in production. Identical
-            // position/args in run_core's build_tick_infrastructure. shadow::start
-            // (the socket-ingest plane above) stays host-local — separate fork.
-            let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
-                crate::daemon::owner_services::OwnerRole::Owned,
-                &monitoring,
-                &home,
-                &registry,
-                &crate::daemon::owner_services::OwnerStreamStarters::real(),
-            );
-            // Attached mode stays unwired: that process never owns the registry,
-            // and the Telegram bot (if any) runs under the other daemon which
-            // already did its own attach.
-            //
-            // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
-            // is always None at this point post-backgrounding. Publish registry
-            // to the pending slot so the background thread can attach when its
-            // ~6s HTTP init completes. The if-let path below covers the eager
-            // (fast/mocked init) case.
-            crate::agent::set_pending_registry(Arc::clone(&registry));
-            if let Some(tg) = telegram_state.as_ref() {
-                tg.attach_registry(Arc::clone(&registry));
-            } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
-                // Multi-channel-safe (t-20260703164240502572-50899-11): this
-                // fallback is telegram-specific (the `tg`/`telegram_state`
-                // naming already assumed it); `active_channel()` would silently
-                // no-op here once discord is also registered.
-                tg.attach_registry(Arc::clone(&registry));
-            }
-            // #2737: hand the final witness to the owned-only maintenance tick below.
-            Some(owner_services)
-        } else {
-            None
-        };
-
-    // #2453: root AppState construction, hoisted here because every
-    // initializer is context-free — the setup code below already works on
-    // owned fields. Field semantics are documented on the struct.
-    let mut state = AppState {
-        ui: UiState {
-            layout: Layout::new(),
-            last_tab: 0,
-            name_counter: HashMap::new(),
-            overlay: Overlay::None,
-            key_handler: KeyHandler::new(),
-            mouse_state: mouse::MouseState::default(),
-        },
-        known_remote_agents: std::collections::HashSet::new(),
-        pending_fwd: HashMap::new(),
-        needs_resize: true,
-        last_remote_sync: std::time::Instant::now(),
-        last_session_save: std::time::Instant::now(),
-        last_session_json: None,
-        last_draw: None,
-        dirty: true,
-        last_notif_sync: None,
-        last_decision_sync: None,
-        pending_decisions_total: 0,
-        booting: true,
-        restart: RestartState {
-            restart_outcome: RunOutcome::Normal,
-            restart_probe: None,
-            restart_commit_pending: None,
-        },
-    };
-
+    let app_restart_rx = never_when_attached(app_restart_rx, attached_mode);
+    let owner_services = start_owned_services(&home, &registry, &telegram_state, attached_mode);
+    let mut state = AppState::new();
     let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
-
-    // #2057: size-probe env gate, read ONCE here (hoisted from its old spot
-    // below the spawn block) so the startup-milestone traces + the per-frame
-    // loop probe share it — zero per-frame env-lookup cost (codex #2060).
+    // #2057: size-probe env gate, read once; shared by milestones + per-frame probe.
     let size_debug = std::env::var("AGEND_TUI_SIZE_DEBUG").as_deref() == Ok("1");
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-    // #2057 milestone 1: BEFORE the default-home-extra work (supervisor +
-    // telegram already ran above and are reflected here; this baseline is the
-    // 56 in the fresh-vs-default A/B).
     trace_tty_size(size_debug, "startup-baseline");
-    let pane_rows = rows.saturating_sub(4);
-    let pane_cols = cols.saturating_sub(2);
-
-    // restart-freeze RCA (t-…55279): anchor for the boot critical path the
-    // operator sees freeze on daemon restart — session restore + the
-    // synchronous per-agent PTY spawns, then post-spawn wiring, up to the
-    // first render. Logged at restore-complete and pre-render-loop below.
-    // Pure tracing, zero behavior.
+    // restart-freeze RCA anchor: boot critical path start (pure tracing).
     let restore_start = std::time::Instant::now();
-
-    // #render-first phase-(b): OWNED restore collects deferred attach jobs here;
-    // the synchronous per-agent fork/exec + skills-install is replaced by
-    // background workers spawned AFTER the render loop is live (below). Attached
-    // mode leaves this empty — its remote panes attach via the bridge, a separate
-    // cheap path not subject to the restore freeze.
-    let mut attach_jobs: Vec<pane_factory::AttachJob> = Vec::new();
-
-    if let Some(ref run_dir) = attached_run_dir {
-        // Attached (#895 fix): tabs derive from the union of
-        //   (a) daemon's `*.port` files (live agent registry — source of truth
-        //       for WHICH agents exist while daemon is alive), and
-        //   (b) session.json (layout hint — source of truth for HOW the user
-        //       arranged those agents in the TUI).
-        //
-        // Pre-#895: tabs built solely from (a) in alphabetical order; custom
-        // splits/grouping were lost on every detach/reattach cycle.
-        //
-        // Post-#895: `restore_with_reconciliation_attached` walks session.json
-        // tabs, drops leaves whose agent is not in (a) (silent — daemon drift
-        // between attaches is normal), then appends agents in (a) that weren't
-        // placed in session as new tabs (Rule 3, team-grouped). Falls back to
-        // pre-#895 alphabetical-from-(a) when session.json is missing.
-        let started = session::restore_with_reconciliation_attached(
-            &home,
-            &fleet_path,
-            run_dir,
-            &mut state.ui.layout,
-            &wakeup_tx,
-            pane_cols,
-            pane_rows,
-        );
-        // Populate the remote-agent roster from the placed tabs so the periodic
-        // sync (lines 615-665) tracks them correctly.
-        for tab in &state.ui.layout.tabs {
-            for name in tab.root().agent_names() {
-                state.known_remote_agents.insert(name);
-            }
-        }
-        if !started {
-            tracing::warn!(
-                "attached to daemon but no agents are reachable; check `agend-terminal list`"
-            );
-        }
-    } else {
-        // Owned: reconcile fleet.yaml (agent definitions) with session.json
-        // (layout hint); fall back to a shell tab on cold start.
-        let started = session::restore_with_reconciliation(
-            &home,
-            &fleet_path,
-            &mut state.ui.layout,
-            &mut state.ui.name_counter,
-            &mut attach_jobs,
-            pane_cols,
-            pane_rows,
-        );
-        if !started {
-            pane_factory::spawn_pane_tab(
-                &mut state.ui.layout,
-                &registry,
-                &home,
-                "shell",
-                &crate::shell_command(),
-                &[],
-                crate::backend::SpawnMode::Fresh,
-                None,
-                &HashMap::new(),
-                "\r",
-                pane_cols,
-                pane_rows,
-                &wakeup_tx,
-                &mut state.ui.name_counter,
-                pane_factory::SpawnIdentity::UnmanagedLocalShell,
-            )?;
-        }
-    }
-
-    // #2057 milestone 2: AFTER session restore + the per-tab agent PTY spawns
-    // (the default-home-extra work that scales with #agents/#tabs — the prime
-    // suspect). If rows here < the baseline, a spawn/restore step shrank the
-    // controlling TTY (e.g. a winsize written to fd 0/1 instead of a pane's
-    // pty master).
-    trace_tty_size(size_debug, "post-fleet-spawn");
-
-    // restart-freeze RCA (t-…55279): session restore + all synchronous
-    // per-agent PTY spawns are done. Sum of the per-agent `restore-spawn`
-    // lines ≈ this; the gap to `pre-render-loop` below is post-spawn wiring.
-    tracing::info!(
-        phase = "restore-complete",
-        elapsed_ms = restore_start.elapsed().as_millis() as u64,
-        attached = attached_mode,
-        "restore-complete: session restore + fleet PTY spawns done"
-    );
-
-    // #render-first phase-(b): all placeholders are now in the Layout. Spawn a
-    // bounded (W=3) pool of background workers to run the deferred attaches
-    // (skills + fork/exec + subscribe) and hand results back over `attach_rx`;
-    // the render loop's select! arm applies each to its pane. The render loop is
-    // entered immediately below — the operator sees the TUI shell while attaches
-    // run in the background, instead of freezing on N synchronous spawns.
-    //
-    // attach_tx is held by the main thread for the ENTIRE render-loop scope
-    // (mirrors `wakeup_tx`): a live sender keeps `attach_rx` connected, so
-    // `recv(attach_rx)` BLOCKS instead of busy-spinning once every worker exits
-    // and drops its sender clone (the #BLOCKER must-resolve).
-    let (attach_tx, attach_rx) = crossbeam_channel::unbounded::<pane_factory::AttachOutcome>();
-    // Stored JoinHandles — joined at teardown BEFORE the registry drain so every
-    // worker-spawned child is reaped (not fire-and-forget).
-    let mut attach_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    if !attach_jobs.is_empty() {
-        let (job_tx, job_rx) = crossbeam_channel::unbounded::<(usize, pane_factory::AttachSpec)>();
-        const ATTACH_WORKERS: usize = 3;
-        for w in 0..ATTACH_WORKERS {
-            let job_rx = job_rx.clone();
-            let attach_tx = attach_tx.clone();
-            let registry = Arc::clone(&registry);
-            let home = home.clone();
-            let handle = std::thread::Builder::new()
-                .name(format!("attach_worker_{w}"))
-                .spawn(move || {
-                    while let Ok((pane_id, spec)) = job_rx.recv() {
-                        let outcome = pane_factory::run_attach(spec, pane_id, &registry, &home);
-                        if attach_tx.send(outcome).is_err() {
-                            break; // render loop gone
-                        }
-                    }
-                })
-                .expect("spawn attach worker");
-            attach_workers.push(handle);
-        }
-        for job in attach_jobs.drain(..) {
-            let pane_factory::AttachJob {
-                pane_id,
-                fwd_tx,
-                spec,
-            } = job;
-            state.pending_fwd.insert(pane_id, fwd_tx);
-            let _ = job_tx.send((pane_id, spec));
-        }
-        // Drop job_tx → workers exit once the queue drains (after each spawn or an
-        // early-abort on the shutdown flag inside run_attach).
-        drop(job_tx);
-    }
-
-    // #2453 ownership-move fix: re-stamp the sync/save throttle baselines at
-    // the former declaration seam. Restore + deferred-attach scheduling above
-    // can exceed the 2s/10s intervals, and the pre-ownership code observed
-    // its baselines from HERE — without this, the first loop iteration could
-    // trigger an immediate remote sync / session save the old code never did.
-    state.last_remote_sync = std::time::Instant::now();
-    state.last_session_save = std::time::Instant::now();
-
-    // fire-and-forget: blocks in crossterm::event::read(); terminated by process exit.
-    let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
-    std::thread::Builder::new()
-        .name("crossterm_events".into())
-        .spawn(move || loop {
-            if let Ok(ev) = event::read() {
-                if event_tx.send(ev).is_err() {
-                    break;
-                }
-            }
-        })
-        .ok();
-
-    // #event-bus: owned `app` mode never calls `daemon::run_core`, so it must
-    // register the bus subscribers itself — otherwise the maintenance tick below
-    // emits `CronFire` / `CiReady` / idle nudges into a bus with ZERO subscribers
-    // and every delivery silently drops (the live #1720 cron silent-drop; same
-    // regression class as #1002 / #982). Mirrors run_core; gated to owned mode
-    // because the attached daemon process owns delivery when attached.
-    if !attached_mode {
-        crate::daemon::register_event_subscribers(&registry);
-    }
-
-    // Periodic maintenance tick (10s) — mirrors daemon tick cadence.
-    // Only active in owned (non-attached) mode; when attached, the daemon
-    // process handles schedules, CI watches, and health decay.
-    let tick_rx = if !attached_mode {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        std::thread::Builder::new()
-            .name("app_tick".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                if tx.send(()).is_err() {
-                    break;
-                }
-            })
-            .ok();
-        Some(rx)
-    } else {
-        None
-    };
-    // Never-ready channel used when attached_mode — select! needs a
-    // concrete Receiver but this arm will never fire.
-    let never_rx = crossbeam_channel::never::<()>();
-    let tick_rx_ref = tick_rx.as_ref().unwrap_or(&never_rx);
-
-    // #1726: app-standalone runs the FULL daemon per-tick pipeline (same
-    // `build_default_handlers` as run_core) minus APP_TICK_ALLOWLIST, replacing
-    // the old hand-picked subset that kept silently dropping handlers (#1002 /
-    // #982 / #1719 class). Built once, reused each tick like run_core. App has no
-    // external-agent / AgentConfig registry, so these are empty; the handlers that
-    // read them (external_liveness, inbox_maintenance worktree cleanup) graceful-
-    // no-op on empty. In attached mode the tick arm never fires, so these are
-    // harmlessly unused.
-    let app_externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
-    // W1.1 (#2050): the `mcp_registry` tracker (now a handler) flips this same
-    // `daemon_binary_stale` flag the render loop reads (line ~186); hand it the
-    // shared `Arc` so the status-bar warning still surfaces after the tracker
-    // moved off the supervisor thread.
-    let app_handlers = app_tick_handlers(Arc::clone(&daemon_binary_stale));
-
-    // The attached app constructs no owned maintenance cycle. Owned mode keeps
-    // its profile handlers, owner-service witness, and optional stall monitor in
-    // one typed value; the tick producer and select arm remain host-local.
-    let app_cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new_for_role(
-        if attached_mode {
-            crate::daemon::owner_services::OwnerRole::Attached
-        } else {
-            crate::daemon::owner_services::OwnerRole::Owned
-        },
-        app_handlers,
-        owner_services,
-        "app-owned-tick",
-        &home,
-    );
-
-    // #2057 milestone 3: just BEFORE the render loop. If this is < the baseline,
-    // a startup phase shrank the controlling TTY; milestone 2 brackets whether
-    // it was the fleet spawn/restore vs the post-spawn wiring (subscribers /
-    // tick threads). The per-frame `#2057-size` probe below only ever sees this
-    // post-shrink value (confirmed by the operator A/B), so the cause is here.
-    trace_tty_size(size_debug, "pre-render-loop");
-
-    // restart-freeze RCA (t-…55279): entering the render loop — the first
-    // `terminal.draw` is imminent. Elapsed from `restore_start` is the full
-    // boot critical path the operator perceives as the restart freeze
-    // (restore + per-agent spawns + post-spawn wiring). Pure tracing.
-    tracing::info!(
-        phase = "pre-render-loop",
-        elapsed_ms = restore_start.elapsed().as_millis() as u64,
-        attached = attached_mode,
-        "pre-render-loop: entering render loop (first draw imminent)"
-    );
-
-    // #freeze-4 boot phase anchors (see `AppState::booting` for the mechanism).
-    let boot_start = std::time::Instant::now();
-    let attaches_expected = state.pending_fwd.len();
-
-    // #2453: loop-stable shared deps for handle_key_event/handle_mouse_event,
-    // built once.
-    let ui_deps = UiDeps {
-        registry: &registry,
+    let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
+        registry: &registry,
         wakeup_tx: &wakeup_tx,
+        app_restart_gate: &app_restart_gate,
+        daemon_binary_stale: &daemon_binary_stale,
+        telegram_status,
+        attached_run_dir: &attached_run_dir,
+        attached_mode,
+        size_debug,
     };
-
+    // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
+    let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
+    let event_rx = spawn_crossterm_event_reader();
+    register_app_event_bus(attached_mode, &registry);
+    let (tick_rx, never_rx) = spawn_app_tick(attached_mode);
+    let (app_externals, app_configs, app_cycle) =
+        build_app_maintenance(&home, attached_mode, owner_services, &daemon_binary_stale);
+    log_pre_render_milestone(size_debug, restore_start, attached_mode);
     loop {
-        if crate::bootstrap::signals::term_requested() {
-            tracing::info!("app: SIGTERM received, exiting main loop");
+        if term_requested_logged() || state.poll_restart(&deps) == LoopFlow::Break {
             break;
         }
-        // #2453 R2: poll the in-flight restart preflight probe (non-blocking) each
-        // loop tick so the TUI never freezes on it.
-        if state.restart.restart_probe.is_some() {
-            use crate::api::app_restart::AppRestartVerdict;
-            match poll_restart_probe(&mut state.restart.restart_probe, &app_restart_gate) {
-                ProbePoll::Prepared(reply, flush_ack) => {
-                    // Probe passed; the gate is still Probing. Reply PREPARED, then park
-                    // the transport ack (do NOT block): the handler returns the
-                    // `prepared` reply, handle_session writes+flushes it, and its
-                    // post-flush action sends `()` on `flush_ack`. We poll that below,
-                    // non-blockingly, and CAS Probing→Committing only on the ack — so the
-                    // UI stays responsive even if the API writer wedges. If the handler
-                    // is already gone (send fails), roll the gate back now.
-                    if reply.send(AppRestartVerdict::Prepared).is_ok() {
-                        state.restart.restart_commit_pending = Some(CommitPending {
-                            flush_ack,
-                            deadline: std::time::Instant::now() + RESTART_COMMIT_WATCHDOG,
-                        });
-                    } else {
-                        app_restart_gate.abort_to_serving();
-                    }
-                }
-                ProbePoll::Abort(reply, reason) => {
-                    let _ = reply.send(AppRestartVerdict::Aborted(reason));
-                }
-                ProbePoll::Pending => {}
-            }
-        }
-        // #2453 R2 P0-2: poll the commit-pending state (NON-BLOCKING). The ack means
-        // the `prepared` reply flushed → CAS Probing→Committing + break to teardown+
-        // exec. A disconnect (reply not flushed) or the watchdog deadline aborts the
-        // restart with the app intact and an observable log; the `prepared` reply is
-        // an honest indeterminate attempt, so a watchdog abort stays truthful.
-        if state.restart.restart_commit_pending.is_some() {
-            let now = std::time::Instant::now();
-            let poll = poll_commit_pending(
-                state
-                    .restart
-                    .restart_commit_pending
-                    .as_ref()
-                    .expect("commit-pending present (checked above)"),
-                now,
-            );
-            match poll {
-                CommitPoll::Commit => {
-                    state.restart.restart_commit_pending = None;
-                    if app_restart_gate.to_committing() {
-                        state.restart.restart_outcome = RunOutcome::RestartRequested;
-                        break;
-                    }
-                    // Could not advance Probing→Committing (should not happen for the
-                    // claim owner) — fail safe: roll back, keep serving.
-                    app_restart_gate.abort_to_serving();
-                }
-                CommitPoll::Abort(reason) => {
-                    state.restart.restart_commit_pending = None;
-                    app_restart_gate.abort_to_serving();
-                    tracing::warn!(
-                        target: "handoff",
-                        event = "app_restart_abort",
-                        reason,
-                        "#2453 app restart aborted before commit — app intact (retry)"
-                    );
-                }
-                CommitPoll::Pending => {}
-            }
-        }
-        // Auto-close the scratch shell overlay once its backing process
-        // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
-        // 50ms `default` arm of the main `select!` below guarantees this
-        // runs at least every 50ms even without new PTY output.
-        if let Overlay::ScratchShell { pane } = &state.ui.overlay {
-            if !agent_is_alive(&registry, &pane.agent_name) {
-                let name = pane.agent_name.clone();
-                state.ui.overlay = Overlay::None;
-                kill_agent(&home, &registry, &name);
-            }
-        }
-        if state.needs_resize {
-            let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
-            let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
-            crate::layout::resize_panes(pane_area, &mut state.ui.layout, &registry);
-            // #1140: force full redraw to clear wide-char ghost artifacts.
-            // ratatui's Buffer::diff() can leave stale spacer cells when
-            // wide chars are replaced by narrow chars across frames.
-            let _ = terminal.clear();
-            state.needs_resize = false;
-        }
-        // #84833-15 R2 perf: throttle the per-wakeup notification-queue disk scan to
-        // ≥1s (the badge it feeds tolerates staleness); see `should_sync_notifications`.
-        let notif_now = std::time::Instant::now();
-        if should_sync_notifications(state.last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
-            state.last_notif_sync = Some(notif_now);
-            sync_notification_state(&home, &mut state.ui.layout);
-        }
-        // #2524 P2b / #2313: same throttle idiom, separate cadence state — the
-        // decision-badge scan is independent of the notification scan above.
-        if should_sync_notifications(state.last_decision_sync, notif_now, DECISION_SYNC_INTERVAL) {
-            state.last_decision_sync = Some(notif_now);
-            state.pending_decisions_total = sync_decision_badge_state(&home, &mut state.ui.layout);
-        }
-        // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm).
-        // std::sync::Mutex is fine here: only the main thread touches this,
-        // the critical section is sub-microsecond, and the TUI render loop is
-        // not async (crossbeam select!, not tokio).
-        {
-            static LAST_FLUSH: std::sync::Mutex<Option<std::time::Instant>> =
-                std::sync::Mutex::new(None);
-            let now = std::time::Instant::now();
-            let should_flush = LAST_FLUSH
-                .lock()
-                .map(|guard| {
-                    guard
-                        .map(|t| now.duration_since(t).as_secs() >= 1)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true);
-            if should_flush {
-                flush_idle_notifications(&home, &mut state.ui.layout);
-                if let Ok(mut guard) = LAST_FLUSH.lock() {
-                    *guard = Some(now);
-                }
-            }
-        }
-
-        let repeat_mode = state.ui.key_handler.in_repeat();
-
-        // #2057 instrumentation (env-gated, AGEND_TUI_SIZE_DEBUG=1): the
-        // operator sees ~3 blank rows below the status bar (frame shorter than
-        // the window) and it follows the home dir, but the static trace found
-        // NO stored size anywhere — every size source is live crossterm. Log
-        // the actual numbers per draw so a repro says which one is short.
-        if size_debug {
-            let cross = crossterm::terminal::size().unwrap_or((0, 0));
-            let term_sz = terminal
-                .size()
-                .map(|s| (s.width, s.height))
-                .unwrap_or((0, 0));
-            tracing::info!(
-                tag = "#2057-size",
-                crossterm_cols = cross.0,
-                crossterm_rows = cross.1,
-                terminal_size = ?term_sz,
-                tabs = state.ui.layout.tabs.len(),
-                "TUI draw size probe"
-            );
-        }
-
-        // #t-84833-10 redraw-storm frame cap: draw at most once per FRAME_INTERVAL
-        // and only when something changed (`state.dirty`). Input is NOT throttled — the
-        // `event_rx` arm below processes keystrokes immediately; only the (expensive)
-        // full-TUI redraw is rate-limited, which is what the boot flood saturated.
-        let frame_now = std::time::Instant::now();
-        if state.dirty && should_draw(state.last_draw, frame_now, FRAME_INTERVAL) {
-            state.last_draw = Some(frame_now);
-            state.dirty = false;
-            // #freeze-4: during the bounded boot catch-up phase, drain the restart
-            // flood with a per-frame TIME-capped drain — it clears the backlog fast
-            // as a "loading" phase while still yielding to input every frame. Exit
-            // to the steady path once all deferred attaches are applied AND every
-            // pane's rx is drained, or after MAX_BOOT_CATCHUP (so boot can't hang).
-            if state.booting {
-                let backlog_remains =
-                    render::drain_all_panes_until(&mut state.ui.layout, BOOT_FRAME_TIME_CAP);
-                let timed_out = boot_start.elapsed() >= MAX_BOOT_CATCHUP;
-                if (state.pending_fwd.is_empty() && !backlog_remains) || timed_out {
-                    state.booting = false;
-                    tracing::info!(
-                        phase = "boot-catchup-complete",
-                        elapsed_ms = boot_start.elapsed().as_millis() as u64,
-                        attaches_expected = attaches_expected,
-                        attaches_pending = state.pending_fwd.len(),
-                        timed_out = timed_out,
-                        "#freeze-4: restart-flood boot catch-up drained"
-                    );
-                }
-            } else {
-                // #freeze-3: drain queued PTY output for EVERY pane (active +
-                // background) into its VTerm BEFORE drawing, within one shared
-                // per-frame byte budget. `render_pane` no longer drains, so a
-                // backgrounded busy tab's `rx` stays bounded instead of replaying a
-                // multi-second catch-up when switched to. Background panes are drained
-                // but not redrawn; only the active tab is painted below.
-                render::drain_all_panes(&mut state.ui.layout);
-            }
-            terminal.draw(|frame| {
-                // #1027: snapshot the shared daemon-binary-stale flag once
-                // per frame so the render path sees a consistent value.
-                // Relaxed is enough — single-bit flag, no fence vs other
-                // state needed; the supervisor's SeqCst store will always
-                // be visible to this load before the next paint tick.
-                let binary_stale = daemon_binary_stale.load(std::sync::atomic::Ordering::Relaxed);
-                // #2057: the area render actually fills — compare to crossterm above.
-                if size_debug {
-                    let a = frame.area();
-                    tracing::info!(
-                        tag = "#2057-area",
-                        x = a.x,
-                        y = a.y,
-                        w = a.width,
-                        h = a.height,
-                        "frame.area() in draw"
-                    );
-                }
-                render::render(
-                    frame,
-                    &mut state.ui.layout,
-                    repeat_mode,
-                    &registry,
-                    telegram_status,
-                    binary_stale,
-                    state.pending_decisions_total,
-                );
-                // &mut because ScratchShell needs to drain output and maybe
-                // resize its pane's VTerm/PTY during render.
-                render_active_overlay(
-                    frame,
-                    &mut state.ui.overlay,
-                    &state.ui.layout,
-                    &registry,
-                    &home,
-                );
-                // #freeze-4: loading indicator while the boot catch-up phase absorbs
-                // the restart flood (so it reads as loading-with-progress, not a freeze).
-                if state.booting {
-                    render::render_boot_indicator(
-                        frame,
-                        attaches_expected.saturating_sub(state.pending_fwd.len()),
-                        attaches_expected,
-                    );
-                }
-            })?;
-            // #freeze-4: while state.booting, keep cycling at frame cadence so the
-            // time-capped catch-up runs every frame until the restart flood clears.
-            // #freeze-2/#freeze-3: otherwise the budget-capped `drain_all_panes`
-            // above may have left a backlog in a VISIBLE pane's channel — re-arm
-            // `state.dirty` so the next frame continues the active tab's catch-up (the
-            // select-timeout below shrinks to the frame boundary when state.dirty), clearing
-            // over a few frames instead of one input-stalling mega-draw. Background
-            // backlog needs no redraw: the loop's ≤50ms idle cadence + per-output
-            // wakeups guarantee `drain_all_panes` runs again to bound every pane's `rx`.
-            if state.booting || render::active_tab_has_pending_output(&state.ui.layout) {
-                state.dirty = true;
-            }
-        }
-
-        // #t-84833-10: wake the loop at the next frame boundary when a change is
-        // pending but throttled (so it never stays stale beyond one frame), else
-        // keep the cheap ~50ms idle refresh cadence (catches non-wakeup state like
-        // status-bar / notification updates).
-        let select_timeout = if state.dirty {
-            match state.last_draw {
-                Some(t) => FRAME_INTERVAL
-                    .saturating_sub(t.elapsed())
-                    .max(std::time::Duration::from_millis(1)),
-                None => std::time::Duration::from_millis(1),
-            }
-        } else {
-            std::time::Duration::from_millis(50)
-        };
-
+        state.pre_select(terminal, &deps);
+        state.render_frame(terminal, &deps)?;
         crossbeam_channel::select! {
-            // #2453 R2: an operator `restart_daemon` request (owned app mode only;
-            // never-ready in attached). Start the preflight probe; the poll at the
-            // loop top drives it to commit/abort. The gate CAS-serializes, so at
-            // most one probe is ever in flight.
-            recv(app_restart_rx) -> req => {
-                if let Ok(req) = req {
-                    use crate::api::app_restart::AppRestartVerdict;
-                    if state.restart.restart_probe.is_some() {
-                        // Defensive: the gate should prevent this. Reject without
-                        // disturbing the in-flight probe's claim.
-                        let _ = req.reply.send(AppRestartVerdict::Aborted(
-                            "a restart preflight is already in flight".into(),
-                        ));
-                    } else {
-                        match spawn_restart_probe() {
-                            Ok(child) => {
-                                state.restart.restart_probe = Some(RestartProbe {
-                                    child,
-                                    reply: req.reply,
-                                    flush_ack: req.flush_ack,
-                                    deadline: std::time::Instant::now()
-                                        + std::time::Duration::from_secs(5),
-                                });
-                            }
-                            Err(e) => {
-                                app_restart_gate.abort_to_serving();
-                                let _ = req.reply.send(AppRestartVerdict::Aborted(format!(
-                                    "could not start preflight probe: {e}"
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
+            recv(app_restart_rx) -> req => state.handle_restart_request(req, &deps),
             recv(event_rx) -> ev => {
-                state.dirty = true; // input may change the display → redraw next due frame
-                let ev = match ev {
-                    Ok(e) => e,
-                    Err(_) => break,
-                };
-                match ev {
-                    // Windows crossterm emits both Press and Release events for every key;
-                    // Unix only emits Press. Ignoring non-Press avoids every keystroke
-                    // firing the handler twice (breaks Ctrl+B prefix state, etc.).
-                    Event::Key(key) if key.kind != KeyEventKind::Press => {}
-                    Event::Key(key) => {
-                        // #2453: former inline overlay/dispatch branch, now behind UiState.
-                        let out = state.ui.handle_key_event(key, &ui_deps);
-                        if out.needs_resize {
-                            state.needs_resize = true;
-                        }
-                        if out.should_break {
-                            break;
-                        }
-                    }
-                    // Overlays (Help, Tasks, Decisions, Command palette, rename,
-                    // etc.) are modal — mouse events must not reach hidden panes,
-                    // otherwise drag/selection state accumulates on panes the user
-                    // can't see. Swallow mouse events while any overlay is active.
-                    // #2453: overlays are modal — mouse must not reach hidden
-                    // panes. The modal-swallow guard + mouse routing now live in
-                    // UiState::handle_mouse_event (mirrors the Event::Key branch).
-                    Event::Mouse(mouse_evt) => {
-                        if state.ui.handle_mouse_event(mouse_evt, &ui_deps) {
-                            state.needs_resize = true;
-                        }
-                    }
-                    Event::Paste(text) => {
-                        match &mut state.ui.overlay {
-                            Overlay::RenameTab { ref mut input }
-                            | Overlay::RenamePane { ref mut input } => {
-                                input.push_str(&text);
-                            }
-                            // #t-5: paste grows `input` → the candidate set changes,
-                            // so reset the completion highlight (same as Char /
-                            // Backspace) — otherwise a stale `selected` past the new
-                            // (shorter) list left Tab silently no-op.
-                            Overlay::Command {
-                                ref mut input,
-                                ref mut selected,
-                            } => {
-                                input.push_str(&text);
-                                *selected = 0;
-                            }
-                            Overlay::ScratchShell { pane } => {
-                                pane.write_input(&registry, text.as_bytes());
-                            }
-                            Overlay::None => {
-                                write_to_focused(&home, &mut state.ui.layout, &registry, text.as_bytes());
-                            }
-                            _ => {} // ignore paste in non-input overlays
-                        }
-                    }
-                    Event::Resize(cols, rows) => {
-                        let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
-                        crate::layout::resize_panes(pane_area, &mut state.ui.layout, &registry);
-                        // #1140: an interactive terminal resize reflows pane widths
-                        // (the wide→narrow transition that leaves stale wide-char
-                        // spacer cells in ratatui's Buffer::diff), so force the same
-                        // full clear the state.needs_resize path performs — otherwise the
-                        // ghost artifacts reappear after the resize.
-                        let _ = terminal.clear();
-                    }
-                    _ => {}
+                if state.handle_crossterm_event(ev, terminal, &deps) == LoopFlow::Break {
+                    break;
                 }
             }
-            recv(wakeup_rx) -> _ => {
-                // Wakeup from PTY output — drain the whole burst (11 state.booting agents
-                // flood this channel, one wakeup per output chunk) so N chunks
-                // coalesce into ONE redraw, not N iterations. The frame cap above
-                // then bounds the actual redraw rate.
-                while wakeup_rx.try_recv().is_ok() {}
-                state.dirty = true;
+            recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
+            recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps),
+            recv(tui_event_rx) -> ev => state.handle_tui_event(ev, &deps),
+            recv(tick_rx.as_ref().unwrap_or(&never_rx)) -> _ => {
+                state.handle_maintenance_tick(&app_cycle, &deps, &app_externals, &app_configs)
             }
-            recv(attach_rx) -> outcome => {
-                state.dirty = true;
-                // #render-first phase-(b): a background worker finished a deferred
-                // attach. Apply it to its placeholder pane (instance id + dump +
-                // forwarder on Ready, or a visible "failed to start" banner on
-                // Failed). If the pane was closed before the attach completed, drop
-                // the outcome. The keepalive `attach_tx` keeps this arm from
-                // busy-spinning after all workers exit.
-                if let Ok(outcome) = outcome {
-                    let pane_id = outcome.pane_id();
-                    if let Some(fwd_tx) = state.pending_fwd.remove(&pane_id) {
-                        if let Some(pane) = state.ui.layout.find_pane_mut(pane_id) {
-                            pane_factory::apply_attach_outcome(
-                                pane, &registry, outcome, fwd_tx, &wakeup_tx,
-                            );
-                        } else if let pane_factory::AttachOutcome::Ready { name, .. } = &outcome {
-                            // F1 (r4): the pane was closed while the attach was in
-                            // flight → the agent is already spawned + registered with
-                            // no host pane. Kill it so it doesn't run orphaned until
-                            // quit (fwd_tx already removed above → forwarder/rx drop).
-                            kill_agent(&home, &registry, name);
-                        }
-                    }
-                }
-            }
-            recv(tui_event_rx) -> ev => {
-                state.dirty = true;
-                if let Ok(event) = ev {
-                    tui_events::handle_tui_event(event, &mut state.ui.layout, &registry, &wakeup_tx);
-                    state.needs_resize = true;
-                }
-            }
-            recv(tick_rx_ref) -> _ => {
-                state.dirty = true;
-                // #1726: owned-mode periodic maintenance now runs the FULL daemon
-                // per-tick pipeline (build_default_handlers minus APP_TICK_ALLOWLIST)
-                // instead of a hand-picked subset. Gated to owned mode via tick_rx
-                // (None in attached mode). The replaced manual calls map to:
-                //   cron_tick::check_schedules      → CheckSchedulesHandler
-                //   ci_watch::check_ci_watches      → CiWatchPollHandler
-                //   health.maybe_decay + check_hang → HangDetectionHandler
-                //   core.state.tick()               → supervisor::spawn (runs in
-                //     owned mode too — supervisor.rs:tick; the old manual call here
-                //     was a benign idempotent double, now removed).
-                app_cycle
-                    .as_ref()
-                    .expect("owned maintenance tick requires the owned cycle")
-                    .run_once(&home, &registry, &app_externals, &app_configs);
-                // PR4: back to Waiting between maintenance ticks so the monitor
-                // never attributes render/idle time to the maintenance host.
-                app_cycle
-                    .as_ref()
-                    .expect("owned maintenance tick requires the owned cycle")
-                    .enter_waiting();
-            }
-            default(select_timeout) => {
-                // #t-84833-10: periodic idle refresh — mark state.dirty so the cap above
-                // redraws (catches non-wakeup state changes; ~50ms cadence when idle).
-                state.dirty = true;
-                // #1479: throttled, change-gated session persistence (every
-                // 10s). Cheap when the layout is unchanged (no write); on a
-                // change it preserves the on-screen layout against a hard
-                // crash. Graceful exit still saves unconditionally below.
-                if state.last_session_save.elapsed() >= std::time::Duration::from_secs(10) {
-                    state.last_session_save = std::time::Instant::now();
-                    session::save_session_if_changed(&home, &state.ui.layout, &mut state.last_session_json);
-                }
-                // Periodic redraw for state updates. In Attached mode, also
-                // poll the daemon's `*.port` directory every 2s and open a
-                // tab for each newly-appeared remote agent (hot-reload
-                // Phase C). Matches the daemon's add-only policy: removed
-                // agents are logged but their panes stay put so the user's
-                // scrollback isn't destroyed mid-session.
-                if attached_run_dir.is_some()
-                    && state.last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
-                {
-                    {
-                        // #910 PR3 of 4: daemon-registry truth via runtime
-                        // helper. The state-transition log gate inside the
-                        // helper keeps this 2s-cadence call from spamming
-                        // daemon.log — only Live↔Fallback transitions
-                        // emit (validated by `runtime::tests::
-                        // helper_steady_state_does_not_log_per_call`).
-                        let current: std::collections::HashSet<String> =
-                            crate::runtime::list_agents_with_fallback(&home)
-                                .into_iter()
-                                .collect();
-                        let mut to_add: Vec<String> = current
-                            .difference(&state.known_remote_agents)
-                            .cloned()
-                            .collect();
-                        to_add.sort();
-                        for name in &to_add {
-                            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
-                            match pane_factory::create_remote_pane(
-                                name,
-                                &home,
-                                &fleet_path,
-                                &mut state.ui.layout,
-                                dc.saturating_sub(2),
-                                dr.saturating_sub(4),
-                                &wakeup_tx,
-                            ) {
-                                Ok(pane) => {
-                                    let tab_name = pane.agent_name.clone();
-                                    state.known_remote_agents.insert(tab_name.to_string());
-                                    // #1591: this sync is add-only — a gone
-                                    // agent's tab is RETAINED (stale output) so
-                                    // scrollback survives. If a same-named agent
-                                    // re-appears (recovery respawn / operator
-                                    // create-after-delete churn), REUSE the
-                                    // retained single-pane tab in place (the
-                                    // fresh pane reconnects to the new instance;
-                                    // the stale dead-connection pane is dropped)
-                                    // instead of appending a DUPLICATE tab.
-                                    // Preserves tab position + focus.
-                                    if let Some(idx) =
-                                        state.ui.layout.single_pane_tab_index_for_agent(&tab_name)
-                                    {
-                                        state.ui.layout.tabs[idx] = crate::layout::Tab::new(
-                                            tab_name.to_string(),
-                                            pane,
-                                        );
-                                        tracing::info!(
-                                            agent = %name,
-                                            "reused retained tab for re-appeared remote agent (no duplicate)"
-                                        );
-                                    } else {
-                                        state.ui.layout.push_tab_preserve_focus(
-                                            crate::layout::Tab::new(tab_name.to_string(), pane),
-                                        );
-                                        tracing::info!(
-                                            agent = %name,
-                                            "opened tab for newly-appeared remote agent"
-                                        );
-                                    }
-                                    state.needs_resize = true;
-                                }
-                                Err(e) => tracing::warn!(
-                                    agent = %name,
-                                    error = %e,
-                                    "remote pane attach failed during sync",
-                                ),
-                            }
-                        }
-                        let gone: Vec<String> = state.known_remote_agents
-                            .difference(&current)
-                            .cloned()
-                            .collect();
-                        for name in &gone {
-                            tracing::warn!(
-                                agent = %name,
-                                "daemon-side agent gone; pane retained with stale output",
-                            );
-                            state.known_remote_agents.remove(name);
-                        }
-                        state.last_remote_sync = std::time::Instant::now();
-                    }
-                }
-            }
+            default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
     }
-
-    // Attached mode: the daemon owns agent state + every agent's PTY.
-    // `sync_fleet_yaml` STAYS gated — in Attached mode, fleet entries whose
-    // remote connect happened to fail at startup would be silently deleted
-    // if we touched fleet.yaml. Agent kill also STAYS gated — daemon owns
-    // those PTYs.
-    //
-    // BUT `save_session` is now UNGATED (#895 fix). Layout state (tab
-    // grouping, splits, ratios) is presentation-layer client state and
-    // belongs to the app, NOT the daemon. Saving session.json in Attached
-    // mode lets the next attached relaunch restore custom layout via the
-    // same reconciliation path Owned mode uses (parameterized over agent
-    // source: fleet.yaml for Owned, `runtime::list_agents_with_fallback`
-    // for Attached — see #910 for the registry-truth migration).
+    // Teardown gating rationale is documented on `app_teardown`.
     app_teardown(
         &home,
         &state.ui.layout,
@@ -1708,7 +757,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         attached_mode,
         attach_workers,
     );
-
     Ok(state.restart.restart_outcome)
 }
 
@@ -1802,6 +850,314 @@ static APP_SHUTDOWN: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
 
 pub(crate) fn app_shutdown_flag() -> &'static Arc<std::sync::atomic::AtomicBool> {
     APP_SHUTDOWN.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+/// #2453 R2: app owner-restart gate + bounded(1) request channel. Owned mode
+/// injects the Sender into the API server; the run_app loop owns the Receiver
+/// and drives probe → re-exec commit.
+fn build_app_restart_wiring() -> (
+    crate::api::app_restart::AppRestartGate,
+    crate::api::app_restart::AppRestart,
+    crossbeam_channel::Receiver<crate::api::app_restart::AppRestartRequest>,
+) {
+    let gate = crate::api::app_restart::AppRestartGate::new();
+    let (tx, rx) = crossbeam_channel::bounded::<crate::api::app_restart::AppRestartRequest>(1);
+    let inject = crate::api::app_restart::AppRestart {
+        tx,
+        gate: gate.clone(),
+    };
+    (gate, inject, rx)
+}
+
+/// #2453 R2: attached mode never listens for app restart requests — the
+/// daemon owns restart and the injected Sender was dropped in
+/// `setup_app_bootstrap`, so the arm must be never-ready.
+fn never_when_attached(
+    rx: crossbeam_channel::Receiver<crate::api::app_restart::AppRestartRequest>,
+    attached_mode: bool,
+) -> crossbeam_channel::Receiver<crate::api::app_restart::AppRestartRequest> {
+    if attached_mode {
+        crossbeam_channel::never()
+    } else {
+        rx
+    }
+}
+
+/// restart-freeze RCA (t-…55279): entering the render loop — the first draw
+/// is imminent; elapsed from `restore_start` is the full boot critical path
+/// the operator perceives as the restart freeze. Pure tracing.
+fn log_pre_render_milestone(size_debug: bool, restore_start: std::time::Instant, attached: bool) {
+    trace_tty_size(size_debug, "pre-render-loop");
+    tracing::info!(
+        phase = "pre-render-loop",
+        elapsed_ms = restore_start.elapsed().as_millis() as u64,
+        attached = attached,
+        "pre-render-loop: entering render loop (first draw imminent)"
+    );
+}
+
+/// Loop-skeleton guard: SIGTERM exit with its operator-visible log line.
+fn term_requested_logged() -> bool {
+    if crate::bootstrap::signals::term_requested() {
+        tracing::info!("app: SIGTERM received, exiting main loop");
+        return true;
+    }
+    false
+}
+
+/// #2453 Slice 2: one-shot app boot preflight, extracted verbatim from the
+/// head of `run_app`.
+fn app_boot_preflight(home: &Path) {
+    // #2325: the app process (unlike the daemon's `run_core`, the only other
+    // `runtime_config::reload` caller) never tick-reloads runtime config, so load
+    // the persisted values once at startup. Otherwise a persisted `copy_on_select`
+    // (the TUI mouse copy-on-select mode) would reset to the compile-time default
+    // on every restart. In-session changes update the in-process global directly
+    // via `runtime_config::set` (the `Ctrl+B e` toggle and `:set`/`:config set`).
+    crate::runtime_controls::reload_runtime_controls(home);
+
+    // PR-D6/F1: fail LOUD if the retired `AGEND_WORKTREE_PRUNE_LIVE` is still set.
+    // The LIVE fleet daemon runs THIS app-mode path — never `run_core` (see
+    // `main.rs`'s subcommand dispatch: `App` → `app::run` → here, vs `Start` →
+    // `daemon::run`/`run_core`; the two are mutually exclusive per process). So
+    // the run_core:764 boot-warn is DEAD in production without this call. Fired
+    // ONCE per app boot here: `run_app` is invoked exactly once (from `run`, not
+    // in any retry loop) and this sits before the sweep/TUI event loop. Mirrors
+    // run_core's placement — a single startup warn so an operator carrying the
+    // stale flag learns it is ignored (not silent).
+    crate::worktree_cleanup::warn_if_prune_live_retired();
+}
+
+/// #2453 Slice 2: owned-mode service wiring (supervisor, owner monitoring,
+/// shadow socket, stream observers, telegram registry attach), extracted
+/// verbatim from `run_app`. Attached mode returns None (daemon owns these).
+fn start_owned_services(
+    home: &Path,
+    registry: &AgentRegistry,
+    telegram_state: &Option<Arc<dyn crate::channel::Channel>>,
+    attached_mode: bool,
+) -> Option<crate::daemon::owner_services::OwnerServicesStarted> {
+    // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
+    // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
+    // mode), and SIGHUP's default "kill the process group" keeps shell-exit
+    // semantics intact. SIGTERM is the only signal the app intercepts, and
+    // only in the Owned branch — see `install_term_only` above.
+
+    // Per-agent AwaitingOperator supervisor: watches for stdout silence during
+    // Starting (or recently-entered Idle — some backends like codex match
+    // ready_pattern against the startup banner that precedes the update menu)
+    // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
+    // the daemon already runs its own supervisor against the real registry, so
+    // the app must not also poll a disjoint (empty) registry.
+    // #2737: the owner-service composition is now a typed two-phase seam. This
+    // owned-only block yields the `OwnerServicesStarted` witness (None when
+    // attached); the owned-only maintenance tick REQUIRES it, so a run_app that
+    // skips the seam fails to compile (structural I2, replacing the old
+    // `owner_services_called_by_both_hosts` string-scan).
+    let owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted> =
+        if !attached_mode {
+            crate::daemon::supervisor::spawn(home.to_path_buf(), Arc::clone(registry));
+            // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
+            // api_activity_probe) via the typed phase-1 seam — identical position/args
+            // in run_core's build_tick_infrastructure, so a service can't be wired in
+            // one host and silently dead in the other (#982/#1002/#1720/#2434). The
+            // returned OwnerMonitoringStarted token is required by phase 2 below, so
+            // monitoring is compile-forced to precede the stream observers (exact
+            // order preserved: monitoring → shadow::start → stream).
+            let monitoring = crate::daemon::owner_services::start_owner_monitoring(
+                crate::daemon::owner_services::OwnerRole::Owned,
+                home,
+                registry,
+                &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
+            );
+            // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
+            // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
+            // only other caller), so without this the whole Shadow Observer plane was dead in
+            // production (observed_status null on every agent under the flag — #1720/#685
+            // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
+            // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
+            // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
+            // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
+            // detached accept loop that exits with the process; the stale socket is cleared on
+            // next bind (start_unix removes it before binding).
+            crate::daemon::shadow::start(home);
+            // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout
+            // + opencode + kiro) via the typed phase-2 seam. Requires the phase-1
+            // OwnerMonitoringStarted token (compile-enforced order). #2434: the live
+            // fleet daemon is app mode, so these must be app-wired (not run_core-only)
+            // or each backend's observer source is dead in production. Identical
+            // position/args in run_core's build_tick_infrastructure. shadow::start
+            // (the socket-ingest plane above) stays host-local — separate fork.
+            let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
+                crate::daemon::owner_services::OwnerRole::Owned,
+                &monitoring,
+                home,
+                registry,
+                &crate::daemon::owner_services::OwnerStreamStarters::real(),
+            );
+            // Attached mode stays unwired: that process never owns the registry,
+            // and the Telegram bot (if any) runs under the other daemon which
+            // already did its own attach.
+            //
+            // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
+            // is always None at this point post-backgrounding. Publish registry
+            // to the pending slot so the background thread can attach when its
+            // ~6s HTTP init completes. The if-let path below covers the eager
+            // (fast/mocked init) case.
+            crate::agent::set_pending_registry(Arc::clone(registry));
+            if let Some(tg) = telegram_state.as_ref() {
+                tg.attach_registry(Arc::clone(registry));
+            } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
+                // Multi-channel-safe (t-20260703164240502572-50899-11): this
+                // fallback is telegram-specific (the `tg`/`telegram_state`
+                // naming already assumed it); `active_channel()` would silently
+                // no-op here once discord is also registered.
+                tg.attach_registry(Arc::clone(registry));
+            }
+            // #2737: hand the final witness to the owned-only maintenance tick below.
+            Some(owner_services)
+        } else {
+            None
+        };
+    owner_services
+}
+
+/// #2453 Slice 2: the crossterm event-reader thread, extracted verbatim.
+fn spawn_crossterm_event_reader() -> crossbeam_channel::Receiver<Event> {
+    // fire-and-forget: blocks in crossterm::event::read(); terminated by process exit.
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
+    std::thread::Builder::new()
+        .name("crossterm_events".into())
+        .spawn(move || loop {
+            if let Ok(ev) = event::read() {
+                if event_tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok();
+    event_rx
+}
+
+/// #2453 Slice 2: owned-mode event-bus subscriber registration, extracted
+/// verbatim (comment included — the silent-drop history is load-bearing).
+fn register_app_event_bus(attached_mode: bool, registry: &AgentRegistry) {
+    let _ = attached_mode;
+    // #event-bus: owned `app` mode never calls `daemon::run_core`, so it must
+    // register the bus subscribers itself — otherwise the maintenance tick below
+    // emits `CronFire` / `CiReady` / idle nudges into a bus with ZERO subscribers
+    // and every delivery silently drops (the live #1720 cron silent-drop; same
+    // regression class as #1002 / #982). Mirrors run_core; gated to owned mode
+    // because the attached daemon process owns delivery when attached.
+    if !attached_mode {
+        crate::daemon::register_event_subscribers(registry);
+    }
+}
+
+/// #2453 Slice 2: the 10s owned-mode maintenance tick producer, extracted
+/// verbatim. Attached mode returns None (the daemon process owns cadence).
+fn spawn_app_tick(
+    attached_mode: bool,
+) -> (
+    Option<crossbeam_channel::Receiver<()>>,
+    crossbeam_channel::Receiver<()>,
+) {
+    // Periodic maintenance tick (10s) — mirrors daemon tick cadence.
+    // Only active in owned (non-attached) mode; when attached, the daemon
+    // process handles schedules, CI watches, and health decay.
+    let tick_rx = if !attached_mode {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("app_tick".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if tx.send(()).is_err() {
+                    break;
+                }
+            })
+            .ok();
+        Some(rx)
+    } else {
+        None
+    };
+    // Never-ready placeholder for attached mode (select! needs a Receiver).
+    (tick_rx, crossbeam_channel::never::<()>())
+}
+
+/// #2453 Slice 2: the owned-maintenance pipeline wiring (registries, handler
+/// set, typed cycle), extracted verbatim from `run_app`.
+fn build_app_maintenance(
+    home: &Path,
+    attached_mode: bool,
+    owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted>,
+    daemon_binary_stale: &crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
+) -> (
+    crate::agent::ExternalRegistry,
+    crate::api::ConfigRegistry,
+    Option<crate::daemon::owned_maintenance::OwnedMaintenanceCycle>,
+) {
+    // #1726: app-standalone runs the FULL daemon per-tick pipeline (same
+    // `build_default_handlers` as run_core) minus APP_TICK_ALLOWLIST, replacing
+    // the old hand-picked subset that kept silently dropping handlers (#1002 /
+    // #982 / #1719 class). Built once, reused each tick like run_core. App has no
+    // external-agent / AgentConfig registry, so these are empty; the handlers that
+    // read them (external_liveness, inbox_maintenance worktree cleanup) graceful-
+    // no-op on empty. In attached mode the tick arm never fires, so these are
+    // harmlessly unused.
+    let app_externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // W1.1 (#2050): the `mcp_registry` tracker (now a handler) flips this same
+    // `daemon_binary_stale` flag the render loop reads (line ~186); hand it the
+    // shared `Arc` so the status-bar warning still surfaces after the tracker
+    // moved off the supervisor thread.
+    let app_handlers = app_tick_handlers(Arc::clone(daemon_binary_stale));
+
+    // The attached app constructs no owned maintenance cycle. Owned mode keeps
+    // its profile handlers, owner-service witness, and optional stall monitor in
+    // one typed value; the tick producer and select arm remain host-local.
+    let app_cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new_for_role(
+        if attached_mode {
+            crate::daemon::owner_services::OwnerRole::Attached
+        } else {
+            crate::daemon::owner_services::OwnerRole::Owned
+        },
+        app_handlers,
+        owner_services,
+        "app-owned-tick",
+        home,
+    );
+    (app_externals, app_configs, app_cycle)
+}
+
+/// #2453 Slice 2: one owned-maintenance tick, extracted verbatim from the
+/// tick select! arm (the handler-mapping comment is load-bearing).
+fn run_owned_maintenance_tick(
+    app_cycle: &Option<crate::daemon::owned_maintenance::OwnedMaintenanceCycle>,
+    home: &Path,
+    registry: &AgentRegistry,
+    app_externals: &crate::agent::ExternalRegistry,
+    app_configs: &crate::api::ConfigRegistry,
+) {
+    // #1726: owned-mode periodic maintenance now runs the FULL daemon
+    // per-tick pipeline (build_default_handlers minus APP_TICK_ALLOWLIST)
+    // instead of a hand-picked subset. Gated to owned mode via tick_rx
+    // (None in attached mode). The replaced manual calls map to:
+    //   cron_tick::check_schedules      → CheckSchedulesHandler
+    //   ci_watch::check_ci_watches      → CiWatchPollHandler
+    //   health.maybe_decay + check_hang → HangDetectionHandler
+    //   core.state.tick()               → supervisor::spawn (runs in
+    //     owned mode too — supervisor.rs:tick; the old manual call here
+    //     was a benign idempotent double, now removed).
+    app_cycle
+        .as_ref()
+        .expect("owned maintenance tick requires the owned cycle")
+        .run_once(home, registry, app_externals, app_configs);
+    // PR4: back to Waiting between maintenance ticks so the monitor
+    // never attributes render/idle time to the maintenance host.
+    app_cycle
+        .as_ref()
+        .expect("owned maintenance tick requires the owned cycle")
+        .enter_waiting();
 }
 
 /// #render-first phase-(b) F2: join attach workers, but DETACH any that haven't
@@ -2788,7 +2144,7 @@ mod tests {
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
-            prod.contains("crate::daemon::shadow::start(&home)"),
+            prod.contains("crate::daemon::shadow::start("),
             "run_app must start the Shadow Observer hook-socket server in the PRODUCTION \
              region (#2413 live-fix) — gating it to run_core left the whole plane dead in \
              the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \

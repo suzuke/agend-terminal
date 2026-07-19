@@ -179,16 +179,28 @@ mod tests {
             .or_else(|| after_start.find("\npub fn setup_app_bootstrap"))
             .unwrap_or(after_start.len());
         let body = &after_start[..fn_end];
+        // #2453 Slice 2: the reload call moved into `app_boot_preflight`,
+        // invoked at the top of run_app — the ordering guarantee is preserved
+        // transitively: preflight-call precedes bootstrap-call in run_app, and
+        // the preflight body performs the reload.
         let reload_pos = body
-            .find("reload_runtime_controls")
-            .expect("reload_runtime_controls call must exist inside run_app body");
+            .find("app_boot_preflight")
+            .expect("app_boot_preflight call must exist inside run_app body");
         let bootstrap_pos = body
             .find("setup_app_bootstrap")
             .expect("setup_app_bootstrap call must exist inside run_app body");
         assert!(
             reload_pos < bootstrap_pos,
-            "reload_runtime_controls must appear before setup_app_bootstrap \
-             within the bounded run_app function body"
+            "app_boot_preflight (reload_runtime_controls) must appear before \
+             setup_app_bootstrap within the bounded run_app function body"
+        );
+        let preflight = src
+            .find("fn app_boot_preflight(")
+            .and_then(|s| src[s..].find("\n}").map(|e| &src[s..s + e]))
+            .expect("fn app_boot_preflight must exist in app/mod.rs");
+        assert!(
+            preflight.contains("reload_runtime_controls"),
+            "app_boot_preflight must perform the runtime-controls reload"
         );
     }
 

@@ -62,7 +62,7 @@ impl<'ast> Visit<'ast> for FnBodyScanner<'_> {
     }
 }
 
-fn scan_fn_body_for_call(rel_path: &str, fn_name: &str) -> (bool, bool) {
+fn scan_fn_body_for_call(rel_path: &str, fn_name: &str, call_ident: &str) -> (bool, bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let full = root.join(rel_path);
     let src =
@@ -70,7 +70,7 @@ fn scan_fn_body_for_call(rel_path: &str, fn_name: &str) -> (bool, bool) {
     let file = syn::parse_file(&src).unwrap_or_else(|e| panic!("parse {}: {e}", full.display()));
     let mut scanner = FnBodyScanner {
         fn_name,
-        call_ident: "warn_if_prune_live_retired",
+        call_ident,
         fn_seen: false,
         call_in_fn: false,
     };
@@ -82,15 +82,27 @@ fn scan_fn_body_for_call(rel_path: &str, fn_name: &str) -> (bool, bool) {
 /// LIVE fleet daemon actually runs) must call the retired-flag boot warn.
 #[test]
 fn both_startup_paths_warn_prune_live_retired_d6() {
-    for (path, func) in [
-        ("src/daemon/mod.rs", "run_core"),
-        ("src/app/mod.rs", "run_app"),
+    // #2453 Slice 2: run_app delegates the boot warn to `app_boot_preflight`;
+    // pin BOTH the delegation edge and the warn itself so the transitive
+    // guarantee cannot silently break at either hop.
+    for (path, func, call) in [
+        (
+            "src/daemon/mod.rs",
+            "run_core",
+            "warn_if_prune_live_retired",
+        ),
+        ("src/app/mod.rs", "run_app", "app_boot_preflight"),
+        (
+            "src/app/mod.rs",
+            "app_boot_preflight",
+            "warn_if_prune_live_retired",
+        ),
     ] {
-        let (fn_seen, call_in_fn) = scan_fn_body_for_call(path, func);
+        let (fn_seen, call_in_fn) = scan_fn_body_for_call(path, func, call);
         assert!(fn_seen, "expected to find `fn {func}` in {path}");
         assert!(
             call_in_fn,
-            "`fn {func}` in {path} must call `warn_if_prune_live_retired` — the \
+            "`fn {func}` in {path} must call `{call}` — the \
              retired-flag boot warn is dead on that deployment path otherwise \
              (daemon `run_core` and owned-app `run_app` are mutually exclusive \
              per process, so each boot fires exactly one)"
