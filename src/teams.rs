@@ -184,6 +184,25 @@ pub fn create(home: &Path, args: &Value) -> Value {
     // routing without touching worktree/dispatch identity.
     let project_id = args["project_id"].as_str().map(String::from);
 
+    // #2855: fail-closed identifier validation before any membership check or
+    // roster write — validation semantics must win over membership-shaped
+    // errors so a traversal orchestrator is reported as invalid, not missing.
+    for candidate in std::iter::once(name.as_str())
+        .chain(members.iter().map(String::as_str))
+        .chain(orchestrator.as_deref())
+        .chain(
+            args["accept_from"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str()),
+        )
+    {
+        if let Err(e) = crate::agent::validate_name(candidate) {
+            return serde_json::json!({"error": e});
+        }
+    }
+
     // Validate orchestrator
     if let Some(ref orch) = orchestrator {
         if !members.contains(orch) {
@@ -338,6 +357,11 @@ pub(crate) fn delete_with_runtime(
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
+    // #2855: reject an invalid team-name argument with validation semantics
+    // before any lookup — never let a traversal name shape later behavior.
+    if let Err(e) = crate::agent::validate_name(&name) {
+        return serde_json::json!({"error": e, "members_cleaned": 0});
+    }
 
     // Snapshot existence + members BEFORE cascade. The cascade itself
     // may auto-delete the team (when `remove_member_from_all` removes
@@ -351,6 +375,18 @@ pub(crate) fn delete_with_runtime(
         });
     }
     let members = list_team_members(home, &name);
+    // #2855: prevalidate the COMPLETE persisted roster before the FIRST
+    // cascade side effect. A poisoned entry (pre-existing/manual fleet.yaml
+    // contamination) must abort the disband atomically and loudly — the
+    // cascade's per-member cleanup derives filesystem paths from raw names.
+    for member in &members {
+        if let Err(e) = crate::agent::validate_name(member) {
+            return serde_json::json!({
+                "error": format!("team '{name}' roster prevalidation failed for '{member}': {e}"),
+                "members_cleaned": 0,
+            });
+        }
+    }
     let members_count = members.len();
     let mut cascade_warnings: Vec<String> = Vec::new();
     for member in &members {
@@ -489,6 +525,28 @@ pub fn update(home: &Path, args: &Value) -> Value {
         })
         .unwrap_or_default();
     let new_orchestrator = args["orchestrator"].as_str().map(String::from);
+
+    // #2855: fail-closed identifier validation before lookup or any roster
+    // mutation. Only args-provided identifiers are validated — the persisted
+    // current roster/accept_from are not re-validated here so an unrelated
+    // update cannot be bricked by pre-existing contamination (delete's roster
+    // prevalidation owns that surface).
+    for candidate in std::iter::once(name.as_str())
+        .chain(to_add.iter().map(String::as_str))
+        .chain(to_remove.iter().map(String::as_str))
+        .chain(new_orchestrator.as_deref())
+        .chain(
+            args["accept_from"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str()),
+        )
+    {
+        if let Err(e) = crate::agent::validate_name(candidate) {
+            return serde_json::json!({"error": e});
+        }
+    }
 
     let fleet = load_fleet(home);
     let Some(current) = fleet.teams.get(&name).cloned() else {
