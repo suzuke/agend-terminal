@@ -1456,10 +1456,10 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Frozen Slice-12 baseline (pre-Slice-13): exactly 5 same-daemon
-    /// api::call production sites remain in src/mcp/handlers/.
+    /// #2454 residual RED: after the create_instance(team=...) migration,
+    /// exactly 3 same-daemon api::call production sites should remain.
     #[test]
-    fn production_api_call_baseline_is_5_2454() {
+    fn production_api_call_post_create_instance_team_is_3_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
@@ -1488,45 +1488,8 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 4,
-            "production same-daemon api::call post-Slice-13 must be exactly 4; got {count}"
-        );
-    }
-
-    /// #2454 Slice 13 RED: after CREATE_TEAM migration, exactly 4
-    /// same-daemon api::call production sites remain (down from 5).
-    #[test]
-    fn production_api_call_post_create_team_is_4_2454() {
-        let needle_call = concat!("crate::", "api::", "call");
-        let needle_at = concat!("api::", "call_at");
-        let test_mod_marker = "#[cfg(test)]\nmod ";
-        let files: &[&str] = &[
-            include_str!("comms.rs"),
-            include_str!("comms_delegate/mod.rs"),
-            include_str!("task.rs"),
-            include_str!("restart.rs"),
-            include_str!("instance_state/mod.rs"),
-            include_str!("instance_state/spawn.rs"),
-            include_str!("instance_state/lifecycle.rs"),
-            include_str!("instance_metadata.rs"),
-        ];
-        let mut count = 0;
-        for src in files {
-            let boundary = src.rfind(test_mod_marker).unwrap_or(src.len());
-            let production = &src[..boundary];
-            for line in production.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                    continue;
-                }
-                if line.contains(needle_call) && !line.contains(needle_at) {
-                    count += 1;
-                }
-            }
-        }
-        assert_eq!(
-            count, 4,
-            "production same-daemon api::call post-Slice-13 must be exactly 4; got {count}"
+            count, 3,
+            "production same-daemon api::call after create_instance(team=...) must be exactly 3; got {count}"
         );
     }
 

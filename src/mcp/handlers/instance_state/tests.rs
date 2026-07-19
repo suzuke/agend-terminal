@@ -1,6 +1,158 @@
 use super::*;
 use std::collections::HashMap;
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn tmp_home_for_create_instance_team(tag: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "agend-create-instance-team-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
+/// #2454 residual RED: pure generated-member team mode must route a live MCP
+/// RuntimeContext directly to the merged typed CREATE_TEAM owner. The missing
+/// owner wire-up currently tries the API socket and therefore reports its
+/// transport failure before the deliberately invalid backend can be observed.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_team_runtime_some_reaches_typed_owner_without_api_2454() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("runtime-some");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    let result = handle_create_instance(
+        &home,
+        &serde_json::json!({
+            "team": "runtime-team",
+            "backends": ["/definitely-missing-agent-binary-2454"],
+            "description": "runtime-owner-red",
+            "topic_binding": "skip"
+        }),
+        "caller",
+        Some(&runtime),
+    );
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("all 1 spawns failed"),
+        "runtime=Some pure team mode must reach team_ops::create without an API listener; got {result}"
+    );
+    assert!(
+        !error.contains("API unavailable"),
+        "runtime=Some must not use the legacy API loopback: {result}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("typed owner should persist its planned member before spawn");
+    assert!(
+        fleet.instances.contains_key("runtime-team-1"),
+        "typed owner must preserve generated-member planning before the spawn failure: {fleet:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 parity RED: the legacy CREATE_TEAM adapter normalizes `auto` and
+/// other unsupported topic-binding values to `None`, preserving the default
+/// topic-creation behavior. The direct RuntimeContext path must keep that
+/// same boundary contract before handing the typed request to team_ops.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_team_runtime_some_normalizes_topic_binding_like_api_2454() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    for mode in ["auto", "invalid"] {
+        let home = tmp_home_for_create_instance_team("topic-binding-parity");
+        let result = handle_create_instance(
+            &home,
+            &serde_json::json!({
+                "team": "parity-team",
+                "backends": ["/definitely-missing-agent-binary-2454"],
+                "topic_binding": mode
+            }),
+            "caller",
+            Some(&runtime),
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("all 1 spawns failed")),
+            "typed owner should still be reached for {mode}: {result}"
+        );
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("typed owner should persist its planned member");
+        let entry = fleet
+            .instances
+            .get("parity-team-1")
+            .expect("typed owner should persist the generated member");
+        assert_eq!(
+            entry.topic_binding_mode, None,
+            "unsupported topic_binding={mode:?} must retain API auto-default semantics"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #2454 residual contract: a standalone bridge has no RuntimeContext and
+/// keeps the isolated legacy API transport. With no listener, it fails closed
+/// and must not create a team as a side effect.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_team_runtime_none_keeps_legacy_bridge_2454() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("runtime-none");
+    let result = handle_create_instance(
+        &home,
+        &serde_json::json!({
+            "team": "legacy-team",
+            "backends": ["/definitely-missing-agent-binary-2454"]
+        }),
+        "caller",
+        None,
+    );
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("API unavailable") || error.contains("daemon") || error.contains("run dir"),
+        "runtime=None must retain the isolated legacy API transport failure: {result}"
+    );
+    let fleet_content =
+        std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        !fleet_content.contains("legacy-team"),
+        "legacy bridge failure must not create a team as a side effect: {fleet_content}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2454 residual RED seam: the executable RED test above omits `task` so it
+/// never sleeps. This structural pin keeps the existing delayed task capture
+/// intact until GREEN rewires only the CREATE_TEAM leaf.
+#[test]
+fn create_instance_team_delayed_injection_captures_runtime_and_spawned_2454() {
+    let source = include_str!("mod.rs");
+    let marker = source
+        .find("\"team_task_inject\"")
+        .expect("team task injection thread marker");
+    let region_start = marker.saturating_sub(1_000);
+    let region_end = (marker + 1_200).min(source.len());
+    let region = &source[region_start..region_end];
+    for needle in [
+        "let names = spawned.clone()",
+        "runtime.map",
+        "Arc::clone(&rt.registry)",
+        "Arc::clone(&rt.externals)",
+        "inject_with_routing",
+        "Duration::from_secs(3)",
+    ] {
+        assert!(
+            region.contains(needle),
+            "team task injection must preserve `{needle}` capture/routing seam"
+        );
+    }
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn delete_instance_denies_non_owner_non_orchestrator_audit2_002() {

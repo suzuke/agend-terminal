@@ -106,20 +106,53 @@ pub(super) fn handle_create_instance(
             )});
         }
         let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
-        match crate::api::call(
-            home,
-            &json!({"method": crate::api::method::CREATE_TEAM, "params": {
-                "name": team_name,
-                "backends": per_member_backends,
-                "description": args.get("description"),
-                // #991 PR-B: team-level default (all spawned members share
-                // it) — forwarded to handle_create_team, which persists +
-                // gates topic creation the same way handle_spawn does for
-                // single-instance create_instance.
-                "topic_binding": args.get("topic_binding"),
-            }}),
-        ) {
-            Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+        let resp = if let Some(rt) = runtime {
+            crate::team_ops::create(
+                home,
+                crate::team_ops::CreateTeamRequest {
+                    name: team_name.to_string(),
+                    per_member_backends: per_member_backends.clone(),
+                    existing_members: Vec::new(),
+                    topic_binding_mode: args["topic_binding"]
+                        .as_str()
+                        .filter(|s| matches!(*s, "skip" | "deferred"))
+                        .map(String::from),
+                    orchestrator: None,
+                    description: args
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    repository_path: None,
+                    project_id: None,
+                    accept_from: Vec::new(),
+                },
+                &rt.registry,
+                rt.notifier.as_deref(),
+            )
+        } else {
+            // Standalone bridge calls retain the legacy API transport. Reuse
+            // the existing SPAWN compatibility leaf so this loopback remains
+            // isolated to RuntimeContext=None without adding another socket
+            // call site.
+            match spawn::legacy_spawn(
+                home,
+                &json!({"method": crate::api::method::CREATE_TEAM, "params": {
+                    "name": team_name,
+                    "backends": per_member_backends.clone(),
+                    "description": args.get("description"),
+                    // #991 PR-B: team-level default (all spawned members share
+                    // it) — forwarded to handle_create_team, which persists +
+                    // gates topic creation the same way handle_spawn does for
+                    // single-instance create_instance.
+                    "topic_binding": args.get("topic_binding"),
+                }}),
+            ) {
+                Ok(resp) => resp,
+                Err(e) => return json!({"error": format!("API unavailable: {e}")}),
+            }
+        };
+        match resp {
+            resp if resp["ok"].as_bool() == Some(true) => {
                 let spawned: Vec<String> = resp["spawned"]
                     .as_array()
                     .map(|a| {
@@ -166,10 +199,9 @@ pub(super) fn handle_create_instance(
                 }
                 result
             }
-            Ok(resp) => {
+            resp => {
                 json!({"error": resp["error"].as_str().unwrap_or("team creation failed")})
             }
-            Err(e) => json!({"error": format!("API unavailable: {e}")}),
         }
     } else {
         spawn::spawn_single_instance(home, instance_name, args, runtime)

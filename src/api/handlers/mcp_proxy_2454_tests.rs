@@ -4,7 +4,7 @@ use serde_json::json;
 // ── #2454 Slice 12: SEND runtime contract RED tests ─────────────
 
 /// #2454 Slice 12 RED (1/3): structural budget + reachability guard.
-/// (a) cumulative handler api::call == 5, (b) dispatch_send not adapter!,
+/// (a) cumulative handler api::call == 3, (b) dispatch_send not adapter!,
 /// (c) agent_ops::send_to zero api::call, (d) SEND region bridge == 1.
 #[test]
 fn send_structural_budget_and_reachability_2454() {
@@ -12,7 +12,7 @@ fn send_structural_budget_and_reachability_2454() {
     let needle_at = concat!("api::", "call_at");
     let test_mod_marker = "#[cfg(test)]\nmod ";
 
-    // (a) cumulative budget: 8 → 5
+    // (a) cumulative budget: 8 → 3
     // Three handler-local sites to eliminate: SEND (comms.rs),
     // REPORT (comms.rs), DELEGATE (comms_delegate/mod.rs).
     let files: &[&str] = &[
@@ -40,8 +40,8 @@ fn send_structural_budget_and_reachability_2454() {
         }
     }
     assert_eq!(
-        handler_count, 4,
-        "Slice-13 cumulative api::call budget must be 4; got {handler_count}"
+        handler_count, 3,
+        "Slice-14 cumulative api::call budget must be 3; got {handler_count}"
     );
 
     // (b) dispatch_send must NOT be adapter! — custom fn threads RuntimeContext
