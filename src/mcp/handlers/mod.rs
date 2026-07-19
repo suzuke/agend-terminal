@@ -96,7 +96,7 @@ pub(super) fn require_instance(args: &Value) -> Result<&str, Value> {
 use instance::resolve_team_layout;
 
 #[cfg(test)]
-fn minimal_test_runtime() -> dispatch::RuntimeContext {
+pub fn minimal_test_runtime() -> dispatch::RuntimeContext {
     dispatch::RuntimeContext {
         registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         configs: Default::default(),
@@ -111,7 +111,7 @@ fn minimal_test_runtime() -> dispatch::RuntimeContext {
 
 #[cfg(test)]
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
-    handle_tool_with_runtime(tool, args, instance_name, Some(minimal_test_runtime()))
+    handle_tool_with_runtime(tool, args, instance_name, None)
 }
 
 pub(crate) fn handle_tool_with_runtime(
