@@ -1493,10 +1493,10 @@ mod tests {
         );
     }
 
-    /// #2454 Slice 13 RED: after CREATE_TEAM migration, exactly 4
-    /// same-daemon api::call production sites remain (down from 5).
+    /// #2454 residual RED: after the create_instance(team=...) migration,
+    /// exactly 3 same-daemon api::call production sites should remain.
     #[test]
-    fn production_api_call_post_create_team_is_4_2454() {
+    fn production_api_call_post_create_instance_team_is_3_2454() {
         let needle_call = concat!("crate::", "api::", "call");
         let needle_at = concat!("api::", "call_at");
         let test_mod_marker = "#[cfg(test)]\nmod ";
@@ -1525,8 +1525,8 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 4,
-            "production same-daemon api::call post-Slice-13 must be exactly 4; got {count}"
+            count, 3,
+            "production same-daemon api::call after create_instance(team=...) must be exactly 3; got {count}"
         );
     }
 
