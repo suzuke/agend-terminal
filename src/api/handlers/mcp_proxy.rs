@@ -1119,7 +1119,7 @@ mod tests {
         let id = crate::types::InstanceId::new().full();
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            format!("instances:\n  victim:\n    id: {id}\n    backend: claude\n"),
+            format!("instances:\n  victim:\n    id: {id}\n    backend: claude\n    created_by: s10-delete-caller-2454\n"),
         )
         .unwrap();
         let previous_home = std::env::var_os("AGEND_HOME");
@@ -1158,7 +1158,7 @@ mod tests {
         let response = handle_mcp_tool(
             &json!({
                 "tool": "delete_instance",
-                "instance": "victim",
+                "instance": "s10-delete-caller-2454",
                 "arguments": {"instance": "victim"}
             }),
             &ctx,
