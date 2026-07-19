@@ -1686,7 +1686,8 @@ mod tests {
                 .strip_prefix(env!("CARGO_MANIFEST_DIR"))
                 .unwrap_or(&path)
                 .display()
-                .to_string();
+                .to_string()
+                .replace('\\', "/");
             let mut current_function = String::from("<module>");
             for (line_number, line) in production.lines().enumerate() {
                 let code = code_without_strings_or_comments(line);
