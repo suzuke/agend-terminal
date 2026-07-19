@@ -2202,6 +2202,31 @@ fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
             !body.contains("crate::api::call"),
             "typed runtime owner `{needle}` must not contain the legacy api::call transport"
         );
+        if needle == "spawn_instance(" {
+            assert!(
+                body.contains("resolve_spawn_request("),
+                "typed SPAWN wrapper must resolve the persisted deployment fields before spawn"
+            );
+            for field in [
+                "entry.backend",
+                "entry.args",
+                "entry.model",
+                "entry.env",
+                "entry.topic_binding_mode",
+                "entry.working_directory",
+            ] {
+                assert!(
+                    body.contains(field),
+                    "typed SPAWN wrapper must map InstanceYamlEntry field `{field}` into the request"
+                );
+            }
+        }
+        if needle == "team_ops::create" {
+            assert!(
+                !body.contains("crate::teams::create") && !body.contains("teams::create"),
+                "runtime-present typed CREATE_TEAM wrapper must not retain a direct teams::create fallback"
+            );
+        }
     }
     assert!(
         deployments.contains("crate::api::call"),
