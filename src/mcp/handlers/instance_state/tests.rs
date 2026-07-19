@@ -54,6 +54,47 @@ fn create_instance_team_runtime_some_reaches_typed_owner_without_api_2454() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2454 parity RED: the legacy CREATE_TEAM adapter normalizes `auto` and
+/// other unsupported topic-binding values to `None`, preserving the default
+/// topic-creation behavior. The direct RuntimeContext path must keep that
+/// same boundary contract before handing the typed request to team_ops.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_team_runtime_some_normalizes_topic_binding_like_api_2454() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    for mode in ["auto", "invalid"] {
+        let home = tmp_home_for_create_instance_team("topic-binding-parity");
+        let result = handle_create_instance(
+            &home,
+            &serde_json::json!({
+                "team": "parity-team",
+                "backends": ["/definitely-missing-agent-binary-2454"],
+                "topic_binding": mode
+            }),
+            "caller",
+            Some(&runtime),
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("all 1 spawns failed")),
+            "typed owner should still be reached for {mode}: {result}"
+        );
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("typed owner should persist its planned member");
+        let entry = fleet
+            .instances
+            .get("parity-team-1")
+            .expect("typed owner should persist the generated member");
+        assert_eq!(
+            entry.topic_binding_mode, None,
+            "unsupported topic_binding={mode:?} must retain API auto-default semantics"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
 /// #2454 residual contract: a standalone bridge has no RuntimeContext and
 /// keeps the isolated legacy API transport. With no listener, it fails closed
 /// and must not create a team as a side effect.
