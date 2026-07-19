@@ -3410,3 +3410,10 @@ mod review_repro_app_tui;
 // private `CommitPending` / `CommitPoll` / `poll_commit_pending`.
 #[cfg(test)]
 mod commit_pending_tests;
+
+// #2453: AppState ownership structural guards, re-homed to a sibling
+// `*_tests.rs` file (exempt from the src file-size invariant) mirroring
+// `commit_pending_tests` above — src/app/mod.rs sits under a grandfathered
+// anti-monolith ratchet and may not grow.
+#[cfg(test)]
+mod appstate_2453_tests;
