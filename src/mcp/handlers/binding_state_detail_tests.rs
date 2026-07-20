@@ -495,8 +495,7 @@ fn detail_current_binding_bitbucket_cloud_origin_production_path() {
 // explicit probe status/error, and matches_binding. RED: none exist today.
 
 fn arch14_idfix_home(tag: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME").expect("HOME set");
-    let d = std::path::PathBuf::from(home).join(format!(
+    let d = std::env::temp_dir().join(format!(
         ".agend-arch14-id-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
