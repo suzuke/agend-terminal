@@ -2485,11 +2485,11 @@ templates:
 
     let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
     assert!(
-        reloaded.instances.get("mixed-good").is_none(),
+        !reloaded.instances.contains_key("mixed-good"),
         "the valid sibling must not be persisted to fleet.yaml when the deployment was rejected"
     );
     assert!(
-        reloaded.instances.get("mixed-bad").is_none(),
+        !reloaded.instances.contains_key("mixed-bad"),
         "the malformed instance must not be persisted to fleet.yaml"
     );
     std::fs::remove_dir_all(&home).ok();

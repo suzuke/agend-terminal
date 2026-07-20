@@ -169,6 +169,23 @@ fn validate_context_threshold(
 fn create_instance_entries(
     params: &DeployParams,
 ) -> Result<(Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>), serde_json::Value> {
+    for (name_val, inst_val) in &params.instances_def {
+        let inst_suffix = name_val.as_str().unwrap_or("?");
+        let inst_name = format!("{}-{inst_suffix}", params.deploy_name);
+        for field in [
+            "context_alert_pct",
+            "context_handoff_pct",
+            "context_handoff_escalate_pct",
+        ] {
+            validate_context_threshold(inst_val, field).map_err(|e| {
+                serde_json::json!({
+                    "error": format!("deploy_template: instance `{inst_name}` — {e}"),
+                    "code": "deploy_invalid_threshold",
+                })
+            })?;
+        }
+    }
+
     let mut created = Vec::new();
     let mut yaml_entries = Vec::new();
     let dir = std::path::PathBuf::from(&params.directory);
