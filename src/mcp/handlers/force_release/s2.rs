@@ -192,6 +192,7 @@ pub(crate) fn force_release(
             &identity.source_repo,
             sender,
             &permit,
+            None,
         ),
     };
     let dir_removed = outcome.worktree_removed
@@ -436,6 +437,7 @@ pub(crate) fn rebase_repair(
                 &identity.source_repo,
                 sender,
                 permit,
+                None,
             );
             if let Some(error) = outcome.error {
                 return Err(RepairBlocked::PathUnsafe(error));

@@ -388,13 +388,15 @@ pub(crate) fn def_repo() -> Value {
             "min_age_days": {"type": "integer", "description": "#817 cleanup_merged_branches: stale_idle threshold in days (default 90)."},
             "apply": {"type": "boolean", "description": "#817 cleanup_merged_branches: when false (default), returns dry-run plan; when true, deletes confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
-            "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
+            "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore. release with discard_nested_dirt: required non-empty justification recorded in the event-log audit entry."},
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
             "expected_head": {"type": "string", "description": "#6: optional exact full-SHA precondition. When provided, the branch HEAD must equal this value; mismatch returns structured error with zero mutation. Omitted preserves current behavior."},
             "checkout_purpose": {"type": "string", "enum": ["disposable_review"], "description": "Architecture-14 item 10: typed daemon-provisioned disposable review checkout. Requires bind=true, task_id, expected_head, and a newly-created branch."},
             "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
-            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. The handler always read this field, but it was never declared here — an MCP client validating against this schema had no way to send it, so force=true silently never reached the daemon (#2539)."},
-            "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."}
+            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. release — required when `discard_nested_dirt=true` (confirms destructive intent)."},
+            "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."},
+            "discard_nested_dirt": {"type": "boolean", "description": "release: authorize discarding unpreservable nested-submodule working-tree dirt. Requires `force=true` and a matching `expected_nested_dirt_digest` (confirmation round-trip). The digest is returned in the refusal response when nested dirt blocks a release."},
+            "expected_nested_dirt_digest": {"type": "string", "description": "release: exact hex digest of the nested-dirt enumeration, as returned by a prior refusal's `nested_dirt_digest` field. Guards against TOCTOU: the daemon re-enumerates under locks and refuses if the digest changed."}
         }, "required": ["action"]}})
 }
 
@@ -1196,6 +1198,8 @@ mod tests {
             ("repo", "checkout_purpose", "ci/checkout.rs typed disposable_review provenance gate (Architecture-14 item 10)"),
             ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
             ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
+            ("repo", "discard_nested_dirt", "ci/release.rs handle_release_repo — authorize nested-submodule dirt discard with digest round-trip"),
+            ("repo", "expected_nested_dirt_digest", "ci/release.rs handle_release_repo — TOCTOU digest gate for nested-dirt discard confirmation"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
             ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
@@ -1382,5 +1386,31 @@ mod tests {
                  stale entry."
             );
         }
+    }
+
+    #[test]
+    fn repo_schema_exposes_discard_nested_dirt_params() {
+        let d = def_repo();
+        let props = &d["inputSchema"]["properties"];
+        assert!(
+            props["discard_nested_dirt"].is_object(),
+            "def_repo must declare discard_nested_dirt"
+        );
+        assert!(
+            props["expected_nested_dirt_digest"].is_object(),
+            "def_repo must declare expected_nested_dirt_digest"
+        );
+        assert!(
+            props["force"]["description"]
+                .as_str()
+                .is_some_and(|s| s.contains("discard_nested_dirt")),
+            "force description must reference discard_nested_dirt"
+        );
+        assert!(
+            props["audit_reason"]["description"]
+                .as_str()
+                .is_some_and(|s| s.contains("discard")),
+            "audit_reason description must reference discard use"
+        );
     }
 }
