@@ -233,7 +233,7 @@ fn prepare(
             "episode is not CandidateReady",
         );
     }
-    if episode.key.source != source || episode.key.notification_id() != episode_id {
+    if episode.key.source != source || episode.notification_id() != episode_id {
         return refusal(
             "episode_mismatch",
             "requested episode is not the persisted source episode",

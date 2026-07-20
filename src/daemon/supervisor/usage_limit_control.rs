@@ -73,6 +73,10 @@ pub(crate) struct Episode {
     pub(crate) state: EpisodeState,
     pub(crate) consecutive_ticks: u8,
     pub(crate) candidate: Option<String>,
+    /// Persisted per-episode identity. Zero preserves the legacy key-only id;
+    /// same-key recurrences increment it after a Recovered episode.
+    #[serde(default)]
+    pub(crate) episode_nonce: u64,
     #[serde(default)]
     pub(crate) unlock_at: Option<String>,
     #[serde(default)]
@@ -80,6 +84,15 @@ pub(crate) struct Episode {
 }
 
 impl Episode {
+    pub(crate) fn notification_id(&self) -> String {
+        let base = self.key.notification_id();
+        if self.episode_nonce == 0 {
+            base
+        } else {
+            format!("{base}:episode-{}", self.episode_nonce)
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn activated(
         key: EpisodeKey,
@@ -91,6 +104,7 @@ impl Episode {
             state,
             consecutive_ticks: 2,
             candidate,
+            episode_nonce: 0,
             unlock_at: None,
             recipient: String::new(),
         }
@@ -139,15 +153,15 @@ pub(crate) enum TickOutcome {
 trait ControlEffects {
     fn load_episode(&self) -> Option<Episode>;
     fn persist_episode(&mut self, episode: Episode) -> anyhow::Result<()>;
-    fn block_task(&mut self, key: &EpisodeKey) -> anyhow::Result<()>;
-    fn recover_task_atomically(&mut self, key: &EpisodeKey) -> anyhow::Result<bool>;
+    fn block_task(&mut self, episode: &Episode) -> anyhow::Result<()>;
+    fn recover_task_atomically(&mut self, episode: &Episode) -> anyhow::Result<bool>;
     fn notify_once(
         &mut self,
-        key: &EpisodeKey,
+        episode: &Episode,
         recipient: &str,
         executable: bool,
     ) -> anyhow::Result<()>;
-    fn reconcile_active(&mut self, _key: &EpisodeKey, _recipient: &str) -> anyhow::Result<()> {
+    fn reconcile_active(&mut self, _episode: &Episode, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -228,7 +242,7 @@ fn observe_tick<E: ControlEffects>(
         if !matches!(input.raw_state, AgentState::Idle | AgentState::Active) {
             return Ok(TickOutcome::AlreadyActive);
         }
-        if effects.recover_task_atomically(&episode.key)? {
+        if effects.recover_task_atomically(&episode)? {
             episode.state = EpisodeState::Recovered;
             effects.persist_episode(episode)?;
             return Ok(TickOutcome::Recovered);
@@ -272,7 +286,7 @@ fn observe_tick<E: ControlEffects>(
                 } else {
                     episode.recipient.as_str()
                 };
-                effects.reconcile_active(&current_key, recipient)?;
+                effects.reconcile_active(&episode, recipient)?;
                 return Ok(if episode.state == EpisodeState::NeedsOperator {
                     TickOutcome::NeedsOperator
                 } else {
@@ -289,9 +303,9 @@ fn observe_tick<E: ControlEffects>(
             episode.candidate = candidate;
             episode.unlock_at = input.unlock_at.map(|deadline| deadline.to_rfc3339());
             episode.recipient = input.recipient.clone();
-            effects.persist_episode(episode)?;
-            effects.block_task(&current_key)?;
-            effects.notify_once(&current_key, &input.recipient, false)?;
+            effects.persist_episode(episode.clone())?;
+            effects.block_task(&episode)?;
+            effects.notify_once(&episode, &input.recipient, false)?;
             Ok(outcome)
         }
         Some(episode) if episode.state == EpisodeState::Recovered => {
@@ -303,6 +317,7 @@ fn observe_tick<E: ControlEffects>(
                 state: EpisodeState::Detected,
                 consecutive_ticks: 1,
                 candidate: None,
+                episode_nonce: episode.episode_nonce.saturating_add(1),
                 unlock_at: input.unlock_at.map(|deadline| deadline.to_rfc3339()),
                 recipient: input.recipient,
             })?;
@@ -322,6 +337,7 @@ fn observe_tick<E: ControlEffects>(
                 state: EpisodeState::Detected,
                 consecutive_ticks: 1,
                 candidate: None,
+                episode_nonce: 0,
                 unlock_at: input.unlock_at.map(|deadline| deadline.to_rfc3339()),
                 recipient: input.recipient,
             })?;
@@ -398,8 +414,8 @@ impl ControlEffects for FsEffects<'_> {
         Ok(())
     }
 
-    fn block_task(&mut self, key: &EpisodeKey) -> anyhow::Result<()> {
-        if !self.current_binding_matches(key) {
+    fn block_task(&mut self, episode: &Episode) -> anyhow::Result<()> {
+        if !self.current_binding_matches(&episode.key) {
             anyhow::bail!("binding generation changed before UsageLimit block");
         }
         // #2760 item 4: the strict route, per-id lock, write-time revalidation and
@@ -407,27 +423,27 @@ impl ControlEffects for FsEffects<'_> {
         // no longer touches a raw board path or a generic append. It supplies only
         // the identity guard + the fully-built block-reason payload (which embeds
         // the episode id, so the op's idempotency check can recognise it).
-        let notification_id = key.notification_id();
-        let episode = self.episode.as_ref().cloned();
+        let notification_id = episode.notification_id();
+        let persisted_episode = self.episode.as_ref().cloned();
         let reason = serde_json::json!({
             "type": "usage_limit_episode",
             "episode_id": notification_id,
-            "source": key.source,
-            "binding_issued_at": key.binding_issued_at,
-            "branch": key.branch,
-            "state": episode.as_ref().map(|e| e.state),
-            "unlock_at": episode.as_ref().and_then(|e| e.unlock_at.clone()),
+            "source": episode.key.source,
+            "binding_issued_at": episode.key.binding_issued_at,
+            "branch": episode.key.branch,
+            "state": persisted_episode.as_ref().map(|e| e.state),
+            "unlock_at": persisted_episode.as_ref().and_then(|e| e.unlock_at.clone()),
             "proposal": {
-                "candidate": episode.as_ref().and_then(|e| e.candidate.clone()),
+                "candidate": persisted_episode.as_ref().and_then(|e| e.candidate.clone()),
                 "executable": false,
                 "requires": "operator_takeover_slice_2"
             }
         })
         .to_string();
         let guard = crate::tasks::UsageLimitGuard {
-            task_id: key.task_id.clone(),
-            source: key.source.clone(),
-            branch: key.branch.clone(),
+            task_id: episode.key.task_id.clone(),
+            source: episode.key.source.clone(),
+            branch: episode.key.branch.clone(),
             episode_id: notification_id,
         };
         match crate::tasks::apply_usage_limit_block(self.home, &guard, reason)? {
@@ -442,8 +458,8 @@ impl ControlEffects for FsEffects<'_> {
         }
     }
 
-    fn recover_task_atomically(&mut self, key: &EpisodeKey) -> anyhow::Result<bool> {
-        if !self.current_binding_matches(key) {
+    fn recover_task_atomically(&mut self, episode: &Episode) -> anyhow::Result<bool> {
+        if !self.current_binding_matches(&episode.key) {
             return Ok(false);
         }
         // #2760 item 4: strict route + per-id lock + revalidation + the atomic
@@ -453,10 +469,10 @@ impl ControlEffects for FsEffects<'_> {
         // route/generation change → Stale → not recovered this pass (no events),
         // and the control loop re-attempts.
         let guard = crate::tasks::UsageLimitGuard {
-            task_id: key.task_id.clone(),
-            source: key.source.clone(),
-            branch: key.branch.clone(),
-            episode_id: key.notification_id(),
+            task_id: episode.key.task_id.clone(),
+            source: episode.key.source.clone(),
+            branch: episode.key.branch.clone(),
+            episode_id: episode.notification_id(),
         };
         match crate::tasks::recover_usage_limit_block(self.home, &guard)? {
             crate::tasks::ApplyOutcome::Applied | crate::tasks::ApplyOutcome::AlreadyApplied => {
@@ -468,11 +484,11 @@ impl ControlEffects for FsEffects<'_> {
 
     fn notify_once(
         &mut self,
-        key: &EpisodeKey,
+        episode: &Episode,
         recipient: &str,
         executable: bool,
     ) -> anyhow::Result<()> {
-        let id = key.notification_id();
+        let id = episode.notification_id();
         if crate::inbox::find_message(self.home, &id).is_some() {
             return Ok(());
         }
@@ -483,8 +499,8 @@ impl ControlEffects for FsEffects<'_> {
         let payload = serde_json::json!({
             "type": "usage_limit_failover_proposal",
             "episode_id": id,
-            "task_id": key.task_id,
-            "source": key.source,
+            "task_id": episode.key.task_id,
+            "source": episode.key.source,
             "state": episode.state,
             "unlock_at": episode.unlock_at,
             "proposal": {
@@ -498,15 +514,15 @@ impl ControlEffects for FsEffects<'_> {
             "usage_limit_failover",
             payload.to_string(),
         );
-        message.id = Some(key.notification_id());
-        message.task_id = Some(key.task_id.clone());
-        message.correlation_id = Some(key.notification_id());
+        message.id = Some(id.clone());
+        message.task_id = Some(episode.key.task_id.clone());
+        message.correlation_id = Some(id);
         crate::inbox::enqueue(self.home, recipient, message)
     }
 
-    fn reconcile_active(&mut self, key: &EpisodeKey, recipient: &str) -> anyhow::Result<()> {
-        self.block_task(key)?;
-        self.notify_once(key, recipient, false)
+    fn reconcile_active(&mut self, episode: &Episode, recipient: &str) -> anyhow::Result<()> {
+        self.block_task(episode)?;
+        self.notify_once(episode, recipient, false)
     }
 }
 
@@ -899,31 +915,31 @@ impl ControlEffects for MemoryEffects {
         Ok(())
     }
 
-    fn block_task(&mut self, key: &EpisodeKey) -> anyhow::Result<()> {
+    fn block_task(&mut self, episode: &Episode) -> anyhow::Result<()> {
         if self.task_blocked_with_episode_reason {
             return Ok(());
         }
-        self.effects.push(Effect::BlockTask(key.clone()));
+        self.effects.push(Effect::BlockTask(episode.key.clone()));
         self.task_blocked_with_episode_reason = true;
         Ok(())
     }
 
-    fn recover_task_atomically(&mut self, key: &EpisodeKey) -> anyhow::Result<bool> {
+    fn recover_task_atomically(&mut self, episode: &Episode) -> anyhow::Result<bool> {
         if !self.generation_matches_at_atomic_append {
             return Ok(false);
         }
         self.effects
-            .push(Effect::RecoverTaskAtomically(key.clone()));
+            .push(Effect::RecoverTaskAtomically(episode.key.clone()));
         Ok(true)
     }
 
     fn notify_once(
         &mut self,
-        key: &EpisodeKey,
+        episode: &Episode,
         recipient: &str,
         executable: bool,
     ) -> anyhow::Result<()> {
-        if self.notification_ids.insert(key.notification_id()) {
+        if self.notification_ids.insert(episode.notification_id()) {
             self.effects.push(Effect::NotifyOnce {
                 recipient: recipient.to_string(),
                 executable,
@@ -935,9 +951,9 @@ impl ControlEffects for MemoryEffects {
     // #2759 r1 (M1): mirror FsEffects::reconcile_active instead of inheriting
     // the trait's no-op default, so active-episode ticks surface their
     // block/notify side effects to memory-level assertions.
-    fn reconcile_active(&mut self, key: &EpisodeKey, recipient: &str) -> anyhow::Result<()> {
-        self.block_task(key)?;
-        self.notify_once(key, recipient, false)
+    fn reconcile_active(&mut self, episode: &Episode, recipient: &str) -> anyhow::Result<()> {
+        self.block_task(episode)?;
+        self.notify_once(episode, recipient, false)
     }
 }
 
@@ -1127,6 +1143,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_episode_without_nonce_keeps_key_only_id_and_restart_dedup() {
+        let legacy = serde_json::json!({
+            "key": key(),
+            "state": "CandidateReady",
+            "consecutive_ticks": 2,
+            "candidate": "worker-b",
+            "unlock_at": null,
+            "recipient": "lead"
+        });
+        let episode: Episode = serde_json::from_value(legacy).expect("legacy episode json");
+        assert_eq!(episode.episode_nonce, 0);
+        assert_eq!(episode.notification_id(), key().notification_id());
+
+        let mut fx = MemoryEffects {
+            episode: Some(episode),
+            task_blocked_with_episode_reason: true,
+            ..Default::default()
+        };
+        fx.notification_ids.insert(key().notification_id());
+        assert_eq!(
+            observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("legacy restart"),
+            TickOutcome::AlreadyActive
+        );
+        assert!(
+            fx.effects.is_empty(),
+            "legacy active episode remains deduped"
+        );
+    }
+
     /// #2759 r1: memory-level pin of the same-key recurrence guard. With the
     /// honest reconcile mirror (M1), an unguarded arm-1 would surface
     /// `BlockTask` here on ONE tick — the fixed guard must instead start a
@@ -1139,6 +1185,7 @@ mod tests {
                 state: EpisodeState::Recovered,
                 consecutive_ticks: 2,
                 candidate: None,
+                episode_nonce: 0,
                 unlock_at: None,
                 recipient: "lead".into(),
             }),
@@ -1150,6 +1197,37 @@ mod tests {
             fx.effects,
             vec![Effect::Persist(EpisodeState::Detected)],
             "one tick after Recovered: fresh cycle only — no re-block, no notify"
+        );
+    }
+
+    /// Regression (RED committed before the implementation): completing one
+    /// same-key episode and then activating a second one used to emit only one
+    /// notification because both episodes shared the key-derived id. Each
+    /// completed episode must produce its own actionable recommendation.
+    #[test]
+    fn same_key_recurrence_after_recovery_emits_fresh_notification() {
+        let mut fx = MemoryEffects::default();
+
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("first episode tick one");
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("first episode activation");
+        observe_tick(&mut fx, input(AgentState::Idle)).expect("first episode recovery");
+
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("second episode tick one");
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("second episode activation");
+
+        let notifications = fx
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::NotifyOnce { .. }))
+            .count();
+        assert_eq!(
+            notifications, 2,
+            "each completed same-key episode must emit a distinct notification"
+        );
+        assert_eq!(
+            fx.notification_ids.len(),
+            2,
+            "each completed same-key episode must use a distinct notification id"
         );
     }
 
@@ -1516,6 +1594,7 @@ teams:
             state: EpisodeState::Recovered,
             consecutive_ticks: 2,
             candidate: None,
+            episode_nonce: 0,
             unlock_at: None,
             recipient: "lead".into(),
         };
