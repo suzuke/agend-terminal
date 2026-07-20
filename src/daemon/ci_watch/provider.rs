@@ -839,8 +839,7 @@ impl CiProvider for GitHubCiProvider {
                 })
             })
             .unwrap_or_else(|| {
-                detect_billing_exhaustion(&jobs_resp)
-                    .unwrap_or_else(|| "unknown step".to_string())
+                detect_billing_exhaustion(&jobs_resp).unwrap_or_else(|| "unknown step".to_string())
             })
     }
 
@@ -1029,15 +1028,14 @@ impl CiProvider for GitHubCiProvider {
 fn detect_billing_exhaustion(jobs_resp: &serde_json::Value) -> Option<String> {
     let jobs = jobs_resp["jobs"].as_array()?;
     let zero_step_failed = jobs.iter().any(|job| {
-        let failed = job["conclusion"]
-            .as_str()
-            .is_some_and(|c| matches!(super::poller::CiOutcome::from(Some(c)), super::poller::CiOutcome::Failure));
-        let no_steps = job["steps"]
-            .as_array()
-            .is_some_and(|s| s.is_empty());
-        let no_runner = job["runner_id"]
-            .as_u64()
-            .is_none_or(|id| id == 0);
+        let failed = job["conclusion"].as_str().is_some_and(|c| {
+            matches!(
+                super::poller::CiOutcome::from(Some(c)),
+                super::poller::CiOutcome::Failure
+            )
+        });
+        let no_steps = job["steps"].as_array().is_some_and(|s| s.is_empty());
+        let no_runner = job["runner_id"].as_u64().is_none_or(|id| id == 0);
         failed && no_steps && no_runner
     });
     if zero_step_failed {
