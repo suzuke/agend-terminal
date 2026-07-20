@@ -697,28 +697,22 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             // Committed durable ⇒ transaction resolved; drop the journal tombstone.
             super::checkout_txn::Journal::clear(home, &mangled);
-            // #6: echo expected_head/actual_head only when the caller supplied it
-            // (omitted → no new fields, byte-compatible with pre-#6 callers).
-            // Re-read the actual HEAD from the provisioned worktree rather than
-            // echoing the expected value — the worktree is the ground truth.
-            if let Some(expected) = args["expected_head"].as_str() {
-                let actual = crate::git_helpers::git_cmd(
-                    Path::new(&worktree_path_str),
-                    &["rev-parse", "HEAD"],
-                )
-                .unwrap_or_default();
-                let actual = actual.trim();
-                resp["actual_head"] = json!(actual);
-                resp["expected_head"] = json!(expected);
-            }
+            super::checkout_helpers::annotate_actual_head(
+                &mut resp,
+                args["expected_head"].as_str(),
+                Path::new(&worktree_path_str),
+            );
             resp
         }
         Ok(o) => {
-            // Prepared journal but `git worktree add` failed ⇒ no worktree to roll
-            // back; drop the journal.
+            super::checkout_helpers::rollback_auto_created_branch_if_needed(
+                Path::new(&source_path),
+                branch,
+                args["expected_head"].as_str().unwrap_or(""),
+                bind && auto_created_branch,
+            );
             super::checkout_txn::Journal::clear(home, &mangled);
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            let redacted = redact_paths(stderr.trim());
+            let redacted = redact_paths(String::from_utf8_lossy(&o.stderr).trim());
             let mut err = json!({
                 "error": format!("git worktree add failed: {redacted}"),
                 "code": "worktree_add_failed",
@@ -732,6 +726,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             err
         }
         Err(e) => {
+            super::checkout_helpers::rollback_auto_created_branch_if_needed(
+                Path::new(&source_path),
+                branch,
+                args["expected_head"].as_str().unwrap_or(""),
+                bind && auto_created_branch,
+            );
             super::checkout_txn::Journal::clear(home, &mangled);
             let spawn_err = redact_paths(&e.to_string());
             let mut err = json!({

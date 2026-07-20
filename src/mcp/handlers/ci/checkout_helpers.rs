@@ -27,6 +27,30 @@ pub(crate) fn checkout_source(args: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Echo the actual provisioned HEAD only when the caller supplied an exact-head
+/// expectation; the worktree remains the source of truth for the observed value.
+pub(super) fn annotate_actual_head(resp: &mut Value, expected: Option<&str>, worktree: &Path) {
+    if let Some(expected) = expected {
+        let actual =
+            crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"]).unwrap_or_default();
+        resp["actual_head"] = json!(actual.trim());
+        resp["expected_head"] = json!(expected);
+    }
+}
+
+/// Remove only a branch authored by this checkout transaction after worktree-add
+/// failure; pre-existing refs are never touched.
+pub(super) fn rollback_auto_created_branch_if_needed(
+    source: &Path,
+    branch: &str,
+    expected_head: &str,
+    should_rollback: bool,
+) {
+    if should_rollback {
+        super::checkout_disposable::rollback_auto_created_branch(source, branch, expected_head);
+    }
+}
+
 #[cfg(all(test, unix))]
 use std::cell::RefCell;
 
