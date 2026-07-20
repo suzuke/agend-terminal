@@ -1397,6 +1397,16 @@ pub(crate) fn dirty_submodule_paths(wt_path: &Path) -> Result<Vec<String>, Strin
     Ok(paths)
 }
 
+/// Returns `false` if the path contains characters that would make the SHA-256
+/// digest non-canonical: CR, LF, NUL, or the Unicode replacement character
+/// U+FFFD (lossy OsStr→String conversion marker).
+fn is_canonical_nested_path(path: &str) -> bool {
+    !path.contains('\r')
+        && !path.contains('\n')
+        && !path.contains('\0')
+        && !path.contains('\u{FFFD}')
+}
+
 /// One level of [`enumerate_nested_dirty`]. `dir_canon` is the canonical repo dir;
 /// `display_prefix` is its path relative to the super (`""` for the super root).
 fn walk_nested_dirty(
@@ -1444,6 +1454,10 @@ fn walk_nested_dirty(
         out.push_str(&format!("{display_prefix}:\n"));
         for e in &entries {
             if !e.is_submodule() {
+                if !is_canonical_nested_path(&e.path) {
+                    out.push_str("  [skipped: non-canonical nested path]\n");
+                    continue;
+                }
                 out.push_str(&format!("  {} {}\n", e.token, e.path));
             }
         }
@@ -1451,6 +1465,10 @@ fn walk_nested_dirty(
     // Descend into each submodule with INTERNAL dirt.
     for e in &entries {
         if !e.dirty_submodule() {
+            continue;
+        }
+        if !is_canonical_nested_path(&e.path) {
+            out.push_str("[skipped: non-canonical nested path]\n");
             continue;
         }
         let disp = if display_prefix.is_empty() {
@@ -1495,6 +1513,10 @@ fn walk_nested_dirty(
     for e in &entries {
         if e.token != "??" {
             continue; // only an untracked `?` row can be an unregistered embedded repo
+        }
+        if !is_canonical_nested_path(&e.path) {
+            out.push_str("[skipped: non-canonical nested path]\n");
+            continue;
         }
         let candidate = dir_canon.join(&e.path);
         if !candidate.join(".git").exists() {
@@ -1543,6 +1565,11 @@ fn hash_hex<T: std::hash::Hash>(v: &T) -> String {
 /// process restarts (unlike `DefaultHasher`/SipHash whose seed is randomized
 /// on some platforms). Used as the public confirmation token in the discard
 /// round-trip — callers echo it back to prove they saw the exact state.
+///
+/// Canonical over the accepted path subset: paths containing CR, LF, NUL, or
+/// lossy U+FFFD are rejected upstream by [`is_canonical_nested_path`] and never
+/// enter the hashed string (they appear as `[skipped: non-canonical nested
+/// path]` markers, which the discard gate refuses before mutation).
 pub(crate) fn nested_dirt_digest_sha256(nested_status: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

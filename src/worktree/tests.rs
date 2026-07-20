@@ -3467,3 +3467,60 @@ fn discard_seam_audit_targets_are_json_encoded() {
         std::fs::remove_dir_all(root).ok();
     }
 }
+
+/// A file whose name contains a literal newline inside a dirty submodule triggers
+/// the non-canonical path gate: release is refused, worktree bytes are unchanged,
+/// and no success audit is emitted.
+#[cfg(unix)]
+#[test]
+fn discard_seam_newline_path_no_mutation() {
+    let home = release_tmp_home("discard-newline-path");
+    let super_repo = tmp_super_one_sub("discard-newline-path");
+    let info = create(&home, &super_repo, "agent1", Some("feat/newline")).expect("worktree");
+
+    let sub_dir = info.path.join("vendor/dep");
+    std::fs::write(sub_dir.join("vendored.txt"), b"modified\n").unwrap();
+    std::fs::write(sub_dir.join("foo\nbar.txt"), b"newline-in-name\n").unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let event_log = home.join("event-log.jsonl");
+    let before = std::fs::read_to_string(&event_log).unwrap_or_default();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/newline",
+        true,
+        true,
+        Some(&digest),
+    );
+
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("skipped/truncated"),
+        "release must be refused due to non-canonical nested path: {result}"
+    );
+    assert!(info.path.exists(), "worktree must survive (no mutation)");
+    assert_eq!(
+        std::fs::read_to_string(sub_dir.join("vendored.txt")).unwrap(),
+        "modified\n",
+        "submodule file bytes must be unchanged"
+    );
+
+    let after = std::fs::read_to_string(&event_log).unwrap_or_default();
+    let new_lines: Vec<&str> = after.lines().skip(before.lines().count()).collect();
+    assert!(
+        !new_lines
+            .iter()
+            .any(|l| l.contains("nested_dirt_discard_release")),
+        "no success audit must be emitted for refused release"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
