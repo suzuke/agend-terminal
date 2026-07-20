@@ -1819,6 +1819,48 @@ pub(crate) fn release_absent_target_under_branch_lock(
                 .to_string(),
         );
     }
+    // arch14 (d-20260720060251593745-8 + d-20260720061505902353-9): for a
+    // PRESENT target CARRYING a `.git` entry, the ACTUAL checked-out HEAD
+    // branch must equal the requested branch — resolved HERE, after the
+    // AfterBindingSnapshot seam and under the same A/B locks, so a concurrent
+    // checkout drift between the caller's pre-gate and this transaction can
+    // never remove a tree under a stale branch identity. Classification is
+    // `symlink_metadata(target/.git)`: ONLY NotFound counts as marker-only
+    // stale residue (no checkout identity to drift — the existing
+    // marker/source proof + canonical removal apply, keeping the s2 cleanup
+    // of torn/stale pool directories working); ANY `.git` entry (file, dir,
+    // symlink, other) must resolve, and a Git error, detached HEAD (resolves
+    // to the literal "HEAD", which never equals a branch name), or mismatch
+    // refuses with the target preserved. Any other metadata error also
+    // refuses. Applies to every caller uniformly — no opt-out.
+    if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
+        match std::fs::symlink_metadata(target.join(".git")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return opaque_release(format!(
+                    "target .git entry metadata unreadable: {e} — refusing (state preserved)"
+                ));
+            }
+            Ok(_) => {
+                match crate::git_helpers::git_cmd(target, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+                    Ok(out) => {
+                        let actual = out.trim();
+                        if actual != branch {
+                            return opaque_release(format!(
+                            "target actual HEAD branch '{actual}' does not match requested branch \
+                             '{branch}' — refusing (post-seam identity drift; state preserved)"
+                        ));
+                        }
+                    }
+                    Err(e) => {
+                        return opaque_release(format!(
+                        "cannot resolve target actual HEAD branch: {e} — refusing (state preserved)"
+                    ));
+                    }
+                }
+            }
+        }
+    }
     let mut out = ReleaseOutcome::default();
     let mut notices = Vec::new();
     if matches!(target_state, crate::mcp::handlers::TargetState::Absent) {

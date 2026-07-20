@@ -4097,3 +4097,196 @@ fn arch14_symlink_alias_lease_survives_alias_removal() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+// ═══ Arch14 legacy marker: absent-binding release (t-…-39872-18) ══════════
+// Superseding contract d-20260720044124067125-6. #2860 landed producer
+// canonical source parity + BINDING-authoritative legacy adoption; the
+// remaining hole: a legacy sourceless-but-otherwise-valid managed worktree
+// whose BINDING no longer exists is refused forever
+// (managed_release_no_binding) — no retry source can ever settle it.
+
+/// RED (fail today): binding ABSENT + valid linked worktree + non-empty
+/// agent/branch three-line legacy marker + authorized caller (the marker
+/// agent itself) must path-release via the target's own verified .git
+/// linkage. Today delegate_managed_release dies at
+/// `managed_release_no_binding` before any identity derivation.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-nobind");
+    arch14_write_legacy_marker(&wt, "arch14-nb2-agent", "feat/test");
+    // Deliberately NO binding — the legacy worktree's agent is long gone.
+
+    let r = dispatch_repo_release(&home, "arch14-nb2-agent", wt.to_str().unwrap());
+    assert!(
+        r["released"].as_bool() == Some(true) && r.get("error").and_then(|e| e.as_str()).is_none(),
+        "absent-binding legacy marker with verified .git linkage must release: {r}"
+    );
+    assert!(!wt.exists(), "released worktree must be removed: {r}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-correction guard (green today, must stay green): ABSENT binding +
+/// a marker missing ONLY the branch= line stays refused and preserved — the
+/// absent-binding arm must never derive identity without a branch to match.
+#[test]
+#[cfg(unix)]
+fn arch14_release_still_refuses_missing_branch_marker() {
+    let (base, home, repo, wt) = managed_wt_fixture("arch14-nobranch");
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!(
+            "agent=arch14-nbr-agent\nsource_repo={}\nleased_at=2026-07-18T00:00:00+00:00\n",
+            repo.display()
+        ),
+    )
+    .expect("branchless marker");
+    // Deliberately NO binding — this guard constrains the binding-ABSENT arm.
+    let r = dispatch_repo_release(&home, "arch14-nbr-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "marker missing only branch= must stay refused: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on refusal");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-correction guard (green today, must stay green): absent binding +
+/// zero-byte marker stays refused — the absent-binding arm derives identity
+/// only for a marker that still carries non-empty agent AND branch.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_zero_byte_marker_still_refused() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-nb-zero");
+    std::fs::write(wt.join(".agend-managed"), "").expect("empty marker");
+
+    let r = dispatch_repo_release(&home, "arch14-nbz-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "absent binding + zero-byte marker must stay refused: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on refusal");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+// ── Supplemental RED 2 (root rejection of 98df/7e81 GREEN,
+// d-20260720053617389698-7): the new absent-binding arm must (a) support a
+// VALID RELATIVE gitlink identity and (b) run its revalidation inside the
+// canonical absent-target transaction so a deterministic marker rewrite at
+// ReleaseTestPhase::AfterBindingSnapshot is refused. Today it does neither:
+// the lexical derive fails on relative gitdirs, and the arm never reaches
+// the canonical seam.
+
+/// RED A (fail today): a linked worktree whose `.git` gitlink is RELATIVE
+/// (a shape git itself fully supports and resolves) must release exactly
+/// like the absolute form — the identity authority is git's common-dir
+/// resolution, not lexical path arithmetic on the gitlink text.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_relative_gitlink_releases() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-relgit");
+    // Rewrite the absolute gitlink to the equivalent RELATIVE form; git
+    // resolves it relative to the worktree, so identity stays valid.
+    std::fs::write(
+        wt.join(".git"),
+        "gitdir: ../source/.git/worktrees/managed-wt\n",
+    )
+    .expect("relative gitlink");
+    let probe = crate::git_helpers::git_cmd(&wt, &["rev-parse", "--git-common-dir"])
+        .expect("git must still resolve the relative gitlink");
+    assert!(
+        probe.contains("source"),
+        "fixture sanity: relative gitlink resolves to the source repo: {probe}"
+    );
+    arch14_write_legacy_marker(&wt, "arch14-rel-agent", "feat/test");
+    // Deliberately NO binding.
+
+    let r = dispatch_repo_release(&home, "arch14-rel-agent", wt.to_str().unwrap());
+    assert!(
+        r["released"].as_bool() == Some(true) && r.get("error").and_then(|e| e.as_str()).is_none(),
+        "valid RELATIVE gitlink identity must release like the absolute form: {r}"
+    );
+    assert!(!wt.exists(), "released worktree must be removed: {r}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// RED B (fail today): a deterministic marker rewrite injected at the
+/// canonical ReleaseTestPhase::AfterBindingSnapshot seam must be REFUSED
+/// with the worktree preserved — the absent-binding arm must revalidate
+/// marker agent/branch/source identity INSIDE the canonical absent-target
+/// transaction, after the seam. Today the arm never reaches that seam (its
+/// checks run before its own ad-hoc locks), so the rewrite goes unnoticed
+/// and the worktree is deleted under a changed identity.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_seam_marker_rewrite_refused() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-seam");
+    arch14_write_legacy_marker(&wt, "arch14-seam-agent", "feat/test");
+    // Deliberately NO binding.
+
+    // Deterministic rewrite: at AfterBindingSnapshot the marker's identity
+    // changes hands — the transaction's post-seam revalidation must refuse.
+    let marker_path = wt.join(".agend-managed");
+    let _seam = crate::worktree_pool::release_test_seam::install(move |phase| {
+        if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+            let _ = std::fs::write(
+                &marker_path,
+                "agent=someone-else\nbranch=feat/test\nleased_at=2026-07-18T00:00:00+00:00\n",
+            );
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "arch14-seam-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "a marker identity rewrite at the canonical seam must be refused: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when the seam rewrite is refused"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Supplemental RED 3 (root gate d-20260720060251593745-8, reviewer finding
+/// on 3fbddf7c): the canonical absent-target transaction re-validates
+/// binding/marker/source after AfterBindingSnapshot but never re-reads the
+/// target's ACTUAL Git HEAD branch — a deterministic post-seam checkout
+/// drift (binding still absent, marker agent/branch/source unchanged) must
+/// be refused with the worktree preserved; today the stale pre-gate branch
+/// identity passes and the removal proceeds.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_seam_head_drift_refused() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-headdrift");
+    arch14_write_legacy_marker(&wt, "arch14-hd-agent", "feat/test");
+    // Deliberately NO binding.
+
+    // Deterministic ACTUAL-HEAD drift at the canonical seam: the worktree's
+    // checked-out branch changes hands while marker/binding stay untouched.
+    let wt_for_hook = wt.clone();
+    let _seam = crate::worktree_pool::release_test_seam::install(move |phase| {
+        if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+            let _ = std::process::Command::new("git")
+                .args(["checkout", "-b", "feat/drifted"])
+                .current_dir(&wt_for_hook)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output();
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "arch14-hd-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "post-seam ACTUAL-HEAD drift must be refused: {r}"
+    );
+    assert!(
+        r["released"].as_bool() != Some(true),
+        "post-seam ACTUAL-HEAD drift must not report released: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when the HEAD drift is refused"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}

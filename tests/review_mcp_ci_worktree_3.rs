@@ -86,10 +86,13 @@ fn release_repo_surfaces_unprunable_metadata_leak_mcp_ci_worktree() {
         .expect("src/mcp/handlers/ci/release.rs must exist");
     let text = std::fs::read_to_string(&ci_release).expect("read ci/release.rs");
 
-    let body = fn_body_after(&text, "fn handle_release_repo");
+    // arch14 (PR #2862): handle_release_repo's cleanup tail moved verbatim into
+    // `remove_linked_worktree_canonical` so the absent-binding arm reuses the
+    // exact same removal path — the guarded body is that extracted fn now.
+    let body = fn_body_after(&text, "fn remove_linked_worktree_canonical");
     assert!(
         !body.is_empty(),
-        "could not locate `handle_release_repo` in ci/release.rs — re-check signature drift"
+        "could not locate `remove_linked_worktree_canonical` in ci/release.rs — re-check signature drift"
     );
 
     // Sanity: confirm we located the RIGHT function — it must contain the
