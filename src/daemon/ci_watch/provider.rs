@@ -839,7 +839,7 @@ impl CiProvider for GitHubCiProvider {
                 })
             })
             .unwrap_or_else(|| {
-                detect_billing_exhaustion(&jobs_resp).unwrap_or_else(|| "unknown step".to_string())
+                detect_pre_run_failure(&jobs_resp).unwrap_or_else(|| "unknown step".to_string())
             })
     }
 
@@ -1020,14 +1020,15 @@ impl CiProvider for GitHubCiProvider {
     }
 }
 
-/// When a job has `conclusion: "failure"` but zero steps and no runner
-/// assigned, the failure is not a code error — it's a billing / spending
-/// limit exhaustion (the job was rejected at the GitHub scheduler level).
-/// Returns `Some("billing quota exhausted (no runner assigned)")` in that
-/// case, or `None` if the zero-step failure doesn't match the billing profile.
-fn detect_billing_exhaustion(jobs_resp: &serde_json::Value) -> Option<String> {
+/// When a job has `conclusion: "failure"` but zero steps and runner_id
+/// explicitly 0, the job never reached a runner — an observable pre-run
+/// symptom whose root cause (billing quota, infrastructure, transient
+/// scheduler error) cannot be confirmed from the API response alone.
+/// Returns a cause-unconfirmed diagnostic, or `None` if the pattern does
+/// not match.
+fn detect_pre_run_failure(jobs_resp: &serde_json::Value) -> Option<String> {
     let jobs = jobs_resp["jobs"].as_array()?;
-    let zero_step_failed = jobs.iter().any(|job| {
+    let pre_run_failed = jobs.iter().any(|job| {
         let failed = job["conclusion"].as_str().is_some_and(|c| {
             matches!(
                 super::poller::CiOutcome::from(Some(c)),
@@ -1035,11 +1036,11 @@ fn detect_billing_exhaustion(jobs_resp: &serde_json::Value) -> Option<String> {
             )
         });
         let no_steps = job["steps"].as_array().is_some_and(|s| s.is_empty());
-        let no_runner = job["runner_id"].as_u64().is_none_or(|id| id == 0);
+        let no_runner = job["runner_id"].as_u64() == Some(0);
         failed && no_steps && no_runner
     });
-    if zero_step_failed {
-        Some("billing quota exhausted (no runner assigned)".to_string())
+    if pre_run_failed {
+        Some("pre-run failure: no runner assigned and no steps (cause unconfirmed)".to_string())
     } else {
         None
     }

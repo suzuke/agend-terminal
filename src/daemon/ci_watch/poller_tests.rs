@@ -4237,12 +4237,11 @@ fn github_fetch_failure_summary_finds_failed_step() {
     assert_eq!(summary, "build / Run tests", "summary: {summary}");
 }
 
-/// When GitHub Actions billing quota is exhausted, the job has
-/// `conclusion: "failure"`, zero steps, and `runner_id: 0` (no runner
-/// assigned).  The daemon must detect this and return a descriptive
-/// detail instead of the uninformative `"unknown step"` fallback.
+/// When a job has `conclusion: "failure"`, zero steps, and `runner_id: 0`
+/// (no runner assigned), the daemon detects a pre-run failure symptom and
+/// returns a cause-unconfirmed diagnostic instead of `"unknown step"`.
 #[test]
-fn github_fetch_failure_summary_detects_billing_exhaustion() {
+fn github_fetch_failure_summary_detects_pre_run_failure() {
     let body = r#"{
         "jobs": [{
             "name": "build",
@@ -4269,13 +4268,13 @@ fn github_fetch_failure_summary_detects_billing_exhaustion() {
         "path: {path}"
     );
     assert_eq!(
-        summary, "billing quota exhausted (no runner assigned)",
+        summary, "pre-run failure: no runner assigned and no steps (cause unconfirmed)",
         "summary: {summary}"
     );
 }
 
 /// A job with zero steps but a non-zero `runner_id` (runner WAS assigned) is
-/// NOT billing exhaustion — it's a different zero-step failure mode.  The
+/// NOT a pre-run failure — it's a different zero-step failure mode.  The
 /// daemon must fall back to `"unknown step"` (the same fallback a real-but-
 /// unclassifiable failure gets).
 #[test]
