@@ -233,6 +233,8 @@ pub struct ReleaseOutcome {
     /// Exact S2 absent-arm metadata cleanup, surfaced only by the force
     /// handler after the transaction; ordinary release responses skip it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) nested_dirt_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub intent_persist_error: Option<String>,
     #[serde(skip)]
     pub(crate) git_metadata_pruned: usize,
@@ -1945,10 +1947,57 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         ..ReleaseOutcome::default()
                     };
                 }
-                if let Err(e) = crate::git_helpers::git_cmd(
-                    target,
-                    &["submodule", "update", "--force", "--checkout"],
-                ) {
+                if nested_status
+                    .lines()
+                    .any(|l| l.contains("[skipped:") || l.contains("[truncated:"))
+                {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(
+                            "nested dirt discard refused: opaque or unsupported nested state \
+                             detected (skipped/truncated entries); state preserved"
+                                .to_string(),
+                        ),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+                let dirty_sub_paths: Vec<&str> = nested_status
+                    .lines()
+                    .filter_map(|l| {
+                        let l = l.trim_end();
+                        if !l.starts_with(' ')
+                            && !l.starts_with('[')
+                            && l.ends_with(':')
+                            && l.len() > 1
+                        {
+                            Some(&l[..l.len() - 1])
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if dirty_sub_paths.is_empty() {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(
+                            "nested dirt discard refused: no eligible registered dirty submodule \
+                             paths found; state preserved"
+                                .to_string(),
+                        ),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+                let mut sub_args = vec!["submodule", "update", "--force", "--checkout", "--"];
+                sub_args.extend(dirty_sub_paths.iter().copied());
+                if let Err(e) = crate::git_helpers::git_cmd(target, &sub_args) {
                     drop(_binding_lock);
                     drop(_agent_lock);
                     for notice in notices {
@@ -2012,6 +2061,15 @@ pub(crate) fn release_absent_target_under_branch_lock(
                     };
                 }
             } else {
+                let digest = if matches!(
+                    &preservation,
+                    crate::worktree::WipPreservation::UnpreservableNestedDirty(_)
+                ) {
+                    let ns = crate::worktree::enumerate_nested_dirty(target);
+                    Some(crate::worktree::hash_hex(&ns))
+                } else {
+                    None
+                };
                 drop(_binding_lock);
                 drop(_agent_lock);
                 for notice in notices {
@@ -2022,6 +2080,7 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         "force release refused: worktree WIP could not be preserved ({reason}); \
                          not removing it"
                     )),
+                    nested_dirt_digest: digest,
                     ..ReleaseOutcome::default()
                 };
             }

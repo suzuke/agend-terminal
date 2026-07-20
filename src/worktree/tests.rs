@@ -2494,6 +2494,28 @@ fn release_entry(
     force: bool,
     expected_digest: Option<&str>,
 ) -> serde_json::Value {
+    release_entry_with_reason(
+        home,
+        agent,
+        wt_path,
+        branch,
+        discard_nested_dirt,
+        force,
+        expected_digest,
+        "nested discard release confirmation",
+    )
+}
+
+fn release_entry_with_reason(
+    home: &Path,
+    agent: &str,
+    wt_path: &Path,
+    branch: &str,
+    discard_nested_dirt: bool,
+    force: bool,
+    expected_digest: Option<&str>,
+    audit_reason: &str,
+) -> serde_json::Value {
     std::fs::write(
         wt_path.join(crate::worktree_pool::MANAGED_MARKER),
         format!("agent={agent}\nbranch={branch}\n"),
@@ -2507,22 +2529,17 @@ fn release_entry(
         "repository_path": source_repo,
         "discard_nested_dirt": discard_nested_dirt,
         "force": force,
-        "audit_reason": "nested discard release confirmation",
+        "audit_reason": audit_reason,
     });
     if let Some(digest) = expected_digest {
         args["expected_nested_dirt_digest"] = serde_json::json!(digest);
     }
     let _guard = crate::mcp::handlers::fleet_test_guard();
-    // Pin AGENTIC_GIT_HOME to the real daemon home so the git shim's
-    // self-exclusion from PATH still works after AGEND_HOME is overridden
-    // to a test directory (AGEND_HOME is the legacy compat name for
-    // AGENTIC_GIT_HOME — see #1504).
     if let Some(ref h) = *DAEMON_HOME {
         std::env::set_var("AGENTIC_GIT_HOME", h);
     }
     std::env::set_var("AGEND_HOME", home);
     let result = crate::mcp::handlers::handle_tool("repo", &args, "");
-    // Restore AGEND_HOME (not just remove — other tests need it for shim resolution)
     match &*DAEMON_HOME {
         Some(h) => std::env::set_var("AGEND_HOME", h),
         None => std::env::remove_var("AGEND_HOME"),
@@ -2873,6 +2890,111 @@ fn discard_seam_records_audit_evidence() {
         }),
         "(f) discard must append agent/branch evidence to event-log.jsonl: {after}"
     );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Trimmed-empty digest must refuse (not silently pass through).
+#[cfg(unix)]
+#[test]
+fn discard_seam_empty_digest_refuses() {
+    let home = release_tmp_home("discard-empty-digest");
+    let super_repo = tmp_super_one_sub("discard-empty-digest");
+    let info = create(&home, &super_repo, "agent1", Some("feat/empty-digest")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"edit\n").unwrap();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/empty-digest",
+        true,
+        true,
+        Some("  "),
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("digest"),
+        "trimmed-empty digest must refuse: {result}"
+    );
+    assert!(
+        info.path.exists(),
+        "trimmed-empty digest must preserve target"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Trimmed-empty audit_reason must refuse.
+#[cfg(unix)]
+#[test]
+fn discard_seam_empty_audit_reason_refuses() {
+    let home = release_tmp_home("discard-empty-reason");
+    let super_repo = tmp_super_one_sub("discard-empty-reason");
+    let info = create(&home, &super_repo, "agent1", Some("feat/empty-reason")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"edit\n").unwrap();
+    let digest = nested_dirt_digest(&info.path);
+
+    let result = release_entry_with_reason(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/empty-reason",
+        true,
+        true,
+        Some(&digest),
+        "  ",
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("audit_reason"),
+        "trimmed-empty audit_reason must refuse: {result}"
+    );
+    assert!(
+        info.path.exists(),
+        "trimmed-empty audit_reason must preserve target"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Ordinary nested-dirt refusal (no discard) must return the daemon-computed
+/// digest for the confirmation round-trip.
+#[cfg(unix)]
+#[test]
+fn discard_seam_refusal_returns_digest() {
+    let home = release_tmp_home("discard-refusal-digest");
+    let super_repo = tmp_super_one_sub("discard-refusal-digest");
+    let info = create(&home, &super_repo, "agent1", Some("feat/refusal-digest")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"edit\n").unwrap();
+    let expected = nested_dirt_digest(&info.path);
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/refusal-digest",
+        false,
+        false,
+        None,
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(!error.is_empty(), "nested dirt must refuse: {result}");
+    let returned_digest = result["nested_dirt_digest"].as_str().unwrap_or("");
+    assert_eq!(
+        returned_digest, expected,
+        "refusal must return daemon-computed digest for round-trip: {result}"
+    );
+    assert!(info.path.exists(), "refusal must preserve target");
 
     std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {

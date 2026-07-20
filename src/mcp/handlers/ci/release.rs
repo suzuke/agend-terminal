@@ -99,6 +99,13 @@ fn delegate_managed_release(
             "code": "managed_release_unauthorized",
         });
     }
+    if nested_discard.is_some() {
+        return json!({
+            "error": "nested dirt discard is not supported for Known-bound managed releases; \
+                      resolve nested dirt in place before releasing",
+            "code": "discard_unsupported_release_path",
+        });
+    }
     let outcome = crate::worktree_pool::release_full_exact(home, &marker_agent, &fingerprint, true);
     json!({
         "path": canonical.display().to_string(),
@@ -261,14 +268,18 @@ fn absent_binding_legacy_release(
         &permit,
         nested_discard,
     );
-    json!({
+    let mut resp = json!({
         "path": canonical.display().to_string(),
         "legacy_absent_binding": true,
         "released": outcome.released,
         "worktree_removed": outcome.worktree_removed,
         "git_metadata_pruned": outcome.git_metadata_pruned,
         "error": outcome.error,
-    })
+    });
+    if let Some(ref digest) = outcome.nested_dirt_digest {
+        resp["nested_dirt_digest"] = json!(digest);
+    }
+    resp
 }
 
 /// #t-…83936-6 P0 (data-loss incident): is `p` a TRUE linked git worktree — the
@@ -393,11 +404,17 @@ pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str
             return json!({"error": "nested dirt discard requires force=true"});
         }
         match expected_digest {
-            Some(d) => Some(crate::worktree_pool::NestedDirtDiscard {
-                expected_digest: d,
-                audit_reason,
-            }),
-            None => {
+            Some(d) if !d.trim().is_empty() => {
+                let reason = audit_reason.trim();
+                if reason.is_empty() {
+                    return json!({"error": "nested dirt discard requires non-empty audit_reason"});
+                }
+                Some(crate::worktree_pool::NestedDirtDiscard {
+                    expected_digest: d,
+                    audit_reason: reason,
+                })
+            }
+            _ => {
                 return json!({"error": "nested dirt discard requires expected_nested_dirt_digest"});
             }
         }
@@ -412,6 +429,14 @@ pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str
 
     if crate::worktree_pool::is_daemon_managed(&canonical) {
         return delegate_managed_release(home, &canonical, instance_name, nested_discard.as_ref());
+    }
+
+    if nested_discard.is_some() {
+        return json!({
+            "error": "nested dirt discard is not supported for unmanaged worktrees; \
+                      resolve nested dirt in place before releasing",
+            "code": "discard_unsupported_release_path",
+        });
     }
 
     remove_linked_worktree_canonical(&canonical, path)
