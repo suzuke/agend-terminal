@@ -487,3 +487,262 @@ fn detail_current_binding_bitbucket_cloud_origin_production_path() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ═══ Arch14 cross-agent identity — typed target-path identity fields ══════
+// (t-20260720064306627171-39872-29, d-20260719233444615181-2 clause 1)
+// binding_state must return, WITHOUT mutation: the persisted expected
+// branch/worktree, a path-anchored actual_branch, the full actual_head, an
+// explicit probe status/error, and matches_binding. RED: none exist today.
+
+fn arch14_idfix_home(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        ".agend-arch14-id-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Real source repo + real linked worktree checked out on `branch`, plus a
+/// persisted binding pointing at them. Returns (source, worktree).
+fn arch14_idfix_bound_worktree(
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = home.join("source");
+    std::fs::create_dir_all(&src).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&src, &["init", "-b", "main"]);
+    git(
+        &src,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let wt = home.join("wt");
+    git(
+        &src,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", branch],
+    );
+    let rt = crate::paths::runtime_dir(home).join(agent);
+    std::fs::create_dir_all(&rt).unwrap();
+    let binding = serde_json::json!({
+        "version": 1,
+        "agent": agent,
+        "task_id": "t-arch14",
+        "branch": branch,
+        "worktree": wt.to_str().unwrap(),
+        "source_repo": src.to_str().unwrap(),
+    });
+    std::fs::write(
+        rt.join("binding.json"),
+        serde_json::to_string_pretty(&binding).unwrap(),
+    )
+    .unwrap();
+    (src, wt)
+}
+
+/// RED: aligned target — identity fields present, probe ok, matches.
+#[test]
+fn arch14_identity_fields_present_and_aligned() {
+    let home = arch14_idfix_home("aligned");
+    let (_src, wt) = arch14_idfix_bound_worktree(&home, "id-agent", "feat/idx");
+    let d = handle_binding_state(&home, &json!({"instance": "id-agent"}), &None);
+
+    let ti = &d["target_identity"];
+    assert!(
+        ti.is_object(),
+        "#arch14: binding_state must expose a target_identity object: {d}"
+    );
+    assert_eq!(ti["expected_branch"].as_str(), Some("feat/idx"), "{d}");
+    assert_eq!(ti["expected_worktree"].as_str(), wt.to_str(), "{d}");
+    assert_eq!(
+        ti["actual_branch"].as_str(),
+        Some("feat/idx"),
+        "path-anchored actual branch: {d}"
+    );
+    let real_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        ti["actual_head"].as_str(),
+        Some(real_head.as_str()),
+        "actual_head must EQUAL the target worktree's real full HEAD (not merely 40 hex): {d}"
+    );
+    assert_eq!(ti["probe_status"].as_str(), Some("ok"), "{d}");
+    assert_eq!(ti["matches_binding"].as_bool(), Some(true), "{d}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED: drifted checkout — actual_branch reports the drift, matches=false,
+/// persisted expectation unchanged.
+#[test]
+fn arch14_identity_reports_checkout_drift() {
+    let home = arch14_idfix_home("drift");
+    let (_src, wt) = arch14_idfix_bound_worktree(&home, "id-agent-d", "feat/idx");
+    let out = std::process::Command::new("git")
+        .args(["checkout", "-b", "feat/drifted"])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git runs");
+    assert!(out.status.success());
+
+    let d = handle_binding_state(&home, &json!({"instance": "id-agent-d"}), &None);
+    let ti = &d["target_identity"];
+    assert_eq!(ti["expected_branch"].as_str(), Some("feat/idx"), "{d}");
+    assert_eq!(
+        ti["actual_branch"].as_str(),
+        Some("feat/drifted"),
+        "actual_branch must be path-anchored, not the persisted expectation: {d}"
+    );
+    let real_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        ti["actual_head"].as_str(),
+        Some(real_head.as_str()),
+        "drifted actual_head must equal the target worktree's REAL HEAD: {d}"
+    );
+    assert_eq!(ti["probe_status"].as_str(), Some("ok"), "{d}");
+    assert_eq!(ti["matches_binding"].as_bool(), Some(false), "{d}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED (root supplemental, no-fabricated-collision): TWO bound agents keep
+/// fully DISTINCT typed identities — each agent's target_identity reports its
+/// OWN expected/actual worktree+branch, never the sibling's.
+#[test]
+fn arch14_identity_two_agents_no_fabricated_collision() {
+    let home = arch14_idfix_home("twoagent");
+    let (_sa, wt_a) = arch14_idfix_bound_worktree(&home, "id-agent-a", "feat/ia");
+    // Second agent: its own source+worktree under the same home.
+    let src_b = home.join("source-b");
+    std::fs::create_dir_all(&src_b).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&src_b, &["init", "-b", "main"]);
+    git(
+        &src_b,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    );
+    let wt_b = home.join("wt-b");
+    git(
+        &src_b,
+        &["worktree", "add", wt_b.to_str().unwrap(), "-b", "feat/ib"],
+    );
+    let rt_b = crate::paths::runtime_dir(&home).join("id-agent-b");
+    std::fs::create_dir_all(&rt_b).unwrap();
+    std::fs::write(
+        rt_b.join("binding.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "agent": "id-agent-b",
+            "task_id": "t-arch14",
+            "branch": "feat/ib",
+            "worktree": wt_b.to_str().unwrap(),
+            "source_repo": src_b.to_str().unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let da = handle_binding_state(&home, &json!({"instance": "id-agent-a"}), &None);
+    let db = handle_binding_state(&home, &json!({"instance": "id-agent-b"}), &None);
+    let (ta, tb) = (&da["target_identity"], &db["target_identity"]);
+    assert_eq!(ta["expected_worktree"].as_str(), wt_a.to_str(), "{da}");
+    assert_eq!(tb["expected_worktree"].as_str(), wt_b.to_str(), "{db}");
+    assert_eq!(ta["actual_branch"].as_str(), Some("feat/ia"), "{da}");
+    assert_eq!(tb["actual_branch"].as_str(), Some("feat/ib"), "{db}");
+    assert_eq!(ta["matches_binding"].as_bool(), Some(true), "{da}");
+    assert_eq!(tb["matches_binding"].as_bool(), Some(true), "{db}");
+    assert_ne!(
+        ta["actual_head"].as_str(),
+        tb["actual_head"].as_str(),
+        "distinct repos must not collide on fabricated heads: {da} vs {db}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED: broken target — explicit probe error, no panic, and the probe MUST
+/// NOT mutate the persisted binding.
+#[test]
+fn arch14_identity_probe_error_without_mutation() {
+    let home = arch14_idfix_home("broken");
+    let (_src, wt) = arch14_idfix_bound_worktree(&home, "id-agent-b", "feat/idx");
+    std::fs::remove_dir_all(&wt).unwrap(); // target vanishes
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("id-agent-b")
+        .join("binding.json");
+    let before = std::fs::read(&binding_path).unwrap();
+
+    let d = handle_binding_state(&home, &json!({"instance": "id-agent-b"}), &None);
+    let ti = &d["target_identity"];
+    assert_eq!(
+        ti["probe_status"].as_str(),
+        Some("error"),
+        "unprobeable target must report an explicit error status: {d}"
+    );
+    assert!(
+        ti["probe_error"].as_str().is_some_and(|e| !e.is_empty()),
+        "probe error text must be present: {d}"
+    );
+    assert_eq!(ti["matches_binding"].as_bool(), Some(false), "{d}");
+    let after = std::fs::read(&binding_path).unwrap();
+    assert_eq!(before, after, "probe must not mutate the persisted binding");
+    std::fs::remove_dir_all(&home).ok();
+}

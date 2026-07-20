@@ -171,6 +171,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         )
         .unwrap_or_default();
 
+        let target_identity = target_identity::probe_target_identity(wt_path, branch, wt_str);
+
         json!({
             "agent": agent,
             "bound": true,
@@ -191,6 +193,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "cross_branch_holders": cross_branch_holders,
             "dispatched_waiting_for": dispatched_waiting_for,
             "pending_response_to": pending_response_to,
+            "target_identity": target_identity,
         })
     } else {
         json!({
@@ -213,6 +216,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 #[path = "binding_state_ci_watches.rs"]
 mod ci_watches;
 use ci_watches::{enumerate_ci_watches_detail_for_agent, enumerate_ci_watches_for_agent};
+#[path = "binding_state_target_identity.rs"]
+mod target_identity;
 
 /// Return list of agent names (other than `exclude_agent`) whose
 /// binding currently references `branch`. P0-1.5 enforces uniqueness
