@@ -4097,3 +4097,83 @@ fn arch14_symlink_alias_lease_survives_alias_removal() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+// ═══ Arch14 legacy marker: absent-binding release (t-…-39872-18) ══════════
+// Superseding contract d-20260720044124067125-6. #2860 landed producer
+// canonical source parity + BINDING-authoritative legacy adoption; the
+// remaining hole: a legacy sourceless-but-otherwise-valid managed worktree
+// whose BINDING no longer exists is refused forever
+// (managed_release_no_binding) — no retry source can ever settle it.
+
+/// RED (fail today): binding ABSENT + valid linked worktree + non-empty
+/// agent/branch three-line legacy marker + authorized caller (the marker
+/// agent itself) must path-release via the target's own verified .git
+/// linkage. Today delegate_managed_release dies at
+/// `managed_release_no_binding` before any identity derivation.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-nobind");
+    arch14_write_legacy_marker(&wt, "arch14-nb2-agent", "feat/test");
+    // Deliberately NO binding — the legacy worktree's agent is long gone.
+
+    let r = dispatch_repo_release(&home, "arch14-nb2-agent", wt.to_str().unwrap());
+    assert!(
+        r["released"].as_bool() == Some(true) && r.get("error").and_then(|e| e.as_str()).is_none(),
+        "absent-binding legacy marker with verified .git linkage must release: {r}"
+    );
+    assert!(!wt.exists(), "released worktree must be removed: {r}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-correction guard (green today, must stay green): a marker missing
+/// ONLY the branch= line stays refused and preserved — the absent-binding
+/// arm must never weaken the branch identity requirement.
+#[test]
+#[cfg(unix)]
+fn arch14_release_still_refuses_missing_branch_marker() {
+    let (base, home, repo, wt) = managed_wt_fixture("arch14-nobranch");
+    std::fs::write(
+        wt.join(".agend-managed"),
+        format!(
+            "agent=arch14-nbr-agent\nsource_repo={}\nleased_at=2026-07-18T00:00:00+00:00\n",
+            repo.display()
+        ),
+    )
+    .expect("branchless marker");
+    crate::binding::bind_full(
+        &home,
+        "arch14-nbr-agent",
+        "",
+        "feat/test",
+        &wt,
+        &repo,
+        false,
+    )
+    .expect("bind");
+    let r = dispatch_repo_release(&home, "arch14-nbr-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "marker missing only branch= must stay refused: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on refusal");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Over-correction guard (green today, must stay green): absent binding +
+/// zero-byte marker stays refused — the absent-binding arm derives identity
+/// only for a marker that still carries non-empty agent AND branch.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_zero_byte_marker_still_refused() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-nb-zero");
+    std::fs::write(wt.join(".agend-managed"), "").expect("empty marker");
+
+    let r = dispatch_repo_release(&home, "arch14-nbz-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "absent binding + zero-byte marker must stay refused: {r}"
+    );
+    assert!(wt.exists(), "worktree must be preserved on refusal");
+    std::fs::remove_dir_all(&base).ok();
+}
