@@ -1,20 +1,43 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-fn parse_managed_marker(wt: &Path) -> Option<(String, String, String)> {
+/// arch14 (d-20260720044124067125-6): `source_repo` is `None` when the LINE is
+/// missing (a pre-#2860 legacy marker — the absent-binding arm's only legal
+/// input) vs `Some("")` for an explicit blank value (always refused).
+fn parse_managed_marker(wt: &Path) -> Option<(String, String, Option<String>)> {
     let content = std::fs::read_to_string(wt.join(crate::worktree_pool::MANAGED_MARKER)).ok()?;
     let get = |prefix: &str| {
         content
             .lines()
             .find_map(|l| l.strip_prefix(prefix))
             .map(|s| s.trim().to_string())
-            .unwrap_or_default()
     };
-    let agent = get("agent=");
+    let agent = get("agent=").unwrap_or_default();
     if agent.is_empty() {
         return None;
     }
-    Some((agent, get("branch="), get("source_repo=")))
+    Some((
+        agent,
+        get("branch=").unwrap_or_default(),
+        get("source_repo="),
+    ))
+}
+
+/// Derive the source repo from a linked worktree's `.git` gitlink file
+/// (`gitdir: <src>/.git/worktrees/<name>`). Shared by the non-managed removal
+/// path (post-removal prune) and the arch14 absent-binding arm (branch-lease
+/// lock key). `None` on any unexpected shape — callers stay fail-safe.
+fn derive_source_from_gitlink(canonical: &Path) -> Option<std::path::PathBuf> {
+    canonical
+        .join(".git")
+        .is_file()
+        .then(|| std::fs::read_to_string(canonical.join(".git")).ok())
+        .flatten()
+        .and_then(|content| {
+            let gitdir = content.strip_prefix("gitdir: ")?.trim();
+            let p = std::path::Path::new(gitdir);
+            p.parent()?.parent()?.parent().map(|pp| pp.to_path_buf())
+        })
 }
 
 fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Value {
@@ -40,13 +63,11 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
             fingerprint
         }
         Ok(crate::binding::GuardedBinding::Absent) => {
-            return json!({
-                "error": format!(
-                    "managed marker claims agent '{}' but no binding exists — refusing",
-                    marker_agent
-                ),
-                "code": "managed_release_no_binding",
-            });
+            // arch14 (d-20260720044124067125-6): a legacy sourceless-but-
+            // otherwise-valid marker whose binding no longer exists may release
+            // via the target's OWN verified .git linkage — every other absent-
+            // binding shape keeps the fail-closed refusal below.
+            return absent_binding_legacy_release(home, canonical, caller, &marker_agent);
         }
         Ok(crate::binding::GuardedBinding::Opaque(reason)) | Err(reason) => {
             return json!({
@@ -77,6 +98,143 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
         "branch_deleted": outcome.branch_deleted,
         "error": outcome.error,
     })
+}
+
+/// arch14 absent-binding arm (d-20260720044124067125-6): a LEGACY marker —
+/// non-empty agent AND branch, source_repo LINE MISSING (pre-#2860 producer
+/// format) — whose binding no longer exists may release via the target's own
+/// verified Git linkage. Everything else keeps the fail-closed
+/// `managed_release_no_binding` refusal. Caller authority is the SAME set as
+/// the bound path (marker agent / its orchestrator / anonymous operator).
+/// Identity is path-anchored: the gitlink names the source, the checked-out
+/// branch must equal the marker's branch, and under the existing
+/// branch→agent→binding lock order the binding must STILL be absent (a bind
+/// that raced in wins). The removal itself reuses the canonical
+/// linked-worktree removal path while the locks are held — the agent lock
+/// blocks a concurrent re-provision of this exact `worktrees/<agent>/<branch>`
+/// path for the removal's duration.
+fn absent_binding_legacy_release(
+    home: &Path,
+    canonical: &Path,
+    caller: &str,
+    marker_agent: &str,
+) -> Value {
+    let refuse_no_binding = || {
+        json!({
+            "error": format!(
+                "managed marker claims agent '{marker_agent}' but no binding exists — refusing"
+            ),
+            "code": "managed_release_no_binding",
+        })
+    };
+    let Some((_, mk_branch, mk_source)) = parse_managed_marker(canonical) else {
+        return refuse_no_binding();
+    };
+    // Only the missing-LINE legacy shape qualifies; an explicit (even blank)
+    // source_repo value or a branchless marker stays refused.
+    if mk_source.is_some() || mk_branch.is_empty() {
+        return refuse_no_binding();
+    }
+    if !caller.is_empty()
+        && caller != marker_agent
+        && !crate::teams::is_orchestrator_of(home, caller, marker_agent)
+    {
+        return json!({
+            "error": format!(
+                "caller '{caller}' not authorized to release agent '{marker_agent}' worktree"
+            ),
+            "code": "managed_release_unauthorized",
+        });
+    }
+    // Path-anchored Git identity: the worktree's own gitlink names the source…
+    let Some(source_repo) = derive_source_from_gitlink(canonical) else {
+        return json!({
+            "error": format!(
+                "legacy marker for '{marker_agent}': worktree Git linkage unverifiable — refusing"
+            ),
+            "code": "managed_release_unverified_linkage",
+        });
+    };
+    let Ok(source_canonical) = std::fs::canonicalize(&source_repo) else {
+        return json!({
+            "error": format!(
+                "legacy marker for '{marker_agent}': linked source '{}' cannot be canonicalized — refusing",
+                source_repo.display()
+            ),
+            "code": "managed_release_unverified_linkage",
+        });
+    };
+    // …and the checked-out branch must equal the marker's branch identity.
+    let head_branch = match crate::git_helpers::git_cmd(
+        canonical,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    ) {
+        Ok(out) => out.trim().to_string(),
+        Err(e) => {
+            return json!({
+                "error": format!(
+                    "legacy marker for '{marker_agent}': cannot resolve worktree HEAD branch: {e} — refusing"
+                ),
+                "code": "managed_release_unverified_linkage",
+            });
+        }
+    };
+    if head_branch != mk_branch {
+        return json!({
+            "error": format!(
+                "legacy marker branch '{mk_branch}' does not match checked-out branch '{head_branch}' — refusing"
+            ),
+            "code": "managed_release_branch_mismatch",
+        });
+    }
+    // Existing lock order (branch → agent → binding) + CAS re-read.
+    let source_repo_str = source_canonical.display().to_string();
+    let _branch_lock =
+        match crate::binding::acquire_branch_lease_lock(home, &source_repo_str, &mk_branch) {
+            Ok(lock) => lock,
+            Err(e) => {
+                return json!({
+                    "error": format!("branch lease lock failed: {e} — refusing"),
+                    "code": "managed_release_lock_failed",
+                });
+            }
+        };
+    let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, marker_agent) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({
+                "error": format!("agent mutation lock failed: {e} — refusing"),
+                "code": "managed_release_lock_failed",
+            });
+        }
+    };
+    let _binding_lock = match crate::binding::acquire_binding_file_lock(home, marker_agent) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({
+                "error": format!("binding file lock failed: {e} — refusing"),
+                "code": "managed_release_lock_failed",
+            });
+        }
+    };
+    match crate::binding::guarded_binding_disk_fresh(home, marker_agent) {
+        crate::binding::GuardedBinding::Absent => {}
+        _ => {
+            return json!({
+                "error": format!(
+                    "binding for '{marker_agent}' appeared or is undecidable under lock — refusing (an in-flight bind wins)"
+                ),
+                "code": "managed_release_raced",
+            });
+        }
+    }
+    // Verified — reuse the canonical linked-worktree removal under the locks.
+    let mut resp = remove_linked_worktree_canonical(canonical, &canonical.display().to_string());
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert("released".into(), json!(!canonical.exists()));
+        obj.insert("legacy_absent_binding".into(), json!(true));
+    }
+    resp
 }
 
 /// #t-…83936-6 P0 (data-loss incident): is `p` a TRUE linked git worktree — the
@@ -200,20 +358,20 @@ pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str
         return delegate_managed_release(home, &canonical, instance_name);
     }
 
+    remove_linked_worktree_canonical(&canonical, path)
+}
+
+/// The canonical linked-worktree removal: bounded `git worktree remove
+/// --force`, the #t-…83936-6 whitelist-guarded `remove_dir_all` fallback, and
+/// the post-removal source prune. Extracted verbatim from
+/// `handle_release_repo`'s tail so the arch14 absent-binding arm reuses the
+/// EXACT same path (no second removal implementation).
+fn remove_linked_worktree_canonical(canonical: &Path, path: &str) -> Value {
     let path_str = canonical.to_string_lossy();
 
     // Derive source repo from worktree .git link before any removal —
     // needed for post-removal prune if git worktree remove fails.
-    let source_repo = canonical
-        .join(".git")
-        .is_file()
-        .then(|| std::fs::read_to_string(canonical.join(".git")).ok())
-        .flatten()
-        .and_then(|content| {
-            let gitdir = content.strip_prefix("gitdir: ")?.trim();
-            let p = std::path::Path::new(gitdir);
-            p.parent()?.parent()?.parent().map(|pp| pp.to_path_buf())
-        });
+    let source_repo = derive_source_from_gitlink(canonical);
 
     // #1899: bounded via spawn_group_bounded with a BARE Command — this site
     // deliberately does NOT set AGEND_GIT_BYPASS and does NOT set current_dir
@@ -246,14 +404,14 @@ pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str
             // #t-…83936-6 depth guard (WHITELIST): only `remove_dir_all` a LINKED
             // worktree, even if `git worktree remove` failed and validate was
             // somehow bypassed — this fallback is what deleted the canonical/bare.
-            if is_linked_worktree(&canonical) {
-                let _ = std::fs::remove_dir_all(&canonical);
+            if is_linked_worktree(canonical) {
+                let _ = std::fs::remove_dir_all(canonical);
             }
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
         Err(_) => {
-            if is_linked_worktree(&canonical) {
-                let _ = std::fs::remove_dir_all(&canonical);
+            if is_linked_worktree(canonical) {
+                let _ = std::fs::remove_dir_all(canonical);
             }
             json!({"path": path})
         }
