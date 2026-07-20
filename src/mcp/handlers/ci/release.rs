@@ -146,25 +146,45 @@ fn absent_binding_legacy_release(
             "code": "managed_release_unauthorized",
         });
     }
-    // Path-anchored Git identity: the worktree's own gitlink names the source…
-    let Some(source_repo) = derive_source_from_gitlink(canonical) else {
+    // Canonical Git identity (GREEN-2, d-20260720053617389698-7): git's OWN
+    // common-dir resolution is the source authority — never lexical gitlink
+    // text arithmetic, so a VALID relative gitlink works exactly like the
+    // absolute form. `--path-format=absolute` makes the answer directly
+    // canonicalizable regardless of the gitlink's spelling.
+    let common_dir = match crate::git_helpers::git_cmd(
+        canonical,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        Ok(out) => std::path::PathBuf::from(out.trim()),
+        Err(e) => {
+            return json!({
+                "error": format!(
+                    "legacy marker for '{marker_agent}': worktree Git linkage unverifiable: {e} — refusing"
+                ),
+                "code": "managed_release_unverified_linkage",
+            });
+        }
+    };
+    let Some(source_parent) = common_dir.parent() else {
         return json!({
             "error": format!(
-                "legacy marker for '{marker_agent}': worktree Git linkage unverifiable — refusing"
+                "legacy marker for '{marker_agent}': common-dir '{}' has no parent source — refusing",
+                common_dir.display()
             ),
             "code": "managed_release_unverified_linkage",
         });
     };
-    let Ok(source_canonical) = std::fs::canonicalize(&source_repo) else {
+    let Ok(source_canonical) = std::fs::canonicalize(source_parent) else {
         return json!({
             "error": format!(
                 "legacy marker for '{marker_agent}': linked source '{}' cannot be canonicalized — refusing",
-                source_repo.display()
+                source_parent.display()
             ),
             "code": "managed_release_unverified_linkage",
         });
     };
-    // …and the checked-out branch must equal the marker's branch identity.
+    // The checked-out branch must equal the marker's branch identity (pre-gate;
+    // the canonical transaction re-validates marker identity post-seam).
     let head_branch = match crate::git_helpers::git_cmd(
         canonical,
         &["rev-parse", "--abbrev-ref", "HEAD"],
@@ -187,7 +207,26 @@ fn absent_binding_legacy_release(
             "code": "managed_release_branch_mismatch",
         });
     }
-    // Existing lock order (branch → agent → binding) + CAS re-read.
+    // GREEN-2: converge on the CANONICAL absent-target transaction. The caller
+    // holds the lifecycle permit and L(repo,branch); the transaction acquires
+    // A→B, re-reads the binding as truly absent AFTER the
+    // ReleaseTestPhase::AfterBindingSnapshot seam, re-validates the marker's
+    // agent/branch and the target's common-dir identity
+    // (target_source_repo_matches), preserves dirty WIP, and removes via the
+    // exact-metadata-aware path — no second removal implementation.
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        marker_agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(e) => {
+            return json!({
+                "error": format!("release refused: bind/rebase in flight; {e}"),
+                "code": "managed_release_lock_failed",
+            });
+        }
+    };
     let source_repo_str = source_canonical.display().to_string();
     let _branch_lock =
         match crate::binding::acquire_branch_lease_lock(home, &source_repo_str, &mk_branch) {
@@ -199,42 +238,24 @@ fn absent_binding_legacy_release(
                 });
             }
         };
-    let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, marker_agent) {
-        Ok(lock) => lock,
-        Err(e) => {
-            return json!({
-                "error": format!("agent mutation lock failed: {e} — refusing"),
-                "code": "managed_release_lock_failed",
-            });
-        }
-    };
-    let _binding_lock = match crate::binding::acquire_binding_file_lock(home, marker_agent) {
-        Ok(lock) => lock,
-        Err(e) => {
-            return json!({
-                "error": format!("binding file lock failed: {e} — refusing"),
-                "code": "managed_release_lock_failed",
-            });
-        }
-    };
-    match crate::binding::guarded_binding_disk_fresh(home, marker_agent) {
-        crate::binding::GuardedBinding::Absent => {}
-        _ => {
-            return json!({
-                "error": format!(
-                    "binding for '{marker_agent}' appeared or is undecidable under lock — refusing (an in-flight bind wins)"
-                ),
-                "code": "managed_release_raced",
-            });
-        }
-    }
-    // Verified — reuse the canonical linked-worktree removal under the locks.
-    let mut resp = remove_linked_worktree_canonical(canonical, &canonical.display().to_string());
-    if let Some(obj) = resp.as_object_mut() {
-        obj.insert("released".into(), json!(!canonical.exists()));
-        obj.insert("legacy_absent_binding".into(), json!(true));
-    }
-    resp
+    let sender = (!caller.is_empty()).then_some(caller);
+    let outcome = crate::worktree_pool::release_absent_target_under_branch_lock(
+        home,
+        marker_agent,
+        &mk_branch,
+        canonical,
+        &source_canonical,
+        sender,
+        &permit,
+    );
+    json!({
+        "path": canonical.display().to_string(),
+        "legacy_absent_binding": true,
+        "released": outcome.released,
+        "worktree_removed": outcome.worktree_removed,
+        "git_metadata_pruned": outcome.git_metadata_pruned,
+        "error": outcome.error,
+    })
 }
 
 /// #t-…83936-6 P0 (data-loss incident): is `p` a TRUE linked git worktree — the
