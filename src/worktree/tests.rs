@@ -3126,3 +3126,218 @@ fn discard_seam_refusal_digest_is_sha256_round_trippable() {
         std::fs::remove_dir_all(root).ok();
     }
 }
+
+/// Deep-nested dirty submodule (sub-within-sub has edits) must be caught by
+/// preflight before any target is mutated.
+#[cfg(unix)]
+#[test]
+fn discard_seam_deep_nested_preflight_refuses() {
+    let home = release_tmp_home("discard-deep-nested");
+    let super_repo = tmp_super_with_nested_submodules("discard-deep-nested");
+    commit_marker_gitignore(&super_repo);
+    let info = create(&home, &super_repo, "agent1", Some("feat/deep-nested")).expect("worktree");
+    let deep_file = info.path.join("vendor/mid/nested/nested_b.txt");
+    std::fs::write(&deep_file, b"deep-nested-edit\n").unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let dirty_content = std::fs::read(&deep_file).unwrap();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/deep-nested",
+        true,
+        true,
+        Some(&digest),
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("deep-nested"),
+        "preflight must refuse deep-nested dirty submodules: {result}"
+    );
+    assert!(
+        info.path.exists(),
+        "worktree must be preserved on preflight refusal"
+    );
+    assert_eq!(
+        std::fs::read(&deep_file).unwrap(),
+        dirty_content,
+        "deep-nested file must not be modified by preflight refusal"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Two dirty submodules: vendor/alpha (valid) and vendor/beta (deep-nested).
+/// Preflight must reject the deep-nested one WITHOUT mutating the valid one.
+#[cfg(unix)]
+#[test]
+fn discard_seam_later_invalid_target_no_earlier_mutation() {
+    let home = release_tmp_home("discard-multi-preflight");
+    let root = std::env::temp_dir().join(format!(
+        "agend-wt-multi-pre-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let simple = tmp_repo_with_file("multi-alpha", "alpha.txt", "simple-v1\n");
+    let inner = tmp_repo_with_file("multi-inner", "inner.txt", "inner-v1\n");
+    let beta_dir = root.join("beta-src");
+    std::fs::create_dir_all(&beta_dir).unwrap();
+    git_run_ok(&beta_dir, &["init", "-b", "main"], false);
+    git_run_ok(&beta_dir, &["config", "user.email", "t@t"], false);
+    git_run_ok(&beta_dir, &["config", "user.name", "t"], false);
+    git_run_ok(
+        &beta_dir,
+        &["submodule", "add", &inner.display().to_string(), "inner"],
+        true,
+    );
+    git_run_ok(&beta_dir, &["commit", "-m", "beta with inner"], false);
+
+    let super_dir = root.join("super");
+    std::fs::create_dir_all(&super_dir).unwrap();
+    git_run_ok(&super_dir, &["init", "-b", "main"], false);
+    git_run_ok(&super_dir, &["config", "user.email", "t@t"], false);
+    git_run_ok(&super_dir, &["config", "user.name", "t"], false);
+    commit_marker_gitignore(&super_dir);
+    git_run_ok(
+        &super_dir,
+        &[
+            "submodule",
+            "add",
+            &simple.display().to_string(),
+            "vendor/alpha",
+        ],
+        true,
+    );
+    git_run_ok(
+        &super_dir,
+        &[
+            "submodule",
+            "add",
+            &beta_dir.display().to_string(),
+            "vendor/beta",
+        ],
+        true,
+    );
+    git_run_ok(&super_dir, &["commit", "-m", "two submodules"], false);
+
+    let info = create(&home, &super_dir, "agent1", Some("feat/multi-pre")).expect("worktree");
+
+    let alpha_file = info.path.join("vendor/alpha/alpha.txt");
+    std::fs::write(&alpha_file, b"alpha-dirty\n").unwrap();
+    let beta_deep = info.path.join("vendor/beta/inner/inner.txt");
+    std::fs::write(&beta_deep, b"deep-dirty\n").unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let alpha_dirty = std::fs::read(&alpha_file).unwrap();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/multi-pre",
+        true,
+        true,
+        Some(&digest),
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("deep-nested"),
+        "preflight must catch deep-nested target: {result}"
+    );
+    assert_eq!(
+        std::fs::read(&alpha_file).unwrap(),
+        alpha_dirty,
+        "earlier valid target must NOT be mutated when later target fails preflight"
+    );
+    assert!(
+        info.path.exists(),
+        "worktree must be preserved on preflight refusal"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// When worktree removal fails after successful discard, the event log must
+/// contain `nested_dirt_discard_aborted` (with release_failed), NOT the
+/// success event `nested_dirt_discard_release`.
+#[cfg(unix)]
+#[test]
+fn discard_seam_removal_failure_no_success_audit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = release_tmp_home("discard-rm-fail");
+    let super_repo = tmp_super_one_sub("discard-rm-fail");
+    let gi = super_repo.join(".gitignore");
+    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    std::fs::write(&gi, format!("{existing}.trap\n")).unwrap();
+    git_run_ok(&super_repo, &["add", ".gitignore"], false);
+    git_run_ok(
+        &super_repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "gitignore trap",
+        ],
+        false,
+    );
+
+    let info = create(&home, &super_repo, "agent1", Some("feat/rm-fail")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-edit\n").unwrap();
+
+    let locked = info.path.join(".trap/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("content.txt"), b"trapped\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let event_log = home.join("event-log.jsonl");
+    let before = std::fs::read_to_string(&event_log).unwrap_or_default();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/rm-fail",
+        true,
+        true,
+        Some(&digest),
+    );
+    assert!(
+        result["error"].as_str().is_some(),
+        "removal failure must surface an error: {result}"
+    );
+
+    let after = std::fs::read_to_string(&event_log).unwrap_or_default();
+    let new_lines: Vec<&str> = after.lines().skip(before.lines().count()).collect();
+    assert!(
+        !new_lines
+            .iter()
+            .any(|l| l.contains("nested_dirt_discard_release")),
+        "removal failure must NOT emit success audit: {new_lines:?}"
+    );
+    assert!(
+        new_lines
+            .iter()
+            .any(|l| l.contains("nested_dirt_discard_aborted") && l.contains("release_failed")),
+        "removal failure must emit aborted/release_failed audit: {new_lines:?}"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&info.path).ok();
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
