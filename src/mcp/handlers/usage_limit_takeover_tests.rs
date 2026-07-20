@@ -147,6 +147,7 @@ fn fixture(tag: &str) -> Fixture {
             state: EpisodeState::CandidateReady,
             consecutive_ticks: 2,
             candidate: Some("worker-b".into()),
+            episode_nonce: 0,
             unlock_at: Some("2026-07-16T06:00:00Z".into()),
             recipient: "worker-a".into(),
         })
