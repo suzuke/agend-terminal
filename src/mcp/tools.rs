@@ -1198,6 +1198,8 @@ mod tests {
             ("repo", "checkout_purpose", "ci/checkout.rs typed disposable_review provenance gate (Architecture-14 item 10)"),
             ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
             ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
+            ("repo", "discard_nested_dirt", "ci/release.rs handle_release_repo — authorize nested-submodule dirt discard with digest round-trip"),
+            ("repo", "expected_nested_dirt_digest", "ci/release.rs handle_release_repo — TOCTOU digest gate for nested-dirt discard confirmation"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
             ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),

@@ -2506,6 +2506,7 @@ fn release_entry(
     )
 }
 
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn release_entry_with_reason(
     home: &Path,
