@@ -1428,6 +1428,12 @@ struct NotifyOutcome {
     // #1991: anchor run's own conclusion at notify time.
     new_notified_run_conclusion: Option<String>,
     new_stale_emitted_sha: Option<String>,
+    // arch14 (t-…-39872-11): event-level delivery acknowledgement — true when
+    // an emitted terminal notification had ELIGIBLE recipients but ZERO durable
+    // successes (zero handlers, enqueue failure). persist_watch_state must then
+    // hold every notified/terminal cursor so the next poll retries; deliberate
+    // zombie/eligibility skips never set this (they must not poison the watch).
+    delivery_failed: bool,
 }
 
 /// Fetch latest CI run and notify ALL subscribed agents on any
@@ -1926,6 +1932,11 @@ async fn fan_out_notifications(
     let mut new_notified_run_attempt = tracking.last_notified_run_attempt;
     let mut new_notified_run_conclusion = tracking.last_notified_run_conclusion.map(String::from);
     let mut new_stale_emitted_sha = tracking.last_stale_emitted_sha.map(String::from);
+    // arch14: event-level delivery acknowledgement (root contract,
+    // m-20260720035257793137-407). Set when an event with eligible recipients
+    // lands ZERO durable successes — the cursors for that event must not
+    // settle, so the next poll retries (supersede-token idempotent).
+    let mut delivery_failed = false;
 
     for (idx, run_id, sha) in deduped {
         let run = &pr.runs[*idx];
@@ -2034,6 +2045,12 @@ async fn fan_out_notifications(
             // applied ONCE. Per recipient: success/failure → emit Ci{Ready,Fail}
             // (the subscriber delivers via the shared `deliver_ci_watch`); a
             // non-pair "[ci-ended]" conclusion has no event kind → direct deliver.
+            // arch14: per-event delivery tally. Deliberate skips (action
+            // target, #931 zombie) are NOT eligible attempts — they must
+            // never poison the watch into eternal retry.
+            let mut eligible_attempts = 0usize;
+            let mut durable_successes = 0usize;
+            let mut failed_subs: Vec<&str> = Vec::new();
             for sub in ctx.subscribers {
                 if action_targets_on_success.iter().any(|target| target == sub) {
                     continue;
@@ -2054,10 +2071,15 @@ async fn fan_out_notifications(
                     );
                     continue;
                 }
+                eligible_attempts += 1;
                 // #event-bus Step 2 (legacy-zero): the success/failure pair emits
                 // (the subscriber delivers via deliver_ci_watch). A non-pair
                 // "[ci-ended]" conclusion has no event kind → direct deliver.
-                let emitted = match outcome {
+                // arch14: emit's handled-count IS the delivery acknowledgement —
+                // the handler only reports handled on a successful durable
+                // enqueue, so handled==0 covers both zero-handler and
+                // enqueue-failure. The direct path returns the same signal.
+                let delivered = match outcome {
                     CiOutcome::Failure => {
                         crate::daemon::event_bus::global().emit(
                             ctx.home,
@@ -2067,8 +2089,7 @@ async fn fan_out_notifications(
                                 correlation_id: repo_branch_key.clone(),
                                 supersede_token: supersede_token.clone(),
                             },
-                        );
-                        true
+                        ) > 0
                     }
                     CiOutcome::Success => {
                         crate::daemon::event_bus::global().emit(
@@ -2079,14 +2100,42 @@ async fn fan_out_notifications(
                                 correlation_id: repo_branch_key.clone(),
                                 supersede_token: supersede_token.clone(),
                             },
-                        );
-                        true
+                        ) > 0
                     }
-                    _ => false,
+                    _ => deliver_ci_watch(ctx.home, sub, &body, &repo_branch_key, &supersede_token),
                 };
-                if !emitted {
-                    deliver_ci_watch(ctx.home, sub, &body, &repo_branch_key, &supersede_token);
+                if delivered {
+                    durable_successes += 1;
+                } else {
+                    failed_subs.push(sub);
                 }
+            }
+            // arch14 (root contract): zero durable successes across eligible
+            // attempts → this event is UNDELIVERED. Skip every cursor
+            // advancement for it so the next poll reselects and retries
+            // (supersede-token idempotent). With at least one success, settle
+            // and loud-log the failed peers — the successful recipients must
+            // not be re-woken by a blanket retry.
+            if eligible_attempts > 0 && durable_successes == 0 {
+                delivery_failed = true;
+                tracing::warn!(
+                    repo = %ctx.repo,
+                    branch = %ctx.branch,
+                    sha = %sha,
+                    eligible = eligible_attempts,
+                    "arch14: terminal CI notification had ZERO durable deliveries — holding cursors for retry next poll"
+                );
+                continue;
+            }
+            if !failed_subs.is_empty() {
+                tracing::warn!(
+                    repo = %ctx.repo,
+                    branch = %ctx.branch,
+                    sha = %sha,
+                    failed = ?failed_subs,
+                    delivered = durable_successes,
+                    "arch14: terminal CI notification settled with FAILED peer deliveries — failed peers will not be re-woken"
+                );
             }
         }
         new_notified_sha = Some(sha.to_string());
@@ -2105,6 +2154,7 @@ async fn fan_out_notifications(
         new_notified_run_attempt,
         new_notified_run_conclusion,
         new_stale_emitted_sha,
+        delivery_failed,
     }
 }
 
@@ -2116,24 +2166,34 @@ async fn fan_out_notifications(
 /// Must NOT run under the registry lock (#1492 self-IPC-under-lock) — both callers
 /// invoke it lock-free (the legacy loop's registry lock is a dropped temporary; the
 /// subscriber fires from `emit`, outside any lock).
+/// arch14 (t-…-39872-11): returns whether the durable inbox enqueue SUCCEEDED —
+/// the producer consumes this (directly, or via the event-bus handled-count) to
+/// decide whether the terminal cursors may settle. The supersede pass stays
+/// best-effort; only the enqueue outcome is delivery authority.
 fn deliver_ci_watch(
     home: &std::path::Path,
     sub: &str,
     body: &str,
     repo_branch_key: &str,
     supersede_token: &str,
-) {
+) -> bool {
     crate::inbox::mark_ci_watch_superseded(home, sub, repo_branch_key, supersede_token);
-    persist_or_log!(
-        crate::inbox::enqueue_with_idle_hint(
-            home,
-            sub,
-            crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.to_string())
-                .with_correlation_id(repo_branch_key.to_string()),
-        ),
-        "ci_watch_notify",
-        sub
-    );
+    match crate::inbox::enqueue_with_idle_hint(
+        home,
+        sub,
+        crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.to_string())
+            .with_correlation_id(repo_branch_key.to_string()),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                sub = %sub,
+                error = %e,
+                "ci_watch_notify: durable inbox enqueue FAILED — notification not delivered (cursors will not settle on zero durable successes)"
+            );
+            false
+        }
+    }
 }
 
 /// #event-bus (ci_watch) subscriber: re-deliver a `CiReady`/`CiFail` event via the
@@ -2155,8 +2215,11 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
             supersede_token,
             ..
         } => {
-            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
-            true
+            // arch14: handled ONLY when the durable enqueue succeeded — the
+            // producer reads emit's handled-count, so handled==0 (no handler
+            // OR failed enqueue) means "no durable delivery" and the terminal
+            // cursors must not settle.
+            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token)
         }
         _ => false,
     }
@@ -2337,7 +2400,10 @@ fn persist_watch_state(
         );
     }
 
-    if !ci_ready_delivery_failed {
+    // arch14: the informational fan-out's event-level acknowledgement joins the
+    // existing (independent, stricter) actionable next_after_ci row+paired-track
+    // gate — EITHER failure holds every cursor so the next poll retries.
+    if !ci_ready_delivery_failed && !outcome.delivery_failed {
         state.last_run_id = Some(outcome.max_notified_id);
         if !pr.current_sha.is_empty() {
             state.head_sha = Some(pr.current_sha.clone());
