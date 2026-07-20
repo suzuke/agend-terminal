@@ -104,6 +104,19 @@ impl std::error::Error for LeaseError {}
 /// AFTER leasing (dispatch's checked `bind_full` + reused-aware rollback —
 /// arch-review finding D+H). `source_repo` is still required to create the
 /// worktree, but is persisted into the binding by the caller, not here.
+/// arch14: make the `.agend-managed` marker's CONTENTS durable — `fs::write`
+/// alone leaves the bytes vulnerable to a crash/power loss even when the
+/// dirent survives. Opened for WRITE (not read-only): Windows `sync_all`
+/// maps to `FlushFileBuffers`, which needs `GENERIC_WRITE`. Shared by the
+/// `worktree::create` first write and the lease re-write; the checkout
+/// transaction keeps its own seam-instrumented copy (checkout_helpers).
+pub(crate) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
 pub fn lease(
     home: &Path,
     source_repo: &Path,
@@ -127,15 +140,25 @@ pub fn lease(
     // #1137: marker is now written inside worktree::create() immediately
     // after checkout. Re-write here is idempotent and ensures the marker
     // is present for reused worktrees (which skip the create path).
+    // arch14 (d-20260719234211852352-4): a write/sync failure is an ABORT —
+    // the lease must not report success over a broken identity the
+    // deep-validated release would refuse. The (possibly reused) worktree is
+    // deliberately NOT deleted: it may hold WIP; abort-only is the safe arm.
     let marker = info.path.join(MANAGED_MARKER);
-    let _ = std::fs::write(
+    std::fs::write(
         &marker,
         format!(
             "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
             source_repo.display(),
             chrono::Utc::now().to_rfc3339()
         ),
-    );
+    )
+    .and_then(|()| sync_marker_contents(&marker))
+    .map_err(|e| {
+        LeaseError::CreateFailed(format!(
+            "managed-marker write/sync failed for {agent}@{branch}: {e}"
+        ))
+    })?;
 
     Ok(WorktreeLease {
         agent: agent.to_string(),
@@ -1157,8 +1180,22 @@ fn release_full_guarded(
         };
         let mk_agent = mk_get("agent=");
         let mk_branch = mk_get("branch=");
-        let mk_source = mk_get("source_repo=");
-        if mk_agent.is_empty() || mk_branch.is_empty() || mk_source.is_empty() {
+        // arch14 (d-20260719234211852352-4): distinguish a MISSING source_repo
+        // line (a pre-fix legacy marker — adoption candidate, decided below
+        // after agent/branch corroboration) from an EXPLICIT blank value
+        // (stays refused as empty identity). Both read back "" through the
+        // old defaulting getter, which is exactly the distinction adoption
+        // must not blur.
+        let mk_source_line = marker_content
+            .lines()
+            .find_map(|l| l.strip_prefix("source_repo="))
+            .map(|s| s.trim().to_string());
+        let legacy_missing_source = mk_source_line.is_none();
+        let mk_source = mk_source_line.unwrap_or_default();
+        if mk_agent.is_empty()
+            || mk_branch.is_empty()
+            || (mk_source.is_empty() && !legacy_missing_source)
+        {
             return ReleaseOutcome {
                 error: Some(format!(
                     "managed marker has empty identity under lock (agent={mk_agent:?} \
@@ -1191,6 +1228,34 @@ fn release_full_guarded(
                 ..ReleaseOutcome::default()
             };
         }
+        // arch14 legacy adoption: a marker MISSING the source_repo line adopts
+        // the AUTHORITATIVE binding's source. Authority here is stricter than
+        // the ordinary release path: on top of the disk-fresh fingerprint-
+        // CAS'd read under the binding file lock, adoption also requires the
+        // binding's #1651 HMAC sidecar to verify (`binding::signature_valid`,
+        // fail-closed on a missing/stale/tampered sidecar) — a hand-edited
+        // binding.json must never lend its source to a sourceless marker.
+        // The marker's agent/branch already corroborated the binding above,
+        // and the worktree Git-pointer/common-dir check below still gates the
+        // final decision, so a marker that merely lost its source line
+        // releases while a worktree that actually belongs to another repo
+        // stays refused. The marker file is NOT rewritten (no migration — it
+        // is about to be released under this same lock).
+        let mk_source = if legacy_missing_source {
+            if !crate::binding::signature_valid(home, agent) {
+                return ReleaseOutcome {
+                    error: Some(
+                        "legacy sourceless marker: binding signature not verifiable — \
+                         refusing adoption (fail-closed)"
+                            .into(),
+                    ),
+                    ..ReleaseOutcome::default()
+                };
+            }
+            bound_source_str.to_string()
+        } else {
+            mk_source
+        };
         let Ok(mk_source_canonical) = std::fs::canonicalize(&mk_source) else {
             return ReleaseOutcome {
                 error: Some(format!(

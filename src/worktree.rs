@@ -258,13 +258,40 @@ pub fn create(
             );
             // #1137: write .agend-managed marker immediately after successful
             // checkout to prevent orphan dirs if process dies before caller writes it.
-            let _ = std::fs::write(
-                wt_dir.join(".agend-managed"),
+            // arch14 (d-20260719234211852352-4): the FIRST write already carries the
+            // canonical four-field identity — no crash window may leave a sourceless
+            // marker — and a write/sync failure aborts (fail-loud) instead of handing
+            // back a worktree whose identity the deep-validated release would refuse.
+            let marker_path = wt_dir.join(".agend-managed");
+            let marker_write = std::fs::write(
+                &marker_path,
                 format!(
-                    "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                    repo_dir.display(),
                     chrono::Utc::now().to_rfc3339()
                 ),
-            );
+            )
+            .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+            if let Err(e) = marker_write {
+                tracing::warn!(
+                    instance = instance_name,
+                    path = %wt_dir.display(),
+                    error = %e,
+                    "managed-marker write/sync failed — rolling back fresh worktree (fail-loud)"
+                );
+                // Rollback the worktree THIS attempt just created (never a reused
+                // tree — that path returned earlier), so no half-managed dir leaks.
+                let _ = git_cmd(
+                    repo_dir,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        &wt_dir.display().to_string(),
+                    ],
+                );
+                return None;
+            }
             // Fresh worktree: `git worktree add` copies gitlinks + .gitmodules
             // but does NOT populate submodule content — init recursively here.
             init_submodules_after_create(&wt_dir);
@@ -300,13 +327,36 @@ pub fn create(
                         "created worktree on existing branch"
                     );
                     // #1137: write marker immediately (same as primary path above).
-                    let _ = std::fs::write(
-                        wt_dir.join(".agend-managed"),
+                    // arch14: canonical four-field identity + fail-loud, mirroring
+                    // the primary `-b` arm exactly.
+                    let marker_path = wt_dir.join(".agend-managed");
+                    let marker_write = std::fs::write(
+                        &marker_path,
                         format!(
-                            "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                            "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                            repo_dir.display(),
                             chrono::Utc::now().to_rfc3339()
                         ),
-                    );
+                    )
+                    .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+                    if let Err(e) = marker_write {
+                        tracing::warn!(
+                            instance = instance_name,
+                            path = %wt_dir.display(),
+                            error = %e,
+                            "managed-marker write/sync failed — rolling back fresh worktree (fail-loud)"
+                        );
+                        let _ = git_cmd(
+                            repo_dir,
+                            &[
+                                "worktree",
+                                "remove",
+                                "--force",
+                                &wt_dir.display().to_string(),
+                            ],
+                        );
+                        return None;
+                    }
                     init_submodules_after_create(&wt_dir);
                     Some(WorktreeInfo {
                         path: wt_dir,
