@@ -1916,7 +1916,7 @@ pub(crate) fn release_absent_target_under_branch_lock(
                 (nested_discard, &preservation)
             {
                 let nested_status = crate::worktree::enumerate_nested_dirty(target);
-                let current_digest = crate::worktree::hash_hex(&nested_status);
+                let current_digest = crate::worktree::nested_dirt_digest_sha256(&nested_status);
                 if current_digest != discard.expected_digest {
                     drop(_binding_lock);
                     drop(_agent_lock);
@@ -1965,50 +1965,62 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         ..ReleaseOutcome::default()
                     };
                 }
-                let dirty_sub_paths: Vec<&str> = nested_status
-                    .lines()
-                    .filter_map(|l| {
-                        let l = l.trim_end();
-                        if !l.starts_with(' ')
-                            && !l.starts_with('[')
-                            && l.ends_with(':')
-                            && l.len() > 1
-                        {
-                            Some(&l[..l.len() - 1])
-                        } else {
-                            None
+                let dirty_sub_paths = match crate::worktree::dirty_submodule_paths(target) {
+                    Ok(p) if p.is_empty() => {
+                        drop(_binding_lock);
+                        drop(_agent_lock);
+                        for notice in notices {
+                            notice.emit(home);
                         }
-                    })
-                    .collect();
-                if dirty_sub_paths.is_empty() {
-                    drop(_binding_lock);
-                    drop(_agent_lock);
-                    for notice in notices {
-                        notice.emit(home);
+                        return ReleaseOutcome {
+                            error: Some(
+                                "nested dirt discard refused: no eligible registered dirty \
+                                 submodule paths found; state preserved"
+                                    .to_string(),
+                            ),
+                            ..ReleaseOutcome::default()
+                        };
                     }
-                    return ReleaseOutcome {
-                        error: Some(
-                            "nested dirt discard refused: no eligible registered dirty submodule \
-                             paths found; state preserved"
-                                .to_string(),
-                        ),
-                        ..ReleaseOutcome::default()
-                    };
-                }
-                let mut sub_args = vec!["submodule", "update", "--force", "--checkout", "--"];
-                sub_args.extend(dirty_sub_paths.iter().copied());
-                if let Err(e) = crate::git_helpers::git_cmd(target, &sub_args) {
-                    drop(_binding_lock);
-                    drop(_agent_lock);
-                    for notice in notices {
-                        notice.emit(home);
+                    Ok(p) => p,
+                    Err(e) => {
+                        drop(_binding_lock);
+                        drop(_agent_lock);
+                        for notice in notices {
+                            notice.emit(home);
+                        }
+                        return ReleaseOutcome {
+                            error: Some(format!(
+                                "nested dirt discard refused: {e}; state preserved"
+                            )),
+                            ..ReleaseOutcome::default()
+                        };
                     }
-                    return ReleaseOutcome {
-                        error: Some(format!(
-                            "nested dirt discard refused: submodule reset failed: {e}; state preserved"
-                        )),
-                        ..ReleaseOutcome::default()
-                    };
+                };
+                for sub_path in &dirty_sub_paths {
+                    if let Err(e) = crate::git_helpers::git_cmd(
+                        target,
+                        &[
+                            "submodule",
+                            "update",
+                            "--force",
+                            "--checkout",
+                            "--",
+                            sub_path,
+                        ],
+                    ) {
+                        drop(_binding_lock);
+                        drop(_agent_lock);
+                        for notice in notices {
+                            notice.emit(home);
+                        }
+                        return ReleaseOutcome {
+                            error: Some(format!(
+                                "nested dirt discard refused: submodule reset failed for \
+                                 '{sub_path}': {e}; state preserved"
+                            )),
+                            ..ReleaseOutcome::default()
+                        };
+                    }
                 }
                 let residual = crate::worktree::enumerate_nested_dirty(target);
                 if !residual.is_empty() {
@@ -2026,18 +2038,7 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         ..ReleaseOutcome::default()
                     };
                 }
-                crate::event_log::log(
-                    home,
-                    "nested_dirt_discard_release",
-                    agent,
-                    &format!(
-                        "branch={branch_for_preserve} discard_digest={} audit_reason={} \
-                         pre_discard_status_lines={}",
-                        discard.expected_digest,
-                        discard.audit_reason,
-                        nested_status.lines().count(),
-                    ),
-                );
+                let pre_discard_line_count = nested_status.lines().count();
                 let (pres2, collected2) = crate::worktree::preserve_dirty_worktree_collect(
                     home,
                     agent,
@@ -2047,6 +2048,16 @@ pub(crate) fn release_absent_target_under_branch_lock(
                 );
                 notices = collected2;
                 if let Some(r2) = pres2.blocked_reason() {
+                    crate::event_log::log(
+                        home,
+                        "nested_dirt_discard_aborted",
+                        agent,
+                        &format!(
+                            "branch={branch_for_preserve} discard_digest={} audit_reason={} \
+                             abort_reason=parent_wip_preservation_failed",
+                            discard.expected_digest, discard.audit_reason,
+                        ),
+                    );
                     drop(_binding_lock);
                     drop(_agent_lock);
                     for notice in notices {
@@ -2060,13 +2071,26 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         ..ReleaseOutcome::default()
                     };
                 }
+                crate::event_log::log(
+                    home,
+                    "nested_dirt_discard_release",
+                    agent,
+                    &format!(
+                        "branch={branch_for_preserve} discard_digest={} audit_reason={} \
+                         pre_discard_status_lines={pre_discard_line_count} \
+                         targets={}",
+                        discard.expected_digest,
+                        discard.audit_reason,
+                        dirty_sub_paths.join(","),
+                    ),
+                );
             } else {
                 let digest = if matches!(
                     &preservation,
                     crate::worktree::WipPreservation::UnpreservableNestedDirty(_)
                 ) {
                     let ns = crate::worktree::enumerate_nested_dirty(target);
-                    Some(crate::worktree::hash_hex(&ns))
+                    Some(crate::worktree::nested_dirt_digest_sha256(&ns))
                 } else {
                     None
                 };

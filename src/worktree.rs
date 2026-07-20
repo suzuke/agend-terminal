@@ -1368,6 +1368,35 @@ pub(crate) fn enumerate_nested_dirty(wt_path: &Path) -> String {
     out
 }
 
+/// Extract the registered dirty submodule paths at the root level of `wt_path`.
+/// Returns `Ok(paths)` with the list of top-level submodule relative paths that
+/// have internal dirt (`dirty_submodule()` = true), or `Err(reason)` if the
+/// root-level status contains untracked entries (which `git submodule update`
+/// cannot clean) or the git status call itself fails.
+pub(crate) fn dirty_submodule_paths(wt_path: &Path) -> Result<Vec<String>, String> {
+    let entries = match crate::git_helpers::git_cmd(
+        wt_path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--ignore-submodules=none",
+            "--untracked-files=all",
+        ],
+    ) {
+        Ok(s) => parse_porcelain_v2_z(&s),
+        Err(e) => return Err(format!("git status failed: {e}")),
+    };
+    let mut paths = Vec::new();
+    for e in &entries {
+        if e.dirty_submodule() {
+            paths.push(e.path.clone());
+        }
+    }
+    Ok(paths)
+}
+
 /// One level of [`enumerate_nested_dirty`]. `dir_canon` is the canonical repo dir;
 /// `display_prefix` is its path relative to the super (`""` for the super root).
 fn walk_nested_dirty(
@@ -1501,13 +1530,24 @@ fn walk_nested_dirty(
 }
 
 /// Hex digest of a `Hash`-able value via `DefaultHasher` (bounded, allocation-free
-/// key). Used both for the per-worktree marker filename (path) and the last-seen
-/// nested-status content.
-pub(crate) fn hash_hex<T: std::hash::Hash>(v: &T) -> String {
+/// key). Used for per-worktree marker filenames and internal dedup keys.
+/// NOT for public-facing confirmation tokens — use [`nested_dirt_digest_sha256`].
+fn hash_hex<T: std::hash::Hash>(v: &T) -> String {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// SHA-256 hex digest of the nested-dirt enumeration string. Stable across
+/// process restarts (unlike `DefaultHasher`/SipHash whose seed is randomized
+/// on some platforms). Used as the public confirmation token in the discard
+/// round-trip — callers echo it back to prove they saw the exact state.
+pub(crate) fn nested_dirt_digest_sha256(nested_status: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(nested_status.as_bytes());
+    hex::encode(h.finalize())
 }
 
 /// The per-worktree refusal-notice directory: `<runtime>/release_refusal_notices`.
@@ -1557,7 +1597,7 @@ fn notify_unpreservable_nested_dirty(
     sender: Option<&str>,
 ) {
     let recipient = wip_notice_recipient(home, agent, sender);
-    let current_hash = hash_hex(&nested_status);
+    let current_hash = nested_dirt_digest_sha256(nested_status);
     let dir = refusal_notice_dir(home);
     let key = hash_hex(&wt_path);
     let marker_path = dir.join(&key);

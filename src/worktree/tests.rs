@@ -2552,7 +2552,7 @@ fn release_entry_with_reason(
 /// Compute the nested-dirt digest a caller must supply to authorize discard.
 #[cfg(unix)]
 fn nested_dirt_digest(wt_path: &Path) -> String {
-    hash_hex(&enumerate_nested_dirty(wt_path))
+    nested_dirt_digest_sha256(&enumerate_nested_dirty(wt_path))
 }
 
 /// (a) Without discard authorization, nested-only dirt still refuses through
@@ -2996,6 +2996,130 @@ fn discard_seam_refusal_returns_digest() {
         "refusal must return daemon-computed digest for round-trip: {result}"
     );
     assert!(info.path.exists(), "refusal must preserve target");
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// SHA-256 digest must be 64 hex chars and stable across calls.
+#[cfg(unix)]
+#[test]
+fn discard_seam_sha256_shape_and_stability() {
+    let home = release_tmp_home("discard-sha256");
+    let super_repo = tmp_super_one_sub("discard-sha256");
+    let info = create(&home, &super_repo, "agent1", Some("feat/sha256")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"sha256-test\n").unwrap();
+
+    let d1 = nested_dirt_digest(&info.path);
+    let d2 = nested_dirt_digest(&info.path);
+    assert_eq!(d1.len(), 64, "SHA-256 hex digest must be 64 chars: {d1}");
+    assert!(
+        d1.chars().all(|c| c.is_ascii_hexdigit()),
+        "digest must be pure hex: {d1}"
+    );
+    assert_eq!(d1, d2, "digest must be deterministic across calls");
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Successful discard must NOT record audit before parent preservation succeeds.
+/// Verify: on success the event is "nested_dirt_discard_release" (not _aborted).
+#[cfg(unix)]
+#[test]
+fn discard_seam_audit_records_after_parent_preservation() {
+    let home = release_tmp_home("discard-audit-order");
+    let super_repo = tmp_super_one_sub("discard-audit-order");
+    let info = create(&home, &super_repo, "agent1", Some("feat/audit-order")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-edit\n").unwrap();
+    std::fs::write(info.path.join("parent-wip.txt"), b"parent-work\n").unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let event_log = home.join("event-log.jsonl");
+    let before = std::fs::read_to_string(&event_log).unwrap_or_default();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/audit-order",
+        true,
+        true,
+        Some(&digest),
+    );
+    assert_eq!(
+        result["released"].as_bool(),
+        Some(true),
+        "must succeed: {result}"
+    );
+
+    let after = std::fs::read_to_string(&event_log).expect("event log");
+    let new_lines: Vec<&str> = after.lines().skip(before.lines().count()).collect();
+    assert!(
+        new_lines
+            .iter()
+            .any(|l| l.contains("nested_dirt_discard_release")),
+        "success audit must be nested_dirt_discard_release: {new_lines:?}"
+    );
+    assert!(
+        !new_lines
+            .iter()
+            .any(|l| l.contains("nested_dirt_discard_aborted")),
+        "success must NOT have an aborted audit: {new_lines:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// The refusal digest from an ordinary (no-discard) refusal must be SHA-256
+/// shaped (64 hex chars) and usable in the confirmation round-trip.
+#[cfg(unix)]
+#[test]
+fn discard_seam_refusal_digest_is_sha256_round_trippable() {
+    let home = release_tmp_home("discard-sha-rt");
+    let super_repo = tmp_super_one_sub("discard-sha-rt");
+    let info = create(&home, &super_repo, "agent1", Some("feat/sha-rt")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"edit\n").unwrap();
+
+    let refusal = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/sha-rt",
+        false,
+        false,
+        None,
+    );
+    let returned_digest = refusal["nested_dirt_digest"]
+        .as_str()
+        .expect("refusal must return digest");
+    assert_eq!(
+        returned_digest.len(),
+        64,
+        "refusal digest must be SHA-256 (64 hex): {returned_digest}"
+    );
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/sha-rt",
+        true,
+        true,
+        Some(returned_digest),
+    );
+    assert_eq!(
+        result["released"].as_bool(),
+        Some(true),
+        "round-trip with refusal digest must succeed: {result}"
+    );
 
     std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
