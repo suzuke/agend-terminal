@@ -1015,6 +1015,12 @@ pub struct InstanceYamlEntry {
     /// Mirror of [`InstanceConfig::created_by`] — the identified caller that
     /// ran `create_instance`, written at spawn time.
     pub created_by: Option<String>,
+    /// Mirror of [`InstanceConfig::context_alert_pct`].
+    pub context_alert_pct: Option<f32>,
+    /// Mirror of [`InstanceConfig::context_handoff_pct`].
+    pub context_handoff_pct: Option<f32>,
+    /// Mirror of [`InstanceConfig::context_handoff_escalate_pct`].
+    pub context_handoff_escalate_pct: Option<f32>,
 }
 
 // Persistence, merge, and team mutation functions live in fleet::persist and fleet::merge.

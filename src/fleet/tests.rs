@@ -2320,3 +2320,184 @@ instances:
     );
     fs::remove_dir_all(&dir).ok();
 }
+
+// ── PR #2864 / Issue #2863: context threshold template→fleet contract ──
+
+#[test]
+fn context_threshold_round_trips_through_fleet_yaml() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-ctx-rt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let path = write_fleet(
+        &dir,
+        r#"
+instances:
+  ctx-agent:
+    backend: claude
+    context_alert_pct: 75.0
+    context_handoff_pct: 85.0
+    context_handoff_escalate_pct: 95.0
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    let inst = config.instances.get("ctx-agent").expect("ctx-agent");
+    assert_eq!(
+        inst.context_alert_pct,
+        Some(75.0),
+        "context_alert_pct must round-trip"
+    );
+    assert_eq!(
+        inst.context_handoff_pct,
+        Some(85.0),
+        "context_handoff_pct must round-trip"
+    );
+    assert_eq!(
+        inst.context_handoff_escalate_pct,
+        Some(95.0),
+        "context_handoff_escalate_pct must round-trip"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn context_threshold_absent_resolves_to_none() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-ctx-absent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let path = write_fleet(
+        &dir,
+        r#"
+instances:
+  plain-agent:
+    backend: claude
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    let inst = config.instances.get("plain-agent").expect("plain-agent");
+    assert!(
+        inst.context_alert_pct.is_none(),
+        "absent context_alert_pct must be None"
+    );
+    assert!(
+        inst.context_handoff_pct.is_none(),
+        "absent context_handoff_pct must be None"
+    );
+    assert!(
+        inst.context_handoff_escalate_pct.is_none(),
+        "absent context_handoff_escalate_pct must be None"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn context_threshold_add_instance_persists_and_reloads() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-ctx-add-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    fs::create_dir_all(&dir).ok();
+    let entry = InstanceYamlEntry {
+        backend: Some("claude".to_string()),
+        context_alert_pct: Some(72.5),
+        context_handoff_pct: Some(82.5),
+        context_handoff_escalate_pct: Some(92.5),
+        ..Default::default()
+    };
+    add_instance_to_yaml(&dir, "ctx-new", &entry).expect("add");
+    let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
+    assert!(
+        content.contains("context_alert_pct"),
+        "context_alert_pct must appear in persisted YAML: {content}"
+    );
+    let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("reload");
+    let inst = config.instances.get("ctx-new").expect("ctx-new");
+    assert_eq!(inst.context_alert_pct, Some(72.5));
+    assert_eq!(inst.context_handoff_pct, Some(82.5));
+    assert_eq!(inst.context_handoff_escalate_pct, Some(92.5));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn context_threshold_merge_idempotent_on_same_values() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-ctx-idem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let _ = write_fleet(
+        &dir,
+        r#"
+instances:
+  ctx-idem:
+    backend: claude
+    context_alert_pct: 75.0
+    context_handoff_pct: 85.0
+"#,
+    );
+    let entry = InstanceYamlEntry {
+        backend: Some("claude".to_string()),
+        context_alert_pct: Some(75.0),
+        context_handoff_pct: Some(85.0),
+        ..Default::default()
+    };
+    let result = add_instances_to_yaml(&dir, &[("ctx-idem", &entry)]);
+    assert!(
+        result.is_ok(),
+        "re-merging same context threshold values must be idempotent: {result:?}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn context_threshold_merge_conflict_on_changed_value() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-ctx-conflict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let _ = write_fleet(
+        &dir,
+        r#"
+instances:
+  ctx-conflict:
+    backend: claude
+    context_alert_pct: 75.0
+"#,
+    );
+    let entry = InstanceYamlEntry {
+        backend: Some("claude".to_string()),
+        context_alert_pct: Some(80.0),
+        ..Default::default()
+    };
+    let result = add_instances_to_yaml(&dir, &[("ctx-conflict", &entry)]);
+    assert!(
+        result.is_err(),
+        "merging a different context_alert_pct into an operator-edited instance must produce FieldConflict"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("context_alert_pct"),
+        "conflict message must name the field: {err_msg}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}

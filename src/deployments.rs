@@ -145,9 +145,47 @@ fn yaml_str(val: &serde_yaml_ng::Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+fn validate_context_threshold(
+    inst_val: &serde_yaml_ng::Value,
+    field: &str,
+) -> Result<Option<f32>, String> {
+    let Some(val) = inst_val.get(field) else {
+        return Ok(None);
+    };
+    let f64_val = val
+        .as_f64()
+        .ok_or_else(|| format!("`{field}` must be a YAML number, got: {val:?}"))?;
+    if !f64_val.is_finite() {
+        return Err(format!("`{field}` must be finite, got: {f64_val}"));
+    }
+    let f32_val = f64_val as f32;
+    if !f32_val.is_finite() {
+        return Err(format!("`{field}` overflows f32 precision: {f64_val}"));
+    }
+    Ok(Some(f32_val))
+}
+
+#[allow(clippy::type_complexity)]
 fn create_instance_entries(
     params: &DeployParams,
-) -> (Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>) {
+) -> Result<(Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>), serde_json::Value> {
+    for (name_val, inst_val) in &params.instances_def {
+        let inst_suffix = name_val.as_str().unwrap_or("?");
+        let inst_name = format!("{}-{inst_suffix}", params.deploy_name);
+        for field in [
+            "context_alert_pct",
+            "context_handoff_pct",
+            "context_handoff_escalate_pct",
+        ] {
+            validate_context_threshold(inst_val, field).map_err(|e| {
+                serde_json::json!({
+                    "error": format!("deploy_template: instance `{inst_name}` — {e}"),
+                    "code": "deploy_invalid_threshold",
+                })
+            })?;
+        }
+    }
+
     let mut created = Vec::new();
     let mut yaml_entries = Vec::new();
     let dir = std::path::PathBuf::from(&params.directory);
@@ -302,11 +340,35 @@ fn create_instance_entries(
                     .filter(|s| matches!(*s, "skip" | "deferred"))
                     .map(String::from),
                 created_by: None, // no single ACL creator for templated instances
+                context_alert_pct: validate_context_threshold(inst_val, "context_alert_pct")
+                    .map_err(|e| {
+                        serde_json::json!({
+                            "error": format!("deploy_template: instance `{inst_name}` — {e}"),
+                            "code": "deploy_invalid_threshold",
+                        })
+                    })?,
+                context_handoff_pct: validate_context_threshold(inst_val, "context_handoff_pct")
+                    .map_err(|e| {
+                        serde_json::json!({
+                            "error": format!("deploy_template: instance `{inst_name}` — {e}"),
+                            "code": "deploy_invalid_threshold",
+                        })
+                    })?,
+                context_handoff_escalate_pct: validate_context_threshold(
+                    inst_val,
+                    "context_handoff_escalate_pct",
+                )
+                .map_err(|e| {
+                    serde_json::json!({
+                        "error": format!("deploy_template: instance `{inst_name}` — {e}"),
+                        "code": "deploy_invalid_threshold",
+                    })
+                })?,
             },
         ));
         created.push(inst_name);
     }
-    (created, yaml_entries)
+    Ok((created, yaml_entries))
 }
 
 fn prepare_work_dir(
@@ -632,7 +694,10 @@ pub(crate) fn deploy_with_runtime(
         return duplicate_deploy_error(&params.deploy_name);
     }
 
-    let (created, yaml_entries) = create_instance_entries(&params);
+    let (created, yaml_entries) = match create_instance_entries(&params) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     if let Err(e) =
         persist_to_fleet_yaml(home, &yaml_entries, &params.template, &params.deploy_name)
