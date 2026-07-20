@@ -364,9 +364,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // #1275 + #2755: write `.agend-managed` FAIL-CLOSED — a missing marker
             // breaks release_worktree/GC cleanup, so a write failure rolls back
             // rather than returning a half-managed worktree.
-            // arch14 (d-20260719234211852352-4): canonical four-field identity —
-            // source_repo= included so the deep-validated path-addressed release
-            // accepts checkout-provisioned worktrees.
+            // arch14: canonical four-field identity (source_repo= included).
             let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
             if std::fs::write(
                 &marker_path,
