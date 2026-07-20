@@ -2433,3 +2433,276 @@ fn list_residual_includes_workspace_gitlink_2234() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+// ── Phase 1 RED: nested-submodule discard release seam (#arch14-nested-dirt) ──
+//
+// These 6 tests define the contract for the forthcoming `discard_nested_dirt`
+// capability on the force-release path. The test-only `try_discard_and_preserve`
+// shim stands in for the production entry point that GREEN will introduce.
+// Test (a) is a GREEN control; tests (b)–(f) are EXPECTED RED against current code.
+
+/// Test-only seam: represents the production entry point GREEN will add.
+/// RED stub: ignores `expected_digest`, delegates to existing preserve_dirty_worktree.
+#[cfg(unix)]
+fn try_discard_and_preserve(
+    home: &Path,
+    agent: &str,
+    wt_path: &Path,
+    branch: &str,
+    expected_digest: Option<&str>,
+) -> WipPreservation {
+    let _ = expected_digest;
+    preserve_dirty_worktree(home, agent, wt_path, branch, None)
+}
+
+/// Compute the nested-dirt digest a caller must supply to authorize discard.
+#[cfg(unix)]
+fn nested_dirt_digest(wt_path: &Path) -> String {
+    hash_hex(&enumerate_nested_dirty(wt_path))
+}
+
+/// (a) GREEN control: without discard authorization, nested-only dirt still refuses.
+#[cfg(unix)]
+#[test]
+fn discard_seam_no_authorization_still_refuses() {
+    let home = tmp_home("discard-no-auth");
+    let super_repo = tmp_super_one_sub("discard-no-auth");
+    let info = create(&home, &super_repo, "agent1", Some("feat/no-auth")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-edit\n").unwrap();
+
+    let outcome =
+        try_discard_and_preserve(&home, "agent1", &info.path, "feat/no-auth", None);
+    assert_eq!(
+        pres_kind(&outcome),
+        "UnpreservableNestedDirty",
+        "(a) without discard authorization, nested dirt must still refuse"
+    );
+    assert!(
+        outcome.blocked_reason().is_some(),
+        "(a) refusal must be fail-closed"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// (b) RED: authorization with matching digest must succeed for nested-only dirt.
+#[cfg(unix)]
+#[test]
+fn discard_seam_matching_digest_succeeds() {
+    let home = tmp_home("discard-match");
+    let super_repo = tmp_super_one_sub("discard-match");
+    let info = create(&home, &super_repo, "agent1", Some("feat/match")).expect("worktree");
+    std::fs::write(
+        info.path.join("vendor/dep/vendored.txt"),
+        b"nested-edit\n",
+    )
+    .unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    assert!(!digest.is_empty(), "precondition: digest is non-empty");
+
+    let outcome =
+        try_discard_and_preserve(&home, "agent1", &info.path, "feat/match", Some(&digest));
+    assert_eq!(
+        pres_kind(&outcome),
+        "Clean",
+        "(b) authorized discard with matching digest must succeed as Clean"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// (c) RED: stale/wrong digest must refuse with a TOCTOU-specific reason.
+#[cfg(unix)]
+#[test]
+fn discard_seam_wrong_digest_refuses_toctou() {
+    let home = tmp_home("discard-toctou");
+    let super_repo = tmp_super_one_sub("discard-toctou");
+    let info =
+        create(&home, &super_repo, "agent1", Some("feat/toctou")).expect("worktree");
+    std::fs::write(
+        info.path.join("vendor/dep/vendored.txt"),
+        b"nested-edit-v1\n",
+    )
+    .unwrap();
+    let stale_digest = nested_dirt_digest(&info.path);
+
+    // Mutate further so the real digest no longer matches stale_digest.
+    std::fs::write(
+        info.path.join("vendor/dep/vendored.txt"),
+        b"nested-edit-v2-changed\n",
+    )
+    .unwrap();
+    let fresh_digest = nested_dirt_digest(&info.path);
+    assert_ne!(
+        stale_digest, fresh_digest,
+        "precondition: digest changed after mutation"
+    );
+
+    let outcome = try_discard_and_preserve(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/toctou",
+        Some(&stale_digest),
+    );
+    assert_eq!(pres_kind(&outcome), "UnpreservableNestedDirty");
+    let reason = match &outcome {
+        WipPreservation::UnpreservableNestedDirty(r) => r.as_str(),
+        _ => panic!("expected UnpreservableNestedDirty"),
+    };
+    assert!(
+        reason.contains("digest"),
+        "(c) TOCTOU refusal must mention 'digest' in reason, got: {reason}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// (d) RED: if targeted reset leaves residual untracked dirt, must still refuse.
+#[cfg(unix)]
+#[test]
+fn discard_seam_residual_dirt_after_reset_refuses() {
+    let home = tmp_home("discard-residual");
+    let super_repo = tmp_super_one_sub("discard-residual");
+    let info =
+        create(&home, &super_repo, "agent1", Some("feat/residual")).expect("worktree");
+    // Tracked modification (would be reset by `git submodule update --force`)
+    std::fs::write(
+        info.path.join("vendor/dep/vendored.txt"),
+        b"tracked-mod\n",
+    )
+    .unwrap();
+    // Untracked file (persists after `git submodule update --force`)
+    std::fs::write(
+        info.path.join("vendor/dep/rogue-untracked.txt"),
+        b"rogue\n",
+    )
+    .unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+
+    let outcome = try_discard_and_preserve(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/residual",
+        Some(&digest),
+    );
+    assert_eq!(pres_kind(&outcome), "UnpreservableNestedDirty");
+    let reason = match &outcome {
+        WipPreservation::UnpreservableNestedDirty(r) => r.as_str(),
+        _ => panic!("expected UnpreservableNestedDirty"),
+    };
+    assert!(
+        reason.contains("residual"),
+        "(d) post-reset residual refusal must mention 'residual', got: {reason}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// (e) RED: parent-level dirt + nested dirt + authorized discard → parent Preserved.
+#[cfg(unix)]
+#[test]
+fn discard_seam_preserves_parent_wip() {
+    let home = tmp_home("discard-parent");
+    let super_repo = tmp_super_one_sub("discard-parent");
+    let info =
+        create(&home, &super_repo, "agent1", Some("feat/parent")).expect("worktree");
+    // Parent-level WIP (must be preserved to recovery ref)
+    std::fs::write(info.path.join("parent-wip.txt"), b"parent-work\n").unwrap();
+    // Nested submodule dirt (must be discarded)
+    std::fs::write(
+        info.path.join("vendor/dep/vendored.txt"),
+        b"nested-edit\n",
+    )
+    .unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+
+    let outcome = try_discard_and_preserve(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/parent",
+        Some(&digest),
+    );
+    assert_eq!(
+        pres_kind(&outcome),
+        "Preserved",
+        "(e) parent WIP must be Preserved after nested discard"
+    );
+    let refs = recovery_ref_names(&super_repo, "feat/parent");
+    assert!(
+        !refs.is_empty(),
+        "(e) recovery ref must exist for parent WIP"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// (f) RED: successful discard must write audit evidence under home.
+#[cfg(unix)]
+#[test]
+fn discard_seam_records_audit_evidence() {
+    let home = tmp_home("discard-audit");
+    let super_repo = tmp_super_one_sub("discard-audit");
+    let info =
+        create(&home, &super_repo, "agent1", Some("feat/audit")).expect("worktree");
+    std::fs::write(
+        info.path.join("vendor/dep/vendored.txt"),
+        b"nested-edit\n",
+    )
+    .unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+
+    let outcome = try_discard_and_preserve(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/audit",
+        Some(&digest),
+    );
+    assert_eq!(
+        pres_kind(&outcome),
+        "Clean",
+        "(f) nested-only discard must succeed before audit check"
+    );
+
+    let audit_dir = home.join("audit").join("nested_discard");
+    assert!(
+        audit_dir.is_dir(),
+        "(f) audit evidence directory must exist at {}",
+        audit_dir.display()
+    );
+    let entries: Vec<_> = std::fs::read_dir(&audit_dir)
+        .expect("read audit dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "(f) at least one audit evidence file must be written"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
