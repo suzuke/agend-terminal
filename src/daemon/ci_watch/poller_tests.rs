@@ -4237,6 +4237,77 @@ fn github_fetch_failure_summary_finds_failed_step() {
     assert_eq!(summary, "build / Run tests", "summary: {summary}");
 }
 
+/// When GitHub Actions billing quota is exhausted, the job has
+/// `conclusion: "failure"`, zero steps, and `runner_id: 0` (no runner
+/// assigned).  The daemon must detect this and return a descriptive
+/// detail instead of the uninformative `"unknown step"` fallback.
+#[test]
+fn github_fetch_failure_summary_detects_billing_exhaustion() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": [],
+            "runner_id": 0,
+            "runner_name": ""
+        }]
+    }"#;
+    let (port, handle, captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 49));
+
+    handle.join().expect("mock");
+    let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+    assert!(
+        path.contains("/repos/foo/bar/actions/runs/49/jobs"),
+        "path: {path}"
+    );
+    assert_eq!(
+        summary, "billing quota exhausted (no runner assigned)",
+        "summary: {summary}"
+    );
+}
+
+/// A job with zero steps but a non-zero `runner_id` (runner WAS assigned) is
+/// NOT billing exhaustion — it's a different zero-step failure mode.  The
+/// daemon must fall back to `"unknown step"` (the same fallback a real-but-
+/// unclassifiable failure gets).
+#[test]
+fn github_fetch_failure_summary_unknown_step_when_runner_was_assigned() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": [],
+            "runner_id": 42,
+            "runner_name": "github-actions-runner"
+        }]
+    }"#;
+    let (port, handle, captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 50));
+
+    handle.join().expect("mock");
+    let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+    assert!(
+        path.contains("/repos/foo/bar/actions/runs/50/jobs"),
+        "path: {path}"
+    );
+    assert_eq!(summary, "unknown step", "summary: {summary}");
+}
+
 #[test]
 fn github_check_pr_terminal_returns_unknown_on_head_ref_mismatch() {
     // Hotfix F gap gate 2 (defensive): even with the correct URL,

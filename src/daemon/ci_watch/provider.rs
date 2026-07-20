@@ -838,7 +838,10 @@ impl CiProvider for GitHubCiProvider {
                     })
                 })
             })
-            .unwrap_or_else(|| "unknown step".to_string())
+            .unwrap_or_else(|| {
+                detect_billing_exhaustion(&jobs_resp)
+                    .unwrap_or_else(|| "unknown step".to_string())
+            })
     }
 
     async fn fetch_run_jobs(&self, repo: &str, run_id: u64) -> Vec<CiJob> {
@@ -1015,6 +1018,32 @@ impl CiProvider for GitHubCiProvider {
 
     fn token_warning(&self) -> Option<&'static str> {
         github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
+    }
+}
+
+/// When a job has `conclusion: "failure"` but zero steps and no runner
+/// assigned, the failure is not a code error — it's a billing / spending
+/// limit exhaustion (the job was rejected at the GitHub scheduler level).
+/// Returns `Some("billing quota exhausted (no runner assigned)")` in that
+/// case, or `None` if the zero-step failure doesn't match the billing profile.
+fn detect_billing_exhaustion(jobs_resp: &serde_json::Value) -> Option<String> {
+    let jobs = jobs_resp["jobs"].as_array()?;
+    let zero_step_failed = jobs.iter().any(|job| {
+        let failed = job["conclusion"]
+            .as_str()
+            .is_some_and(|c| matches!(super::poller::CiOutcome::from(Some(c)), super::poller::CiOutcome::Failure));
+        let no_steps = job["steps"]
+            .as_array()
+            .is_some_and(|s| s.is_empty());
+        let no_runner = job["runner_id"]
+            .as_u64()
+            .is_none_or(|id| id == 0);
+        failed && no_steps && no_runner
+    });
+    if zero_step_failed {
+        Some("billing quota exhausted (no runner assigned)".to_string())
+    } else {
+        None
     }
 }
 
