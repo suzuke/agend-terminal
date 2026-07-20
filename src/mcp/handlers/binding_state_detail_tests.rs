@@ -586,10 +586,20 @@ fn arch14_identity_fields_present_and_aligned() {
         Some("feat/idx"),
         "path-anchored actual branch: {d}"
     );
-    let head = ti["actual_head"].as_str().unwrap_or("");
-    assert!(
-        head.len() == 40 && head.chars().all(|c| c.is_ascii_hexdigit()),
-        "actual_head must be the FULL 40-hex head, got {head:?}: {d}"
+    let real_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        ti["actual_head"].as_str(),
+        Some(real_head.as_str()),
+        "actual_head must EQUAL the target worktree's real full HEAD (not merely 40 hex): {d}"
     );
     assert_eq!(ti["probe_status"].as_str(), Some("ok"), "{d}");
     assert_eq!(ti["matches_binding"].as_bool(), Some(true), "{d}");
@@ -618,8 +628,94 @@ fn arch14_identity_reports_checkout_drift() {
         Some("feat/drifted"),
         "actual_branch must be path-anchored, not the persisted expectation: {d}"
     );
+    let real_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        ti["actual_head"].as_str(),
+        Some(real_head.as_str()),
+        "drifted actual_head must equal the target worktree's REAL HEAD: {d}"
+    );
     assert_eq!(ti["probe_status"].as_str(), Some("ok"), "{d}");
     assert_eq!(ti["matches_binding"].as_bool(), Some(false), "{d}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED (root supplemental, no-fabricated-collision): TWO bound agents keep
+/// fully DISTINCT typed identities — each agent's target_identity reports its
+/// OWN expected/actual worktree+branch, never the sibling's.
+#[test]
+fn arch14_identity_two_agents_no_fabricated_collision() {
+    let home = arch14_idfix_home("twoagent");
+    let (_sa, wt_a) = arch14_idfix_bound_worktree(&home, "id-agent-a", "feat/ia");
+    // Second agent: its own source+worktree under the same home.
+    let src_b = home.join("source-b");
+    std::fs::create_dir_all(&src_b).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&src_b, &["init", "-b", "main"]);
+    git(
+        &src_b,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    );
+    let wt_b = home.join("wt-b");
+    git(
+        &src_b,
+        &["worktree", "add", wt_b.to_str().unwrap(), "-b", "feat/ib"],
+    );
+    let rt_b = crate::paths::runtime_dir(&home).join("id-agent-b");
+    std::fs::create_dir_all(&rt_b).unwrap();
+    std::fs::write(
+        rt_b.join("binding.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "agent": "id-agent-b",
+            "task_id": "t-arch14",
+            "branch": "feat/ib",
+            "worktree": wt_b.to_str().unwrap(),
+            "source_repo": src_b.to_str().unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let da = handle_binding_state(&home, &json!({"instance": "id-agent-a"}), &None);
+    let db = handle_binding_state(&home, &json!({"instance": "id-agent-b"}), &None);
+    let (ta, tb) = (&da["target_identity"], &db["target_identity"]);
+    assert_eq!(ta["expected_worktree"].as_str(), wt_a.to_str(), "{da}");
+    assert_eq!(tb["expected_worktree"].as_str(), wt_b.to_str(), "{db}");
+    assert_eq!(ta["actual_branch"].as_str(), Some("feat/ia"), "{da}");
+    assert_eq!(tb["actual_branch"].as_str(), Some("feat/ib"), "{db}");
+    assert_eq!(ta["matches_binding"].as_bool(), Some(true), "{da}");
+    assert_eq!(tb["matches_binding"].as_bool(), Some(true), "{db}");
+    assert_ne!(
+        ta["actual_head"].as_str(),
+        tb["actual_head"].as_str(),
+        "distinct repos must not collide on fabricated heads: {da} vs {db}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
