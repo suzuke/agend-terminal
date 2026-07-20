@@ -32,6 +32,7 @@ fn fixture_home(tag: &str) -> PathBuf {
 
 // allow: dead-code-helper — frozen RED contract helper; not shadowing production git_ok semantics (takes &Path not &cwd)
 fn git_ok(dir: &Path, args: &[&str]) {
+    // allow: raw-git-subprocess — fixture setup with explicit AGEND_GIT_BYPASS
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -280,6 +281,7 @@ fn arch14_scratch_repo_read_unchanged() {
 fn arch14_sibling_write_isolation_unchanged() {
     let home = fixture_home("write");
     let (_src, _wt_a, wt_b, shim_git) = two_agent_fixture(&home);
+    // allow: raw-git-subprocess — bypass-env read to capture HEAD before shim attempt
     let head_before = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&wt_b)
@@ -302,6 +304,7 @@ fn arch14_sibling_write_isolation_unchanged() {
             "x",
         ],
     );
+    // allow: raw-git-subprocess — bypass-env read to capture HEAD after shim attempt
     let head_after = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&wt_b)
