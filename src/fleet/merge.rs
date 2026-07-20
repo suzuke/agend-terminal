@@ -98,6 +98,33 @@ pub fn merge_instance_into_existing(
 
     merge_typed_field(name, existing, "worktree", config.worktree.map(Value::Bool))?;
 
+    merge_typed_field(
+        name,
+        existing,
+        "context_alert_pct",
+        config
+            .context_alert_pct
+            .map(|pct| Value::Number(serde_yaml_ng::Number::from(pct as f64))),
+    )?;
+
+    merge_typed_field(
+        name,
+        existing,
+        "context_handoff_pct",
+        config
+            .context_handoff_pct
+            .map(|pct| Value::Number(serde_yaml_ng::Number::from(pct as f64))),
+    )?;
+
+    merge_typed_field(
+        name,
+        existing,
+        "context_handoff_escalate_pct",
+        config
+            .context_handoff_escalate_pct
+            .map(|pct| Value::Number(serde_yaml_ng::Number::from(pct as f64))),
+    )?;
+
     Ok(())
 }
 
@@ -217,6 +244,24 @@ pub(super) fn build_instance_mapping(config: &InstanceYamlEntry) -> serde_yaml_n
         inst.insert(
             "topic_binding_mode".into(),
             serde_yaml_ng::Value::String(mode.clone()),
+        );
+    }
+    if let Some(pct) = config.context_alert_pct {
+        inst.insert(
+            "context_alert_pct".into(),
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(pct as f64)),
+        );
+    }
+    if let Some(pct) = config.context_handoff_pct {
+        inst.insert(
+            "context_handoff_pct".into(),
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(pct as f64)),
+        );
+    }
+    if let Some(pct) = config.context_handoff_escalate_pct {
+        inst.insert(
+            "context_handoff_escalate_pct".into(),
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(pct as f64)),
         );
     }
     inst

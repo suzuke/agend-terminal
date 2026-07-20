@@ -302,6 +302,18 @@ fn create_instance_entries(
                     .filter(|s| matches!(*s, "skip" | "deferred"))
                     .map(String::from),
                 created_by: None, // no single ACL creator for templated instances
+                context_alert_pct: inst_val
+                    .get("context_alert_pct")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32),
+                context_handoff_pct: inst_val
+                    .get("context_handoff_pct")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32),
+                context_handoff_escalate_pct: inst_val
+                    .get("context_handoff_escalate_pct")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32),
             },
         ));
         created.push(inst_name);
