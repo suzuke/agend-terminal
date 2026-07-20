@@ -3556,6 +3556,38 @@ fn repo_release_marker_rewritten_after_snapshot_refuses() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// RED #2875: marker already absent at entry with a live binding must refuse,
+/// not raw-remove the worktree while retaining the stale binding.
+#[test]
+#[cfg(unix)]
+fn repo_release_marker_absent_with_live_binding_refuses_2875() {
+    let (base, home, repo, wt) = managed_wt_fixture("2875");
+    seed_managed_marker(&wt, &repo, &home, "agent-2875", "feat/test");
+
+    // Remove ONLY the marker — binding stays live.
+    std::fs::remove_file(wt.join(".agend-managed")).expect("remove marker");
+    assert!(
+        crate::binding::read(&home, "agent-2875").is_some(),
+        "precondition: binding must exist before release"
+    );
+
+    let r = dispatch_repo_release(&home, "agent-2875", wt.to_str().unwrap());
+
+    assert!(
+        r.get("error").is_some(),
+        "marker-absent release with live binding must refuse: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when marker is absent but binding is live"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-2875").is_some(),
+        "binding must be preserved when marker is absent — not left stale"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// Marker DELETED after pre-read — under-lock re-read must refuse.
 #[test]
 #[cfg(unix)]
