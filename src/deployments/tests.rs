@@ -2233,3 +2233,207 @@ fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
         "RuntimeContext=None compatibility must retain an explicit legacy api::call path"
     );
 }
+
+// ── PR #2864 / Issue #2863: context threshold template→fleet contract ──
+
+#[test]
+fn deploy_persists_context_thresholds_into_fleet_yaml() {
+    let home = tmp_home("ctx_persist");
+    let yaml = r#"
+templates:
+  ctx-dev:
+    instances:
+      worker:
+        backend: claude
+        context_alert_pct: 75.0
+        context_handoff_pct: 85.0
+        context_handoff_escalate_pct: 95.0
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "ctx-dev",
+        "directory": home.display().to_string(),
+    });
+    let result = deploy(&home, "caller", &args);
+    assert!(
+        result.get("error").is_none(),
+        "deploy must succeed: {result}"
+    );
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    let inst = reloaded
+        .instances
+        .get("ctx-dev-worker")
+        .expect("ctx-dev-worker must be persisted");
+    assert_eq!(
+        inst.context_alert_pct,
+        Some(75.0),
+        "context_alert_pct must persist through template deploy"
+    );
+    assert_eq!(
+        inst.context_handoff_pct,
+        Some(85.0),
+        "context_handoff_pct must persist through template deploy"
+    );
+    assert_eq!(
+        inst.context_handoff_escalate_pct,
+        Some(95.0),
+        "context_handoff_escalate_pct must persist through template deploy"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn deploy_omits_context_thresholds_when_absent() {
+    let home = tmp_home("ctx_omit");
+    let yaml = r#"
+templates:
+  plain:
+    instances:
+      worker:
+        backend: claude
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "plain",
+        "directory": home.display().to_string(),
+    });
+    let _ = deploy(&home, "caller", &args);
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let inst = reloaded
+        .instances
+        .get("plain-worker")
+        .expect("plain-worker");
+    assert!(
+        inst.context_alert_pct.is_none(),
+        "context_alert_pct must stay None when template omits it"
+    );
+    assert!(
+        inst.context_handoff_pct.is_none(),
+        "context_handoff_pct must stay None when template omits it"
+    );
+    assert!(
+        inst.context_handoff_escalate_pct.is_none(),
+        "context_handoff_escalate_pct must stay None when template omits it"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED: malformed string type for context threshold must NOT be silently
+/// swallowed as None (which falls back to global thresholds). The operator
+/// wrote an explicit per-instance override that happens to be mistyped —
+/// silent omission means the daemon runs with different thresholds than the
+/// operator intended, with no diagnostic.
+#[test]
+fn deploy_rejects_malformed_context_threshold_string_type() {
+    let home = tmp_home("ctx_malformed_str");
+    let yaml = r#"
+templates:
+  bad-str:
+    instances:
+      worker:
+        backend: claude
+        context_alert_pct: "not-a-number"
+        context_handoff_pct: 85.0
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "bad-str",
+        "directory": home.display().to_string(),
+    });
+    let result = deploy(&home, "caller", &args);
+    let has_error = result.get("error").is_some();
+    let has_warning = result
+        .get("warnings")
+        .and_then(|w| w.as_array())
+        .map(|a| {
+            a.iter().any(|w| {
+                w.as_str()
+                    .map(|s| s.contains("context_alert_pct"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        has_error || has_warning,
+        "a malformed string context_alert_pct must produce an error or warning, \
+         not silently fall back to global thresholds: {result}"
+    );
+}
+
+/// RED: boolean type for context threshold must not be silently swallowed.
+/// `as_f64()` on a YAML bool returns None, causing silent omission.
+#[test]
+fn deploy_rejects_malformed_context_threshold_bool_type() {
+    let home = tmp_home("ctx_malformed_bool");
+    let yaml = r#"
+templates:
+  bad-bool:
+    instances:
+      worker:
+        backend: claude
+        context_handoff_pct: true
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "bad-bool",
+        "directory": home.display().to_string(),
+    });
+    let result = deploy(&home, "caller", &args);
+    let has_error = result.get("error").is_some();
+    let has_warning = result
+        .get("warnings")
+        .and_then(|w| w.as_array())
+        .map(|a| {
+            a.iter().any(|w| {
+                w.as_str()
+                    .map(|s| s.contains("context_handoff_pct"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        has_error || has_warning,
+        "a boolean context_handoff_pct must produce an error or warning, \
+         not silently fall back to global thresholds: {result}"
+    );
+}
+
+/// RED: sequence type for context threshold must not be silently swallowed.
+#[test]
+fn deploy_rejects_malformed_context_threshold_sequence_type() {
+    let home = tmp_home("ctx_malformed_seq");
+    let yaml = r#"
+templates:
+  bad-seq:
+    instances:
+      worker:
+        backend: claude
+        context_handoff_escalate_pct:
+          - 90
+          - 95
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "bad-seq",
+        "directory": home.display().to_string(),
+    });
+    let result = deploy(&home, "caller", &args);
+    let has_error = result.get("error").is_some();
+    let has_warning = result
+        .get("warnings")
+        .and_then(|w| w.as_array())
+        .map(|a| {
+            a.iter().any(|w| {
+                w.as_str()
+                    .map(|s| s.contains("context_handoff_escalate_pct"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        has_error || has_warning,
+        "a sequence context_handoff_escalate_pct must produce an error or warning, \
+         not silently fall back to global thresholds: {result}"
+    );
+}
