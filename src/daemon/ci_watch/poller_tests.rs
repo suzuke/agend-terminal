@@ -4308,6 +4308,232 @@ fn github_fetch_failure_summary_unknown_step_when_runner_was_assigned() {
     assert_eq!(summary, "unknown step", "summary: {summary}");
 }
 
+// --- billing detection conservative contract (RED + guard) ---
+//
+// The conservative contract requires explicit evidence before claiming
+// billing exhaustion: runner_id must be explicitly 0 (not missing/null),
+// steps must be an explicit empty array, and conclusion must be "failure".
+// Real step failures always take precedence over the billing heuristic.
+
+/// RED: missing `runner_id` field is ambiguous — a partial API response may
+/// omit it without implying billing exhaustion. Must fall back to "unknown
+/// step", not claim billing.
+#[test]
+fn github_billing_false_positive_runner_id_missing() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": []
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 60));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "unknown step",
+        "missing runner_id must not trigger billing detection; got: {summary}"
+    );
+}
+
+/// RED: `runner_id: null` is ambiguous — the API may return null without
+/// confirming no runner was assigned. Must fall back to "unknown step".
+#[test]
+fn github_billing_false_positive_runner_id_null() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": [],
+            "runner_id": null
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 61));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "unknown step",
+        "null runner_id must not trigger billing detection; got: {summary}"
+    );
+}
+
+/// Guard: `steps: null` with `runner_id: 0` — null is not an empty array.
+/// Must not trigger billing detection.
+#[test]
+fn github_billing_guard_steps_null_not_triggered() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": null,
+            "runner_id": 0
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 62));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "unknown step",
+        "null steps must not trigger billing detection; got: {summary}"
+    );
+}
+
+/// Guard: steps field entirely omitted with `runner_id: 0` — absent field
+/// is not an empty array. Must not trigger billing detection.
+#[test]
+fn github_billing_guard_steps_omitted_not_triggered() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "runner_id": 0
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 63));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "unknown step",
+        "omitted steps field must not trigger billing detection; got: {summary}"
+    );
+}
+
+/// Guard: `conclusion: "cancelled"` with zero steps and no runner is NOT
+/// billing exhaustion — only `"failure"` conclusions qualify. Covers the
+/// "other terminal conclusions" contract.
+#[test]
+fn github_billing_guard_cancelled_not_triggered() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "cancelled",
+            "steps": [],
+            "runner_id": 0
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 64));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "unknown step",
+        "cancelled conclusion must not trigger billing detection; got: {summary}"
+    );
+}
+
+/// Guard: mixed jobs — one billing-exhausted job plus another with a real
+/// failed step. The real step failure must take precedence (find_map
+/// discovers the failed step before detect_billing_exhaustion runs).
+#[test]
+fn github_billing_guard_mixed_real_failure_precedence() {
+    let body = r#"{
+        "jobs": [
+            {
+                "name": "blocked-by-quota",
+                "conclusion": "failure",
+                "steps": [],
+                "runner_id": 0
+            },
+            {
+                "name": "real-build",
+                "conclusion": "failure",
+                "steps": [
+                    {"name": "Checkout", "conclusion": "success"},
+                    {"name": "Run tests", "conclusion": "failure"}
+                ],
+                "runner_id": 7
+            }
+        ]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 65));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "real-build / Run tests",
+        "real step failure must take precedence over billing detection; got: {summary}"
+    );
+}
+
+/// Guard: a single job with `runner_id: 0` but actual failed steps is NOT
+/// billing exhaustion — the job DID execute, so the step failure takes
+/// precedence via find_map (detect_billing_exhaustion is never reached).
+#[test]
+fn github_billing_guard_step_failure_precedence() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": [
+                {"name": "Setup", "conclusion": "success"},
+                {"name": "Compile", "conclusion": "failure"}
+            ],
+            "runner_id": 0
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 66));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "build / Compile",
+        "step failure must take precedence even with runner_id=0; got: {summary}"
+    );
+}
+
 #[test]
 fn github_check_pr_terminal_returns_unknown_on_head_ref_mismatch() {
     // Hotfix F gap gate 2 (defensive): even with the correct URL,
