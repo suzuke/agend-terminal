@@ -4308,18 +4308,21 @@ fn github_fetch_failure_summary_unknown_step_when_runner_was_assigned() {
     assert_eq!(summary, "unknown step", "summary: {summary}");
 }
 
-// --- billing detection conservative contract (RED + guard) ---
+// --- pre-run failure detection conservative contract (RED + guard) ---
 //
-// The conservative contract requires explicit evidence before claiming
-// billing exhaustion: runner_id must be explicitly 0 (not missing/null),
-// steps must be an explicit empty array, and conclusion must be "failure".
-// Real step failures always take precedence over the billing heuristic.
+// The conservative contract treats zero-step + no-runner as an observable
+// pre-run symptom, NOT proof of any specific cause (billing, quota,
+// infrastructure). The Detail message must reflect this uncertainty.
+// runner_id must be explicitly 0 (not missing/null), steps must be an
+// explicit empty array, conclusion must be "failure", and the output
+// message must not claim a specific diagnosed cause.
+// Real step failures always take precedence over the pre-run heuristic.
 
 /// RED: missing `runner_id` field is ambiguous — a partial API response may
-/// omit it without implying billing exhaustion. Must fall back to "unknown
-/// step", not claim billing.
+/// omit it without implying a pre-run failure. Must fall back to "unknown
+/// step", not claim any diagnosed cause.
 #[test]
-fn github_billing_false_positive_runner_id_missing() {
+fn github_pre_run_false_positive_runner_id_missing() {
     let body = r#"{
         "jobs": [{
             "name": "build",
@@ -4340,14 +4343,14 @@ fn github_billing_false_positive_runner_id_missing() {
     handle.join().expect("mock");
     assert_eq!(
         summary, "unknown step",
-        "missing runner_id must not trigger billing detection; got: {summary}"
+        "missing runner_id must not trigger pre-run detection; got: {summary}"
     );
 }
 
 /// RED: `runner_id: null` is ambiguous — the API may return null without
 /// confirming no runner was assigned. Must fall back to "unknown step".
 #[test]
-fn github_billing_false_positive_runner_id_null() {
+fn github_pre_run_false_positive_runner_id_null() {
     let body = r#"{
         "jobs": [{
             "name": "build",
@@ -4369,14 +4372,46 @@ fn github_billing_false_positive_runner_id_null() {
     handle.join().expect("mock");
     assert_eq!(
         summary, "unknown step",
-        "null runner_id must not trigger billing detection; got: {summary}"
+        "null runner_id must not trigger pre-run detection; got: {summary}"
+    );
+}
+
+/// RED: even explicit runner_id=0 + steps=[] is only an observable pre-run
+/// symptom — zero-step + no-runner does not uniquely prove billing. The
+/// conservative contract requires uncertainty-aware messaging, not a
+/// diagnosed cause claim.
+#[test]
+fn github_pre_run_explicit_zero_uncertain_message() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "conclusion": "failure",
+            "steps": [],
+            "runner_id": 0,
+            "runner_name": ""
+        }]
+    }"#;
+    let (port, handle, _captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 67));
+
+    handle.join().expect("mock");
+    assert_eq!(
+        summary, "pre-run failure: no runner assigned and no steps (cause unconfirmed)",
+        "explicit zero must use uncertain pre-run message, not claim billing; got: {summary}"
     );
 }
 
 /// Guard: `steps: null` with `runner_id: 0` — null is not an empty array.
-/// Must not trigger billing detection.
+/// Must not trigger pre-run detection.
 #[test]
-fn github_billing_guard_steps_null_not_triggered() {
+fn github_pre_run_guard_steps_null_not_triggered() {
     let body = r#"{
         "jobs": [{
             "name": "build",
@@ -4398,14 +4433,14 @@ fn github_billing_guard_steps_null_not_triggered() {
     handle.join().expect("mock");
     assert_eq!(
         summary, "unknown step",
-        "null steps must not trigger billing detection; got: {summary}"
+        "null steps must not trigger pre-run detection; got: {summary}"
     );
 }
 
 /// Guard: steps field entirely omitted with `runner_id: 0` — absent field
-/// is not an empty array. Must not trigger billing detection.
+/// is not an empty array. Must not trigger pre-run detection.
 #[test]
-fn github_billing_guard_steps_omitted_not_triggered() {
+fn github_pre_run_guard_steps_omitted_not_triggered() {
     let body = r#"{
         "jobs": [{
             "name": "build",
@@ -4426,15 +4461,15 @@ fn github_billing_guard_steps_omitted_not_triggered() {
     handle.join().expect("mock");
     assert_eq!(
         summary, "unknown step",
-        "omitted steps field must not trigger billing detection; got: {summary}"
+        "omitted steps field must not trigger pre-run detection; got: {summary}"
     );
 }
 
 /// Guard: `conclusion: "cancelled"` with zero steps and no runner is NOT
-/// billing exhaustion — only `"failure"` conclusions qualify. Covers the
+/// a pre-run failure — only `"failure"` conclusions qualify. Covers the
 /// "other terminal conclusions" contract.
 #[test]
-fn github_billing_guard_cancelled_not_triggered() {
+fn github_pre_run_guard_cancelled_not_triggered() {
     let body = r#"{
         "jobs": [{
             "name": "build",
@@ -4456,15 +4491,15 @@ fn github_billing_guard_cancelled_not_triggered() {
     handle.join().expect("mock");
     assert_eq!(
         summary, "unknown step",
-        "cancelled conclusion must not trigger billing detection; got: {summary}"
+        "cancelled conclusion must not trigger pre-run detection; got: {summary}"
     );
 }
 
-/// Guard: mixed jobs — one billing-exhausted job plus another with a real
+/// Guard: mixed jobs — one pre-run-failed job plus another with a real
 /// failed step. The real step failure must take precedence (find_map
-/// discovers the failed step before detect_billing_exhaustion runs).
+/// discovers the failed step before the pre-run heuristic runs).
 #[test]
-fn github_billing_guard_mixed_real_failure_precedence() {
+fn github_pre_run_guard_mixed_real_failure_precedence() {
     let body = r#"{
         "jobs": [
             {
@@ -4497,15 +4532,15 @@ fn github_billing_guard_mixed_real_failure_precedence() {
     handle.join().expect("mock");
     assert_eq!(
         summary, "real-build / Run tests",
-        "real step failure must take precedence over billing detection; got: {summary}"
+        "real step failure must take precedence over pre-run detection; got: {summary}"
     );
 }
 
 /// Guard: a single job with `runner_id: 0` but actual failed steps is NOT
-/// billing exhaustion — the job DID execute, so the step failure takes
-/// precedence via find_map (detect_billing_exhaustion is never reached).
+/// a pre-run failure — the job DID execute, so the step failure takes
+/// precedence via find_map (pre-run heuristic is never reached).
 #[test]
-fn github_billing_guard_step_failure_precedence() {
+fn github_pre_run_guard_step_failure_precedence() {
     let body = r#"{
         "jobs": [{
             "name": "build",
