@@ -69,7 +69,14 @@ fn test_create_worktree() {
     let info = info.expect("worktree created");
     assert!(info.path.exists());
     assert_eq!(info.branch, "agend/agent1");
-    assert_eq!(info.source_repo, repo);
+    // arch14: create snapshots the CANONICAL source at entry, so
+    // info.source_repo is the canonicalized repo — not the raw fixture path
+    // (macOS: /var -> /private/var; Windows: \\?\-prefixed canonical form).
+    assert_eq!(
+        info.source_repo,
+        std::fs::canonicalize(&repo).expect("fixture repo canonicalizes"),
+        "info.source_repo must be the entry-snapshotted CANONICAL source"
+    );
     // Sprint 57 Wave 4 (#546 Item 4): worktree must live under
     // `<home>/worktrees/<agent>/<branch>/`, NOT `<repo>/.worktrees/`.
     let expected = home.join("worktrees").join("agent1").join("agend/agent1");
