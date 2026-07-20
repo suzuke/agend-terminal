@@ -4037,3 +4037,63 @@ fn arch14_release_still_refuses_missing_agent_parseable_marker() {
     assert!(wt.exists(), "worktree must be preserved on refusal");
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// arch14 correction (root-validated review of 6fafa912): producers persist
+/// the CANONICAL source identity, so a lease taken through a symlink ALIAS
+/// stays releasable after the alias is removed — the recorded identity never
+/// depends on the alias's continued existence. Deterministic: symlink
+/// creation/removal is synchronous; no timing.
+#[test]
+#[cfg(unix)]
+fn arch14_symlink_alias_lease_survives_alias_removal() {
+    let base = release_guard_tmp("arch14-symlink");
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    let real = p778_setup_source_repo(&base, "feat/arch14sym");
+    let alias = base.join("alias-source");
+    std::os::unix::fs::symlink(&real, &alias).expect("symlink alias");
+    let agent = "arch14-sym-agent";
+
+    let lease = crate::worktree_pool::lease(&home, &alias, agent, "feat/arch14sym")
+        .expect("lease through the alias succeeds");
+    let marker = std::fs::read_to_string(lease.path.join(crate::worktree_pool::MANAGED_MARKER))
+        .expect("marker");
+    let recorded = marker
+        .lines()
+        .find_map(|l| l.strip_prefix("source_repo="))
+        .map(str::trim)
+        .expect("source_repo present");
+    let real_canonical = std::fs::canonicalize(&real).expect("real source resolves");
+    assert_eq!(
+        std::path::Path::new(recorded),
+        real_canonical.as_path(),
+        "marker must record the CANONICAL source, not the alias: {marker}"
+    );
+
+    // Bind with the same canonical identity (mirrors checkout's bind_full,
+    // which passes source_canonical).
+    crate::binding::bind_full(
+        &home,
+        agent,
+        "",
+        "feat/arch14sym",
+        &lease.path,
+        &real_canonical,
+        false,
+    )
+    .expect("bind");
+
+    // The alias disappears — the recorded canonical identity must keep the
+    // lease releasable.
+    std::fs::remove_file(&alias).expect("remove alias symlink");
+    let r = dispatch_repo_release(&home, agent, lease.path.to_str().unwrap());
+    assert!(
+        r["released"].as_bool() == Some(true) && r.get("error").and_then(|e| e.as_str()).is_none(),
+        "release from the recorded canonical identity must succeed after alias removal: {r}"
+    );
+    assert!(
+        !lease.path.exists(),
+        "released worktree must be removed: {r}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}

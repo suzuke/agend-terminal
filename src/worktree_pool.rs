@@ -140,25 +140,31 @@ pub fn lease(
     // #1137: marker is now written inside worktree::create() immediately
     // after checkout. Re-write here is idempotent and ensures the marker
     // is present for reused worktrees (which skip the create path).
-    // arch14 (d-20260719234211852352-4): a write/sync failure is an ABORT —
-    // the lease must not report success over a broken identity the
-    // deep-validated release would refuse. The (possibly reused) worktree is
-    // deliberately NOT deleted: it may hold WIP; abort-only is the safe arm.
+    // arch14 (d-20260719234211852352-4): the recorded source is CANONICALIZED
+    // (a symlink-alias caller must never persist an alias identity that a
+    // later alias retarget/removal would strand), and a canonicalize/write/
+    // sync failure is an ABORT — the lease must not report success over a
+    // broken identity the deep-validated release would refuse. The (possibly
+    // reused) worktree is deliberately NOT deleted: it may hold WIP;
+    // abort-only is the safe arm.
     let marker = info.path.join(MANAGED_MARKER);
-    std::fs::write(
-        &marker,
-        format!(
-            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-            source_repo.display(),
-            chrono::Utc::now().to_rfc3339()
-        ),
-    )
-    .and_then(|()| sync_marker_contents(&marker))
-    .map_err(|e| {
-        LeaseError::CreateFailed(format!(
-            "managed-marker write/sync failed for {agent}@{branch}: {e}"
-        ))
-    })?;
+    std::fs::canonicalize(source_repo)
+        .and_then(|source_canonical| {
+            std::fs::write(
+                &marker,
+                format!(
+                    "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                    source_canonical.display(),
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            )
+        })
+        .and_then(|()| sync_marker_contents(&marker))
+        .map_err(|e| {
+            LeaseError::CreateFailed(format!(
+                "managed-marker canonicalize/write/sync failed for {agent}@{branch}: {e}"
+            ))
+        })?;
 
     Ok(WorktreeLease {
         agent: agent.to_string(),

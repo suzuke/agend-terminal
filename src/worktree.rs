@@ -260,18 +260,24 @@ pub fn create(
             // checkout to prevent orphan dirs if process dies before caller writes it.
             // arch14 (d-20260719234211852352-4): the FIRST write already carries the
             // canonical four-field identity — no crash window may leave a sourceless
-            // marker — and a write/sync failure aborts (fail-loud) instead of handing
-            // back a worktree whose identity the deep-validated release would refuse.
+            // marker — and the recorded source is CANONICALIZED here (fail-loud if
+            // that fails), so a symlink-alias caller can never persist an alias
+            // identity that a later alias retarget/removal would strand. A
+            // write/sync failure likewise aborts instead of handing back a worktree
+            // whose identity the deep-validated release would refuse.
             let marker_path = wt_dir.join(".agend-managed");
-            let marker_write = std::fs::write(
-                &marker_path,
-                format!(
-                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-                    repo_dir.display(),
-                    chrono::Utc::now().to_rfc3339()
-                ),
-            )
-            .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+            let marker_write = std::fs::canonicalize(repo_dir)
+                .and_then(|source_canonical| {
+                    std::fs::write(
+                        &marker_path,
+                        format!(
+                            "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                            source_canonical.display(),
+                            chrono::Utc::now().to_rfc3339()
+                        ),
+                    )
+                })
+                .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
             if let Err(e) = marker_write {
                 tracing::warn!(
                     instance = instance_name,
@@ -327,18 +333,21 @@ pub fn create(
                         "created worktree on existing branch"
                     );
                     // #1137: write marker immediately (same as primary path above).
-                    // arch14: canonical four-field identity + fail-loud, mirroring
-                    // the primary `-b` arm exactly.
+                    // arch14: canonical four-field identity (source canonicalized,
+                    // fail-loud) + rollback, mirroring the primary `-b` arm exactly.
                     let marker_path = wt_dir.join(".agend-managed");
-                    let marker_write = std::fs::write(
-                        &marker_path,
-                        format!(
-                            "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-                            repo_dir.display(),
-                            chrono::Utc::now().to_rfc3339()
-                        ),
-                    )
-                    .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+                    let marker_write = std::fs::canonicalize(repo_dir)
+                        .and_then(|source_canonical| {
+                            std::fs::write(
+                                &marker_path,
+                                format!(
+                                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                                    source_canonical.display(),
+                                    chrono::Utc::now().to_rfc3339()
+                                ),
+                            )
+                        })
+                        .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
                     if let Err(e) = marker_write {
                         tracing::warn!(
                             instance = instance_name,

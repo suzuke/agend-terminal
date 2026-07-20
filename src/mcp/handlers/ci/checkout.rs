@@ -361,15 +361,16 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
-            // #1275 + #2755: write `.agend-managed` FAIL-CLOSED — a missing marker
-            // breaks release_worktree/GC cleanup, so a write failure rolls back
-            // rather than returning a half-managed worktree.
-            // arch14: canonical four-field identity (source_repo= included).
+            // #1275 + #2755: write `.agend-managed` FAIL-CLOSED — a write failure
+            // rolls back rather than returning a half-managed worktree. arch14:
+            // canonical four-field identity — source_repo persists the CANONICAL
+            // source (bind_full's source_canonical below; symlink-alias safe).
             let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
             if std::fs::write(
                 &marker_path,
                 format!(
-                    "agent={instance_name}\nbranch={branch}\nsource_repo={source_path}\nleased_at={}\n",
+                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                    source_canonical.display(),
                     chrono::Utc::now().to_rfc3339()
                 ),
             )
