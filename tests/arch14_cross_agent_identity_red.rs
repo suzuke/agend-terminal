@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Arch14 cross-agent git identity — RED (t-20260720064306627171-39872-29,
 //! frozen contract d-20260719233444615181-2 clauses 2/3).
 //!
