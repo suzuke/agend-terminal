@@ -3341,3 +3341,129 @@ fn discard_seam_removal_failure_no_success_audit() {
         std::fs::remove_dir_all(root).ok();
     }
 }
+
+/// `dirty_submodule_paths` must return Err (not silently succeed) on a
+/// non-git directory, proving the fail-closed match arm is reachable.
+/// The production code's `match ... Err(e) => refuse` ensures this error
+/// prevents mutation (defense-in-depth behind TOCTOU).
+#[cfg(unix)]
+#[test]
+fn discard_seam_dirty_submodule_paths_errors_on_non_git() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-wt-nongit-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = dirty_submodule_paths(&dir);
+    assert!(
+        result.is_err(),
+        "non-git directory must return Err: {result:?}"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("git status failed"),
+        "error must mention git status failure: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// When the index gitlink OID is not a reachable commit inside the
+/// submodule, preflight must refuse before any target is mutated.
+#[cfg(unix)]
+#[test]
+fn discard_seam_missing_index_gitlink_object_no_mutation() {
+    let home = release_tmp_home("discard-missing-oid");
+    let super_repo = tmp_super_one_sub("discard-missing-oid");
+    let info = create(&home, &super_repo, "agent1", Some("feat/missing-oid")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-edit\n").unwrap();
+
+    let bogus_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    git_run_ok(
+        &info.path,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{bogus_oid},vendor/dep"),
+        ],
+        false,
+    );
+
+    let digest = nested_dirt_digest(&info.path);
+    let dirty_content = std::fs::read(info.path.join("vendor/dep/vendored.txt")).unwrap();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/missing-oid",
+        true,
+        true,
+        Some(&digest),
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("not a reachable commit") || error.contains("index"),
+        "preflight must refuse missing index gitlink object: {result}"
+    );
+    assert_eq!(
+        std::fs::read(info.path.join("vendor/dep/vendored.txt")).unwrap(),
+        dirty_content,
+        "target must NOT be mutated when index gitlink object is missing"
+    );
+    assert!(info.path.exists(), "worktree must be preserved");
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Audit target encoding must use JSON arrays, not raw comma-join,
+/// so paths containing commas or special chars are unambiguous.
+#[cfg(unix)]
+#[test]
+fn discard_seam_audit_targets_are_json_encoded() {
+    let home = release_tmp_home("discard-json-targets");
+    let super_repo = tmp_super_one_sub("discard-json-targets");
+    let info = create(&home, &super_repo, "agent1", Some("feat/json-targets")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-edit\n").unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let event_log = home.join("event-log.jsonl");
+    let before = std::fs::read_to_string(&event_log).unwrap_or_default();
+
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/json-targets",
+        true,
+        true,
+        Some(&digest),
+    );
+    assert_eq!(
+        result["released"].as_bool(),
+        Some(true),
+        "discard must succeed for audit encoding check: {result}"
+    );
+
+    let after = std::fs::read_to_string(&event_log).expect("event log");
+    let new_lines: Vec<&str> = after.lines().skip(before.lines().count()).collect();
+    let release_line = new_lines
+        .iter()
+        .find(|l| l.contains("nested_dirt_discard_release"))
+        .expect("success audit must exist");
+    let parsed: serde_json::Value =
+        serde_json::from_str(release_line).expect("audit line must be valid JSON");
+    let detail = parsed["detail"].as_str().expect("detail field must exist");
+    assert!(
+        detail.contains(r#"targets=["vendor/dep"]"#),
+        "audit targets must be JSON-encoded array in detail, got: {detail}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}

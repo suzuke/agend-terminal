@@ -2014,8 +2014,67 @@ pub(crate) fn release_absent_target_under_branch_lock(
                             ..ReleaseOutcome::default()
                         };
                     }
-                    if crate::git_helpers::git_cmd(target, &["ls-tree", "HEAD", "--", sub_path])
-                        .map_or(true, |out| out.trim().is_empty())
+                    let ls_out = match crate::git_helpers::git_cmd(
+                        target,
+                        &["ls-files", "--stage", "-z", "--", sub_path],
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            drop(_binding_lock);
+                            drop(_agent_lock);
+                            for notice in notices {
+                                notice.emit(home);
+                            }
+                            return ReleaseOutcome {
+                                error: Some(format!(
+                                    "nested dirt discard refused: index query failed for \
+                                     '{sub_path}': {e}; state preserved"
+                                )),
+                                ..ReleaseOutcome::default()
+                            };
+                        }
+                    };
+                    let records: Vec<&str> = ls_out.split('\0').filter(|s| !s.is_empty()).collect();
+                    if records.len() != 1 {
+                        drop(_binding_lock);
+                        drop(_agent_lock);
+                        for notice in notices {
+                            notice.emit(home);
+                        }
+                        return ReleaseOutcome {
+                            error: Some(format!(
+                                "nested dirt discard refused: target '{sub_path}' has {} \
+                                 index stage entries (expected exactly 1); state preserved",
+                                records.len()
+                            )),
+                            ..ReleaseOutcome::default()
+                        };
+                    }
+                    let fields: Vec<&str> = records[0].splitn(3, [' ', '\t']).collect();
+                    let (mode, oid) = if fields.len() >= 2 {
+                        (fields[0], fields[1])
+                    } else {
+                        ("", "")
+                    };
+                    if mode != "160000" {
+                        drop(_binding_lock);
+                        drop(_agent_lock);
+                        for notice in notices {
+                            notice.emit(home);
+                        }
+                        return ReleaseOutcome {
+                            error: Some(format!(
+                                "nested dirt discard refused: target '{sub_path}' index mode \
+                                 is '{mode}', not 160000 (gitlink); state preserved"
+                            )),
+                            ..ReleaseOutcome::default()
+                        };
+                    }
+                    if crate::git_helpers::git_cmd(
+                        &sub_dir,
+                        &["cat-file", "-e", &format!("{oid}^{{commit}}")],
+                    )
+                    .is_err()
                     {
                         drop(_binding_lock);
                         drop(_agent_lock);
@@ -2024,14 +2083,15 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         }
                         return ReleaseOutcome {
                             error: Some(format!(
-                                "nested dirt discard refused: target '{sub_path}' has no \
-                                 committed gitlink object in HEAD; state preserved"
+                                "nested dirt discard refused: target '{sub_path}' index \
+                                 gitlink object {oid} is not a reachable commit; \
+                                 state preserved"
                             )),
                             ..ReleaseOutcome::default()
                         };
                     }
-                    if let Ok(deep) = crate::worktree::dirty_submodule_paths(&sub_dir) {
-                        if !deep.is_empty() {
+                    match crate::worktree::dirty_submodule_paths(&sub_dir) {
+                        Ok(deep) if !deep.is_empty() => {
                             drop(_binding_lock);
                             drop(_agent_lock);
                             for notice in notices {
@@ -2045,6 +2105,21 @@ pub(crate) fn release_absent_target_under_branch_lock(
                                 ..ReleaseOutcome::default()
                             };
                         }
+                        Err(e) => {
+                            drop(_binding_lock);
+                            drop(_agent_lock);
+                            for notice in notices {
+                                notice.emit(home);
+                            }
+                            return ReleaseOutcome {
+                                error: Some(format!(
+                                    "nested dirt discard refused: nested status check \
+                                     failed for '{sub_path}': {e}; state preserved"
+                                )),
+                                ..ReleaseOutcome::default()
+                            };
+                        }
+                        Ok(_) => {}
                     }
                 }
                 let mut completed_targets: Vec<&str> = Vec::new();
@@ -2060,6 +2135,8 @@ pub(crate) fn release_absent_target_under_branch_lock(
                             sub_path,
                         ],
                     ) {
+                        let completed_json = serde_json::to_string(&completed_targets)
+                            .unwrap_or_else(|_| format!("{completed_targets:?}"));
                         crate::event_log::log(
                             home,
                             "nested_dirt_discard_aborted",
@@ -2067,10 +2144,9 @@ pub(crate) fn release_absent_target_under_branch_lock(
                             &format!(
                                 "branch={branch_for_preserve} discard_digest={} \
                                  audit_reason={} failed_target={sub_path} \
-                                 completed_targets={} abort_reason=reset_failed",
-                                discard.expected_digest,
-                                discard.audit_reason,
-                                completed_targets.join(","),
+                                 completed_targets={completed_json} \
+                                 abort_reason=reset_failed",
+                                discard.expected_digest, discard.audit_reason,
                             ),
                         );
                         drop(_binding_lock);
@@ -2143,13 +2219,13 @@ pub(crate) fn release_absent_target_under_branch_lock(
                         ..ReleaseOutcome::default()
                     };
                 }
+                let targets_json = serde_json::to_string(&dirty_sub_paths)
+                    .unwrap_or_else(|_| format!("{dirty_sub_paths:?}"));
                 discard_audit_detail = Some(format!(
                     "branch={branch_for_preserve} discard_digest={} audit_reason={} \
                      pre_discard_status_lines={pre_discard_line_count} \
-                     targets={}",
-                    discard.expected_digest,
-                    discard.audit_reason,
-                    dirty_sub_paths.join(","),
+                     targets={targets_json}",
+                    discard.expected_digest, discard.audit_reason,
                 ));
             } else {
                 let digest = if matches!(
