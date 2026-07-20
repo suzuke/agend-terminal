@@ -4247,3 +4247,46 @@ fn arch14_absent_binding_seam_marker_rewrite_refused() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Supplemental RED 3 (root gate d-20260720060251593745-8, reviewer finding
+/// on 3fbddf7c): the canonical absent-target transaction re-validates
+/// binding/marker/source after AfterBindingSnapshot but never re-reads the
+/// target's ACTUAL Git HEAD branch — a deterministic post-seam checkout
+/// drift (binding still absent, marker agent/branch/source unchanged) must
+/// be refused with the worktree preserved; today the stale pre-gate branch
+/// identity passes and the removal proceeds.
+#[test]
+#[cfg(unix)]
+fn arch14_absent_binding_seam_head_drift_refused() {
+    let (base, home, _repo, wt) = managed_wt_fixture("arch14-headdrift");
+    arch14_write_legacy_marker(&wt, "arch14-hd-agent", "feat/test");
+    // Deliberately NO binding.
+
+    // Deterministic ACTUAL-HEAD drift at the canonical seam: the worktree's
+    // checked-out branch changes hands while marker/binding stay untouched.
+    let wt_for_hook = wt.clone();
+    let _seam = crate::worktree_pool::release_test_seam::install(move |phase| {
+        if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+            let _ = std::process::Command::new("git")
+                .args(["checkout", "-b", "feat/drifted"])
+                .current_dir(&wt_for_hook)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output();
+        }
+    });
+
+    let r = dispatch_repo_release(&home, "arch14-hd-agent", wt.to_str().unwrap());
+    assert!(
+        r.get("error").is_some() || r.get("code").is_some(),
+        "post-seam ACTUAL-HEAD drift must be refused: {r}"
+    );
+    assert!(
+        r["released"].as_bool() != Some(true),
+        "post-seam ACTUAL-HEAD drift must not report released: {r}"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must be preserved when the HEAD drift is refused"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
