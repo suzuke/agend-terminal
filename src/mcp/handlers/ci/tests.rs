@@ -4126,9 +4126,9 @@ fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// Over-correction guard (green today, must stay green): a marker missing
-/// ONLY the branch= line stays refused and preserved — the absent-binding
-/// arm must never weaken the branch identity requirement.
+/// Over-correction guard (green today, must stay green): ABSENT binding +
+/// a marker missing ONLY the branch= line stays refused and preserved — the
+/// absent-binding arm must never derive identity without a branch to match.
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_missing_branch_marker() {
@@ -4141,16 +4141,7 @@ fn arch14_release_still_refuses_missing_branch_marker() {
         ),
     )
     .expect("branchless marker");
-    crate::binding::bind_full(
-        &home,
-        "arch14-nbr-agent",
-        "",
-        "feat/test",
-        &wt,
-        &repo,
-        false,
-    )
-    .expect("bind");
+    // Deliberately NO binding — this guard constrains the binding-ABSENT arm.
     let r = dispatch_repo_release(&home, "arch14-nbr-agent", wt.to_str().unwrap());
     assert!(
         r.get("error").is_some() || r.get("code").is_some(),
