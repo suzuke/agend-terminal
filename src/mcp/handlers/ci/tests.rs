@@ -1875,6 +1875,117 @@ fn p780_setup_source_broken_origin(parent: &Path) -> std::path::PathBuf {
     repo
 }
 
+#[cfg(unix)]
+fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::PathBuf {
+    home.join("worktrees").join(format!(
+        "{}-{}",
+        agent,
+        source
+            .display()
+            .to_string()
+            .replace(['/', '\\', ':'], "_")
+            .replace('~', "")
+    ))
+}
+
+#[cfg(unix)]
+fn p780_branch_exists(source: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git rev-parse branch")
+        .success()
+}
+
+/// Arch14 residue: a checkout that auto-created its branch must delete only that
+/// branch when the fixed worktree target is already occupied and `git worktree add`
+/// fails. The occupied target is deliberately preserved as out-of-scope state.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_worktree_add_failure_rolls_back_auto_created_branch_arch14() {
+    let home = p778_tmp_home("arch14-branch-rollback-new");
+    let parent = p778_tmp_home("arch14-branch-rollback-new-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "arch14-rollback-new-agent";
+    let branch = "feat/arch14-rollback-new";
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("occupied checkout target");
+    let keep = target.join("KEEP.txt");
+    std::fs::write(&keep, "legacy dirty worktree state").expect("preserved target state");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(resp["code"].as_str(), Some("worktree_add_failed"), "{resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(true), "{resp}");
+    assert!(
+        !p780_branch_exists(&source, branch),
+        "a branch created by this failed checkout must be rolled back: {resp}"
+    );
+    assert!(
+        keep.exists(),
+        "the pre-existing occupied target and its dirty state must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// Arch14 guard: the same worktree-add failure must never delete a branch that
+/// existed before this checkout transaction began.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_worktree_add_failure_preserves_preexisting_branch_arch14() {
+    let home = p778_tmp_home("arch14-branch-rollback-existing");
+    let parent = p778_tmp_home("arch14-branch-rollback-existing-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "arch14-rollback-existing-agent";
+    let branch = "feat/arch14-rollback-existing";
+    let create = std::process::Command::new("git")
+        .args(["branch", branch, "main"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("create pre-existing branch");
+    assert!(create.status.success(), "create branch: {:?}", create);
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("occupied checkout target");
+    let keep = target.join("KEEP.txt");
+    std::fs::write(&keep, "legacy dirty worktree state").expect("preserved target state");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(resp["code"].as_str(), Some("worktree_add_failed"), "{resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(false), "{resp}");
+    assert!(
+        p780_branch_exists(&source, branch),
+        "a pre-existing branch must survive a failed checkout: {resp}"
+    );
+    assert!(keep.exists(), "the occupied target must be preserved");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 #[cfg(unix)]
 fn checkout_bind_true_invalid_from_ref_returns_structured_error_with_stage() {
