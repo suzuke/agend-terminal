@@ -310,43 +310,6 @@ pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn probe_target_identity(
-    wt_path: &Path,
-    expected_branch: &str,
-    expected_worktree: &str,
-) -> serde_json::Value {
-    let actual_head = git_cmd(wt_path, &["rev-parse", "HEAD"]);
-    let actual_branch = git_cmd(wt_path, &["symbolic-ref", "--short", "HEAD"]);
-    match (&actual_head, &actual_branch) {
-        (Ok(head), Ok(branch)) => {
-            let matches = branch == expected_branch;
-            serde_json::json!({
-                "expected_branch": expected_branch,
-                "expected_worktree": expected_worktree,
-                "actual_branch": branch,
-                "actual_head": head,
-                "probe_status": "ok",
-                "matches_binding": matches,
-            })
-        }
-        _ => {
-            let err = actual_head
-                .as_ref()
-                .err()
-                .map(|e| format!("{e}"))
-                .or_else(|| actual_branch.as_ref().err().map(|e| format!("{e}")))
-                .unwrap_or_else(|| "unknown probe failure".into());
-            serde_json::json!({
-                "expected_branch": expected_branch,
-                "expected_worktree": expected_worktree,
-                "probe_status": "error",
-                "probe_error": err,
-                "matches_binding": false,
-            })
-        }
-    }
-}
-
 /// Detect the default branch of a repository.
 /// Reads `refs/remotes/origin/HEAD` → extracts branch name.
 /// Falls back to "main" if detection fails.
