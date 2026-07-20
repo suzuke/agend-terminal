@@ -171,9 +171,15 @@ fn arch14_sibling_cwd_read_fails_loud_never_fabricates() {
          structurally refuse (contract clause 3: nonzero/refusal identity); \
          got exit=0 stdout={stdout:?} (today: fabricated data from the caller's own tree)"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.trim() != "feat/a",
-        "the refusal must not leak fabricated branch data from the caller's own tree: {stdout:?}"
+        stderr.contains("agent-a") && stderr.contains("agent-b"),
+        "the refusal must EXPLICITLY identify the caller (agent-a) and the target \
+         owner (agent-b) — a generic error must not pass: stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("feat/a") && !stdout.contains("feat/b"),
+        "refusal stdout must carry no branch data: {stdout:?}"
     );
     assert!(wt_b.exists(), "target tree untouched");
     std::fs::remove_dir_all(&home).ok();
@@ -211,6 +217,16 @@ fn arch14_sibling_dash_c_read_fails_loud_never_fabricates() {
         "an explicit leading -C into ANOTHER agent's managed worktree must fail \
          loudly / structurally refuse (contract clause 3: nonzero/refusal \
          identity); got exit=0 stdout={stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent-a") && stderr.contains("agent-b"),
+        "the -C refusal must EXPLICITLY identify the caller (agent-a) and the \
+         target owner (agent-b) — a generic error must not pass: stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("feat/a") && !stdout.contains("feat/b"),
+        "refusal stdout must carry no branch data: {stdout:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
