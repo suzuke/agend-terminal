@@ -3,6 +3,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Original AGEND_HOME captured once before any test can modify it.
+/// The git shim uses AGEND_HOME as fallback for AGENTIC_GIT_HOME to locate
+/// its own bin/ directory for self-exclusion from PATH (#1504). Tests that
+/// override AGEND_HOME must pin AGENTIC_GIT_HOME to this value so the shim
+/// can still resolve the real git binary.
+#[cfg(unix)]
+static DAEMON_HOME: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("AGEND_HOME").ok());
+
 fn tmp_repo(name: &str) -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -2504,9 +2513,21 @@ fn release_entry(
         args["expected_nested_dirt_digest"] = serde_json::json!(digest);
     }
     let _guard = crate::mcp::handlers::fleet_test_guard();
+    // Pin AGENTIC_GIT_HOME to the real daemon home so the git shim's
+    // self-exclusion from PATH still works after AGEND_HOME is overridden
+    // to a test directory (AGEND_HOME is the legacy compat name for
+    // AGENTIC_GIT_HOME — see #1504).
+    if let Some(ref h) = *DAEMON_HOME {
+        std::env::set_var("AGENTIC_GIT_HOME", h);
+    }
     std::env::set_var("AGEND_HOME", home);
     let result = crate::mcp::handlers::handle_tool("repo", &args, "");
-    std::env::remove_var("AGEND_HOME");
+    // Restore AGEND_HOME (not just remove — other tests need it for shim resolution)
+    match &*DAEMON_HOME {
+        Some(h) => std::env::set_var("AGEND_HOME", h),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+    std::env::remove_var("AGENTIC_GIT_HOME");
     result
 }
 

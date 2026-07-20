@@ -5,6 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+pub(crate) struct NestedDirtDiscard<'a> {
+    pub expected_digest: &'a str,
+    pub audit_reason: &'a str,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReleaseTestPhase {
@@ -1768,6 +1773,7 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
 /// Absent-binding arm of the S2 force transaction.  The branch lease is held
 /// by the caller; A/B are acquired here and the binding is re-read as truly
 /// absent before the managed target is removed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn release_absent_target_under_branch_lock(
     home: &Path,
     agent: &str,
@@ -1776,6 +1782,7 @@ pub(crate) fn release_absent_target_under_branch_lock(
     source_repo: &Path,
     sender: Option<&str>,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+    nested_discard: Option<&NestedDirtDiscard<'_>>,
 ) -> ReleaseOutcome {
     if !permit.authorizes(home, agent) {
         return ReleaseOutcome {
@@ -1892,26 +1899,132 @@ pub(crate) fn release_absent_target_under_branch_lock(
         return out;
     }
     if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
+        let mk_branch = marker_branch(target);
+        let branch_for_preserve = mk_branch.as_deref().unwrap_or("");
         let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
             home,
             agent,
             target,
-            marker_branch(target).as_deref().unwrap_or(""),
+            branch_for_preserve,
             sender,
         );
         notices = collected;
         if let Some(reason) = preservation.blocked_reason() {
-            drop(_binding_lock);
-            drop(_agent_lock);
-            for notice in notices {
-                notice.emit(home);
+            if let (Some(discard), crate::worktree::WipPreservation::UnpreservableNestedDirty(_)) =
+                (nested_discard, &preservation)
+            {
+                let nested_status = crate::worktree::enumerate_nested_dirty(target);
+                let current_digest = crate::worktree::hash_hex(&nested_status);
+                if current_digest != discard.expected_digest {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(format!(
+                            "nested dirt discard refused: digest mismatch (expected {}, got {current_digest}); \
+                             state preserved",
+                            discard.expected_digest
+                        )),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+                if nested_status.lines().any(|l| l.starts_with("  ?? ")) {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(
+                            "nested dirt discard refused: residual untracked nested content would \
+                             survive targeted reset; state preserved"
+                                .to_string(),
+                        ),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+                if let Err(e) = crate::git_helpers::git_cmd(
+                    target,
+                    &["submodule", "update", "--force", "--checkout"],
+                ) {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(format!(
+                            "nested dirt discard refused: submodule reset failed: {e}; state preserved"
+                        )),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+                let residual = crate::worktree::enumerate_nested_dirty(target);
+                if !residual.is_empty() {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(
+                            "nested dirt discard refused: residual nested dirt remains after targeted \
+                             reset; state preserved"
+                                .to_string(),
+                        ),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+                crate::event_log::log(
+                    home,
+                    "nested_dirt_discard_release",
+                    agent,
+                    &format!(
+                        "branch={branch_for_preserve} discard_digest={} audit_reason={} \
+                         pre_discard_status_lines={}",
+                        discard.expected_digest,
+                        discard.audit_reason,
+                        nested_status.lines().count(),
+                    ),
+                );
+                let (pres2, collected2) = crate::worktree::preserve_dirty_worktree_collect(
+                    home,
+                    agent,
+                    target,
+                    branch_for_preserve,
+                    sender,
+                );
+                notices = collected2;
+                if let Some(r2) = pres2.blocked_reason() {
+                    drop(_binding_lock);
+                    drop(_agent_lock);
+                    for notice in notices {
+                        notice.emit(home);
+                    }
+                    return ReleaseOutcome {
+                        error: Some(format!(
+                            "nested dirt discarded but parent WIP preservation failed ({r2}); \
+                             not removing it"
+                        )),
+                        ..ReleaseOutcome::default()
+                    };
+                }
+            } else {
+                drop(_binding_lock);
+                drop(_agent_lock);
+                for notice in notices {
+                    notice.emit(home);
+                }
+                return ReleaseOutcome {
+                    error: Some(format!(
+                        "force release refused: worktree WIP could not be preserved ({reason}); \
+                         not removing it"
+                    )),
+                    ..ReleaseOutcome::default()
+                };
             }
-            return ReleaseOutcome {
-                error: Some(format!(
-                    "force release refused: worktree WIP could not be preserved ({reason}); not removing it"
-                )),
-                ..ReleaseOutcome::default()
-            };
         }
     }
     match remove_worktree(agent, target, source_repo) {

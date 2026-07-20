@@ -40,7 +40,12 @@ fn derive_source_from_gitlink(canonical: &Path) -> Option<std::path::PathBuf> {
         })
 }
 
-fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Value {
+fn delegate_managed_release(
+    home: &Path,
+    canonical: &Path,
+    caller: &str,
+    nested_discard: Option<&crate::worktree_pool::NestedDirtDiscard<'_>>,
+) -> Value {
     let Some((marker_agent, _, _)) = parse_managed_marker(canonical) else {
         return json!({
             "error": "managed worktree marker unreadable or missing agent — refusing (fail-closed)",
@@ -67,7 +72,13 @@ fn delegate_managed_release(home: &Path, canonical: &Path, caller: &str) -> Valu
             // otherwise-valid marker whose binding no longer exists may release
             // via the target's OWN verified .git linkage — every other absent-
             // binding shape keeps the fail-closed refusal below.
-            return absent_binding_legacy_release(home, canonical, caller, &marker_agent);
+            return absent_binding_legacy_release(
+                home,
+                canonical,
+                caller,
+                &marker_agent,
+                nested_discard,
+            );
         }
         Ok(crate::binding::GuardedBinding::Opaque(reason)) | Err(reason) => {
             return json!({
@@ -118,6 +129,7 @@ fn absent_binding_legacy_release(
     canonical: &Path,
     caller: &str,
     marker_agent: &str,
+    nested_discard: Option<&crate::worktree_pool::NestedDirtDiscard<'_>>,
 ) -> Value {
     let refuse_no_binding = || {
         json!({
@@ -247,6 +259,7 @@ fn absent_binding_legacy_release(
         &source_canonical,
         sender,
         &permit,
+        nested_discard,
     );
     json!({
         "path": canonical.display().to_string(),
@@ -370,13 +383,35 @@ pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str
         None => return json!({"error": "missing 'path'"}),
     };
 
+    let discard_nested = args["discard_nested_dirt"].as_bool().unwrap_or(false);
+    let force = args["force"].as_bool().unwrap_or(false);
+    let expected_digest = args["expected_nested_dirt_digest"].as_str();
+    let audit_reason = args["audit_reason"].as_str().unwrap_or("");
+
+    let nested_discard = if discard_nested {
+        if !force {
+            return json!({"error": "nested dirt discard requires force=true"});
+        }
+        match expected_digest {
+            Some(d) => Some(crate::worktree_pool::NestedDirtDiscard {
+                expected_digest: d,
+                audit_reason,
+            }),
+            None => {
+                return json!({"error": "nested dirt discard requires expected_nested_dirt_digest"});
+            }
+        }
+    } else {
+        None
+    };
+
     let canonical = match validate_release_path(path) {
         Ok(p) => p,
         Err(e) => return json!({"error": e}),
     };
 
     if crate::worktree_pool::is_daemon_managed(&canonical) {
-        return delegate_managed_release(home, &canonical, instance_name);
+        return delegate_managed_release(home, &canonical, instance_name, nested_discard.as_ref());
     }
 
     remove_linked_worktree_canonical(&canonical, path)

@@ -1355,7 +1355,7 @@ const NESTED_ENUM_MAX: usize = 256;
 /// canonical CONTAINMENT (reject `..`/symlink escape) + a visited-set (cycle
 /// guard); exceeding [`NESTED_ENUM_MAX`] or any git error appends an explicit
 /// `[truncated: …]` / `[skipped: …]` line rather than stopping silently.
-fn enumerate_nested_dirty(wt_path: &Path) -> String {
+pub(crate) fn enumerate_nested_dirty(wt_path: &Path) -> String {
     let root = match std::fs::canonicalize(wt_path) {
         Ok(p) => p,
         Err(e) => return format!("[truncated: canonicalize worktree root failed: {e}]\n"),
@@ -1503,7 +1503,7 @@ fn walk_nested_dirty(
 /// Hex digest of a `Hash`-able value via `DefaultHasher` (bounded, allocation-free
 /// key). Used both for the per-worktree marker filename (path) and the last-seen
 /// nested-status content.
-fn hash_hex<T: std::hash::Hash>(v: &T) -> String {
+pub(crate) fn hash_hex<T: std::hash::Hash>(v: &T) -> String {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut h);
