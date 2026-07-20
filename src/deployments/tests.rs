@@ -2437,3 +2437,60 @@ templates:
          not silently fall back to global thresholds: {result}"
     );
 }
+
+/// RED: a later malformed instance must not leave residue from an earlier
+/// valid instance. When the template has [valid, malformed], deploy must
+/// error atomically: zero instance directories on disk, zero persisted
+/// fleet.yaml instance entries.
+#[test]
+fn deploy_malformed_threshold_leaves_no_residue_from_valid_sibling() {
+    let home = tmp_home("ctx_residue");
+    let yaml = r#"
+templates:
+  mixed:
+    instances:
+      good:
+        backend: claude
+        context_alert_pct: 75.0
+      bad:
+        backend: claude
+        context_alert_pct: "oops"
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let deploy_dir = home.join("deploys");
+    std::fs::create_dir_all(&deploy_dir).ok();
+    let args = serde_json::json!({
+        "template": "mixed",
+        "directory": deploy_dir.display().to_string(),
+    });
+    let result = deploy(&home, "caller", &args);
+    assert!(
+        result.get("error").is_some(),
+        "deploy must fail when any instance has a malformed threshold: {result}"
+    );
+
+    let good_dir = deploy_dir.join("mixed-good");
+    let bad_dir = deploy_dir.join("mixed-bad");
+    assert!(
+        !good_dir.exists(),
+        "the valid sibling's work directory must not be left as residue after \
+         the malformed sibling caused deployment failure: {}",
+        good_dir.display()
+    );
+    assert!(
+        !bad_dir.exists(),
+        "the malformed instance's work directory must not exist: {}",
+        bad_dir.display()
+    );
+
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(
+        reloaded.instances.get("mixed-good").is_none(),
+        "the valid sibling must not be persisted to fleet.yaml when the deployment was rejected"
+    );
+    assert!(
+        reloaded.instances.get("mixed-bad").is_none(),
+        "the malformed instance must not be persisted to fleet.yaml"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
