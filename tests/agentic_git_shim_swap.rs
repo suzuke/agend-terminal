@@ -29,8 +29,7 @@ const VENDORED_CLASSIFY: &str =
     include_str!("../vendor/agentic-git/crates/agentic-git/src/classify.rs");
 const VENDORED_PUSH_GUARDS: &str =
     include_str!("../vendor/agentic-git/crates/agentic-git/src/push_guards.rs");
-const VENDORED_PATHS: &str =
-    include_str!("../vendor/agentic-git/crates/agentic-git/src/paths.rs");
+const VENDORED_PATHS: &str = include_str!("../vendor/agentic-git/crates/agentic-git/src/paths.rs");
 const VENDORED_SOURCES: &[&str] = &[
     VENDORED_LIB,
     VENDORED_CLASSIFY,
@@ -84,7 +83,9 @@ fn vendored_shim_carries_every_depended_on_git_guard() {
 #[test]
 fn vendored_shim_reads_every_daemon_injected_agend_env() {
     assert!(
-        VENDORED_SOURCES.iter().any(|s| s.contains("fn legacy_env_name")),
+        VENDORED_SOURCES
+            .iter()
+            .any(|s| s.contains("fn legacy_env_name")),
         "vendored shim must map AGENTIC_GIT_* → AGEND_* legacy names"
     );
     for var in [
@@ -98,7 +99,9 @@ fn vendored_shim_reads_every_daemon_injected_agend_env() {
         "AGEND_GIT_ALLOW_CANONICAL_MUTATE",
     ] {
         assert!(
-            VENDORED_SOURCES.iter().any(|s| s.contains(&format!("\"{var}\""))),
+            VENDORED_SOURCES
+                .iter()
+                .any(|s| s.contains(&format!("\"{var}\""))),
             "vendored shim does not read daemon-injected {var} under any name — \
              swapping the git shim would drop it"
         );
