@@ -1657,10 +1657,13 @@ async fn ci_check_repo(
     );
     let outcome =
         fan_out_notifications(&ctx, &state, &pr, &deduped, &tracking, registry, provider).await;
-    persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    let settled = persist_watch_state(&ctx, &pr, &outcome, &mut state);
     // S1 exact-head one-shot: the pinned target SHA reached terminal and we've
     // just notified — remove the watch instead of persisting/refreshing it.
-    if maybe_clear_exact_head_terminal(&ctx, &state, &pr) {
+    // arch14: gated on SETTLEMENT — an unsettled exact-head watch (delivery
+    // failure held the cursors) is the only retry source and must stay armed;
+    // the quiet/already-notified removal path below is unchanged.
+    if settled && maybe_clear_exact_head_terminal(&ctx, &state, &pr) {
         return Ok(());
     }
     if state != snapshot {
@@ -2231,12 +2234,16 @@ pub(crate) fn register_subscriber() {
     crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
+/// arch14: returns SETTLEMENT SUCCESS — whether the notified/terminal cursors
+/// were actually advanced (no delivery failure held them). The post-notify
+/// exact-head removal is gated on this: an unsettled exact-head watch is the
+/// only retry source and must stay armed.
 fn persist_watch_state(
     ctx: &CiCheckCtx<'_>,
     pr: &PollResult,
     outcome: &NotifyOutcome,
     state: &mut WatchState,
-) {
+) -> bool {
     // Row-first CI handoffs must not advance the notified stamp when durable
     // enqueue (or the paired track write) fails; the next poll must retry.
     let mut ci_ready_delivery_failed = false;
@@ -2434,6 +2441,7 @@ fn persist_watch_state(
             state.last_notified_by_workflow = cursors;
         }
     }
+    !ci_ready_delivery_failed && !outcome.delivery_failed
 }
 
 /// Refresh `expires_at` to now + 72h after a successful poll (#1267).
