@@ -1153,6 +1153,32 @@ mod tests {
         );
     }
 
+    /// RED: completing one same-key episode and then activating a second one
+    /// currently emits only one notification because both episodes share the
+    /// key-derived notification id. Each completed episode must produce its
+    /// own actionable candidate recommendation.
+    #[test]
+    fn same_key_recurrence_after_recovery_emits_fresh_notification_red() {
+        let mut fx = MemoryEffects::default();
+
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("first episode tick one");
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("first episode activation");
+        observe_tick(&mut fx, input(AgentState::Idle)).expect("first episode recovery");
+
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("second episode tick one");
+        observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("second episode activation");
+
+        let notifications = fx
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::NotifyOnce { .. }))
+            .count();
+        assert_eq!(
+            notifications, 2,
+            "each completed same-key episode must emit a distinct notification"
+        );
+    }
+
     #[test]
     fn restart_starting_state_does_not_false_recover_an_active_episode() {
         let mut fx = MemoryEffects {
