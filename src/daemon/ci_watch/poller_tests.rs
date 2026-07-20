@@ -7493,3 +7493,114 @@ fn arch14_delivered_failure_settles_and_dedupes() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── Supplemental RED (root GREEN-gate rejection m-20260720040031170642-422):
+// exact-head lifecycle hole — maybe_clear_exact_head_terminal removes a
+// terminal exact-head watch on target/runs alone, even when
+// outcome.delivery_failed held every cursor, deleting the only retry source.
+
+/// Exact-head variant of the delivery watch (post-merge pinned-SHA check).
+fn arch14_exact_head_watch_json() -> serde_json::Value {
+    let mut w = arch14_delivery_watch_json();
+    w["target_head_sha"] = serde_json::json!("deadbeef");
+    w
+}
+
+/// Supplemental helper: like `arch14_run_check` but takes any provider —
+/// exact-head polling needs `ExactHeadMock` (`poll_runs_for_sha` support;
+/// clone-based, safe across multiple polls).
+fn arch14_run_check_dyn(
+    dir: &std::path::Path,
+    watch_path: &std::path::Path,
+    provider: &dyn CiProvider,
+) {
+    let watch: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(watch_path).expect("watch readable"))
+            .expect("watch parses");
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        dir,
+        watch_path,
+        watch,
+        vec!["dev".to_string()],
+        &registry,
+        provider,
+    ))
+    .unwrap();
+}
+
+/// Supplemental RED A: an exact-head terminal failure whose durable delivery
+/// FAILED must keep the watch armed and unsettled — removing it would delete
+/// the only retry source. Today the removal fires on target/runs alone.
+#[test]
+fn arch14_exact_head_blocked_inbox_keeps_watch_armed() {
+    let dir = tmp_dir("arch14-eh-armed");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    std::fs::write(dir.join("inbox"), b"blocked").expect("block inbox root");
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_exact_head_watch_json()).unwrap(),
+    )
+    .unwrap();
+    let provider = ExactHeadMock::new(vec![arch14_failure_run()], vec![arch14_failure_run()]);
+
+    arch14_run_check_dyn(&dir, &watch_path, &provider);
+
+    assert!(
+        watch_path.exists(),
+        "exact-head watch with an UNDELIVERED terminal notification must stay armed \
+         (removing it deletes the only retry source)"
+    );
+    let w = arch14_read_watch(&watch_path);
+    assert!(
+        w["last_notified_head_sha"].is_null(),
+        "undelivered exact-head terminal must stay unsettled: {w}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Supplemental RED B: after the blocked poll, a healthy retry delivers the
+/// exact-head terminal notification EXACTLY once and only then removes the
+/// watch (settlement-gated clear).
+#[test]
+fn arch14_exact_head_retry_delivers_then_clears() {
+    let dir = tmp_dir("arch14-eh-retry");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    std::fs::write(dir.join("inbox"), b"blocked").expect("block inbox root");
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_exact_head_watch_json()).unwrap(),
+    )
+    .unwrap();
+    let provider = ExactHeadMock::new(vec![arch14_failure_run()], vec![arch14_failure_run()]);
+    arch14_run_check_dyn(&dir, &watch_path, &provider); // delivery fails
+
+    assert!(
+        watch_path.exists(),
+        "watch must survive the undelivered terminal so the retry can happen"
+    );
+    std::fs::remove_file(dir.join("inbox")).expect("unblock inbox root");
+    arch14_run_check_dyn(&dir, &watch_path, &provider); // retry delivers + settles
+
+    let body = std::fs::read_to_string(dir.join("inbox").join("dev.jsonl"))
+        .expect("dev inbox must contain the exact-head terminal notification");
+    let ci_fail_rows = body.lines().filter(|l| l.contains("[ci-fail]")).count();
+    assert_eq!(
+        ci_fail_rows, 1,
+        "exact-head retry must deliver exactly once: {body}"
+    );
+    assert!(
+        !watch_path.exists(),
+        "exact-head watch is removed only AFTER the delivery settled"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
