@@ -715,7 +715,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         }
         Ok(o) => {
             // Prepared journal but `git worktree add` failed ⇒ no worktree to roll
-            // back; drop the journal.
+            // back. If this transaction created the branch, remove only that ref;
+            // pre-existing branches are never touched.
+            if bind && auto_created_branch {
+                super::checkout_disposable::rollback_auto_created_branch(
+                    Path::new(&source_path),
+                    branch,
+                    args["expected_head"].as_str().unwrap_or(""),
+                );
+            }
             super::checkout_txn::Journal::clear(home, &mangled);
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             let redacted = redact_paths(stderr.trim());
@@ -732,6 +740,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             err
         }
         Err(e) => {
+            if bind && auto_created_branch {
+                super::checkout_disposable::rollback_auto_created_branch(
+                    Path::new(&source_path),
+                    branch,
+                    args["expected_head"].as_str().unwrap_or(""),
+                );
+            }
             super::checkout_txn::Journal::clear(home, &mangled);
             let spawn_err = redact_paths(&e.to_string());
             let mut err = json!({
