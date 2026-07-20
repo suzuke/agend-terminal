@@ -838,7 +838,9 @@ impl CiProvider for GitHubCiProvider {
                     })
                 })
             })
-            .unwrap_or_else(|| "unknown step".to_string())
+            .unwrap_or_else(|| {
+                detect_pre_run_failure(&jobs_resp).unwrap_or_else(|| "unknown step".to_string())
+            })
     }
 
     async fn fetch_run_jobs(&self, repo: &str, run_id: u64) -> Vec<CiJob> {
@@ -1015,6 +1017,32 @@ impl CiProvider for GitHubCiProvider {
 
     fn token_warning(&self) -> Option<&'static str> {
         github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
+    }
+}
+
+/// When a job has `conclusion: "failure"` but zero steps and runner_id
+/// explicitly 0, the job never reached a runner — an observable pre-run
+/// symptom whose root cause (billing quota, infrastructure, transient
+/// scheduler error) cannot be confirmed from the API response alone.
+/// Returns a cause-unconfirmed diagnostic, or `None` if the pattern does
+/// not match.
+fn detect_pre_run_failure(jobs_resp: &serde_json::Value) -> Option<String> {
+    let jobs = jobs_resp["jobs"].as_array()?;
+    let pre_run_failed = jobs.iter().any(|job| {
+        let failed = job["conclusion"].as_str().is_some_and(|c| {
+            matches!(
+                super::poller::CiOutcome::from(Some(c)),
+                super::poller::CiOutcome::Failure
+            )
+        });
+        let no_steps = job["steps"].as_array().is_some_and(|s| s.is_empty());
+        let no_runner = job["runner_id"].as_u64() == Some(0);
+        failed && no_steps && no_runner
+    });
+    if pre_run_failed {
+        Some("pre-run failure: no runner assigned and no steps (cause unconfirmed)".to_string())
+    } else {
+        None
     }
 }
 
