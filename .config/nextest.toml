@@ -15,6 +15,9 @@
 # Warn (mark SLOW) at 60s; SIGKILL the test after 2 periods (120s). Normal tests
 # finish in well under a second; a real-git test that takes >120s is wedged.
 slow-timeout = { period = "60s", terminate-after = 2 }
+# Surface the terminated/hung test prominently in the run summary.
+failure-output = "immediate-final"
+final-status-level = "slow"
 
 # build_provenance_version tests run nested `cargo build` (real git init + fixture
 # compilation). On Windows CI runners the nested build is 2-3× slower — give it
@@ -22,10 +25,6 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 [[profile.ci.overrides]]
 filter = 'test(/build_provenance_version::/)'
 slow-timeout = { period = "120s", terminate-after = 3 }
-
-# Surface the terminated/hung test prominently in the run summary.
-failure-output = "immediate-final"
-final-status-level = "slow"
 
 # #1893: serialize the heavy real-git / worktree / subprocess test cluster.
 # These tests spawn real `git` (worktree add / branch / fetch) and share
