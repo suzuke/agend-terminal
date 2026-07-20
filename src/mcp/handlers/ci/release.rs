@@ -439,6 +439,26 @@ pub(crate) fn handle_release_repo(home: &Path, args: &Value, instance_name: &str
         });
     }
 
+    match crate::binding::worktree_binding_state(home, &canonical) {
+        crate::binding::WorktreeBindingState::Bound => {
+            return json!({
+                "error": "release refused: marker absent but an authoritative binding \
+                          targets this worktree — restore the marker or use the managed \
+                          release path",
+                "code": "markerless_bound_worktree",
+            });
+        }
+        crate::binding::WorktreeBindingState::Uncertain => {
+            return json!({
+                "error": "release refused: marker absent and binding state is uncertain \
+                          (unreadable or unparseable binding present) — cannot safely \
+                          determine ownership; resolve the binding or restore the marker",
+                "code": "markerless_uncertain_binding",
+            });
+        }
+        crate::binding::WorktreeBindingState::Unbound => {}
+    }
+
     remove_linked_worktree_canonical(&canonical, path)
 }
 
