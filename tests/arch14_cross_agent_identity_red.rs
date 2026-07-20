@@ -30,6 +30,7 @@ fn fixture_home(tag: &str) -> PathBuf {
     d
 }
 
+// allow: dead-code-helper — frozen RED contract helper; not shadowing production git_ok semantics (takes &Path not &cwd)
 fn git_ok(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)

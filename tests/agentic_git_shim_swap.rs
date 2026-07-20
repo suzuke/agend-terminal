@@ -24,7 +24,19 @@
 //! `agentic-git-core` from this same submodule, P1b), so `include_str!` on it
 //! adds no new fragility.
 
-const VENDORED_SHIM: &str = include_str!("../vendor/agentic-git/crates/agentic-git/src/lib.rs");
+const VENDORED_LIB: &str = include_str!("../vendor/agentic-git/crates/agentic-git/src/lib.rs");
+const VENDORED_CLASSIFY: &str =
+    include_str!("../vendor/agentic-git/crates/agentic-git/src/classify.rs");
+const VENDORED_PUSH_GUARDS: &str =
+    include_str!("../vendor/agentic-git/crates/agentic-git/src/push_guards.rs");
+const VENDORED_PATHS: &str =
+    include_str!("../vendor/agentic-git/crates/agentic-git/src/paths.rs");
+const VENDORED_SOURCES: &[&str] = &[
+    VENDORED_LIB,
+    VENDORED_CLASSIFY,
+    VENDORED_PUSH_GUARDS,
+    VENDORED_PATHS,
+];
 
 /// Every git guard agend-terminal relies on must be present in the vendored
 /// successor shim (design §5 DUAL parity core). A missing one = a silent guard
@@ -59,7 +71,7 @@ fn vendored_shim_carries_every_depended_on_git_guard() {
         ("fn read_binding", "fail-closed binding read"),
     ] {
         assert!(
-            VENDORED_SHIM.contains(needle),
+            VENDORED_SOURCES.iter().any(|src| src.contains(needle)),
             "vendored agentic-git shim missing `{needle}` ({why}) — flipping \
              use_agentic_git_shim on would regress this guard. Re-pin the submodule."
         );
@@ -72,7 +84,7 @@ fn vendored_shim_carries_every_depended_on_git_guard() {
 #[test]
 fn vendored_shim_reads_every_daemon_injected_agend_env() {
     assert!(
-        VENDORED_SHIM.contains("fn legacy_env_name"),
+        VENDORED_SOURCES.iter().any(|s| s.contains("fn legacy_env_name")),
         "vendored shim must map AGENTIC_GIT_* → AGEND_* legacy names"
     );
     for var in [
@@ -86,7 +98,7 @@ fn vendored_shim_reads_every_daemon_injected_agend_env() {
         "AGEND_GIT_ALLOW_CANONICAL_MUTATE",
     ] {
         assert!(
-            VENDORED_SHIM.contains(&format!("\"{var}\"")),
+            VENDORED_SOURCES.iter().any(|s| s.contains(&format!("\"{var}\""))),
             "vendored shim does not read daemon-injected {var} under any name — \
              swapping the git shim would drop it"
         );
