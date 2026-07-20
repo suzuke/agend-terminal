@@ -81,6 +81,24 @@ pub fn create(
     instance_name: &str,
     custom_branch: Option<&str>,
 ) -> Option<WorktreeInfo> {
+    // arch14: snapshot the CANONICAL source identity ONCE, before the reuse
+    // check and any side effect, and use it for everything downstream — the
+    // git worktree add/remove target, the marker, and WorktreeInfo.source_repo.
+    // A symlink-alias caller therefore can never split identities across
+    // stages (repo-A worktree with repo-B identity after an alias retarget),
+    // and a failure rollback never aims at a vanished alias. Fail-closed.
+    let repo_dir_canonical = match std::fs::canonicalize(repo_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_dir.display(),
+                error = %e,
+                "source repo cannot be canonicalized — refusing worktree creation (fail-closed)"
+            );
+            return None;
+        }
+    };
+    let repo_dir: &Path = &repo_dir_canonical;
     if !is_git_repo(repo_dir) {
         return None;
     }
@@ -259,25 +277,20 @@ pub fn create(
             // #1137: write .agend-managed marker immediately after successful
             // checkout to prevent orphan dirs if process dies before caller writes it.
             // arch14 (d-20260719234211852352-4): the FIRST write already carries the
-            // canonical four-field identity — no crash window may leave a sourceless
-            // marker — and the recorded source is CANONICALIZED here (fail-loud if
-            // that fails), so a symlink-alias caller can never persist an alias
-            // identity that a later alias retarget/removal would strand. A
-            // write/sync failure likewise aborts instead of handing back a worktree
-            // whose identity the deep-validated release would refuse.
+            // canonical four-field identity (`repo_dir` is the entry-snapshotted
+            // canonical source) — no crash window may leave a sourceless marker —
+            // and a write/sync failure aborts (fail-loud) instead of handing back a
+            // worktree whose identity the deep-validated release would refuse.
             let marker_path = wt_dir.join(".agend-managed");
-            let marker_write = std::fs::canonicalize(repo_dir)
-                .and_then(|source_canonical| {
-                    std::fs::write(
-                        &marker_path,
-                        format!(
-                            "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-                            source_canonical.display(),
-                            chrono::Utc::now().to_rfc3339()
-                        ),
-                    )
-                })
-                .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+            let marker_write = std::fs::write(
+                &marker_path,
+                format!(
+                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                    repo_dir.display(),
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            )
+            .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
             if let Err(e) = marker_write {
                 tracing::warn!(
                     instance = instance_name,
@@ -333,21 +346,19 @@ pub fn create(
                         "created worktree on existing branch"
                     );
                     // #1137: write marker immediately (same as primary path above).
-                    // arch14: canonical four-field identity (source canonicalized,
-                    // fail-loud) + rollback, mirroring the primary `-b` arm exactly.
+                    // arch14: canonical four-field identity (entry-snapshotted
+                    // canonical `repo_dir`) + fail-loud rollback, mirroring the
+                    // primary `-b` arm exactly.
                     let marker_path = wt_dir.join(".agend-managed");
-                    let marker_write = std::fs::canonicalize(repo_dir)
-                        .and_then(|source_canonical| {
-                            std::fs::write(
-                                &marker_path,
-                                format!(
-                                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-                                    source_canonical.display(),
-                                    chrono::Utc::now().to_rfc3339()
-                                ),
-                            )
-                        })
-                        .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+                    let marker_write = std::fs::write(
+                        &marker_path,
+                        format!(
+                            "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                            repo_dir.display(),
+                            chrono::Utc::now().to_rfc3339()
+                        ),
+                    )
+                    .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
                     if let Err(e) = marker_write {
                         tracing::warn!(
                             instance = instance_name,
