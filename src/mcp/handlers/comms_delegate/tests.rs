@@ -1514,7 +1514,10 @@ mod merge_train_admission_tests {
             (forge_identity, path_identity),
             (
                 Some(json!("forge:owner/repo")),
-                Some(json!(format!("path:{}", path_repo.display())))
+                Some(json!(format!(
+                    "path:{}",
+                    std::fs::canonicalize(&path_repo).unwrap().display()
+                )))
             )
         );
 
@@ -1561,7 +1564,7 @@ mod merge_train_admission_tests {
             &home,
             "t-r6-invalid",
             "merge_train_repository",
-            json!("owner/repo"),
+            json!("forge:owner/repo"),
         );
         set_meta(&home, "t-r6-invalid", "merge_train_domain", json!("core"));
         set_meta(
