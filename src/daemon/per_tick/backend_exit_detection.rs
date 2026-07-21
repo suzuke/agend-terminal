@@ -1,16 +1,18 @@
 //! #2538: backend-exit detection — the daemon already knows (via
-//! `AgentHandle::backend_command`, mutated by `agent::on_clean_exit_shell_fallback`
-//! and any other exit-driven respawn) when an instance's LIVE foreground identity
-//! no longer matches its fleet.yaml-DECLARED backend (e.g. a `codex`-configured
+//! `AgentHandle::declared_backend` plus the live `backend_command` (mutated by
+//! `agent::on_clean_exit_shell_fallback` and any other exit-driven respawn) when
+//! an instance's LIVE foreground identity no longer matches its
+//! fleet.yaml-DECLARED backend (e.g. a `codex`-configured
 //! instance whose backend exited cleanly and the daemon deliberately spawned a
 //! bare shell in its place — the pane looks alive, `health_state` stays
 //! `healthy`, and nothing ever notices). This ground-truth signal was already in
 //! hand and simply never consumed — same family as #2413's API-activity probe /
 //! #1523 state-detection.
 //!
-//! Every tick: snapshot each agent's live `backend_command` (registry lock, no
-//! file IO), resolve the fleet.yaml-declared backend ONCE for the whole tick (no
-//! lock held), then re-lock briefly to apply the `HealthState::Unhealthy`
+//! Every tick: snapshot each agent's immutable declared backend and live
+//! `backend_command` (registry lock, no file IO), resolve the fleet.yaml
+//! configuration ONCE for the whole tick (no lock held), then re-lock briefly to
+//! apply the `HealthState::Unhealthy`
 //! transition (or clear it once the mismatch resolves) and fire a debounced
 //! `backend_exited` notify.
 
@@ -34,25 +36,53 @@ const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
 /// with a Shell or unrecognized Raw backend — there is no known preset identity
 /// to compare against, so it is exempt. This is also how a `backend: shell`
 /// instance is naturally exempt (its resolved command never maps to a preset).
+#[cfg(test)]
 pub(crate) fn backend_mismatch(
     configured_backend_command: &str,
     live_backend_command: &str,
 ) -> bool {
-    let Some(expected) = Backend::from_command(configured_backend_command) else {
+    backend_mismatch_declared(
+        Backend::from_command(configured_backend_command).as_ref(),
+        live_backend_command,
+    )
+}
+
+/// Pure: does the LIVE `backend_command` mismatch the immutable declared
+/// backend identity? Shell and raw declarations have no preset executable
+/// identity to compare, so they remain exempt just like legacy command
+/// inference.
+pub(crate) fn backend_mismatch_declared(
+    declared_backend: Option<&Backend>,
+    live_backend_command: &str,
+) -> bool {
+    let Some(expected) = declared_backend else {
         return false;
     };
-    Backend::from_command(live_backend_command) != Some(expected)
+    if matches!(expected, Backend::Shell | Backend::Raw(_)) {
+        return false;
+    }
+    Backend::from_command(live_backend_command).as_ref() != Some(expected)
 }
 
 /// Pure: should this tick fire a backend-exit detection for an agent whose live
 /// backend mismatches its configured one, `elapsed_since_spawn` since its last
 /// (re)spawn?
+#[cfg(test)]
 pub(crate) fn should_fire_backend_exit(
     configured_backend_command: &str,
     live_backend_command: &str,
     elapsed_since_spawn: Duration,
 ) -> bool {
     backend_mismatch(configured_backend_command, live_backend_command)
+        && elapsed_since_spawn >= BACKEND_EXIT_GRACE
+}
+
+fn should_fire_backend_exit_declared(
+    declared_backend: Option<&Backend>,
+    live_backend_command: &str,
+    elapsed_since_spawn: Duration,
+) -> bool {
+    backend_mismatch_declared(declared_backend, live_backend_command)
         && elapsed_since_spawn >= BACKEND_EXIT_GRACE
 }
 
@@ -75,11 +105,18 @@ impl PerTickHandler for BackendExitDetectionHandler {
 
     fn run(&self, ctx: &TickContext<'_>) {
         // Phase 1 (registry lock, NO file IO — DAEMON-LOCK-ORDERING): snapshot
-        // each agent's live backend_command + spawn instant.
-        let snaps: Vec<(String, String, Instant)> = {
+        // each agent's immutable declared backend, live backend_command + spawn instant.
+        let snaps: Vec<(String, Option<Backend>, String, Instant)> = {
             let reg = crate::agent::lock_registry(ctx.registry);
             reg.values()
-                .map(|h| (h.name.to_string(), h.backend_command.clone(), h.spawned_at))
+                .map(|h| {
+                    (
+                        h.name.to_string(),
+                        h.declared_backend.clone(),
+                        h.backend_command.clone(),
+                        h.spawned_at,
+                    )
+                })
                 .collect()
         };
         if snaps.is_empty() {
@@ -97,15 +134,18 @@ impl PerTickHandler for BackendExitDetectionHandler {
         let mut mismatched: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut to_notify: Vec<(String, String, String)> = Vec::new();
 
-        for (name, live_backend, spawned_at) in &snaps {
+        for (name, declared_backend, live_backend, spawned_at) in &snaps {
             let Some(resolved) = fleet.resolve_instance(name) else {
                 continue;
             };
-            if backend_mismatch(&resolved.backend_command, live_backend) {
+            let expected_backend = declared_backend
+                .clone()
+                .or_else(|| Some(resolved.backend.clone()));
+            if backend_mismatch_declared(expected_backend.as_ref(), live_backend) {
                 mismatched.insert(name.clone());
             }
-            if should_fire_backend_exit(
-                &resolved.backend_command,
+            if should_fire_backend_exit_declared(
+                expected_backend.as_ref(),
                 live_backend,
                 spawned_at.elapsed(),
             ) {
@@ -115,11 +155,11 @@ impl PerTickHandler for BackendExitDetectionHandler {
                     .is_none_or(|t| now.duration_since(*t) >= NOTIFY_COOLDOWN);
                 if should_notify {
                     tracker.insert(name.clone(), now);
-                    to_notify.push((
-                        name.clone(),
-                        resolved.backend_command.clone(),
-                        live_backend.clone(),
-                    ));
+                    let expected = expected_backend
+                        .as_ref()
+                        .map(|backend| backend.as_str().to_string())
+                        .unwrap_or_else(|| resolved.backend.as_str().to_string());
+                    to_notify.push((name.clone(), expected, live_backend.clone()));
                 }
             } else {
                 // Recovered (or never mismatched) — drop any stale debounce entry

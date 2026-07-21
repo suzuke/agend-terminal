@@ -698,6 +698,7 @@ mod deleted_gate_tests_1913 {
         AgentHandle {
             id: InstanceId::parse(VICTIM_UUID).expect("uuid"),
             name: VICTIM.to_string().into(),
+            declared_backend: None,
             backend_command: "true".to_string(),
             pty_writer,
             pty_master,

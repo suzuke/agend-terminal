@@ -313,6 +313,7 @@ mod tests {
         let handle = AgentHandle {
             id: crate::types::InstanceId::default(),
             name: name.to_string().into(),
+            declared_backend: None,
             backend_command: "test".to_string(),
             pty_writer: Arc::new(Mutex::new(writer)),
             pty_master: Arc::new(Mutex::new(pair.master)),

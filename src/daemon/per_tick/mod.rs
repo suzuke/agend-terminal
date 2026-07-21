@@ -604,6 +604,7 @@ pub(crate) fn mock_live_agent_no_context(
     let handle = crate::agent::AgentHandle {
         id: crate::types::InstanceId::default(),
         name: name.to_string().into(),
+        declared_backend: None,
         backend_command: "claude".to_string(),
         pty_writer,
         pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
@@ -676,6 +677,7 @@ pub(crate) fn mock_live_agent_with_context(
     let handle = crate::agent::AgentHandle {
         id: crate::types::InstanceId::default(),
         name: name.to_string().into(),
+        declared_backend: None,
         backend_command: "claude".to_string(),
         pty_writer,
         pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),

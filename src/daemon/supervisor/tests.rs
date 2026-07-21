@@ -1393,6 +1393,7 @@ fn mock_agent_handle_with_size(
     let handle = crate::agent::AgentHandle {
         id: crate::types::InstanceId::default(),
         name: name.to_string().into(),
+        declared_backend: None,
         backend_command: "claude".to_string(),
         pty_writer,
         pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),

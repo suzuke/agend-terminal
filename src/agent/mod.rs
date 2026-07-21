@@ -73,6 +73,10 @@ pub struct ApiActivity {
 pub struct AgentHandle {
     pub(crate) id: crate::types::InstanceId,
     pub(crate) name: crate::types::AgentName,
+    /// Immutable logical backend declared for this spawn. Unlike
+    /// `backend_command`, this identity never changes when the live process is
+    /// replaced by a shell or another fallback executable.
+    pub(crate) declared_backend: Option<crate::backend::Backend>,
     pub(crate) backend_command: String,
     pub(crate) pty_writer: PtyWriter,
     pub(crate) pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
@@ -1325,6 +1329,7 @@ pub fn spawn_agent(
             AgentHandle {
                 id: instance_id,
                 name: name.to_string().into(),
+                declared_backend: detected_backend.clone(),
                 backend_command: backend_command.to_string(),
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
@@ -2880,6 +2885,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
     AgentHandle {
         id,
         name: name.to_string().into(),
+        declared_backend: None,
         backend_command: "true".to_string(),
         pty_writer,
         pty_master,

@@ -553,6 +553,22 @@ fn correlation_from_disk(home: &Path, source: &str) -> Option<(Correlation, crat
     Some((correlation, task))
 }
 
+/// Resolve the logical backend identity used by UsageLimit source/candidate
+/// facts. A declared backend is authoritative even when the live executable is
+/// an arbitrarily named wrapper; legacy handles retain command inference.
+pub(crate) fn backend_identity_name(
+    declared_backend: Option<&crate::backend::Backend>,
+    live_backend_command: &str,
+) -> String {
+    declared_backend
+        .map(|backend| backend.as_str().to_string())
+        .or_else(|| {
+            crate::backend::Backend::from_command(live_backend_command)
+                .map(|backend| backend.as_str().to_string())
+        })
+        .unwrap_or_else(|| live_backend_command.to_string())
+}
+
 pub(crate) fn fleet_facts(
     home: &Path,
     registry: &crate::agent::AgentRegistry,
@@ -583,9 +599,10 @@ pub(crate) fn fleet_facts(
                 (
                     handle.name.to_string(),
                     (
-                        crate::backend::Backend::from_command(&handle.backend_command)
-                            .map(|backend| backend.as_str().to_string())
-                            .unwrap_or_else(|| handle.backend_command.clone()),
+                        backend_identity_name(
+                            handle.declared_backend.as_ref(),
+                            &handle.backend_command,
+                        ),
                         state,
                         !handle.deleted.load(std::sync::atomic::Ordering::Acquire),
                         std::sync::Arc::clone(&handle.core),
@@ -667,6 +684,7 @@ pub(crate) fn observe_supervisor_tick(
     registry: &crate::agent::AgentRegistry,
     source: &str,
     raw_state: AgentState,
+    declared_backend: Option<&crate::backend::Backend>,
     backend_command: &str,
     pane_tail: &str,
 ) -> anyhow::Result<TickOutcome> {
@@ -727,9 +745,7 @@ pub(crate) fn observe_supervisor_tick(
     let unlock_at = super::parse_unlock_at(pane_tail)
         .as_deref()
         .and_then(|hhmm| super::unlock_deadline(hhmm, now));
-    let source_backend = crate::backend::Backend::from_command(backend_command)
-        .map(|backend| backend.as_str().to_string())
-        .unwrap_or_else(|| backend_command.to_string());
+    let source_backend = backend_identity_name(declared_backend, backend_command);
     observe_tick(
         &mut effects,
         TickInput {
