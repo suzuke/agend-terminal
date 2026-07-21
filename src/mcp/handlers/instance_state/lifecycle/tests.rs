@@ -853,5 +853,9 @@ fn full_delete_survivor_canonicalization_ambiguity_preserves_and_errors_2764_sli
         result.is_ok(),
         "#2876: unrelated unreachable survivor must not block deletion: {result:?}"
     );
+    assert!(
+        !victim_dir.exists(),
+        "#2876: victim directory must be actually removed, not just preserved/no-op'd"
+    );
     std::fs::remove_dir_all(home).ok();
 }

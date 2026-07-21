@@ -36,8 +36,10 @@ fn path_entry_present(candidate: &Path) -> Result<bool, std::io::Error> {
 }
 
 /// #2876: when full canonicalization fails, walk up to the deepest existing
-/// ancestor, canonicalize it, and append the absent suffix. Returns `None`
-/// when no ancestor can be canonicalized (root unreachable, permission error).
+/// ancestor, canonicalize it, and append only verified-absent suffix
+/// components. Returns `None` (indeterminate) when a component is present
+/// but broken (dangling symlink), a non-NotFound metadata error occurs,
+/// or no ancestor can be canonicalized at all.
 fn best_effort_canonical(path: &Path) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     let mut suffix_parts: Vec<std::ffi::OsString> = Vec::new();
@@ -45,6 +47,12 @@ fn best_effort_canonical(path: &Path) -> Option<PathBuf> {
         if let Ok(canonical) = dunce::canonicalize(&current) {
             let suffix: PathBuf = suffix_parts.iter().rev().collect();
             return Some(canonical.join(suffix));
+        }
+        // Only strip a component whose absence is positively confirmed.
+        // A present broken symlink or a permission/IO error is indeterminate.
+        match std::fs::symlink_metadata(&current) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
         }
         let name = current.file_name()?.to_owned();
         suffix_parts.push(name);
