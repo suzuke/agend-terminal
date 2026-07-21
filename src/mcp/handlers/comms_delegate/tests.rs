@@ -1435,11 +1435,10 @@ mod merge_train_admission_tests {
         std::fs::create_dir_all(corrupt_board.join("task_events.jsonl")).unwrap();
 
         let events_before = train_event_count(&home, "t-r6-board");
-        let fronts = crate::tasks::scan_merge_train_fronts(&home, "owner/repo", "core");
-        let next_seq = crate::tasks::next_merge_train_seq(&home, "owner/repo", "core");
+        let scan = crate::tasks::scan_merge_train_state(&home, "owner/repo", "core");
         assert!(
-            fronts.iter().any(|id| id == "t-r6-board") && next_seq == 2,
-            "unreadable extra board must not degrade authority to no-Front/seq1: fronts={fronts:?} next_seq={next_seq}"
+            scan.is_err(),
+            "unreadable extra board must fail the authority scan closed: {scan:?}"
         );
         assert_eq!(train_event_count(&home, "t-r6-board"), events_before);
 

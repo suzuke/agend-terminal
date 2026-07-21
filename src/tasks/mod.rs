@@ -947,12 +947,13 @@ pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, Task
 
 // ── Merge Train Slice 1 — admission metadata through the board-root seam ──
 
-pub(crate) fn scan_merge_train_fronts(home: &Path, repo: &str, domain: &str) -> Vec<String> {
-    let state = match board_router::replay_all_boards(home) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    state
+pub(crate) fn scan_merge_train_state(
+    home: &Path,
+    repo: &str,
+    domain: &str,
+) -> Result<(Vec<String>, u64), TaskRouteError> {
+    let state = board_router::replay_all_boards_strict(home)?;
+    let fronts = state
         .tasks
         .iter()
         .filter(|(_, r)| {
@@ -970,14 +971,7 @@ pub(crate) fn scan_merge_train_fronts(home: &Path, repo: &str, domain: &str) -> 
                     == Some("Front")
         })
         .map(|(id, _)| id.0.clone())
-        .collect()
-}
-
-pub(crate) fn next_merge_train_seq(home: &Path, repo: &str, domain: &str) -> u64 {
-    let state = match board_router::replay_all_boards(home) {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
+        .collect();
     let max_seq = state
         .tasks
         .values()
@@ -998,7 +992,7 @@ pub(crate) fn next_merge_train_seq(home: &Path, repo: &str, domain: &str) -> u64
         })
         .max()
         .unwrap_or(0);
-    max_seq + 1
+    Ok((fronts, max_seq + 1))
 }
 
 pub(crate) fn write_merge_train_metadata(
@@ -1013,7 +1007,6 @@ pub(crate) fn write_merge_train_metadata(
             "code": "merge_train_route_error",
         })
     })?;
-    let board = routed.board().path().to_path_buf();
     let emitter = crate::task_events::InstanceName("system:merge_train".into());
     let events: Vec<crate::task_events::TaskEvent> = entries
         .iter()
@@ -1024,14 +1017,43 @@ pub(crate) fn write_merge_train_metadata(
             value: value.clone(),
         })
         .collect();
-    crate::task_events::append_batch_at(&board, &emitter, events).map_err(|e| {
-        serde_json::json!({
+    let task = crate::task_events::TaskId(task_id.into());
+    match routed.with_revalidated_computed(home, &emitter, move |fresh| {
+        let record = fresh
+            .tasks
+            .get(&task)
+            .ok_or_else(|| format!("task '{}' disappeared before merge-train write", task.0))?;
+        let train_keys = [
+            "merge_train_repository",
+            "merge_train_domain",
+            "merge_train_position",
+            "merge_train_queue_seq",
+        ];
+        if train_keys
+            .iter()
+            .any(|key| record.metadata.contains_key(*key))
+        {
+            return Err("merge-train metadata changed before atomic append".into());
+        }
+        Ok(events)
+    }) {
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(serde_json::json!({
+            "ok": false,
+            "error": format!("merge train metadata write revalidation: {e}"),
+            "code": "merge_train_write_conflict",
+        })),
+        Ok(Err(e)) => Err(serde_json::json!({
             "ok": false,
             "error": format!("merge train metadata write: {e}"),
             "code": "merge_train_write_error",
-        })
-    })?;
-    Ok(())
+        })),
+        Err(e) => Err(serde_json::json!({
+            "ok": false,
+            "error": format!("merge train metadata route revalidation: {e}"),
+            "code": "merge_train_route_error",
+        })),
+    }
 }
 
 /// Return all tasks as typed structs. **PR3 cutover** — sources state

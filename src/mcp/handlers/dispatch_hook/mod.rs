@@ -722,6 +722,16 @@ fn resolve_source_repo(
     (stub, SourceRepoTier::Stub)
 }
 
+/// Resolve a target's source repository through the exact dispatch tier order.
+/// Kept narrow so pre-dispatch authority checks can share the resolver without
+/// acquiring a bind guard or starting any worktree lifecycle operation.
+pub(crate) fn resolve_source_repo_for_target(home: &Path, target: &str) -> PathBuf {
+    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.resolve_instance(target));
+    resolve_source_repo(home, target, None, resolved.as_ref()).0
+}
+
 /// CR-2026-06-14 F3: dispatch-time `git fetch` budget. `ensure_branch_exists` is
 /// on the synchronous pre-send path bounded by the 30s `send` proxy
 /// (`DEFAULT_TOOL_TIMEOUT`); the prior 300s `NETWORK_GIT_TIMEOUT` let a fetch run
