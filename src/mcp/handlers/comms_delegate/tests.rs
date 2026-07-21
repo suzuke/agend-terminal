@@ -999,6 +999,28 @@ mod merge_train_admission_tests {
         count
     }
 
+    fn assignment_snapshot(home: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn collect(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(root, &path, out);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.push((path.strip_prefix(root).unwrap().to_path_buf(), bytes));
+                }
+            }
+        }
+
+        let root = home.join("reviewer-assignments");
+        let mut records = Vec::new();
+        collect(&root, &root, &mut records);
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        records
+    }
+
     // ════════════════════════════════════════════════════════════════
     // Group A — concurrent same-key admission
     // ════════════════════════════════════════════════════════════════
@@ -1113,7 +1135,7 @@ mod merge_train_admission_tests {
         let ci_before =
             crate::binding::agent_has_active_ci_watch_on_branch(&home, "dev-b", "feat/q1");
         let tracking_before = crate::dispatch_tracking::has_for_instance(&home, "dev-b");
-        let assignment_before = home.join("reviewer-assignments").exists();
+        let assignment_before = assignment_snapshot(&home);
 
         let result = dispatch(&home, "dev-b", "t-q1", "feat/q1");
         assert_eq!(
@@ -1148,9 +1170,9 @@ mod merge_train_admission_tests {
 
         // 5. review assignment
         assert_eq!(
-            home.join("reviewer-assignments").exists(),
+            assignment_snapshot(&home),
             assignment_before,
-            "Queued must not create review assignment"
+            "Queued must not create or mutate reviewer-assignment records"
         );
 
         // 6. dispatch tracking
