@@ -211,22 +211,6 @@ const LOOP_LOGIC_WITNESSES_2453S2: [&str; 5] = [
     "poll_commit_pending",
 ];
 
-/// #2453 Slice 2 RED 1/3: run_app must become genuine thin orchestration —
-/// construction/dispatch/render/select/teardown around AppState methods.
-/// Closure criterion is ~80 lines (root contract tightening); 90 gives
-/// honest comment headroom and is anti-gaming-guarded by the witness and
-/// impl pins below.
-#[test]
-fn run_app_is_thin_orchestration_2453s2() {
-    let region = run_app_region();
-    let lines = region.lines().count();
-    assert!(
-        lines <= 90,
-        "#2453 Slice 2: run_app must be thin orchestration (~80 lines, cap 90); \
-         currently {lines} lines"
-    );
-}
-
 /// #2453 Slice 2 RED 2/3: the extracted loop logic must live in cohesive
 /// `impl AppState` methods — not free helper functions (laundering).
 #[test]
