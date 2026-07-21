@@ -150,8 +150,8 @@ pub(crate) struct RecoveryExecutionPermit {
 }
 
 /// The health/accounting result committed by one exact-generation permit.
-/// This value is produced only after [`RecoveryExecutionPermit::admit_restarting`]
-/// succeeds and therefore never represents a raw crash observation.
+/// This value is produced only after exact execution admission and therefore
+/// never represents a raw crash observation.
 pub(crate) struct RecoveryAttempt {
     pub(crate) should_respawn: bool,
     pub(crate) delay: std::time::Duration,
@@ -163,7 +163,7 @@ pub(crate) struct RecoveryAttempt {
 
 impl RecoveryExecutionPermit {
     /// Publish Restarting on the exact old core immediately before spawning a
-    /// replacement.  This is idempotent only as a guarded one-shot operation;
+    /// replacement. This is idempotent only as a guarded one-shot operation;
     /// callers cannot use the same permit to publish a second transition.
     pub(crate) fn admit_restarting(&mut self) -> bool {
         if self.restarting_admitted {
@@ -183,13 +183,14 @@ impl RecoveryExecutionPermit {
     }
 
     /// Debit the retry budget exactly once on the exact old core captured by
-    /// this permit.  A reused permit cannot issue another attempt or mutate
-    /// persistence/accounting a second time.
+    /// this permit. A reused permit cannot issue another attempt or mutate
+    /// persistence/accounting a second time; retryability is decided before
+    /// the caller publishes Restarting.
     pub(crate) fn debit_attempt(
         &mut self,
         self_orch: crate::teams::SelfOrchStatus,
     ) -> Option<RecoveryAttempt> {
-        if !self.restarting_admitted || self.attempt_debited {
+        if self.attempt_debited {
             return None;
         }
         self.attempt_debited = true;
@@ -357,7 +358,7 @@ impl CrashDispositionLedger {
     }
 
     pub(crate) fn mark_failed(&self, permit: RecoveryExecutionPermit) -> bool {
-        if !permit.restarting_admitted {
+        if !permit.restarting_admitted && !permit.attempt_debited {
             return false;
         }
         let key = permit.key();
