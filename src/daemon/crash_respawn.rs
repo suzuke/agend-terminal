@@ -417,19 +417,12 @@ fn respawn_agent_worker(
     }
     let mut permit = match claim {
         Some(token) => {
-            let Some(mut permit) = agent::crash_disposition::owner_ledger().begin_execute(token)
-            else {
+            let Some(permit) = agent::crash_disposition::owner_ledger().begin_execute(token) else {
                 tracing::info!(agent = %config.name, "exact-generation recovery was discarded before execution");
                 #[cfg(test)]
                 signal_test_worker_done(&test_done);
                 return;
             };
-            if !permit.admit_restarting() {
-                tracing::info!(agent = %config.name, "execution permit could not admit Restarting");
-                #[cfg(test)]
-                signal_test_worker_done(&test_done);
-                return;
-            }
             Some(permit)
         }
         None => None,
@@ -481,6 +474,14 @@ fn respawn_agent_worker(
             if let Some(permit) = permit.take() {
                 let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
             }
+            #[cfg(test)]
+            signal_test_worker_done(&test_done);
+            return;
+        }
+    }
+    if let Some(permit) = permit.as_mut() {
+        if !permit.admit_restarting() {
+            tracing::info!(agent = %config.name, "execution permit could not admit Restarting");
             #[cfg(test)]
             signal_test_worker_done(&test_done);
             return;

@@ -150,8 +150,8 @@ pub(crate) struct RecoveryExecutionPermit {
 }
 
 /// The health/accounting result committed by one exact-generation permit.
-/// This value is produced only after [`RecoveryExecutionPermit::admit_restarting`]
-/// succeeds and therefore never represents a raw crash observation.
+/// This value is produced only after exact execution admission and therefore
+/// never represents a raw crash observation.
 pub(crate) struct RecoveryAttempt {
     pub(crate) should_respawn: bool,
     pub(crate) delay: std::time::Duration,
@@ -163,7 +163,7 @@ pub(crate) struct RecoveryAttempt {
 
 impl RecoveryExecutionPermit {
     /// Publish Restarting on the exact old core immediately before spawning a
-    /// replacement.  This is idempotent only as a guarded one-shot operation;
+    /// replacement. This is idempotent only as a guarded one-shot operation;
     /// callers cannot use the same permit to publish a second transition.
     pub(crate) fn admit_restarting(&mut self) -> bool {
         if self.restarting_admitted {
@@ -183,13 +183,14 @@ impl RecoveryExecutionPermit {
     }
 
     /// Debit the retry budget exactly once on the exact old core captured by
-    /// this permit.  A reused permit cannot issue another attempt or mutate
-    /// persistence/accounting a second time.
+    /// this permit. A reused permit cannot issue another attempt or mutate
+    /// persistence/accounting a second time; retryability is decided before
+    /// the caller publishes Restarting.
     pub(crate) fn debit_attempt(
         &mut self,
         self_orch: crate::teams::SelfOrchStatus,
     ) -> Option<RecoveryAttempt> {
-        if !self.restarting_admitted || self.attempt_debited {
+        if self.attempt_debited {
             return None;
         }
         self.attempt_debited = true;
@@ -357,7 +358,7 @@ impl CrashDispositionLedger {
     }
 
     pub(crate) fn mark_failed(&self, permit: RecoveryExecutionPermit) -> bool {
-        if !permit.restarting_admitted {
+        if !permit.restarting_admitted && !permit.attempt_debited {
             return false;
         }
         let key = permit.key();
@@ -752,6 +753,60 @@ mod tests {
             crate::state::AgentState::Crashed
         );
         assert_eq!(ledger.disposition(obs.key()), Some(Disposition::Failed));
+    }
+
+    #[test]
+    fn terminal_debit_keeps_state_crashed_until_no_restart_2872_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(2872), &deleted, None);
+        obs.core.lock().health.total_crashes = 4;
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish_crashed(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let mut permit = ledger.begin_execute(token).expect("permit");
+        let attempt = permit
+            .debit_attempt(crate::teams::SelfOrchStatus::No)
+            .expect("terminal debit");
+        assert!(!attempt.should_respawn);
+        assert_eq!(
+            obs.core.lock().state.get_state(),
+            crate::state::AgentState::Crashed,
+            "terminal retry exhaustion must never publish Restarting"
+        );
+        assert!(ledger.mark_failed(permit));
+        assert_eq!(ledger.disposition(obs.key()), Some(Disposition::Failed));
+    }
+
+    #[test]
+    fn retryable_debit_admits_restarting_after_budget_check_2872_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(2873), &deleted, None);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish_crashed(obs.clone()));
+        let token = ledger.claim(obs.key(), Claimant::Crash).expect("claim");
+        assert!(ledger.mark_ready(token));
+
+        let mut permit = ledger.begin_execute(token).expect("permit");
+        let attempt = permit
+            .debit_attempt(crate::teams::SelfOrchStatus::No)
+            .expect("retryable debit");
+        assert!(attempt.should_respawn);
+        assert_eq!(
+            obs.core.lock().state.get_state(),
+            crate::state::AgentState::Crashed,
+            "Restarting must wait until retry budget admits a spawn"
+        );
+        assert!(permit.admit_restarting());
+        assert_eq!(
+            obs.core.lock().state.get_state(),
+            crate::state::AgentState::Restarting
+        );
     }
 
     #[test]
