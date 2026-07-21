@@ -220,7 +220,11 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<Canonica
     // runtime re-alert throttling). Detached states are handled by the stash path
     // above; they have `head_state != repo_default`, so they never surface here.
     if head_state == repo_default && !working_tree_clean {
-        Some(CanonicalDirtyReport::from_status(canonical, &status, &repo_default))
+        Some(CanonicalDirtyReport::from_status(
+            canonical,
+            &status,
+            &repo_default,
+        ))
     } else {
         None
     }
@@ -324,7 +328,11 @@ fn git_stash_push(canonical: &std::path::Path, message: &str) -> Result<(), Stri
 /// The canonical-auto-stash notice BODY. The `[system:canonical_auto_stash]`
 /// marker is added by the notify layer (`NotifySource::System`); the body must
 /// NOT embed a second (double-prefix bug, #t-…61315-2).
-fn canonical_auto_stash_notice(canonical: &std::path::Path, stash_message: &str, default_branch: &str) -> String {
+fn canonical_auto_stash_notice(
+    canonical: &std::path::Path,
+    stash_message: &str,
+    default_branch: &str,
+) -> String {
     format!(
         "Canonical at `{path}` was detached + dirty; \
          auto-stashed WIP as `{stash_message}` and switched back to {default_branch}. \
@@ -333,7 +341,11 @@ fn canonical_auto_stash_notice(canonical: &std::path::Path, stash_message: &str,
     )
 }
 
-fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &str, default_branch: &str) {
+fn notify_operator_of_auto_stash(
+    canonical: &std::path::Path,
+    stash_message: &str,
+    default_branch: &str,
+) {
     let home = crate::home_dir();
     let text = canonical_auto_stash_notice(canonical, stash_message, default_branch);
     let source = crate::inbox::NotifySource::System("canonical_auto_stash");
@@ -472,7 +484,8 @@ mod tests {
     /// #t-…61315-2 Bug2 (RED-first): auto-stash notice builder — same invariant.
     #[test]
     fn canonical_auto_stash_notice_no_embedded_marker() {
-        let notice = canonical_auto_stash_notice(std::path::Path::new("/tmp/canon"), "wip-abc123", "main");
+        let notice =
+            canonical_auto_stash_notice(std::path::Path::new("/tmp/canon"), "wip-abc123", "main");
         assert!(
             !notice.contains("[system:"),
             "notice body must not embed a [system:…] marker (notify layer adds it): {notice}"
@@ -781,23 +794,36 @@ mod tests {
         };
 
         // Bare origin with default branch "dev".
-        assert!(run_at(&bare, &["init", "--bare", "-b", "dev"]).status.success());
+        assert!(run_at(&bare, &["init", "--bare", "-b", "dev"])
+            .status
+            .success());
         // Canonical repo on "dev".
         assert!(run_at(&canonical, &["init", "-b", "dev"]).status.success());
         std::fs::write(canonical.join("file.txt"), "initial\n").unwrap();
         assert!(run_at(&canonical, &["add", "file.txt"]).status.success());
-        assert!(run_at(&canonical, &["commit", "-q", "-m", "initial"]).status.success());
+        assert!(run_at(&canonical, &["commit", "-q", "-m", "initial"])
+            .status
+            .success());
         // Wire remote + push + set origin/HEAD → origin/dev.
         assert!(run_at(
             &canonical,
             &["remote", "add", "origin", bare.to_str().unwrap()],
-        ).status.success());
-        assert!(run_at(&canonical, &["push", "-u", "origin", "dev"]).status.success());
-        assert!(run_at(&canonical, &["remote", "set-head", "origin", "dev"]).status.success());
+        )
+        .status
+        .success());
+        assert!(run_at(&canonical, &["push", "-u", "origin", "dev"])
+            .status
+            .success());
+        assert!(run_at(&canonical, &["remote", "set-head", "origin", "dev"])
+            .status
+            .success());
 
         // Sanity: git_helpers::default_branch must resolve to "dev".
         let resolved = crate::git_helpers::default_branch(&canonical);
-        assert_eq!(resolved, "dev", "setup: default_branch must resolve to 'dev'");
+        assert_eq!(
+            resolved, "dev",
+            "setup: default_branch must resolve to 'dev'"
+        );
 
         // --- (a) HEAD on "dev" + dirty → MUST produce CanonicalDirtyReport ---
         std::fs::write(canonical.join("scratch.txt"), "dirty\n").unwrap();
@@ -816,16 +842,17 @@ mod tests {
             .trim()
             .to_string();
         assert!(
-            run_at(&canonical, &["checkout", "-q", &sha]).status.success(),
+            run_at(&canonical, &["checkout", "-q", &sha])
+                .status
+                .success(),
             "detach HEAD via checkout SHA"
         );
         let _ = apply_to_canonical(&canonical);
-        let head_after = String::from_utf8(
-            run_at(&canonical, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let head_after =
+            String::from_utf8(run_at(&canonical, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
         assert_eq!(
             head_after, "dev",
             "#2895 bug (b): detached clean canonical must auto-switch to 'dev' (the true \
