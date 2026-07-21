@@ -144,6 +144,58 @@ fn excluded_worktree_requires_binding_worktree_identity() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2874 RED: an unrelated binding row (different source+branch) whose
+/// worktree field is missing must NOT poison the scan for the target branch.
+/// Currently returns None because the missing-worktree check fires before
+/// the target-relevance check.
+#[test]
+fn unrelated_missing_worktree_binding_does_not_poison_target_scan_2874() {
+    let repo = setup_repo("unrelated-missing-wt");
+    let home = tmp_home("unrelated-missing-wt");
+    let other_repo = setup_repo("unrelated-missing-wt-other");
+    // Unrelated agent: different source_repo AND different branch, no worktree field.
+    write_binding(
+        &home,
+        "unrelated-agent",
+        serde_json::json!({
+            "branch": "feat/completely-different",
+            "source_repo": other_repo.display().to_string()
+        }),
+    );
+    assert_eq!(
+        branch_has_other_active_binding(&home, &repo, "feat/done", Some("/my-worktree")),
+        Some(false),
+        "#2874: unrelated binding with missing worktree must not block target scan"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&other_repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2874 safety control: a SAME-TARGET binding (same source+branch) with
+/// missing worktree must still fail closed (None). This test must pass
+/// today and remain green after the fix.
+#[test]
+fn same_target_missing_worktree_binding_stays_fail_closed_2874() {
+    let repo = setup_repo("same-target-missing-wt");
+    let home = tmp_home("same-target-missing-wt");
+    write_binding(
+        &home,
+        "same-target-agent",
+        serde_json::json!({
+            "branch": "feat/done",
+            "source_repo": repo.display().to_string()
+        }),
+    );
+    assert_eq!(
+        branch_has_other_active_binding(&home, &repo, "feat/done", Some("/my-worktree")),
+        None,
+        "#2874 safety: same-target binding with missing worktree must fail closed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn prune_batches_open_pr_inventory_once_per_repo_sweep() {
     let repo = setup_repo("open-pr-batch");
