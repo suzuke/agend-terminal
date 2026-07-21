@@ -54,7 +54,10 @@ pub fn propagate_usage_limit(
         if handle.name.as_str() == source_agent {
             continue;
         }
-        let their_backend = crate::backend::Backend::from_command(&handle.backend_command);
+        let their_backend = handle
+            .declared_backend
+            .clone()
+            .or_else(|| crate::backend::Backend::from_command(&handle.backend_command));
         if their_backend.as_ref() == Some(source_backend) {
             let mut core = handle.core.lock();
             core.health

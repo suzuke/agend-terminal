@@ -667,12 +667,13 @@ fn tick(
     // deadlocks against code paths that take core then registry.
     // #1441: registry is UUID-keyed; carry the id for the re-lock lookup and
     // the display name for the many name-keyed side channels in this loop.
-    // #1530/F2: also capture each agent's backend_command here (under the
-    // registry lock, registry→core order) so the per-agent loop never needs to
-    // RE-acquire the registry while holding that agent's core — the core→registry
-    // inversion that risked an AB-BA deadlock with the registry→core render/
-    // monitor loops. `Backend::from_command` on the captured string is lock-free.
-    let handles: Vec<(String, String, _)> = {
+    // #1530/F2: also capture each agent's immutable declared backend and live
+    // backend_command here (under the registry lock, registry→core order) so
+    // the per-agent loop never needs to RE-acquire the registry while holding
+    // that agent's core — the core→registry inversion that risked an AB-BA
+    // deadlock with the registry→core render/monitor loops. Backend resolution
+    // on the captured values is lock-free.
+    let handles: Vec<(String, Option<crate::backend::Backend>, String, _)> = {
         let reg = agent::lock_registry(registry);
         reg.values()
             // #1915 TIER-B1: skip a handle being deleted (deleted flag set in
@@ -684,6 +685,7 @@ fn tick(
             .map(|h| {
                 (
                     h.name.to_string(),
+                    h.declared_backend.clone(),
                     h.backend_command.clone(),
                     Arc::clone(&h.core),
                 )
@@ -691,7 +693,7 @@ fn tick(
             .collect()
     };
 
-    for (name, backend_command, core) in handles {
+    for (name, declared_backend, backend_command, core) in handles {
         // #1665/#2042 reply-ledger: TTL/settled fallback for a user-message
         // turn that never hit a clear site (no reply, no mirror, no takeover).
         // Lock-free snapshot read; acts only past the grace window AND when the
@@ -854,9 +856,12 @@ fn tick(
             // make it compile-impossible is deferred (#1644) — revisit when a new
             // reaction is added to this loop; both guards above make that safe.
             for decision in reactions_from_transitions(&transitions) {
-                // #1530/F2: backend resolved from the pre-captured command
-                // (no registry re-acquire while holding core).
-                let backend = crate::backend::Backend::from_command(&backend_command);
+                // #1530/F2/#2877: backend resolved from the immutable declared
+                // identity, falling back to the captured live command for legacy
+                // handles (no registry re-acquire while holding core).
+                let backend = declared_backend
+                    .clone()
+                    .or_else(|| crate::backend::Backend::from_command(&backend_command));
                 reaction_intents.push(ReactionIntent {
                     from: decision.from,
                     to: decision.to,
@@ -1027,6 +1032,7 @@ fn tick(
             registry,
             &name,
             usage_limit_raw_state,
+            declared_backend.as_ref(),
             &backend_command,
             &usage_limit_pane_tail,
         ) {
