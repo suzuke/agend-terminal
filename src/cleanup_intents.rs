@@ -600,6 +600,21 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
             continue;
         }
 
+        let default = crate::git_helpers::default_branch(repo_path);
+        let open_pr_status =
+            crate::branch_sweep::open_pr_status(repo_path, &default, &intent.branch);
+        if !matches!(open_pr_status, crate::branch_sweep::OpenPrStatus::NotOpen) {
+            result.preserved += 1;
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome: format!("preserved:open_pr_status:{open_pr_status:?}"),
+            });
+            continue;
+        }
+
         // All gates passed under lock. Dry-run stops here.
         if dry_run {
             result.candidates.push(ReconcileCandidate {
@@ -1213,9 +1228,10 @@ mod tests {
                 "https://github.com/example/repo.git",
             ],
         );
-        let provider = crate::scm::MockScmProvider::with_pr_list(
-            crate::scm::MockPrList::Branches(vec![branch.into()]),
-        );
+        let provider =
+            crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+                branch.into(),
+            ]));
         let _provider_guard = crate::scm::set_test_scm_provider(provider);
         let rs = repo.display().to_string();
         persist_intent(&home, &rs, branch, &tip, "t-reconcile-open-pr", None, None)
@@ -1228,8 +1244,14 @@ mod tests {
             result.preserved, 1,
             "open PR must preserve terminal intent: {result:?}"
         );
-        assert!(branch_exists(&repo, branch), "open PR branch must be preserved");
-        assert!(has_intent(&home, &rs, branch), "open PR intent must be preserved");
+        assert!(
+            branch_exists(&repo, branch),
+            "open PR branch must be preserved"
+        );
+        assert!(
+            has_intent(&home, &rs, branch),
+            "open PR intent must be preserved"
+        );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
