@@ -33,11 +33,6 @@
 //! falls back to `emit_dirty_detached_warning` — no half-switch,
 //! no mutation, operator's WIP preserved.
 
-/// The default branch the canonical-hygiene helper switches TO when
-/// it auto-resolves a detached-HEAD state. Mirror of the protected-
-/// refs convention used by `agend-git` shim's `is_protected_ref`.
-pub const DEFAULT_BRANCH: &str = "main";
-
 /// Possible actions for the canonical's HEAD state at boot.
 /// Returned by [`decide_canonical_action`] as a pure value; the
 /// integration fn dispatches based on the variant.
@@ -75,6 +70,8 @@ pub enum CanonicalAction {
 pub(crate) struct CanonicalDirtyReport {
     /// Canonical repo path (a `source_repo` from fleet.yaml).
     pub path: std::path::PathBuf,
+    /// The repo's resolved default branch (e.g. "main", "dev", "master").
+    pub default_branch: String,
     /// Raw `git status --porcelain` lines (non-ignored entries), original order,
     /// preserved verbatim for the audit trail.
     pub porcelain_lines: Vec<String>,
@@ -85,7 +82,7 @@ pub(crate) struct CanonicalDirtyReport {
 }
 
 impl CanonicalDirtyReport {
-    fn from_status(path: &std::path::Path, porcelain: &str) -> Self {
+    fn from_status(path: &std::path::Path, porcelain: &str, default_branch: &str) -> Self {
         let porcelain_lines: Vec<String> = porcelain
             .lines()
             .filter(|l| !l.is_empty())
@@ -103,6 +100,7 @@ impl CanonicalDirtyReport {
         };
         Self {
             path: path.to_path_buf(),
+            default_branch: default_branch.to_string(),
             porcelain_lines,
             fingerprint,
         }
@@ -169,6 +167,9 @@ pub(crate) fn run_hygiene_with_dirty_report(
 /// (their WIP is handled by the stash path).
 pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<CanonicalDirtyReport> {
     let head_state = git_capture(canonical, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    // #2895: resolve the per-repo default branch once (e.g. "main", "dev",
+    // "master") instead of assuming "main".
+    let repo_default = crate::git_helpers::default_branch(canonical);
     // `--untracked-files=normal` is explicit so a global `status.showUntrackedFiles=no`
     // can't hide an untracked stray file (exactly the SESSION-HANDOFF-006.md class).
     let status = git_capture(
@@ -181,24 +182,27 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<Canonica
         CanonicalAction::SwitchToDefault => {
             // #1899: bounded via git_bypass (current_dir == `-C`, LOCAL 60s).
             let switch_result =
-                crate::git_helpers::git_bypass(canonical, &["switch", DEFAULT_BRANCH]);
+                crate::git_helpers::git_bypass(canonical, &["switch", &repo_default]);
             match switch_result {
                 Ok(out) if out.status.success() => {
                     tracing::info!(
                         canonical = %canonical.display(),
-                        "#852 canonical hygiene: detached HEAD on clean tree, auto-switched to {DEFAULT_BRANCH}"
+                        default_branch = %repo_default,
+                        "#852 canonical hygiene: detached HEAD on clean tree, auto-switched to default branch"
                     );
                 }
                 Ok(out) => {
                     tracing::warn!(
                         canonical = %canonical.display(),
+                        default_branch = %repo_default,
                         stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                        "#852 canonical hygiene: git switch {DEFAULT_BRANCH} failed"
+                        "#852 canonical hygiene: git switch to default branch failed"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         canonical = %canonical.display(),
+                        default_branch = %repo_default,
                         error = %e,
                         "#852 canonical hygiene: git switch spawn failed"
                     );
@@ -206,7 +210,7 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<Canonica
             }
         }
         CanonicalAction::StashAndSwitchToDefault => {
-            apply_stash_and_switch(canonical);
+            apply_stash_and_switch(canonical, &repo_default);
         }
     }
 
@@ -214,9 +218,9 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<Canonica
     // non-ignored dirty tree here means someone wrote into the canonical working
     // tree instead of a worktree — return a report so the caller notifies (with
     // runtime re-alert throttling). Detached states are handled by the stash path
-    // above; they have `head_state != DEFAULT_BRANCH`, so they never surface here.
-    if head_state == DEFAULT_BRANCH && !working_tree_clean {
-        Some(CanonicalDirtyReport::from_status(canonical, &status))
+    // above; they have `head_state != repo_default`, so they never surface here.
+    if head_state == repo_default && !working_tree_clean {
+        Some(CanonicalDirtyReport::from_status(canonical, &status, &repo_default))
     } else {
         None
     }
@@ -227,7 +231,7 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<Canonica
 /// the default branch, and notifying the operator with recovery
 /// instructions. On stash failure, fall back to
 /// [`emit_dirty_detached_warning`] so the operator's WIP is preserved.
-fn apply_stash_and_switch(canonical: &std::path::Path) {
+fn apply_stash_and_switch(canonical: &std::path::Path, default_branch: &str) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let stash_message = format!("agend canonical hygiene auto-stash {timestamp}");
     match git_stash_push(canonical, &stash_message) {
@@ -238,20 +242,21 @@ fn apply_stash_and_switch(canonical: &std::path::Path) {
                 "#852 canonical hygiene: stash push failed; falling back to \
                  warn-only (operator WIP preserved)"
             );
-            emit_dirty_detached_warning(canonical);
+            emit_dirty_detached_warning(canonical, default_branch);
         }
         Ok(()) => {
             // #1899: bounded via git_bypass (current_dir == `-C`, LOCAL 60s).
             let switch_result =
-                crate::git_helpers::git_bypass(canonical, &["switch", DEFAULT_BRANCH]);
+                crate::git_helpers::git_bypass(canonical, &["switch", default_branch]);
             match switch_result {
                 Ok(out) if out.status.success() => {
                     tracing::info!(
                         canonical = %canonical.display(),
+                        default_branch = %default_branch,
                         stash_message = %stash_message,
-                        "#852 canonical hygiene: dirty detached HEAD auto-stashed and switched to {DEFAULT_BRANCH}"
+                        "#852 canonical hygiene: dirty detached HEAD auto-stashed and switched to default branch"
                     );
-                    notify_operator_of_auto_stash(canonical, &stash_message);
+                    notify_operator_of_auto_stash(canonical, &stash_message, default_branch);
                 }
                 Ok(out) => {
                     // Stash succeeded but switch failed — operator's
@@ -259,9 +264,10 @@ fn apply_stash_and_switch(canonical: &std::path::Path) {
                     // but clean. Warn so the operator restores manually.
                     tracing::warn!(
                         canonical = %canonical.display(),
+                        default_branch = %default_branch,
                         stderr = %String::from_utf8_lossy(&out.stderr).trim(),
                         stash_message = %stash_message,
-                        "#852 canonical hygiene: stash succeeded but git switch {DEFAULT_BRANCH} failed — recover via `git stash pop`"
+                        "#852 canonical hygiene: stash succeeded but git switch to default branch failed — recover via `git stash pop`"
                     );
                 }
                 Err(e) => {
@@ -280,12 +286,13 @@ fn apply_stash_and_switch(canonical: &std::path::Path) {
 /// Emit the dirty-detached warn log. Called by
 /// `apply_stash_and_switch` on stash failure when the detached HEAD
 /// + dirty tree state can't be auto-recovered.
-fn emit_dirty_detached_warning(canonical: &std::path::Path) {
+fn emit_dirty_detached_warning(canonical: &std::path::Path, default_branch: &str) {
     tracing::warn!(
         canonical = %canonical.display(),
+        default_branch = %default_branch,
         "#852 canonical hygiene: detached HEAD with dirty working tree — \
-         NOT auto-switching (operator WIP protection). Run `git switch \
-         {DEFAULT_BRANCH}` manually after committing/stashing changes."
+         NOT auto-switching (operator WIP protection). Run `git switch <default>` \
+         manually after committing/stashing changes."
     );
 }
 
@@ -317,18 +324,18 @@ fn git_stash_push(canonical: &std::path::Path, message: &str) -> Result<(), Stri
 /// The canonical-auto-stash notice BODY. The `[system:canonical_auto_stash]`
 /// marker is added by the notify layer (`NotifySource::System`); the body must
 /// NOT embed a second (double-prefix bug, #t-…61315-2).
-fn canonical_auto_stash_notice(canonical: &std::path::Path, stash_message: &str) -> String {
+fn canonical_auto_stash_notice(canonical: &std::path::Path, stash_message: &str, default_branch: &str) -> String {
     format!(
         "Canonical at `{path}` was detached + dirty; \
-         auto-stashed WIP as `{stash_message}` and switched back to {DEFAULT_BRANCH}. \
+         auto-stashed WIP as `{stash_message}` and switched back to {default_branch}. \
          Recover via:\n  git -C {path} stash list\n  git -C {path} stash pop  # or: git stash apply <ref>\n#852.",
         path = canonical.display(),
     )
 }
 
-fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &str) {
+fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &str, default_branch: &str) {
     let home = crate::home_dir();
-    let text = canonical_auto_stash_notice(canonical, stash_message);
+    let text = canonical_auto_stash_notice(canonical, stash_message, default_branch);
     let source = crate::inbox::NotifySource::System("canonical_auto_stash");
     crate::inbox::notify_agent(&home, "general", &source, &text);
 }
@@ -364,7 +371,7 @@ fn canonical_dirty_notice(report: &CanonicalDirtyReport) -> String {
          under AgEnD — work in a git worktree and move any scratch/handoff files \
          OUT of the canonical tree.{body}\nInspect: git -C {path} status",
         path = report.path.display(),
-        branch = DEFAULT_BRANCH,
+        branch = report.default_branch,
     )
 }
 
@@ -453,6 +460,7 @@ mod tests {
         let report = CanonicalDirtyReport::from_status(
             std::path::Path::new("/tmp/canon"),
             " M src/foo.rs\n?? scratch.txt",
+            "main",
         );
         let notice = canonical_dirty_notice(&report);
         assert!(
@@ -464,7 +472,7 @@ mod tests {
     /// #t-…61315-2 Bug2 (RED-first): auto-stash notice builder — same invariant.
     #[test]
     fn canonical_auto_stash_notice_no_embedded_marker() {
-        let notice = canonical_auto_stash_notice(std::path::Path::new("/tmp/canon"), "wip-abc123");
+        let notice = canonical_auto_stash_notice(std::path::Path::new("/tmp/canon"), "wip-abc123", "main");
         assert!(
             !notice.contains("[system:"),
             "notice body must not embed a [system:…] marker (notify layer adds it): {notice}"
