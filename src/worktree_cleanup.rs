@@ -768,6 +768,11 @@ pub(crate) fn branch_has_other_active_binding(
         let source = binding["source_repo"]
             .as_str()
             .filter(|source| !source.is_empty())?;
+        // #2874: canonicalize once; skip rows proven unrelated before worktree identity.
+        let cs = std::fs::canonicalize(source);
+        if matches!(&cs, Ok(s) if bound_branch != branch || *s != canonical_repo) {
+            continue;
+        }
         if excluded_worktree.is_some() && binding["worktree"].as_str().is_none_or(str::is_empty) {
             return None;
         }
@@ -777,12 +782,7 @@ pub(crate) fn branch_has_other_active_binding(
         {
             continue;
         }
-        let Ok(source) = std::fs::canonicalize(source) else {
-            return None;
-        };
-        if bound_branch == branch && source == canonical_repo {
-            return Some(true);
-        }
+        return if cs.is_ok() { Some(true) } else { None };
     }
     Some(false)
 }
