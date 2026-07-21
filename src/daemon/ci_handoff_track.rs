@@ -825,7 +825,7 @@ pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Ut
                 episode,
                 class,
             ),
-            crate::inbox::storage::ProtectedHandoffRowState::Processed
+            crate::inbox::storage::ProtectedHandoffRowState::ExplicitlyAcked
         ) {
             continue;
         }
@@ -2060,7 +2060,16 @@ mod tests {
         let home = tmp_home("r12-reconcile");
         seed_protected(&home, "reviewer", "o/r@main", "ep-1");
         crate::inbox::drain(&home, "reviewer");
-        crate::inbox::ack(&home, "reviewer", None);
+        assert!(matches!(
+            crate::inbox::storage::settle_ci_handoff_row_exact(
+                &home,
+                "reviewer",
+                "o/r@main",
+                "ep-1",
+                crate::inbox::CiHandoffClass::Protected,
+            ),
+            crate::inbox::storage::HandoffRowSettleOutcome::Settled
+        ));
         // Recreate the sidecar to model a crash after row processing but before
         // the resolver's delete completed.
         assert!(record_with_identity(

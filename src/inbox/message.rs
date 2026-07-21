@@ -193,6 +193,13 @@ pub struct InboxMessage {
     /// closed rather than guessing protected-vs-feature semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_handoff_class: Option<CiHandoffClass>,
+    /// #2870: explicit settlement provenance. Written only by
+    /// `settle_ci_handoff_row_exact` (called from `ack_handoff`); generic
+    /// drain/ack/discharge never sets this. The reconciler and already-acked
+    /// path require its presence to distinguish explicit ack from generic
+    /// inbox lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_handoff_settlement: Option<String>,
 }
 
 /// Reply-to correlation context for a quoted bot message (resolved from the

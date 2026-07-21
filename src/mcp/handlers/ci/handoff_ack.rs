@@ -54,7 +54,7 @@ pub(crate) fn handle_ack_handoff_ci(home: &Path, args: &Value, instance_name: &s
             crate::inbox::CiHandoffClass::Protected,
         ] {
             if handoff_row_state(home, instance_name, &correlation, episode, class)
-                == ProtectedHandoffRowState::Processed
+                == ProtectedHandoffRowState::ExplicitlyAcked
             {
                 return json!({
                     "ok": true,

@@ -1051,6 +1051,7 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             terminal: None,
             ci_handoff_episode: None,
             ci_handoff_class: None,
+            ci_handoff_settlement: None,
             delivery_nonce: None,
             review_assignment: None,
         },
@@ -1129,6 +1130,7 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             terminal: None,
             ci_handoff_episode: None,
             ci_handoff_class: None,
+            ci_handoff_settlement: None,
             delivery_nonce: None,
             review_assignment: None,
         },
@@ -1292,6 +1294,7 @@ fn test_describe_message_shows_delivery_mode() {
         terminal: None,
         ci_handoff_episode: None,
         ci_handoff_class: None,
+        ci_handoff_settlement: None,
         delivery_nonce: None,
         review_assignment: None,
     };
