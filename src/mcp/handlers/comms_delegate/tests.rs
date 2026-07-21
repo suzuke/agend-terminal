@@ -1412,4 +1412,175 @@ mod merge_train_admission_tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // R6 — frozen fail-closed and atomicity boundaries
+    // ════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn r6_unreadable_extra_board_refuses_without_train_writes() {
+        let home = mt_home("r6-board-replay");
+        fixture(&home);
+        create_task(&home, "t-r6-board");
+        set_meta(
+            &home,
+            "t-r6-board",
+            "merge_train_repository",
+            json!("owner/repo"),
+        );
+        set_meta(&home, "t-r6-board", "merge_train_domain", json!("core"));
+        set_meta(&home, "t-r6-board", "merge_train_position", json!("Front"));
+        set_meta(&home, "t-r6-board", "merge_train_queue_seq", json!(1));
+        let corrupt_board = crate::task_events::board_root(&home, "corrupt/project");
+        std::fs::create_dir_all(corrupt_board.join("task_events.jsonl")).unwrap();
+
+        let events_before = train_event_count(&home, "t-r6-board");
+        let fronts = crate::tasks::scan_merge_train_fronts(&home, "owner/repo", "core");
+        let next_seq = crate::tasks::next_merge_train_seq(&home, "owner/repo", "core");
+        assert!(
+            fronts.iter().any(|id| id == "t-r6-board") && next_seq == 2,
+            "unreadable extra board must not degrade authority to no-Front/seq1: fronts={fronts:?} next_seq={next_seq}"
+        );
+        assert_eq!(train_event_count(&home, "t-r6-board"), events_before);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn r6_concurrent_same_task_emits_one_fresh_four_event_batch() {
+        let home = mt_home("r6-same-task");
+        fixture(&home);
+        create_task(&home, "t-r6-same");
+        set_meta(&home, "t-r6-same", "conflict_domain", json!("same-task"));
+
+        const N: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let home = home.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                dispatch(&home, "dev-a", "t-r6-same", "feat/r6-same")
+            }));
+        }
+        let results: Vec<Value> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            train_event_count(&home, "t-r6-same"),
+            4,
+            "same-task races must commit exactly one fresh four-event authority batch; results={results:?}"
+        );
+        assert_eq!(
+            read_meta(&home, "t-r6-same", "merge_train_position")
+                .and_then(|v| v.as_str().map(str::to_owned)),
+            Some("Front".into())
+        );
+        assert_eq!(
+            read_meta(&home, "t-r6-same", "merge_train_queue_seq"),
+            Some(json!(1))
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn r6_repository_identity_is_namespaced_across_full_source_resolver() {
+        let forge_home = mt_home("r6-forge-id");
+        fixture(&forge_home);
+        create_task(&forge_home, "t-r6-forge");
+        dispatch(&forge_home, "dev-a", "t-r6-forge", "feat/r6-forge");
+        let forge_identity = read_meta(&forge_home, "t-r6-forge", "merge_train_repository");
+
+        let path_home = mt_home("r6-path-id");
+        let path_repo = init_repo(&path_home, "path-only", "owner/path-only");
+        let remove_remote = std::process::Command::new("git")
+            .args(["remote", "remove", "origin"])
+            .current_dir(&path_repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(remove_remote.status.success());
+        let yaml = format!(
+            "instances:\n  lead: {{ backend: claude, id: 11111111-1111-4111-8111-111111111111 }}\n  dev-a:\n    backend: claude\n    id: 22222222-2222-4222-8222-222222222222\n    source_repo: {}\nteams:\n  core:\n    orchestrator: lead\n    members: [lead, dev-a]\n",
+            path_repo.display()
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(&path_home), yaml).unwrap();
+        create_task(&path_home, "t-r6-path");
+        dispatch(&path_home, "dev-a", "t-r6-path", "feat/r6-path");
+        let path_identity = read_meta(&path_home, "t-r6-path", "merge_train_repository");
+
+        assert_eq!(
+            (forge_identity, path_identity),
+            (
+                Some(json!("forge:owner/repo")),
+                Some(json!(format!("path:{}", path_repo.display())))
+            )
+        );
+
+        std::fs::remove_dir_all(&forge_home).ok();
+        std::fs::remove_dir_all(&path_home).ok();
+    }
+
+    #[test]
+    fn r6_distinct_lossy_collision_pairs_use_distinct_lock_identities() {
+        let home = mt_home("r6-lock-hash");
+        fixture(&home);
+        create_task(&home, "t-r6-lock-a");
+        create_task(&home, "t-r6-lock-b");
+        set_meta(&home, "t-r6-lock-a", "conflict_domain", json!("area/a"));
+        set_meta(&home, "t-r6-lock-b", "conflict_domain", json!("area?a"));
+
+        dispatch(&home, "dev-a", "t-r6-lock-a", "feat/r6-lock-a");
+        dispatch(&home, "dev-b", "t-r6-lock-b", "feat/r6-lock-b");
+
+        let mut locks: Vec<String> = std::fs::read_dir(home.join("merge_train"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".lock"))
+            .collect();
+        locks.sort();
+        locks.dedup();
+        assert_eq!(
+            locks.len(),
+            2,
+            "distinct repo/domain pairs must have collision-safe lock identities: {locks:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn r6_complete_invalid_position_refuses_without_new_train_writes() {
+        let home = mt_home("r6-invalid-position");
+        fixture(&home);
+        create_task(&home, "t-r6-invalid");
+        set_meta(&home, "t-r6-invalid", "conflict_domain", json!("core"));
+        set_meta(
+            &home,
+            "t-r6-invalid",
+            "merge_train_repository",
+            json!("owner/repo"),
+        );
+        set_meta(&home, "t-r6-invalid", "merge_train_domain", json!("core"));
+        set_meta(
+            &home,
+            "t-r6-invalid",
+            "merge_train_position",
+            json!("Sideways"),
+        );
+        set_meta(&home, "t-r6-invalid", "merge_train_queue_seq", json!(1));
+
+        let events_before = train_event_count(&home, "t-r6-invalid");
+        let result = dispatch(&home, "dev-a", "t-r6-invalid", "feat/r6-invalid");
+        assert_eq!(
+            result.get("code").and_then(Value::as_str),
+            Some("merge_train_invalid_position"),
+            "complete invalid position must fail closed: {result}"
+        );
+        assert_eq!(train_event_count(&home, "t-r6-invalid"), events_before);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
