@@ -750,32 +750,6 @@ pub(super) fn replay_all_boards(home: &Path) -> anyhow::Result<crate::task_event
     Ok(merged)
 }
 
-/// Strict all-board replay for cross-board authority decisions. Every board is
-/// strict-replayed and duplicate task ids are rejected instead of overwritten.
-pub(super) fn replay_all_boards_strict(
-    home: &Path,
-) -> Result<crate::task_events::TaskBoardState, TaskRouteError> {
-    let mut merged = crate::task_events::TaskBoardState::default();
-    for project in enumerate_projects(home)? {
-        let board = board_root(home, &project);
-        let state = crate::task_events::replay_strict_at(&board).map_err(|e| {
-            TaskRouteError::Unreadable {
-                path: e.path,
-                cause: e.cause,
-            }
-        })?;
-        for (id, record) in state.tasks {
-            if merged.tasks.insert(id.clone(), record).is_some() {
-                return Err(TaskRouteError::Ambiguous {
-                    candidates: vec![id.0],
-                    cause: "duplicate task id across boards during merge-train scan".into(),
-                });
-            }
-        }
-    }
-    Ok(merged)
-}
-
 /// P0 cross-lease: strict cross-board task list for authority decisions
 /// (auto-release). Unlike `list_all_boards` (display-only, degrades to
 /// default on error), this function FAILS CLOSED:
