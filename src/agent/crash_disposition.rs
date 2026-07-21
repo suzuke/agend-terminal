@@ -145,6 +145,7 @@ impl ClaimToken {
 pub(crate) struct RecoveryExecutionPermit {
     key: DispositionKey,
     core: Arc<CoreMutex<AgentCore>>,
+    claimant: Claimant,
     restarting_admitted: bool,
     attempt_debited: bool,
 }
@@ -341,17 +342,24 @@ impl CrashDispositionLedger {
             return None;
         }
         let core = Arc::clone(&entry.observation.core);
+        let claimant = entry.claimant.unwrap_or(Claimant::Crash);
         entry.disposition = Disposition::Executing;
         Some(RecoveryExecutionPermit {
             key: token.key,
             core,
+            claimant,
             restarting_admitted: false,
             attempt_debited: false,
         })
     }
 
     pub(crate) fn mark_live(&self, permit: RecoveryExecutionPermit) -> bool {
-        if !permit.restarting_admitted || !permit.attempt_debited {
+        if !permit.restarting_admitted {
+            return false;
+        }
+        // Crash claimant must debit the per-core retry budget before settling Live.
+        // Watchdog accounts attempts via its own RetryRecord, not HealthTracker.
+        if permit.claimant == Claimant::Crash && !permit.attempt_debited {
             return false;
         }
         self.transition(permit.key(), Disposition::Executing, Disposition::Live)
@@ -873,6 +881,84 @@ mod tests {
         let late = observation(id, SpawnGeneration::new(20), &deleted, None);
         assert!(!ledger.publish(late));
         assert!(ledger.entry_count() <= 1);
+    }
+
+    /// #2869 RED: successful watchdog recovery must settle the old entry to Live
+    /// without requiring crash-budget debit.  The watchdog intentionally accounts
+    /// attempts via its own `RetryRecord`, not the per-core `HealthTracker`.
+    /// Today `mark_live` rejects the undebited permit and the entry leaks as
+    /// Executing for the daemon lifetime.
+    #[test]
+    fn watchdog_success_settles_without_crash_debit_2869_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let obs = observation(id, SpawnGeneration::new(2869), &deleted, None);
+        let weak_core = Arc::downgrade(&obs.core);
+        ledger.register_generation(id, obs.generation);
+        assert!(ledger.publish(obs.clone()));
+        let token = ledger
+            .claim(obs.key(), Claimant::RespawnWatchdog)
+            .expect("watchdog claim");
+        assert!(ledger.mark_ready(token));
+
+        // Watchdog path: begin_execute → admit_restarting, deliberately no debit_attempt.
+        let mut permit = ledger.begin_execute(token).expect("permit");
+        assert!(permit.admit_restarting());
+
+        // Simulate successful restart: register replacement generation.
+        ledger.register_generation(id, SpawnGeneration::new(2870));
+
+        // BUG: mark_live returns false because attempt_debited is false,
+        // leaving the entry stuck in Executing.
+        assert!(
+            ledger.mark_live(permit),
+            "watchdog success must settle to Live without crash-budget debit"
+        );
+
+        // The superseded entry must be cleaned up, not retained.
+        drop(obs);
+        assert!(
+            weak_core.upgrade().is_none(),
+            "settled watchdog entry must release old core Arc"
+        );
+        assert_eq!(
+            ledger.entry_count(),
+            0,
+            "no entries should leak after watchdog settlement"
+        );
+    }
+
+    /// #2869 RED: prove that repeated watchdog recoveries leak unbounded
+    /// Executing entries when mark_live silently fails.
+    #[test]
+    fn watchdog_repeated_success_does_not_leak_entries_2869_red() {
+        let ledger = CrashDispositionLedger::new();
+        let id = InstanceId::new();
+        let deleted = Arc::new(AtomicBool::new(false));
+
+        for cycle in 0u64..5 {
+            let gen = SpawnGeneration::new(100 + cycle * 2);
+            let obs = observation(id, gen, &deleted, None);
+            ledger.register_generation(id, gen);
+            assert!(ledger.publish(obs.clone()));
+            let token = ledger
+                .claim(obs.key(), Claimant::RespawnWatchdog)
+                .expect("claim");
+            assert!(ledger.mark_ready(token));
+            let mut permit = ledger.begin_execute(token).expect("permit");
+            assert!(permit.admit_restarting());
+
+            let next_gen = SpawnGeneration::new(100 + cycle * 2 + 1);
+            ledger.register_generation(id, next_gen);
+            let _ = ledger.mark_live(permit);
+        }
+
+        assert!(
+            ledger.entry_count() <= 1,
+            "repeated watchdog recoveries must not leak entries, count={}",
+            ledger.entry_count()
+        );
     }
 
     #[test]
