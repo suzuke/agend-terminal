@@ -175,7 +175,11 @@ fn resolve_repo(home: &Path, args: &Value, target: &str) -> Result<String, Value
             .ok_or_else(unresolved);
     }
     let source_repo = dispatch_hook::resolve_source_repo_for_target(home, target);
-    let canonical = std::fs::canonicalize(&source_repo).map_err(|_| unresolved())?;
+    let canonical = match std::fs::canonicalize(&source_repo) {
+        Ok(path) => path,
+        Err(_) if source_repo.is_absolute() => source_repo,
+        Err(_) => return Err(unresolved()),
+    };
     Ok(
         match dispatch_hook::canonical_repo_slug_for_source(&canonical) {
             Some(slug) => format!("forge:{slug}"),

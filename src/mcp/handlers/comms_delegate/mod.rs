@@ -536,6 +536,20 @@ pub(crate) fn handle_delegate_task(
 
     let composed = compose_delegate_message(task, args, &checks);
 
+    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
+    // durable mutations, including merge-train admission metadata.
+    if !checks.review_assignment
+        && runtime.is_none()
+        && args["branch"].as_str().is_some_and(|b| !b.is_empty())
+    {
+        return json!({
+            "ok": false,
+            "error": "branch dispatch requires in-process runtime",
+            "code": "runtime_unavailable_branch_2454",
+            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
+        });
+    }
+
     // Merge train admission — must precede bind/create/deliver so a Queued
     // dispatch never leases a worktree or creates side-effects.
     match merge_train::admit(home, args, target, checks.review_assignment) {
@@ -565,18 +579,6 @@ pub(crate) fn handle_delegate_task(
         return review_assignment::dispatch_review_assignment_via_store(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
-    }
-
-    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
-    // durable mutations (task-create/delivery). Placed after the
-    // review_assignment early-return to preserve that path byte-for-byte.
-    if runtime.is_none() && args["branch"].as_str().is_some_and(|b| !b.is_empty()) {
-        return json!({
-            "ok": false,
-            "error": "branch dispatch requires in-process runtime",
-            "code": "runtime_unavailable_branch_2454",
-            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
-        });
     }
 
     let (effective_task_id, auto_created_task_id) = if runtime.is_some() {
