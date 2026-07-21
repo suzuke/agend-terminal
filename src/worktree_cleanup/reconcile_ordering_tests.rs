@@ -78,10 +78,6 @@ fn reconcile_runs_before_fetch_loop_ordering() {
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     let home = tmp_home("reconcile-order");
     let repo = setup_test_repo("reconcile-order-repo");
-    git_in(
-        &repo,
-        &["remote", "add", "origin", "/nonexistent/order-test-fixture"],
-    );
     git_in(&repo, &["checkout", "-b", "review/pr-order-test"]);
     std::fs::write(repo.join("f.txt"), "work").ok();
     git_in(&repo, &["add", "."]);
