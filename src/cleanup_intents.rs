@@ -1199,6 +1199,43 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn reconcile_terminal_review_intent_preserves_open_pr_branch() {
+        let home = tmp_dir("reconcile-open-pr");
+        let repo = tmp_repo("reconcile-open-pr-repo");
+        let branch = "review/pr-999-open";
+        let tip = make_branch(&repo, branch);
+        git_in(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        let provider = crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Branches(vec![branch.into()]),
+        );
+        let _provider_guard = crate::scm::set_test_scm_provider(provider);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-reconcile-open-pr", None, None)
+            .expect("persist");
+        seed_terminal_task(&home, "t-reconcile-open-pr");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(
+            result.preserved, 1,
+            "open PR must preserve terminal intent: {result:?}"
+        );
+        assert!(branch_exists(&repo, branch), "open PR branch must be preserved");
+        assert!(has_intent(&home, &rs, branch), "open PR intent must be preserved");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn reconcile_preserves_non_terminal_task() {
         let home = tmp_dir("reconcile-nt");
         let repo = tmp_repo("reconcile-nt-repo");
