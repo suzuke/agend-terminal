@@ -176,3 +176,84 @@ pub(crate) fn derive(
         canonical: candidate_canonical,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn test_dir(label: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "agend-test-2876-{label}-{}-{id}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    fn parse_fleet(yaml: &str) -> crate::fleet::FleetConfig {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    /// #2876 RED: an unreachable survivor whose deepest existing ancestor is
+    /// provably disjoint from the candidate must NOT block deletion.
+    /// Currently returns `Refuse` because `dunce::canonicalize` fails on the
+    /// missing path and the error arm unconditionally refuses.
+    #[test]
+    fn unrelated_unreachable_survivor_permits_owned_victim_cleanup_2876() {
+        let base = test_dir("unrelated");
+        let home = base.join("home");
+        let victim_dir = crate::paths::workspace_dir(&home).join("victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        // Separate existing root for the survivor — clearly disjoint.
+        let other_root = base.join("other-root");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let survivor_missing = other_root.join("nas-mount").join("data");
+
+        let config = parse_fleet(&format!(
+            "instances:\n  victim:\n    backend: claude\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            survivor_missing.display()
+        ));
+
+        let result = derive(Some(&config), &home, "victim", &victim_dir);
+        assert!(
+            matches!(result, CleanupAdmission::RemoveOwned { .. }),
+            "#2876: unrelated unreachable survivor must not block owned-victim \
+             cleanup, got: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2876 safety pair: a missing survivor whose deepest existing ancestor
+    /// overlaps the candidate must STILL refuse — the fail-closed invariant
+    /// from #2764 is preserved for ambiguous paths.
+    #[test]
+    fn overlapping_unreachable_survivor_still_refuses_2876() {
+        let base = test_dir("overlap");
+        let home = base.join("home");
+        let victim_dir = crate::paths::workspace_dir(&home).join("victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        // Survivor nested under victim — deepest ancestor IS the victim dir.
+        let survivor_missing = victim_dir.join("nested-missing").join("deep");
+
+        let config = parse_fleet(&format!(
+            "instances:\n  victim:\n    backend: claude\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            survivor_missing.display()
+        ));
+
+        let result = derive(Some(&config), &home, "victim", &victim_dir);
+        assert!(
+            matches!(
+                result,
+                CleanupAdmission::Refuse { .. } | CleanupAdmission::Preserve { .. }
+            ),
+            "#2876 safety: overlapping unreachable survivor must still block \
+             cleanup, got: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
