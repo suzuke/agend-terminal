@@ -35,6 +35,23 @@ fn path_entry_present(candidate: &Path) -> Result<bool, std::io::Error> {
     }
 }
 
+/// #2876: when full canonicalization fails, walk up to the deepest existing
+/// ancestor, canonicalize it, and append the absent suffix. Returns `None`
+/// when no ancestor can be canonicalized (root unreachable, permission error).
+fn best_effort_canonical(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut suffix_parts: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = dunce::canonicalize(&current) {
+            let suffix: PathBuf = suffix_parts.iter().rev().collect();
+            return Some(canonical.join(suffix));
+        }
+        let name = current.file_name()?.to_owned();
+        suffix_parts.push(name);
+        current = current.parent()?.to_path_buf();
+    }
+}
+
 fn raw_working_directory(snapshot: &FleetConfig, home: &Path, name: &str) -> Option<PathBuf> {
     let instance = snapshot.instances.get(name)?;
     let path = instance
@@ -132,13 +149,31 @@ pub(crate) fn derive(
                 };
             }
             Ok(_) => {}
-            Err(error) => {
-                return CleanupAdmission::Refuse {
-                    reason: format!(
-                        "survivor '{name}' working directory {} is ambiguous: {error}",
-                        survivor_path.display()
-                    ),
-                };
+            Err(_) => {
+                // #2876: full canonicalization failed (path absent/unreachable).
+                // Try the deepest existing ancestor; if the best-effort path is
+                // provably disjoint from the candidate, this survivor cannot
+                // overlap — skip it. Otherwise fail closed.
+                match best_effort_canonical(&survivor_path) {
+                    Some(best) if !paths_overlap(&candidate_canonical, &best) => {}
+                    Some(best) => {
+                        return CleanupAdmission::Preserve {
+                            reason: format!(
+                                "survivor '{name}' unreachable path {} may overlap candidate (ancestor resolves to {})",
+                                survivor_path.display(),
+                                best.display()
+                            ),
+                        };
+                    }
+                    None => {
+                        return CleanupAdmission::Refuse {
+                            reason: format!(
+                                "survivor '{name}' working directory {} is ambiguous: no canonicalizable ancestor",
+                                survivor_path.display()
+                            ),
+                        };
+                    }
+                }
             }
         }
     }
