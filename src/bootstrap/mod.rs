@@ -115,7 +115,9 @@ impl DaemonAlreadyRunning {
         let run = crate::daemon::find_active_run_dir(home);
         Self {
             pid: run.as_deref().and_then(crate::daemon::read_daemon_pid),
-            boot_unix: run.as_deref().and_then(crate::daemon::read_daemon_boot_unix),
+            boot_unix: run
+                .as_deref()
+                .and_then(crate::daemon::read_daemon_boot_unix),
         }
     }
 
@@ -641,7 +643,8 @@ pub(crate) fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
             Err(anyhow::Error::new(DaemonAlreadyRunning::probe(home)))
         }
         Err(fs4::TryLockError::Error(e)) => {
-            Err(anyhow::Error::new(e).context(format!("flock try_lock failed on {}", path.display())))
+            Err(anyhow::Error::new(e)
+                .context(format!("flock try_lock failed on {}", path.display())))
         }
     }
 }

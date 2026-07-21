@@ -648,9 +648,8 @@ fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
     let announces_peer = loser_stderr.contains("another agend-terminal daemon is already running");
     let lock_contended = announces_peer
         && (loser_stderr.contains(", started ") || loser_stderr.contains("pid not published yet"));
-    let attached_existing = announces_peer
-        && loser_stderr.contains("(pid ")
-        && loser_stderr.contains("run_dir ");
+    let attached_existing =
+        announces_peer && loser_stderr.contains("(pid ") && loser_stderr.contains("run_dir ");
     assert!(
         lock_contended || attached_existing,
         "the flock loser MUST exit via a production single-daemon fail-fast path \

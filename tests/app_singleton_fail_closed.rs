@@ -62,7 +62,10 @@ fn hold_daemon_lock(home: &Path) -> File {
     let file = File::create(home.join(".daemon.lock")).expect("create .daemon.lock");
     // SAFETY: `file` owns a valid fd for the duration of the call.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(rc, 0, "test harness must own the daemon lock to be meaningful");
+    assert_eq!(
+        rc, 0,
+        "test harness must own the daemon lock to be meaningful"
+    );
     file
 }
 
