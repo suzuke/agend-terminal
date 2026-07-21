@@ -7935,3 +7935,289 @@ fn arch14_exact_head_retry_delivers_then_clears() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── #2870 RED: feature ci-handoff drain must not lose re-nudge ──────
+
+/// #2870 positive control (MUST PASS): real `ack_handoff` settles the feature
+/// ci-handoff track correctly, preserves the watch subscription, and a
+/// crash-reconciliation of a re-created sidecar works.
+#[test]
+fn feature_ci_ack_handoff_positive_control_2870() {
+    let dir = tmp_dir("2870-ack-positive");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = watch_with_chain(Some("reviewer"));
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: 28700,
+        conclusion: Some("success".to_string()),
+        head_sha: "ack2870".to_string(),
+        url: "https://example/run/28700".to_string(),
+        name: String::new(),
+    }]);
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
+        &registry,
+        &provider,
+    ))
+    .unwrap();
+
+    // Real producer must have created a feature ci-ready row + sidecar track
+    let tracks = crate::daemon::ci_handoff_track::list(&dir);
+    assert!(
+        tracks.iter().any(|(_p, t)| t.target == "reviewer"
+            && t.correlation == "o/r@feat"
+            && t.ci_handoff_class == Some(crate::inbox::CiHandoffClass::Feature)),
+        "#2870 positive: real producer must record a Feature-class ci-handoff track"
+    );
+
+    // Drain once to transition the row to delivering (ack_handoff needs it)
+    let d1 = crate::inbox::drain(&dir, "reviewer");
+    let ci_ready = d1
+        .iter()
+        .find(|m| m.kind.as_deref() == Some("ci-ready-for-action"))
+        .expect("#2870 positive: reviewer must receive ci-ready-for-action");
+    let episode = ci_ready
+        .ci_handoff_episode
+        .as_deref()
+        .expect("producer must set ci_handoff_episode");
+
+    // Real ack_handoff
+    let ack_result = crate::mcp::handlers::ci::handle_ack_handoff_ci(
+        &dir,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat",
+            "episode": episode,
+        }),
+        "reviewer",
+    );
+    assert_eq!(
+        ack_result["ok"].as_bool(),
+        Some(true),
+        "#2870 positive: ack_handoff must succeed: {ack_result}"
+    );
+    assert_eq!(
+        ack_result["watch_preserved"].as_bool(),
+        Some(true),
+        "#2870 positive: ack_handoff must preserve watch subscription: {ack_result}"
+    );
+
+    // Track resolved after ack_handoff
+    let tracks_after = crate::daemon::ci_handoff_track::list(&dir);
+    assert!(
+        tracks_after
+            .iter()
+            .all(|(_p, t)| t.ci_handoff_episode.as_deref() != Some(episode)),
+        "#2870 positive: ack_handoff must resolve the exact-episode track"
+    );
+
+    // Crash-reconciliation: re-create the sidecar as if the resolve didn't persist
+    let sent_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    assert!(crate::daemon::ci_handoff_track::record_with_identity(
+        &dir,
+        "reviewer",
+        "o/r@feat",
+        &sent_at,
+        Some("ack2870"),
+        None,
+        Some(episode),
+        Some(crate::inbox::CiHandoffClass::Feature),
+    ));
+    let now_reconcile = chrono::Utc::now();
+    let reconciled = crate::daemon::ci_handoff_track::reconcile_processed(&dir, &now_reconcile);
+    assert_eq!(
+        reconciled, 1,
+        "#2870 positive: crash-reconciliation must clean up a re-created sidecar \
+         whose inbox row is already Processed via ack_handoff"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// #2870 RED: a feature-class CI handoff sidecar produced by the real
+/// `ci_check_repo` pipeline (MockProvider → poller → enqueue + record) must
+/// survive ordinary inbox drains and remain available for re-nudge / escalation
+/// by the watchdog. Current production WRONGLY deletes the sidecar: the second
+/// drain implicitly marks the row Processed, and `reconcile_processed` (called
+/// from the watchdog tick) deletes the track — killing re-nudge and escalation.
+#[test]
+fn feature_ci_drain_must_not_lose_renudge_or_escalation_real_producer_2870() {
+    let dir = tmp_dir("2870-real-producer-red");
+
+    // Fleet config for watchdog escalation
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&dir),
+        "instances:\n  reviewer:\n    backend: claude\n  lead:\n    backend: claude\n\
+         teams:\n  t:\n    members: [reviewer, lead]\n    orchestrator: lead\n",
+    )
+    .unwrap();
+
+    // Agent snapshot: reviewer is idle (re-nudge target)
+    crate::snapshot::save(
+        &dir,
+        &[crate::snapshot::AgentSnapshot {
+            name: "reviewer".to_string(),
+            backend_command: String::new(),
+            args: vec![],
+            working_dir: None,
+            submit_key: String::new(),
+            health_state: String::new(),
+            agent_state: "idle".to_string(),
+            silent_secs: 0,
+            output_silent_secs: 0,
+        }],
+    );
+
+    // ── real MockProvider CI producer ──
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = watch_with_chain(Some("reviewer"));
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: 28701,
+        conclusion: Some("success".to_string()),
+        head_sha: "red2870".to_string(),
+        url: "https://example/run/28701".to_string(),
+        name: String::new(),
+    }]);
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
+        &registry,
+        &provider,
+    ))
+    .unwrap();
+
+    // Precondition: real producer created a Feature-class track
+    let tracks = crate::daemon::ci_handoff_track::list(&dir);
+    assert!(
+        tracks.iter().any(|(_p, t)| t.target == "reviewer"
+            && t.correlation == "o/r@feat"
+            && t.ci_handoff_class == Some(crate::inbox::CiHandoffClass::Feature)),
+        "precondition: real producer must create a Feature-class ci-handoff track; got: {tracks:?}"
+    );
+
+    // ── first drain: row transitions unread → delivering ──
+    let d1 = crate::inbox::drain(&dir, "reviewer");
+    assert!(
+        d1.iter()
+            .any(|m| m.kind.as_deref() == Some("ci-ready-for-action")),
+        "first drain must deliver the feature ci-ready row"
+    );
+    assert_eq!(
+        crate::daemon::ci_handoff_track::list(&dir)
+            .iter()
+            .filter(|(_, t)| t.target == "reviewer" && t.correlation == "o/r@feat")
+            .count(),
+        1,
+        "track must survive first drain"
+    );
+
+    // ── second drain WITHOUT ack_handoff: implicit ack ──
+    let d2 = crate::inbox::drain(&dir, "reviewer");
+    assert!(
+        d2.iter()
+            .all(|m| m.kind.as_deref() != Some("ci-ready-for-action")),
+        "second drain must not re-deliver the already-delivering row"
+    );
+    assert_eq!(
+        crate::daemon::ci_handoff_track::list(&dir)
+            .iter()
+            .filter(|(_, t)| t.target == "reviewer" && t.correlation == "o/r@feat")
+            .count(),
+        1,
+        "track must survive second drain (no protected settlement for feature class)"
+    );
+
+    // ── watchdog tick: reconcile_processed fires ──
+    // The track's sent_at was set by the real producer moments ago. We need
+    // `now` to be past TRACK_RECONCILE_GRACE (30s) relative to sent_at.
+    let now_past_grace = chrono::Utc::now() + chrono::Duration::seconds(35);
+    let mut esc = std::collections::HashMap::new();
+    let mut ren = std::collections::HashMap::new();
+    let mut nudged = Vec::new();
+    crate::daemon::handoff_timeout_watchdog::scan_and_emit_with(
+        &dir,
+        &now_past_grace,
+        &mut esc,
+        &mut ren,
+        |t, _| nudged.push(t.to_string()),
+        |_, _| 0,
+    );
+
+    // RED: the track must survive reconcile_processed — the agent never called
+    // ack_handoff, so the sidecar must remain for re-nudge / escalation.
+    assert_eq!(
+        crate::daemon::ci_handoff_track::list(&dir)
+            .iter()
+            .filter(|(_, t)| t.target == "reviewer" && t.correlation == "o/r@feat")
+            .count(),
+        1,
+        "#2870: feature ci-handoff track must survive watchdog reconciliation \
+         after ordinary inbox drain — only explicit ack_handoff should resolve it"
+    );
+
+    // ── watchdog at +2m → re-nudge must fire ──
+    let now_2m = chrono::Utc::now() + chrono::Duration::minutes(2) + chrono::Duration::seconds(5);
+    let mut esc_2m = std::collections::HashMap::new();
+    let mut ren_2m = std::collections::HashMap::new();
+    let mut nudged_2m = Vec::new();
+    crate::daemon::handoff_timeout_watchdog::scan_and_emit_with(
+        &dir,
+        &now_2m,
+        &mut esc_2m,
+        &mut ren_2m,
+        |t, _| nudged_2m.push(t.to_string()),
+        |_, _| 0,
+    );
+    assert!(
+        nudged_2m.iter().any(|t| t == "reviewer"),
+        "#2870: watchdog must re-nudge after ordinary drain — \
+         the feature ci-handoff was never explicitly acked"
+    );
+
+    // ── watchdog at +10m → escalation must fire ──
+    let now_10m = chrono::Utc::now() + chrono::Duration::minutes(10) + chrono::Duration::seconds(5);
+    let mut esc_10m = std::collections::HashMap::new();
+    let mut ren_10m = std::collections::HashMap::new();
+    crate::daemon::handoff_timeout_watchdog::scan_and_emit_with(
+        &dir,
+        &now_10m,
+        &mut esc_10m,
+        &mut ren_10m,
+        |_, _| {},
+        |_, _| 0,
+    );
+    let lead_msgs = crate::inbox::drain(&dir, "lead");
+    assert!(
+        lead_msgs
+            .iter()
+            .any(|m| m.text.contains("handoff_timeout_watchdog") || m.text.contains("ci-ready")),
+        "#2870: watchdog must escalate to lead after ordinary drain — \
+         the feature ci-handoff track must not have been silently deleted"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
