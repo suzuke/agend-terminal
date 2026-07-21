@@ -1152,6 +1152,48 @@ fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
     std::fs::remove_dir_all(workspace).ok();
 }
 
+/// #2877 RED: an arbitrarily named wrapper must leave the declared backend on
+/// the live handle so exit detection and UsageLimit routing do not infer from
+/// the mutable executable command.
+#[test]
+fn wrapper_spawn_persists_declared_backend_for_consumers_2877() {
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let declared = Backend::ClaudeCode;
+    let config = SpawnConfig {
+        name: "wrapper-2877",
+        backend: Some(&declared),
+        backend_command: "true",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let id = spawn_agent(&config, &registry).expect("wrapper spawn");
+    let handle = registry
+        .lock()
+        .remove(&id)
+        .expect("spawned handle must be registered");
+
+    assert_eq!(handle.declared_backend, Some(Backend::ClaudeCode));
+    assert!(crate::daemon::per_tick::backend_exit_detection::backend_mismatch_declared(
+        handle.declared_backend.as_ref(),
+        "codex",
+    ));
+    assert_eq!(
+        crate::daemon::supervisor::usage_limit_control::backend_identity_name(
+            handle.declared_backend.as_ref(),
+            "true",
+        ),
+        "claude"
+    );
+}
+
 #[test]
 fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
     let config = SpawnConfig {
