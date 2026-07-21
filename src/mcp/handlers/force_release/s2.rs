@@ -137,7 +137,7 @@ pub(crate) fn force_release(
             (Some(identity), Some(fingerprint))
         }
         GuardedBinding::Absent => {
-            let target = crate::worktree::worktree_path(home, agent, branch);
+            let target = unbound(home, agent, branch, explicit_repo)?;
             let target_state = classify_target(&target)?;
             let identity = match target_state {
                 TargetState::Present => {
@@ -316,6 +316,42 @@ fn resolve_identity(
         worktree: worktree.to_path_buf(),
         source_repo,
     })
+}
+
+fn unbound(home: &Path, agent: &str, branch: &str, repo: Option<&Path>) -> Result<PathBuf, String> {
+    let legacy = crate::worktree::worktree_path(home, agent, branch);
+    if matches!(classify_target(&legacy)?, TargetState::Present) {
+        return Ok(legacy);
+    }
+    let Some(repo) = repo else {
+        return Ok(legacy);
+    };
+    let repo = canonical_repo(repo)?;
+    let entries = match std::fs::read_dir(home.join("worktrees")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(legacy),
+        Err(error) => return Err(format!("force release refused: unreadable pool: {error}")),
+    };
+    let prefix = format!("{agent}-");
+    let mut found = None;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("force release refused: unreadable entry: {e}"))?;
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with(&prefix)
+            || marker_field(&path, "agent").as_deref() != Some(agent)
+            || marker_field(&path, "branch").as_deref() != Some(branch)
+        {
+            continue;
+        }
+        let marker_repo = marker_field(&path, "source_repo").ok_or("target missing source_repo")?;
+        if canonical_repo(Path::new(&marker_repo))? != repo {
+            continue;
+        }
+        if found.replace(path).is_some() {
+            return Err("force release refused: ambiguous exact managed targets".to_string());
+        }
+    }
+    Ok(found.unwrap_or(legacy))
 }
 
 fn canonical_repo(path: &Path) -> Result<PathBuf, String> {
