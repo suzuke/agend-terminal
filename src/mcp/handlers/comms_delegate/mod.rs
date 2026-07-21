@@ -1,19 +1,3 @@
-//! W2.2: `handle_delegate_task` as an ordered phase pipeline.
-//!
-//! Stages (failure order preserved — a reject before lease never leases;
-//! a send failure may still have leased/created a task, same as pre-split):
-//!
-//! 1. **resolve** — identity, instance/team target, self-dispatch reject
-//! 2. **validate** — pre-send gates (`comms_gates::run_dispatch_pre_checks`)
-//! 3. **compose** — message body + force_meta
-//! 4. **lease** — optional `dispatch_auto_bind_lease` when `branch` set
-//! 5. **create** — optional auto board task after all rejectable checks
-//! 6. **send** — `execute_send` via neutral typed service (or API bridge fallback)
-//! 7. **track** — dispatch_tracking + UX + `auto_created_task_id` on success
-//!
-//! Loaded as a child of `comms` so `file_size_invariant` keeps `comms.rs` under
-//! the handler LOC cap while the choreography stays one ordered function.
-
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
 use crate::daemon::pr_state::ReviewClass;
