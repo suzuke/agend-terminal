@@ -733,4 +733,97 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&canonical);
     }
+
+    /// #2895 RED: `DEFAULT_BRANCH` is hardcoded to `"main"` — repos whose
+    /// actual default is NOT `"main"` (e.g. `"dev"`) hit two bugs:
+    ///   (a) `head_state == DEFAULT_BRANCH` is false → dirty-on-default report
+    ///       never fires even when the canonical IS on its true default + dirty.
+    ///   (b) `git switch DEFAULT_BRANCH` switches to `"main"` instead of the
+    ///       repo's actual default → fails or targets the wrong branch.
+    ///
+    /// Fixture: real micro-repo with `refs/remotes/origin/HEAD → origin/dev`.
+    #[test]
+    fn apply_to_canonical_respects_repo_default_branch_2895() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let base = std::env::temp_dir().join(format!(
+            "agend-test-2895-dev-default-{}-{id}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let bare = base.join("origin.git");
+        let canonical = base.join("canonical");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let run_at = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command spawn")
+        };
+
+        // Bare origin with default branch "dev".
+        assert!(run_at(&bare, &["init", "--bare", "-b", "dev"]).status.success());
+        // Canonical repo on "dev".
+        assert!(run_at(&canonical, &["init", "-b", "dev"]).status.success());
+        std::fs::write(canonical.join("file.txt"), "initial\n").unwrap();
+        assert!(run_at(&canonical, &["add", "file.txt"]).status.success());
+        assert!(run_at(&canonical, &["commit", "-q", "-m", "initial"]).status.success());
+        // Wire remote + push + set origin/HEAD → origin/dev.
+        assert!(run_at(
+            &canonical,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        ).status.success());
+        assert!(run_at(&canonical, &["push", "-u", "origin", "dev"]).status.success());
+        assert!(run_at(&canonical, &["remote", "set-head", "origin", "dev"]).status.success());
+
+        // Sanity: git_helpers::default_branch must resolve to "dev".
+        let resolved = crate::git_helpers::default_branch(&canonical);
+        assert_eq!(resolved, "dev", "setup: default_branch must resolve to 'dev'");
+
+        // --- (a) HEAD on "dev" + dirty → MUST produce CanonicalDirtyReport ---
+        std::fs::write(canonical.join("scratch.txt"), "dirty\n").unwrap();
+        let report = apply_to_canonical(&canonical);
+        assert!(
+            report.is_some(),
+            "#2895 bug (a): canonical dirty on 'dev' (the true default) must report, \
+             but hardcoded DEFAULT_BRANCH='main' makes the comparison false"
+        );
+        // Clean up for part (b).
+        std::fs::remove_file(canonical.join("scratch.txt")).unwrap();
+
+        // --- (b) Detach HEAD + clean → must auto-switch to "dev", not "main" ---
+        let sha = String::from_utf8(run_at(&canonical, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            run_at(&canonical, &["checkout", "-q", &sha]).status.success(),
+            "detach HEAD via checkout SHA"
+        );
+        let _ = apply_to_canonical(&canonical);
+        let head_after = String::from_utf8(
+            run_at(&canonical, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(
+            head_after, "dev",
+            "#2895 bug (b): detached clean canonical must auto-switch to 'dev' (the true \
+             default), not 'main'"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
