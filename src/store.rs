@@ -297,9 +297,10 @@ impl Drop for FileFlockGuard {
 /// partially initialised lock file might be observed empty by another opener
 /// while the flock itself is still held on the inode.
 ///
-/// #1629: this is the SOLE flock chokepoint that bumps `FLOCK_DEPTH`. The 2
-/// daemon-singleton `.daemon.lock` raw `fs4::try_lock` sites deliberately bypass
-/// it (they hold for the daemon's whole life and must not pin the depth).
+/// #1629: this is the SOLE flock chokepoint that bumps `FLOCK_DEPTH`. The one
+/// daemon-singleton `.daemon.lock` raw `fs4::try_lock` site
+/// (`bootstrap::acquire_daemon_lock`) deliberately bypasses it (it holds for the
+/// daemon's whole life and must not pin the depth).
 pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<FileFlockGuard> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;

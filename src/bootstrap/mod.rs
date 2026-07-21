@@ -42,7 +42,7 @@ fn maybe_init_discord(_config: &crate::fleet::FleetConfig, _enabled: bool) {}
 
 pub use agent_resolve::AgentDef;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -78,9 +78,84 @@ pub(crate) fn time_step<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
 ///
 /// Dropping the struct releases the lock. Keep this alive for the entire
 /// lifetime of the owning process.
+#[derive(Debug)]
 pub struct DaemonLock {
     _file: std::fs::File,
 }
+
+/// Sentinel error: `.daemon.lock` is held by another live process.
+///
+/// Losing this flock is NOT a generic bootstrap failure — it is positive
+/// evidence that a daemon is already alive on this `$AGEND_HOME`. A caller that
+/// degrades to "assume we own the fleet" spawns a SECOND copy of every instance
+/// (duplicate agent identities, cross-written memory dirs, dispatch replies
+/// answered by the wrong lead). Callers MUST fail closed; see
+/// `app::setup_app_bootstrap`, whose catch-all `Err` arm did exactly that
+/// degrade before this type existed.
+///
+/// Carried through `anyhow` — recover it with
+/// `err.downcast_ref::<DaemonAlreadyRunning>()`.
+#[derive(Debug)]
+pub struct DaemonAlreadyRunning {
+    /// Incumbent's PID. `None` when the lock is held but its run dir is not yet
+    /// discoverable — a real window: `prepare` takes the flock at
+    /// [`acquire_daemon_lock`] but does not publish `.daemon` until
+    /// [`crate::daemon::write_daemon_id`] a few steps later.
+    pub pid: Option<u32>,
+    /// Incumbent's boot time (unix seconds), when discoverable.
+    pub boot_unix: Option<u64>,
+}
+
+impl DaemonAlreadyRunning {
+    /// Identify whoever currently owns `home` for the operator-facing message.
+    ///
+    /// Reuses the daemon's own discovery fn, so PID-reuse and start-token
+    /// mismatches are filtered out the same way everywhere else in the codebase.
+    fn probe(home: &Path) -> Self {
+        let run = crate::daemon::find_active_run_dir(home);
+        Self {
+            pid: run.as_deref().and_then(crate::daemon::read_daemon_pid),
+            boot_unix: run.as_deref().and_then(crate::daemon::read_daemon_boot_unix),
+        }
+    }
+
+    /// Render the boot time as a local-time string; falls back to the raw epoch
+    /// when it cannot be interpreted, so the operator always gets *something*
+    /// to correlate against `ps`.
+    fn started_at(&self) -> String {
+        let Some(secs) = self.boot_unix else {
+            return "unknown".to_string();
+        };
+        match chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0) {
+            Some(dt) => dt
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            None => format!("epoch {secs}"),
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonAlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.pid {
+            Some(pid) => write!(
+                f,
+                "another agend-terminal daemon is already running (pid {pid}, started {})",
+                self.started_at()
+            ),
+            // Mid-boot window: the flock is held but `.daemon` is not published
+            // yet. Say so plainly rather than printing a bogus PID.
+            None => write!(
+                f,
+                "another agend-terminal daemon is already running \
+                 (holds .daemon.lock; still starting up, pid not published yet)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonAlreadyRunning {}
 
 /// Result of [`prepare`] — tells the caller whether this process is the daemon
 /// or a client of an existing one.
@@ -543,15 +618,32 @@ fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
     }))
 }
 
-fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
+/// Take the process-lifetime daemon singleton flock.
+///
+/// Contention is reported as a typed [`DaemonAlreadyRunning`] so callers can
+/// tell "a daemon is already alive" apart from "bootstrap broke". Everything
+/// else (open failure, real flock I/O error) stays an untyped error with the
+/// pre-existing semantics — an I/O failure is not evidence about peers.
+pub(crate) fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
     let path = home.join(".daemon.lock");
     let file = std::fs::File::create(&path).with_context(|| format!("open {}", path.display()))?;
     // Explicit trait method: Rust 1.89 stabilized inherent
     // `File::try_lock` shadowing the trait method; current MSRV is 1.87.
-    fs4::FileExt::try_lock(&file).map_err(|e| {
-        anyhow!("another agend-terminal daemon is already running (lock held): {e}")
-    })?;
-    Ok(DaemonLock { _file: file })
+    //
+    // Mirrors `store::classify_try_lock`'s shape (contention must stay
+    // distinguishable from I/O failure) but deliberately does NOT bump
+    // `sync_audit::FLOCK_DEPTH` — this guard is held for the whole process
+    // lifetime and would pin the self-IPC deadlock guard at >0 forever
+    // (see the audit note in `sync_audit.rs`).
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => Ok(DaemonLock { _file: file }),
+        Err(fs4::TryLockError::WouldBlock) => {
+            Err(anyhow::Error::new(DaemonAlreadyRunning::probe(home)))
+        }
+        Err(fs4::TryLockError::Error(e)) => {
+            Err(anyhow::Error::new(e).context(format!("flock try_lock failed on {}", path.display())))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +723,124 @@ mod tests {
             }
             BootstrapOutcome::Attached(_) => panic!("expected Owned on fresh home"),
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Split-brain regression (2026-07-21 incident).
+    ///
+    /// Contention on `.daemon.lock` must surface as the typed
+    /// [`DaemonAlreadyRunning`], not an opaque string error. The app path keys
+    /// its fail-closed decision off this downcast; if contention ever degrades
+    /// back to an untyped error, `setup_app_bootstrap` silently resumes spawning
+    /// a second fleet. Deterministic: two file descriptions in one process
+    /// conflict under `flock`, so no timing or child process is involved.
+    #[test]
+    fn daemon_lock_contention_reports_typed_already_running() {
+        let home = tmp_home("lock-typed");
+        let first = acquire_daemon_lock(&home).expect("first acquisition owns the lock");
+
+        let err = acquire_daemon_lock(&home).expect_err("second acquisition must be refused");
+        assert!(
+            err.downcast_ref::<DaemonAlreadyRunning>().is_some(),
+            "contention must be typed so callers can fail closed; got: {err:#}"
+        );
+
+        drop(first);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The refusal must name the incumbent — the operator's next move is
+    /// `ps`/`kill` against that PID, and "some other daemon" is not actionable.
+    /// `prepare` publishes `.daemon` for the live process, so the probe resolves
+    /// this process as the holder.
+    #[test]
+    fn daemon_lock_contention_carries_incumbent_identity() {
+        let home = tmp_home("lock-identity");
+        let fleet = write_minimal_fleet(&home);
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            init_discord: false,
+            resolve_agents: false,
+        };
+        let owned = prepare(&home, &fleet, opts).expect("prepare");
+
+        let err = acquire_daemon_lock(&home).expect_err("lock is held by `owned`");
+        let conflict = err
+            .downcast_ref::<DaemonAlreadyRunning>()
+            .expect("typed conflict");
+        assert_eq!(
+            conflict.pid,
+            Some(std::process::id()),
+            "incumbent PID must be the process holding the lock"
+        );
+        assert!(
+            conflict.boot_unix.is_some(),
+            "start time must be reported so the operator can correlate with `ps`"
+        );
+        let rendered = conflict.to_string();
+        assert!(
+            rendered.contains(&std::process::id().to_string()),
+            "operator-facing message must contain the PID; got: {rendered}"
+        );
+
+        drop(owned);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Stale-lock reclaim. `flock` is released by the kernel when the holding
+    /// file description goes away — on `kill -9` just as on a clean exit — so a
+    /// dead daemon can never wedge the next boot. Dropping the guard is the
+    /// in-process equivalent of the holder dying.
+    #[test]
+    fn daemon_lock_is_reclaimable_after_holder_releases() {
+        let home = tmp_home("lock-reclaim");
+        let first = acquire_daemon_lock(&home).expect("first acquisition");
+        assert!(
+            acquire_daemon_lock(&home).is_err(),
+            "precondition: contended while held"
+        );
+
+        drop(first);
+
+        let second = acquire_daemon_lock(&home);
+        assert!(
+            second.is_ok(),
+            "a released lock must be reclaimable — otherwise a crashed daemon \
+             bricks every subsequent start; got: {:?}",
+            second.err()
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The seam the app fix depends on: the typed conflict must survive being
+    /// raised through `prepare`, not just from `acquire_daemon_lock` directly.
+    /// `prepare` runs `try_attach` first; with no reachable API the attach
+    /// returns `None` and control reaches the lock, which is already held.
+    #[test]
+    fn prepare_surfaces_typed_conflict_when_lock_already_held() {
+        let home = tmp_home("prepare-conflict");
+        let fleet = write_minimal_fleet(&home);
+        let _held = acquire_daemon_lock(&home).expect("pre-hold the lock");
+
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            init_discord: false,
+            resolve_agents: false,
+        };
+        // `expect_err` would need `BootstrapOutcome: Debug`, and deriving it
+        // would drag Debug onto OwnedFleet/DaemonLock/FleetConfig for one test.
+        let err = match prepare(&home, &fleet, opts) {
+            Ok(_) => panic!("prepare must not claim ownership while the lock is held"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<DaemonAlreadyRunning>().is_some(),
+            "prepare must propagate the typed conflict for callers to fail closed on; got: {err:#}"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 
