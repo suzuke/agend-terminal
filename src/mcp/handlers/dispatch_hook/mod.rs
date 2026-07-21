@@ -20,6 +20,7 @@ pub(crate) use lifecycle_permit::{
     is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
 };
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
+pub(crate) use provider_neutral_slug::canonicalize_repo_slug_any_forge;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across

@@ -28,6 +28,7 @@ use super::super::{err_needs_identity, is_ok_result, require_instance};
 
 // #6: pub(crate) so ci/review_workspace_tests.rs can drive the validation
 // function directly (RED-first test for bind/worktree_binding_required rejection).
+mod merge_train;
 pub(crate) mod review_assignment;
 
 /// Sprint 55 P0-C — true when the caller passed `bind: false`.
@@ -534,6 +535,14 @@ pub(crate) fn handle_delegate_task(
     };
 
     let composed = compose_delegate_message(task, args, &checks);
+
+    // Merge train admission — must precede bind/create/deliver so a Queued
+    // dispatch never leases a worktree or creates side-effects.
+    match merge_train::admit(home, args, target, checks.review_assignment) {
+        Ok(merge_train::Admission::NotGoverned | merge_train::Admission::Front) => {}
+        Ok(merge_train::Admission::Queued(v)) => return v,
+        Err(e) => return e,
+    }
 
     let review_assignment_repo = if checks.review_assignment {
         match review_assignment::validate_review_assignment_marker(
