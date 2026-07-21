@@ -945,6 +945,117 @@ pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, Task
     })
 }
 
+// ── Merge Train Slice 1 — admission metadata through the board-root seam ──
+
+pub(crate) fn scan_merge_train_state(
+    home: &Path,
+    repo: &str,
+    domain: &str,
+) -> Result<(Vec<String>, u64), TaskRouteError> {
+    let state = board_router::replay_all_boards_strict(home)?;
+    let fronts = state
+        .tasks
+        .iter()
+        .filter(|(_, r)| {
+            r.metadata
+                .get("merge_train_repository")
+                .and_then(|v| v.as_str())
+                == Some(repo)
+                && r.metadata
+                    .get("merge_train_domain")
+                    .and_then(|v| v.as_str())
+                    == Some(domain)
+                && r.metadata
+                    .get("merge_train_position")
+                    .and_then(|v| v.as_str())
+                    == Some("Front")
+        })
+        .map(|(id, _)| id.0.clone())
+        .collect();
+    let max_seq = state
+        .tasks
+        .values()
+        .filter(|r| {
+            r.metadata
+                .get("merge_train_repository")
+                .and_then(|v| v.as_str())
+                == Some(repo)
+                && r.metadata
+                    .get("merge_train_domain")
+                    .and_then(|v| v.as_str())
+                    == Some(domain)
+        })
+        .filter_map(|r| {
+            r.metadata
+                .get("merge_train_queue_seq")
+                .and_then(|v| v.as_u64())
+        })
+        .max()
+        .unwrap_or(0);
+    Ok((fronts, max_seq + 1))
+}
+
+pub(crate) fn write_merge_train_metadata(
+    home: &Path,
+    task_id: &str,
+    entries: &[(&str, serde_json::Value)],
+) -> Result<(), serde_json::Value> {
+    let routed = load_routed(home, task_id).map_err(|e| {
+        serde_json::json!({
+            "ok": false,
+            "error": format!("merge train metadata write: task route for '{task_id}': {e}"),
+            "code": "merge_train_route_error",
+        })
+    })?;
+    let emitter = crate::task_events::InstanceName("system:merge_train".into());
+    let events: Vec<crate::task_events::TaskEvent> = entries
+        .iter()
+        .map(|(key, value)| crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(task_id.into()),
+            by: emitter.clone(),
+            key: (*key).into(),
+            value: value.clone(),
+        })
+        .collect();
+    let task = crate::task_events::TaskId(task_id.into());
+    match routed.with_revalidated_computed(home, &emitter, move |fresh| {
+        let record = fresh
+            .tasks
+            .get(&task)
+            .ok_or_else(|| format!("task '{}' disappeared before merge-train write", task.0))?;
+        let train_keys = [
+            "merge_train_repository",
+            "merge_train_domain",
+            "merge_train_position",
+            "merge_train_queue_seq",
+        ];
+        if train_keys
+            .iter()
+            .any(|key| record.metadata.contains_key(*key))
+        {
+            return Err("merge-train metadata changed before atomic append".into());
+        }
+        Ok(events)
+    }) {
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(serde_json::json!({
+            "ok": false,
+            "error": format!("merge train metadata write revalidation: {e}"),
+            "code": "merge_train_write_conflict",
+        })),
+        Ok(Err(e)) => Err(serde_json::json!({
+            "ok": false,
+            "error": format!("merge train metadata write: {e}"),
+            "code": "merge_train_write_error",
+        })),
+        Err(e) => Err(serde_json::json!({
+            "ok": false,
+            "error": format!("merge train metadata route revalidation: {e}"),
+            "code": "merge_train_route_error",
+        })),
+    }
+}
+
 /// Return all tasks as typed structs. **PR3 cutover** — sources state
 /// from `task_events::replay()` instead of the legacy `tasks.json`.
 /// Dep-derived blocking is computed in-memory at this call (option (a)

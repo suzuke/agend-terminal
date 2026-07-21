@@ -20,6 +20,7 @@ pub(crate) use lifecycle_permit::{
     is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
 };
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
+pub(crate) use provider_neutral_slug::canonicalize_repo_slug_any_forge;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across
@@ -719,6 +720,16 @@ fn resolve_source_repo(
     tracing::warn!(%target, tier = "stub", path = %stub.display(),
         "source_repo using home/workspace stub (tier 4) — fleet.yaml has no source_repo OR working_directory; binding may target wrong git history");
     (stub, SourceRepoTier::Stub)
+}
+
+/// Resolve a target's source repository through the exact dispatch tier order.
+/// Kept narrow so pre-dispatch authority checks can share the resolver without
+/// acquiring a bind guard or starting any worktree lifecycle operation.
+pub(crate) fn resolve_source_repo_for_target(home: &Path, target: &str) -> PathBuf {
+    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.resolve_instance(target));
+    resolve_source_repo(home, target, None, resolved.as_ref()).0
 }
 
 /// CR-2026-06-14 F3: dispatch-time `git fetch` budget. `ensure_branch_exists` is

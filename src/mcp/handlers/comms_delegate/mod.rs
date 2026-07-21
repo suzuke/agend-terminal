@@ -1,19 +1,3 @@
-//! W2.2: `handle_delegate_task` as an ordered phase pipeline.
-//!
-//! Stages (failure order preserved — a reject before lease never leases;
-//! a send failure may still have leased/created a task, same as pre-split):
-//!
-//! 1. **resolve** — identity, instance/team target, self-dispatch reject
-//! 2. **validate** — pre-send gates (`comms_gates::run_dispatch_pre_checks`)
-//! 3. **compose** — message body + force_meta
-//! 4. **lease** — optional `dispatch_auto_bind_lease` when `branch` set
-//! 5. **create** — optional auto board task after all rejectable checks
-//! 6. **send** — `execute_send` via neutral typed service (or API bridge fallback)
-//! 7. **track** — dispatch_tracking + UX + `auto_created_task_id` on success
-//!
-//! Loaded as a child of `comms` so `file_size_invariant` keeps `comms.rs` under
-//! the handler LOC cap while the choreography stays one ordered function.
-
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
 use crate::daemon::pr_state::ReviewClass;
@@ -28,6 +12,7 @@ use super::super::{err_needs_identity, is_ok_result, require_instance};
 
 // #6: pub(crate) so ci/review_workspace_tests.rs can drive the validation
 // function directly (RED-first test for bind/worktree_binding_required rejection).
+mod merge_train;
 pub(crate) mod review_assignment;
 
 /// Sprint 55 P0-C — true when the caller passed `bind: false`.
@@ -246,15 +231,16 @@ pub(crate) fn resolve_existing_task_review_class(
     Ok(resolved)
 }
 
-/// Phase 4 — optional auto-bind lease (rejectable).
-fn maybe_auto_bind_lease(
+/// Read-only merge-authority preflight. Uses the exact auto-bind applicability
+/// predicate, but performs no bind/watch side effect.
+fn preflight_auto_bind_review_class(
     home: &Path,
     args: &Value,
     target: &str,
     second_reviewer: bool,
-) -> Result<(), Value> {
+) -> Result<Option<&'static str>, Value> {
     let Some(branch) = args["branch"].as_str() else {
-        return Ok(());
+        return Ok(None);
     };
     let task_id_val = args["task_id"].as_str().unwrap_or("");
     if dispatch_should_skip_auto_bind(args) {
@@ -262,10 +248,8 @@ fn maybe_auto_bind_lease(
             %target, %branch, task_id = %task_id_val,
             "dispatch_auto_bind_lease skipped (bind: false)"
         );
-        return Ok(());
+        return Ok(None);
     }
-    let next_after_ci =
-        crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
     // #2745 (decision d-…-11 + R3 finding 2): this is the MERGE-AUTHORITY branch — a
     // `branch` was supplied → PR-producing / auto-watched. Resolve the durable
     // review_class authority BEFORE arming, with the authority source keyed on the
@@ -304,9 +288,14 @@ fn maybe_auto_bind_lease(
             // byte-identical to the removed default-only `load_by_id` seam (a task
             // not found there yielded `None`). The existing-task resolver then
             // rejects it as `review_class_unspecified` (unchanged #2745 contract).
-            Err(crate::tasks::TaskRouteError::NotFound) => {
+            Err(crate::tasks::TaskRouteError::NotFound) if !task_id_val.starts_with("t-") => {
                 resolve_existing_task_review_class(None, arg_review_class, second_reviewer)
             }
+            // Canonical task ids are governed by merge-train admission. Preserve
+            // its task-existence/uniqueness refusal codes by deferring unresolved
+            // routes to that gate; no bind can occur because admission returns.
+            Err(crate::tasks::TaskRouteError::NotFound) => return Ok(None),
+            Err(_) if task_id_val.starts_with("t-") => return Ok(None),
             // #2760 NEW fail-closed: the task EXISTS but its authoritative board
             // cannot be uniquely proven (duplicate id across boards / unreadable
             // board) — REJECT the merge-authority dispatch atomically BEFORE any
@@ -332,8 +321,8 @@ fn maybe_auto_bind_lease(
             }
         }
     };
-    let armed_review_class = match resolved_review_class {
-        Ok(class) => class.as_token(),
+    match resolved_review_class {
+        Ok(class) => Ok(Some(class.as_token())),
         Err(refusal) => {
             // #2745 fail-closed (root pre-review finding 2): REJECT the
             // merge-authority dispatch ATOMICALLY — before any bind / task-create /
@@ -356,16 +345,35 @@ fn maybe_auto_bind_lease(
                      then re-dispatch"
                 )
             };
-            return Err(json!({
+            Err(json!({
                 "ok": false,
                 "error": refusal.diagnostic(branch),
                 "code": refusal.code(),
                 "remediation": remediation,
                 "branch": branch,
                 "task_id": task_id_val,
-            }));
+            }))
         }
+    }
+}
+
+/// Phase 4 — optional auto-bind lease (rejectable). The review-class authority
+/// was already resolved by the read-only preflight before merge-train admission.
+fn maybe_auto_bind_lease(
+    home: &Path,
+    args: &Value,
+    target: &str,
+    armed_review_class: Option<&str>,
+) -> Result<(), Value> {
+    let Some(armed_review_class) = armed_review_class else {
+        return Ok(());
     };
+    let branch = args["branch"]
+        .as_str()
+        .expect("review-class preflight requires a branch");
+    let task_id_val = args["task_id"].as_str().unwrap_or("");
+    let next_after_ci =
+        crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
     dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain(
         home,
         target,
@@ -535,6 +543,37 @@ pub(crate) fn handle_delegate_task(
 
     let composed = compose_delegate_message(task, args, &checks);
 
+    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
+    // durable mutations, including merge-train admission metadata.
+    if !checks.review_assignment
+        && runtime.is_none()
+        && args["branch"].as_str().is_some_and(|b| !b.is_empty())
+    {
+        return json!({
+            "ok": false,
+            "error": "branch dispatch requires in-process runtime",
+            "code": "runtime_unavailable_branch_2454",
+            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
+        });
+    }
+
+    let armed_review_class = if checks.review_assignment {
+        None
+    } else {
+        match preflight_auto_bind_review_class(home, args, target, composed.second_reviewer) {
+            Ok(class) => class,
+            Err(e) => return e,
+        }
+    };
+
+    // Merge train admission — must precede bind/create/deliver so a Queued
+    // dispatch never leases a worktree or creates side-effects.
+    match merge_train::admit(home, args, target, checks.review_assignment) {
+        Ok(merge_train::Admission::NotGoverned | merge_train::Admission::Front) => {}
+        Ok(merge_train::Admission::Queued(v)) => return v,
+        Err(e) => return e,
+    }
+
     let review_assignment_repo = if checks.review_assignment {
         match review_assignment::validate_review_assignment_marker(
             home, sender, target, args, &checks,
@@ -547,7 +586,7 @@ pub(crate) fn handle_delegate_task(
     };
 
     if !checks.review_assignment && runtime.is_some() {
-        if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
+        if let Err(e) = maybe_auto_bind_lease(home, args, target, armed_review_class) {
             return e;
         }
     }
@@ -556,18 +595,6 @@ pub(crate) fn handle_delegate_task(
         return review_assignment::dispatch_review_assignment_via_store(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
-    }
-
-    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
-    // durable mutations (task-create/delivery). Placed after the
-    // review_assignment early-return to preserve that path byte-for-byte.
-    if runtime.is_none() && args["branch"].as_str().is_some_and(|b| !b.is_empty()) {
-        return json!({
-            "ok": false,
-            "error": "branch dispatch requires in-process runtime",
-            "code": "runtime_unavailable_branch_2454",
-            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
-        });
     }
 
     let (effective_task_id, auto_created_task_id) = if runtime.is_some() {
