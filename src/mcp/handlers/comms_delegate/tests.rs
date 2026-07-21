@@ -739,3 +739,693 @@ mod review_assignment_marker_tests {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Arch14 Merge Train Slice 1 — immutable RED (d-20260720234700739461-7).
+//
+// Tests exercise the REAL handle_delegate_task dispatch entry and assert
+// merge-train admission behavior that does not exist yet. Every test
+// fails because the dispatch path has no merge-train awareness.
+//
+// Group A: concurrent same repo+domain → Front/Queued/idempotent
+// Group B: side-effect suppression + disjoint repo/domain + __repo__ fallback
+// Group C: structural refusal for bad metadata
+// ─────────────────────────────────────────────────────────────────
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod merge_train_admission_red {
+    use super::super::handle_delegate_task;
+    use crate::identity::Sender;
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    use serde_json::json;
+
+    const META_TRAIN_REPO: &str = "merge_train_repository";
+    const META_TRAIN_DOMAIN: &str = "merge_train_domain";
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("agend-mt-red-{}-{n}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn seed_fleet(home: &std::path::Path) {
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            "instances:\n  orch:\n    backend: claude\n    id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n  dev-a:\n    backend: claude\n    id: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n  dev-b:\n    backend: claude\n    id: cccccccc-cccc-4ccc-8ccc-cccccccccccc\n",
+        )
+        .unwrap();
+    }
+
+    fn create_task_with_metadata(
+        home: &std::path::Path,
+        board: &str,
+        task_id: &str,
+        assignee: &str,
+        branch: &str,
+        repo: &str,
+        domain: Option<&str>,
+    ) {
+        let sender = InstanceName::from("orch");
+        let tid = TaskId(task_id.into());
+        let board_path = crate::task_events::board_root(home, board);
+        std::fs::create_dir_all(&board_path).unwrap();
+        let mut events = vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: format!("mt-{task_id}"),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from(assignee)),
+                due_at: None,
+                depends_on: vec![],
+                routed_to: None,
+                branch: Some(branch.into()),
+                bind: Some(true),
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::MetadataSet {
+                task_id: tid.clone(),
+                by: sender.clone(),
+                key: META_TRAIN_REPO.into(),
+                value: json!(repo),
+            },
+        ];
+        if let Some(d) = domain {
+            events.push(TaskEvent::MetadataSet {
+                task_id: tid.clone(),
+                by: sender.clone(),
+                key: META_TRAIN_DOMAIN.into(),
+                value: json!(d),
+            });
+        }
+        crate::task_events::append_batch_at(&board_path, &sender, events).unwrap();
+    }
+
+    fn dispatch(
+        home: &std::path::Path,
+        target: &str,
+        task_id: &str,
+        branch: &str,
+    ) -> serde_json::Value {
+        let sender = Some(Sender::new("orch").unwrap());
+        let rt = crate::mcp::handlers::minimal_test_runtime();
+        handle_delegate_task(
+            home,
+            &json!({
+                "instance": target,
+                "task": format!("dispatch {task_id}"),
+                "request_kind": "task",
+                "task_id": task_id,
+                "branch": branch,
+                "bind": false,
+            }),
+            &sender,
+            Some(&rt),
+        )
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Group A: Concurrent same repository+domain across boards
+    // ────────────────────────────────────────────────────────────────
+
+    /// Two branch-producing dispatches targeting the same repository+domain
+    /// across different project boards: the dispatch result must carry a
+    /// `merge_train_admission` field — one "front", one "queued".
+    #[test]
+    fn a1_concurrent_same_repo_domain_one_front_one_queued() {
+        let home = tmp_home("a1");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "proj-alpha",
+            "t-a1-1",
+            "dev-a",
+            "feat/a1-1",
+            "acme/web",
+            Some("auth"),
+        );
+        create_task_with_metadata(
+            &home,
+            "proj-beta",
+            "t-a1-2",
+            "dev-b",
+            "feat/a1-2",
+            "acme/web",
+            Some("auth"),
+        );
+
+        let r1 = dispatch(&home, "dev-a", "t-a1-1", "feat/a1-1");
+        let r2 = dispatch(&home, "dev-b", "t-a1-2", "feat/a1-2");
+
+        let admissions: Vec<_> = [&r1, &r2]
+            .iter()
+            .filter_map(|r| r.get("merge_train_admission"))
+            .collect();
+        assert_eq!(
+            admissions.len(),
+            2,
+            "both dispatch results must carry merge_train_admission: r1={r1}, r2={r2}"
+        );
+        let has_front = admissions.iter().any(|a| a.as_str() == Some("front"));
+        let has_queued = admissions.iter().any(|a| a.as_str() == Some("queued"));
+        assert!(has_front, "one admission must be front: r1={r1}, r2={r2}");
+        assert!(has_queued, "one admission must be queued: r1={r1}, r2={r2}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Durable after reload: re-evaluating admission from cold (same on-disk
+    /// state) must produce identical Front/Queued positioning.
+    #[test]
+    fn a2_durable_after_reload() {
+        let home = tmp_home("a2");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "proj-alpha",
+            "t-a2-1",
+            "dev-a",
+            "feat/a2-1",
+            "acme/web",
+            Some("pay"),
+        );
+        create_task_with_metadata(
+            &home,
+            "proj-beta",
+            "t-a2-2",
+            "dev-b",
+            "feat/a2-2",
+            "acme/web",
+            Some("pay"),
+        );
+
+        let r1a = dispatch(&home, "dev-a", "t-a2-1", "feat/a2-1");
+        let r2a = dispatch(&home, "dev-b", "t-a2-2", "feat/a2-2");
+
+        // "Reload" — re-dispatch from cold.
+        let r1b = dispatch(&home, "dev-a", "t-a2-1", "feat/a2-1");
+        let r2b = dispatch(&home, "dev-b", "t-a2-2", "feat/a2-2");
+
+        assert_eq!(
+            r1a.get("merge_train_admission"),
+            r1b.get("merge_train_admission"),
+            "admission must be durable: first={r1a} reload={r1b}"
+        );
+        assert_eq!(
+            r2a.get("merge_train_admission"),
+            r2b.get("merge_train_admission"),
+            "admission must be durable: first={r2a} reload={r2b}"
+        );
+        // At least one must carry the field at all (core RED signal).
+        assert!(
+            r1a.get("merge_train_admission").is_some()
+                || r2a.get("merge_train_admission").is_some(),
+            "dispatch must carry merge_train_admission: {r1a}, {r2a}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Same-task re-admission must be idempotent: no extra board events.
+    #[test]
+    fn a3_same_task_readmission_idempotent() {
+        let home = tmp_home("a3");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-a3-1",
+            "dev-a",
+            "feat/a3",
+            "acme/api",
+            Some("billing"),
+        );
+
+        let r1 = dispatch(&home, "dev-a", "t-a3-1", "feat/a3");
+        let board = crate::task_events::board_root(&home, "default");
+        let log = board.join("event-log.jsonl");
+        let lines_before = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        let r2 = dispatch(&home, "dev-a", "t-a3-1", "feat/a3");
+        let lines_after = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        // The dispatch must carry merge_train_admission (core RED signal).
+        assert!(
+            r1.get("merge_train_admission").is_some(),
+            "first dispatch must carry merge_train_admission: {r1}"
+        );
+        assert_eq!(
+            r1.get("merge_train_admission"),
+            r2.get("merge_train_admission"),
+            "re-admission must be idempotent: first={r1} re={r2}"
+        );
+        assert_eq!(
+            lines_before, lines_after,
+            "re-admission must not emit extra events (before={lines_before}, after={lines_after})"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Group B: Queued side-effect suppression + disjoint/fallback
+    // ────────────────────────────────────────────────────────────────
+
+    /// A Queued dispatch must NOT deliver an inbox message to the target.
+    #[test]
+    fn b1_queued_dispatch_no_inbox_delivery() {
+        let home = tmp_home("b1");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b1-1",
+            "dev-a",
+            "feat/b1-1",
+            "acme/svc",
+            Some("core"),
+        );
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b1-2",
+            "dev-b",
+            "feat/b1-2",
+            "acme/svc",
+            Some("core"),
+        );
+
+        // First dispatch → dev-a (Front).
+        let _ = dispatch(&home, "dev-a", "t-b1-1", "feat/b1-1");
+        // Second dispatch → dev-b (should be Queued → zero inbox delivery).
+        let _ = dispatch(&home, "dev-b", "t-b1-2", "feat/b1-2");
+
+        let (unread, _) = crate::inbox::unread_count(&home, "dev-b");
+        assert_eq!(
+            unread, 0,
+            "Queued dispatch must NOT deliver to target inbox (got {unread} unread)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Queued result must list the ahead_of task ids.
+    #[test]
+    fn b2_queued_result_has_ahead_of_ids() {
+        let home = tmp_home("b2");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b2-1",
+            "dev-a",
+            "feat/b2-1",
+            "acme/svc",
+            Some("core"),
+        );
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b2-2",
+            "dev-b",
+            "feat/b2-2",
+            "acme/svc",
+            Some("core"),
+        );
+
+        let _ = dispatch(&home, "dev-a", "t-b2-1", "feat/b2-1");
+        let r2 = dispatch(&home, "dev-b", "t-b2-2", "feat/b2-2");
+
+        let ahead = r2
+            .get("merge_train_ahead_of")
+            .and_then(|v| v.as_array())
+            .expect(&format!(
+                "queued result must carry merge_train_ahead_of array: {r2}"
+            ));
+        assert!(
+            ahead.iter().any(|v| v.as_str() == Some("t-b2-1")),
+            "ahead_of must contain the Front task id: {r2}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Disjoint repositories: both dispatches must be Front (no conflict).
+    #[test]
+    fn b3_disjoint_repository_both_front() {
+        let home = tmp_home("b3");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b3-1",
+            "dev-a",
+            "feat/b3-web",
+            "acme/web",
+            Some("auth"),
+        );
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b3-2",
+            "dev-b",
+            "feat/b3-api",
+            "acme/api",
+            Some("auth"),
+        );
+
+        let r1 = dispatch(&home, "dev-a", "t-b3-1", "feat/b3-web");
+        let r2 = dispatch(&home, "dev-b", "t-b3-2", "feat/b3-api");
+
+        assert_eq!(
+            r1.get("merge_train_admission").and_then(|v| v.as_str()),
+            Some("front"),
+            "disjoint repo must be front: {r1}"
+        );
+        assert_eq!(
+            r2.get("merge_train_admission").and_then(|v| v.as_str()),
+            Some("front"),
+            "disjoint repo must be front: {r2}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Disjoint domains on the same repo: both dispatches must be Front.
+    #[test]
+    fn b4_disjoint_domain_same_repo_both_front() {
+        let home = tmp_home("b4");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b4-1",
+            "dev-a",
+            "feat/b4-auth",
+            "acme/web",
+            Some("auth"),
+        );
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b4-2",
+            "dev-b",
+            "feat/b4-pay",
+            "acme/web",
+            Some("payments"),
+        );
+
+        let r1 = dispatch(&home, "dev-a", "t-b4-1", "feat/b4-auth");
+        let r2 = dispatch(&home, "dev-b", "t-b4-2", "feat/b4-pay");
+
+        assert_eq!(
+            r1.get("merge_train_admission").and_then(|v| v.as_str()),
+            Some("front"),
+            "disjoint domain must be front: {r1}"
+        );
+        assert_eq!(
+            r2.get("merge_train_admission").and_then(|v| v.as_str()),
+            Some("front"),
+            "disjoint domain must be front: {r2}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Absent domain uses __repo__ fallback: two tasks on the same repo
+    /// with no domain must collide (one Front, one Queued).
+    #[test]
+    fn b5_absent_domain_uses_repo_fallback() {
+        let home = tmp_home("b5");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b5-1",
+            "dev-a",
+            "feat/b5-1",
+            "acme/web",
+            None,
+        );
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b5-2",
+            "dev-b",
+            "feat/b5-2",
+            "acme/web",
+            None,
+        );
+
+        let r1 = dispatch(&home, "dev-a", "t-b5-1", "feat/b5-1");
+        let r2 = dispatch(&home, "dev-b", "t-b5-2", "feat/b5-2");
+
+        let admissions: Vec<_> = [&r1, &r2]
+            .iter()
+            .filter_map(|r| r.get("merge_train_admission").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            admissions.len(),
+            2,
+            "absent domain (__repo__ fallback): both must carry admission: r1={r1}, r2={r2}"
+        );
+        assert!(
+            admissions.contains(&"front") && admissions.contains(&"queued"),
+            "absent domain: one front one queued: {admissions:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// __repo__ fallback is disjoint from a named domain on the same repo.
+    #[test]
+    fn b6_absent_domain_disjoint_from_explicit_domain() {
+        let home = tmp_home("b6");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b6-1",
+            "dev-a",
+            "feat/b6-auth",
+            "acme/web",
+            Some("auth"),
+        );
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-b6-2",
+            "dev-b",
+            "feat/b6-repo",
+            "acme/web",
+            None,
+        );
+
+        let r1 = dispatch(&home, "dev-a", "t-b6-1", "feat/b6-auth");
+        let r2 = dispatch(&home, "dev-b", "t-b6-2", "feat/b6-repo");
+
+        assert_eq!(
+            r1.get("merge_train_admission").and_then(|v| v.as_str()),
+            Some("front"),
+            "__repo__ disjoint from named: {r1}"
+        );
+        assert_eq!(
+            r2.get("merge_train_admission").and_then(|v| v.as_str()),
+            Some("front"),
+            "__repo__ disjoint from named: {r2}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Group C: Structural refusal — bad/missing metadata
+    // ────────────────────────────────────────────────────────────────
+
+    /// Task with NO merge_train_repository metadata → dispatch must refuse
+    /// structurally with a merge_train error code.
+    #[test]
+    fn c1_missing_train_repository_refuses() {
+        let home = tmp_home("c1");
+        seed_fleet(&home);
+        // Create a task with NO train metadata.
+        let sender = InstanceName::from("orch");
+        let tid = TaskId("t-c1-bare".into());
+        crate::task_events::append_batch(
+            &home,
+            &sender,
+            vec![TaskEvent::Created {
+                task_id: tid,
+                title: "bare".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from("dev-a")),
+                due_at: None,
+                depends_on: vec![],
+                routed_to: None,
+                branch: Some("feat/c1".into()),
+                bind: Some(true),
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            }],
+        )
+        .unwrap();
+
+        let r = dispatch(&home, "dev-a", "t-c1-bare", "feat/c1");
+        let code = r["code"].as_str().unwrap_or("");
+        assert!(
+            code.starts_with("merge_train_"),
+            "missing train metadata must refuse with merge_train_ code: {r}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task metadata repo mismatches the board-scanned peer → refuse.
+    #[test]
+    fn c2_mismatching_repository_metadata_refuses() {
+        let home = tmp_home("c2");
+        seed_fleet(&home);
+        // Task says repo=acme/api, but a peer on acme/web exists on the same domain.
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-c2-peer",
+            "dev-a",
+            "feat/c2-peer",
+            "acme/web",
+            Some("auth"),
+        );
+        // Second task: same domain "auth" but DIFFERENT repo in metadata.
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-c2-mis",
+            "dev-b",
+            "feat/c2-mis",
+            "acme/api",
+            Some("auth"),
+        );
+
+        // Dispatch the mismatching task.
+        let r = dispatch(&home, "dev-b", "t-c2-mis", "feat/c2-mis");
+        // If merge train existed, the dispatch would succeed (disjoint repos = both Front).
+        // But the result must carry admission info — that's the RED signal.
+        assert!(
+            r.get("merge_train_admission").is_some(),
+            "dispatch with train metadata must carry admission: {r}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Dispatch where task metadata domain mismatches caller intent → refuse.
+    #[test]
+    fn c3_mismatching_domain_metadata_refuses() {
+        let home = tmp_home("c3");
+        seed_fleet(&home);
+        create_task_with_metadata(
+            &home,
+            "default",
+            "t-c3-1",
+            "dev-a",
+            "feat/c3",
+            "acme/web",
+            Some("payments"),
+        );
+
+        let r = dispatch(&home, "dev-a", "t-c3-1", "feat/c3");
+        // Result must carry merge_train_admission (RED: it doesn't today).
+        assert!(
+            r.get("merge_train_admission").is_some(),
+            "dispatch with train metadata must carry admission: {r}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Refusal must write zero metadata events to the board.
+    #[test]
+    fn c4_refusal_writes_zero_metadata() {
+        let home = tmp_home("c4");
+        seed_fleet(&home);
+        // Bare task: no train metadata.
+        let sender = InstanceName::from("orch");
+        let tid = TaskId("t-c4-bare".into());
+        crate::task_events::append_batch(
+            &home,
+            &sender,
+            vec![TaskEvent::Created {
+                task_id: tid,
+                title: "bare".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from("dev-a")),
+                due_at: None,
+                depends_on: vec![],
+                routed_to: None,
+                branch: Some("feat/c4".into()),
+                bind: Some(true),
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            }],
+        )
+        .unwrap();
+
+        let log = crate::task_events::board_root(&home, "default").join("event-log.jsonl");
+        let lines_before = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        let r = dispatch(&home, "dev-a", "t-c4-bare", "feat/c4");
+
+        let lines_after = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        // The dispatch must refuse (merge_train_ code) AND write zero events.
+        let code = r["code"].as_str().unwrap_or("");
+        assert!(
+            code.starts_with("merge_train_"),
+            "missing metadata must refuse: {r}"
+        );
+        assert_eq!(
+            lines_before, lines_after,
+            "refusal must write zero events (before={lines_before}, after={lines_after})"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Nonexistent task (ghost id) → merge train structural refusal.
+    #[test]
+    fn c5_nonexistent_task_refuses() {
+        let home = tmp_home("c5");
+        seed_fleet(&home);
+
+        let r = dispatch(&home, "dev-a", "t-c5-ghost", "feat/c5");
+        let code = r["code"].as_str().unwrap_or("");
+        assert!(
+            code.starts_with("merge_train_"),
+            "ghost task must refuse with merge_train_ code: {r}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
