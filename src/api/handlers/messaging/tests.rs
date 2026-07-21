@@ -1760,6 +1760,7 @@ fn seed_drained_blocker(home: &std::path::Path, target: &str, kind: &str, corr: 
         review_assignment: None,
         ci_handoff_episode: None,
         ci_handoff_class: None,
+        ci_handoff_settlement: None,
     };
     crate::inbox::enqueue(home, target, msg).expect("seed blocker");
 }
@@ -1863,6 +1864,7 @@ fn b3_codex_report_keeps_absorption_when_blocker_undrained() {
         review_assignment: None,
         ci_handoff_episode: None,
         ci_handoff_class: None,
+        ci_handoff_settlement: None,
     };
     msg.read_at = None;
     crate::inbox::enqueue(&home_path, "codex-agent", msg).expect("seed");

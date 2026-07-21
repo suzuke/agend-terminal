@@ -1720,4 +1720,8 @@ mod tests {
         );
         std::fs::remove_dir_all(home).ok();
     }
+
+    // #2870 tests moved to poller_tests.rs where the real MockProvider CI
+    // producer lives (feature_ci_ack_handoff_positive_control_2870 +
+    // feature_ci_drain_must_not_lose_renudge_or_escalation_real_producer_2870).
 }

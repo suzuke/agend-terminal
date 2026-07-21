@@ -825,7 +825,7 @@ pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Ut
                 episode,
                 class,
             ),
-            crate::inbox::storage::ProtectedHandoffRowState::Processed
+            crate::inbox::storage::ProtectedHandoffRowState::ExplicitlyAcked
         ) {
             continue;
         }
@@ -2060,7 +2060,16 @@ mod tests {
         let home = tmp_home("r12-reconcile");
         seed_protected(&home, "reviewer", "o/r@main", "ep-1");
         crate::inbox::drain(&home, "reviewer");
-        crate::inbox::ack(&home, "reviewer", None);
+        assert!(matches!(
+            crate::inbox::storage::settle_ci_handoff_row_exact(
+                &home,
+                "reviewer",
+                "o/r@main",
+                "ep-1",
+                crate::inbox::CiHandoffClass::Protected,
+            ),
+            crate::inbox::storage::HandoffRowSettleOutcome::Settled
+        ));
         // Recreate the sidecar to model a crash after row processing but before
         // the resolver's delete completed.
         assert!(record_with_identity(
@@ -2078,6 +2087,48 @@ mod tests {
             .with_timezone(&chrono::Utc);
         assert_eq!(reconcile_processed(&home, &now), 1);
         assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r12b_unknown_settlement_provenance_fails_closed_2870() {
+        let home = tmp_home("r12b-unknown-provenance");
+        let correlation = "o/r@main";
+        let episode = "ep-unknown";
+        let mut msg = protected_message("reviewer", correlation, episode);
+        msg.read_at = Some("2026-06-10T00:00:01Z".to_string());
+        msg.delivering_at = None;
+        // Inject a raw unknown provenance value via serde_json round-trip
+        let mut raw = serde_json::to_value(&msg).unwrap();
+        raw["ci_handoff_settlement"] = serde_json::json!("injected_garbage");
+        let tampered: crate::inbox::InboxMessage = serde_json::from_value(raw).unwrap();
+        assert!(
+            tampered.ci_handoff_settlement.is_none(),
+            "#2870: unknown settlement string must deserialize to None (fail closed)"
+        );
+        crate::inbox::enqueue(&home, "reviewer", tampered).unwrap();
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            correlation,
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some(episode),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            reconcile_processed(&home, &now),
+            0,
+            "#2870: unknown provenance must NOT authorize reconciler cleanup"
+        );
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "track must survive unknown provenance"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
     #[test]

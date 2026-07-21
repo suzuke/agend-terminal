@@ -367,6 +367,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     review_assignment: None,
                     ci_handoff_episode: None,
                     ci_handoff_class: None,
+                    ci_handoff_settlement: None,
                 },
             ),
             "status_summary",
@@ -716,6 +717,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             review_assignment: None,
             ci_handoff_episode: None,
             ci_handoff_class: None,
+            ci_handoff_settlement: None,
         };
         persist_or_log!(
             inbox::enqueue(&home, &instance_name, msg_obj),
