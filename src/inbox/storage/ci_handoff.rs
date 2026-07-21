@@ -49,7 +49,8 @@ pub(crate) fn handoff_row_state(
         match matches.as_slice() {
             [] => ProtectedHandoffRowState::Missing,
             [msg] if msg.read_at.is_some() && msg.delivering_at.is_none() => {
-                if msg.ci_handoff_settlement.is_some() {
+                if msg.ci_handoff_settlement == Some(crate::inbox::CiHandoffSettlement::AckHandoff)
+                {
                     ProtectedHandoffRowState::ExplicitlyAcked
                 } else {
                     ProtectedHandoffRowState::Processed
@@ -107,12 +108,12 @@ pub(crate) fn settle_ci_handoff_row_exact(
             };
         };
         let msg = &mut messages[*index];
-        if msg.ci_handoff_settlement.is_some() {
+        if msg.ci_handoff_settlement == Some(crate::inbox::CiHandoffSettlement::AckHandoff) {
             return HandoffRowSettleOutcome::AlreadySettled;
         }
         msg.read_at = Some(chrono::Utc::now().to_rfc3339());
         msg.delivering_at = None;
-        msg.ci_handoff_settlement = Some("ack_handoff".to_string());
+        msg.ci_handoff_settlement = Some(crate::inbox::CiHandoffSettlement::AckHandoff);
         let tmp = path.with_extension("jsonl.tmp");
         let write = (|| -> anyhow::Result<()> {
             let mut file = std::fs::OpenOptions::new()

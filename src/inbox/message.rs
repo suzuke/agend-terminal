@@ -13,6 +13,22 @@ pub enum CiHandoffClass {
     Feature,
 }
 
+/// #2870: typed settlement provenance for CI handoff rows. Only the exact
+/// `AckHandoff` variant authorizes reconciler cleanup; unknown serialized
+/// values deserialize to `None` via `#[serde(default)]` on the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiHandoffSettlement {
+    AckHandoff,
+}
+
+fn deserialize_settlement_lenient<'de, D>(d: D) -> Result<Option<CiHandoffSettlement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<CiHandoffSettlement>::deserialize(d).unwrap_or(None))
+}
+
 /// Type-safe notification source — replaces raw string conventions.
 pub enum NotifySource<'a> {
     /// Message from a channel user (Telegram, Discord, etc.).
@@ -196,10 +212,17 @@ pub struct InboxMessage {
     /// #2870: explicit settlement provenance. Written only by
     /// `settle_ci_handoff_row_exact` (called from `ack_handoff`); generic
     /// drain/ack/discharge never sets this. The reconciler and already-acked
-    /// path require its presence to distinguish explicit ack from generic
-    /// inbox lifecycle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ci_handoff_settlement: Option<String>,
+    /// path require the exact `AckHandoff` variant to distinguish explicit
+    /// ack from generic inbox lifecycle. Unknown/unrecognized values
+    /// deserialize to `None` (fail closed) via the lenient deserializer,
+    /// so a corrupted or tampered field never grants cleanup authority
+    /// and never breaks inbox message parsing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_settlement_lenient"
+    )]
+    pub ci_handoff_settlement: Option<CiHandoffSettlement>,
 }
 
 /// Reply-to correlation context for a quoted bot message (resolved from the

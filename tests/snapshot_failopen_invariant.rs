@@ -142,6 +142,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "per-tick",
         "benign name-clash: `pub(crate) use snapshot::SnapshotRotationHandler` re-exports the SAME-NAMED per_tick child module (crate::daemon::per_tick::snapshot, the rotation handler), NOT the crate::snapshot projection. The conservative bare-root rule cannot resolve the two apart, so this is audited as benign. Reads no snapshot.",
     ),
+    (
+        "src/daemon/ci_watch/poller_tests.rs",
+        "writer",
+        "#2870 test fixture: writes a synthetic snapshot (crate::snapshot::save/AgentSnapshot) so the watchdog re-nudge test has a deterministic idle agent. Not a reader; no production decision reads snapshot here — the file is tests-only (poller_tests.rs).",
+    ),
 ];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
