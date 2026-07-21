@@ -829,6 +829,10 @@ fn full_delete_candidate_canonicalization_ambiguity_preserves_and_errors_2764_sl
     std::fs::remove_dir_all(home).ok();
 }
 
+/// #2876: a missing survivor whose deepest existing ancestor is provably
+/// disjoint from the victim candidate must NOT block deletion. Previously
+/// this test asserted `expect_err` (#2764 fail-closed); after #2876 the
+/// deepest-ancestor proof lets the deletion proceed.
 #[test]
 fn full_delete_survivor_canonicalization_ambiguity_preserves_and_errors_2764_slice10a() {
     let home = tmp_home("slice10a_survivor_ambiguous");
@@ -844,16 +848,14 @@ fn full_delete_survivor_canonicalization_ambiguity_preserves_and_errors_2764_sli
     )
     .unwrap();
 
-    let error = super::full_delete_instance(&home, "victim")
-        .expect_err("an unresolved survivor path must fail closed loudly");
-
+    let result = super::full_delete_instance(&home, "victim");
     assert!(
-        error.contains("survivor 'survivor'") && error.contains("ambiguous"),
-        "survivor ambiguity should identify the admission refusal: {error}"
+        result.is_ok(),
+        "#2876: unrelated unreachable survivor must not block deletion: {result:?}"
     );
     assert!(
-        cleanup_admission_canaries_intact(&victim_dir),
-        "survivor canonicalization ambiguity must preserve all victim bytes"
+        !victim_dir.exists(),
+        "#2876: victim directory must be actually removed, not just preserved/no-op'd"
     );
     std::fs::remove_dir_all(home).ok();
 }
