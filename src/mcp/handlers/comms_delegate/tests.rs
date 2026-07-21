@@ -763,35 +763,94 @@ mod merge_train_admission_tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);
         let id = CTR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-mt-{}-{label}-{id}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agend-mt-{}-{label}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn seed_fleet(home: &Path, teams_yaml: &str) {
+    fn init_repo(home: &Path, name: &str, slug: &str) -> PathBuf {
+        let repo = home.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{slug}.git"),
+        ]);
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        run(&["update-ref", "refs/remotes/origin/main", head.trim()]);
+        repo.canonicalize().unwrap()
+    }
+
+    fn seed_fleet(home: &Path, repo: &Path) {
         let yaml = format!(
             "instances:\n\
              \x20 lead:\n\
              \x20   backend: claude\n\
              \x20   id: 11111111-1111-4111-8111-111111111111\n\
-             \x20 dev:\n\
+             \x20 dev-a:\n\
              \x20   backend: claude\n\
              \x20   id: 22222222-2222-4222-8222-222222222222\n\
-             {teams_yaml}"
+             \x20 dev-b:\n\
+             \x20   backend: claude\n\
+             \x20   id: 33333333-3333-4333-8333-333333333333\n\
+             teams:\n\
+             \x20 core:\n\
+             \x20   orchestrator: lead\n\
+             \x20   members:\n\
+             \x20     - lead\n\
+             \x20     - dev-a\n\
+             \x20     - dev-b\n\
+             \x20   source_repo: {}\n",
+            repo.display()
         );
         std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
     }
 
-    const TEAMS_CORE: &str = "\
-teams:\n\
-\x20 core:\n\
-\x20   orchestrator: lead\n\
-\x20   members:\n\
-\x20     - lead\n\
-\x20     - dev\n";
+    fn fixture(home: &Path) -> PathBuf {
+        let repo = init_repo(home, "canonical", "owner/repo");
+        seed_fleet(home, &repo);
+        repo
+    }
+
+    fn seed_two_repo_fleet(home: &Path, repo_a: &Path, repo_b: &Path) {
+        let yaml = format!(
+            "instances:\n  lead: {{ backend: claude, id: 11111111-1111-4111-8111-111111111111 }}\n  dev-a: {{ backend: claude, id: 22222222-2222-4222-8222-222222222222 }}\n  dev-b: {{ backend: claude, id: 33333333-3333-4333-8333-333333333333 }}\nteams:\n  repo-a:\n    orchestrator: lead\n    members: [lead, dev-a]\n    source_repo: {}\n  repo-b:\n    orchestrator: lead\n    members: [lead, dev-b]\n    source_repo: {}\n",
+            repo_a.display(), repo_b.display()
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
 
     fn create_task(home: &Path, task_id: &str) {
         let event = crate::task_events::TaskEvent::Created {
@@ -815,6 +874,7 @@ teams:\n\
             event,
         )
         .unwrap();
+        set_meta(home, task_id, "review_class", json!("single"));
     }
 
     fn create_task_on_board(home: &Path, task_id: &str, project: &str) {
@@ -841,39 +901,69 @@ teams:\n\
             event,
         )
         .unwrap();
+        crate::task_events::append_at(
+            &board,
+            &crate::task_events::InstanceName("lead".into()),
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(task_id.into()),
+                by: crate::task_events::InstanceName("lead".into()),
+                key: "review_class".into(),
+                value: json!("single"),
+            },
+        )
+        .unwrap();
     }
 
     fn set_meta(home: &Path, task_id: &str, key: &str, value: Value) {
-        let out = crate::tasks::handle(
+        crate::task_events::append(
             home,
-            "lead",
-            &json!({
-                "action": "metadata_set",
-                "id": task_id,
-                "metadata_key": key,
-                "metadata_value": value,
-            }),
-        );
-        assert!(out.get("error").is_none(), "set_meta({key}) failed: {out}");
+            &crate::task_events::InstanceName("lead".into()),
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(task_id.into()),
+                by: crate::task_events::InstanceName("lead".into()),
+                key: key.into(),
+                value,
+            },
+        )
+        .unwrap();
     }
 
-    fn dispatch(home: &Path, task_id: &str, branch: &str) -> Value {
+    fn dispatch(home: &Path, target: &str, task_id: &str, branch: &str) -> Value {
         let sender = Some(Sender::new("lead").unwrap());
-        handle_delegate_task(home, &json!({"instance": "dev", "task": "implement", "task_id": task_id, "branch": branch}), &sender, None)
+        let runtime = crate::mcp::handlers::minimal_test_runtime();
+        handle_delegate_task(
+            home,
+            &json!({"instance": target, "task": "implement", "task_id": task_id, "branch": branch}),
+            &sender,
+            Some(&runtime),
+        )
     }
 
-    fn dispatch_with_repo(home: &Path, task_id: &str, branch: &str, repo: &str) -> Value {
+    fn dispatch_with_repo(
+        home: &Path,
+        target: &str,
+        task_id: &str,
+        branch: &str,
+        repo: &str,
+    ) -> Value {
         let sender = Some(Sender::new("lead").unwrap());
-        handle_delegate_task(home, &json!({"instance": "dev", "task": "implement", "task_id": task_id, "branch": branch, "repository": repo}), &sender, None)
+        let runtime = crate::mcp::handlers::minimal_test_runtime();
+        handle_delegate_task(
+            home,
+            &json!({"instance": target, "task": "implement", "task_id": task_id, "branch": branch, "repository": repo}),
+            &sender,
+            Some(&runtime),
+        )
     }
 
     fn read_meta(home: &Path, task_id: &str, key: &str) -> Option<Value> {
-        let r = crate::tasks::handle(
-            home,
-            "lead",
-            &json!({"action": "metadata_get", "id": task_id, "metadata_key": key}),
-        );
-        r.get("value").filter(|v| !v.is_null()).cloned()
+        crate::task_events::replay(home)
+            .ok()?
+            .tasks
+            .get(&crate::task_events::TaskId(task_id.into()))?
+            .metadata
+            .get(key)
+            .cloned()
     }
 
     const TRAIN_KEYS: [&str; 4] = [
@@ -916,7 +1006,7 @@ teams:\n\
     #[test]
     fn a_concurrent_same_key_one_front_one_queued() {
         let home = mt_home("a-conc");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-a1");
         create_task(&home, "t-a2");
         set_meta(&home, "t-a1", "conflict_domain", json!("core"));
@@ -928,11 +1018,11 @@ teams:\n\
 
         let h1 = std::thread::spawn(move || {
             b1.wait();
-            dispatch(&home1, "t-a1", "feat/a1")
+            dispatch(&home1, "dev-a", "t-a1", "feat/a1")
         });
         let h2 = std::thread::spawn(move || {
             b2.wait();
-            dispatch(&home2, "t-a2", "feat/a2")
+            dispatch(&home2, "dev-b", "t-a2", "feat/a2")
         });
         let _r1 = h1.join().unwrap();
         let _r2 = h2.join().unwrap();
@@ -955,7 +1045,11 @@ teams:\n\
             .iter()
             .filter_map(|v| v.as_ref().and_then(|v| v.as_u64()))
             .collect();
-        assert_eq!(seqs.len(), 2, "both tasks must have queue_seq: {seq1:?}, {seq2:?}");
+        assert_eq!(
+            seqs.len(),
+            2,
+            "both tasks must have queue_seq: {seq1:?}, {seq2:?}"
+        );
         assert!(
             seqs.contains(&1) && seqs.contains(&2),
             "Front=seq 1, Queued=seq 2, got {seqs:?}"
@@ -976,18 +1070,18 @@ teams:\n\
     #[test]
     fn a_readmission_emits_zero_new_train_events() {
         let home = mt_home("a-readmit");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-r1");
         set_meta(&home, "t-r1", "conflict_domain", json!("core"));
 
-        dispatch(&home, "t-r1", "feat/r1");
+        dispatch(&home, "dev-a", "t-r1", "feat/r1");
         assert!(
             read_meta(&home, "t-r1", "merge_train_position").is_some(),
             "first dispatch must write merge_train_position"
         );
 
         let events_before = train_event_count(&home, "t-r1");
-        dispatch(&home, "t-r1", "feat/r1");
+        dispatch(&home, "dev-a", "t-r1", "feat/r1");
         let events_after = train_event_count(&home, "t-r1");
         assert_eq!(
             events_before, events_after,
@@ -1004,15 +1098,24 @@ teams:\n\
     #[test]
     fn b_queued_zero_side_effects() {
         let home = mt_home("b-queued");
-        seed_fleet(&home, TEAMS_CORE);
+        let repo = fixture(&home);
         create_task(&home, "t-front");
         create_task(&home, "t-q1");
         set_meta(&home, "t-front", "conflict_domain", json!("core"));
         set_meta(&home, "t-q1", "conflict_domain", json!("core"));
 
-        dispatch(&home, "t-front", "feat/front");
+        dispatch(&home, "dev-a", "t-front", "feat/front");
+        assert!(
+            crate::binding::read(&home, "dev-a").is_some(),
+            "Front fixture must reach auto-bind"
+        );
+        let inbox_before = crate::inbox::unread_count(&home, "dev-b");
+        let ci_before =
+            crate::binding::agent_has_active_ci_watch_on_branch(&home, "dev-b", "feat/q1");
+        let tracking_before = crate::dispatch_tracking::has_for_instance(&home, "dev-b");
+        let assignment_before = home.join("reviewer-assignments").exists();
 
-        let result = dispatch(&home, "t-q1", "feat/q1");
+        let result = dispatch(&home, "dev-b", "t-q1", "feat/q1");
         assert_eq!(
             result.get("merge_train_position").and_then(|v| v.as_str()),
             Some("Queued"),
@@ -1020,35 +1123,53 @@ teams:\n\
         );
 
         // 1. inbox
-        let inbox = crate::inbox::drain(&home, "dev");
-        assert!(inbox.is_empty(), "Queued must not deliver to inbox: {} msgs", inbox.len());
+        assert_eq!(
+            crate::inbox::unread_count(&home, "dev-b"),
+            inbox_before,
+            "Queued must not deliver to inbox"
+        );
 
         // 2. binding
-        let binding = home.join("runtime").join("dev").join("binding.json");
-        assert!(!binding.exists(), "Queued must not create binding");
+        assert!(
+            crate::binding::read(&home, "dev-b").is_none(),
+            "Queued must not create binding"
+        );
 
         // 3. worktree
-        let wt = home.join("worktrees").join("dev");
+        let wt = crate::worktree::worktree_path(&home, "dev-b", "feat/q1");
         assert!(!wt.exists(), "Queued must not create worktree");
 
         // 4. CI watch
-        let ci = home.join("ci_watch");
-        let has_ci = ci.is_dir() && std::fs::read_dir(&ci).map(|d| d.count() > 0).unwrap_or(false);
-        assert!(!has_ci, "Queued must not arm CI watch");
+        assert_eq!(
+            crate::binding::agent_has_active_ci_watch_on_branch(&home, "dev-b", "feat/q1"),
+            ci_before,
+            "Queued must not arm CI watch"
+        );
 
         // 5. review assignment
-        let ra_dir = home.join("reviewer-assignments");
-        let has_ra = ra_dir.is_dir()
-            && std::fs::read_dir(&ra_dir).map(|d| d.count() > 0).unwrap_or(false);
-        assert!(!has_ra, "Queued must not create review assignment");
+        assert_eq!(
+            home.join("reviewer-assignments").exists(),
+            assignment_before,
+            "Queued must not create review assignment"
+        );
 
         // 6. dispatch tracking
-        let dt = crate::store::store_path(&home, "dispatch_tracking.json");
-        let has_dt = dt.exists()
-            && std::fs::read_to_string(&dt)
-                .map(|s| s.contains("t-q1"))
-                .unwrap_or(false);
-        assert!(!has_dt, "Queued must not write dispatch tracking");
+        assert_eq!(
+            crate::dispatch_tracking::has_for_instance(&home, "dev-b"),
+            tracking_before,
+            "Queued must not write dispatch tracking"
+        );
+
+        let ref_status = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "refs/heads/feat/q1"])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .status()
+            .unwrap();
+        assert!(
+            !ref_status.success(),
+            "Queued must not create its canonical branch ref"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1056,25 +1177,18 @@ teams:\n\
     #[test]
     fn b_disjoint_repo_is_front() {
         let home = mt_home("b-disjoint-repo");
-        // First dispatch with team pointing to repo-A.
-        seed_fleet(
-            &home,
-            "teams:\n\
-             \x20 core:\n\
-             \x20   orchestrator: lead\n\
-             \x20   members:\n\
-             \x20     - lead\n\
-             \x20     - dev\n",
-        );
+        let repo_a = init_repo(&home, "canonical-a", "owner/repo-a");
+        let repo_b = init_repo(&home, "canonical-b", "owner/repo-b");
+        seed_two_repo_fleet(&home, &repo_a, &repo_b);
         create_task(&home, "t-dr1");
         create_task(&home, "t-dr2");
         set_meta(&home, "t-dr1", "conflict_domain", json!("core"));
         set_meta(&home, "t-dr2", "conflict_domain", json!("core"));
         // Simulate repo-A identity via dispatch arg (future admission reads this).
-        dispatch_with_repo(&home, "t-dr1", "feat/dr1", "repo-a/proj");
+        dispatch_with_repo(&home, "dev-a", "t-dr1", "feat/dr1", "owner/repo-a");
 
         // Second dispatch with a different repo identity.
-        dispatch_with_repo(&home, "t-dr2", "feat/dr2", "repo-b/proj");
+        dispatch_with_repo(&home, "dev-b", "t-dr2", "feat/dr2", "owner/repo-b");
 
         let pos = read_meta(&home, "t-dr2", "merge_train_position");
         assert_eq!(
@@ -1089,14 +1203,14 @@ teams:\n\
     #[test]
     fn b_disjoint_domain_is_front() {
         let home = mt_home("b-disjoint-dom");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-dd1");
         create_task(&home, "t-dd2");
         set_meta(&home, "t-dd1", "conflict_domain", json!("backend"));
         set_meta(&home, "t-dd2", "conflict_domain", json!("frontend"));
 
-        dispatch(&home, "t-dd1", "feat/dd1");
-        dispatch(&home, "t-dd2", "feat/dd2");
+        dispatch(&home, "dev-a", "t-dd1", "feat/dd1");
+        dispatch(&home, "dev-b", "t-dd2", "feat/dd2");
 
         let pos = read_meta(&home, "t-dd2", "merge_train_position");
         assert_eq!(
@@ -1111,13 +1225,13 @@ teams:\n\
     #[test]
     fn b_absent_domain_falls_back_to_repo() {
         let home = mt_home("b-absent-dom");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-no1");
         create_task(&home, "t-no2");
         // No conflict_domain set — must fall back to __repo__.
 
-        dispatch(&home, "t-no1", "feat/no1");
-        dispatch(&home, "t-no2", "feat/no2");
+        dispatch(&home, "dev-a", "t-no1", "feat/no1");
+        dispatch(&home, "dev-b", "t-no2", "feat/no2");
 
         let dom1 = read_meta(&home, "t-no1", "merge_train_domain");
         let dom2 = read_meta(&home, "t-no2", "merge_train_domain");
@@ -1144,15 +1258,15 @@ teams:\n\
     #[test]
     fn b_named_domain_disjoint_from_repo_fallback() {
         let home = mt_home("b-named-vs-repo");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-bare");
         create_task(&home, "t-named");
         // t-bare: no domain → __repo__ fallback.
         // t-named: explicit "backend" domain.
         set_meta(&home, "t-named", "conflict_domain", json!("backend"));
 
-        dispatch(&home, "t-bare", "feat/bare");
-        dispatch(&home, "t-named", "feat/named");
+        dispatch(&home, "dev-a", "t-bare", "feat/bare");
+        dispatch(&home, "dev-b", "t-named", "feat/named");
 
         let pos = read_meta(&home, "t-named", "merge_train_position");
         assert_eq!(
@@ -1171,7 +1285,7 @@ teams:\n\
     #[test]
     fn c_partial_train_metadata_refuses() {
         let home = mt_home("c-partial");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-part");
         // Pre-seed only ONE of the four required train keys.
         set_meta(
@@ -1181,15 +1295,19 @@ teams:\n\
             json!("forge:owner/repo"),
         );
 
-        let result = dispatch(&home, "t-part", "feat/part");
+        let events_before = train_event_count(&home, "t-part");
+        let result = dispatch(&home, "dev-a", "t-part", "feat/part");
         let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             code.starts_with("merge_train_"),
             "partial train metadata must produce a merge_train_* refusal, got: {result}"
         );
 
-        let events = train_event_count(&home, "t-part");
-        assert_eq!(events, 0, "partial-refusal must not append merge_train_* events");
+        let events_after = train_event_count(&home, "t-part");
+        assert_eq!(
+            events_after, events_before,
+            "partial-refusal must append zero new merge_train_* events"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1197,19 +1315,30 @@ teams:\n\
     #[test]
     fn c_mismatched_metadata_refuses() {
         let home = mt_home("c-mismatch");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         create_task(&home, "t-mis");
         // Pre-seed all four train keys but with a WRONG repository.
-        set_meta(&home, "t-mis", "merge_train_repository", json!("forge:wrong/repo"));
+        set_meta(
+            &home,
+            "t-mis",
+            "merge_train_repository",
+            json!("forge:wrong/repo"),
+        );
         set_meta(&home, "t-mis", "merge_train_domain", json!("core"));
         set_meta(&home, "t-mis", "merge_train_position", json!("Front"));
         set_meta(&home, "t-mis", "merge_train_queue_seq", json!(1));
 
-        let result = dispatch(&home, "t-mis", "feat/mis");
+        let events_before = train_event_count(&home, "t-mis");
+        let result = dispatch(&home, "dev-a", "t-mis", "feat/mis");
         let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             code.starts_with("merge_train_"),
             "mismatched repo identity must produce merge_train_* refusal, got: {result}"
+        );
+        assert_eq!(
+            train_event_count(&home, "t-mis"),
+            events_before,
+            "mismatch refusal must append zero new merge_train_* events"
         );
 
         std::fs::remove_dir_all(&home).ok();
@@ -1218,12 +1347,13 @@ teams:\n\
     #[test]
     fn c_ambiguous_cross_board_task_refuses() {
         let home = mt_home("c-ambig");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         // Create same task_id on default board AND a project board.
         create_task(&home, "t-dup");
         create_task_on_board(&home, "t-dup", "other/project");
 
-        let result = dispatch(&home, "t-dup", "feat/dup");
+        let events_before = train_event_count(&home, "t-dup");
+        let result = dispatch(&home, "dev-a", "t-dup", "feat/dup");
         let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             code.starts_with("merge_train_"),
@@ -1236,6 +1366,11 @@ teams:\n\
                 "ambiguous refusal must not write {key}"
             );
         }
+        assert_eq!(
+            train_event_count(&home, "t-dup"),
+            events_before,
+            "ambiguous refusal must append zero new merge_train_* events"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1243,10 +1378,10 @@ teams:\n\
     #[test]
     fn c_ghost_task_refuses() {
         let home = mt_home("c-ghost");
-        seed_fleet(&home, TEAMS_CORE);
+        fixture(&home);
         // Do NOT create any task — dispatch a non-existent task_id.
 
-        let result = dispatch(&home, "t-nonexistent", "feat/ghost");
+        let result = dispatch(&home, "dev-a", "t-nonexistent", "feat/ghost");
         let code = result.get("code").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             code.starts_with("merge_train_"),
