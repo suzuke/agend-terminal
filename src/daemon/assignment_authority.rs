@@ -2094,6 +2094,51 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #2914: a reviewer who has READ the assignment but not yet submitted a
+    /// verdict must NOT be re-nudged every 60s. The read row is still present
+    /// and not superseded — the reviewer is actively working. Only truly
+    /// missing or superseded rows should trigger repair.
+    #[test]
+    fn read_assignment_does_not_trigger_renudge() {
+        let home = tmp_home("2914");
+        let rec = mk_record("o/r", "feat/x", "reviewer", 99, "2026-07-13T00:00:00Z");
+        persist(&home, &rec).unwrap();
+        durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        let n1 = rec.delivery_nonce.clone();
+
+        // Reviewer reads the assignment — actively working on the review.
+        mark_row_read(&home, "reviewer", &n1, "2026-07-13T00:00:05Z");
+
+        // After the 60s lease, repair_row must NOT re-nudge a read-but-present row.
+        assert!(
+            !repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:01:01Z").unwrap(),
+            "#2914: read-but-present row must not trigger re-nudge"
+        );
+        // No new nonce rotation — the original nonce is still current.
+        assert_eq!(
+            get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .delivery_nonce,
+            n1,
+            "nonce must not rotate on a read-but-present row"
+        );
+        // Inbox must have exactly 1 row (the original), no duplicate.
+        assert_eq!(
+            inbox_rows(&home, "reviewer").len(),
+            1,
+            "no duplicate delivery for a read-but-present assignment"
+        );
+
+        // Positive control: a SUPERSEDED row (truly stale) must still trigger repair.
+        crate::inbox::storage::supersede_by_nonce(&home, "reviewer", &n1, "m-manual-supersede");
+        assert!(
+            repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:02:02Z").unwrap(),
+            "superseded row must still trigger repair"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ─────────────────── C7: 4-state evidence classifier ───────────────────
 
     use crate::daemon::pr_state::{PrState, VerdictState};
