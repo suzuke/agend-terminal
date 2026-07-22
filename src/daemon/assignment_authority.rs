@@ -894,11 +894,10 @@ pub(crate) fn durable_enqueue(
     Ok(())
 }
 
-/// A4 — APPEND-ONLY row repair, gated on `now >= next_nudge_at` (FIXED-interval
-/// lease). Mints a NEW nonce, enqueues a fresh actionable row, SUPERSEDES the
-/// stale row by the OLD nonce, and advances `delivery_nonce` + `next_nudge_at`
-/// (CAS on `assignment_id`). NEVER resets `read_at`. Returns whether a repair
-/// fired.
+/// A4 — row repair / re-wake, gated on `now >= next_nudge_at` (FIXED-interval
+/// lease). Returns whether a WAKE is needed: true for actionable-unread (pure
+/// wake, no rotation) or missing/superseded (append-only repair); false for
+/// read/delivering (lease advance only).
 pub(crate) fn repair_row(
     home: &Path,
     repo: &str,
@@ -922,18 +921,21 @@ pub(crate) fn repair_row(
     if !now_ge(now, &record.next_nudge_at) {
         return Ok(false);
     }
-    // B2 (#2914): a present, non-superseded row is HEALTHY — the reviewer either
-    // hasn't read it yet OR has read it and is actively working. Do NOT
+    // B2 (#2914): a present, non-superseded row is HEALTHY — do NOT
     // rotate/supersede (that floods the reviewer mid-review). Only a truly
     // missing or superseded row proceeds to the append-only repair below.
+    // However, an actionable-unread row still needs a wake so the reviewer
+    // notices the assignment; read/delivering rows do not wake.
     if crate::inbox::storage::nonce_present_not_superseded(home, target, &record.delivery_nonce) {
+        let needs_wake =
+            crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce);
         if let Ok(Some(mut cur)) = read_record(&path) {
             if cur.assignment_id == record.assignment_id {
                 cur.next_nudge_at = add_interval(now);
                 atomic_write_json(&path, &cur)?;
             }
         }
-        return Ok(false);
+        return Ok(needs_wake);
     }
     let old_nonce = record.delivery_nonce.clone();
     let new_nonce = uuid::Uuid::new_v4().to_string();
@@ -2030,8 +2032,8 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// A4/I12: append-only repair — nonce rotation, interval bound, read_at preserved.
-    /// #2914: present rows (read or unread) are healthy; only missing rows trigger repair.
+    /// A4/I12: repair_row semantics — unread→pure wake, read→no-op, missing→repair.
+    /// #2914: present non-superseded rows skip nonce rotation; unread ones still wake.
     #[test]
     fn repair_append_only_fixed_interval() {
         let home = tmp_home("repair");
@@ -2046,10 +2048,10 @@ mod tests {
             "repair before the lease is a no-op (bounded)"
         );
 
-        // Row still present (unread) → no repair even after the lease.
+        // Row present and unread → pure wake (true) but no nonce rotation.
         assert!(
-            !repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
-            "present (unread) row is healthy — no repair"
+            repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
+            "actionable-unread row returns true (pure wake)"
         );
 
         // Mark read — row is still present and not superseded → still no repair (#2914).

@@ -225,8 +225,8 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<Str
             .filter(|p| p.pr_number == record.pr_number);
         // A3/A4: ONLY Unengaged is nudge/repair-eligible. `repair_row` self-gates on
         // the FIXED-interval lease (returns false when not due) and advances it, so
-        // two ticks in one interval fire at most once (I12) — the wake follows only
-        // an actual repair.
+        // two ticks in one interval fire at most once (I12). Wake fires on an
+        // actionable-unread row (pure wake) or a missing/superseded row (repair).
         if store::classify_assignment(&record, prstate) == store::AssignmentEvidence::Unengaged
             && store::repair_row(home, repo, branch, &record.target, now).unwrap_or(false)
         {
@@ -290,10 +290,10 @@ mod tests {
     }
 
     /// Simulate the reviewer having READ the inbox row carrying `nonce` (set
-    /// `read_at`), making it NON-actionable. Post-B2, `repair_row` only re-nudges a
-    /// NON-actionable row — so tests that exercise the FIXED-interval repair must
-    /// first mark the current delivery read (a healthy unread row is intentionally
-    /// left alone).
+    /// `read_at`), making it NON-actionable. Post-B2, `repair_row` only triggers
+    /// the append-only nonce-rotation repair for missing/superseded rows — tests
+    /// that exercise that path must first mark the current delivery read (an
+    /// unread row takes the pure-wake path instead of rotation).
     fn mark_row_read(home: &Path, target: &str, nonce: &str, ts: &str) {
         let path = crate::inbox::storage::inbox_path_resolved(home, target);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -569,12 +569,8 @@ mod tests {
     }
 
     /// B2 (A4 guard) — the FIRST reconcile tick must NOT rotate/supersede a HEALTHY,
-    /// still-actionable (unread) delivery row. `repair_row` gated ONLY on the lease;
-    /// with `next_nudge_at = created_at` the first Unengaged tick would supersede a
-    /// perfectly healthy just-delivered unread row (a spurious re-nudge before the
-    /// reviewer has even read the first). FIX: only a NON-actionable current row is
-    /// repaired; a healthy row merely advances the lease. RED: the nonce rotates and
-    /// the row is superseded on the first tick.
+    /// still-actionable (unread) delivery row. The row stays intact (no nonce
+    /// rotation, no supersede), but a pure WAKE fires so the reviewer notices it.
     #[test]
     fn b2_first_tick_does_not_rotate_healthy_unread_row() {
         let home = tmp_home("b2");
@@ -601,9 +597,10 @@ mod tests {
             crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &n0),
             "a healthy unread row must NOT be superseded (still actionable)"
         );
-        assert!(
-            wakes.is_empty(),
-            "no nudge/wake fires for a healthy unread row"
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "actionable-unread row triggers pure wake (no rotation)"
         );
         // The lease still advanced (a full interval away) so the guard is bounded.
         assert_ne!(
@@ -1680,6 +1677,70 @@ mod tests {
             store::get(&home, "o/r", "feat/y", "reviewer-b").is_none(),
             "retired assignment must be absent from active store"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Actionable-unread row: lease-due reconciliation fires exactly one wake
+    /// without nonce rotation or supersede. A second tick within 60s is bounded.
+    #[test]
+    fn actionable_unread_row_triggers_bounded_wake() {
+        let home = tmp_home("unread-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        let nonce_0 = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+
+        // Row is unread/actionable. Tick at lease-due time → should wake.
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:01Z");
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "actionable-unread row ⇒ wake"
+        );
+
+        // Pure wake: nonce must NOT rotate (no new row, no supersede).
+        let nonce_1 = store::get(&home, "o/r", "feat/x", "reviewer")
+            .unwrap()
+            .delivery_nonce;
+        assert_eq!(nonce_0, nonce_1, "pure wake: nonce not rotated");
+
+        // Second tick within 60s → lease not due → no wake.
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:30Z");
+        assert!(wakes.is_empty(), "second tick within lease ⇒ no wake");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Read or delivering row: lease-due reconciliation does NOT wake.
+    #[test]
+    fn read_or_delivering_row_does_not_wake() {
+        // -- read case --
+        let home = tmp_home("read-no-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        let nonce = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        mark_row_read(&home, "reviewer", &nonce, "2026-07-13T00:00:05Z");
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:10Z");
+        assert!(wakes.is_empty(), "read row ⇒ no wake");
+        std::fs::remove_dir_all(&home).ok();
+
+        // -- delivering case --
+        let home = tmp_home("delivering-no-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        let nonce = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // drain transitions unread → delivering.
+        let drained = crate::inbox::storage::drain(&home, "reviewer");
+        assert!(
+            drained
+                .iter()
+                .any(|m| m.delivery_nonce.as_deref() == Some(&nonce)),
+            "drained row carries the assignment nonce"
+        );
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:10Z");
+        assert!(wakes.is_empty(), "delivering row ⇒ no wake");
         std::fs::remove_dir_all(&home).ok();
     }
 }
