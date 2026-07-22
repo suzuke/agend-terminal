@@ -275,6 +275,55 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    fn watch_json(home: &Path, branch: &str) -> serde_json::Value {
+        let path = crate::daemon::ci_watch::ci_watches_dir(home)
+            .join(crate::daemon::ci_watch::watch_filename(REPO, branch));
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    fn write_fleet(home: &Path) {
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            "instances:\n  dev-x:\n    backend: claude\n  lead:\n    backend: claude\n\
+             teams:\n  t:\n    members: [dev-x, lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn auto_arm_team_member_carries_next_after_ci_orchestrator() {
+        let home = tmp_home("team-nac");
+        write_fleet(&home);
+        bind(&home, "dev-x", "feat/x");
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(watch_exists(&home, "feat/x"), "watch must be armed");
+        let watch = watch_json(&home, "feat/x");
+        let next: Vec<String> = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
+            watch
+                .get("next_after_ci")
+                .unwrap_or(&serde_json::Value::Null),
+        );
+        assert_eq!(
+            next,
+            vec!["lead"],
+            "auto-arm of a non-orchestrator team member must carry \
+             next_after_ci=<team orchestrator>; got {next:?}"
+        );
+        assert!(
+            watch.get("task_id").and_then(|v| v.as_str()).is_none(),
+            "auto-arm must NOT fabricate a task_id"
+        );
+        assert!(
+            watch.get("review_class").and_then(|v| v.as_str()).is_none(),
+            "auto-arm must NOT set review_class (stays Unresolved/fail-closed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn open_pr_no_bound_agent_fails_loud_no_arm() {
         let home = tmp_home("failloud");
