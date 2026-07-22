@@ -171,6 +171,88 @@ mod tests {
     }
 
     #[test]
+    fn force_release_finds_unbound_checkout_by_exact_managed_marker_2878() {
+        let home = tmp_home("2878-unbound-checkout");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git_bypassed(&repo, &["init", "-b", "main"])
+            .status
+            .success());
+        assert!(git_bypassed(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .status
+        .success());
+
+        let agent = "dev-2878";
+        let branch = "feat/unbound-2878";
+        let target = home.join("worktrees").join("dev-2878-mangled-repo");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let add = git_bypassed(
+            &repo,
+            &["worktree", "add", "-b", branch, target.to_str().unwrap()],
+        );
+        assert!(
+            add.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        std::fs::write(
+            target.join(crate::worktree_pool::MANAGED_MARKER),
+            format!(
+                "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+
+        let outcome = rebase_clean_self(&home, agent, branch, Some(&repo), None)
+            .expect("exact marker must identify the unbound checkout");
+        assert!(outcome.dir_existed, "the discovered checkout exists");
+        assert!(outcome.dir_removed, "the discovered checkout is reclaimed");
+        assert!(!target.exists(), "the physical checkout must be gone");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn force_release_refuses_ambiguous_unbound_marker_matches_2878() {
+        let home = tmp_home("2878-ambiguous");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let agent = "dev-2878";
+        let branch = "feat/ambiguous-2878";
+        for suffix in ["one", "two"] {
+            let target = home
+                .join("worktrees")
+                .join(format!("{agent}-mangled-{suffix}"));
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(
+                target.join(crate::worktree_pool::MANAGED_MARKER),
+                format!(
+                    "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+                    repo.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let error = rebase_clean_self(&home, agent, branch, Some(&repo), None)
+            .expect_err("multiple exact markers must fail closed");
+        assert!(error.contains("ambiguous"), "unexpected error: {error}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn rebase_clean_self_rejects_path_outside_worktree_pool() {
         // Defense-in-depth: even if a malicious caller bypassed the
         // outer validators, the helper refuses to clean paths outside
