@@ -64,11 +64,12 @@ pub fn auto_arm_unwatched_open_prs(home: &Path, repo: &str, prs: &[GhPrMetadata]
             continue;
         };
 
-        // Arm with the bound agent as the sole subscriber; next_after_ci unset →
-        // on CI pass the agent receives the informational `[ci-pass]` (PR-1 #1796
-        // fallback). The actionable `[ci-ready-for-action]` chain still requires
-        // an explicit next_after_ci (review handoff stays explicit, PR-2 #1797).
-        let args = serde_json::json!({ "repository": repo, "branch": branch });
+        let mut args = serde_json::json!({ "repository": repo, "branch": branch });
+        if let Some(orch) = crate::fleet::team_orchestrator_for(home, &agent) {
+            if orch != agent {
+                args["next_after_ci"] = serde_json::json!(orch);
+            }
+        }
         let resp = crate::mcp::handlers::ci::handle_watch_ci(home, &args, &agent);
         if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
             tracing::warn!(
