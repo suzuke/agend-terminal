@@ -2140,6 +2140,23 @@ async fn fan_out_notifications(
                     "arch14: terminal CI notification settled with FAILED peer deliveries — failed peers will not be re-woken"
                 );
             }
+            if conclusion == Some("action_required") {
+                if let Some(rt) = state.task_id.as_deref().and_then(|t| {
+                    let r = crate::tasks::load_routed(ctx.home, t).ok()?;
+                    (!ctx.subscribers.iter().any(|s| s == &r.task.created_by)).then_some(r)
+                }) {
+                    let s = &sha[..sha.len().min(7)];
+                    let b = format!(
+                        "[ci-action-required] {repo_branch_key} ({s}): action_required\nURL: {}",
+                        rep.url
+                    );
+                    let c = &rt.task.created_by;
+                    if !deliver_ci_watch(ctx.home, c, &b, &repo_branch_key, &supersede_token) {
+                        delivery_failed = true;
+                        continue;
+                    }
+                }
+            }
         }
         new_notified_sha = Some(sha.to_string());
         new_notified_conclusion = conclusion.map(String::from);

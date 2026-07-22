@@ -8221,3 +8221,159 @@ fn feature_ci_drain_must_not_lose_renudge_or_escalation_real_producer_2870() {
 
     std::fs::remove_dir_all(dir).ok();
 }
+
+// ── RED: action_required → task creator handoff ──────────────────────────
+// Frozen decisions: d-20260721185014480622-8, d-20260722033958747668-6.
+
+fn seed_task(home: &Path, task_id: &str, created_by: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    crate::task_events::append(
+        home,
+        &InstanceName(created_by.to_string()),
+        TaskEvent::Created {
+            task_id: TaskId(task_id.to_string()),
+            title: "test task".to_string(),
+            description: String::new(),
+            priority: "normal".to_string(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat".to_string()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        },
+    )
+    .expect("seed_task: append must succeed");
+}
+
+fn action_required_watch(task_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "repo": "o/r",
+        "branch": "feat",
+        "subscribers": [
+            {"instance": "dev", "subscribed_at": "2026-07-22T00:00:00Z"}
+        ],
+        "instance": "dev",
+        "interval_secs": 60,
+        "last_run_id": null,
+        "head_sha": null,
+        "last_polled_at": null,
+        "last_notified_head_sha": null,
+        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+        "last_terminal_seen_at": null,
+        "task_id": task_id,
+    })
+}
+
+fn action_required_provider(run_id: u64, sha: &str) -> MockCiProvider {
+    MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: run_id,
+        conclusion: Some("action_required".to_string()),
+        head_sha: sha.to_string(),
+        url: format!("https://github.com/o/r/actions/runs/{run_id}"),
+        name: "CI".to_string(),
+    }])
+}
+
+/// RED: action_required on a task-backed watch must deliver exactly one
+/// `[ci-action-required]` to `task.created_by` when distinct from subscriber,
+/// deduped by the existing `ci-{run_id}-{sha}` supersede token.
+///
+/// Positive control: subscriber "dev" receives `[ci-ended] …: action_required`.
+/// RED assertion: creator "orchestrator" receives `[ci-action-required]`
+/// with repo@branch, exactly once even after two identical polls.
+#[test]
+fn action_required_creator_handoff_distinct_and_deduped() {
+    let dir = tmp_dir("action-required-creator-handoff");
+    let task_id = "t-test-action-required-1";
+
+    seed_task(&dir, task_id, "orchestrator");
+    let routed = crate::tasks::load_routed(&dir, task_id)
+        .expect("seed_task fixture must produce a loadable task");
+    assert_eq!(routed.task.created_by, "orchestrator");
+
+    // First poll
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(500, "aaa1111"),
+    )
+    .expect("first poll must succeed");
+
+    // Positive control: subscriber receives [ci-ended]
+    let dev_msgs = crate::inbox::drain(&dir, "dev");
+    assert!(
+        dev_msgs
+            .iter()
+            .any(|m| m.text.contains("[ci-ended]") && m.text.contains("action_required")),
+        "positive control: dev must receive [ci-ended] action_required; got: {:?}",
+        dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // Second poll — same run_id + sha → supersede token identical
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(500, "aaa1111"),
+    )
+    .expect("second poll must succeed");
+
+    // RED: creator must have exactly 1 [ci-action-required] with repo@branch
+    let creator_msgs: Vec<_> = crate::inbox::drain(&dir, "orchestrator")
+        .into_iter()
+        .filter(|m| m.text.contains("[ci-action-required]"))
+        .collect();
+    assert_eq!(
+        creator_msgs.len(),
+        1,
+        "RED: orchestrator must receive exactly 1 [ci-action-required] after \
+         two identical polls (supersede dedup); got {}",
+        creator_msgs.len()
+    );
+    assert!(
+        creator_msgs[0].text.contains("o/r@feat"),
+        "RED: creator notification must reference repo@branch; got: {:?}",
+        creator_msgs[0].text
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Negative control: when creator IS the subscriber, no extra
+/// `[ci-action-required]` is delivered.
+#[test]
+fn action_required_skips_creator_when_already_subscriber() {
+    let dir = tmp_dir("action-required-creator-is-sub");
+    let task_id = "t-test-action-required-self";
+
+    seed_task(&dir, task_id, "dev");
+
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(700, "ccc3333"),
+    )
+    .expect("ci_check_repo must not error");
+
+    let dev_msgs = crate::inbox::drain(&dir, "dev");
+    assert!(
+        dev_msgs
+            .iter()
+            .any(|m| m.text.contains("[ci-ended]") && m.text.contains("action_required")),
+        "positive control: dev must receive [ci-ended]; got: {:?}",
+        dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    assert!(
+        !dev_msgs
+            .iter()
+            .any(|m| m.text.contains("[ci-action-required]")),
+        "creator==subscriber: must NOT receive extra [ci-action-required]; got: {:?}",
+        dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
