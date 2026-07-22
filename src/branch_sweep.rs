@@ -902,6 +902,7 @@ pub(crate) fn emit_delete_batch(
         confirm_ids,
         audit_reason,
     )
+    .map(|(count, _)| count)
 }
 
 /// Apply a branch-sweep confirmation with lifecycle evidence. The legacy
@@ -915,7 +916,7 @@ pub(crate) fn emit_delete_batch_with_context(
     categories: &Categories,
     confirm_ids: &std::collections::HashSet<String>,
     audit_reason: &str,
-) -> Result<usize, String> {
+) -> Result<(usize, Vec<serde_json::Value>), String> {
     // #2011: prune orphaned worktree REGISTRATIONS first, in the same
     // transaction as the branch deletions. A worktree whose physical
     // directory is gone (crashed release, manual rm, pre-prune-era leak)
@@ -955,6 +956,7 @@ pub(crate) fn emit_delete_batch_with_context(
         }
     };
     let mut deleted = 0usize;
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
     for name in confirm_ids {
         let Some(cand) = name_to_candidate.get(name.as_str()) else {
             continue;
@@ -1015,14 +1017,21 @@ pub(crate) fn emit_delete_batch_with_context(
             lifecycle,
             crate::worktree::disposition::BranchLifecycleDisposition::Delete
         ) {
+            let blocker = first_lifecycle_blocker(
+                terminal,
+                active_holder,
+                task_active,
+                open_pr,
+                unique_unpreserved_work,
+                provenance,
+            );
             crate::event_log::log(
                 home.unwrap_or(repo),
                 "branch_sweep_apply_skipped",
                 "system:branch_sweep",
-                &format!(
-                    "branch={name} reason=branch lifecycle evidence not terminal or provenance unknown; preserved"
-                ),
+                &format!("branch={name} blocker={blocker}"),
             );
+            skipped.push(serde_json::json!({"branch": name, "blocker": blocker}));
             continue;
         }
         let recovery_ref = if is_reviewer || is_stale_idle {
@@ -1072,7 +1081,55 @@ pub(crate) fn emit_delete_batch_with_context(
             }
         }
     }
-    Ok(deleted)
+    Ok((deleted, skipped))
+}
+
+fn first_lifecycle_blocker(
+    terminal: bool,
+    active_holder: Option<bool>,
+    task_active: Option<bool>,
+    open_pr: Option<bool>,
+    unique_unpreserved_work: Option<bool>,
+    provenance: crate::worktree::disposition::BranchProvenance,
+) -> &'static str {
+    if !terminal {
+        return "non_terminal";
+    }
+    if active_holder != Some(false) {
+        return if active_holder == Some(true) {
+            "active_holder"
+        } else {
+            "active_holder_unknown"
+        };
+    }
+    if task_active != Some(false) {
+        return if task_active == Some(true) {
+            "task_active"
+        } else {
+            "task_active_unknown"
+        };
+    }
+    if open_pr != Some(false) {
+        return if open_pr == Some(true) {
+            "open_pr"
+        } else {
+            "open_pr_status_unknown"
+        };
+    }
+    if unique_unpreserved_work != Some(false) {
+        return if unique_unpreserved_work == Some(true) {
+            "unique_unpreserved_work"
+        } else {
+            "unique_unpreserved_work_unknown"
+        };
+    }
+    if matches!(
+        provenance,
+        crate::worktree::disposition::BranchProvenance::Unknown
+    ) {
+        return "provenance_unknown";
+    }
+    "unknown"
 }
 
 fn branch_is_checked_out(repo: &Path, branch: &str) -> Option<bool> {
@@ -2231,7 +2288,16 @@ mod tests {
 
         // Create a branch and merge it → clean_merged (terminal provenance).
         create_branch_with_commit(&repo, "feat-merged-local", "feat: local work");
-        git_run(&repo, &["merge", "--no-ff", "-m", "merge feat-merged-local", "feat-merged-local"]);
+        git_run(
+            &repo,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge feat-merged-local",
+                "feat-merged-local",
+            ],
+        );
 
         bind_handler_repo(&home, &repo, agent);
 
@@ -2249,9 +2315,9 @@ mod tests {
         assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
 
         // The response MUST contain a structured skipped list.
-        let skipped = r["skipped"]
-            .as_array()
-            .expect(&format!("apply response must contain 'skipped' array, got: {r}"));
+        let skipped = r["skipped"].as_array().expect(&format!(
+            "apply response must contain 'skipped' array, got: {r}"
+        ));
         assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
         assert_eq!(
             skipped[0]["branch"], "feat-merged-local",
@@ -2278,7 +2344,10 @@ mod tests {
 
         // Create and merge a branch → clean_merged.
         create_branch_with_commit(&repo, "feat-held", "feat: held work");
-        git_run(&repo, &["merge", "--no-ff", "-m", "merge feat-held", "feat-held"]);
+        git_run(
+            &repo,
+            &["merge", "--no-ff", "-m", "merge feat-held", "feat-held"],
+        );
 
         // Bind the caller agent so handle_cleanup finds source_repo.
         bind_handler_repo(&home, &repo, caller);
@@ -2310,9 +2379,9 @@ mod tests {
         );
         assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
 
-        let skipped = r["skipped"]
-            .as_array()
-            .expect(&format!("apply response must contain 'skipped' array, got: {r}"));
+        let skipped = r["skipped"].as_array().expect(&format!(
+            "apply response must contain 'skipped' array, got: {r}"
+        ));
         assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
         assert_eq!(
             skipped[0]["branch"], "feat-held",
