@@ -14,6 +14,7 @@ static READONLY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn tmp_home(suffix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agend-inbox-{}-{}", suffix, std::process::id()));
+    fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).ok();
     dir
 }
