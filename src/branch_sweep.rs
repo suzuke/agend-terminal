@@ -2213,6 +2213,119 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    /// RED #2920-a: a clean-merged branch with a non-GitHub local origin
+    /// causes `open_pr_status` → `Unknown` → lifecycle Keep. The apply
+    /// response currently returns only `applied: 0` with zero structured
+    /// explanation. Assert that a `skipped` list surfaces the concrete
+    /// blocker so operators can distinguish "safely preserved because of
+    /// open-PR uncertainty" from "nothing matched".
+    #[test]
+    fn apply_skipped_surfaces_local_origin_unknown_pr_blocker() {
+        let repo = setup_repo("skip-local-pr-unknown");
+        let home = repo.parent().unwrap().to_path_buf();
+        let agent = "skip-pr-agent";
+
+        // Local bare origin → extract_github_repo returns None →
+        // OpenPrStatus::Unknown for any terminal branch.
+        add_local_bare_origin(&repo);
+
+        // Create a branch and merge it → clean_merged (terminal provenance).
+        create_branch_with_commit(&repo, "feat-merged-local", "feat: local work");
+        git_run(&repo, &["merge", "--no-ff", "-m", "merge feat-merged-local", "feat-merged-local"]);
+
+        bind_handler_repo(&home, &repo, agent);
+
+        // Apply with the merged branch → lifecycle Keep (open_pr = Unknown).
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({
+                "instance": agent,
+                "apply": true,
+                "confirm_ids": ["feat-merged-local"],
+                "audit_reason": "RED: verify skipped reason surfaces",
+            }),
+            agent,
+        );
+        assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
+
+        // The response MUST contain a structured skipped list.
+        let skipped = r["skipped"]
+            .as_array()
+            .expect(&format!("apply response must contain 'skipped' array, got: {r}"));
+        assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
+        assert_eq!(
+            skipped[0]["branch"], "feat-merged-local",
+            "skipped entry must name the branch: {r}"
+        );
+        assert!(
+            skipped[0]["blocker"].is_string() || skipped[0]["reason"].is_string(),
+            "skipped entry must carry a concrete blocker or reason: {r}"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// RED #2920-b: a clean-merged branch with a live binding on another
+    /// agent causes `active_holder` → `Some(true)` → lifecycle Keep. The
+    /// apply response must surface the concrete binding blocker, not just
+    /// `applied: 0`.
+    #[test]
+    fn apply_skipped_surfaces_active_binding_blocker() {
+        let repo = setup_repo("skip-active-binding");
+        let home = repo.parent().unwrap().to_path_buf();
+        let caller = "skip-binding-caller";
+        let holder = "holder-agent";
+
+        // Create and merge a branch → clean_merged.
+        create_branch_with_commit(&repo, "feat-held", "feat: held work");
+        git_run(&repo, &["merge", "--no-ff", "-m", "merge feat-held", "feat-held"]);
+
+        // Bind the caller agent so handle_cleanup finds source_repo.
+        bind_handler_repo(&home, &repo, caller);
+
+        // Create a SECOND agent's binding on the same branch + repo →
+        // branch_has_active_binding returns Some(true).
+        let holder_dir = home.join("runtime").join(holder);
+        std::fs::create_dir_all(&holder_dir).expect("holder dir");
+        std::fs::write(
+            holder_dir.join("binding.json"),
+            serde_json::json!({
+                "source_repo": repo.display().to_string(),
+                "branch": "feat-held",
+                "worktree": repo.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("holder binding");
+
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({
+                "instance": caller,
+                "apply": true,
+                "confirm_ids": ["feat-held"],
+                "audit_reason": "RED: verify binding blocker surfaces",
+            }),
+            caller,
+        );
+        assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
+
+        let skipped = r["skipped"]
+            .as_array()
+            .expect(&format!("apply response must contain 'skipped' array, got: {r}"));
+        assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
+        assert_eq!(
+            skipped[0]["branch"], "feat-held",
+            "skipped entry must name the branch: {r}"
+        );
+        assert!(
+            skipped[0]["blocker"].is_string() || skipped[0]["reason"].is_string(),
+            "skipped entry must carry a concrete blocker or reason: {r}"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
     /// Bug 3 RED: dry_run_observability must not abort when a reviewer_checkout
     /// branch from the categories no longer exists in a fresh branch enumeration.
     /// This can happen when a concurrent cleanup or manual deletion removes the
