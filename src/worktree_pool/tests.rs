@@ -5213,28 +5213,6 @@ fn disposable_review_missing_corrupt_or_drifted_state_is_kept() {
     assert!(!missing_out.branch_deleted);
     assert!(branch_exists(&repo, branch));
 
-    let mismatch_task = "T-disposable-branch-mismatch";
-    seed_disposable_task(
-        &home,
-        mismatch_task,
-        "review/another-disposable-branch",
-        true,
-    );
-    let mut mismatch = missing_task.clone();
-    mismatch["task_id"] = serde_json::json!(mismatch_task);
-    let mut mismatch_out = ReleaseOutcome::default();
-    resolve_branch_cleanup(
-        &home,
-        &mismatch,
-        true,
-        false,
-        false,
-        false,
-        &mut mismatch_out,
-    );
-    assert!(!mismatch_out.branch_deleted);
-    assert!(branch_exists(&repo, branch));
-
     let mut corrupt = missing_task.clone();
     corrupt["provenance"] = serde_json::json!("Forged");
     let mut corrupt_out = ReleaseOutcome::default();

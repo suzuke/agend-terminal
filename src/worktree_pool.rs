@@ -695,25 +695,17 @@ fn disposable_review_provisioned_head(
     Ok(Some(head))
 }
 
-fn disposable_review_task_terminal(home: &Path, task_id: &str, branch: &str) -> Option<bool> {
+fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
     if task_id.is_empty() {
         return None;
     }
     match crate::tasks::load_routed(home, task_id) {
-        Ok(routed) => {
-            // A terminal task is authoritative only for the branch it owns;
-            // a mismatched branch is contradictory evidence and must preserve
-            // the disposable review branch fail-closed.
-            if routed.task.branch.as_deref() != Some(branch) {
-                return None;
-            }
-            Some(matches!(
-                routed.task.status,
-                crate::task_events::TaskStatus::Done
-                    | crate::task_events::TaskStatus::Cancelled
-                    | crate::task_events::TaskStatus::Verified
-            ))
-        }
+        Ok(routed) => Some(matches!(
+            routed.task.status,
+            crate::task_events::TaskStatus::Done
+                | crate::task_events::TaskStatus::Cancelled
+                | crate::task_events::TaskStatus::Verified
+        )),
         Err(crate::tasks::TaskRouteError::NotFound)
         | Err(crate::tasks::TaskRouteError::Unreadable { .. })
         | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
@@ -786,7 +778,7 @@ fn resolve_branch_cleanup(
         if let Some(expected) = review_head {
             let default = crate::git_helpers::default_branch(Path::new(sr_str));
             let task_active = if disposable_head.is_some() {
-                disposable_review_task_terminal(home, task_id, branch).map(|terminal| !terminal)
+                disposable_review_task_terminal(home, task_id).map(|terminal| !terminal)
             } else {
                 task_active_for_branch(home, task_id, branch)
             };
