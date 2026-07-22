@@ -14,8 +14,25 @@ static READONLY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn tmp_home(suffix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agend-inbox-{}-{}", suffix, std::process::id()));
+    fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).ok();
     dir
+}
+
+#[test]
+fn tmp_home_starts_clean_when_suffix_is_reused() {
+    let first = tmp_home("freshness");
+    let stale = first.join("stale.marker");
+    fs::write(&stale, "stale").unwrap();
+
+    let second = tmp_home("freshness");
+    let stale_survives = second.join("stale.marker").exists();
+    fs::remove_dir_all(&first).ok();
+
+    assert!(
+        !stale_survives,
+        "tmp_home must remove stale content when reused"
+    );
 }
 
 fn make_msg(from: &str, text: &str) -> InboxMessage {
