@@ -2140,6 +2140,56 @@ async fn fan_out_notifications(
                     "arch14: terminal CI notification settled with FAILED peer deliveries — failed peers will not be re-woken"
                 );
             }
+            // action_required → task creator handoff (d-…-8, d-…-6):
+            // when a task-backed watch sees action_required, notify
+            // task.created_by if distinct from subscriber(s).
+            if conclusion == Some("action_required") {
+                if let Some(tid) = state.task_id.as_deref() {
+                    match crate::tasks::load_routed(ctx.home, tid) {
+                        Ok(routed) => {
+                            let creator = &routed.task.created_by;
+                            if !ctx.subscribers.iter().any(|s| s == creator) {
+                                let sha_short = &sha[..sha.len().min(7)];
+                                let creator_body = build_inbox_body(
+                                    &format!(
+                                        "[ci-action-required] {}@{} ({sha_short}): action_required",
+                                        ctx.repo, ctx.branch
+                                    ),
+                                    "action_required",
+                                    None,
+                                    &rep.url,
+                                    Some(rep.id),
+                                    None,
+                                );
+                                if !deliver_ci_watch(
+                                    ctx.home,
+                                    creator,
+                                    &creator_body,
+                                    &repo_branch_key,
+                                    &supersede_token,
+                                ) {
+                                    delivery_failed = true;
+                                    tracing::warn!(
+                                        creator = %creator,
+                                        task_id = %tid,
+                                        repo = %ctx.repo,
+                                        branch = %ctx.branch,
+                                        "action_required creator handoff delivery FAILED — holding cursors"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %tid,
+                                error = %e,
+                                "action_required creator handoff: load_routed failed"
+                            );
+                        }
+                    }
+                }
+            }
         }
         new_notified_sha = Some(sha.to_string());
         new_notified_conclusion = conclusion.map(String::from);
