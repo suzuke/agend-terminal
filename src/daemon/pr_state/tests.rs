@@ -2864,6 +2864,36 @@ fn review_verdict_no_matching_binding_falls_back_to_author_2920() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// #2920 compatibility: one legacy binding without `source_repo` still
+/// receives a verdict for its matching branch.
+#[test]
+fn review_verdict_routes_legacy_binding_without_source_repo_2920() {
+    let root = std::env::temp_dir().join(format!(
+        "agend-2920-legacy-binding-{}-{}",
+        std::process::id(),
+        "single"
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(home.join("inbox")).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    let branch = "feat/legacy-shared";
+    bind_route_agent(&home, "legacy-holder", branch, None);
+
+    let head = "f".repeat(40);
+    let mut state = new_for_branch("owner/repo", branch, &head, ReviewClass::Single);
+    state.pr_number = 2920;
+    state.pr_author = "legacy-author-fallback".into();
+    save(&home, &state).unwrap();
+    let receipt = seed_route_assignment(&home, "owner/repo", branch, &head);
+
+    assert!(record_validated_receipt(&home, &receipt));
+    assert_eq!(route_messages(&home, "legacy-holder").len(), 1);
+    assert!(route_messages(&home, "legacy-author-fallback").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn verdict_verified_not_merge_ready_notifies_bound_author() {
     let home = verdict_home("verified-notready");
