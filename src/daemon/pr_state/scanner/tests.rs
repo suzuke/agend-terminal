@@ -876,6 +876,70 @@ fn gh_poll_writes_atomic_observed_head_and_base() {
     );
 }
 
+/// #2913 RED: a fresh gh observation of a force-pushed head must advance the
+/// authoritative subject even when no CI run exists for the new head. The
+/// scanner must reuse the reducer's Pending transition so stale review and
+/// auto-arm state cannot survive the zero-CI head change.
+#[test]
+fn gh_poll_zero_ci_head_advance_syncs_authoritative_subject() {
+    let home = tmp_home(line!());
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    let mut s = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    s.pr_number = 2913;
+    s.pr_author = "dev".into();
+    s.ci_state = CiState::Green {
+        sha: "sha-A".into(),
+        observed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    add_typed_receipt(&mut s, crate::review_receipt::ReviewVerdict::Verified);
+    s.auto_armed = true;
+    s.auto_armed_for_sha = Some("sha-A".into());
+    s.ready_emitted_for_sha = Some("sha-A".into());
+    s.diagnostic_emitted_for_sha = Some("sha-A".into());
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(
+        &home,
+        &empty_registry(),
+        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            2913, "feat/x", "sha-B", "base-B",
+        )])]),
+    );
+
+    let r = load(&home, "owner/repo", "feat/x").expect("state persists");
+    assert_eq!(r.head_sha, "sha-B");
+    assert!(matches!(r.ci_state, CiState::Pending));
+    assert!(r.validated_review_receipts.is_empty());
+    assert!(matches!(
+        r.verdict_state,
+        super::super::VerdictState::Pending
+    ));
+    assert!(!r.auto_armed);
+    assert_eq!(r.auto_armed_for_sha, None);
+    assert_eq!(r.ready_emitted_for_sha, None);
+    assert_eq!(r.diagnostic_emitted_for_sha, None);
+
+    let exact_b = crate::review_receipt::ReviewReceiptSummary {
+        receipt_id: "review-receipt:exact-b".into(),
+        source_id: "source-exact-b".into(),
+        evidence_digest: "b".repeat(64),
+        assignment_id: uuid::Uuid::new_v4(),
+        reviewer_instance_id: crate::types::InstanceId::new(),
+        reviewer_name: "reviewer".into(),
+        repo: r.repo.clone(),
+        pr_number: r.pr_number,
+        branch: r.branch.clone(),
+        task_id: "t-2913-review".into(),
+        reviewed_head: "sha-B".into(),
+        review_class: r.review_class,
+        slot: crate::review_receipt::ReviewSlot::Primary,
+        verdict: crate::review_receipt::ReviewVerdict::Verified,
+    };
+    assert!(exact_b.matches_state(&r));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2749 3a: a gh-poll TRANSPORT FAILURE flags observed_error and does NOT
 /// advance observed_at nor clobber the last-good observed pair — the gate then
 /// fails closed while the prior observation is preserved (CORRECTION 3 / GO-proof).

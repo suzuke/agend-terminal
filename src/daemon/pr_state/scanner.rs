@@ -967,6 +967,22 @@ fn apply_gh_observations(
         return;
     };
 
+    // #2913: a runless/zero-CI force-push still advances the authoritative PR
+    // subject. Reuse the reducer's Pending transition so stale review and
+    // auto-arm state are invalidated by the same head-change rules as CI.
+    if let Some(head_sha) = meta.head_ref_oid.as_deref() {
+        if state.head_sha != head_sha {
+            apply(
+                state,
+                Event::CiObserved {
+                    head_sha,
+                    conclusion: super::CiConclusion::Pending,
+                    observed_at: now.to_string(),
+                },
+            );
+        }
+    }
+
     // #2749: ATOMIC observation — write the head + base tips from the SAME gh
     // response TOGETHER (never a torn two-read compose; CORRECTION 3 / codex R2).
     // Only write when BOTH OIDs are present: GitHub always surfaces them, so
