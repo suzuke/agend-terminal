@@ -436,18 +436,28 @@ pub fn resolve_author_with_gh(
     "fixup-lead".to_string()
 }
 
-/// #2918: does `instance`'s `source_repo` match the PR's `repo` slug?
-/// `None` (unset `source_repo`) matches ANY repo — preserves backward
-/// compat for single-repo fleets that never set the field. `Some(sr)`
-/// must resolve (bare slug or local-checkout `origin` remote) to the
-/// same canonical `owner/repo` as `repo`.
+/// #2918: does `instance`'s configured repo identity match the PR's
+/// originating `repo` slug? Precedence: explicit `repo` override
+/// (Sprint 55 EC4) → `source_repo` derivation (bare slug / local
+/// origin remote). `source_repo=None` matches ANY repo (backward
+/// compat for single-repo fleets). Invalid/unresolvable → no match.
 fn source_repo_matches(inst: &crate::fleet::InstanceConfig, repo: &str) -> bool {
-    let Some(sr) = inst.source_repo.as_deref() else {
+    let Some(_sr) = inst.source_repo.as_deref() else {
         return true;
     };
-    let slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
-        crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(sr))
-    });
+    let slug = inst
+        .repo
+        .as_deref()
+        .and_then(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug)
+        .or_else(|| {
+            inst.source_repo.as_deref().and_then(|sr| {
+                crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
+                    crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
+                        std::path::Path::new(sr),
+                    )
+                })
+            })
+        });
     slug.is_some_and(|s| s.eq_ignore_ascii_case(repo))
 }
 
@@ -792,20 +802,20 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// T8-f / #2918: two instances share the same `github_login` but have
-    /// different `source_repo`s. A PR on repo-B MUST resolve to the
-    /// repo-B agent, not whichever instance iterates first in
-    /// fleet.yaml (map order is unspecified — the current bug picks
-    /// "whichever comes first", which is wrong for repo-B PRs whenever
-    /// the repo-A entry happens to iterate first).
+    /// T8-f / #2918 Tier 1: two instances share `github_login` but have
+    /// different repos. `source_repo` paths are local/unresolvable so the
+    /// explicit `repo` override is the only slug source — tests that
+    /// `repo` takes precedence over `source_repo` derivation.
     #[test]
     fn t8f_repo_aware_github_login_resolves_correct_agent() {
         let home = tmp_home("auth-repo-aware");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             "instances:\n  \
-             bot-repoA:\n    backend: claude\n    github_login: shared-bot\n    source_repo: owner/repo-a\n  \
-             bot-repoB:\n    backend: claude\n    github_login: shared-bot\n    source_repo: owner/repo-b\n",
+             bot-repoA:\n    backend: claude\n    github_login: shared-bot\n    \
+               source_repo: /nonexistent/local/path-a\n    repo: owner/repo-a\n  \
+             bot-repoB:\n    backend: claude\n    github_login: shared-bot\n    \
+               source_repo: /nonexistent/local/path-b\n    repo: owner/repo-b\n",
         )
         .unwrap();
         let mut state = fresh_state("br");
@@ -813,8 +823,30 @@ pub(crate) mod tests {
         let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
         assert_eq!(
             resolved, "bot-repoB",
-            "github_login=shared-bot on repo-b's PR MUST resolve to bot-repoB, \
-             not whichever instance iterates first in fleet.yaml"
+            "explicit repo override must distinguish same-login instances"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-g / #2918 Tier 2: instance name matches gh_login but repo
+    /// mismatches → falls through to subscriber (Tier 3).
+    #[test]
+    fn t8g_tier2_repo_mismatch_falls_to_subscriber() {
+        let home = tmp_home("auth-t2-repo");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+             shared-bot:\n    backend: claude\n    \
+               source_repo: /nonexistent/local/path\n    repo: owner/other-repo\n",
+        )
+        .unwrap();
+        let mut state = fresh_state("br");
+        state.repo = "owner/target-repo".to_string();
+        state.subscribers = vec!["the-subscriber".to_string()];
+        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
+        assert_eq!(
+            resolved, "the-subscriber",
+            "Tier 2 repo mismatch must fall through to subscriber"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
