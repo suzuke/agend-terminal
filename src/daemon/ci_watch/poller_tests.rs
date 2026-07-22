@@ -8224,19 +8224,7 @@ fn feature_ci_drain_must_not_lose_renudge_or_escalation_real_producer_2870() {
 
 // ── RED: action_required → task creator handoff ──────────────────────────
 // Frozen decisions: d-20260721185014480622-8, d-20260722033958747668-6.
-//
-// Gap: when a task-backed CI watch receives `action_required`, the current
-// code delivers `[ci-ended] …: action_required` to subscribers only.
-// `task.created_by` (the orchestrator/dispatcher) is never notified — the
-// `next_after_ci` chain is gated on `CiOutcome::Success`.
-//
-// Contract: retain `CiOutcome::Other`; additionally deliver one
-// `[ci-action-required]` notification to `task.created_by` (resolved via
-// `tasks::load_routed`) when that creator is distinct from any subscriber,
-// deduped by the existing `ci-{run_id}-{sha}` supersede token.
 
-/// Helper: seed a task on the default board so `tasks::load_routed` can
-/// find it.  Returns the task_id used.
 fn seed_task(home: &Path, task_id: &str, created_by: &str) {
     use crate::task_events::{InstanceName, TaskEvent, TaskId};
     crate::task_events::append(
@@ -8261,33 +8249,8 @@ fn seed_task(home: &Path, task_id: &str, created_by: &str) {
     .expect("seed_task: append must succeed");
 }
 
-/// RED test: action_required on a task-backed watch must deliver
-/// `[ci-action-required]` to the task creator when distinct from subscriber.
-///
-/// Positive control: subscriber "dev" receives `[ci-ended] …: action_required`
-/// (existing behavior — must pass today).
-///
-/// RED assertion: creator "orchestrator" receives a `[ci-action-required]`
-/// notification through `deliver_ci_watch` with the standard supersede token.
-/// This is NOT implemented yet → test must FAIL.
-#[test]
-fn action_required_notifies_task_creator_when_distinct_from_subscriber() {
-    let dir = tmp_dir("action-required-creator-handoff");
-    let task_id = "t-test-action-required-1";
-
-    // 1. Seed a task created by "orchestrator"
-    seed_task(&dir, task_id, "orchestrator");
-
-    // Verify the task is loadable (guard against fixture issues)
-    let routed = crate::tasks::load_routed(&dir, task_id)
-        .expect("seed_task fixture must produce a loadable task");
-    assert_eq!(
-        routed.task.created_by, "orchestrator",
-        "fixture: created_by must be 'orchestrator'"
-    );
-
-    // 2. Watch with subscriber "dev" (distinct from creator) + task_id
-    let watch = serde_json::json!({
+fn action_required_watch(task_id: &str) -> serde_json::Value {
+    serde_json::json!({
         "repo": "o/r",
         "branch": "feat",
         "subscribers": [
@@ -8302,21 +8265,46 @@ fn action_required_notifies_task_creator_when_distinct_from_subscriber() {
         "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
         "last_terminal_seen_at": null,
         "task_id": task_id,
-    });
+    })
+}
 
-    // 3. Provider returns action_required
-    let provider = MockCiProvider::with_runs(vec![CiRun {
+fn action_required_provider(run_id: u64, sha: &str) -> MockCiProvider {
+    MockCiProvider::with_runs(vec![CiRun {
         run_attempt: 1,
-        id: 500,
+        id: run_id,
         conclusion: Some("action_required".to_string()),
-        head_sha: "aaa1111".to_string(),
-        url: "https://github.com/o/r/actions/runs/500".to_string(),
+        head_sha: sha.to_string(),
+        url: format!("https://github.com/o/r/actions/runs/{run_id}"),
         name: "CI".to_string(),
-    }]);
+    }])
+}
 
-    run_ci_check(&dir, &watch, &provider).expect("ci_check_repo must not error");
+/// RED: action_required on a task-backed watch must deliver exactly one
+/// `[ci-action-required]` to `task.created_by` when distinct from subscriber,
+/// deduped by the existing `ci-{run_id}-{sha}` supersede token.
+///
+/// Positive control: subscriber "dev" receives `[ci-ended] …: action_required`.
+/// RED assertion: creator "orchestrator" receives `[ci-action-required]`
+/// with repo@branch, exactly once even after two identical polls.
+#[test]
+fn action_required_creator_handoff_distinct_and_deduped() {
+    let dir = tmp_dir("action-required-creator-handoff");
+    let task_id = "t-test-action-required-1";
 
-    // 4. Positive control: subscriber "dev" receives [ci-ended] action_required
+    seed_task(&dir, task_id, "orchestrator");
+    let routed = crate::tasks::load_routed(&dir, task_id)
+        .expect("seed_task fixture must produce a loadable task");
+    assert_eq!(routed.task.created_by, "orchestrator");
+
+    // First poll
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(500, "aaa1111"),
+    )
+    .expect("first poll must succeed");
+
+    // Positive control: subscriber receives [ci-ended]
     let dev_msgs = crate::inbox::drain(&dir, "dev");
     assert!(
         dev_msgs
@@ -8326,79 +8314,15 @@ fn action_required_notifies_task_creator_when_distinct_from_subscriber() {
         dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 
-    // 5. RED: creator "orchestrator" must receive [ci-action-required]
-    let creator_msgs = crate::inbox::drain(&dir, "orchestrator");
-    assert!(
-        creator_msgs
-            .iter()
-            .any(|m| m.text.contains("[ci-action-required]")),
-        "RED: orchestrator (task creator) must receive [ci-action-required] \
-         notification when distinct from subscriber; got: {:?}",
-        creator_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
-    );
+    // Second poll — same run_id + sha → supersede token identical
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(500, "aaa1111"),
+    )
+    .expect("second poll must succeed");
 
-    // 6. RED: the creator notification must carry the correct repo@branch
-    assert!(
-        creator_msgs.iter().any(|m| m.text.contains("o/r@feat")),
-        "RED: creator notification must reference repo@branch; got: {:?}",
-        creator_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// RED test: creator notification is deduped by supersede token.
-/// Running ci_check_repo twice with the same run_id+sha must NOT
-/// double-deliver to the creator.
-#[test]
-fn action_required_creator_handoff_deduped_by_supersede_token() {
-    let dir = tmp_dir("action-required-creator-dedup");
-    let task_id = "t-test-action-required-dedup";
-
-    seed_task(&dir, task_id, "orchestrator");
-
-    let make_watch = || {
-        serde_json::json!({
-            "repo": "o/r",
-            "branch": "feat",
-            "subscribers": [
-                {"instance": "dev", "subscribed_at": "2026-07-22T00:00:00Z"}
-            ],
-            "instance": "dev",
-            "interval_secs": 60,
-            "last_run_id": null,
-            "head_sha": null,
-            "last_polled_at": null,
-            "last_notified_head_sha": null,
-            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
-            "last_terminal_seen_at": null,
-            "task_id": task_id,
-        })
-    };
-
-    // First run
-    let provider1 = MockCiProvider::with_runs(vec![CiRun {
-        run_attempt: 1,
-        id: 600,
-        conclusion: Some("action_required".to_string()),
-        head_sha: "bbb2222".to_string(),
-        url: "https://github.com/o/r/actions/runs/600".to_string(),
-        name: "CI".to_string(),
-    }]);
-    run_ci_check(&dir, &make_watch(), &provider1).expect("first run must succeed");
-
-    // Second run — same run_id + sha → supersede token identical
-    let provider2 = MockCiProvider::with_runs(vec![CiRun {
-        run_attempt: 1,
-        id: 600,
-        conclusion: Some("action_required".to_string()),
-        head_sha: "bbb2222".to_string(),
-        url: "https://github.com/o/r/actions/runs/600".to_string(),
-        name: "CI".to_string(),
-    }]);
-    run_ci_check(&dir, &make_watch(), &provider2).expect("second run must succeed");
-
-    // RED: creator must have exactly 1 notification (supersede-token dedup)
+    // RED: creator must have exactly 1 [ci-action-required] with repo@branch
     let creator_msgs: Vec<_> = crate::inbox::drain(&dir, "orchestrator")
         .into_iter()
         .filter(|m| m.text.contains("[ci-action-required]"))
@@ -8406,53 +8330,35 @@ fn action_required_creator_handoff_deduped_by_supersede_token() {
     assert_eq!(
         creator_msgs.len(),
         1,
-        "RED: creator must receive exactly 1 [ci-action-required] after two \
-         identical runs (supersede dedup); got {}",
+        "RED: orchestrator must receive exactly 1 [ci-action-required] after \
+         two identical polls (supersede dedup); got {}",
         creator_msgs.len()
+    );
+    assert!(
+        creator_msgs[0].text.contains("o/r@feat"),
+        "RED: creator notification must reference repo@branch; got: {:?}",
+        creator_msgs[0].text
     );
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Negative control: when creator IS the subscriber, no extra notification
-/// is delivered (the subscriber path already covers them).
+/// Negative control: when creator IS the subscriber, no extra
+/// `[ci-action-required]` is delivered.
 #[test]
 fn action_required_skips_creator_when_already_subscriber() {
     let dir = tmp_dir("action-required-creator-is-sub");
     let task_id = "t-test-action-required-self";
 
-    // Creator and subscriber are the same agent
     seed_task(&dir, task_id, "dev");
 
-    let watch = serde_json::json!({
-        "repo": "o/r",
-        "branch": "feat",
-        "subscribers": [
-            {"instance": "dev", "subscribed_at": "2026-07-22T00:00:00Z"}
-        ],
-        "instance": "dev",
-        "interval_secs": 60,
-        "last_run_id": null,
-        "head_sha": null,
-        "last_polled_at": null,
-        "last_notified_head_sha": null,
-        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
-        "last_terminal_seen_at": null,
-        "task_id": task_id,
-    });
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(700, "ccc3333"),
+    )
+    .expect("ci_check_repo must not error");
 
-    let provider = MockCiProvider::with_runs(vec![CiRun {
-        run_attempt: 1,
-        id: 700,
-        conclusion: Some("action_required".to_string()),
-        head_sha: "ccc3333".to_string(),
-        url: "https://github.com/o/r/actions/runs/700".to_string(),
-        name: "CI".to_string(),
-    }]);
-
-    run_ci_check(&dir, &watch, &provider).expect("ci_check_repo must not error");
-
-    // "dev" gets the subscriber [ci-ended] notification (positive control)
     let dev_msgs = crate::inbox::drain(&dir, "dev");
     assert!(
         dev_msgs
@@ -8461,11 +8367,6 @@ fn action_required_skips_creator_when_already_subscriber() {
         "positive control: dev must receive [ci-ended]; got: {:?}",
         dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
-
-    // "dev" must NOT receive a separate [ci-action-required] — they already
-    // got the subscriber notification. (This test is RED-adjacent: it will
-    // pass trivially today because [ci-action-required] isn't implemented,
-    // but it constrains the GREEN implementation to skip when creator==subscriber.)
     assert!(
         !dev_msgs
             .iter()
