@@ -1609,7 +1609,6 @@ fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<A
     out
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
