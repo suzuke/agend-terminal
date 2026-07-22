@@ -980,7 +980,6 @@ mod tests {
         );
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
-        let n0 = rec.delivery_nonce.clone();
         // #2914: simulate a genuinely lost message so repair fires.
         let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
         std::fs::remove_file(&inbox_path).ok();
