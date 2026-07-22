@@ -125,27 +125,43 @@ pub fn execute_cleanup(repo: &Path, checks: &[BranchCheck], dry_run: bool) -> (u
                             .filter(|o| o.status.success())
                             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                             .unwrap_or_default();
-                    // #1899: bounded via git_bypass (LOCAL 60s).
-                    // Use -D (force) because squash-merged branches are not
-                    // ancestry-reachable from HEAD and -d refuses them.
-                    let result =
-                        crate::git_helpers::git_bypass(repo, &["branch", "-D", &check.branch]);
-                    match result {
-                        Ok(out) if out.status.success() => {
-                            let msg = format!(
-                                "deleted: {} (PR #{}) [tip={}]",
-                                check.branch, pr_number, tip_sha
-                            );
-                            println!("{msg}");
-                            log_lines.push(msg);
-                            deleted += 1;
-                        }
+                    // Try safe -d first; it succeeds for ancestry-reachable
+                    // (true-merge) branches. For squash-merged branches -d
+                    // refuses because the tip is not reachable from HEAD.
+                    let safe =
+                        crate::git_helpers::git_bypass(repo, &["branch", "-d", &check.branch]);
+                    let deleted_ok = match &safe {
+                        Ok(out) if out.status.success() => true,
                         _ => {
-                            let msg = format!("FAILED to delete: {}", check.branch);
-                            eprintln!("{msg}");
-                            log_lines.push(msg);
-                            skipped += 1;
+                            // -d refused: force-delete only if the branch is
+                            // proven squash-equivalent to main; otherwise a
+                            // reused branch name with new unique commits must
+                            // be preserved.
+                            if crate::branch_sweep::is_squash_merged(repo, "main", &check.branch) {
+                                crate::git_helpers::git_bypass(
+                                    repo,
+                                    &["branch", "-D", &check.branch],
+                                )
+                                .is_ok_and(|o| o.status.success())
+                            } else {
+                                false
+                            }
                         }
+                    };
+                    if deleted_ok {
+                        let msg = format!(
+                            "deleted: {} (PR #{}) [tip={}]",
+                            check.branch, pr_number, tip_sha
+                        );
+                        println!("{msg}");
+                        log_lines.push(msg);
+                        deleted += 1;
+                    } else {
+                        let msg =
+                            format!("FAILED to delete: {} (not squash-equivalent)", check.branch);
+                        eprintln!("{msg}");
+                        log_lines.push(msg);
+                        skipped += 1;
                     }
                 }
             }
@@ -384,6 +400,89 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
             "feat-squash must no longer exist after cleanup"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reused branch name with new unique commits must NOT be force-deleted
+    /// even if an old merged PR with the same branch name exists.
+    #[test]
+    fn execute_cleanup_preserves_reused_branch_with_new_commits() {
+        let dir = tmp_dir("reused-branch");
+        init_repo(&dir);
+
+        // Create a branch with unique content that is NOT squash-equivalent
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["checkout", "-b", "feat-reused"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("new-work.txt"), "unique new work\n").unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["add", "new-work.txt"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "feat: new unique work on reused branch",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["checkout", "main"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Precondition: branch is NOT ancestry-reachable and NOT squash-equivalent
+        let ancestor_check = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["merge-base", "--is-ancestor", "feat-reused", "main"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            !ancestor_check.status.success(),
+            "precondition: not reachable"
+        );
+        assert!(
+            !crate::branch_sweep::is_squash_merged(&dir, "main", "feat-reused"),
+            "precondition: not squash-equivalent"
+        );
+
+        // Even though analyze would have marked Delete (old merged PR),
+        // execute_cleanup must refuse because the tip is not squash-equivalent.
+        let checks = vec![BranchCheck {
+            branch: "feat-reused".to_string(),
+            action: BranchAction::Delete { pr_number: 50 },
+        }];
+        let (deleted, skipped) = execute_cleanup(&dir, &checks, false);
+        assert_eq!(deleted, 0, "reused branch must NOT be deleted");
+        assert_eq!(skipped, 1, "reused branch must be skipped");
+
+        // Branch still exists
+        let branches = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["branch", "--list", "feat-reused"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "feat-reused must still exist"
         );
 
         std::fs::remove_dir_all(&dir).ok();
