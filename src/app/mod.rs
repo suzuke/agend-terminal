@@ -696,7 +696,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         &registry,
         tui_event_tx,
         Some(app_restart_inject),
-    );
+    )?;
     let attached_mode = attached_run_dir.is_some();
     let app_restart_rx = never_when_attached(app_restart_rx, attached_mode);
     let owner_services = start_owned_services(&home, &registry, &telegram_state, attached_mode);
@@ -769,18 +769,35 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 /// Returns `(api_guard, telegram_channel, telegram_status, attached_run_dir)`.
 /// The RAII `ApiGuard` must outlive the TUI loop, so the caller binds it;
 /// `attached_run_dir.is_some()` ⇒ Attached mode.
+/// Does this `bootstrap::prepare` failure mean "another daemon already owns this
+/// `$AGEND_HOME`"?
+///
+/// App mode MUST NOT degrade to Owned when this is true: Owned spawns the whole
+/// fleet a second time behind the live daemon's back. Split out from the match
+/// arm in [`setup_app_bootstrap`] so the classification is directly testable —
+/// the TUI path itself needs a real TTY and cannot be driven headlessly.
+fn is_singleton_conflict(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::bootstrap::DaemonAlreadyRunning>()
+        .is_some()
+}
+
+/// What [`setup_app_bootstrap`] hands back to `run_app`: the RAII API guard, the
+/// optional Telegram channel, its status, and — when non-`None` — the run dir of
+/// the daemon we attached to (`Some` ⇒ Attached mode).
+type AppBootstrap = (
+    api_server::ApiGuard,
+    Option<Arc<dyn crate::channel::Channel>>,
+    TelegramStatus,
+    Option<PathBuf>,
+);
+
 fn setup_app_bootstrap(
     home: &Path,
     fleet_path: &Path,
     registry: &AgentRegistry,
     tui_event_tx: TuiEventSender,
     app_restart: Option<crate::api::app_restart::AppRestart>,
-) -> (
-    api_server::ApiGuard,
-    Option<Arc<dyn crate::channel::Channel>>,
-    TelegramStatus,
-    Option<PathBuf>,
-) {
+) -> Result<AppBootstrap> {
     let opts = crate::bootstrap::PrepareOptions {
         resolve_agents: false, // app spawns via pane_factory from tabs
         ..Default::default()
@@ -816,6 +833,26 @@ fn setup_app_bootstrap(
                     TelegramStatus::NotConfigured,
                 )
             }
+            // Losing the daemon singleton flock is NOT a degradable failure.
+            // Falling through here leaves `attached_run_dir == None`, which makes
+            // `run_app` take the Owned branch and spawn a SECOND copy of every
+            // fleet instance behind the live daemon's back — the split-brain this
+            // guard exists to prevent (duplicate agent identities, cross-written
+            // memory dirs, dispatch replies answered by the wrong lead).
+            //
+            // Note the asymmetry this fixes: `start --foreground` already bailed
+            // on this error (`cli::start_with_fleet`), only the app path degraded.
+            Err(e) if is_singleton_conflict(&e) => {
+                tracing::error!(error = %e, "refusing to boot: daemon singleton lock is held");
+                return Err(e.context(
+                    "refusing to start a second fleet — stop the running instance first, \
+                     or use `agend-terminal attach <agent>` to reach the live one",
+                ));
+            }
+            // Every other bootstrap failure keeps the pre-existing degraded-TUI
+            // behaviour: without the flock as evidence we cannot claim a peer is
+            // alive, and locking the operator out of the TUI on (say) an
+            // unparseable fleet.yaml would remove their only repair surface.
             Err(e) => {
                 tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
                 (
@@ -825,7 +862,7 @@ fn setup_app_bootstrap(
                 )
             }
         };
-    (api_guard, telegram_state, telegram_status, attached_run_dir)
+    Ok((api_guard, telegram_state, telegram_status, attached_run_dir))
 }
 
 /// App exit teardown: persist the on-screen layout, then (Owned mode only) sync
@@ -1604,6 +1641,43 @@ mod tests {
     use crate::backend::Backend;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    /// Split-brain regression (2026-07-21 incident).
+    ///
+    /// `setup_app_bootstrap` used to funnel EVERY `bootstrap::prepare` failure
+    /// into one degraded arm: `attached_run_dir` stayed `None`, `run_app` read
+    /// that as Owned mode, and the app spawned a second copy of the whole fleet
+    /// while the real daemon was still running. Losing the singleton flock must
+    /// be classified as fatal; everything else must stay degradable so an
+    /// unparseable fleet.yaml does not lock the operator out of the only UI that
+    /// can repair it.
+    ///
+    /// The TUI path needs a real TTY (`app::run` bails without one), so the
+    /// classification is tested directly rather than by driving the app.
+    #[test]
+    fn singleton_conflict_is_fatal_but_other_bootstrap_failures_are_not() {
+        let conflict = anyhow::Error::new(crate::bootstrap::DaemonAlreadyRunning {
+            pid: Some(4242),
+            boot_unix: Some(1_784_604_392),
+        });
+        assert!(
+            is_singleton_conflict(&conflict),
+            "losing the daemon flock must be fatal — degrading here is the split-brain bug"
+        );
+
+        // Same shape, wrapped in operator-facing context the way callers add it.
+        let wrapped = conflict.context("refusing to start a second fleet");
+        assert!(
+            is_singleton_conflict(&wrapped),
+            "classification must survive `.context()` — callers always add guidance"
+        );
+
+        let unrelated = anyhow::anyhow!("fleet.yaml: mapping values are not allowed here");
+        assert!(
+            !is_singleton_conflict(&unrelated),
+            "unrelated bootstrap failures must keep the degraded-TUI escape hatch"
+        );
+    }
 
     /// #t-84833-10 redraw-storm frame cap — the `should_draw` rate-limit decision.
     #[test]

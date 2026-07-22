@@ -638,13 +638,18 @@ fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
     //   - attached-daemon detection after the winner has published run/<pid>/.
     // Both prove the same invariant this test exists to pin: no double-bind.
     eprintln!("[1814] flock-loser stderr: {loser_stderr:?}");
-    let lock_contended = loser_stderr.contains(
-        "another agend-terminal daemon is already running (lock held): \
-         try_lock failed because the operation would block",
-    );
-    let attached_existing = loser_stderr
-        .contains("another agend-terminal daemon is already running (pid ")
-        && loser_stderr.contains("run_dir ");
+    // Wording note: contention used to surface as the raw fs4 string ("lock
+    // held: try_lock failed because the operation would block"). It is now the
+    // typed `bootstrap::DaemonAlreadyRunning`, which names the incumbent so the
+    // operator can act on it — either "(pid N, started <time>)" once the winner
+    // has published `.daemon`, or an explicit "still starting up" when this
+    // process lost the race inside the winner's pre-publish window. Both remain
+    // the SAME mechanism (flock contention); only the message improved.
+    let announces_peer = loser_stderr.contains("another agend-terminal daemon is already running");
+    let lock_contended = announces_peer
+        && (loser_stderr.contains(", started ") || loser_stderr.contains("pid not published yet"));
+    let attached_existing =
+        announces_peer && loser_stderr.contains("(pid ") && loser_stderr.contains("run_dir ");
     assert!(
         lock_contended || attached_existing,
         "the flock loser MUST exit via a production single-daemon fail-fast path \

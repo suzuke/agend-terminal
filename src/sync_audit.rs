@@ -171,10 +171,12 @@ fn core_lock_exited() {
 // `FLOCK_DEPTH` for its lifetime so the same self-IPC assert covers the flock
 // tier too.
 //
-// The 2 daemon-singleton `.daemon.lock` raw `fs4::try_lock` sites
-// (`bootstrap::acquire_daemon_lock`, `daemon::run`) deliberately bypass
-// `acquire_file_lock` and MUST NOT bump: they hold for the daemon's whole life,
-// which would pin the depth > 0 and false-trip every self-IPC.
+// The single daemon-singleton `.daemon.lock` raw `fs4::try_lock` site
+// (`bootstrap::acquire_daemon_lock`) deliberately bypasses `acquire_file_lock`
+// and MUST NOT bump: it holds for the daemon's whole life, which would pin the
+// depth > 0 and false-trip every self-IPC. `daemon::run` used to carry a second
+// hand-rolled copy; it now calls `acquire_daemon_lock` so contention surfaces as
+// one typed `DaemonAlreadyRunning` for every singleton entry point.
 
 thread_local! {
     /// How many `acquire_file_lock` flocks this thread currently holds (0 = none).

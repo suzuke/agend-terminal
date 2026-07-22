@@ -506,14 +506,16 @@ pub type AgentDef = (
 /// The fleet-driven path uses [`run_with_prepared`] instead, which skips the
 /// preflight because [`crate::bootstrap::prepare`] has already done it.
 pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
-    // Acquire exclusive daemon lock (prevents TOCTOU race)
+    // Acquire exclusive daemon lock (prevents TOCTOU race).
+    //
+    // Was a second, hand-rolled copy of the flock dance. Unified onto
+    // `bootstrap::acquire_daemon_lock` so both singleton entry points report
+    // contention as the same typed `DaemonAlreadyRunning` — otherwise a caller
+    // that fails closed on the bootstrap error would still degrade on this one.
+    // The guard is bound for the rest of `run`, matching the previous
+    // `lock_file` lifetime.
     std::fs::create_dir_all(home)?;
-    let lock_path = home.join(".daemon.lock");
-    let lock_file = std::fs::File::create(&lock_path)?;
-    // Explicit trait method: Rust 1.89 stabilized inherent
-    // `File::try_lock`; current MSRV is 1.87.
-    fs4::FileExt::try_lock(&lock_file)
-        .map_err(|e| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;
+    let _daemon_lock = crate::bootstrap::acquire_daemon_lock(home)?;
 
     // #933: zombie sweep BEFORE find_active_run_dir so an aged-out
     // unresponsive daemon (which would otherwise satisfy find_active_run_dir)
