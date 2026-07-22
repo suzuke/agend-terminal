@@ -149,8 +149,9 @@ pub(crate) fn handle_cleanup_merged_branches(
         &confirm_ids,
         audit_reason,
     ) {
-        Ok(count) => json!({
+        Ok((count, skipped)) => json!({
             "applied": count,
+            "skipped": skipped,
             "audit_reason": audit_reason,
             "restore_hint": "see event-log.jsonl `branch_sweep_apply` entries for source SHAs (git branch <name> <sha>)",
         }),
