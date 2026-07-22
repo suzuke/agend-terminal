@@ -189,6 +189,35 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<Str
                 continue;
             }
         }
+        // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
+        // valid review — retire the assignment instead of re-nudging it.
+        // Fail-closed: route error or unknown task_id → preserve.
+        if let Ok(routed) = crate::tasks::load_routed(home, &record.task_id) {
+            if matches!(
+                routed.task.status,
+                crate::task_events::TaskStatus::Cancelled | crate::task_events::TaskStatus::Done
+            ) {
+                if store::retire_if_id_matches(
+                    home,
+                    repo,
+                    branch,
+                    &record.target,
+                    record.assignment_id,
+                    now,
+                )
+                .unwrap_or(false)
+                {
+                    tracing::info!(
+                        assignment_id = %record.assignment_id,
+                        target = %record.target,
+                        task_id = %record.task_id,
+                        task_status = %routed.task.status,
+                        "assignment retired: owning task is terminal"
+                    );
+                }
+                continue;
+            }
+        }
         // Classify against the LIVE pr_state for THIS record's generation (its
         // pr_number). A pr_state for a different generation, or none, ⇒ Unengaged.
         let prstate = raw_prstate
@@ -218,6 +247,7 @@ mod tests {
     use crate::daemon::assignment_authority::{self as store, ActiveAssignment, TerminalKind};
     use crate::daemon::pr_state::{self, MergeState, ReviewClass};
     use crate::mcp::handlers::comms_gates::ReviewAuthor;
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
     use std::path::{Path, PathBuf};
 
     fn tmp_home(tag: &str) -> PathBuf {
@@ -1527,6 +1557,127 @@ mod tests {
         assert_eq!(
             notice_count, 1,
             "persist replacement must not duplicate revocation notice (stable nonce dedup)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn seed_and_cancel_task(home: &Path, task_id: &str) {
+        seed_and_cancel_task_on_board(home, task_id, None);
+    }
+
+    fn seed_and_cancel_task_on_board(home: &Path, task_id: &str, project: Option<&str>) {
+        let tid = TaskId(task_id.into());
+        let inst = InstanceName("orchestrator".into());
+        let board = match project {
+            Some(p) => crate::task_events::board_root(home, p),
+            None => home.to_path_buf(),
+        };
+        crate::task_events::append_batch_at(
+            &board,
+            &inst,
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "review task".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Cancelled {
+                    task_id: tid,
+                    by: inst.clone(),
+                    reason: "BUSY declined".into(),
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cancelled_task_assignment_is_retired_not_nudged() {
+        let home = tmp_home("cancel-retire");
+        seed_and_cancel_task(&home, "t-cancel-retire-1");
+
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "lead",
+            "t-cancel-retire-1",
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Please review",
+            None,
+            None,
+            "2026-07-22T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-22T00:00:00Z").unwrap();
+        mark_row_read(
+            &home,
+            "reviewer",
+            &rec.delivery_nonce,
+            "2026-07-22T00:00:01Z",
+        );
+
+        let wakes = reconcile_all_collect(&home, "2026-07-22T00:00:02Z");
+        assert!(
+            wakes.is_empty(),
+            "cancelled task's assignment must be retired, not nudged"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "retired assignment must be absent from active store"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cancelled_task_on_project_board_assignment_is_retired() {
+        let home = tmp_home("cancel-retire-project");
+        seed_and_cancel_task_on_board(&home, "t-cancel-proj-1", Some("Hack_agend-terminal"));
+
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/y",
+            "reviewer-b",
+            9,
+            "lead",
+            "t-cancel-proj-1",
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Please review",
+            None,
+            None,
+            "2026-07-22T01:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/y", "reviewer-b", "2026-07-22T01:00:00Z")
+            .unwrap();
+        mark_row_read(
+            &home,
+            "reviewer-b",
+            &rec.delivery_nonce,
+            "2026-07-22T01:00:01Z",
+        );
+
+        let wakes = reconcile_all_collect(&home, "2026-07-22T01:00:02Z");
+        assert!(
+            wakes.is_empty(),
+            "cancelled task on project board must retire its assignment"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/y", "reviewer-b").is_none(),
+            "retired assignment must be absent from active store"
         );
         std::fs::remove_dir_all(&home).ok();
     }
