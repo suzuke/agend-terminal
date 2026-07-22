@@ -405,12 +405,12 @@ pub(crate) fn dry_run_observability(
 
     let mut needs_external = false;
     for candidate in &categories.reviewer_checkout {
-        let branch = by_name.get(candidate.name.as_str()).ok_or_else(|| {
-            format!(
-                "review candidate {} missing from branch inventory",
-                candidate.name
-            )
-        })?;
+        // A reviewer branch may have been deleted between scan() and this
+        // observability call (concurrent cleanup, worktree release, manual
+        // deletion). Skip absent branches instead of aborting the dry-run.
+        let Some(branch) = by_name.get(candidate.name.as_str()) else {
+            continue;
+        };
         if !checked_is_ancestor(repo, &branch.tip_sha, base)? {
             needs_external = true;
             break;
@@ -431,9 +431,10 @@ pub(crate) fn dry_run_observability(
         let name = candidate["name"]
             .as_str()
             .ok_or_else(|| "serialized reviewer candidate missing name".to_string())?;
-        let branch = by_name
-            .get(name)
-            .ok_or_else(|| format!("review candidate {name} missing from branch inventory"))?;
+        // Same as above: skip absent reviewer branches instead of aborting.
+        let Some(branch) = by_name.get(name) else {
+            continue;
+        };
         let evidence = classify_preservation(repo, base, branch, &branches, &external)?;
         candidate["preservation"] = serde_json::to_value(evidence)
             .map_err(|e| format!("serialize preservation evidence for {name}: {e}"))?;
@@ -959,12 +960,15 @@ pub(crate) fn emit_delete_batch_with_context(
             continue;
         };
         let is_reviewer = categories.reviewer_checkout.iter().any(|c| c.name == *name);
+        let is_stale_idle = categories.stale_idle.iter().any(|c| c.name == *name);
         let provenance = if is_reviewer {
             crate::worktree::disposition::BranchProvenance::ReviewerResidue
         } else if categories.clean_merged.iter().any(|c| c.name == *name) {
             crate::worktree::disposition::BranchProvenance::Merged
         } else if categories.squash_merged.iter().any(|c| c.name == *name) {
             crate::worktree::disposition::BranchProvenance::SquashMerged
+        } else if is_stale_idle {
+            crate::worktree::disposition::BranchProvenance::StaleIdle
         } else {
             // `active_unknown` has no terminal provenance and therefore
             // remains fail-closed in the shared classifier.
@@ -1021,7 +1025,7 @@ pub(crate) fn emit_delete_batch_with_context(
             );
             continue;
         }
-        let recovery_ref = if is_reviewer {
+        let recovery_ref = if is_reviewer || is_stale_idle {
             Some(prepare_branch_recovery(
                 home,
                 repo,
@@ -2204,6 +2208,37 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.name == "wip-active"),
             "active_unknown branch must remain after explicit confirmation"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// Bug 3 RED: dry_run_observability must not abort when a reviewer_checkout
+    /// branch from the categories no longer exists in a fresh branch enumeration.
+    /// This can happen when a concurrent cleanup or manual deletion removes the
+    /// branch between scan() and dry_run_observability(). Currently the code
+    /// calls ok_or_else(...) which returns Err, aborting the entire dry-run.
+    #[test]
+    fn dry_run_observability_skips_absent_reviewer_branch() {
+        let repo = setup_repo("absent_reviewer");
+        add_local_bare_origin(&repo);
+
+        // Build categories with a reviewer_checkout entry for a branch that
+        // does NOT exist in the repo (simulating concurrent deletion).
+        let categories = Categories {
+            reviewer_checkout: vec![Candidate {
+                name: "tmp_gone".to_string(),
+                tip_sha: "0000000000000000000000000000000000000000".to_string(),
+                reason: "reviewer checkout pattern".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let result = dry_run_observability(&repo, "main", &categories);
+        assert!(
+            result.is_ok(),
+            "dry_run_observability must not abort when a reviewer branch is absent, got: {:?}",
+            result.err()
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
