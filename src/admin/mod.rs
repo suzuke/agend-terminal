@@ -118,12 +118,24 @@ pub fn execute_cleanup(repo: &Path, checks: &[BranchCheck], dry_run: bool) -> (u
                     println!("{msg}");
                     log_lines.push(msg);
                 } else {
+                    // Capture the tip SHA before deletion for restore auditing.
+                    let tip_sha =
+                        crate::git_helpers::git_bypass(repo, &["rev-parse", &check.branch])
+                            .ok()
+                            .filter(|o| o.status.success())
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                            .unwrap_or_default();
                     // #1899: bounded via git_bypass (LOCAL 60s).
+                    // Use -D (force) because squash-merged branches are not
+                    // ancestry-reachable from HEAD and -d refuses them.
                     let result =
-                        crate::git_helpers::git_bypass(repo, &["branch", "-d", &check.branch]);
+                        crate::git_helpers::git_bypass(repo, &["branch", "-D", &check.branch]);
                     match result {
                         Ok(out) if out.status.success() => {
-                            let msg = format!("deleted: {} (PR #{})", check.branch, pr_number);
+                            let msg = format!(
+                                "deleted: {} (PR #{}) [tip={}]",
+                                check.branch, pr_number, tip_sha
+                            );
                             println!("{msg}");
                             log_lines.push(msg);
                             deleted += 1;
@@ -286,8 +298,13 @@ mod tests {
         std::process::Command::new("git")
             .env("AGEND_GIT_BYPASS", "1")
             .args([
-                "-c", "user.name=test", "-c", "user.email=t@t",
-                "commit", "-m", "feat: squash work",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "feat: squash work",
             ])
             .current_dir(&dir)
             .output()
@@ -304,8 +321,14 @@ mod tests {
         std::process::Command::new("git")
             .env("AGEND_GIT_BYPASS", "1")
             .args([
-                "-c", "user.name=test", "-c", "user.email=t@t",
-                "commit", "--allow-empty", "-m", "main: diverge",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "main: diverge",
             ])
             .current_dir(&dir)
             .output()
@@ -319,8 +342,13 @@ mod tests {
         std::process::Command::new("git")
             .env("AGEND_GIT_BYPASS", "1")
             .args([
-                "-c", "user.name=test", "-c", "user.email=t@t",
-                "commit", "-m", "squash: feat-squash",
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "squash: feat-squash",
             ])
             .current_dir(&dir)
             .output()

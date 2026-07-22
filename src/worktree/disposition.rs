@@ -163,10 +163,9 @@ pub(crate) fn branch_lifecycle_disposition(
         BranchProvenance::ManagedReview
         | BranchProvenance::Merged
         | BranchProvenance::SquashMerged
-        | BranchProvenance::ReviewerResidue => BranchLifecycleDisposition::Delete,
-        BranchProvenance::StaleIdle | BranchProvenance::Unknown => {
-            BranchLifecycleDisposition::Keep
-        }
+        | BranchProvenance::ReviewerResidue
+        | BranchProvenance::StaleIdle => BranchLifecycleDisposition::Delete,
+        BranchProvenance::Unknown => BranchLifecycleDisposition::Keep,
     }
 }
 
