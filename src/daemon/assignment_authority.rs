@@ -922,13 +922,11 @@ pub(crate) fn repair_row(
     if !now_ge(now, &record.next_nudge_at) {
         return Ok(false);
     }
-    // B2 (A4 = Unengaged ∧ NON-ACTIONABLE ∧ lease-due): a still-actionable (unread,
-    // un-superseded) current row is HEALTHY — the reviewer simply hasn't read it yet.
-    // Do NOT rotate/supersede a healthy delivery (that would be a spurious re-nudge
-    // and would orphan an unread row); just advance the lease under the CAS so the
-    // next check is a full interval away. ONLY a NON-actionable current row
-    // (read-and-ignored, or lost) proceeds to the append-only repair below.
-    if crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce) {
+    // B2 (#2914): a present, non-superseded row is HEALTHY — the reviewer either
+    // hasn't read it yet OR has read it and is actively working. Do NOT
+    // rotate/supersede (that floods the reviewer mid-review). Only a truly
+    // missing or superseded row proceeds to the append-only repair below.
+    if crate::inbox::storage::nonce_present_not_superseded(home, target, &record.delivery_nonce) {
         if let Ok(Some(mut cur)) = read_record(&path) {
             if cur.assignment_id == record.assignment_id {
                 cur.next_nudge_at = add_interval(now);
@@ -2032,10 +2030,8 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// A4/I12: append-only repair rotates the nonce, supersedes the OLD row, keeps
-    /// the new row actionable, and respects the FIXED-interval bound — a repair
-    /// before `next_nudge_at` is a no-op; two repairs inside one interval fire at
-    /// most once. `read_at` is never reset.
+    /// A4/I12: append-only repair — nonce rotation, interval bound, read_at preserved.
+    /// #2914: present rows (read or unread) are healthy; only missing rows trigger repair.
     #[test]
     fn repair_append_only_fixed_interval() {
         let home = tmp_home("repair");
@@ -2043,9 +2039,6 @@ mod tests {
         persist(&home, &rec).unwrap();
         durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
         let n1 = rec.delivery_nonce.clone();
-        // B2: repair only re-nudges a NON-actionable row. Mark the delivered row READ
-        // (seen but not acted) — the state the FIXED-interval re-nudge exists for.
-        mark_row_read(&home, "reviewer", &n1, "2026-07-13T00:00:00Z");
 
         // Before next_nudge_at (== created_at) → NOT eligible.
         assert!(
@@ -2053,35 +2046,40 @@ mod tests {
             "repair before the lease is a no-op (bounded)"
         );
 
-        // At/after next_nudge_at, with the row seen (non-actionable) → repairs once.
+        // Row still present (unread) → no repair even after the lease.
         assert!(
-            repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
-            "repair fires once the lease is due and the row is non-actionable"
+            !repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
+            "present (unread) row is healthy — no repair"
+        );
+
+        // Mark read — row is still present and not superseded → still no repair (#2914).
+        mark_row_read(&home, "reviewer", &n1, "2026-07-13T00:00:05Z");
+        assert!(
+            !repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:01:06Z").unwrap(),
+            "#2914: read-but-present row is healthy — no repair"
+        );
+
+        // Wipe inbox (simulating a truly lost message) → repair fires.
+        let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
+        std::fs::remove_file(&inbox_path).ok();
+        let cur = get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        let repair_time = add_interval(&cur.next_nudge_at);
+        assert!(
+            repair_row(&home, "o/r", "feat/x", "reviewer", &repair_time).unwrap(),
+            "missing row triggers repair"
         );
         let after = get(&home, "o/r", "feat/x", "reviewer").unwrap();
         let n2 = after.delivery_nonce.clone();
         assert_ne!(n1, n2, "repair rotates the nonce");
-        assert_eq!(
-            after.next_nudge_at,
-            add_interval("2026-07-13T00:00:01Z"),
-            "next_nudge_at advanced by exactly FIXED_INTERVAL"
-        );
-        // OLD row superseded (not actionable); NEW row actionable.
-        assert!(
-            !crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &n1),
-            "stale row superseded by the old nonce"
-        );
+        // NEW row is actionable.
         assert!(
             crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &n2),
             "fresh row carries the new nonce and is actionable"
         );
-        // Both nonces still have exactly one row each (append-only, no in-place reset).
-        assert_eq!(rows_with_nonce(&home, "reviewer", &n1).len(), 1);
-        assert_eq!(rows_with_nonce(&home, "reviewer", &n2).len(), 1);
 
         // A second repair within the same interval must NOT fire.
         assert!(
-            !repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:30Z").unwrap(),
+            !repair_row(&home, "o/r", "feat/x", "reviewer", &repair_time).unwrap(),
             "≤ 1 repair per FIXED_INTERVAL"
         );
         assert_eq!(

@@ -640,6 +640,27 @@ pub fn nonce_present_actionable(home: &Path, target: &str, nonce: &str) -> bool 
         })
 }
 
+/// #2914: like [`nonce_present_actionable`] but treats a read-but-not-superseded
+/// row as alive. A reviewer who read the assignment is actively working — not
+/// disengaged. Only missing or superseded rows warrant re-delivery.
+pub fn nonce_present_not_superseded(home: &Path, target: &str, nonce: &str) -> bool {
+    let path = inbox_path_resolved(home, target);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains(nonce))
+        .any(|l| {
+            serde_json::from_str::<InboxMessage>(l)
+                .ok()
+                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
+                .map(|m| m.superseded_by.is_none())
+                .unwrap_or(false)
+        })
+}
+
 /// Outcome of [`supersede_by_nonce`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NonceSupersedeOutcome {

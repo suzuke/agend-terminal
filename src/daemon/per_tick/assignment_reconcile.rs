@@ -327,6 +327,9 @@ mod tests {
     /// only when `now >= next_nudge_at`, two ticks inside one interval fire at most
     /// once, and the lease (persisted in the record) survives a "restart" (a fresh
     /// `reconcile_all_collect` call — the core holds no in-memory lease state).
+    ///
+    /// #2914: repair fires only when the inbox row is genuinely missing — not when
+    /// merely read. Simulate loss by removing the inbox file.
     #[test]
     fn t16_unengaged_fixed_interval_bounded_survives_restart() {
         let home = tmp_home("t16");
@@ -334,18 +337,16 @@ mod tests {
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
         let n0 = rec.delivery_nonce.clone();
-        // B2: repair only re-nudges a NON-actionable row. Mark the delivered row READ
-        // so the reviewer has SEEN it but not acted — the state the FIXED-interval
-        // re-nudge is for. (A still-unread row is intentionally left alone — see
-        // b2_first_tick_does_not_rotate_healthy_unread_row.)
-        mark_row_read(&home, "reviewer", &n0, "2026-07-13T00:00:00Z");
+        // #2914: simulate a genuinely lost message (inbox wiped).
+        let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
+        std::fs::remove_file(&inbox_path).ok();
 
         // Tick 1 @ +1s (lease due at created_at): repair fires ⇒ wake + nonce rotates.
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:01Z");
         assert_eq!(
             wakes,
             vec!["reviewer".to_string()],
-            "lease-due Unengaged (row read) ⇒ wake"
+            "lease-due Unengaged (row missing) ⇒ wake"
         );
         let n1 = store::get(&home, "o/r", "feat/x", "reviewer")
             .unwrap()
@@ -353,6 +354,7 @@ mod tests {
         assert_ne!(n0, n1, "repair rotated the nonce");
 
         // Tick 2 @ +30s (SAME interval): throttled ⇒ NO wake, NO rotation.
+        // The tick-1 repair re-created the inbox with a fresh row, so nonce is present.
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:30Z");
         assert!(
             wakes.is_empty(),
@@ -366,9 +368,8 @@ mod tests {
             "throttled tick did not rotate"
         );
 
-        // The tick-1 repair enqueued a FRESH actionable row (nonce n1). Mark it read
-        // too, so the next-interval re-nudge has a NON-actionable row to act on.
-        mark_row_read(&home, "reviewer", &n1, "2026-07-13T00:00:30Z");
+        // Simulate another loss so the next-interval repair has something to act on.
+        std::fs::remove_file(&inbox_path).ok();
 
         // "Restart" = fresh core call; the lease is on-disk. @ +90s (next interval):
         // repair fires again ⇒ ≤1 repair per FIXED_INTERVAL, bound survived restart.
@@ -799,9 +800,9 @@ mod tests {
         let n0 = store::get(&home, "o/r", "feat/x", "reviewer")
             .unwrap()
             .delivery_nonce;
-        // B2: the re-nudge only rotates a NON-actionable row — mark the delivered row
-        // READ so the lease-due repair has a seen-but-unacted row to re-nudge.
-        mark_row_read(&home, "reviewer", &n0, "2020-01-01T00:00:00Z");
+        // #2914: simulate a genuinely lost message so repair fires.
+        let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
+        std::fs::remove_file(&inbox_path).ok();
 
         let registry: crate::agent::AgentRegistry =
             std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -979,9 +980,9 @@ mod tests {
         );
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
-        let n0 = rec.delivery_nonce.clone();
-        // Mark the row read so repair_row will actually fire.
-        mark_row_read(&home, "reviewer", &n0, "2026-07-13T00:00:00Z");
+        // #2914: simulate a genuinely lost message so repair fires.
+        let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
+        std::fs::remove_file(&inbox_path).ok();
         // PrState head matches the assignment's reviewed_head — no contradiction.
         open_prstate(&home, "o/r", "feat/x", 7, "sha-same");
 
