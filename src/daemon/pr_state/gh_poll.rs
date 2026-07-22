@@ -414,10 +414,10 @@ pub fn resolve_author_with_gh(
     state: &super::PrState,
 ) -> String {
     if let Some(login) = gh_author {
-        if let Some(name) = match_via_github_login_field(home, login) {
+        if let Some(name) = match_via_github_login_field(home, login, &state.repo) {
             return name;
         }
-        if let Some(name) = match_via_instance_name(home, login) {
+        if let Some(name) = match_via_instance_name(home, login, &state.repo) {
             return name;
         }
     }
@@ -436,22 +436,42 @@ pub fn resolve_author_with_gh(
     "fixup-lead".to_string()
 }
 
-fn match_via_github_login_field(home: &std::path::Path, gh_login: &str) -> Option<String> {
+/// #2918: does `instance`'s `source_repo` match the PR's `repo` slug?
+/// `None` (unset `source_repo`) matches ANY repo — preserves backward
+/// compat for single-repo fleets that never set the field. `Some(sr)`
+/// must resolve (bare slug or local-checkout `origin` remote) to the
+/// same canonical `owner/repo` as `repo`.
+fn source_repo_matches(inst: &crate::fleet::InstanceConfig, repo: &str) -> bool {
+    let Some(sr) = inst.source_repo.as_deref() else {
+        return true;
+    };
+    let slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
+        crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(sr))
+    });
+    slug.is_some_and(|s| s.eq_ignore_ascii_case(repo))
+}
+
+fn match_via_github_login_field(
+    home: &std::path::Path,
+    gh_login: &str,
+    repo: &str,
+) -> Option<String> {
     let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
     cfg.instances.iter().find_map(|(name, inst)| {
         inst.github_login
             .as_deref()
             .filter(|gl| gl.eq_ignore_ascii_case(gh_login))
+            .filter(|_| source_repo_matches(inst, repo))
             .map(|_| name.clone())
     })
 }
 
-fn match_via_instance_name(home: &std::path::Path, gh_login: &str) -> Option<String> {
+fn match_via_instance_name(home: &std::path::Path, gh_login: &str, repo: &str) -> Option<String> {
     let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
     cfg.instances
-        .keys()
-        .find(|name| name.eq_ignore_ascii_case(gh_login))
-        .cloned()
+        .iter()
+        .find(|(name, inst)| name.eq_ignore_ascii_case(gh_login) && source_repo_matches(inst, repo))
+        .map(|(name, _)| name.clone())
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────
