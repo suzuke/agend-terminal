@@ -895,12 +895,9 @@ pub(crate) fn durable_enqueue(
 }
 
 /// A4 — row repair / re-wake, gated on `now >= next_nudge_at` (FIXED-interval
-/// lease). Returns whether a WAKE is needed. Three paths:
-/// - Actionable-unread row (present, not superseded, not read/delivering):
-///   advance lease, return true (pure wake, no nonce rotation).
-/// - Read/delivering row (present, not superseded): advance lease, return false.
-/// - Missing/superseded row: mint NEW nonce, enqueue fresh row, SUPERSEDE the
-///   stale row, advance nonce + lease, return true (append-only repair).
+/// lease). Returns whether a WAKE is needed: true for actionable-unread (pure
+/// wake, no rotation) or missing/superseded (append-only repair); false for
+/// read/delivering (lease advance only).
 pub(crate) fn repair_row(
     home: &Path,
     repo: &str,
