@@ -1628,9 +1628,13 @@ mod tests {
             "2026-07-22T00:00:00Z",
         );
         store::persist(&home, &rec).unwrap();
-        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-22T00:00:00Z")
-            .unwrap();
-        mark_row_read(&home, "reviewer", &rec.delivery_nonce, "2026-07-22T00:00:01Z");
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-22T00:00:00Z").unwrap();
+        mark_row_read(
+            &home,
+            "reviewer",
+            &rec.delivery_nonce,
+            "2026-07-22T00:00:01Z",
+        );
 
         let wakes = reconcile_all_collect(&home, "2026-07-22T00:00:02Z");
         assert!(
