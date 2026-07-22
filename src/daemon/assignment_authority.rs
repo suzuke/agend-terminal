@@ -894,11 +894,13 @@ pub(crate) fn durable_enqueue(
     Ok(())
 }
 
-/// A4 — APPEND-ONLY row repair, gated on `now >= next_nudge_at` (FIXED-interval
-/// lease). Mints a NEW nonce, enqueues a fresh actionable row, SUPERSEDES the
-/// stale row by the OLD nonce, and advances `delivery_nonce` + `next_nudge_at`
-/// (CAS on `assignment_id`). NEVER resets `read_at`. Returns whether a repair
-/// fired.
+/// A4 — row repair / re-wake, gated on `now >= next_nudge_at` (FIXED-interval
+/// lease). Returns whether a WAKE is needed. Three paths:
+/// - Actionable-unread row (present, not superseded, not read/delivering):
+///   advance lease, return true (pure wake, no nonce rotation).
+/// - Read/delivering row (present, not superseded): advance lease, return false.
+/// - Missing/superseded row: mint NEW nonce, enqueue fresh row, SUPERSEDE the
+///   stale row, advance nonce + lease, return true (append-only repair).
 pub(crate) fn repair_row(
     home: &Path,
     repo: &str,
@@ -922,18 +924,21 @@ pub(crate) fn repair_row(
     if !now_ge(now, &record.next_nudge_at) {
         return Ok(false);
     }
-    // B2 (#2914): a present, non-superseded row is HEALTHY — the reviewer either
-    // hasn't read it yet OR has read it and is actively working. Do NOT
+    // B2 (#2914): a present, non-superseded row is HEALTHY — do NOT
     // rotate/supersede (that floods the reviewer mid-review). Only a truly
     // missing or superseded row proceeds to the append-only repair below.
+    // However, an actionable-unread row still needs a wake so the reviewer
+    // notices the assignment; read/delivering rows do not wake.
     if crate::inbox::storage::nonce_present_not_superseded(home, target, &record.delivery_nonce) {
+        let needs_wake =
+            crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce);
         if let Ok(Some(mut cur)) = read_record(&path) {
             if cur.assignment_id == record.assignment_id {
                 cur.next_nudge_at = add_interval(now);
                 atomic_write_json(&path, &cur)?;
             }
         }
-        return Ok(false);
+        return Ok(needs_wake);
     }
     let old_nonce = record.delivery_nonce.clone();
     let new_nonce = uuid::Uuid::new_v4().to_string();
