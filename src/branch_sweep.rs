@@ -2315,9 +2315,9 @@ mod tests {
         assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
 
         // The response MUST contain a structured skipped list.
-        let skipped = r["skipped"].as_array().expect(&format!(
-            "apply response must contain 'skipped' array, got: {r}"
-        ));
+        let skipped = r["skipped"]
+            .as_array()
+            .unwrap_or_else(|| panic!("apply response must contain 'skipped' array, got: {r}"));
         assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
         assert_eq!(
             skipped[0]["branch"], "feat-merged-local",
@@ -2379,9 +2379,9 @@ mod tests {
         );
         assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
 
-        let skipped = r["skipped"].as_array().expect(&format!(
-            "apply response must contain 'skipped' array, got: {r}"
-        ));
+        let skipped = r["skipped"]
+            .as_array()
+            .unwrap_or_else(|| panic!("apply response must contain 'skipped' array, got: {r}"));
         assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
         assert_eq!(
             skipped[0]["branch"], "feat-held",
