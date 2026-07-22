@@ -1577,10 +1577,18 @@ mod tests {
     }
 
     fn seed_and_cancel_task(home: &Path, task_id: &str) {
+        seed_and_cancel_task_on_board(home, task_id, None);
+    }
+
+    fn seed_and_cancel_task_on_board(home: &Path, task_id: &str, project: Option<&str>) {
         let tid = TaskId(task_id.into());
         let inst = InstanceName("orchestrator".into());
-        crate::task_events::append_batch(
-            home,
+        let board = match project {
+            Some(p) => crate::task_events::board_root(home, p),
+            None => home.to_path_buf(),
+        };
+        crate::task_events::append_batch_at(
+            &board,
             &inst,
             vec![
                 TaskEvent::Created {
@@ -1643,6 +1651,47 @@ mod tests {
         );
         assert!(
             store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "retired assignment must be absent from active store"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cancelled_task_on_project_board_assignment_is_retired() {
+        let home = tmp_home("cancel-retire-project");
+        seed_and_cancel_task_on_board(&home, "t-cancel-proj-1", Some("Hack_agend-terminal"));
+
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/y",
+            "reviewer-b",
+            9,
+            "lead",
+            "t-cancel-proj-1",
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Please review",
+            None,
+            None,
+            "2026-07-22T01:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/y", "reviewer-b", "2026-07-22T01:00:00Z")
+            .unwrap();
+        mark_row_read(
+            &home,
+            "reviewer-b",
+            &rec.delivery_nonce,
+            "2026-07-22T01:00:01Z",
+        );
+
+        let wakes = reconcile_all_collect(&home, "2026-07-22T01:00:02Z");
+        assert!(
+            wakes.is_empty(),
+            "cancelled task on project board must retire its assignment"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/y", "reviewer-b").is_none(),
             "retired assignment must be absent from active store"
         );
         std::fs::remove_dir_all(&home).ok();
