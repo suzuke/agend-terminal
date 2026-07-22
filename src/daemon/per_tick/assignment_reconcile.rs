@@ -132,27 +132,16 @@ pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
     workset.extend(store::active_branches(home));
     workset.extend(crate::daemon::pr_state::list_state_identities(home));
 
-    // Task-terminal gate (#2878-16): replay the default board ONCE per tick so
-    // reconcile_branch can retire assignments whose owning task is terminal.
-    // Fail-closed: an unreadable board → None → assignments preserved.
-    let board = crate::task_events::replay(home).ok();
-
     let mut wakes = Vec::new();
     for (repo, branch) in workset {
-        wakes.extend(reconcile_branch(home, &repo, &branch, now, board.as_ref()));
+        wakes.extend(reconcile_branch(home, &repo, &branch, now));
     }
     wakes
 }
 
 /// One branch. Returns the targets to WAKE (A3). No lock is held across the calls
 /// below — each store op locks internally, so they never nest (no re-lock deadlock).
-fn reconcile_branch(
-    home: &Path,
-    repo: &str,
-    branch: &str,
-    now: &str,
-    board: Option<&crate::task_events::TaskBoardState>,
-) -> Vec<String> {
+fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<String> {
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
     store::tombstone_terminal_matches(home, repo, branch);
@@ -202,35 +191,31 @@ fn reconcile_branch(
         }
         // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
         // valid review — retire the assignment instead of re-nudging it.
-        // Fail-closed: absent board or unknown task_id → preserve.
-        if let Some(board) = board {
-            let tid = crate::task_events::TaskId(record.task_id.clone());
-            if let Some(task) = board.tasks.get(&tid) {
-                if matches!(
-                    task.status,
-                    crate::task_events::TaskStatus::Cancelled
-                        | crate::task_events::TaskStatus::Done
-                ) {
-                    if store::retire_if_id_matches(
-                        home,
-                        repo,
-                        branch,
-                        &record.target,
-                        record.assignment_id,
-                        now,
-                    )
-                    .unwrap_or(false)
-                    {
-                        tracing::info!(
-                            assignment_id = %record.assignment_id,
-                            target = %record.target,
-                            task_id = %record.task_id,
-                            task_status = %task.status,
-                            "assignment retired: owning task is terminal"
-                        );
-                    }
-                    continue;
+        // Fail-closed: route error or unknown task_id → preserve.
+        if let Ok(routed) = crate::tasks::load_routed(home, &record.task_id) {
+            if matches!(
+                routed.task.status,
+                crate::task_events::TaskStatus::Cancelled | crate::task_events::TaskStatus::Done
+            ) {
+                if store::retire_if_id_matches(
+                    home,
+                    repo,
+                    branch,
+                    &record.target,
+                    record.assignment_id,
+                    now,
+                )
+                .unwrap_or(false)
+                {
+                    tracing::info!(
+                        assignment_id = %record.assignment_id,
+                        target = %record.target,
+                        task_id = %record.task_id,
+                        task_status = %routed.task.status,
+                        "assignment retired: owning task is terminal"
+                    );
                 }
+                continue;
             }
         }
         // Classify against the LIVE pr_state for THIS record's generation (its
