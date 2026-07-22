@@ -1682,4 +1682,56 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// Actionable-unread row: lease-due reconciliation fires exactly one wake
+    /// without nonce rotation or supersede. A second tick within 60s is bounded.
+    #[test]
+    fn actionable_unread_row_triggers_bounded_wake() {
+        let home = tmp_home("unread-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        let nonce_0 = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z")
+            .unwrap();
+
+        // Row is unread/actionable. Tick at lease-due time → should wake.
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:01Z");
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "actionable-unread row ⇒ wake"
+        );
+
+        // Pure wake: nonce must NOT rotate (no new row, no supersede).
+        let nonce_1 = store::get(&home, "o/r", "feat/x", "reviewer")
+            .unwrap()
+            .delivery_nonce;
+        assert_eq!(nonce_0, nonce_1, "pure wake: nonce not rotated");
+
+        // Second tick within 60s → lease not due → no wake.
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:30Z");
+        assert!(wakes.is_empty(), "second tick within lease ⇒ no wake");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Read row: lease-due reconciliation does NOT wake (reviewer has seen it).
+    #[test]
+    fn read_row_does_not_wake() {
+        let home = tmp_home("read-no-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        let nonce = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z")
+            .unwrap();
+
+        // Mark row as read.
+        mark_row_read(&home, "reviewer", &nonce, "2026-07-13T00:00:05Z");
+
+        // Tick at lease-due time → no wake (reviewer has read it).
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:10Z");
+        assert!(wakes.is_empty(), "read row ⇒ no wake");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
