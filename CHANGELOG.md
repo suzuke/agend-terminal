@@ -7,6 +7,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-07-23
+
+208 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
+
+### Added
+
+- **Grok Build backend and cross-backend controls** — Grok is now a first-class resumable backend, while explicit model intent and persistent per-instance/fleet context thresholds work across supported backends (#2707, #2718, #2753, #2757, #2779, #2864).
+- **Durable exact-head CI and review coordination** — task-linked protected-branch watches, freshness-aware PR state, durable reviewer assignments, bounded handoff deferral, notification-only post-merge watches, and explicit handoff acknowledgement make CI/review continuation recoverable across restarts (#2743–#2747, #2763, #2766, #2782, #2833, #2835, #2837, #2881).
+- **First-party `agentic-git` integration** — the release now builds and packages the git policy shim, shares binding signing with `agentic-git-core`, and uses the first-party wrapper in managed development flows (#2689–#2692, #2776).
+- **Usage-limit control-plane episodes** — usage-limit incidents are durable and operator-authorized takeover is enforced at API ingress (#2759, #2814).
+
+### Changed
+
+- **Runtime operations use typed in-process services** — pane snapshots, health writes, inject/move/update/delete/spawn/send/team/deployment operations no longer loop back through the daemon's own MCP API when a runtime is already present (#2732, #2734, #2842–#2856).
+- **Worktree cleanup is fail-closed and auditable** — branch lifecycle retirement, cleanup intents, transaction serialization, legacy reconciliation, nested-submodule preservation, and structured skipped-blocker diagnostics now share guarded daemon paths (#2695–#2723, #2754, #2780, #2815, #2826, #2827, #2916, #2922).
+- **Review and CI routing is repository-aware** — assignment retirement, PR-author fallback, task-creator action-required handoff, scanner-head synchronization, and verdict routing now preserve repository/task identity instead of relying on branch or login alone (#2909–#2915, #2918, #2921, #2923).
+- **Documentation was consolidated and refreshed** — bilingual operational, protocol, backend-capability, worktree, CI, and architecture references were updated to match the shipped behavior (#2811, #2819, #2821, #2824).
+
+### Fixed
+
+- **CI continuation gaps and duplicate notifications** — durable episode settlement, exact pickup acknowledgement, task-wake routing, stale assignment retirement, and bounded unread-assignment re-wake close several cases where a green/failing CI event was delivered repeatedly or failed to resume its owner (#2798, #2833, #2835, #2861, #2881, #2911, #2912, #2914, #2917, #2923).
+- **Worktree release and branch-cleanup safety** — canonical/default worktrees, dirty nested submodules, open-PR branches, markerless legacy worktrees, checkout rollback, and cross-repository default branches are preserved or rejected with actionable evidence instead of being deleted ambiguously (#2754, #2831, #2862, #2871, #2875, #2894–#2896, #2908, #2916, #2922).
+- **Crash/restart accounting** — exact-generation disposition, restart admission, claimant permits, and crash-attempt debit ordering prevent duplicate respawns and incorrect crash-budget charges (#2765, #2822, #2825, #2829, #2840, #2869, #2899, #2906).
+- **Backend and daemon edge cases** — declared backend identity survives wrappers and handles, decimal context percentages are accepted, and app mode now fails closed when the daemon singleton lock is already held (#2781, #2834, #2836, #2877, #2883, #2897).
+
+### Migration and known caveats
+
+- Existing `fleet.yaml` and runtime configuration remain compatible; there is no mandatory configuration migration for 0.11.0.
+- Managed git flows now use the shipped first-party `agentic-git` wrapper. Deployments with a custom shim or `PATH` override should verify their setup against `docs/GIT-BEHAVIOR.md` before rollout.
+- Worktree/branch cleanup intentionally fails closed on dirty, foreign-owned, or unproven state. Resolve the structured blocker through daemon release/cleanup actions rather than deleting worktrees or branches manually.
+- Run the documented exact-commit backend smoke matrix in `docs/RELEASING.md` before creating the annotated `v0.11.0` tag.
+
 ## [0.10.0] — 2026-07-07
 
 311 commits since 0.9.0. Highlights, organized by theme (not an exhaustive commit list).
@@ -647,7 +679,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...v0.8.0
