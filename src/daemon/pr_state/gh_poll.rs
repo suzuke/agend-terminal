@@ -772,6 +772,33 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// T8-f / #2918: two instances share the same `github_login` but have
+    /// different `source_repo`s. A PR on repo-B MUST resolve to the
+    /// repo-B agent, not whichever instance iterates first in
+    /// fleet.yaml (map order is unspecified — the current bug picks
+    /// "whichever comes first", which is wrong for repo-B PRs whenever
+    /// the repo-A entry happens to iterate first).
+    #[test]
+    fn t8f_repo_aware_github_login_resolves_correct_agent() {
+        let home = tmp_home("auth-repo-aware");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+             bot-repoA:\n    backend: claude\n    github_login: shared-bot\n    source_repo: owner/repo-a\n  \
+             bot-repoB:\n    backend: claude\n    github_login: shared-bot\n    source_repo: owner/repo-b\n",
+        )
+        .unwrap();
+        let mut state = fresh_state("br");
+        state.repo = "owner/repo-b".to_string();
+        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
+        assert_eq!(
+            resolved, "bot-repoB",
+            "github_login=shared-bot on repo-b's PR MUST resolve to bot-repoB, \
+             not whichever instance iterates first in fleet.yaml"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// MockGhPoller smoke — verifies the test seam itself works.
     #[test]
     fn mock_poller_returns_canned_responses() {
