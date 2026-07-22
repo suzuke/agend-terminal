@@ -2208,4 +2208,35 @@ mod tests {
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
+
+    /// Bug 3 RED: dry_run_observability must not abort when a reviewer_checkout
+    /// branch from the categories no longer exists in a fresh branch enumeration.
+    /// This can happen when a concurrent cleanup or manual deletion removes the
+    /// branch between scan() and dry_run_observability(). Currently the code
+    /// calls ok_or_else(...) which returns Err, aborting the entire dry-run.
+    #[test]
+    fn dry_run_observability_skips_absent_reviewer_branch() {
+        let repo = setup_repo("absent_reviewer");
+        add_local_bare_origin(&repo);
+
+        // Build categories with a reviewer_checkout entry for a branch that
+        // does NOT exist in the repo (simulating concurrent deletion).
+        let categories = Categories {
+            reviewer_checkout: vec![Candidate {
+                name: "tmp_gone".to_string(),
+                tip_sha: "0000000000000000000000000000000000000000".to_string(),
+                reason: "reviewer checkout pattern".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let result = dry_run_observability(&repo, "main", &categories);
+        assert!(
+            result.is_ok(),
+            "dry_run_observability must not abort when a reviewer branch is absent, got: {:?}",
+            result.err()
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
 }

@@ -261,6 +261,106 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Bug 1 RED: squash-merged branches (different SHA on main, same patch)
+    /// must be force-deleted. Currently `execute_cleanup` uses `git branch -d`
+    /// which refuses because the branch tip is not ancestry-reachable from HEAD.
+    #[test]
+    fn execute_cleanup_force_deletes_squash_merged_branch() {
+        let dir = tmp_dir("squash-force");
+        init_repo(&dir);
+
+        // Create feat-squash with a unique commit
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["checkout", "-b", "feat-squash"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("squash.txt"), "squash content\n").unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["add", "squash.txt"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args([
+                "-c", "user.name=test", "-c", "user.email=t@t",
+                "commit", "-m", "feat: squash work",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Switch back to main and cherry-pick (simulating squash merge — different SHA)
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["checkout", "main"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // Add an unrelated commit first so cherry-pick doesn't fast-forward
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args([
+                "-c", "user.name=test", "-c", "user.email=t@t",
+                "commit", "--allow-empty", "-m", "main: diverge",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["cherry-pick", "--no-commit", "feat-squash"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args([
+                "-c", "user.name=test", "-c", "user.email=t@t",
+                "commit", "-m", "squash: feat-squash",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Precondition: feat-squash is NOT ancestry-reachable from main
+        let ancestor_check = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["merge-base", "--is-ancestor", "feat-squash", "main"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            !ancestor_check.status.success(),
+            "precondition: feat-squash must NOT be ancestry-reachable from main"
+        );
+
+        let checks = vec![BranchCheck {
+            branch: "feat-squash".to_string(),
+            action: BranchAction::Delete { pr_number: 99 },
+        }];
+        let (deleted, skipped) = execute_cleanup(&dir, &checks, false);
+        assert_eq!(deleted, 1, "squash-merged branch must be force-deleted");
+        assert_eq!(skipped, 0);
+
+        // Verify branch no longer exists
+        let branches = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["branch", "--list", "feat-squash"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "feat-squash must no longer exist after cleanup"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn dry_run_does_not_delete() {
         let dir = tmp_dir("dry-run");

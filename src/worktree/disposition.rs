@@ -117,6 +117,9 @@ pub(crate) enum BranchProvenance {
     /// `review/*` checkout). This is distinct from a forged name: callers
     /// still need all the terminal/occupancy/task/PR gates below.
     ReviewerResidue,
+    /// A branch whose tip commit is older than the stale_idle threshold and
+    /// is neither merged nor squash-merged.
+    StaleIdle,
     /// Evidence was missing or contradictory.
     Unknown,
 }
@@ -161,7 +164,9 @@ pub(crate) fn branch_lifecycle_disposition(
         | BranchProvenance::Merged
         | BranchProvenance::SquashMerged
         | BranchProvenance::ReviewerResidue => BranchLifecycleDisposition::Delete,
-        BranchProvenance::Unknown => BranchLifecycleDisposition::Keep,
+        BranchProvenance::StaleIdle | BranchProvenance::Unknown => {
+            BranchLifecycleDisposition::Keep
+        }
     }
 }
 
@@ -590,6 +595,26 @@ mod tests {
         assert_eq!(
             branch_lifecycle_disposition(&input),
             BranchLifecycleDisposition::Keep
+        );
+    }
+
+    /// Bug 2 RED: stale_idle branches must be deletable via the lifecycle
+    /// classifier. Currently StaleIdle is grouped with Unknown => Keep, so
+    /// this assertion fails.
+    #[test]
+    fn branch_lifecycle_stale_idle_deletes() {
+        let input = BranchLifecycleInput {
+            provenance: BranchProvenance::StaleIdle,
+            terminal: true,
+            active_holder: Some(false),
+            task_active: Some(false),
+            open_pr: Some(false),
+            unique_unpreserved_work: Some(false),
+        };
+        assert_eq!(
+            branch_lifecycle_disposition(&input),
+            BranchLifecycleDisposition::Delete,
+            "stale_idle branches with all safety gates cleared must be deletable"
         );
     }
 }
