@@ -439,25 +439,19 @@ pub fn resolve_author_with_gh(
 /// #2918: does `instance`'s configured repo identity match the PR's
 /// originating `repo` slug? Precedence: explicit `repo` override
 /// (Sprint 55 EC4) → `source_repo` derivation (bare slug / local
-/// origin remote). `source_repo=None` matches ANY repo (backward
-/// compat for single-repo fleets). Invalid/unresolvable → no match.
+/// origin remote). Match-any backward compat only when BOTH `repo`
+/// and `source_repo` are absent. Invalid/unresolvable → no match.
 fn source_repo_matches(inst: &crate::fleet::InstanceConfig, repo: &str) -> bool {
-    let Some(_sr) = inst.source_repo.as_deref() else {
+    if let Some(explicit) = inst.repo.as_deref() {
+        return crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(explicit)
+            .is_some_and(|s| s.eq_ignore_ascii_case(repo));
+    }
+    let Some(sr) = inst.source_repo.as_deref() else {
         return true;
     };
-    let slug = inst
-        .repo
-        .as_deref()
-        .and_then(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug)
-        .or_else(|| {
-            inst.source_repo.as_deref().and_then(|sr| {
-                crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
-                    crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
-                        std::path::Path::new(sr),
-                    )
-                })
-            })
-        });
+    let slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
+        crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(sr))
+    });
     slug.is_some_and(|s| s.eq_ignore_ascii_case(repo))
 }
 
@@ -847,6 +841,28 @@ pub(crate) mod tests {
         assert_eq!(
             resolved, "the-subscriber",
             "Tier 2 repo mismatch must fall through to subscriber"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-h / #2918: explicit `repo` without `source_repo` must still
+    /// filter — match-any only when BOTH are absent.
+    #[test]
+    fn t8h_explicit_repo_no_source_repo_filters() {
+        let home = tmp_home("auth-t2-nosrc");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+             shared-bot:\n    backend: claude\n    repo: owner/other-repo\n",
+        )
+        .unwrap();
+        let mut state = fresh_state("br");
+        state.repo = "owner/target-repo".to_string();
+        state.subscribers = vec!["fallback-sub".to_string()];
+        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
+        assert_eq!(
+            resolved, "fallback-sub",
+            "explicit repo mismatch (no source_repo) must fall through to subscriber"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
