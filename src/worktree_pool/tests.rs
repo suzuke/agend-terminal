@@ -5271,3 +5271,42 @@ fn disposable_review_missing_corrupt_or_drifted_state_is_kept() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+// RED: In real disposable reviews, task.branch is the subject PR branch (e.g.
+// "feat/foo") while binding.branch is the review workspace branch (e.g.
+// "review/pr-123-abc"). The current disposable_review_task_terminal compares
+// these two and returns None on mismatch, causing the disposition classifier
+// to Keep the branch even after the review task is terminal.
+#[test]
+fn disposable_review_terminal_task_with_subject_branch_deletes_review_branch() {
+    let home = tmp_home("disposable-subject-branch-home");
+    let repo = tmp_repo("disposable-subject-branch");
+    let review_branch = "review/pr-subject-1234";
+    let subject_branch = "feat/subject-pr-branch";
+    let tip = make_review_branch(&repo, review_branch);
+    let task_id = "T-disposable-subject-branch";
+
+    // Task is created with branch = subject PR branch (as the real daemon does)
+    seed_disposable_task(&home, task_id, subject_branch, true);
+
+    // Binding uses the review workspace branch (as the real daemon does)
+    let binding =
+        binding_with_disposable_review(review_branch, &repo.display().to_string(), task_id, &tip);
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    assert!(
+        out.branch_deleted,
+        "terminal disposable review task must delete review branch even when \
+         task.branch (subject PR) != binding.branch (review workspace): {:?}",
+        out.branch_cleanup_skipped_reason
+    );
+    assert!(
+        !branch_exists(&repo, review_branch),
+        "review branch must be cleaned up after terminal task"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
