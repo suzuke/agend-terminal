@@ -414,10 +414,10 @@ pub fn resolve_author_with_gh(
     state: &super::PrState,
 ) -> String {
     if let Some(login) = gh_author {
-        if let Some(name) = match_via_github_login_field(home, login) {
+        if let Some(name) = match_via_github_login_field(home, login, &state.repo) {
             return name;
         }
-        if let Some(name) = match_via_instance_name(home, login) {
+        if let Some(name) = match_via_instance_name(home, login, &state.repo) {
             return name;
         }
     }
@@ -436,22 +436,46 @@ pub fn resolve_author_with_gh(
     "fixup-lead".to_string()
 }
 
-fn match_via_github_login_field(home: &std::path::Path, gh_login: &str) -> Option<String> {
+/// #2918: does `instance`'s configured repo identity match the PR's
+/// originating `repo` slug? Precedence: explicit `repo` override
+/// (Sprint 55 EC4) → `source_repo` derivation (bare slug / local
+/// origin remote). Match-any backward compat only when BOTH `repo`
+/// and `source_repo` are absent. Invalid/unresolvable → no match.
+fn source_repo_matches(inst: &crate::fleet::InstanceConfig, repo: &str) -> bool {
+    if let Some(explicit) = inst.repo.as_deref() {
+        return crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(explicit)
+            .is_some_and(|s| s.eq_ignore_ascii_case(repo));
+    }
+    let Some(sr) = inst.source_repo.as_deref() else {
+        return true;
+    };
+    let slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
+        crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(sr))
+    });
+    slug.is_some_and(|s| s.eq_ignore_ascii_case(repo))
+}
+
+fn match_via_github_login_field(
+    home: &std::path::Path,
+    gh_login: &str,
+    repo: &str,
+) -> Option<String> {
     let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
     cfg.instances.iter().find_map(|(name, inst)| {
         inst.github_login
             .as_deref()
             .filter(|gl| gl.eq_ignore_ascii_case(gh_login))
+            .filter(|_| source_repo_matches(inst, repo))
             .map(|_| name.clone())
     })
 }
 
-fn match_via_instance_name(home: &std::path::Path, gh_login: &str) -> Option<String> {
+fn match_via_instance_name(home: &std::path::Path, gh_login: &str, repo: &str) -> Option<String> {
     let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
     cfg.instances
-        .keys()
-        .find(|name| name.eq_ignore_ascii_case(gh_login))
-        .cloned()
+        .iter()
+        .find(|(name, inst)| name.eq_ignore_ascii_case(gh_login) && source_repo_matches(inst, repo))
+        .map(|(name, _)| name.clone())
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────
@@ -769,6 +793,77 @@ pub(crate) mod tests {
         let state = fresh_state("br"); // subscribers = ["dev"]
         let resolved = resolve_author_with_gh(&home, None, &state);
         assert_eq!(resolved, "dev");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-f / #2918 Tier 1: two instances share `github_login` but have
+    /// different repos. `source_repo` paths are local/unresolvable so the
+    /// explicit `repo` override is the only slug source — tests that
+    /// `repo` takes precedence over `source_repo` derivation.
+    #[test]
+    fn t8f_repo_aware_github_login_resolves_correct_agent() {
+        let home = tmp_home("auth-repo-aware");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+             bot-repoA:\n    backend: claude\n    github_login: shared-bot\n    \
+               source_repo: /nonexistent/local/path-a\n    repo: owner/repo-a\n  \
+             bot-repoB:\n    backend: claude\n    github_login: shared-bot\n    \
+               source_repo: /nonexistent/local/path-b\n    repo: owner/repo-b\n",
+        )
+        .unwrap();
+        let mut state = fresh_state("br");
+        state.repo = "owner/repo-b".to_string();
+        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
+        assert_eq!(
+            resolved, "bot-repoB",
+            "explicit repo override must distinguish same-login instances"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-g / #2918 Tier 2: instance name matches gh_login but repo
+    /// mismatches → falls through to subscriber (Tier 3).
+    #[test]
+    fn t8g_tier2_repo_mismatch_falls_to_subscriber() {
+        let home = tmp_home("auth-t2-repo");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+             shared-bot:\n    backend: claude\n    \
+               source_repo: /nonexistent/local/path\n    repo: owner/other-repo\n",
+        )
+        .unwrap();
+        let mut state = fresh_state("br");
+        state.repo = "owner/target-repo".to_string();
+        state.subscribers = vec!["the-subscriber".to_string()];
+        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
+        assert_eq!(
+            resolved, "the-subscriber",
+            "Tier 2 repo mismatch must fall through to subscriber"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-h / #2918: explicit `repo` without `source_repo` must still
+    /// filter — match-any only when BOTH are absent.
+    #[test]
+    fn t8h_explicit_repo_no_source_repo_filters() {
+        let home = tmp_home("auth-t2-nosrc");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  \
+             shared-bot:\n    backend: claude\n    repo: owner/other-repo\n",
+        )
+        .unwrap();
+        let mut state = fresh_state("br");
+        state.repo = "owner/target-repo".to_string();
+        state.subscribers = vec!["fallback-sub".to_string()];
+        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
+        assert_eq!(
+            resolved, "fallback-sub",
+            "explicit repo mismatch (no source_repo) must fall through to subscriber"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
