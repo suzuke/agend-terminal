@@ -910,7 +910,10 @@ fn gh_poll_zero_ci_head_advance_syncs_authoritative_subject() {
     assert_eq!(r.head_sha, "sha-B");
     assert!(matches!(r.ci_state, CiState::Pending));
     assert!(r.validated_review_receipts.is_empty());
-    assert!(matches!(r.verdict_state, super::super::VerdictState::Pending));
+    assert!(matches!(
+        r.verdict_state,
+        super::super::VerdictState::Pending
+    ));
     assert!(!r.auto_armed);
     assert_eq!(r.auto_armed_for_sha, None);
     assert_eq!(r.ready_emitted_for_sha, None);
