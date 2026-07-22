@@ -2213,12 +2213,12 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-    /// RED #2920-a: a clean-merged branch with a non-GitHub local origin
-    /// causes `open_pr_status` → `Unknown` → lifecycle Keep. The apply
-    /// response currently returns only `applied: 0` with zero structured
-    /// explanation. Assert that a `skipped` list surfaces the concrete
-    /// blocker so operators can distinguish "safely preserved because of
-    /// open-PR uncertainty" from "nothing matched".
+    /// RED: a clean-merged branch with a non-GitHub local origin causes
+    /// `open_pr_status` → `Unknown` → lifecycle Keep. The apply response
+    /// currently returns only `applied: 0` with zero structured explanation.
+    /// Assert that a `skipped` list surfaces the concrete blocker so
+    /// operators can distinguish "safely preserved because of open-PR
+    /// uncertainty" from "nothing matched".
     #[test]
     fn apply_skipped_surfaces_local_origin_unknown_pr_blocker() {
         let repo = setup_repo("skip-local-pr-unknown");
@@ -2257,17 +2257,17 @@ mod tests {
             skipped[0]["branch"], "feat-merged-local",
             "skipped entry must name the branch: {r}"
         );
-        assert!(
-            skipped[0]["blocker"].is_string() || skipped[0]["reason"].is_string(),
-            "skipped entry must carry a concrete blocker or reason: {r}"
+        assert_eq!(
+            skipped[0]["blocker"], "open_pr_status_unknown",
+            "skipped entry must pin the exact blocker: {r}"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-    /// RED #2920-b: a clean-merged branch with a live binding on another
-    /// agent causes `active_holder` → `Some(true)` → lifecycle Keep. The
-    /// apply response must surface the concrete binding blocker, not just
+    /// RED: a clean-merged branch with a live binding on another agent
+    /// causes `active_holder` → `Some(true)` → lifecycle Keep. The apply
+    /// response must surface the concrete binding blocker, not just
     /// `applied: 0`.
     #[test]
     fn apply_skipped_surfaces_active_binding_blocker() {
@@ -2318,9 +2318,9 @@ mod tests {
             skipped[0]["branch"], "feat-held",
             "skipped entry must name the branch: {r}"
         );
-        assert!(
-            skipped[0]["blocker"].is_string() || skipped[0]["reason"].is_string(),
-            "skipped entry must carry a concrete blocker or reason: {r}"
+        assert_eq!(
+            skipped[0]["blocker"], "active_holder",
+            "skipped entry must pin the exact blocker: {r}"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
