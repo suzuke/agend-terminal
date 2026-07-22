@@ -2035,8 +2035,8 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// A4/I12: append-only repair — nonce rotation, interval bound, read_at preserved.
-    /// #2914: present rows (read or unread) are healthy; only missing rows trigger repair.
+    /// A4/I12: repair_row semantics — unread→pure wake, read→no-op, missing→repair.
+    /// #2914: present non-superseded rows skip nonce rotation; unread ones still wake.
     #[test]
     fn repair_append_only_fixed_interval() {
         let home = tmp_home("repair");
@@ -2051,10 +2051,10 @@ mod tests {
             "repair before the lease is a no-op (bounded)"
         );
 
-        // Row still present (unread) → no repair even after the lease.
+        // Row present and unread → pure wake (true) but no nonce rotation.
         assert!(
-            !repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
-            "present (unread) row is healthy — no repair"
+            repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
+            "actionable-unread row returns true (pure wake)"
         );
 
         // Mark read — row is still present and not superseded → still no repair (#2914).

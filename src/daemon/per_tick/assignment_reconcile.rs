@@ -1711,22 +1711,41 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Read row: lease-due reconciliation does NOT wake (reviewer has seen it).
+    /// Read or delivering row: lease-due reconciliation does NOT wake.
     #[test]
-    fn read_row_does_not_wake() {
+    fn read_or_delivering_row_does_not_wake() {
+        // -- read case --
         let home = tmp_home("read-no-wake");
         let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
         let nonce = rec.delivery_nonce.clone();
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
-
-        // Mark row as read.
         mark_row_read(&home, "reviewer", &nonce, "2026-07-13T00:00:05Z");
-
-        // Tick at lease-due time → no wake (reviewer has read it).
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:10Z");
         assert!(wakes.is_empty(), "read row ⇒ no wake");
+        std::fs::remove_dir_all(&home).ok();
 
+        // -- delivering case --
+        let home = tmp_home("delivering-no-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        let nonce = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // Mark row as delivering (inline; no helper needed).
+        let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        let mut out = String::new();
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let mut msg: crate::inbox::InboxMessage = serde_json::from_str(line).unwrap();
+            if msg.delivery_nonce.as_deref() == Some(&nonce) {
+                msg.delivering_at = Some("2026-07-13T00:00:05Z".to_string());
+            }
+            out.push_str(&serde_json::to_string(&msg).unwrap());
+            out.push('\n');
+        }
+        std::fs::write(&inbox_path, out).unwrap();
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:10Z");
+        assert!(wakes.is_empty(), "delivering row ⇒ no wake");
         std::fs::remove_dir_all(&home).ok();
     }
 }
