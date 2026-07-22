@@ -7,6 +7,38 @@
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-07-23
+
+自 0.10.0 起共 208 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
+
+### Added
+
+- **Grok Build backend 與跨 backend 控制** — Grok 現在是可恢復的第一級 backend；明確的 model intent 與持久化 per-instance/fleet context threshold 亦可跨支援的 backend 使用（#2707、#2718、#2753、#2757、#2779、#2864）。
+- **持久化 exact-head CI 與 review 協調** — task-linked protected-branch watch、freshness-aware PR state、持久化 reviewer assignment、有界 handoff defer、notification-only post-merge watch 與明確 handoff acknowledgement，使 CI/review 接續可在重啟後恢復（#2743–#2747、#2763、#2766、#2782、#2833、#2835、#2837、#2881）。
+- **第一方 `agentic-git` 整合** — release 現在會建置並封裝 git policy shim、與 `agentic-git-core` 共用 binding signing，且 managed development flow 改用第一方 wrapper（#2689–#2692、#2776）。
+- **Usage-limit 控制面 episode** — usage-limit 事件已持久化，並在 API ingress 強制 operator-authorized takeover（#2759、#2814）。
+
+### Changed
+
+- **Runtime 操作改用 typed in-process service** — 當 runtime 已存在時，pane snapshot、health write、inject/move/update/delete/spawn/send/team/deployment 不再繞回 daemon 自己的 MCP API（#2732、#2734、#2842–#2856）。
+- **Worktree cleanup 改為 fail-closed 且可稽核** — branch lifecycle retirement、cleanup intent、transaction serialization、legacy reconciliation、nested-submodule preservation 與 structured skipped-blocker diagnostic 現在共用受保護的 daemon 路徑（#2695–#2723、#2754、#2780、#2815、#2826、#2827、#2916、#2922）。
+- **Review 與 CI routing 具 repository awareness** — assignment retirement、PR-author fallback、task-creator action-required handoff、scanner-head 同步與 verdict routing 現在會保留 repository/task identity，不再只依賴 branch 或 login（#2909–#2915、#2918、#2921、#2923）。
+- **文件整併與更新** — 雙語 operation、protocol、backend capability、worktree、CI 與 architecture 參考文件已更新以符合實際交付行為（#2811、#2819、#2821、#2824）。
+
+### Fixed
+
+- **CI 接續斷鏈與重複通知** — durable episode settlement、exact pickup acknowledgement、task-wake routing、stale assignment retirement 與有界 unread-assignment re-wake，修正 CI 綠燈／失敗事件重複送達或未喚醒 owner 的多種情況（#2798、#2833、#2835、#2861、#2881、#2911、#2912、#2914、#2917、#2923）。
+- **Worktree release 與 branch-cleanup 安全性** — canonical/default worktree、dirty nested submodule、open-PR branch、markerless legacy worktree、checkout rollback 與跨 repository default branch 現在會被保留或以可行動證據拒絕，不再含糊刪除（#2754、#2831、#2862、#2871、#2875、#2894–#2896、#2908、#2916、#2922）。
+- **Crash/restart accounting** — exact-generation disposition、restart admission、claimant permit 與 crash-attempt debit ordering 可防止重複 respawn 及錯誤扣除 crash budget（#2765、#2822、#2825、#2829、#2840、#2869、#2899、#2906）。
+- **Backend 與 daemon 邊界情況** — declared backend identity 可穿越 wrapper/handle 保留、decimal context percentage 可被接受，且 app mode 在 daemon singleton lock 已被持有時會 fail closed（#2781、#2834、#2836、#2877、#2883、#2897）。
+
+### Migration and known caveats
+
+- 既有 `fleet.yaml` 與 runtime configuration 保持相容；0.11.0 沒有強制設定遷移。
+- Managed git flow 現在使用隨 release 提供的第一方 `agentic-git` wrapper。使用自訂 shim 或 `PATH` override 的部署，rollout 前應依 `docs/GIT-BEHAVIOR.md` 驗證設定。
+- Worktree/branch cleanup 對 dirty、foreign-owned 或未經證明的狀態刻意 fail closed。請透過 daemon release/cleanup action 解決 structured blocker，不要手動刪除 worktree 或 branch。
+- 建立 annotated `v0.11.0` tag 前，請先依 `docs/RELEASING.zh-TW.md` 執行 exact-commit backend smoke matrix。
+
 ## [0.10.0] — 2026-07-07
 
 自 0.9.0 起 311 個 commit。以下依主題整理重點(非完整 commit 清單)。
@@ -569,7 +601,8 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...v0.8.0
