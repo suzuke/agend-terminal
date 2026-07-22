@@ -1731,19 +1731,14 @@ mod tests {
         let nonce = rec.delivery_nonce.clone();
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
-        // Mark row as delivering (inline; no helper needed).
-        let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "reviewer");
-        let content = std::fs::read_to_string(&inbox_path).unwrap();
-        let mut out = String::new();
-        for line in content.lines().filter(|l| !l.trim().is_empty()) {
-            let mut msg: crate::inbox::InboxMessage = serde_json::from_str(line).unwrap();
-            if msg.delivery_nonce.as_deref() == Some(&nonce) {
-                msg.delivering_at = Some("2026-07-13T00:00:05Z".to_string());
-            }
-            out.push_str(&serde_json::to_string(&msg).unwrap());
-            out.push('\n');
-        }
-        std::fs::write(&inbox_path, out).unwrap();
+        // drain transitions unread → delivering.
+        let drained = crate::inbox::storage::drain(&home, "reviewer");
+        assert!(
+            drained
+                .iter()
+                .any(|m| m.delivery_nonce.as_deref() == Some(&nonce)),
+            "drained row carries the assignment nonce"
+        );
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:10Z");
         assert!(wakes.is_empty(), "delivering row ⇒ no wake");
         std::fs::remove_dir_all(&home).ok();
