@@ -9,7 +9,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [0.11.0] — 2026-07-23
 
-210 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
+212 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
 
 ### Added
 
