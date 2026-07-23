@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-07-23
+
+### Changed
+
+- **Monorepo 整併** — `agentic-git-core` 與 `agentic-git` 原始碼現在內嵌於主倉庫；release workflow 按依賴順序發布 crate（core → shim → root），並帶 index 傳播重試（#2929）。
+
 ## [0.11.1] — 2026-07-23
 
 ### Fixed
@@ -607,7 +613,8 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
