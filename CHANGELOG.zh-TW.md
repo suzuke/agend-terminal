@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-07-23
+
+### Fixed
+
+- **Release archive 驗證** — Unix release packaging 改為直接檢查每個預期 binary，避免跨平台建置成功後因 `pipefail`／SIGPIPE 被誤判為失敗。
+
 ## [0.11.0] — 2026-07-23
 
 自 0.10.0 起共 212 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
@@ -601,7 +607,8 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0

@@ -7,6 +7,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-07-23
+
+### Fixed
+
+- **Release archive validation** — Unix release packaging now checks each expected binary directly, avoiding a `pipefail`/SIGPIPE false failure after successful cross-platform builds.
+
 ## [0.11.0] — 2026-07-23
 
 212 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
@@ -679,7 +685,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0

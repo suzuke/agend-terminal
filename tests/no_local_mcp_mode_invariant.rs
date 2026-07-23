@@ -75,6 +75,14 @@ fn release_workflow_packages_bridge_in_unix_tar_step() {
              Section was:\n{section}"
         );
     }
+    assert!(
+        section.contains(
+            "tar tzf ../../../agend-terminal-${{ matrix.target }}.tar.gz \"$b\" >/dev/null"
+        ),
+        "Unix tar validation must query each member directly; piping the full \
+         listing into grep under pipefail makes tar's expected SIGPIPE look \
+         like a missing archive member. Section was:\n{section}"
+    );
 }
 
 #[test]
