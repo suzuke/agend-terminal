@@ -9,7 +9,7 @@
 
 ## [0.11.0] — 2026-07-23
 
-自 0.10.0 起共 210 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
+自 0.10.0 起共 212 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
 
 ### Added
 
