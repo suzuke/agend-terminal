@@ -4233,3 +4233,74 @@ fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// F7 RED: when the ci-watch arm fails during a branch dispatch, the caller
+/// must receive a typed degraded result — not silent success. Injection:
+/// pre-create `<home>/ci-watches` as a regular file so `handle_watch_ci`
+/// cannot write the watch entry (ENOTDIR). The primary dispatch (bind +
+/// delivery) must still succeed; only the ci-watch arm is degraded.
+#[test]
+fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-f7-arm-degrade-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+
+    // ── Injection: make ci-watches a regular FILE so handle_watch_ci fails
+    // deterministically (cannot create_dir_all inside a file).
+    let ci_watches = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let _ = std::fs::remove_dir_all(&ci_watches);
+    std::fs::write(&ci_watches, "injected-blocker").expect("create ci-watches as file");
+    assert!(ci_watches.is_file(), "precondition: ci-watches must be a regular file");
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement feature X",
+        "task_id": tid,
+        "branch": "feat/f7-arm-fail",
+        "repository": "owner/repo",
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    // ── Primary dispatch must NOT hard-fail.
+    let is_hard_error = result
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(|e| e.contains("dispatch rejected"))
+        .unwrap_or(false);
+    assert!(
+        !is_hard_error,
+        "F7: primary dispatch must succeed even when arm fails; got hard error: {result}"
+    );
+
+    // ── No watch must be created (arm failed — ci-watches is a file).
+    assert!(
+        ci_watches.is_file(),
+        "ci-watches must remain a file (injection intact)"
+    );
+
+    // ── F7 RED assertion: the caller-visible response MUST carry a typed
+    // degraded/warning code so the dispatcher knows the arm failed.
+    // On the current base this field does not exist → test FAILS (RED).
+    let arm_warning = result
+        .get("ci_watch_arm_failed")
+        .or_else(|| result.get("degraded"))
+        .or_else(|| result.get("warning"));
+    assert!(
+        arm_warning.is_some(),
+        "F7 RED: dispatch response must carry a typed ci_watch_arm_failed / \
+         degraded / warning field when auto-watch arm fails, so the dispatcher \
+         can detect the silent failure. Got: {result}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
