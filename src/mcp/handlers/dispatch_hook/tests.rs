@@ -4282,11 +4282,33 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
         "F7: primary dispatch must succeed even when arm fails; got hard error: {result}"
     );
 
-    // ── Positive control: target delivery happened exactly once.
+    // ── Positive control: target delivery happened exactly once (persisted inbox).
+    // Walk inbox/ to find the actual file (may be UUID-based via inbox_path_resolved).
+    let inbox_dir = home.join("inbox");
+    let inbox_content = if inbox_dir.is_dir() {
+        std::fs::read_dir(&inbox_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    let delivery_count = inbox_content
+        .lines()
+        .filter(|line| line.contains("implement feature X"))
+        .count();
     assert_eq!(
-        result.get("target").and_then(|v| v.as_str()),
-        Some("target-agent"),
-        "F7 positive control: dispatch must deliver to target-agent exactly once. Got: {result}"
+        delivery_count, 1,
+        "F7 positive control: exactly one message matching the delegated task \
+         must be persisted in target inbox. Got {delivery_count}. \
+         inbox_dir exists={}, content_len={}",
+        inbox_dir.is_dir(),
+        inbox_content.len()
     );
 
     // ── No watch must be created (arm failed — ci-watches is a file).
