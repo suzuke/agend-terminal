@@ -41,13 +41,14 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::unwrap_used)]
-pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
+pub fn capture_backend(home: &Path, b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
     let preset = b.preset();
     let name = format!("capture-{}", b.name());
     tracing::info!(backend = b.name(), command = preset.command, %seconds, "capture: spawning");
 
     let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    agent::spawn_agent(
+    let (capture_done_tx, capture_done_rx) = crossbeam_channel::bounded(1);
+    agent::spawn_agent_with_capture_home(
         &agent::SpawnConfig {
             name: &name,
             backend: Some(b),
@@ -64,6 +65,8 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
             shutdown: None,
         },
         &registry,
+        Some(home),
+        Some(capture_done_tx),
     )?;
 
     tracing::info!(%seconds, "capture: waiting for output");
@@ -88,9 +91,15 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     {
         let reg = registry.lock();
         if let Some(h) = reg.values().find(|h| h.name.as_str() == name.as_str()) {
-            let _ = h.child.lock().kill();
+            let mut child = h.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
+
+    capture_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| anyhow::anyhow!("capture PTY did not finish within 5 seconds"))?;
 
     println!("=== {} VTerm Screen (ANSI stripped, 120x40) ===", b.name());
     for (i, line) in stripped.lines().enumerate() {
