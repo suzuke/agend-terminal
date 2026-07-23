@@ -12,6 +12,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 ### Changed
 
 - **Monorepo consolidation** — `agentic-git-core` and `agentic-git` sources are now vendored inside the main repository; the release workflow publishes crates in dependency order (core → shim → root) with index-propagation retries (#2929).
+- **Existing source checkouts with an initialized `vendor/agentic-git` submodule** — confirm that the submodule worktree is clean (preserve any local WIP first), then run `git submodule deinit -f vendor/agentic-git` followed by `git pull --ff-only` to switch to the in-tree workspace.
 
 ## [0.11.1] — 2026-07-23
 
