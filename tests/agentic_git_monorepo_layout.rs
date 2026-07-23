@@ -10,6 +10,7 @@ fn agentic_git_is_tracked_in_tree_not_as_a_submodule() {
         "vendor/agentic-git must be an in-tree crate, not a configured submodule"
     );
 
+    // allow: raw-git-subprocess read-only inspection of this repository's index
     let output = Command::new("git")
         .args(["ls-files", "--stage", "--", "vendor/agentic-git"])
         .current_dir(root)
