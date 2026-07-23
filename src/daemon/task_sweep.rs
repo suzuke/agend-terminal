@@ -29,8 +29,6 @@
 //! join refactor (caller can switch to `join_on_shutdown()` without
 //! changing the spawn site).
 
-#![allow(dead_code)]
-
 use crate::daemon::ticker::DaemonTicker;
 use crate::task_events::{
     self, DoneSource, InstanceName, LinkSource, PrId, PrSnapshot, TaskEvent, TaskId,
@@ -554,6 +552,7 @@ fn extract_closes_markers(body: &str) -> Vec<String> {
 /// JSON parsing in [`parse_pr_meta`] flags schema mismatches.
 struct PrMeta {
     number: u64,
+    #[allow(dead_code)]
     title: String,
     state: String,
     merged: bool,
@@ -938,7 +937,7 @@ fn compliance_sweep(home: &Path, repo: &str, prs: &[PrMeta]) -> Vec<ComplianceVi
         if !violations.is_empty() {
             for v in &violations {
                 tracing::warn!(
-                    pr = pr.number,
+                    pr = v.pr_number,
                     check = v.check_name,
                     detail = %v.detail,
                     "compliance violation"

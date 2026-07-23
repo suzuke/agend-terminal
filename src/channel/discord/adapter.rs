@@ -1,8 +1,8 @@
 use super::*;
 use crate::agent::AgentRegistry;
 use crate::channel::{
-    BindingRef, Channel, ChannelCapabilities, ChannelError, ChannelEvent, MarkdownDialect,
-    MentionStyle, MsgRef, OutMsg, RateBudget,
+    BindingRef, ChannelCapabilities, ChannelError, ChannelEvent, MarkdownDialect, MentionStyle,
+    MsgRef, OutMsg, RateBudget,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;

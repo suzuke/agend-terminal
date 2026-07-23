@@ -2,7 +2,6 @@
 
 use crate::channel::dedup::DedupKey;
 use crate::channel::telegram::error::*;
-use crate::channel::telegram::send::*;
 use crate::channel::telegram::state::*;
 
 /// CR-2026-06-14: after a successful notify retry to a RECREATED topic, record a

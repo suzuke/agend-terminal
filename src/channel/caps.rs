@@ -12,10 +12,9 @@
 //!   `docs/FEATURE-channels.md`). Transport path **never** branches on
 //!   UX caps directly.
 //!
-//! **Status (T1 prep scaffold):** fields are defined; readers for the UX
-//! region land with the UX renderer in a later PR. The `Default` impl is
-//! conservative — everything disabled, MarkdownDialect::None, small rate
-//! budget — so adding a new adapter forces explicit opt-in per capability.
+//! The `Default` impl is conservative — everything disabled,
+//! `MarkdownDialect::None`, and a small rate budget — so adding a new adapter
+//! forces explicit opt-in per capability.
 
 /// Declared feature matrix for a channel.
 #[derive(Debug, Clone)]

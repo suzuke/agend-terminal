@@ -1,12 +1,5 @@
 use super::*;
-use crate::agent::AgentRegistry;
-use crate::channel::{
-    BindingRef, Channel, ChannelCapabilities, ChannelError, ChannelEvent, MarkdownDialect,
-    MentionStyle, MsgRef, OutMsg, RateBudget,
-};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::mpsc;
+use crate::channel::{Channel, ChannelEvent};
 
 // ---------------------------------------------------------------------------
 // Inbound dispatcher (#2562 PR-1)

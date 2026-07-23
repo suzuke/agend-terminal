@@ -236,8 +236,7 @@ pub(super) fn inject_provenance_from(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::channel::telegram::topic_registry::*;
-    use std::collections::HashMap;
+    use crate::channel::telegram::topic_registry::{load_topic_registry, register_topic};
     use std::path::PathBuf;
 
     // -----------------------------------------------------------------

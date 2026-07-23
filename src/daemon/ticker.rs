@@ -4,13 +4,6 @@
 //! consumed by Sprint 24 P0 PR2 (task sweep daemon). Forward-compat with
 //! Sprint 25+ graceful-join refactor (shutdown-channel-plumbing track).
 //!
-//! NOTE: `#[allow(dead_code)]` at the module level is intentional — this
-//! sprint ships the primitive ahead of its first consumer (Sprint 24 P0
-//! PR2 task sweep daemon, dispatched concurrently per cross-track
-//! sequencing). Lint-suppression dropped once the consumer lands.
-
-#![allow(dead_code)]
-//!
 //! ## Design
 //!
 //! Wraps `std::thread::Builder::spawn` with two contracts existing daemon
@@ -52,6 +45,9 @@ const SHUTDOWN_POLL_GRANULARITY: Duration = Duration::from_millis(100);
 /// [`Self::join_on_shutdown`] after raising the shutdown flag for graceful
 /// exit.
 pub struct DaemonTicker {
+    // Stored for the opt-in graceful-join path; current daemon callers retain
+    // the established fire-and-forget drop behavior.
+    #[allow(dead_code)]
     handle: Option<JoinHandle<()>>,
 }
 
@@ -105,6 +101,7 @@ impl DaemonTicker {
     /// path) or never stored (spawn failure). Mirrors the
     /// "no-op-if-already-clean" semantics of `delete_transaction` from
     /// Phase 1 (PR #217 lifecycle helper) for predictable shutdown ordering.
+    #[allow(dead_code)]
     pub fn join_on_shutdown(mut self) -> thread::Result<()> {
         match self.handle.take() {
             Some(h) => h.join(),
