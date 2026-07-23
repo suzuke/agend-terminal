@@ -186,7 +186,7 @@ jobs:
             agend-terminal agend-mcp-bridge agend-git agentic-git
           # Fail-loud: the archive MUST contain every expected sibling binary.
           for b in agend-terminal agend-mcp-bridge agend-git agentic-git; do
-            tar tzf ../../../agend-terminal-${{ matrix.target }}.tar.gz | grep -qx "$b" \
+            tar tzf ../../../agend-terminal-${{ matrix.target }}.tar.gz "$b" >/dev/null \
               || { echo "::error::release tarball missing $b"; exit 1; }
           done
 
