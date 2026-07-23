@@ -1,0 +1,9 @@
+{
+  "agent": "claude-golden",
+  "branch": "feat/26-golden-agend",
+  "issued_at": "2026-07-19T21:13:39.964685+00:00",
+  "source_repo": "/tmp/golden/source-repo",
+  "task_id": "t-20260719-golden-agend",
+  "version": 1,
+  "worktree": "/tmp/golden/worktree"
+}

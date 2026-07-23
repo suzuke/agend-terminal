@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace -- -D warnings
+        if: matrix.os == 'ubuntu-latest'
+      # Fully verify the contract crate package. The shim depends on this
+      # not-yet-published core version, so pre-release CI can only validate its
+      # package file boundary; workspace tests/clippy cover the compiled pair.
+      # The ordered release publishes core first, then fully verifies the shim.
+      - run: |
+          cargo package -p agentic-git-core --allow-dirty
+          cargo package -p agentic-git --allow-dirty --list
+        if: matrix.os == 'ubuntu-latest'
+
+  # Windows has cfg(windows) code paths (copy-instead-of-symlink shim wiring,
+  # status()+exit process replacement, case-insensitive dispatch) that have
+  # never been publicly verified. Surface their real state WITHOUT gating
+  # merges (continue-on-error) until Windows support is a committed target —
+  # a red here is information, not a blocker. This asserts what Windows CAN
+  # honestly check: the whole workspace BUILDS on Windows (the "can a Windows
+  # user get a working binary" signal) plus the cross-platform contract crate's
+  # tests. It does NOT run the shim's integration suite — those tests fake
+  # argv[0] via unix-only `CommandExt::arg0`/`std::os::unix`, so they can't even
+  # compile on Windows; porting them is a separate, committed-Windows-support
+  # effort.
+  test-windows-advisory:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
+      - run: cargo test -p agentic-git-core
+
+  # Δ5 / INVARIANT clause 5 (agentic-git issue #1, session mode): the
+  # zero-daemon-change adoption guarantee is a REQUIRED job, not a manual
+  # acceptance check. Explicitly unsets every `AGENTIC_GIT_*` variable — not
+  # merely "doesn't set them" (Δ5 clarification: this runner's own env/cache
+  # could otherwise leak one in) — before running the legacy-only suite, and
+  # fails if its representative route/deny/bypass cases didn't all run
+  # (count-assert via the suite's own marker line), so an accidentally-
+  # skipped case can't pass as green.
+  legacy-env-adoption:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
+      - name: legacy-only adoption suite (AGEND_* env only)
+        run: |
+          unset AGENTIC_GIT_HOME AGENTIC_GIT_AGENT AGENTIC_GIT_REAL_GIT \
+                AGENTIC_GIT_BYPASS AGENTIC_GIT_BYPASS_AGENT AGENTIC_GIT_BYPASS_UNTIL \
+                AGENTIC_GIT_SHIM_DEPTH AGENTIC_GIT_ALLOW_CANONICAL_MUTATE \
+                AGENTIC_GIT_SNAPSHOTS
+          cargo test --test legacy_env_adoption -- --nocapture --test-threads=1 | tee legacy-adoption.log
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "LEGACY-ADOPTION-CASES-RUN: 4" legacy-adoption.log
+        shell: bash

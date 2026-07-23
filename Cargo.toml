@@ -148,18 +148,17 @@ hmac = "0.13"
 # against is visible (and bumps with them, not via transitive drift).
 digest = "0.11"
 hex = "0.4"
-# embedder P1b (§3.A): link agentic-git-core from the pinned submodule
-# (vendor/agentic-git @ 5c02b142 = the published 0.2.3 release). The daemon signs bindings via
+# embedder P1b (§3.A): link agentic-git-core from the in-tree Cargo workspace.
+# The daemon signs bindings via
 # `agentic_git_core::integrity_core::sign_binding` (provision+sign, BARE hex —
 # byte-identical to the pre-swap `config_integrity::sign`), so one HMAC source
-# feeds signer(daemon) + verifier(shim) with zero drift. The submodule PATH is
-# agend-terminal's link source (crates.io stays the STANDALONE agentic-git's
-# release channel, not ours); `version` only pins the resolved crate for
-# `cargo publish` metadata — a normal build/check ignores it and uses the path.
+# feeds signer(daemon) + verifier(shim) with zero drift. The in-tree PATH is
+# agend-terminal's build source; `version` pins the resolved crate for
+# `cargo publish` metadata, while normal builds use the path.
 # LOAD-BEARING (reviewer4 cond #1): exactly ONE agentic-git-core in Cargo.lock —
 # enforced by tests/agentic_core_single_source.rs (RED-first).
-agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core", version = "0.2.0" }
-agentic-git = { path = "vendor/agentic-git/crates/agentic-git", version = "0.2.3" }
+agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core", version = "0.2.1" }
+agentic-git = { path = "vendor/agentic-git/crates/agentic-git", version = "0.2.4" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"
@@ -250,7 +249,7 @@ glob = "0.3"
 tracing-test = "0.2"
 # #2524 P2 cross-build proof (tests/agentic_git_shim_swap.rs): sign a bound
 # binding with the SAME core the daemon links (agend-terminal's build) so the
-# test can assert the SUBMODULE-built agentic-git binary verifies + allows it.
+# test can assert the in-tree agentic-git binary verifies + allows it.
 # SAME path as the normal dep (line ~137) → cargo unifies to ONE package, so the
 # single-source invariant (tests/agentic_core_single_source.rs) is preserved.
 agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core" }

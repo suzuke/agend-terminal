@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "agent": "run-golden",
+  "task_id": "run-session-1789000000",
+  "branch": "feat/26-golden-run",
+  "issued_at": "2026-07-19T12:00:00Z",
+  "worktree": "/tmp/golden/run-worktree",
+  "source_repo": "/tmp/golden/run-source"
+}

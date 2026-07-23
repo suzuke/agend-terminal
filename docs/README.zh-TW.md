@@ -19,8 +19,8 @@ section、table、code block 或 link target。
   與 consumer 同置於 `skills/` 或 `tests/fixtures/`。
 - 每個英文 `name.md` 都有同目錄的 `name.zh-TW.md`，並具備雙向
   language navigation 與一致結構。
-- `vendor/agentic-git` 是獨立管理文件的 pinned git submodule，不屬於
-  superproject 文件。
+- `vendor/agentic-git` 是 repository 內的獨立 Cargo workspace，其 crate
+  文件不納入上層文件索引。
 - Plan、audit、review snapshot 與已完成 incident note 不留在 active tree；
   仍有效的規則必須併入真正擁有該主題的維護中文件。
 

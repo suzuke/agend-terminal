@@ -1,0 +1,26 @@
+[package]
+name = "agentic-git"
+description = "A guarded, transparent git for AI coding agents — a PATH shim over the real git with per-agent worktree routing, a deny guardrail matrix, commit provenance, and audited bypass"
+version = "0.2.4"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentic-git-core = { path = "../agentic-git-core", version = "0.2.1" }
+chrono = "0.4"
+serde_json = "1"
+which = "8"
+# Session mode (Δ2): atomic first-writer-wins key provisioning + default
+# agent-name suffix randomness. The only new dependency this feature adds.
+getrandom = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Exec reachability invariant (tests/exec_reachability_invariant.rs): AST-walk
+# the crate sources for exec_real_git call sites. Already in the dependency
+# tree transitively — this adds no new crate to the build.
+syn = { version = "2", features = ["full", "visit"] }

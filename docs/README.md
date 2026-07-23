@@ -23,8 +23,8 @@ section, table, code block, or link target.
 - Every English `name.md` has a same-directory
   `name.zh-TW.md` twin with reciprocal language navigation and matching
   structure.
-- `vendor/agentic-git` is a pinned git submodule with independent
-  documentation ownership. Its files are not superproject documents.
+- `vendor/agentic-git` is an in-tree Cargo workspace with independent
+  crate documentation. Its files are outside the parent documentation index.
 - Plans, audits, review snapshots, and completed incident notes do not remain
   in the active tree. Durable current rules belong in the maintained document
   that owns the topic.

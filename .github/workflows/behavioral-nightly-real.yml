@@ -26,8 +26,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true # embedder P1b: vendor/agentic-git core path dep
       - uses: dtolnay/rust-toolchain@stable
       - name: Run backend harness tests
         run: cargo test -- --ignored backend_harness

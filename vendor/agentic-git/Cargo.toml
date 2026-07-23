@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/agentic-git-core", "crates/agentic-git"]
+
+[workspace.package]
+# agentic-git-core is the stable contract crate — it stays on its own version
+# and only bumps when its API changes. The shim (crates/agentic-git) sets its
+# own `version` explicitly, so the two can move independently.
+# 0.2.1 adds the public binding contract used by the shim and AgEnD-Terminal.
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/suzuke/agend-terminal"

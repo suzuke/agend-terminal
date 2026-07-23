@@ -25,11 +25,6 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
-        with:
-          # embedder P1b: agentic-git-core is a path dep vendored as the
-          # `vendor/agentic-git` submodule — without this the path is absent and
-          # every cargo build/check/test/clippy fails to resolve the dependency.
-          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -75,8 +70,9 @@ jobs:
         shell: bash
         # task83 (d-46): the owned-source rustfmt boundary now lives in ONE place —
         # scripts/fmt-owned.sh — so CI, GitLab CI and preflight can't drift apart. It
-        # enumerates `git ls-files -z -- '*.rs' ':!:vendor/**'` (NUL-safe; excludes
-        # the vendored agentic-git submodule) and runs `rustfmt --edition 2021 --check`.
+        # enumerates `git ls-files -z -- '*.rs' ':!:vendor/**'` (NUL-safe; the
+        # in-tree agentic-git workspace is checked separately below) and runs
+        # `rustfmt --edition 2021 --check`.
         run: scripts/fmt-owned.sh --check
 
       # task83: exercise the owned-fmt boundary contract itself (hermetic recursive-
@@ -88,16 +84,31 @@ jobs:
         shell: bash
         run: scripts/test_fmt_owned.sh
 
-      # First-party agentic-git wrapper regression: real cargo fmt must leave the
-      # parent and every recursive submodule byte-clean on the ephemeral checkout.
-      - name: Real cargo fmt recursive-clean proof
-        timeout-minutes: 5
+      # The former standalone repository CI now runs from the monorepo checkout.
+      # Keep the same Unix test/clippy/package coverage and Windows advisory
+      # build/core-test boundary without creating a second workflow.
+      - name: Agentic-git workspace checks
+        timeout-minutes: 20
         shell: bash
         run: |
-          cargo fmt
-          test -z "$(git diff --name-only)"
-          dirty="$(git submodule foreach --recursive 'git status --porcelain' | grep -v '^Entering' || true)"
-          test -z "$dirty"
+          set -euo pipefail
+          manifest="vendor/agentic-git/Cargo.toml"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo build --manifest-path "$manifest" --workspace --locked
+            cargo test --manifest-path "$manifest" -p agentic-git-core --locked
+          else
+            cargo test --manifest-path "$manifest" --workspace --locked
+          fi
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo clippy --manifest-path "$manifest" --workspace --locked -- -D warnings
+            cargo package --manifest-path "$manifest" \
+              -p agentic-git-core --locked --allow-dirty --registry crates-io
+            # The shim depends on the just-bumped, not-yet-published core.
+            # `--list` validates its package boundary before the ordered release
+            # job can publish core and perform the shim's full package verify.
+            cargo package --manifest-path "$manifest" \
+              -p agentic-git --allow-dirty --list --registry crates-io
+          fi
 
       # The first-party wrapper delegates to upstream's library entrypoint; lint
       # the binary strictly alongside the other agend-terminal targets.
@@ -143,7 +154,7 @@ jobs:
       # test cluster (`git-subprocess` test-group) so it can't race the suite.
       # #2524 P3 (agentic-git migration): the flag-gated git-shim swap points
       # `git` at a self-built `agentic-git` binary. It is now agend-terminal's OWN
-      # `[[bin]]` target (Cargo.toml `path=` into the vendored submodule source),
+      # `[[bin]]` target backed by the in-tree agentic-git crate,
       # so a plain `cargo build` produces it — no build script (P3 retired
       # scripts/build_agentic_git_shim.sh), and it rides `cargo install`/release
       # archives automatically. Build it explicitly so the runtime parity test
@@ -295,8 +306,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true # embedder P1b: vendor/agentic-git core path dep
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
@@ -347,8 +356,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true # embedder P1b: vendor/agentic-git core path dep
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
