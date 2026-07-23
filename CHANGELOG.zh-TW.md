@@ -12,6 +12,7 @@
 ### Changed
 
 - **Monorepo 整併** — `agentic-git-core` 與 `agentic-git` 原始碼現在內嵌於主倉庫；release workflow 按依賴順序發布 crate（core → shim → root），並帶 index 傳播重試（#2929）。
+- **既有 source checkout 若 `vendor/agentic-git` submodule 已初始化** — 先確認 submodule worktree 是乾淨的（先保存任何 local WIP），再執行 `git submodule deinit -f vendor/agentic-git`，接著 `git pull --ff-only`，切換到 repository 內建 workspace。
 
 ## [0.11.1] — 2026-07-23
 
