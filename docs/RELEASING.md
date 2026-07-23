@@ -44,19 +44,19 @@ gate ──► build (5 targets) ──┐
      Promote it to hard-fail when 1.0 ships.
 2. **build / appimage** — unchanged artifact matrix (5 targets + AppImage).
 3. **release** — GitHub Release with `generate_release_notes` + `SHA256SUMS`.
-4. **publish** — `cargo publish --dry-run` then `cargo publish` to crates.io.
+4. **publish** — publishes `agentic-git-core`, `agentic-git`, then
+   `agend-terminal` to crates.io. Already-published unchanged dependency
+   versions are skipped; transient registry-index lag is retried.
    - Uses the `CRATES_IO_TOKEN` repository secret. If the secret is not
      configured, the job **skips gracefully** (green, with a warning in the
      job summary) — it never reddens a release. To enable publishing:
      crates.io → Account Settings → API Tokens (scope: `publish-update`,
-     restricted to this crate), then `Settings → Secrets and variables →
+     allowed for all three crates), then `Settings → Secrets and variables →
      Actions → New repository secret → CRATES_IO_TOKEN`.
    - **Never runs for pre-release tags** (any tag containing `-`).
-   - `cargo publish` fails if the version already exists on crates.io.
-     That's expected protection, not a bug: the job only runs on a freshly
-     pushed tag, and the gate already proved the tag matches `Cargo.toml` —
-     hitting it means the version was published out-of-band (re-run the
-     release with the next patch version instead).
+   - Bump an `agentic-git` crate version only when that crate changes. The
+     ordered publisher safely reuses unchanged versions on later
+     AgEnD-Terminal releases.
 
 ## Pre-releases
 

@@ -11,7 +11,7 @@
 //!      and prove the unbound-mutation deny actually fires.
 //!   3. CROSS-BUILD HMAC byte-compat (gated): a binding SIGNED by the daemon's
 //!      core (agend-terminal build, via the dev-dep) is VERIFIED + ALLOWED by the
-//!      SUBMODULE-built binary — the load-bearing safety assumption of the flag
+//!      in-tree binary — the load-bearing safety assumption of the flag
 //!      flip — plus a tamper negative-control so the ALLOW can't be a rubber-stamp.
 //!
 //! The gated tiers use the `agentic-git` binary that a plain `cargo build`
@@ -21,7 +21,7 @@
 //! test — that reintroduced the windows
 //! target-lock deadlock removed in agend_git_shim_phase2.rs:42-48. The vendored
 //! source is already a hard build prerequisite (the daemon links
-//! `agentic-git-core` from this same submodule, P1b), so `include_str!` on it
+//! `agentic-git-core` from this same in-tree workspace, P1b), so `include_str!` on it
 //! adds no new fragility.
 
 const VENDORED_LIB: &str = include_str!("../vendor/agentic-git/crates/agentic-git/src/lib.rs");
@@ -72,7 +72,7 @@ fn vendored_shim_carries_every_depended_on_git_guard() {
         assert!(
             VENDORED_SOURCES.iter().any(|src| src.contains(needle)),
             "vendored agentic-git shim missing `{needle}` ({why}) — flipping \
-             use_agentic_git_shim on would regress this guard. Re-pin the submodule."
+             use_agentic_git_shim on would regress this guard. Fix the in-tree crate."
         );
     }
 }
@@ -117,7 +117,7 @@ mod runtime {
 
     /// The prebuilt binary, or None (caller skips-loud). CI exports
     /// AGENTIC_GIT_SHIM_BIN; otherwise fall back to the build script's install
-    /// path or the submodule target.
+    /// path or the in-tree crate target.
     pub fn locate() -> Option<PathBuf> {
         if let Some(p) = std::env::var_os("AGENTIC_GIT_SHIM_BIN") {
             let p = PathBuf::from(p);
@@ -271,7 +271,7 @@ mod runtime {
     }
 
     /// Cross-build proof: a daemon-core-signed BOUND binding is verified and
-    /// ALLOWED by the submodule-built binary (`git add .` → exit 0), proving the
+    /// ALLOWED by the in-tree binary (`git add .` → exit 0), proving the
     /// two independent `agentic-git-core` compiles are HMAC byte-compatible.
     #[test]
     fn daemon_signed_binding_allowed_across_core_builds() {
@@ -287,7 +287,7 @@ mod runtime {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             out.status.success(),
-            "daemon-core-signed bound binding must be VERIFIED + ALLOWED by the submodule-built \
+            "daemon-core-signed bound binding must be VERIFIED + ALLOWED by the in-tree \
              binary (cross-build HMAC byte-compat); exit={:?} stderr={stderr}",
             out.status.code()
         );

@@ -1,0 +1,7 @@
+agentic-git
+Copyright 2026 Huang ChiaCheng (黃家政)
+
+Extracted from the agend-terminal project
+(https://github.com/suzuke/agend-terminal), where this code shipped as the
+`agend-git` fleet shim. The commit history of the shim files is preserved
+in this repository.

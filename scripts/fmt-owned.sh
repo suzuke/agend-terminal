@@ -2,9 +2,9 @@
 # scripts/fmt-owned.sh — THE single repository-owned rustfmt surface (task83, decision
 # d-20260713150435301072-46).
 #
-# "Owned" = tracked *.rs EXCLUDING vendor/** — the vendored agentic-git submodule
-# round-trips to its OWN repo/CI. The parent wrapper keeps plain `cargo fmt` scoped
-# to parent-owned sources; this pathspec remains the explicit boundary. Every fmt caller —
+# "Owned" = tracked *.rs EXCLUDING vendor/** — the in-tree agentic-git workspace
+# keeps its own source-format boundary. This pathspec remains the explicit
+# AgEnD-Terminal boundary. Every fmt caller —
 # GitHub CI, GitLab CI, scripts/preflight.sh (and pre-push via preflight) — invokes
 # THIS one script, so the owned-source boundary is defined in exactly one place.
 #

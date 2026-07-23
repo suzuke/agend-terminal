@@ -1,0 +1,76 @@
+name: release
+
+# Publishes the workspace to crates.io GitHub-side (real registry + the
+# `CARGO_REGISTRY_TOKEN` repo secret — nothing runs locally).
+#
+# One-time setup (operator): add a `CARGO_REGISTRY_TOKEN` repo secret
+# (Settings → Secrets and variables → Actions), value = a crates.io API token.
+#
+# Triggers:
+#   - `release: published`  → auto-publish the tagged version.
+#   - `workflow_dispatch`   → manual run (e.g. to publish the existing v0.1.0).
+#
+# Idempotent: a crate already on crates.io at this version is skipped, so a
+# re-run after a partial publish (e.g. core published but the shim missed the
+# index window) completes cleanly. Bump the workspace version for a genuinely
+# new release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Never publish a version that doesn't build + pass tests.
+      - run: cargo test --workspace
+
+      # Publish core first (the shim's version dep must resolve from crates.io),
+      # then the shim. Both tolerate an already-published version (idempotent
+      # re-runs); the shim retries while core propagates through the sparse
+      # index, clearing the cached index between tries so a negative lookup
+      # isn't reused.
+      - name: publish to crates.io
+        run: |
+          # GitHub runs `run:` under `bash -e`; disable errexit so a non-zero
+          # `cargo publish` (e.g. "already uploaded") is handled by our own
+          # exit-code logic below instead of aborting the whole step.
+          set +e
+          publish() {
+            pkg="$1"
+            for i in $(seq 1 12); do
+              out="$(cargo publish -p "$pkg" 2>&1)"; rc=$?
+              printf '%s\n' "$out"
+              if [ "$rc" -eq 0 ]; then return 0; fi
+              if printf '%s' "$out" | grep -qiE "already (been )?uploaded|already exists|is already uploaded"; then
+                echo "::notice::$pkg is already on crates.io at this version — skipping"
+                return 0
+              fi
+              if printf '%s' "$out" | grep -qiE "no matching package|failed to select a version|not found in registry|unable to .* find"; then
+                echo "::notice::$pkg: a dependency is not indexed yet — retry $i/12 in 30s"
+                rm -rf "$HOME"/.cargo/registry/index/*/.cache 2>/dev/null || true
+                sleep 30
+                continue
+              fi
+              echo "::error::$pkg publish failed (non-retryable):"
+              printf '%s\n' "$out" >&2
+              return 1
+            done
+            echo "::error::$pkg publish did not succeed after retries" >&2
+            return 1
+          }
+          publish agentic-git-core
+          publish agentic-git

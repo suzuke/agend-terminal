@@ -43,17 +43,17 @@ gate ──► build (5 targets) ──┐
      等 1.0 上線後再把它升級成 hard-fail。
 2. **build / appimage** — artifact matrix 維持不變（5 個 target 加上 AppImage）。
 3. **release** — 帶有 `generate_release_notes` 和 `SHA256SUMS` 的 GitHub Release。
-4. **publish** — 先 `cargo publish --dry-run`，再 `cargo publish` 到 crates.io。
+4. **publish** — 依序將 `agentic-git-core`、`agentic-git`、`agend-terminal`
+   發布到 crates.io。未變更且已發布的依賴版本會略過；registry index
+   暫時尚未同步時會重試。
    - 使用 `CRATES_IO_TOKEN` 這個 repository secret。如果沒有設定這個 secret，
      這個 job 會**優雅地跳過**（綠燈，並在 job summary 中附上警告）——它絕不會
      讓一次發布變紅。要啟用發布功能：crates.io → Account Settings → API Tokens
-     （scope：`publish-update`，限制在這個 crate），然後 `Settings → Secrets and
+     （scope：`publish-update`，允許發布這三個 crate），然後 `Settings → Secrets and
      variables → Actions → New repository secret → CRATES_IO_TOKEN`。
    - **絕不會在 pre-release tag 上執行**（任何含有 `-` 的 tag）。
-   - 如果該版本已經存在於 crates.io，`cargo publish` 會失敗。這是預期中的保護
-     機制，不是 bug：這個 job 只會在剛推送的 tag 上執行，而 gate 已經證明 tag
-     與 `Cargo.toml` 相符——會撞到這個錯誤代表這個版本是在流程之外被發布出去
-     的（請改用下一個 patch 版本重新跑一次發布）。
+   - 只有在對應的 `agentic-git` crate 有變更時才 bump 其版本；後續
+     AgEnD-Terminal 發布可安全沿用未變更的既有版本。
 
 ## Pre-releases
 

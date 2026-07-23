@@ -1,4 +1,4 @@
-//! #2524 P3 (agentic-git migration): agend-terminal builds the vendored
+//! #2524 P3 (agentic-git migration): agend-terminal builds the in-tree
 //! `agentic-git` shim as its OWN `[[bin]]` target so a plain `cargo build`
 //! produces the sibling binary — retiring `scripts/build_agentic_git_shim.sh`
 //! and making the shim ride `cargo install` / release archives automatically.
@@ -72,7 +72,7 @@ fn agentic_git_bin_target_is_declared_with_windows_safe_test_false() {
 
     assert!(
         has_kv(&block, "path", &format!("\"{BIN_PATH}\"")),
-        "P3: the agentic-git `[[bin]]` must compile the vendored submodule source \
+        "P3: the agentic-git `[[bin]]` must compile the in-tree crate source \
          (path = \"{BIN_PATH}\"); found block:\n{block}"
     );
 

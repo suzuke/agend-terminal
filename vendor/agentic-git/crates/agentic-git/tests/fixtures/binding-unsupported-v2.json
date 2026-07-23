@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "agent": "future-golden",
+  "task_id": "t-future-1",
+  "branch": "feat/future",
+  "sealed_by": "some-v2-only-authority",
+  "issued_at": "2027-01-01T00:00:00Z"
+}

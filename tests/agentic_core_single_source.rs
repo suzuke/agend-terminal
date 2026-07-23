@@ -1,6 +1,6 @@
 //! Embedder §3.A LOAD-BEARING single-source invariant (reviewer4 CONFIRMED
 //! acceptance cond. #1): agend-terminal's `Cargo.lock` must contain EXACTLY ONE
-//! `agentic-git-core` package, resolved from the vendored submodule PATH.
+//! `agentic-git-core` package, resolved from the in-tree PATH.
 //!
 //! ## Why this exists
 //! P1b swaps the daemon's binding signer to `agentic_git_core::integrity_core::
@@ -72,7 +72,7 @@ fn cargo_lock_has_exactly_one_agentic_git_core_from_path() {
     );
     assert!(
         sources[0].is_none(),
-        "§3.A: the sole agentic-git-core must be the vendored submodule PATH source \
+        "§3.A: the sole agentic-git-core must be the in-tree PATH source \
          (a path dep is source-less in Cargo.lock); found a registry/git source \
          {:?} — the daemon signer must link the SAME source as the shim verifier",
         sources[0]
