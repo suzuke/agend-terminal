@@ -9,7 +9,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [0.11.0] — 2026-07-23
 
-208 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
+210 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
 
 ### Added
 
@@ -30,7 +30,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **CI continuation gaps and duplicate notifications** — durable episode settlement, exact pickup acknowledgement, task-wake routing, stale assignment retirement, and bounded unread-assignment re-wake close several cases where a green/failing CI event was delivered repeatedly or failed to resume its owner (#2798, #2833, #2835, #2861, #2881, #2911, #2912, #2914, #2917, #2923).
 - **Worktree release and branch-cleanup safety** — canonical/default worktrees, dirty nested submodules, open-PR branches, markerless legacy worktrees, checkout rollback, and cross-repository default branches are preserved or rejected with actionable evidence instead of being deleted ambiguously (#2754, #2831, #2862, #2871, #2875, #2894–#2896, #2908, #2916, #2922).
 - **Crash/restart accounting** — exact-generation disposition, restart admission, claimant permits, and crash-attempt debit ordering prevent duplicate respawns and incorrect crash-budget charges (#2765, #2822, #2825, #2829, #2840, #2869, #2899, #2906).
-- **Backend and daemon edge cases** — declared backend identity survives wrappers and handles, decimal context percentages are accepted, and app mode now fails closed when the daemon singleton lock is already held (#2781, #2834, #2836, #2877, #2883, #2897).
+- **Backend and daemon edge cases** — declared backend identity survives wrappers and handles, decimal context percentages are accepted, app mode now fails closed when the daemon singleton lock is already held, and standalone backend capture writes a complete `.cap` plus `.meta.json` pair before returning success (#2781, #2834, #2836, #2877, #2883, #2897, #2925).
 
 ### Migration and known caveats
 

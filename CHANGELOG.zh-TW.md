@@ -9,7 +9,7 @@
 
 ## [0.11.0] — 2026-07-23
 
-自 0.10.0 起共 208 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
+自 0.10.0 起共 210 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
 
 ### Added
 
@@ -30,7 +30,7 @@
 - **CI 接續斷鏈與重複通知** — durable episode settlement、exact pickup acknowledgement、task-wake routing、stale assignment retirement 與有界 unread-assignment re-wake，修正 CI 綠燈／失敗事件重複送達或未喚醒 owner 的多種情況（#2798、#2833、#2835、#2861、#2881、#2911、#2912、#2914、#2917、#2923）。
 - **Worktree release 與 branch-cleanup 安全性** — canonical/default worktree、dirty nested submodule、open-PR branch、markerless legacy worktree、checkout rollback 與跨 repository default branch 現在會被保留或以可行動證據拒絕，不再含糊刪除（#2754、#2831、#2862、#2871、#2875、#2894–#2896、#2908、#2916、#2922）。
 - **Crash/restart accounting** — exact-generation disposition、restart admission、claimant permit 與 crash-attempt debit ordering 可防止重複 respawn 及錯誤扣除 crash budget（#2765、#2822、#2825、#2829、#2840、#2869、#2899、#2906）。
-- **Backend 與 daemon 邊界情況** — declared backend identity 可穿越 wrapper/handle 保留、decimal context percentage 可被接受，且 app mode 在 daemon singleton lock 已被持有時會 fail closed（#2781、#2834、#2836、#2877、#2883、#2897）。
+- **Backend 與 daemon 邊界情況** — declared backend identity 可穿越 wrapper/handle 保留、decimal context percentage 可被接受、app mode 在 daemon singleton lock 已被持有時會 fail closed，且 standalone backend capture 會在成功返回前寫出完整的 `.cap` 與 `.meta.json` 檔案組（#2781、#2834、#2836、#2877、#2883、#2897、#2925）。
 
 ### Migration and known caveats
 
