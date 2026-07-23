@@ -4282,24 +4282,44 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
         "F7: primary dispatch must succeed even when arm fails; got hard error: {result}"
     );
 
+    // ── Positive control: target delivery happened exactly once.
+    assert_eq!(
+        result.get("target").and_then(|v| v.as_str()),
+        Some("target-agent"),
+        "F7 positive control: dispatch must deliver to target-agent exactly once. Got: {result}"
+    );
+
     // ── No watch must be created (arm failed — ci-watches is a file).
     assert!(
         ci_watches.is_file(),
         "ci-watches must remain a file (injection intact)"
     );
 
-    // ── F7 RED assertion: the caller-visible response MUST carry a typed
-    // degraded/warning code so the dispatcher knows the arm failed.
-    // On the current base this field does not exist → test FAILS (RED).
-    let arm_warning = result
-        .get("ci_watch_arm_failed")
-        .or_else(|| result.get("degraded"))
-        .or_else(|| result.get("warning"));
+    // ── F7 RED: exact minimal response contract when auto-watch arm fails.
+    // The response MUST carry:
+    //   "degraded": true
+    //   "warning": { "code": "ci_watch_arm_failed", "remediation": "<non-empty>" }
+    // On the current base none of these exist → test FAILS (RED).
+    assert_eq!(
+        result.get("degraded"),
+        Some(&serde_json::json!(true)),
+        "F7 RED: response.degraded must be boolean true when arm fails. Got: {result}"
+    );
+    let warning = result.get("warning").expect(&format!(
+        "F7 RED: response must contain a 'warning' object when arm fails. Got: {result}"
+    ));
+    assert_eq!(
+        warning.get("code").and_then(|v| v.as_str()),
+        Some("ci_watch_arm_failed"),
+        "F7 RED: warning.code must be 'ci_watch_arm_failed'. Got warning: {warning}"
+    );
+    let remediation = warning
+        .get("remediation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     assert!(
-        arm_warning.is_some(),
-        "F7 RED: dispatch response must carry a typed ci_watch_arm_failed / \
-         degraded / warning field when auto-watch arm fails, so the dispatcher \
-         can detect the silent failure. Got: {result}"
+        !remediation.is_empty(),
+        "F7 RED: warning.remediation must be a non-empty actionable string. Got warning: {warning}"
     );
 
     std::fs::remove_dir_all(&home).ok();
