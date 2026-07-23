@@ -1180,6 +1180,17 @@ pub fn spawn_agent(
     config: &SpawnConfig,
     registry: &AgentRegistry,
 ) -> anyhow::Result<crate::types::InstanceId> {
+    spawn_agent_with_capture_home(config, registry, config.home, None)
+}
+
+/// Spawn an agent while writing passive PTY captures to a location independent
+/// from the fleet identity home. Used by the standalone `capture backend` CLI.
+pub(crate) fn spawn_agent_with_capture_home(
+    config: &SpawnConfig,
+    registry: &AgentRegistry,
+    capture_home: Option<&std::path::Path>,
+    capture_done: Option<crossbeam_channel::Sender<()>>,
+) -> anyhow::Result<crate::types::InstanceId> {
     let SpawnConfig {
         name,
         backend: _,
@@ -1405,7 +1416,7 @@ pub fn spawn_agent(
             .as_ref()
             .map(|b| b.name())
             .unwrap_or(backend_command);
-        crate::capture::make_capture_writer(home.as_deref(), name, backend_str)
+        crate::capture::make_capture_writer(capture_home, name, backend_str)
     };
     // fire-and-forget: pty_read_loop terminates on PTY EOF, which fires when
     // the child process is killed during shutdown / delete. JoinHandle is
@@ -1415,6 +1426,9 @@ pub fn spawn_agent(
         .name(format!("{n}_pty_read"))
         .spawn(move || {
             pty_read_loop(&mut pty_reader, &ctx, capture);
+            if let Some(done) = capture_done {
+                let _ = done.send(());
+            }
         })?;
 
     // Backends whose CLI does not auto-load the instructions file (e.g. Kiro)

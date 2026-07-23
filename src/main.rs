@@ -1441,7 +1441,7 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("{} ({}) not found in PATH", backend, b.preset().command);
                     std::process::exit(1);
                 }
-                cli::capture_backend(&b, seconds)?;
+                cli::capture_backend(&home, &b, seconds)?;
             }
             CaptureAction::Promote {
                 capture_path,
