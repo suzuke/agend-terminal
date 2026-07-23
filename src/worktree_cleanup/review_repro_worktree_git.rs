@@ -144,6 +144,12 @@ fn prune_keeps_remote_gone_branch_with_unpushed_commits_worktree_git() {
 
 #[test]
 fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
+    // This test mutates process-global AGEND_WORKTREE_AUTO_CLEANUP below; every
+    // other toucher serializes on ENV_LOCK. Without it this test's set_var("1")
+    // races e.g. auto_cleanup_opt_out_produces_no_tasks_v1's locked "0" window
+    // (observed as an intermittent Coverage failure — the opt-out test's sweep
+    // ran and upserted a hygiene task).
+    let _lock = super::tests::ENV_LOCK.lock();
     // A bare "remote" + a clone, so `branch.<name>.remote` is real.
     let remote = scratch("p1-remote-gone-bare");
     git(&remote, &["init", "--bare", "-b", "main"]);
@@ -204,9 +210,10 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
 
     // Drive the phase-1 sweep. PR-D6: gating is AUTO_CLEANUP only, and when it is
     // on the sweep runs LIVE (the old AGEND_WORKTREE_PRUNE_LIVE dry-run toggle is
-    // retired) — set it explicitly for determinism (the git-subprocess serialize
-    // group prevents an env race). This test asserts the worktree dir was actually
-    // reclaimed, so it relies on that live behavior.
+    // retired) — set it explicitly for determinism, under ENV_LOCK (held above;
+    // the git-subprocess serialize group serializes git spawns, NOT env reads
+    // from sibling test threads). This test asserts the worktree dir was
+    // actually reclaimed, so it relies on that live behavior.
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     let home = scratch("p1-remote-gone-home");
     let mut configs: HashMap<String, Option<PathBuf>> = HashMap::new();
