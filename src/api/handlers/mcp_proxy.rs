@@ -175,6 +175,9 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
     )
 }
 
+/// Process-global outstanding-worker counter for production admission control.
+static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+
 /// Inner proxy with an injectable executor + explicit timeout — the §3.9 test
 /// seam (drive the timeout path with a sleeping executor + tiny budget, no real
 /// tool and no 30s wait).
@@ -186,12 +189,22 @@ fn handle_mcp_tool_inner(
     action: Option<String>,
     exec: impl FnOnce(&str, &Value, &str) -> Value + Send + 'static,
 ) -> Value {
-    static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+    handle_mcp_tool_counted(&OUTSTANDING, tool, args, instance, timeout, action, exec)
+}
 
-    // #3033: atomic bounded admission — a single CAS prevents the
-    // check-then-act race where two threads both read (cap-1), both
-    // pass, and both increment past the cap.
-    if OUTSTANDING
+/// Counter-parameterized admission + dispatch. Production always passes
+/// `&OUTSTANDING`; the cap test passes its own isolated counter so lingering
+/// workers from other tests cannot pollute it.
+fn handle_mcp_tool_counted(
+    counter: &'static AtomicUsize,
+    tool: &str,
+    args: Value,
+    instance: String,
+    timeout: Duration,
+    action: Option<String>,
+    exec: impl FnOnce(&str, &Value, &str) -> Value + Send + 'static,
+) -> Value {
+    if counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             if cur >= MAX_MCP_WORKERS {
                 None
@@ -210,31 +223,25 @@ fn handle_mcp_tool_inner(
         });
     }
 
-    struct WorkerGuard;
+    struct WorkerGuard(&'static AtomicUsize);
     impl Drop for WorkerGuard {
         fn drop(&mut self) {
-            OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+            self.0.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     let key = content_key(tool, &args);
     let tool_owned = tool.to_string();
 
-    // Execute in a scoped thread with per-tool timeout. This prevents a stuck
-    // tool from blocking the API session thread beyond the tool's budget.
     // fire-and-forget: short-lived tool execution thread; dies on completion
     // or timeout. Result sent via mpsc channel; thread is not joined — the
-    // recv_timeout below bounds the caller's wait. If the tool outlives the
-    // timeout, the thread runs to completion in the background (no leak —
-    // handle_tool is stateless and the thread exits when done). Candidate 2
-    // relies on this: the side effect DOES complete once, so a timeout is
-    // truthfully "accepted_in_progress", not a failure.
+    // recv_timeout below bounds the caller's wait.
     let exec_tool = tool_owned.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::Builder::new()
         .name(format!("mcp_tool_{tool_owned}"))
         .spawn(move || {
-            let _guard = WorkerGuard;
+            let _guard = WorkerGuard(counter);
             let result = exec(&exec_tool, &args, &instance);
             let _ = tx.send(result);
         });
@@ -250,7 +257,7 @@ fn handle_mcp_tool_inner(
             }
         },
         Err(e) => {
-            OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+            counter.fetch_sub(1, Ordering::Relaxed);
             json!({"ok": false, "error": format!("spawn failed: {e}")})
         }
     }
@@ -1636,12 +1643,14 @@ mod tests {
     /// #3033: when outstanding MCP tool workers reach MAX_MCP_WORKERS, the
     /// next call must be refused (ok:false) instead of spawning unboundedly.
     /// After workers complete, capacity is released and new calls succeed.
+    /// Uses its own isolated counter so lingering workers from other tests
+    /// (e.g. 300ms timeout executors) cannot pollute the count.
     #[test]
     fn worker_cap_rejects_then_releases() {
         use std::sync::{mpsc, Arc, Barrier};
 
-        // ready_tx: each worker signals when its executor has started.
-        // hold: barrier that keeps all workers blocked until we release them.
+        static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let hold = Arc::new(Barrier::new(MAX_MCP_WORKERS + 1));
 
@@ -1650,7 +1659,8 @@ mod tests {
             let tx = ready_tx.clone();
             let b = hold.clone();
             let h = std::thread::spawn(move || {
-                handle_mcp_tool_inner(
+                handle_mcp_tool_counted(
+                    &TEST_COUNTER,
                     "inbox",
                     json!({}),
                     "caller".to_string(),
@@ -1667,8 +1677,6 @@ mod tests {
         }
         drop(ready_tx);
 
-        // Wait for all MAX_MCP_WORKERS executors to signal ready —
-        // deterministic, no sleep.
         for _ in 0..MAX_MCP_WORKERS {
             ready_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -1676,7 +1684,8 @@ mod tests {
         }
 
         // The (cap+1)th call must be refused.
-        let resp = handle_mcp_tool_inner(
+        let resp = handle_mcp_tool_counted(
+            &TEST_COUNTER,
             "inbox",
             json!({}),
             "caller".to_string(),
@@ -1703,7 +1712,8 @@ mod tests {
         }
 
         // After release, a new call must succeed (capacity recovered).
-        let resp = handle_mcp_tool_inner(
+        let resp = handle_mcp_tool_counted(
+            &TEST_COUNTER,
             "inbox",
             json!({}),
             "caller".to_string(),
