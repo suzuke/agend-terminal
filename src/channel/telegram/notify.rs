@@ -4,6 +4,12 @@ use crate::channel::dedup::DedupKey;
 use crate::channel::telegram::error::*;
 use crate::channel::telegram::state::*;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// CR-2026-06-14: after a successful notify retry to a RECREATED topic, record a
 /// dedup claim keyed on the NEW topic id. The original claim (recorded before the
 /// first send) is keyed on the now-dead OLD topic id, so without this a
@@ -139,6 +145,8 @@ pub(crate) fn send_telegram_job(job: crate::daemon::delivery_worker::TelegramSen
         // add the timeout. On the (effectively impossible) builder failure, fall
         // back to teloxide's default client — losing the timeout but never the
         // send.
+        #[cfg(test)]
+        CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
         let bot = match teloxide::net::default_reqwest_settings()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -252,6 +260,19 @@ mod tests {
         *FORCED_SEND_ERROR.lock() = Some(err);
     }
 
+    fn forced_job(home: &Path, text: &str) -> crate::daemon::delivery_worker::TelegramSendJob {
+        crate::daemon::delivery_worker::TelegramSendJob {
+            home: home.to_path_buf(),
+            instance: "C".to_string(),
+            text: text.to_string(),
+            disable_notification: false,
+            token: "fake".to_string(),
+            group_id: -100_777,
+            topic_id: None,
+            dedup_key: notify_key(home, "C", text),
+        }
+    }
+
     /// Serialize against the process-global env + dedup cache + forced-error seam.
     fn guard() -> parking_lot::MutexGuard<'static, ()> {
         static G: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -318,6 +339,28 @@ mod tests {
         );
 
         std::env::remove_var("NOTIFY_MED1_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn send_jobs_build_one_client_2976() {
+        let _g = guard();
+        let home = tmp_home("client-reuse");
+        let start = CLIENT_BUILD_COUNT.load(Ordering::Relaxed);
+
+        for text in ["first notification", "second notification"] {
+            set_forced_send_error(anyhow::anyhow!("forced client-reuse test error"));
+            super::send_telegram_job(forced_job(&home, text));
+        }
+
+        let built = CLIENT_BUILD_COUNT.load(Ordering::Relaxed) - start;
+        assert!(
+            built <= 1,
+            "two send jobs must build at most one shared HTTP client, got {built}"
+        );
+        if start == 0 {
+            assert_eq!(built, 1, "the first send job must build the shared client");
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
