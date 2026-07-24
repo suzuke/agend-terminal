@@ -637,19 +637,40 @@ mod tests {
     }
 
     #[test]
-    fn create_instance_command_deprecated() {
+    fn create_instance_command_param_removed() {
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().expect("tools array");
         let create = tools
             .iter()
             .find(|t| t["name"] == "create_instance")
             .expect("create_instance tool not found");
-        let desc = create["inputSchema"]["properties"]["command"]["description"]
-            .as_str()
-            .expect("command desc");
         assert!(
-            desc.to_lowercase().contains("deprecated"),
-            "command should be marked as deprecated"
+            create["inputSchema"]["properties"]["command"].is_null(),
+            "create_instance.command alias must be removed (use 'backend' instead)"
+        );
+    }
+
+    #[test]
+    fn bind_self_repository_param_removed() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let bind = tools
+            .iter()
+            .find(|t| t["name"] == "bind_self")
+            .expect("bind_self tool not found");
+        assert!(
+            bind["inputSchema"]["properties"]["repository"].is_null(),
+            "bind_self.repository alias must be removed (use 'repository_path')"
+        );
+    }
+
+    #[test]
+    fn send_kind_mcp_fallback_removed() {
+        let src = include_str!("handlers/comms.rs");
+        let needle = ["args[\"kind\"]", ".as_str()"].concat();
+        assert!(
+            !src.contains(&needle),
+            "MCP send handler must not fall back to args[\"kind\"] (use request_kind)"
         );
     }
 
