@@ -364,6 +364,8 @@ pub struct VTerm {
     /// caching across frames; VTerm is single-threaded (main render thread only),
     /// so the interior mutability never races.
     snapshot_scratch: std::cell::RefCell<Vec<Cell>>,
+    #[cfg(test)]
+    read_scrollback_rows: std::cell::Cell<usize>,
 }
 
 /// alacritty scrollback cap for every [`VTerm`] (its `Config::scrolling_history`).
@@ -401,6 +403,8 @@ impl VTerm {
             cols,
             rows,
             snapshot_scratch: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            read_scrollback_rows: std::cell::Cell::new(0),
         }
     }
 
@@ -816,6 +820,9 @@ impl VTerm {
         let mut lines: Vec<String> = Vec::new();
         let mut row = top;
         while row <= bot {
+            #[cfg(test)]
+            self.read_scrollback_rows
+                .set(self.read_scrollback_rows.get() + 1);
             let mut line = String::with_capacity(cols);
             let mut col = 0;
             while col < cols {
@@ -2469,6 +2476,23 @@ mod tests {
             lines.len() <= 3,
             "read_scrollback(3) must return at most 3 lines, got {}",
             lines.len()
+        );
+    }
+
+    #[test]
+    fn read_scrollback_scans_only_bounded_tail_2963() {
+        let mut vt = VTerm::new(80, 5);
+        for i in 0..2_000 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+
+        let text = vt.read_scrollback(1);
+
+        assert!(text.contains("line1999"), "latest line must be returned");
+        assert!(
+            vt.read_scrollback_rows.get() < 100,
+            "read_scrollback(1) must not scan the retained history, visited {} rows",
+            vt.read_scrollback_rows.get()
         );
     }
 
