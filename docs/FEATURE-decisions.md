@@ -256,7 +256,7 @@ Expiry flow:
 2. Skips: already archived, created less than 14 days ago, carries a protected tag
 3. Decisions meeting the expiry criteria are moved to `decisions/.archive/`
 
-You must set the environment variable `AGEND_RETENTION_DECISIONS_CUTOVER=1` to enable the auto-expiry scan (the old `AGEND_RETENTION_CUTOVER=1` still works for compatibility, but is deprecated; please switch to the new flag).
+Set `AGEND_RETENTION_DECISIONS_CUTOVER=1` to enable the auto-expiry scan.
 
 This is not a deletion mechanism; it's a way to reduce noise in the active query surface while preserving old records for audit.
 

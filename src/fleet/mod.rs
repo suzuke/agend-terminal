@@ -188,10 +188,8 @@ pub struct FleetConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_workspace_link_base: Option<PathBuf>,
     /// Watchdog topology — which agent the idle watchdog watches and who receives
-    /// each watchdog / anti-stall / decision-timeout notification. Replaces five
-    /// `AGEND_*` env vars (now a deprecated fallback). Omitted block → built-in
-    /// defaults, byte-identical to the pre-migration behaviour. See
-    /// [`watchdog::WatchdogConfig`].
+    /// each watchdog / anti-stall / decision-timeout notification. Omitted
+    /// block → built-in defaults. See [`watchdog::WatchdogConfig`].
     #[serde(default)]
     pub watchdog: WatchdogConfig,
     /// #2524 P2 (agentic-git migration, design §5-Phase-2): flag-gated git-shim

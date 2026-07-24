@@ -83,18 +83,13 @@ pub(crate) fn archive_decision(home: &Path, id: &str) -> anyhow::Result<bool> {
 /// `AGEND_RETENTION_DECISIONS_CUTOVER=1`, independent of the pending-dispatch
 /// kill-switch `AGEND_RETENTION_CUTOVER` (read in `retention/mod.rs` with the
 /// OPPOSITE polarity — opt-OUT). Sharing one name made the `pending-OFF +
-/// decisions-ON` combination unreachable (reviewer-2 finding). Legacy fallback
-/// (deprecation window): the old shared `AGEND_RETENTION_CUTOVER=1` STILL
-/// enables the decisions sweep, so operators who already opted in aren't broken
-/// — prefer the new flag going forward.
+/// decisions-ON` combination unreachable (reviewer-2 finding).
 ///
 /// Decisions-sweep truth table:
 ///   `AGEND_RETENTION_DECISIONS_CUTOVER=1`        → ON
-///   else `AGEND_RETENTION_CUTOVER=1` (legacy)    → ON
 ///   else                                         → OFF (default)
 fn decisions_cutover_enabled() -> bool {
     std::env::var("AGEND_RETENTION_DECISIONS_CUTOVER").as_deref() == Ok("1")
-        || std::env::var("AGEND_RETENTION_CUTOVER").as_deref() == Ok("1")
 }
 
 /// Sweep expired decisions. Gated on [`decisions_cutover_enabled`].
@@ -168,8 +163,8 @@ pub(super) fn sweep(home: &Path) -> usize {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    // The `sweep_*` tests set/remove the process-global `AGEND_RETENTION_CUTOVER`
-    // env var that `sweep()` reads — running them concurrently lets one test's
+    // The `sweep_*` tests set/remove the process-global decisions cutover env
+    // var that `sweep()` reads — running them concurrently lets one test's
     // `remove_var` clear the gate before another's `sweep()` reads it, so the
     // latter early-returns 0 and its `assert_eq!(archived, 1)` flakes (reddened
     // #1752 CI). Serialize them under a named group (mirrors capture.rs's
@@ -339,12 +334,11 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #env-cleanup decouple: legacy fallback — the OLD shared
-    /// `AGEND_RETENTION_CUTOVER=1` must STILL enable the decisions sweep so
-    /// operators who already opted in via the old name aren't broken.
+    /// After the compatibility window, the pending-dispatch gate must not
+    /// enable the decisions sweep.
     #[test]
     #[serial(retention_cutover)]
-    fn legacy_retention_cutover_still_enables_decisions_sweep() {
+    fn pending_retention_cutover_does_not_enable_decisions_sweep() {
         let home = tmp_home("legacy-cutover");
         write_decision(&home, "d-old", 100, &[]);
 
@@ -354,8 +348,8 @@ mod tests {
         std::env::remove_var("AGEND_RETENTION_CUTOVER");
 
         assert_eq!(
-            archived, 1,
-            "legacy AGEND_RETENTION_CUTOVER=1 must still enable the decisions sweep"
+            archived, 0,
+            "AGEND_RETENTION_CUTOVER=1 is pending-dispatch-only"
         );
         std::fs::remove_dir_all(&home).ok();
     }

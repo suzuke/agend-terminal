@@ -83,7 +83,7 @@ gates removed — converged to Stage-1-only, see `docs/RECOVERY-STAGES.md`.)
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_WORKTREE_AUTO_CLEANUP` | Gates the runtime worktree auto-cleanup sweep (removes merged worktrees, prunes orphan branches). | **On** (`unwrap_or(true)`). | Any value except `"0"` → enabled; only `"0"` disables. | `src/worktree_cleanup.rs:17` | Opt-**out**. ⚠️ Module doc comment says "`=1` opt-in" but code is opt-out — code is authoritative. |
 | `AGEND_WORKTREE_ENFORCEMENT` | In the messaging handler, whether a task target must be bound in a managed worktree before delivery. | `"warn"` (log a warning but allow delivery). | `"off"` (skip), `"enforce"` (reject `worktree_not_managed`), else (incl. `"warn"`) → warn-and-allow. | `src/api/handlers/messaging.rs:282` | ⚠️ Security-sensitive (gates messaging unbound agents). Tri-state, not a bool. |
-| `AGEND_WORKTREE_ARCHIVE_FALLBACK` | Enables the worktree-GC **archive-fallthrough belt** only: when a CleanRelease candidate's unconditional hard-delete can't act (lock/repo-unresolved/remove-failed), archive it to `.trash` in the same pass. Does NOT gate GC wholesale. | **Off** (no-op). | `"1"` enables; else off. | `src/daemon/retention/worktrees.rs:497` | ⚠️ Strict `=="1"`. Renamed from `AGEND_WORKTREE_GC` (PR-D6); the old name is honored as a **deprecated alias for one release cycle** (emits a warn), consulted only when this new name is unset. |
+| `AGEND_WORKTREE_ARCHIVE_FALLBACK` | Enables the worktree-GC **archive-fallthrough belt** only: when a CleanRelease candidate's unconditional hard-delete can't act (lock/repo-unresolved/remove-failed), archive it to `.trash` in the same pass. Does NOT gate GC wholesale. | **Off** (no-op). | `"1"` enables; else off. | `src/daemon/retention/worktrees.rs` (`archive_fallback_enabled`) | ⚠️ Strict `=="1"`. |
 | `AGEND_WORKTREE_PRUNE_LIVE` | *(retired, PR-D6)* Formerly selected live-vs-dry-run for the auto-cleanup sweep. | — | — | `src/worktree_cleanup.rs:49` | ❌ **Retired & ignored.** Sweep gating is now `AGEND_WORKTREE_AUTO_CLEANUP` only (on ⇒ live). If still set, the daemon warns once at boot (`warn_if_prune_live_retired`). |
 | `AGEND_WORKTREE_GC_TRASH_DAYS` | Retention window (days) for `.trash/worktrees/*`; older entries purged on GC sweep. | `7`. | `u64` days; `0` = purge same sweep; no positivity filter. | `src/daemon/retention/worktrees.rs:49` | Tuning knob. |
 | `AGEND_WORKTREE_FORCE_RECLAIM_DAYS` | Age cap (days) for the force-reclaim backstop: a never-released lease with no agent liveness older than this is force-reclaimed. | `7` (also when `<=0`). | `i64` days, filtered `>0`. | `src/worktree_pool.rs:534` | ⚠️ Controls destructive reclaim. |
@@ -121,30 +121,20 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 
 ## 8. Watchdog & recipients
 
-> **Deprecation (watchdog topology → `fleet.yaml`).** The five `AGEND_IDLE_WATCHDOG_*`
-> / `AGEND_TASK_STALL_RECIPIENTS` / `AGEND_DECISION_TIMEOUT_RECIPIENT` vars below are
-> agent / recipient **names** — fleet *topology*, not env tuning. Their home is the
-> `fleet.yaml` top-level `watchdog:` block (see `docs/FEATURE-fleet.md`). The env vars
-> remain as a **deprecated fallback for one window** so existing setups keep working;
-> resolution precedence is **fleet.yaml `watchdog:` value > env var (deprecated, warns
-> once) > built-in default**. Move them to `fleet.yaml` and drop the env vars:
+Watchdog topology is configured in the `fleet.yaml` top-level `watchdog:` block
+(see `docs/FEATURE-fleet.md`):
 >
 > ```yaml
 > watchdog:
->   idle_watchdog_agent: dev          # AGEND_IDLE_WATCHDOG_AGENT (single-agent mode)
->   dev_recipient: lead               # AGEND_IDLE_WATCHDOG_DEV_RECIPIENT
->   fleet_recipient: lead             # AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT
->   task_stall_recipients: [general, lead]   # AGEND_TASK_STALL_RECIPIENTS
->   decision_timeout_recipient: general      # AGEND_DECISION_TIMEOUT_RECIPIENT
+>   idle_watchdog_agent: dev
+>   dev_recipient: lead
+>   fleet_recipient: lead
+>   task_stall_recipients: [general, lead]
+>   decision_timeout_recipient: general
 > ```
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_IDLE_WATCHDOG_AGENT` | **Deprecated** → `watchdog.idle_watchdog_agent`. Single-agent mode for the dev-vantage idle watchdog (watch only this agent). | `"dev"` (load-failure fallback only). | Agent name; empty/whitespace ignored. | `src/fleet/watchdog.rs` | Fleet config wins; env is the deprecated fallback. |
-| `AGEND_IDLE_WATCHDOG_DEV_RECIPIENT` | **Deprecated** → `watchdog.dev_recipient`. Recipient for dev-vantage idle alerts. | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/fleet/watchdog.rs` | Fleet config wins; deprecated fallback. |
-| `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` | **Deprecated** → `watchdog.fleet_recipient`. Recipient for fleet-vantage idle alerts ("whole fleet is quiet"). | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/fleet/watchdog.rs` | Fleet config wins; deprecated fallback. |
-| `AGEND_TASK_STALL_RECIPIENTS` | **Deprecated** → `watchdog.task_stall_recipients`. Recipients of task-stall warnings. | `["general", "lead"]`. | Comma-separated names; entries trimmed, empties filtered. | `src/fleet/watchdog.rs` | Fleet config (list) wins; deprecated fallback. |
-| `AGEND_DECISION_TIMEOUT_RECIPIENT` | **Deprecated** → `watchdog.decision_timeout_recipient`. Recipient for the decision-timeout auto-default (operator-proceed) emission. | `"general"`. | Non-empty recipient name; blank treated as unset. | `src/fleet/watchdog.rs` | Fleet config wins; deprecated fallback. |
 | `AGEND_WATCHDOG_DRY_RUN` | Makes the per-tick watchdog log classified PTY errors to the event log only instead of mutating agent health state. | `false` (health mutations applied). | `"1"`/`"true"`/`"TRUE"`/`"True"` → dry-run; else off. | `src/daemon/watchdog.rs:21` | Operator safety toggle. |
 
 ---
@@ -187,8 +177,8 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS` | Enables the destructive boot-time zombie-daemon sweep and sets the age threshold (days); candidates older than N are killed. | Telemetry-only (no kills); threshold const `DEFAULT_AGE_DAYS = 14`. | Positive integer `>=1` days; malformed → warn + treated as unset. | `src/daemon/boot_sweep.rs:36` | ⚠️ **Destructive** (SIGTERM/SIGKILL zombie daemons). Setting a valid value flips destructive mode on. |
 | `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN` | Secondary gate: when `"1"` and age-days is set, downgrades the destructive sweep to log-only. | Not dry-run (destructive if age-days set). | `"1"` enables dry-run; else off. | `src/daemon/boot_sweep.rs:40` | Safety override for the sweep. |
-| `AGEND_RETENTION_CUTOVER` | Kill-switch for the **pending-dispatch** retention sweep (deletes dispatch sidecars older than 14d). | **On** unless `=="0"`. | `"0"` disables; unset / anything else → enabled. | `src/daemon/retention/mod.rs:41` | Opt-**out**. #env-cleanup: decoupled — this is now pending-dispatch ONLY (decisions moved to its own flag below). `=="1"` ALSO still enables the decisions sweep as a legacy fallback (deprecated). |
-| `AGEND_RETENTION_DECISIONS_CUTOVER` | Opt-in gate for the **decisions** retention sweep (archives expired decisions). | **Off**. | `"1"` enables; else off. | `src/daemon/retention/decisions.rs` (`decisions_cutover_enabled`) | Opt-**in**. #env-cleanup decouple: own flag so `pending-OFF + decisions-ON` is reachable. Legacy `AGEND_RETENTION_CUTOVER=1` still enables it (deprecation window). |
+| `AGEND_RETENTION_CUTOVER` | Kill-switch for the **pending-dispatch** retention sweep (deletes dispatch sidecars older than 14d). | **On** unless `=="0"`. | `"0"` disables; unset / anything else → enabled. | `src/daemon/retention/mod.rs:41` | Opt-**out**; pending-dispatch only. |
+| `AGEND_RETENTION_DECISIONS_CUTOVER` | Opt-in gate for the **decisions** retention sweep (archives expired decisions). | **Off**. | `"1"` enables; else off. | `src/daemon/retention/decisions.rs` (`decisions_cutover_enabled`) | Opt-**in**; independent of the pending-dispatch gate. |
 | `AGEND_FLEET_NO_AUTO_MIGRATE` | Disables automatic backfill/migration of missing instance IDs in `fleet.yaml` during load. | Auto-migration runs (backfills IDs and rewrites fleet.yaml). | `"1"` skips migration; else off. | `src/fleet/mod.rs:544` | Opt out of auto-rewrite. |
 | `AGEND_CAPTURE_FIXTURES` | Activates the PTY-capture fixture sink: raw PTY bytes written to `$AGEND_HOME/captures/<agent>/`. Boot path emits a privacy warning. | `NoOpCapture` (no capture, zero overhead). | `"1"` enables; else off. | `src/capture.rs:56`; `src/bootstrap/mod.rs:224` | ⚠️ Fixture-capture tool, readable on the real boot path. Captured bytes may contain **secrets/prompts** — review before committing. See also [test-only](#14-test-only-fixtures--seams). |
 

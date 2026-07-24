@@ -47,7 +47,7 @@ impl GcTickHandler {
         // NOTE (behavior change, deliberate, NOT covered by decision Q3's
         // "gate coverage unchanged"): this call is UNCONDITIONAL, unlike the
         // old `sweep()` it replaces, which only ran (and so only purged
-        // `.trash`) when `AGEND_WORKTREE_GC=1`. Q3 preserved the gate on the
+        // `.trash`) when the archive-fallback gate was enabled. Q3 preserved the gate on the
         // ARCHIVE-DECISION path (CleanRelease's fallthrough); it says nothing
         // about cleaning up entries already IN `.trash`, which can land there
         // via the ForceReclaim path (never gated, before or after this PR) —
@@ -145,13 +145,14 @@ mod tests {
 
     /// #2550 W5 (seat-2 finding on PR #2599): `purge_trash` is now called
     /// UNCONDITIONALLY from `gc_tick`, unlike the old standalone `sweep()` it
-    /// replaces, which only purged `.trash` when `AGEND_WORKTREE_GC=1` — a
+    /// replaces, which only purged `.trash` when the archive-fallback gate was
+    /// enabled — a
     /// gate-off install accumulated `.trash` entries forever (nothing ever
     /// purged them). Deliberately NOT covered by decision Q3 ("gate coverage
     /// unchanged" applies to the archive-DECISION path only); this is a
     /// separate, intentional fix. Proves an aged `.trash` entry is purged by
-    /// a `gc_tick` pass regardless of `AGEND_WORKTREE_GC` — deliberately does
-    /// NOT touch that process-global env var itself (would race
+    /// a `gc_tick` pass regardless of `AGEND_WORKTREE_ARCHIVE_FALLBACK` —
+    /// deliberately does NOT touch that process-global env var itself (would race
     /// `retention::worktrees`'s own gate tests under plain multi-threaded
     /// `cargo test`, across a private per-file mutex nextest doesn't need but
     /// plain `cargo test` would): this test's `home` has zero GC candidates,
@@ -182,7 +183,7 @@ mod tests {
         assert!(
             !trash_dir.exists(),
             "an aged .trash entry must be purged by gc_tick even with \
-             AGEND_WORKTREE_GC unset — purge_trash is no longer gated"
+             AGEND_WORKTREE_ARCHIVE_FALLBACK unset — purge_trash is not gated"
         );
         std::fs::remove_dir_all(&home).ok();
     }

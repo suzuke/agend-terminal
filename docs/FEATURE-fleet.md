@@ -193,17 +193,14 @@ Defines reusable agent configuration templates for dynamically creating instance
 Controls which agent the idle watchdog watches and who receives each watchdog /
 anti-stall / decision-timeout notification. These are agent / recipient **names**
 (fleet topology), so they live here rather than in env vars. Every field is
-optional; an omitted block (or field) falls back to the legacy `AGEND_*` env var
-(deprecated) and then to a built-in default. Resolution precedence:
-
-**`watchdog:` value > `AGEND_*` env var (deprecated, warns once) > built-in default.**
+optional; an omitted block (or field) uses its built-in default.
 
 ```yaml
 watchdog:
-  # Legacy SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
+  # SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
   # watchdog watches ONLY this agent (with the global dev_idle_threshold_secs)
   # instead of iterating every fleet instance. Omit it (default) to keep the
-  # modern per-instance iteration. Mirrors AGEND_IDLE_WATCHDOG_AGENT.
+  # modern per-instance iteration.
   idle_watchdog_agent: dev
   # Recipient for dev-vantage idle alerts. Default: lead.
   dev_recipient: lead
@@ -218,11 +215,6 @@ watchdog:
   # Default: general.
   decision_timeout_recipient: general
 ```
-
-The matching env vars (`AGEND_IDLE_WATCHDOG_AGENT`, `AGEND_IDLE_WATCHDOG_DEV_RECIPIENT`,
-`AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT`, `AGEND_TASK_STALL_RECIPIENTS`,
-`AGEND_DECISION_TIMEOUT_RECIPIENT`) are **deprecated** — they still work for one
-window but will be removed; see `docs/env-vars.md` §8.
 
 ### Environment Variables
 

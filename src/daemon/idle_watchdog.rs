@@ -29,8 +29,7 @@
 //! exceeds `dev_idle_threshold_secs() = 3600` (60 min), emits an
 //! inbox ping to `lead` so the orchestrator can re-dispatch /
 //! unblock. Default watched agent: `dev`. Tunable via fleet.yaml
-//! `watchdog.idle_watchdog_agent` (env `AGEND_IDLE_WATCHDOG_AGENT` is a
-//! deprecated fallback).
+//! `watchdog.idle_watchdog_agent`.
 //!
 //! ### #12 — cross-vantage 30min fleet-idle guard (P1)
 //! Scans the entire fleet's last_active timestamps. When EVERY
@@ -39,9 +38,7 @@
 //! a sidecar exists), emits an inbox ping to `lead` (#1563; was
 //! `general`) so the orchestrator surfaces / re-dispatches the
 //! fleet stall. Overridable via fleet.yaml `watchdog.fleet_recipient`
-//! (env `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` is a deprecated fallback).
-//! The
-//! "at least one tracked" guard distinguishes "fleet really
+//! The "at least one tracked" guard distinguishes "fleet really
 //! stalled" from "fleet not yet started" / "all sidecars stale".
 //!
 //! ## Activity tracking sidecar
@@ -392,18 +389,15 @@ fn task_owner_active_since(
 
 /// Vantage #10 — per-agent idle threshold check. Iterates all fleet
 /// instances, using each agent's `timeout_secs` (falling back to the
-/// global `dev_idle_threshold_secs`). Legacy single-agent mode is
-/// preserved when `AGEND_IDLE_WATCHDOG_AGENT` env var is set.
+/// global `dev_idle_threshold_secs`). `watchdog.idle_watchdog_agent`
+/// selects the optional single-agent mode.
 fn scan_dev_vantage(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
     seeding: bool,
 ) {
-    // #1812-followup: single-agent override now comes from fleet.yaml
-    // `watchdog.idle_watchdog_agent` (env `AGEND_IDLE_WATCHDOG_AGENT` is a
-    // deprecated fallback). `Some` → legacy single-agent mode; `None` → the
-    // modern per-instance iteration below.
+    // `Some` → single-agent mode; `None` → per-instance iteration below.
     let single_override = crate::fleet::watchdog::resolve_idle_watchdog_agent(home);
 
     let agents: Vec<(String, i64)> = if let Some(single) = single_override {

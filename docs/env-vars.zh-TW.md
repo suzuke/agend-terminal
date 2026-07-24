@@ -80,7 +80,7 @@ Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_WORKTREE_AUTO_CLEANUP` | 控管 runtime 的 worktree 自動清理掃描（移除已合併的 worktree、清掉孤兒分支）。 | **開啟**（`unwrap_or(true)`）。 | 除 `"0"` 以外的任何值 → 啟用；只有 `"0"` 才停用。 | `src/worktree_cleanup.rs:17` | opt-**out**。⚠️ Module doc 註解寫「`=1` opt-in」但程式碼是 opt-out——以程式碼為準。 |
 | `AGEND_WORKTREE_ENFORCEMENT` | 在 messaging handler 中，決定 task target 是否必須先綁定到受管理的 worktree 才能投遞。 | `"warn"`（記錄警告但仍允許投遞）。 | `"off"`（略過）、`"enforce"`（拒絕並回 `worktree_not_managed`），其餘（含 `"warn"`）→ 警告後放行。 | `src/api/handlers/messaging.rs:282` | ⚠️ Security-sensitive（控管對未綁定 agent 的訊息傳遞）。是三態，不是 bool。 |
-| `AGEND_WORKTREE_ARCHIVE_FALLBACK` | 僅啟用 worktree-GC 的**封存 fallthrough 補救帶（archive-fallthrough belt）**：當 CleanRelease 候選的無條件硬刪除無法執行（鎖競爭／owning repo 無法解析／remove 失敗）時，在同一輪把它封存到 `.trash`。**不會**控管整個 GC。 | **關閉**（no-op）。 | `"1"` 啟用；否則關閉。 | `src/daemon/retention/worktrees.rs:497` | ⚠️ 嚴格比對 `=="1"`。由 `AGEND_WORKTREE_GC` 更名而來（PR-D6）；舊名以**棄用別名（deprecated alias）身分再保留一個 release cycle**（會發出 warn），僅在新名未設定時才會參考。 |
+| `AGEND_WORKTREE_ARCHIVE_FALLBACK` | 僅啟用 worktree-GC 的**封存 fallthrough 補救帶（archive-fallthrough belt）**：當 CleanRelease 候選的無條件硬刪除無法執行（鎖競爭／owning repo 無法解析／remove 失敗）時，在同一輪把它封存到 `.trash`。**不會**控管整個 GC。 | **關閉**（no-op）。 | `"1"` 啟用；否則關閉。 | `src/daemon/retention/worktrees.rs`（`archive_fallback_enabled`） | ⚠️ 嚴格比對 `=="1"`。 |
 | `AGEND_WORKTREE_PRUNE_LIVE` | *（已退役，PR-D6）* 原本用來為 auto-cleanup 掃描選擇 live-vs-dry-run。 | — | — | `src/worktree_cleanup.rs:49` | ❌ **已退役且被忽略。** 掃描閘門現在只看 `AGEND_WORKTREE_AUTO_CLEANUP`（開啟 ⇒ live）。若仍設定，daemon 會在啟動時警告一次（`warn_if_prune_live_retired`）。 |
 | `AGEND_WORKTREE_GC_TRASH_DAYS` | `.trash/worktrees/*` 的保留視窗（天數）；更舊的條目會在 GC 掃描時被清除。 | `7`。 | `u64` 天數；`0` = 同一次掃描就清除；不過濾正負值。 | `src/daemon/retention/worktrees.rs:49` | 調校旋鈕。 |
 | `AGEND_WORKTREE_FORCE_RECLAIM_DAYS` | 強制回收（force-reclaim）後援機制的年齡上限（天數）：一個從未被釋放、且沒有 agent liveness、又比此值更舊的 lease，會被強制回收。 | `7`（`<=0` 時也是）。 | `i64` 天數，過濾為 `>0`。 | `src/worktree_pool.rs:534` | ⚠️ 控管破壞性的回收行為。 |
@@ -118,30 +118,20 @@ Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 
 ## 8. Watchdog & recipients
 
-> **Deprecation（watchdog 拓樸 → `fleet.yaml`）。** 下列五個 `AGEND_IDLE_WATCHDOG_*`
-> / `AGEND_TASK_STALL_RECIPIENTS` / `AGEND_DECISION_TIMEOUT_RECIPIENT` 變數都是
-> agent / recipient **名稱**——屬於 fleet *拓樸*，而非 env 調校。它們的歸屬地是
-> `fleet.yaml` 頂層的 `watchdog:` 區塊（見 `docs/FEATURE-fleet.md`）。這些 env 變數
-> 暫時保留作為**棄用的 fallback，僅維持一個過渡視窗**，讓既有設定還能運作；
-> 解析優先序為 **fleet.yaml `watchdog:` 值 > env 變數（已棄用，警告一次）>
-> 內建預設**。請把它們搬到 `fleet.yaml` 並移除 env 變數：
+Watchdog 拓樸請在 `fleet.yaml` 頂層的 `watchdog:` 區塊設定
+（見 `docs/FEATURE-fleet.md`）：
 >
 > ```yaml
 > watchdog:
->   idle_watchdog_agent: dev          # AGEND_IDLE_WATCHDOG_AGENT (single-agent mode)
->   dev_recipient: lead               # AGEND_IDLE_WATCHDOG_DEV_RECIPIENT
->   fleet_recipient: lead             # AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT
->   task_stall_recipients: [general, lead]   # AGEND_TASK_STALL_RECIPIENTS
->   decision_timeout_recipient: general      # AGEND_DECISION_TIMEOUT_RECIPIENT
+>   idle_watchdog_agent: dev
+>   dev_recipient: lead
+>   fleet_recipient: lead
+>   task_stall_recipients: [general, lead]
+>   decision_timeout_recipient: general
 > ```
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_IDLE_WATCHDOG_AGENT` | **已棄用** → `watchdog.idle_watchdog_agent`。dev-vantage idle watchdog 的單一 agent 模式（只監看這一個 agent）。 | `"dev"`（僅作為載入失敗時的 fallback）。 | Agent 名稱；空白／純空格會被忽略。 | `src/fleet/watchdog.rs` | Fleet 設定優先；env 是棄用的 fallback。 |
-| `AGEND_IDLE_WATCHDOG_DEV_RECIPIENT` | **已棄用** → `watchdog.dev_recipient`。dev-vantage idle 警示的收件者。 | `"lead"`。 | Recipient 名稱；空白／純空格會被忽略。 | `src/fleet/watchdog.rs` | Fleet 設定優先；棄用的 fallback。 |
-| `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` | **已棄用** → `watchdog.fleet_recipient`。fleet-vantage idle 警示（「整個 fleet 都靜悄悄」）的收件者。 | `"lead"`。 | Recipient 名稱；空白／純空格會被忽略。 | `src/fleet/watchdog.rs` | Fleet 設定優先；棄用的 fallback。 |
-| `AGEND_TASK_STALL_RECIPIENTS` | **已棄用** → `watchdog.task_stall_recipients`。task-stall 警告的收件者。 | `["general", "lead"]`。 | 以逗號分隔的名稱；每項會去除前後空白，空項會被過濾。 | `src/fleet/watchdog.rs` | Fleet 設定（清單）優先；棄用的 fallback。 |
-| `AGEND_DECISION_TIMEOUT_RECIPIENT` | **已棄用** → `watchdog.decision_timeout_recipient`。decision-timeout 自動採預設（operator-proceed）發送時的收件者。 | `"general"`。 | 非空的 recipient 名稱；空白視為未設定。 | `src/fleet/watchdog.rs` | Fleet 設定優先；棄用的 fallback。 |
 | `AGEND_WATCHDOG_DRY_RUN` | 讓每個 tick 的 watchdog 把分類後的 PTY 錯誤只記錄到 event log，而不去更動 agent 的 health 狀態。 | `false`（套用 health 更動）。 | `"1"`/`"true"`/`"TRUE"`/`"True"` → dry-run；否則關閉。 | `src/daemon/watchdog.rs:21` | Operator 安全開關。 |
 
 ---
@@ -184,8 +174,8 @@ Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS` | 啟用開機時的破壞性 zombie-daemon 掃描，並設定年齡門檻（天數）；比 N 更舊的候選會被 kill。 | 僅 telemetry（不 kill）；門檻常數 `DEFAULT_AGE_DAYS = 14`。 | 正整數 `>=1` 天；格式錯誤 → 警告 + 視為未設定。 | `src/daemon/boot_sweep.rs:36` | ⚠️ **破壞性**（對 zombie daemon 送 SIGTERM/SIGKILL）。設定一個有效值就會切換到破壞性模式。 |
 | `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN` | 次級閘門：當值為 `"1"` 且有設定 age-days 時，把破壞性掃描降級為只記錄 log。 | 非 dry-run（若有設定 age-days 則為破壞性）。 | `"1"` 啟用 dry-run；否則關閉。 | `src/daemon/boot_sweep.rs:40` | 對掃描的安全覆寫。 |
-| `AGEND_RETENTION_CUTOVER` | **pending-dispatch** retention 掃描（刪除超過 14 天的 dispatch sidecar）的 kill-switch。 | 除非 `=="0"` 否則**開啟**。 | `"0"` 停用；未設定 / 其他任何值 → 啟用。 | `src/daemon/retention/mod.rs:41` | opt-**out**。#env-cleanup：已解耦——這現在僅針對 pending-dispatch（decisions 已移到下方它自己的旗標）。`=="1"` 仍**同時**啟用 decisions 掃描，作為舊版 fallback（已棄用）。 |
-| `AGEND_RETENTION_DECISIONS_CUTOVER` | **decisions** retention 掃描（封存已過期的 decision）的 opt-in 閘門。 | **關閉**。 | `"1"` 啟用；否則關閉。 | `src/daemon/retention/decisions.rs`（`decisions_cutover_enabled`） | opt-**in**。#env-cleanup 解耦：獨立旗標，讓 `pending-OFF + decisions-ON` 這個組合可達。舊版 `AGEND_RETENTION_CUTOVER=1` 仍會啟用它（棄用過渡視窗）。 |
+| `AGEND_RETENTION_CUTOVER` | **pending-dispatch** retention 掃描（刪除超過 14 天的 dispatch sidecar）的 kill-switch。 | 除非 `=="0"` 否則**開啟**。 | `"0"` 停用；未設定 / 其他任何值 → 啟用。 | `src/daemon/retention/mod.rs:41` | opt-**out**；僅影響 pending-dispatch。 |
+| `AGEND_RETENTION_DECISIONS_CUTOVER` | **decisions** retention 掃描（封存已過期的 decision）的 opt-in 閘門。 | **關閉**。 | `"1"` 啟用；否則關閉。 | `src/daemon/retention/decisions.rs`（`decisions_cutover_enabled`） | opt-**in**；與 pending-dispatch gate 獨立。 |
 | `AGEND_FLEET_NO_AUTO_MIGRATE` | 停用載入 `fleet.yaml` 時對缺漏 instance ID 的自動回填／遷移。 | 執行自動遷移（回填 ID 並重寫 fleet.yaml）。 | `"1"` 略過遷移；否則關閉。 | `src/fleet/mod.rs:544` | 讓你 opt out 自動重寫。 |
 | `AGEND_CAPTURE_FIXTURES` | 啟用 PTY-capture fixture sink：原始 PTY bytes 會寫入 `$AGEND_HOME/captures/<agent>/`。開機路徑會發出隱私警告。 | `NoOpCapture`（不擷取，零開銷）。 | `"1"` 啟用；否則關閉。 | `src/capture.rs:56`；`src/bootstrap/mod.rs:224` | ⚠️ fixture 擷取工具，在真實開機路徑上可讀。擷取到的 bytes 可能含有**機密／prompt**——commit 前請先檢視。另見 [test-only](#14-test-only-fixtures--seams)。 |
 

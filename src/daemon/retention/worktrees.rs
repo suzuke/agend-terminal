@@ -488,25 +488,11 @@ pub(crate) fn purge_trash(home: &Path) {
 /// hard-delete attempt couldn't act on (`worktree_pool::gc_remove_one`) only
 /// fires when this is on.
 ///
-/// PR-D6 rename: `AGEND_WORKTREE_GC` → `AGEND_WORKTREE_ARCHIVE_FALLBACK`. The
-/// old name misleadingly implied it gated GC wholesale; it never did — it only
-/// ever gated THIS archive-fallthrough belt. The new name reads `== "1"` first;
-/// if it is UNSET, the old `AGEND_WORKTREE_GC` is honored as a deprecated alias
-/// for one release cycle (with a loud warn). A set-but-non-`"1"` new name wins
-/// outright (the old name is not consulted).
+/// `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` enables this archive-fallthrough belt.
+/// The similarly named `AGEND_WORKTREE_GC_TRASH_DAYS` remains the independent
+/// trash-retention tuning knob.
 pub(crate) fn archive_fallback_enabled() -> bool {
-    if let Ok(v) = std::env::var("AGEND_WORKTREE_ARCHIVE_FALLBACK") {
-        return v == "1";
-    }
-    if let Ok(v) = std::env::var("AGEND_WORKTREE_GC") {
-        tracing::warn!(
-            "AGEND_WORKTREE_GC is deprecated → renamed AGEND_WORKTREE_ARCHIVE_FALLBACK \
-             (archive-fallthrough belt; it never gated GC wholesale); honoring old name \
-             for one release cycle"
-        );
-        return v == "1";
-    }
-    false
+    std::env::var("AGEND_WORKTREE_ARCHIVE_FALLBACK").as_deref() == Ok("1")
 }
 
 /// Archive a single already-classified candidate this tick's hard-delete
@@ -1459,9 +1445,9 @@ mod tests {
     /// defense-in-depth (not an accidental side effect of two independent
     /// scanners), now delivered within one pass instead of waiting for a
     /// separately-cadenced re-scan. This test is what W5's unification must
-    /// not regress; gated on `AGEND_WORKTREE_GC=1` per decision Q3 (gate
-    /// coverage unchanged — this is the same gate the old standalone `sweep()`
-    /// checked).
+    /// not regress; gated on `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` per decision
+    /// Q3 (gate coverage unchanged — this is the same gate the old standalone
+    /// `sweep()` checked).
     ///
     /// Forces the skip by making `gc_run`'s OWN binding-lock acquisition
     /// (gc.rs's CleanRelease branch) fail with a genuine I/O error — NOT lock
@@ -1517,8 +1503,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Same scenario, but with `AGEND_WORKTREE_ARCHIVE_FALLBACK` (and its
-    /// deprecated `AGEND_WORKTREE_GC` alias) left unset — decision Q3 (gate
+    /// Same scenario, but with `AGEND_WORKTREE_ARCHIVE_FALLBACK` left unset —
+    /// decision Q3 (gate
     /// coverage unchanged): the archive-fallthrough must NOT fire by default,
     /// matching the old standalone `sweep()`'s gate exactly. The hard-delete
     /// attempt itself stays unconditional either way (decision Q3), so the
@@ -1531,8 +1517,6 @@ mod tests {
         // env vars per test process so it never saw this, but plain `cargo
         // test` flaked 3/3.
         let _env_guard = gc_trash_env_guard();
-        // PR-D6: guard against a leaked deprecated-alias var from another test
-        // flipping this gate on under the shared serial lock.
         std::env::remove_var("AGEND_WORKTREE_ARCHIVE_FALLBACK");
         std::env::remove_var("AGEND_WORKTREE_GC");
         let dir = tmp_home("w1-q1-gate-off");
@@ -1547,7 +1531,7 @@ mod tests {
         std::fs::create_dir_all(agent_runtime_dir.parent().unwrap()).unwrap();
         std::fs::write(&agent_runtime_dir, "blocking-file").unwrap();
 
-        // AGEND_WORKTREE_GC deliberately NOT set here.
+        // AGEND_WORKTREE_ARCHIVE_FALLBACK deliberately NOT set here.
         let gc_results = crate::worktree_pool::gc_run(&dir);
         let this_result = gc_results.iter().find(|r| r.agent == "dev-q1-gate-off");
         assert!(
@@ -1563,9 +1547,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// PR-D6 (c): the renamed primary gate `AGEND_WORKTREE_ARCHIVE_FALLBACK=1`
-    /// enables the archive-fallthrough belt. A non-`"1"` value leaves it OFF
-    /// WITHOUT consulting the deprecated alias (new name set ⇒ old name ignored).
+    /// `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` enables the archive-fallthrough
+    /// belt. Any other value leaves it off.
     #[test]
     fn archive_fallback_enabled_by_new_name_d6() {
         let _env_guard = gc_trash_env_guard();
@@ -1575,36 +1558,27 @@ mod tests {
             archive_fallback_enabled(),
             "ARCHIVE_FALLBACK=1 must enable the archive-fallthrough belt"
         );
-        // New name set-but-not-"1" wins outright, even if old name would enable.
+        // The expired old name has no effect.
         std::env::set_var("AGEND_WORKTREE_ARCHIVE_FALLBACK", "0");
         std::env::set_var("AGEND_WORKTREE_GC", "1");
         assert!(
             !archive_fallback_enabled(),
-            "a set-but-non-\"1\" new name must win — the deprecated alias is NOT consulted"
+            "a set-but-non-\"1\" new name must leave the belt off"
         );
         std::env::remove_var("AGEND_WORKTREE_ARCHIVE_FALLBACK");
         std::env::remove_var("AGEND_WORKTREE_GC");
     }
 
-    /// PR-D6 (d): with the new name UNSET, the deprecated `AGEND_WORKTREE_GC=1`
-    /// alias is honored for one release cycle (the gate enables; the same code
-    /// path emits the deprecation warn). Old name unset ⇒ OFF.
-    /// F3: `traced_test` asserts the deprecation `tracing::warn!` ACTUALLY fired
-    /// via `logs_contain` — the previous boolean-only assert stayed green even
-    /// with the warn deleted (the exact bug this fix closes).
-    #[tracing_test::traced_test]
+    /// After the one-release compatibility window, the old name must not
+    /// enable the archive-fallthrough belt.
     #[test]
-    fn archive_fallback_honors_deprecated_gc_alias_d6() {
+    fn archive_fallback_ignores_expired_gc_alias() {
         let _env_guard = gc_trash_env_guard();
         std::env::remove_var("AGEND_WORKTREE_ARCHIVE_FALLBACK");
         std::env::set_var("AGEND_WORKTREE_GC", "1");
         assert!(
-            archive_fallback_enabled(),
-            "deprecated AGEND_WORKTREE_GC=1 (new name unset) must still enable + warn"
-        );
-        assert!(
-            logs_contain("AGEND_WORKTREE_GC is deprecated"),
-            "honoring the deprecated alias must actually emit the deprecation warn"
+            !archive_fallback_enabled(),
+            "expired AGEND_WORKTREE_GC=1 must not enable the archive-fallthrough belt"
         );
         std::env::remove_var("AGEND_WORKTREE_GC");
         assert!(!archive_fallback_enabled(), "neither name set ⇒ gate OFF");
