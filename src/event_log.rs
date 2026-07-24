@@ -188,6 +188,66 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    /// #2991: the high-volume advisory maintenance loops must persist their N
+    /// events through ONE append/sync critical section instead of N.
+    ///
+    /// The size check that owns rotation lives inside that critical section, so
+    /// it fires once per section — which makes the boundary count observable
+    /// without adding instrumentation. Priming the live file to exactly
+    /// MAX_LOG_SIZE (not over it, so nothing rotates up front) means a per-item
+    /// loop appends event 1, pushing the file past the limit, and then event 2's
+    /// own size check rotates *mid-run* and splits the events across two files.
+    /// A single critical section checks size once and keeps all N together.
+    #[test]
+    fn advisory_maintenance_batch_writes_through_one_boundary() {
+        const N: usize = 6;
+        let home = tmp_home("advisory-batch");
+        let base = home.join("event-log.jsonl");
+
+        // Exactly MAX_LOG_SIZE bytes, newline-terminated so the primed body is
+        // one countable line and appended events start on a fresh line.
+        let mut primed = "x".repeat(usize::try_from(MAX_LOG_SIZE).unwrap() - 1);
+        primed.push('\n');
+        fs::write(&base, &primed).unwrap();
+        assert_eq!(fs::metadata(&base).unwrap().len(), MAX_LOG_SIZE);
+
+        // Age past DISPATCH_ASK_MINUTES so sweep_stuck classifies each as an
+        // `ask` (the measured high-volume advisory loop), not a `warn`.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(45)).to_rfc3339();
+        for i in 0..N {
+            crate::dispatch_tracking::track_dispatch(
+                &home,
+                crate::dispatch_tracking::DispatchEntry {
+                    task_id: Some(format!("t-{i}")),
+                    from: "dispatcher".to_string(),
+                    to: format!("agent-{i}"),
+                    delegated_at: stale.clone(),
+                    status: "pending".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        crate::daemon::run_task_maintenance(&home);
+
+        assert!(
+            !rotated_path(&base, 1).exists(),
+            "a rotated .1 means the advisory run was split by per-item size \
+             checks; the batch must cross one append/sync boundary"
+        );
+        let live = fs::read_to_string(&base).unwrap();
+        let asks = live
+            .lines()
+            .filter(|l| l.contains("dispatch_stuck_ask"))
+            .count();
+        assert_eq!(
+            asks, N,
+            "all {N} advisory events must land in the live file"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn rotation_prunes_oldest_beyond_max_generations() {
         let home = tmp_home("prune");
