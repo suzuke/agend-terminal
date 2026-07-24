@@ -3,6 +3,7 @@
 use crate::channel::dedup::DedupKey;
 use crate::channel::telegram::error::*;
 use crate::channel::telegram::state::*;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +25,39 @@ fn rekey_dedup_for_recreated_topic(
 ) {
     let key = DedupKey::new("telegram:notify", instance, Some(i64::from(new_tid)), text);
     let _ = crate::channel::dedup::global(home).record_and_check(key);
+}
+
+/// Build the Telegram HTTP client once and cheaply clone its handle per Bot.
+fn telegram_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            #[cfg(test)]
+            CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+
+            // AUDIT2-006 (A): give the Telegram client an explicit request
+            // timeout so a black-holed API connection cannot park a delivery
+            // indefinitely. Start from teloxide's recommended settings.
+            match teloxide::net::default_reqwest_settings()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    // Preserve the old fallback semantics: retry with
+                    // teloxide's default client settings, without the custom
+                    // timeout, so a builder failure does not drop the send.
+                    tracing::warn!(
+                        error = %e,
+                        "AUDIT2-006: telegram client builder failed — using default (no request timeout)"
+                    );
+                    teloxide::net::default_reqwest_settings()
+                        .build()
+                        .expect("teloxide default client builder failed")
+                }
+            }
+        })
+        .clone()
 }
 
 /// Send a notification to Telegram (instance topic or general).
@@ -139,24 +173,7 @@ pub(crate) fn send_telegram_job(job: crate::daemon::delivery_worker::TelegramSen
     block_on_value(async move {
         use teloxide::payloads::SendMessageSetters;
         use teloxide::prelude::Requester;
-        // AUDIT2-006 (A): give the Telegram client an explicit request timeout so
-        // a black-holed API connection can't park this delivery indefinitely. We
-        // start from teloxide's recommended settings (keep-alive etc.) and only
-        // add the timeout. On the (effectively impossible) builder failure, fall
-        // back to teloxide's default client — losing the timeout but never the
-        // send.
-        #[cfg(test)]
-        CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-        let bot = match teloxide::net::default_reqwest_settings()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            Ok(client) => teloxide::Bot::with_client(&token, client),
-            Err(e) => {
-                tracing::warn!(error = %e, "AUDIT2-006: telegram client builder failed — using default (no request timeout)");
-                teloxide::Bot::new(&token)
-            }
-        };
+        let bot = teloxide::Bot::with_client(&token, telegram_client());
         let chat_id = teloxide::types::ChatId(group_id);
         let result: anyhow::Result<()> = async {
             // Test seam: force the first send to fail without a network call.
