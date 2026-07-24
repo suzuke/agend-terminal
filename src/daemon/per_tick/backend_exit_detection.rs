@@ -125,7 +125,7 @@ impl PerTickHandler for BackendExitDetectionHandler {
 
         // Phase 2 (no lock): resolve fleet.yaml ONCE for the whole tick.
         let Some(fleet) =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
+            crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
         else {
             return;
         };
