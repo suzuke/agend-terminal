@@ -68,12 +68,6 @@ pub fn record_input_activity(home: &Path, agent_name: &str) {
     }
 }
 
-/// Sprint 54 P2-3: record a submit-key keystroke (e.g. claude `\r`).
-/// Caller (`app::write_to_focused`) is responsible for the backend
-/// allowlist + submit-key match — this helper only persists the
-/// timestamp. The daemon supervisor tick reads it via
-/// `last_submit_at_ms` and compares against `last_input_at_ms` for
-/// the typed-but-not-submitted detection.
 /// #2965: flush any in-memory pending input-activity timestamps to disk.
 /// Called from the ~1s `sync_badges` cadence so keystrokes coalesce into
 /// at most one durable metadata write per window instead of one per keystroke.
@@ -108,6 +102,12 @@ pub(crate) fn pending_input_count_for(home: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Sprint 54 P2-3: record a submit-key keystroke (e.g. claude `\r`).
+/// Caller (`app::write_to_focused`) is responsible for the backend
+/// allowlist + submit-key match — this helper only persists the
+/// timestamp. The daemon supervisor tick reads it via
+/// `last_submit_at_ms` and compares against `last_input_at_ms` for
+/// the typed-but-not-submitted detection.
 pub fn record_submit_activity(home: &Path, agent_name: &str) {
     agent_ops::save_metadata(
         home,
