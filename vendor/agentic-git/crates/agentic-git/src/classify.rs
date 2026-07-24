@@ -277,6 +277,27 @@ pub(crate) fn branch_tag_names_ref(subcmd: &str, args: &[String]) -> bool {
     })
 }
 
+/// Sparse-pollution fix (port of the 2026-07-20 agend-git local patch):
+/// repo-local CONFIG-writing subcommands that reach `apply_foreign_repo_passthrough`
+/// as `ChdirPass` (`sparse-checkout` via classify's `_` default arm) yet mutate
+/// per-repo state on disk. In a FOREIGN repo they must run against THAT repo,
+/// exactly like the #1463 mutating passthrough — otherwise a third-party tool's
+/// cwd-targeted invocation (e.g. Claude Code's plugin-cache
+/// `git sparse-checkout set plugins/<x>` run with cwd = the marketplace clone)
+/// is ChdirPass'd into the caller's bound worktree, writes `core.sparseCheckout`
+/// plus cone patterns into `config.worktree`, and silently EMPTIES the agent's
+/// working tree while `git status` keeps reporting clean (four fleet incidents,
+/// pattern `plugins/grafana-mcp`; the fourth hit a worktree whose owner session
+/// was NOT the one syncing). `config` shares the same shape and is kept for
+/// defense in depth even though classify currently passes it through
+/// unconditionally. Deliberately NOT added to `is_mutating_local`: that list
+/// also gates `strip_target_overrides`, and stripping `-C` from
+/// `git -C <dir> config/sparse-checkout` would break legit helpers (see the
+/// #1463 (B) rationale).
+pub(crate) fn is_repo_local_config_write(subcmd: &str) -> bool {
+    matches!(subcmd, "sparse-checkout" | "config")
+}
+
 /// #2158: which `AGENTIC_GIT_BYPASS=1 git <subcmd>` ops are worth auditing — Option B
 /// (lead-chosen), the stray-worktree / drift / stray-tree-push vector. EXCLUDES
 /// `commit`/`add`: agents bypass-commit into their OWN worktree constantly, so
@@ -311,11 +332,12 @@ pub(crate) fn active_bypass_layer() -> &'static str {
     }
 }
 
-/// #1463 (A) + #2027: convert a bound-agent `ChdirPass` into `Passthrough` when
-/// cwd is a foreign repo AND the command is a local mutating one (#1463) or a
-/// ref-naming `branch`/`tag` (#2027). Pure so the matrix is unit-testable;
-/// everything else (push/checkout ChdirPass, Deny, already-Passthrough) is
-/// returned unchanged.
+/// #1463 (A) + #2027 + sparse-pollution fix: convert a bound-agent `ChdirPass`
+/// into `Passthrough` when cwd is a foreign repo AND the command is a local
+/// mutating one (#1463), a ref-naming `branch`/`tag` (#2027), or a repo-local
+/// config write (`sparse-checkout`/`config` — see `is_repo_local_config_write`).
+/// Pure so the matrix is unit-testable; everything else (push/checkout
+/// ChdirPass, Deny, already-Passthrough) is returned unchanged.
 pub(crate) fn apply_foreign_repo_passthrough(
     action: Action,
     subcmd: &str,
@@ -334,7 +356,10 @@ pub(crate) fn apply_foreign_repo_passthrough(
             action
         };
     }
-    if is_mutating_local(subcmd) || branch_tag_names_ref(subcmd, args) {
+    if is_mutating_local(subcmd)
+        || branch_tag_names_ref(subcmd, args)
+        || is_repo_local_config_write(subcmd)
+    {
         return Action::Passthrough;
     }
     action
