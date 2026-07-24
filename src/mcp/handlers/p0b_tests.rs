@@ -102,16 +102,6 @@ fn ci_watch_binding_corrupt_returns_error() {
 
 // ── EC9: bind_self ambiguous_args ───────────────────────────────────────
 
-#[test]
-fn ec9_bind_self_both_args_rejected_as_ambiguous() {
-    let home = tmp_home("ec9");
-    let sender = crate::identity::Sender::new("alpha");
-    let args = json!({"branch": "feat-x", "repository": "owner/name", "repository_path": "/tmp/x"});
-    let result = super::worktree::handle_bind_self(&home, &args, &sender);
-    assert_eq!(result["code"], "ambiguous_args");
-    std::fs::remove_dir_all(&home).ok();
-}
-
 // ── EC7: release_full ci-watch unsubscribe scope ────────────────────────
 // These tests use a real git source-repo + lease + release_full path so
 // the unsubscribe loop sees an actual binding.json with `branch`.

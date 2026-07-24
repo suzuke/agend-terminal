@@ -27,7 +27,7 @@ use std::path::Path;
 /// .agend-managed marker + auto watch_ci all land. Bug fixes in the
 /// dispatch path inherit automatically.
 ///
-/// Required args: `repository_path` / `repository` (one of), `branch`.
+/// Required args: `branch`. Optional: `repository_path`.
 /// Returns `{bound, worktree_path, branch}` on success or `{error, code}`
 /// on failure.
 pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
@@ -51,25 +51,10 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         });
     }
 
-    // Sprint 55 P0-B EC9: dual-arg shape with two-sprint deprecation cycle.
-    // - `repository_path: <local path>` (NEW unified shape; daemon derives owner/repo)
-    // - `repository: "owner/name"` (legacy GitHub slug; warn-log; removed Sprint 57)
-    // Both present → reject as `ambiguous_args`. Neither → fleet.yaml fallback chain.
-    let source_repo_arg = args["repository_path"].as_str().filter(|s| !s.is_empty());
-    let repo_arg = args["repository"].as_str().filter(|s| !s.is_empty());
-    if source_repo_arg.is_some() && repo_arg.is_some() {
-        return json!({
-            "error": "both 'repository_path' and 'repository' provided — pass exactly one",
-            "code": "ambiguous_args"
-        });
-    }
-    if repo_arg.is_some() {
-        tracing::warn!(
-            %agent,
-            "bind_self(repository=...) is deprecated; use bind_self(repository_path=<local-path>) — Sprint 55 warning, Sprint 57 removal"
-        );
-    }
-    let source_repo_path = source_repo_arg.map(std::path::PathBuf::from);
+    let source_repo_path = args["repository_path"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
 
     // Issue #689: reject path traversal in repository_path
     if let Some(ref p) = source_repo_path {
@@ -129,7 +114,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             agent,
             task_id,
             branch,
-            repo_arg,
+            None,
             source_repo_path.as_deref(),
             guard,
             continuation.is_some(),
@@ -140,7 +125,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             agent,
             task_id,
             branch,
-            repo_arg,
+            None,
             source_repo_path.as_deref(),
         )
     };

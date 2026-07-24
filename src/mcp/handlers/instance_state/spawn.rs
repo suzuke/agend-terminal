@@ -194,10 +194,7 @@ fn spawn_single_instance_impl_inner(
         }
     };
     let name: &str = &name_owned;
-    let command = args["backend"]
-        .as_str()
-        .or_else(|| args["command"].as_str())
-        .unwrap_or("claude");
+    let command = args["backend"].as_str().unwrap_or("claude");
     let mut cmd_args = args
         .get("args")
         .and_then(|v| v.as_str())

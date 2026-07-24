@@ -100,9 +100,7 @@ pub(super) fn handle_send_to_instance(
         Some(t) if !t.is_empty() => t,
         _ => return json!({"error": "missing or empty 'message'"}),
     };
-    let kind = args["request_kind"]
-        .as_str()
-        .or_else(|| args["kind"].as_str());
+    let kind = args["request_kind"].as_str();
     let parent_id = args["parent_id"].as_str();
 
     let req = send_request_from_args(sender.as_str(), target, text, kind, args);

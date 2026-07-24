@@ -124,7 +124,6 @@ pub(crate) fn def_create_instance() -> Value {
         "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
         "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
         "description": {"type": "string", "description": "Optional description recorded for a created team (team mode only)."},
-        "command": {"type": "string", "description": "Deprecated: use 'backend' instead"},
         "role": {"type": "string", "description": "Agent role label (e.g. `reviewer`) recorded on the spawned instance's fleet.yaml entry."},
         "env": {"type": "object", "description": "#900: environment variables (object of string→string) injected into the spawned backend process and persisted to the fleet.yaml entry so replace/restart flows re-apply them."},
         "topic_binding": {"type": "string", "description": "Telegram topic binding for the spawned agent, forwarded to the spawn RPC."}
@@ -403,8 +402,7 @@ pub(crate) fn def_repo() -> Value {
 pub(crate) fn def_bind_self() -> Value {
     json!({"name": "bind_self", "description": "Bind the calling agent to a worktree on the named branch. For fresh-task workflows that know the source repo, prefer `repo action=checkout bind:true` (#779 Option 1) — single-step atomic provision + bind. Use `bind_self` when the caller is mid-lifecycle: (a) re-binding a recovered worktree via `rebase_mode=true`, (b) binding via fleet.yaml-resolved source_repo (no explicit source arg), or (c) post-`release_worktree` re-claim of the same branch. Both paths share `dispatch_auto_bind_lease` so binding.json + .agend-managed marker + auto watch_ci all land. Rejects 'main'/'master' (E4.5) and cross-agent branch conflicts. Pair with `release_worktree` to unbind.",
         "inputSchema": {"type": "object", "properties": {
-            "repository_path": {"type": "string", "description": "Local filesystem path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repository` (handler rejects both via `ambiguous_args` code)."},
-            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `repository_path`."},
+            "repository_path": {"type": "string", "description": "Local filesystem path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Omit to resolve from fleet.yaml."},
             "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"},
             "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1/S2: guarded recover-and-bind. When true, force/rebase cleanup joins the release transaction and requires an exact Known identity or a proven marker+owning-repo managed target; Opaque, mismatched, unmanaged, or ambiguous state is preserved. Cross-agent isolation preserved."},
             "task_id": {"type": "string", "description": "#2533: optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."}
@@ -910,10 +908,6 @@ mod tests {
                 "question",
                 "internal: lift_message copies `message` here for kind=query",
             ),
-            // handle_send_to_instance reads `kind` only as a back-compat fallback
-            // when `request_kind` is absent. The current schema name is
-            // `request_kind`; `kind` stays undeclared on purpose.
-            ("kind", "deprecated back-compat alias for `request_kind`"),
             // #1933: task `done` honors a caller-provided `done_source` for the
             // audit trail (tasks/handler.rs:358/568), but it is a daemon/audit
             // concern — agent-FORGEABLE source would be an audit-integrity hole, so
@@ -1223,7 +1217,6 @@ mod tests {
             ("repo", "expected_nested_dirt_digest", "ci/release.rs handle_release_repo — TOCTOU digest gate for nested-dirt discard confirmation"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
-            ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
             ("bind_self", "branch", "mcp/handlers/worktree.rs validated bind branch"),
             ("bind_self", "rebase_mode", "mcp/handlers/worktree.rs recover-and-bind gate"),
             ("bind_self", "task_id", "mcp/handlers/worktree.rs → binding::bind_full task_id linkage (#2533)"),
@@ -1256,7 +1249,6 @@ mod tests {
             ("create_instance", "team", "mcp/handlers/instance.rs team-mode prefix"),
             ("create_instance", "backends", "mcp/handlers/instance.rs per-member backends"),
             ("create_instance", "description", "instance_state/mod.rs team-mode description"),
-            ("create_instance", "command", "instance_state/spawn.rs deprecated backend alias"),
             ("create_instance", "role", "instance_state/spawn.rs fleet.yaml role"),
             ("create_instance", "env", "instance_state/spawn.rs per-instance env (#900)"),
             ("create_instance", "topic_binding", "instance_state/spawn.rs telegram topic binding"),

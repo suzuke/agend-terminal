@@ -71,10 +71,7 @@ pub(super) fn handle_create_instance(
         // workspace root. The single-instance path already validates; this
         // forwarded the raw name straight to the daemon.
         crate::validate_name_or_err!(team_name);
-        let default_backend = args["backend"]
-            .as_str()
-            .or_else(|| args["command"].as_str())
-            .unwrap_or("claude");
+        let default_backend = args["backend"].as_str().unwrap_or("claude");
         let per_member_backends: Vec<String> = match args.get("backends").and_then(|v| v.as_array())
         {
             Some(arr) => arr
