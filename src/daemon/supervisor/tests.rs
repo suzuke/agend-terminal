@@ -3873,3 +3873,43 @@ fn server_rate_limit_exhausted_notify_is_error_severity_1595() {
         "#1595: the exhaust notify must not remain Warn (suppressed in Sleep)"
     );
 }
+
+/// #2937: `check_pane_input_not_submitted_for_agents` must use the
+/// pre-computed `input_timestamps` map rather than re-reading from disk.
+/// RED: the function does not yet accept the parameter — compile error.
+#[test]
+fn pane_input_uses_precomputed_timestamps_not_disk_reread() {
+    let agent = "pin-precomputed";
+    let home = fleet_with_backend("precomputed", agent, "claude");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // Disk: typed 5min ago AND already submitted → no detection.
+    seed_input_submit(&home, agent, now_ms - 300_000, now_ms - 10_000);
+    // Pre-computed map: typed 5min ago, NOT submitted → should fire.
+    let mut input_timestamps = HashMap::new();
+    input_timestamps.insert(agent.to_string(), (now_ms - 300_000, 0i64));
+    let sink = std::sync::Arc::new(TestSink {
+        events: parking_lot::Mutex::new(Vec::new()),
+    });
+    crate::channel::sink_registry::registry().register(sink.clone());
+    let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+    check_pane_input_not_submitted_for_agents(
+        &home,
+        &[agent.to_string()],
+        &mut tracks,
+        past_boot_grace(),
+        &input_timestamps,
+    );
+    let emitted = sink.events.lock().iter().any(|e| {
+        matches!(
+            e,
+            crate::channel::ux_event::UxEvent::Fleet(
+                crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted { agent: a, .. },
+            ) if a == agent
+        )
+    });
+    assert!(
+        emitted,
+        "must use pre-computed timestamps (submit=0 → fire), not re-read from disk (submit>0 → no fire)"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
