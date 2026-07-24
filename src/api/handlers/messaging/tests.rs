@@ -3845,6 +3845,151 @@ fn cross_team_code_review_report_with_valid_assignment_delivers_2957() {
         .expect("receipt must be attached");
     assert_eq!(receipt.summary().assignment_id, assignment.assignment_id);
     assert_eq!(receipt.summary().reviewed_head, RECEIPT_HEAD_2957);
+    assert!(audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: missing assignment → cross-team gate fires normally.
+#[test]
+fn cross_team_code_review_missing_assignment_blocked_2957() {
+    let home = tmp_home("2957-missing-assign");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+
+    let result = handle_send(
+        &cross_team_review_params(uuid::Uuid::new_v4(), "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], false,
+        "missing assignment must be blocked: {result}"
+    );
+    assert!(result["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("cross-team"));
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: wrong sender name → cross-team gate fires normally.
+#[test]
+fn cross_team_code_review_wrong_sender_blocked_2957() {
+    let home = tmp_home("2957-wrong-sender");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    params["from"] = json!("ct-lead");
+    let result = handle_send(&params, &test_ctx(&home));
+    assert_eq!(result["ok"], false, "wrong sender must fail: {result}");
+
+    let delivered = crate::inbox::drain(&home, "ct-lead");
+    assert!(delivered.is_empty(), "zero delivery side effect");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: wrong recipient → cross-team gate fires normally.
+#[test]
+fn cross_team_code_review_wrong_recipient_blocked_2957() {
+    let home = tmp_home("2957-wrong-recipient");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    params["target"] = json!("ct-reviewer");
+    let result = handle_send(&params, &test_ctx(&home));
+    assert_eq!(result["ok"], false, "wrong recipient must fail: {result}");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: revoked (terminal) assignment → cross-team gate fires.
+#[test]
+fn cross_team_code_review_terminal_assignment_blocked_2957() {
+    let home = tmp_home("2957-terminal-assign");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    crate::daemon::assignment_authority::record_terminal(
+        &home,
+        "owner/repo",
+        "fix/cross-team",
+        2957,
+        crate::daemon::assignment_authority::TerminalKind::Merged,
+    );
+
+    let result = handle_send(
+        &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], false,
+        "terminal assignment must be blocked: {result}"
+    );
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    let delivered = crate::inbox::drain(&home, "ct-lead");
+    assert!(delivered.is_empty(), "zero delivery side effect");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: non-code_review report crosses team boundary → still blocked.
+#[test]
+fn cross_team_plain_report_still_blocked_2957() {
+    let home = tmp_home("2957-plain-report");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+
+    let result = handle_send(
+        &json!({
+            "from": "ct-reviewer",
+            "target": "ct-lead",
+            "text": "VERIFIED — plain report",
+            "kind": "report",
+            "report_purpose": "task_result"
+        }),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], false,
+        "plain report must still be blocked: {result}"
+    );
+    assert!(result["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("cross-team"));
 
     std::fs::remove_dir_all(&home).ok();
 }
