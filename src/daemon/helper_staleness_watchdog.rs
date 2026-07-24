@@ -458,4 +458,55 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// Ghost-inbox guard (t-20260723093520705757-38191-14): a default recipient
+    /// with NO `fleet.yaml` instance must not be enqueued to — pre-fix the
+    /// hardcoded `general`+`lead` list wrote `~/.agend/inbox/lead.jsonl` in
+    /// fleets that have no `lead` instance, so the same alert accumulated
+    /// forever with nobody to drain it.
+    #[test]
+    fn ghost_recipient_not_alerted_when_absent_from_fleet() {
+        let home = tmp_home("ghost-guard");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  general: {}\n",
+        )
+        .unwrap();
+        deliver_helper_staleness(&home, "agend-git");
+        assert!(
+            !drained_payloads(&home, "general").is_empty(),
+            "general exists in fleet.yaml — must still be alerted"
+        );
+        assert!(
+            !home.join("inbox").join("lead.jsonl").exists(),
+            "lead has no fleet.yaml instance — writing lead.jsonl creates a \
+             ghost inbox nobody drains"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `fleet.yaml` `watchdog.helper_staleness_recipients` must replace the
+    /// built-in default (same precedence contract as `task_stall_recipients`).
+    #[test]
+    fn fleet_yaml_helper_staleness_recipients_override() {
+        let home = tmp_home("cfg-override");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "watchdog:\n  helper_staleness_recipients:\n    - reviewer\n\
+             instances:\n  reviewer: {}\n  general: {}\n",
+        )
+        .unwrap();
+        deliver_helper_staleness(&home, "agend-git");
+        assert!(
+            !drained_payloads(&home, "reviewer").is_empty(),
+            "configured recipient must be alerted"
+        );
+        assert!(
+            !home.join("inbox").join("general.jsonl").exists(),
+            "configured list replaces the built-in default — general must not be paged"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
