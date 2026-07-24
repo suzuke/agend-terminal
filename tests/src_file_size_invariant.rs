@@ -28,7 +28,6 @@ const MAX_LOC: usize = 2500;
 /// grow past its ceiling; remove the entry once it drops under `MAX_LOC` so the
 /// main scan re-arms for it. Sorted largest-first.
 const GRANDFATHERED: &[(&str, usize)] = &[
-    ("src/daemon/dispatch_idle/mod.rs", 3962),
     ("src/app/mod.rs", 3457),
     // #2745 R3: pr_state/mod.rs test module re-homed to sibling `tests.rs`; the
     // production file dropped under MAX_LOC, so it is de-grandfathered (re-armed).

@@ -147,6 +147,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "writer",
         "#2870 test fixture: writes a synthetic snapshot (crate::snapshot::save/AgentSnapshot) so the watchdog re-nudge test has a deterministic idle agent. Not a reader; no production decision reads snapshot here — the file is tests-only (poller_tests.rs).",
     ),
+    (
+        "src/daemon/dispatch_idle/tests.rs",
+        "writer",
+        "test fixture: writes synthetic snapshots (crate::snapshot::save/AgentSnapshot/FleetSnapshot) so dispatch_idle tests have deterministic agent state. Not a reader; no production decision reads snapshot here — the whole file is #[cfg(test)]-only via its `mod tests;` declaration in dispatch_idle/mod.rs, which the AST scanner (parsing this file standalone) cannot see.",
+    ),
 ];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
