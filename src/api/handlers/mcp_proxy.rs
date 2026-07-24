@@ -24,6 +24,12 @@ pub(crate) const FAST_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const SLOW_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// #3033: maximum concurrent MCP tool worker threads. The 32-session cap
+/// (`api/mod.rs`) bounds connections, not outstanding workers — a single
+/// long-lived connection hitting timeouts against a stuck tool accumulates
+/// threads without bound. This cap is the refusal backstop.
+pub(crate) const MAX_MCP_WORKERS: usize = 64;
+
 pub(crate) fn tool_timeout(tool: &str) -> Duration {
     match crate::mcp::registry::timeout_class(tool) {
         crate::mcp::registry::ToolTimeoutClass::Fast => FAST_TOOL_TIMEOUT,
@@ -1589,6 +1595,64 @@ mod tests {
             !marker_exists,
             "missing authority must not write restart-requested"
         );
+    }
+
+    /// #3033: when outstanding MCP tool workers reach MAX_MCP_WORKERS, the
+    /// next call must be refused (ok:false) instead of spawning unboundedly.
+    #[test]
+    fn worker_cap_rejects_when_exceeded() {
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(MAX_MCP_WORKERS + 1));
+
+        let mut handles = Vec::new();
+        for _ in 0..MAX_MCP_WORKERS {
+            let b = barrier.clone();
+            let h = std::thread::spawn(move || {
+                handle_mcp_tool_inner(
+                    "inbox",
+                    json!({}),
+                    "caller".to_string(),
+                    Duration::from_secs(10),
+                    None,
+                    move |_, _, _| {
+                        b.wait();
+                        json!({})
+                    },
+                )
+            });
+            handles.push(h);
+        }
+
+        // Give workers time to spawn and block on the barrier.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // The (cap+1)th call must be refused, not spawned.
+        let resp = handle_mcp_tool_inner(
+            "inbox",
+            json!({}),
+            "caller".to_string(),
+            Duration::from_secs(1),
+            None,
+            |_, _, _| json!({}),
+        );
+        assert_eq!(
+            resp["ok"], false,
+            "must refuse when worker cap exceeded: {resp}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("worker limit"),
+            "error must mention worker limit: {resp}"
+        );
+
+        // Unblock all workers so they exit cleanly.
+        barrier.wait();
+        for h in handles {
+            h.join().ok();
+        }
     }
 }
 
