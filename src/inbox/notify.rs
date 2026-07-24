@@ -1304,7 +1304,8 @@ mod should_defer_inject_tests_1513 {
     fn ambient_idle_falls_through_to_1457() {
         let h = tmp_home("amb");
         crate::notification_queue::record_input_activity(&h, "a"); // operator just typed
-                                                                   // ambient + idle + recent typing → still NOT deferred here (route_notification handles it)
+        crate::notification_queue::flush_pending_input_activity(&h);
+        // ambient + idle + recent typing → still NOT deferred here (route_notification handles it)
         assert!(
             !should_defer_inject(&h, "a", Some("idle"), false),
             "ambient defers via #1457 downstream, not here"
@@ -1316,6 +1317,7 @@ mod should_defer_inject_tests_1513 {
     fn actionable_defers_on_recent_typing() {
         let h = tmp_home("typing");
         crate::notification_queue::record_input_activity(&h, "a"); // now
+        crate::notification_queue::flush_pending_input_activity(&h);
         assert!(
             should_defer_inject(&h, "a", Some("idle"), true),
             "recent typing defers actionable"
@@ -1451,6 +1453,7 @@ mod should_defer_direct_inject_tests_1513pr2 {
         let h = tmp_home("typing");
         crate::snapshot::save(&h, &[snap("a", "idle")]);
         crate::notification_queue::record_input_activity(&h, "a");
+        crate::notification_queue::flush_pending_input_activity(&h);
         assert!(
             should_defer_direct_inject(&h, "a"),
             "recent keystroke → defer direct inject"

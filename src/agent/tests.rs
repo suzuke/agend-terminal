@@ -1761,6 +1761,7 @@ fn inject_offload_defers_without_touching_delivery_worker() {
     // `operator_typing_recent` (hence `should_defer_direct_inject`) true.
     std::env::set_var("AGEND_HOME", &home);
     crate::notification_queue::record_input_activity(&home, "agentBusy");
+    crate::notification_queue::flush_pending_input_activity(&home);
 
     let dispatch = inject_with_target_gated_offload(&target, "agentBusy", b"hi");
     std::env::remove_var("AGEND_HOME");

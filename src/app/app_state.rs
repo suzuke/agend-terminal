@@ -460,6 +460,7 @@ impl AppState {
         if should_sync_notifications(self.last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
             self.last_notif_sync = Some(notif_now);
             sync_notification_state(home, &mut self.ui.layout);
+            crate::notification_queue::flush_pending_input_activity(home);
         }
         // #2524 P2b / #2313: same throttle idiom, separate cadence state — the
         // decision-badge scan is independent of the notification scan above.

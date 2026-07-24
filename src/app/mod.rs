@@ -2579,6 +2579,7 @@ mod tests {
         let home = tmp_home("flush-compose-disk");
         let mut pane = pane("agent1");
         notification_queue::record_input_activity(&home, "agent1");
+        notification_queue::flush_pending_input_activity(&home);
         notification_queue::enqueue(&home, "agent1", "queued").expect("queue notification");
         pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
 
@@ -2663,6 +2664,7 @@ mod tests {
         let up = b"\x1b[A";
         if is_text_composing_input(up) {
             notification_queue::record_input_activity(&home, agent);
+            notification_queue::flush_pending_input_activity(&home);
         }
         assert_eq!(
             notification_queue::draft_state(&home, agent),
@@ -2673,6 +2675,7 @@ mod tests {
         // (b) operator types real text → gate records → draft present (deferred).
         if is_text_composing_input(b"hello") {
             notification_queue::record_input_activity(&home, agent);
+            notification_queue::flush_pending_input_activity(&home);
         }
         assert_eq!(
             notification_queue::draft_state(&home, agent),

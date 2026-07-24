@@ -49,13 +49,23 @@ fn draining_path(home: &Path, agent_name: &str) -> PathBuf {
     queue_path(home, agent_name).with_extension("draining")
 }
 
+/// #2965: in-memory buffer for coalesced input-activity timestamps.
+/// Drained by `flush_pending_input_activity` at the ~1s `sync_badges` cadence.
+static PENDING_INPUT: std::sync::Mutex<Vec<(PathBuf, String, i64)>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub fn record_input_activity(home: &Path, agent_name: &str) {
-    agent_ops::save_metadata(
-        home,
-        agent_name,
-        COMPOSE_METADATA_KEY,
-        json!(chrono::Utc::now().timestamp_millis()),
-    );
+    let ts = chrono::Utc::now().timestamp_millis();
+    if let Ok(mut pending) = PENDING_INPUT.lock() {
+        if let Some(entry) = pending
+            .iter_mut()
+            .find(|(h, a, _)| h.as_path() == home && a == agent_name)
+        {
+            entry.2 = ts;
+        } else {
+            pending.push((home.to_path_buf(), agent_name.to_owned(), ts));
+        }
+    }
 }
 
 /// Sprint 54 P2-3: record a submit-key keystroke (e.g. claude `\r`).
@@ -67,8 +77,27 @@ pub fn record_input_activity(home: &Path, agent_name: &str) {
 /// #2965: flush any in-memory pending input-activity timestamps to disk.
 /// Called from the ~1s `sync_badges` cadence so keystrokes coalesce into
 /// at most one durable metadata write per window instead of one per keystroke.
-pub fn flush_pending_input_activity(_home: &Path) {
-    // stub — production implementation in GREEN commit
+pub fn flush_pending_input_activity(home: &Path) {
+    let to_flush = {
+        let mut pending = match PENDING_INPUT.lock() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut kept = Vec::new();
+        let mut flushed = Vec::new();
+        for entry in std::mem::take(&mut *pending) {
+            if entry.0.as_path() == home {
+                flushed.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        *pending = kept;
+        flushed
+    };
+    for (_, agent, ts) in to_flush {
+        agent_ops::save_metadata(home, &agent, COMPOSE_METADATA_KEY, json!(ts));
+    }
 }
 
 pub fn record_submit_activity(home: &Path, agent_name: &str) {
@@ -1031,6 +1060,7 @@ mod tests {
         let (typed0, submit0) = read_input_submit_timestamps(&home, "agent1");
         assert_eq!((typed0, submit0), (0, 0));
         record_input_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
         std::thread::sleep(Duration::from_millis(2));
         record_submit_activity(&home, "agent1");
         let (typed1, submit1) = read_input_submit_timestamps(&home, "agent1");
@@ -1071,6 +1101,7 @@ mod tests {
 
         // WRITE a compose keystroke (no submit) → `<uuid>.json` via the resolver.
         record_input_activity(&home, "fixup-x");
+        flush_pending_input_activity(&home);
 
         // READ must see it through the SAME resolver. Pre-fix this reads the
         // never-written `<name>.json` and returns 0 → assert fails (RED).
@@ -1100,6 +1131,7 @@ mod tests {
     fn typed_only_leaves_submit_zero() {
         let home = tmp_home("typed_only");
         record_input_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
         let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
         assert!(typed > 0);
         assert_eq!(

@@ -874,6 +874,7 @@ fn operator_has_live_draft_reflects_unsent_keystrokes() {
     assert!(!crate::inbox::notify::operator_has_live_draft(&home, "a"));
     // A keystroke with no following submit → a live unsent draft.
     crate::notification_queue::record_input_activity(&home, "a");
+    crate::notification_queue::flush_pending_input_activity(&home);
     assert!(crate::inbox::notify::operator_has_live_draft(&home, "a"));
     std::fs::remove_dir_all(&home).ok();
 }
