@@ -180,7 +180,13 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
+        // Shift+Tab: crossterm reports it as a dedicated `BackTab` code on the
+        // legacy protocol, but as `Tab` + SHIFT under the Kitty keyboard
+        // protocol — both must emit the back-tab sequence (CSI Z) or the child
+        // (e.g. Claude Code's permission-mode cycle) never sees it.
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[Z".to_vec(),
         KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => b"\x1b[A".to_vec(),
         KeyCode::Down => b"\x1b[B".to_vec(),
