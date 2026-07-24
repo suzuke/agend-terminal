@@ -252,9 +252,9 @@ fn maybe_auto_bind_lease(
     args: &Value,
     target: &str,
     second_reviewer: bool,
-) -> Result<(), Value> {
+) -> Result<bool, Value> {
     let Some(branch) = args["branch"].as_str() else {
-        return Ok(());
+        return Ok(false);
     };
     let task_id_val = args["task_id"].as_str().unwrap_or("");
     if dispatch_should_skip_auto_bind(args) {
@@ -262,7 +262,7 @@ fn maybe_auto_bind_lease(
             %target, %branch, task_id = %task_id_val,
             "dispatch_auto_bind_lease skipped (bind: false)"
         );
-        return Ok(());
+        return Ok(false);
     }
     let next_after_ci =
         crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
@@ -377,7 +377,7 @@ fn maybe_auto_bind_lease(
         Some(armed_review_class),
         true,
     )
-    .map(|_| ())
+    .map(|outcome| outcome.ci_watch_arm_failed)
     .map_err(|e| json!({"ok": false, "error": format!("dispatch rejected: {e}")}))
 }
 
@@ -546,9 +546,11 @@ pub(crate) fn handle_delegate_task(
         None
     };
 
+    let mut ci_watch_arm_failed = false;
     if !checks.review_assignment && runtime.is_some() {
-        if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
-            return e;
+        match maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
+            Ok(arm_failed) => ci_watch_arm_failed = arm_failed,
+            Err(e) => return e,
         }
     }
 
@@ -595,7 +597,21 @@ pub(crate) fn handle_delegate_task(
         auto_created_task_id,
     };
     let result = deliver_delegate(&ctx, runtime);
-    track_delegate_success(&ctx, result)
+    let mut result = track_delegate_success(&ctx, result);
+    if ci_watch_arm_failed && is_ok_result(&result) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("degraded".into(), json!(true));
+            obj.insert(
+                "warning".into(),
+                json!({
+                    "code": "ci_watch_arm_failed",
+                    "remediation": "CI watch could not be armed for this dispatch; \
+                        run `ci action=watch` manually to enable CI-ready notifications",
+                }),
+            );
+        }
+    }
+    result
 }
 
 #[cfg(test)]

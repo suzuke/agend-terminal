@@ -4243,10 +4243,7 @@ fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
 fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
     use crate::identity::Sender;
 
-    let home = std::env::temp_dir().join(format!(
-        "agend-f7-arm-degrade-{}",
-        std::process::id()
-    ));
+    let home = std::env::temp_dir().join(format!("agend-f7-arm-degrade-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).ok();
     setup_test_repo(&home, "target-agent");
@@ -4257,7 +4254,10 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
     let ci_watches = crate::daemon::ci_watch::ci_watches_dir(&home);
     let _ = std::fs::remove_dir_all(&ci_watches);
     std::fs::write(&ci_watches, "injected-blocker").expect("create ci-watches as file");
-    assert!(ci_watches.is_file(), "precondition: ci-watches must be a regular file");
+    assert!(
+        ci_watches.is_file(),
+        "precondition: ci-watches must be a regular file"
+    );
 
     let args = serde_json::json!({
         "instance": "target-agent",
@@ -4303,7 +4303,8 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
         .filter(|line| line.contains("implement feature X"))
         .count();
     assert_eq!(
-        delivery_count, 1,
+        delivery_count,
+        1,
         "F7 positive control: exactly one message matching the delegated task \
          must be persisted in target inbox. Got {delivery_count}. \
          inbox_dir exists={}, content_len={}",
@@ -4342,6 +4343,42 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
     assert!(
         !remediation.is_empty(),
         "F7 RED: warning.remediation must be a non-empty actionable string. Got warning: {warning}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// F7 success-path control: a normal dispatch where the ci-watch arm succeeds
+/// must NOT carry `degraded` or `warning` in the response.
+#[test]
+fn dispatch_no_degraded_warning_on_successful_arm() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-f7-no-degrade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement feature Y",
+        "task_id": tid,
+        "branch": "feat/f7-normal",
+        "repository": "owner/repo",
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert!(
+        result.get("degraded").is_none(),
+        "F7 control: successful dispatch must NOT carry 'degraded'. Got: {result}"
+    );
+    assert!(
+        result.get("warning").is_none(),
+        "F7 control: successful dispatch must NOT carry 'warning'. Got: {result}"
     );
 
     std::fs::remove_dir_all(&home).ok();
