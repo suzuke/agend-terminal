@@ -490,6 +490,12 @@ enum CheckOutcome {
 // RAII completion guard
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    static ESTIMATED_BYTES_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 struct InProgressGuard<'a> {
     cache: &'a DedupCache,
     request_id: String,
@@ -528,6 +534,8 @@ impl Drop for InProgressGuard<'_> {
 // ---------------------------------------------------------------------------
 
 fn estimated_bytes(v: &Value) -> usize {
+    #[cfg(test)]
+    ESTIMATED_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
     serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
 }
 
@@ -739,6 +747,37 @@ mod tests {
         );
         assert_eq!(resp1, resp2, "duplicate must observe original response");
         assert_eq!(resp1["n"], 1);
+    }
+
+    #[test]
+    fn fresh_cacheable_response_counts_bytes_once() {
+        ESTIMATED_BYTES_CALLS.with(|calls| calls.set(0));
+        let cache = DedupCache::default();
+
+        let first = cache.dispatch(
+            Some("req-byte-count"),
+            0,
+            Duration::from_secs(5),
+            || json!({"ok": true, "result": {"text": "payload"}}),
+        );
+        let expected_bytes = serde_json::to_string(&first).unwrap().len();
+
+        let inner = cache.inner.lock().expect("dedup inner mutex");
+        assert_eq!(
+            inner.entries["req-byte-count"].response_bytes, expected_bytes,
+            "cached response byte accounting must remain exact"
+        );
+        drop(inner);
+
+        let cached = cache.dispatch(Some("req-byte-count"), 0, Duration::from_secs(5), || {
+            panic!("cache hit must not execute the handler")
+        });
+        assert_eq!(cached, first);
+        assert_eq!(
+            ESTIMATED_BYTES_CALLS.with(std::cell::Cell::get),
+            1,
+            "fresh cacheable response must serialize once for byte accounting"
+        );
     }
 
     /// (b) Different request_ids — both handlers execute. Cache must not
