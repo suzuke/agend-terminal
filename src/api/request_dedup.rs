@@ -95,7 +95,7 @@ pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 
 #[derive(Clone, Debug)]
 enum SlotResult {
-    Cached(Value),
+    Cached(Value, usize),
     Oversized,
     Errored(String),
 }
@@ -315,7 +315,7 @@ impl DedupCache {
         }
 
         match result {
-            Some(SlotResult::Cached(v)) => v,
+            Some(SlotResult::Cached(v, _)) => v,
             Some(SlotResult::Oversized) => oversized_error(),
             Some(SlotResult::Errored(detail)) => handler_errored(&detail),
             None => in_progress_error(),
@@ -337,8 +337,8 @@ impl DedupCache {
                     _ => None,
                 };
                 match &outcome {
-                    SlotResult::Cached(v) => {
-                        let bytes = estimated_bytes(v);
+                    SlotResult::Cached(v, bytes) => {
+                        let bytes = *bytes;
                         entry.state = EntryState::Cached(v.clone());
                         entry.response_bytes = bytes;
                         bytes_delta = bytes;
@@ -505,10 +505,11 @@ struct InProgressGuard<'a> {
 impl InProgressGuard<'_> {
     fn complete(&mut self, response: Value) {
         self.completed = true;
-        let outcome = if estimated_bytes(&response) > self.cache.per_entry_cap {
+        let response_bytes = estimated_bytes(&response);
+        let outcome = if response_bytes > self.cache.per_entry_cap {
             SlotResult::Oversized
         } else {
-            SlotResult::Cached(response)
+            SlotResult::Cached(response, response_bytes)
         };
         self.cache.finalize(&self.request_id, outcome);
     }
@@ -760,7 +761,9 @@ mod tests {
             Duration::from_secs(5),
             || json!({"ok": true, "result": {"text": "payload"}}),
         );
-        let expected_bytes = serde_json::to_string(&first).unwrap().len();
+        let expected_bytes = serde_json::to_string(&first)
+            .expect("test response must serialize")
+            .len();
 
         let inner = cache.inner.lock().expect("dedup inner mutex");
         assert_eq!(
