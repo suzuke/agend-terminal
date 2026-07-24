@@ -3740,15 +3740,18 @@ fn write_cross_team_review_fleet(
     reviewer_id: crate::types::InstanceId,
     lead_id: crate::types::InstanceId,
 ) {
+    let imposter_id = crate::types::InstanceId::new();
     std::fs::write(
         crate::fleet::fleet_yaml_path(home),
         format!(
             "instances:\n  \
                ct-lead:\n    backend: claude\n    id: {lead}\n  \
-               ct-reviewer:\n    backend: claude\n    id: {rev}\n\
+               ct-reviewer:\n    backend: claude\n    id: {rev}\n  \
+               ct-imposter:\n    backend: claude\n    id: {imp}\n\
              teams:\n  alpha:\n    members: [ct-lead]\n    orchestrator: ct-lead\n",
             lead = lead_id.full(),
             rev = reviewer_id.full(),
+            imp = imposter_id.full(),
         ),
     )
     .unwrap();
@@ -3883,7 +3886,8 @@ fn cross_team_code_review_missing_assignment_blocked_2957() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #2957 negative: wrong sender name → cross-team gate fires normally.
+/// #2957 negative: wrong sender (ct-imposter, not assignment target) →
+/// assignment identity mismatch → cross-team gate fires.
 #[test]
 fn cross_team_code_review_wrong_sender_blocked_2957() {
     let home = tmp_home("2957-wrong-sender");
@@ -3895,9 +3899,20 @@ fn cross_team_code_review_wrong_sender_blocked_2957() {
     let assignment = seed_cross_team_review_subject(&home, reviewer_id);
 
     let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
-    params["from"] = json!("ct-lead");
+    params["from"] = json!("ct-imposter");
     let result = handle_send(&params, &test_ctx(&home));
     assert_eq!(result["ok"], false, "wrong sender must fail: {result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cross-team"),
+        "must hit cross-team gate, not self-send: {result}"
+    );
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
 
     let delivered = crate::inbox::drain(&home, "ct-lead");
     assert!(delivered.is_empty(), "zero delivery side effect");
@@ -3905,7 +3920,8 @@ fn cross_team_code_review_wrong_sender_blocked_2957() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #2957 negative: wrong recipient → cross-team gate fires normally.
+/// #2957 negative: wrong recipient (ct-imposter, not assignment issuer) →
+/// assignment identity mismatch → cross-team gate fires.
 #[test]
 fn cross_team_code_review_wrong_recipient_blocked_2957() {
     let home = tmp_home("2957-wrong-recipient");
@@ -3917,9 +3933,16 @@ fn cross_team_code_review_wrong_recipient_blocked_2957() {
     let assignment = seed_cross_team_review_subject(&home, reviewer_id);
 
     let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
-    params["target"] = json!("ct-reviewer");
+    params["target"] = json!("ct-imposter");
     let result = handle_send(&params, &test_ctx(&home));
     assert_eq!(result["ok"], false, "wrong recipient must fail: {result}");
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    let delivered = crate::inbox::drain(&home, "ct-imposter");
+    assert!(delivered.is_empty(), "zero delivery side effect");
 
     std::fs::remove_dir_all(&home).ok();
 }

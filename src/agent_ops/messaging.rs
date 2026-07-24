@@ -107,17 +107,15 @@ pub(crate) fn execute_send(
     }
 
     // Phase 2: Policy gates
-    if let Err(e) = check_team_isolation(home, from, target) {
-        if !is_assignment_backed_code_review(home, &request, from, target) {
-            return e;
+    let cross_team_bypassed = match check_team_isolation(home, from, target) {
+        Ok(()) => false,
+        Err(e) => {
+            if !is_assignment_backed_code_review(home, &request, from, target) {
+                return e;
+            }
+            true
         }
-        crate::event_log::log(
-            home,
-            "send_cross_team_allowed_assignment",
-            from,
-            &format!("target={target}"),
-        );
-    }
+    };
     if let Err(e) = check_quota_gate(registry, home, target, request.kind.as_deref()) {
         return e;
     }
@@ -151,6 +149,14 @@ pub(crate) fn execute_send(
     msg.validated_code_review = report_auth.receipt;
     if let Some(receipt) = msg.validated_code_review.as_ref() {
         msg.reviewed_head = Some(receipt.summary().reviewed_head.clone());
+    }
+    if cross_team_bypassed && msg.validated_code_review.is_some() {
+        crate::event_log::log(
+            home,
+            "send_cross_team_allowed_assignment",
+            from,
+            &format!("target={target}"),
+        );
     }
     if let Err(e) = check_worktree_enforcement(home, target, &request) {
         return e;
