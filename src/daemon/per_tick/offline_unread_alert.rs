@@ -196,6 +196,7 @@ impl PerTickHandler for OfflineUnreadAlertHandler {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn decide_fires_once_then_dedups_same_count() {
@@ -246,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(offline_unread_env)]
     fn threshold_env_override_positive_only() {
         std::env::remove_var("AGEND_OFFLINE_UNREAD_ALERT_DAYS");
         assert_eq!(alert_threshold_days(), DEFAULT_ALERT_DAYS);
@@ -317,6 +319,7 @@ mod tests {
     /// agent is written (the operator-visible artifact; the channel fan-out is a
     /// no-op with no channel registered, which is fine — the row still lands).
     #[test]
+    #[serial(offline_unread_env)]
     fn offline_over_threshold_escalates_2604() {
         let home = tmp_home("over");
         seed_obligation(&home, "gone", "q-old", 10); // 10d > 7d default
@@ -339,6 +342,7 @@ mod tests {
     /// An obligation YOUNGER than the threshold does not escalate (the operator
     /// still has runway before the 30-day sweep).
     #[test]
+    #[serial(offline_unread_env)]
     fn offline_under_threshold_does_not_escalate_2604() {
         let home = tmp_home("under");
         seed_obligation(&home, "gone", "q-fresh", 1); // 1d < 7d default
@@ -361,6 +365,7 @@ mod tests {
     /// obligation — its own poll-reminder owns it; the offline watchdog must not
     /// double-page. Reverse-regression for the registry-membership skip.
     #[test]
+    #[serial(offline_unread_env)]
     fn online_agent_with_old_obligation_skipped_2604() {
         let home = tmp_home("online");
         seed_obligation(&home, "alive", "q-old", 10);
@@ -383,6 +388,7 @@ mod tests {
 
     /// Dedup across ticks: the same backlog pages ONCE, not every tick.
     #[test]
+    #[serial(offline_unread_env)]
     fn repeated_run_dedups_same_backlog_2604() {
         let home = tmp_home("dedup");
         seed_obligation(&home, "gone", "q-old", 10);
