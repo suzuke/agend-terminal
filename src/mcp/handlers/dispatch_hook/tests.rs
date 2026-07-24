@@ -4233,3 +4233,153 @@ fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// F7 RED: when the ci-watch arm fails during a branch dispatch, the caller
+/// must receive a typed degraded result — not silent success. Injection:
+/// pre-create `<home>/ci-watches` as a regular file so `handle_watch_ci`
+/// cannot write the watch entry (ENOTDIR). The primary dispatch (bind +
+/// delivery) must still succeed; only the ci-watch arm is degraded.
+#[test]
+fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-f7-arm-degrade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+
+    // ── Injection: make ci-watches a regular FILE so handle_watch_ci fails
+    // deterministically (cannot create_dir_all inside a file).
+    let ci_watches = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let _ = std::fs::remove_dir_all(&ci_watches);
+    std::fs::write(&ci_watches, "injected-blocker").expect("create ci-watches as file");
+    assert!(
+        ci_watches.is_file(),
+        "precondition: ci-watches must be a regular file"
+    );
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement feature X",
+        "task_id": tid,
+        "branch": "feat/f7-arm-fail",
+        "repository": "owner/repo",
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    // ── Primary dispatch must NOT hard-fail.
+    let is_hard_error = result
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(|e| e.contains("dispatch rejected"))
+        .unwrap_or(false);
+    assert!(
+        !is_hard_error,
+        "F7: primary dispatch must succeed even when arm fails; got hard error: {result}"
+    );
+
+    // ── Positive control: target delivery happened exactly once (persisted inbox).
+    // Walk inbox/ to find the actual file (may be UUID-based via inbox_path_resolved).
+    let inbox_dir = home.join("inbox");
+    let inbox_content = if inbox_dir.is_dir() {
+        std::fs::read_dir(&inbox_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    let delivery_count = inbox_content
+        .lines()
+        .filter(|line| line.contains("implement feature X"))
+        .count();
+    assert_eq!(
+        delivery_count,
+        1,
+        "F7 positive control: exactly one message matching the delegated task \
+         must be persisted in target inbox. Got {delivery_count}. \
+         inbox_dir exists={}, content_len={}",
+        inbox_dir.is_dir(),
+        inbox_content.len()
+    );
+
+    // ── No watch must be created (arm failed — ci-watches is a file).
+    assert!(
+        ci_watches.is_file(),
+        "ci-watches must remain a file (injection intact)"
+    );
+
+    // ── F7 RED: exact minimal response contract when auto-watch arm fails.
+    // The response MUST carry:
+    //   "degraded": true
+    //   "warning": { "code": "ci_watch_arm_failed", "remediation": "<non-empty>" }
+    // On the current base none of these exist → test FAILS (RED).
+    assert_eq!(
+        result.get("degraded"),
+        Some(&serde_json::json!(true)),
+        "F7 RED: response.degraded must be boolean true when arm fails. Got: {result}"
+    );
+    let warning = result.get("warning").unwrap_or_else(|| {
+        panic!("F7 RED: response must contain a 'warning' object when arm fails. Got: {result}")
+    });
+    assert_eq!(
+        warning.get("code").and_then(|v| v.as_str()),
+        Some("ci_watch_arm_failed"),
+        "F7 RED: warning.code must be 'ci_watch_arm_failed'. Got warning: {warning}"
+    );
+    let remediation = warning
+        .get("remediation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !remediation.is_empty(),
+        "F7 RED: warning.remediation must be a non-empty actionable string. Got warning: {warning}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// F7 success-path control: a normal dispatch where the ci-watch arm succeeds
+/// must NOT carry `degraded` or `warning` in the response.
+#[test]
+fn dispatch_no_degraded_warning_on_successful_arm() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-f7-no-degrade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement feature Y",
+        "task_id": tid,
+        "branch": "feat/f7-normal",
+        "repository": "owner/repo",
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert!(
+        result.get("degraded").is_none(),
+        "F7 control: successful dispatch must NOT carry 'degraded'. Got: {result}"
+    );
+    assert!(
+        result.get("warning").is_none(),
+        "F7 control: successful dispatch must NOT carry 'warning'. Got: {result}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

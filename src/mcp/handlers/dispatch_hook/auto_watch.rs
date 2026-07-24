@@ -14,6 +14,7 @@ use std::path::Path;
 
 /// Arm the dispatch ci-watch for `target` on `repo`+`branch`. Best-effort: a failed
 /// arm is logged (never fatal — the dispatch + lease already succeeded).
+/// Returns `true` when the arm failed (caller surfaces degraded warning).
 pub(super) fn arm(
     home: &Path,
     target: &str,
@@ -22,7 +23,7 @@ pub(super) fn arm(
     next_after_ci: &[String],
     review_class: Option<&str>,
     task_id: &str,
-) {
+) -> bool {
     // #931 Fix 2 (H5a): propagate the dispatcher's `next_after_ci` chain target into
     // the watch so the poll loop fires `[ci-ready-for-action]` to it on CI pass.
     // Explicit-only since t-ci-ready-pr2 dropped the #1037 `<team>-reviewer`
@@ -49,6 +50,7 @@ pub(super) fn arm(
             %target, repo, %branch, code, error = %err,
             "dispatch auto-watch_ci FAILED — no CI watch armed (ci-ready will not fire)"
         );
+        true
     } else {
         tracing::info!(
             %target, repo, %branch,
@@ -56,5 +58,6 @@ pub(super) fn arm(
             explicit = !next_after_ci.is_empty(),
             "dispatch auto-watch_ci"
         );
+        false
     }
 }
