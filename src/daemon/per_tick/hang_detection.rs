@@ -56,15 +56,16 @@ impl PerTickHandler for HangDetectionHandler {
         // persist that CLEAR (else a restart rehydrates the stale anchor and the
         // next unrelated Hung re-entry's `get_or_insert` keeps it → false
         // immediate escalation. codex catch).
-        // #2944: Phase 1 now retains the `Arc<CoreMutex<AgentCore>>` for each
-        // hung/left agent so Phases 2/3 can use them directly without
-        // re-locking the registry.
+        // #2944: Phase 1 retains the `Arc<CoreMutex<AgentCore>>` for each
+        // hung agent so Phase 2 can use them directly without re-locking
+        // the registry.  `left_hung` collects names only — Phase 3 uses
+        // the narrow `clear_hung_since` (no full snapshot needed).
         type CoreArc = Arc<crate::sync_audit::CoreMutex<crate::agent::AgentCore>>;
         #[allow(clippy::type_complexity)]
         let (hung_now, newly_hung, left_hung): (
             Vec<(String, CoreArc)>,
             std::collections::HashSet<String>,
-            Vec<(String, CoreArc)>,
+            Vec<String>,
         ) = {
             let reg = agent::lock_registry_tracked(ctx.registry, "hang_detection");
             let mut hung = Vec::new();
@@ -116,19 +117,20 @@ impl PerTickHandler for HangDetectionHandler {
                     }
                 } else if was_hung {
                     // Hung → not-Hung this tick: `check_hang` cleared `hung_since`.
-                    left.push((name.to_string(), Arc::clone(&handle.core)));
+                    left.push(name.to_string());
                 }
             }
             (hung, newly, left)
         };
 
-        // Phase 2/3: shared fleet snapshot — one load_arc per tick instead of
+        // Phase 2/3: shared fleet snapshot — one load per tick instead of
         // O(hung) self_orch_status calls (each of which deep-clones the config).
-        // #1744-M7 fail-closed: Err → Unknown → escalate.
-        let fleet_arc =
-            crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home));
+        // Uses `try_load_fleet` semantics: missing fleet.yaml → determinate No
+        // (no teams configured), file-exists-but-unreadable → Unknown → escalate
+        // (#1744-M7 fail-closed).
+        let fleet_result = crate::teams::try_load_fleet(ctx.home);
         let self_orch = |name: &str| -> crate::teams::SelfOrchStatus {
-            match &fleet_arc {
+            match &fleet_result {
                 Ok(fleet) => {
                     match crate::teams::find_team_for_in(fleet, name).and_then(|t| t.orchestrator) {
                         Some(orch) if orch == name => crate::teams::SelfOrchStatus::Yes,
@@ -159,25 +161,23 @@ impl PerTickHandler for HangDetectionHandler {
             }
         }
 
-        // Phase 3 (#1744-H2): persist cleared anchor for left-Hung self-orchestrators.
-        // #2944: uses stored Arc from Phase 1 — no registry re-lock.
-        for (name, core_arc) in &left_hung {
-            persist_or_clear_left_hung_anchor(ctx, name, core_arc, &self_orch);
+        // Phase 3 (#1744-H2): clear persisted hung anchor for left-Hung
+        // self-orchestrators.  Uses the narrow `clear_hung_since` — no full
+        // snapshot persist, no registry re-lock.
+        for name in &left_hung {
+            clear_left_hung_anchor(ctx, name, &self_orch);
         }
     }
 }
 
-/// #1744-H2 + #1870-H2: persist a left-Hung self-orchestrator's cleared anchor.
-/// #2944: takes a pre-retained `core_arc` from Phase 1 and a shared fleet
-/// closure — no registry re-lock, no per-agent fleet load.
-///
-/// The TOCTOU branch (#1870-H2, agent absent from registry between Phase 1 and
-/// now) can no longer occur: Phase 1's `Arc::clone` keeps the core alive even
-/// if the handle is removed from the registry, so we always have a snapshot.
-fn persist_or_clear_left_hung_anchor(
+/// #1744-H2 + #1870-H2: clear the persisted `hung_since` anchor for a
+/// left-Hung self-orchestrator. Uses the narrow `clear_hung_since` so only
+/// the anchor is cleared — crash budget / cooldowns are preserved and no
+/// stale full snapshot is written under a potentially reused name.
+/// #2944: uses a shared fleet closure — no per-agent fleet load.
+fn clear_left_hung_anchor(
     ctx: &TickContext<'_>,
     name: &str,
-    core_arc: &Arc<crate::sync_audit::CoreMutex<crate::agent::AgentCore>>,
     self_orch: &dyn Fn(&str) -> crate::teams::SelfOrchStatus,
 ) {
     if self_orch(name) == crate::teams::SelfOrchStatus::No {
@@ -186,9 +186,8 @@ fn persist_or_clear_left_hung_anchor(
     if crate::daemon::escalation_persist::load_for(ctx.home, name).is_none() {
         return;
     }
-    let snapshot = core_arc.lock().health.escalation_snapshot();
-    crate::daemon::escalation_persist::persist(ctx.home, name, &snapshot);
-    tracing::debug!(agent = %name, "#1744-H2: persisted cleared hung anchor on Hung exit");
+    crate::daemon::escalation_persist::clear_hung_since(ctx.home, name);
+    tracing::debug!(agent = %name, "#1744-H2: cleared hung anchor on Hung exit");
 }
 
 /// #1701: how long a self-orchestrator must stay Hung before its hang escalates
@@ -298,17 +297,12 @@ mod tests {
     }
 
     /// #1870-H2 + #2944: a self-orch that left Hung gets its stale anchor
-    /// cleared via the stored Arc (no registry re-lock). The old TOCTOU gap
-    /// (absent from registry) is structurally closed: Phase 1's Arc::clone
-    /// keeps the core alive even if the handle is removed.
+    /// cleared via the narrow `clear_hung_since` path — no full snapshot
+    /// persist, no registry re-lock.
     #[test]
-    fn left_hung_anchor_cleared_via_stored_arc_1870_h2() {
-        use crate::agent::{AgentCore, ApiActivity};
-        use crate::sync_audit::CoreMutex;
-        use crate::vterm::VTerm;
-
+    fn left_hung_anchor_cleared_narrow_1870_h2() {
         let home = std::env::temp_dir().join(format!(
-            "agend-h2-arc-{}-{}",
+            "agend-h2-narrow-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -336,16 +330,6 @@ mod tests {
             "precondition: a stale anchor is persisted"
         );
 
-        // Core with hung_since already cleared (agent left Hung in Phase 1).
-        let core_arc = Arc::new(CoreMutex::new(AgentCore {
-            vterm: VTerm::new(80, 24),
-            subscribers: Vec::new(),
-            state: crate::state::StateTracker::new(None),
-            health: crate::health::HealthTracker::new(),
-            api_activity: ApiActivity::default(),
-            observed_status: None,
-        }));
-
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
         let configs = Arc::new(Mutex::new(HashMap::new()));
@@ -357,14 +341,55 @@ mod tests {
         };
 
         let self_orch = |_: &str| crate::teams::SelfOrchStatus::Yes;
-        persist_or_clear_left_hung_anchor(&ctx, "orch-1", &core_arc, &self_orch);
+        clear_left_hung_anchor(&ctx, "orch-1", &self_orch);
 
         assert!(
             crate::daemon::escalation_persist::load_for(&home, "orch-1")
                 .unwrap()
                 .hung_since_epoch_ms
                 .is_none(),
-            "#1870-H2: stored Arc must persist a cleared hung anchor"
+            "#1870-H2: narrow clear must remove the stale hung anchor"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression: missing fleet.yaml must produce determinate `No` (no teams
+    /// configured), NOT `Unknown`. `Unknown` would cause a false P0 escalation
+    /// on single-agent / no-fleet installations because the Hung path treats
+    /// `Unknown` as self-orchestrator (#1744-M7 fail-closed).
+    #[test]
+    fn missing_fleet_yaml_is_determinate_no_not_unknown() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-nofleet-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        assert!(
+            !crate::fleet::fleet_yaml_path(&home).exists(),
+            "precondition: no fleet.yaml"
+        );
+
+        let fleet_result = crate::teams::try_load_fleet(&home);
+        let self_orch = |name: &str| -> crate::teams::SelfOrchStatus {
+            match &fleet_result {
+                Ok(fleet) => {
+                    match crate::teams::find_team_for_in(fleet, name).and_then(|t| t.orchestrator) {
+                        Some(orch) if orch == name => crate::teams::SelfOrchStatus::Yes,
+                        _ => crate::teams::SelfOrchStatus::No,
+                    }
+                }
+                Err(_) => crate::teams::SelfOrchStatus::Unknown,
+            }
+        };
+
+        assert_eq!(
+            self_orch("any-agent"),
+            crate::teams::SelfOrchStatus::No,
+            "missing fleet.yaml must be determinate No, not Unknown"
         );
         std::fs::remove_dir_all(&home).ok();
     }
