@@ -885,12 +885,16 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 recv(shutdown_rx) -> _ => { continue; }
             }
 
-            // The cycle owns preflight, profile handlers, and optional progress;
-            // crash dispatch remains host-local while progress stays PostHandlers.
-            keepalive
-                .maintenance
-                .run_once(home, &ctx.registry, &ctx.externals, &ctx.configs);
-
+            // #2935: dispatch maintenance only for tick wakes; crash wakes skip
+            // the full pipeline and go straight to exit-event handling.
+            let exit_event = serve_loop_post_select(
+                &keepalive.maintenance,
+                exit_event,
+                home,
+                &ctx.registry,
+                &ctx.externals,
+                &ctx.configs,
+            );
             let exit_event = match exit_event {
                 Some(e) => e,
                 None => continue,
@@ -1214,6 +1218,23 @@ fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
             tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
         }
     });
+}
+
+/// #2935: post-select dispatch for the serve loop. Runs the periodic maintenance
+/// pipeline only for tick wakes (exit_event is None); crash wakes (Some) skip it.
+/// Returns the exit event unchanged so the caller can dispatch it.
+fn serve_loop_post_select(
+    maintenance: &crate::daemon::owned_maintenance::OwnedMaintenanceCycle,
+    exit_event: Option<crate::agent::AgentExitEvent>,
+    home: &Path,
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+    configs: &crate::api::ConfigRegistry,
+) -> Option<crate::agent::AgentExitEvent> {
+    if exit_event.is_none() {
+        maintenance.run_once(home, registry, externals, configs);
+    }
+    exit_event
 }
 
 /// Opaque bag of daemon-lifetime handles that must not be dropped
@@ -2842,6 +2863,109 @@ mod tests {
         for name in &agent_names {
             kill_registered_child(&registry, name);
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2935: crash wake must not trigger maintenance pipeline ──────────
+
+    fn maintenance_test_cycle() -> (
+        crate::daemon::owned_maintenance::OwnedMaintenanceCycle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::daemon::owner_services::{
+            start_owner_monitoring, start_owner_stream_observers, OwnerMonitoringStarters,
+            OwnerRole, OwnerStreamStarters,
+        };
+        use crate::daemon::per_tick::{PerTickHandler, TickContext};
+
+        struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+        impl PerTickHandler for Counter {
+            fn name(&self) -> &'static str {
+                "counter-2935"
+            }
+            fn run(&self, _ctx: &TickContext<'_>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let monitoring = OwnerMonitoringStarters {
+            monitor_tick: &|_, _, _| {},
+            api_activity_probe: &|_, _| {},
+        };
+        let streams = OwnerStreamStarters {
+            rollout: &|_, _, _| {},
+            opencode: &|_, _, _| {},
+            kiro: &|_, _, _| {},
+        };
+        let phase_one = start_owner_monitoring(
+            OwnerRole::Owned,
+            Path::new("/tmp/agend-2935-red"),
+            &registry,
+            &monitoring,
+        );
+        let owner = start_owner_stream_observers(
+            OwnerRole::Owned,
+            &phase_one,
+            Path::new("/tmp/agend-2935-red"),
+            &registry,
+            &streams,
+        );
+        let cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::from_parts(
+            vec![Box::new(Counter(Arc::clone(&runs)))],
+            owner,
+            None,
+            None,
+        );
+        (cycle, runs)
+    }
+
+    /// #2935 RED: a crash/exit event must NOT trigger the periodic maintenance
+    /// pipeline. Before the fix, `serve_loop_post_select` runs `run_once`
+    /// unconditionally for both tick and crash wakes.
+    #[test]
+    fn crash_wake_must_skip_maintenance_2935() {
+        let (cycle, runs) = maintenance_test_cycle();
+        let home = std::env::temp_dir().join(format!("agend-2935-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let crash = Some(crate::agent::AgentExitEvent::CleanExit("test-agent".into()));
+        let result =
+            super::serve_loop_post_select(&cycle, crash, &home, &registry, &externals, &configs);
+
+        assert!(result.is_some(), "crash event must pass through");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "#2935 RED: crash wake must NOT trigger maintenance pipeline"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2935 control: a tick wake (exit_event=None) MUST trigger the maintenance
+    /// pipeline — this is the desired behavior that must be preserved.
+    #[test]
+    fn tick_wake_runs_maintenance_2935() {
+        let (cycle, runs) = maintenance_test_cycle();
+        let home = std::env::temp_dir().join(format!("agend-2935-tick-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let result =
+            super::serve_loop_post_select(&cycle, None, &home, &registry, &externals, &configs);
+
+        assert!(result.is_none(), "tick returns None");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "#2935 control: tick wake MUST trigger maintenance pipeline"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
