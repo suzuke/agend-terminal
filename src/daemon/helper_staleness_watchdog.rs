@@ -6,9 +6,12 @@
 //! Sprint 58 Wave 2 PR-1 (#11) shipped `cli::check_helper_staleness`
 //! as a Shape-B passive doctor warn — operator-pull. This module
 //! adds the proactive vantage: the supervisor periodically reuses the
-//! same `cli::classify_helper_staleness` classification and pings
-//! `general` + `lead` when a helper goes stale, so operators see the
-//! signal without first running `agend-terminal doctor`.
+//! same `cli::classify_helper_staleness` classification and pings the
+//! resolved helper-staleness recipients (default `general` + `lead`,
+//! fleet.yaml-overridable and filtered against existing instances —
+//! `fleet::watchdog::resolve_helper_staleness_recipients`) when a
+//! helper goes stale, so operators see the signal without first
+//! running `agend-terminal doctor`.
 //!
 //! Pattern parallel to `idle_watchdog.rs` / `anti_stall.rs` /
 //! `decision_timeout.rs` — all four trackers share the supervisor's
@@ -36,11 +39,6 @@ pub(crate) const TICKS_PER_STALENESS_SCAN: u64 = 30;
 /// observed deployment-cadence cycle (Wave 3 PR-2 multi-day) without
 /// being so long that genuine drift goes unnoticed.
 pub(crate) const RE_ALERT_THRESHOLD_SECS: i64 = 6 * 60 * 60;
-
-/// Recipient list — both go via inbox enqueue. Downstream telegram
-/// routing (if the recipient vantage is telegram-bound) is handled by
-/// the existing channel pipeline.
-const RECIPIENTS: &[&str] = &["general", "lead"];
 
 /// Helpers tracked. Mirrors `cli::check_helper_staleness` so a single
 /// classification logic governs both the operator-pull doctor and the
@@ -154,15 +152,19 @@ fn helper_staleness_text(helper_name: &str) -> String {
     )
 }
 
-/// #event-bus pattern #5: deliver the stale-helper alert to the hardcoded
-/// `RECIPIENTS` (general + lead). Shared by the legacy path AND the subscriber
-/// ([`handle_event`]), so the two are byte-identical by construction.
+/// #event-bus pattern #5: deliver the stale-helper alert to the resolved
+/// recipients (`fleet::watchdog::resolve_helper_staleness_recipients` —
+/// default `general` + `lead`, fleet.yaml-overridable, filtered against
+/// existing instances so no ghost inbox is created). Shared by the legacy
+/// path AND the subscriber ([`handle_event`]), so the two are byte-identical
+/// by construction. Downstream telegram routing (if the recipient vantage is
+/// telegram-bound) is handled by the existing channel pipeline.
 fn deliver_helper_staleness(home: &Path, helper_name: &str) {
     let text = helper_staleness_text(helper_name);
-    for recipient in RECIPIENTS {
+    for recipient in crate::fleet::watchdog::resolve_helper_staleness_recipients(home) {
         if let Err(e) = crate::inbox::notify_system(
             home,
-            recipient,
+            &recipient,
             "system:helper_staleness_watchdog",
             "helper_staleness_watchdog",
             text.clone(),
@@ -171,13 +173,13 @@ fn deliver_helper_staleness(home: &Path, helper_name: &str) {
         ) {
             tracing::warn!(
                 error = %e,
-                recipient,
+                recipient = %recipient,
                 helper = helper_name,
                 "helper_staleness_watchdog: enqueue failed"
             );
         } else {
             tracing::info!(
-                recipient,
+                recipient = %recipient,
                 helper = helper_name,
                 "helper_staleness_watchdog: emitted inbox alert"
             );
@@ -404,9 +406,10 @@ mod tests {
 
     /// #event-bus pattern #5 PARITY (gate-ON): the bus `emit`→subscriber path
     /// delivers payloads byte-identical (from/kind/text/correlation) to the legacy
-    /// direct enqueue — for BOTH hardcoded recipients (general + lead). Exercises
-    /// the REAL bus emit→fan-out→subscriber wiring. No `env_lock`: `RECIPIENTS` is
-    /// a hardcoded const, not env-derived.
+    /// direct enqueue — for BOTH default recipients (general + lead; tmp homes
+    /// carry no fleet.yaml, so the resolver returns the unfiltered built-in
+    /// default). Exercises the REAL bus emit→fan-out→subscriber wiring. No
+    /// `env_lock`: the recipient list is fleet.yaml-derived, not env-derived.
     #[test]
     fn gate_on_emit_subscriber_matches_legacy_direct_enqueue() {
         let helper = "agend-git";
@@ -428,7 +431,7 @@ mod tests {
             },
         );
 
-        for recipient in RECIPIENTS {
+        for recipient in ["general", "lead"] {
             let legacy = drained_payloads(&home_legacy, recipient);
             let viabus = drained_payloads(&home_bus, recipient);
             assert_eq!(
@@ -450,7 +453,7 @@ mod tests {
         let daemon = stage_stale_state(&home, "agend-git");
         let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
         scan_and_emit(&home, Some(&daemon), &mut last_alerted, false);
-        for recipient in RECIPIENTS {
+        for recipient in ["general", "lead"] {
             assert!(
                 !drained_payloads(&home, recipient).is_empty(),
                 "#event-bus Option A: gate-off must deliver via legacy to {recipient} (no regression)"
