@@ -48,6 +48,27 @@ const DEFAULT_RETENTION: RetentionPolicy = RetentionPolicy {
     max_rotated_age: MAX_ROTATED_AGE,
 };
 
+#[cfg(test)]
+static MAINTENANCE_PASSES: OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_maintenance_pass(path: &Path) {
+    let counts = MAINTENANCE_PASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
+    *counts.entry(path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn maintenance_passes(path: &Path) -> usize {
+    let counts = MAINTENANCE_PASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    counts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// The usage log path — a dedicated file under `<home>`, deliberately separate
 /// from `daemon.log*` so log rotation never discards it.
 fn stats_path(home: &Path) -> PathBuf {
@@ -160,6 +181,9 @@ fn rotated_stats_path(base: &Path, gen: usize) -> PathBuf {
 }
 
 fn rotate_if_needed(path: &Path, policy: RetentionPolicy) {
+    #[cfg(test)]
+    record_maintenance_pass(path);
+
     if policy.max_rotated_files == 0 {
         return;
     }
@@ -404,6 +428,112 @@ mod tests {
 
         assert!(!old.exists(), "stale rotated stats must be pruned on write");
         assert!(fresh.exists(), "fresh rotated stats must be retained");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_line_runs_one_maintenance_pass_for_normal_append_3020() {
+        let home = tmp_home("single-pass-3020");
+        let path = stats_path(&home);
+        let policy = RetentionPolicy {
+            max_live_bytes: 1024,
+            max_rotated_files: 2,
+            max_rotated_age: Duration::from_secs(30 * 86400),
+        };
+        append_line_with_policy(
+            &path,
+            &json!({"ts":"now","tool":"task","action":"list","opt_params":[]}),
+            policy,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            maintenance_passes(&path),
+            1,
+            "a normal append must perform one rotate/prune maintenance pass"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_line_rotates_when_append_crosses_budget_3020() {
+        let home = tmp_home("cross-budget-3020");
+        let path = stats_path(&home);
+        let policy = RetentionPolicy {
+            max_live_bytes: 32,
+            max_rotated_files: 2,
+            max_rotated_age: Duration::from_secs(30 * 86400),
+        };
+        append_line_with_policy(
+            &path,
+            &json!({
+                "ts":"now",
+                "tool":"task",
+                "action":"create",
+                "opt_params":["branch","priority"]
+            }),
+            policy,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        assert!(
+            rotated_stats_path(&path, 1).exists(),
+            "crossing the live budget must rotate the appended record"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "rotation must leave a fresh live file"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_line_recovers_oversized_crash_residue_with_retention_3020() {
+        let home = tmp_home("crash-residue-3020");
+        let path = stats_path(&home);
+        let policy = RetentionPolicy {
+            max_live_bytes: 32,
+            max_rotated_files: 2,
+            max_rotated_age: Duration::from_secs(30 * 86400),
+        };
+        std::fs::write(rotated_stats_path(&path, 1), "generation-1\n").unwrap();
+        std::fs::write(rotated_stats_path(&path, 2), "generation-2\n").unwrap();
+        std::fs::write(&path, format!("crash-residue:{}\n", "x".repeat(80))).unwrap();
+
+        append_line_with_policy(
+            &path,
+            &json!({
+                "ts":"now",
+                "tool":"task",
+                "action":"list",
+                "opt_params":[]
+            }),
+            policy,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let rotated = (1..=2)
+            .map(|generation| {
+                std::fs::read_to_string(rotated_stats_path(&path, generation)).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rotated.contains("crash-residue") && rotated.contains("\"tool\":\"task\""),
+            "oversized residue and the new record must remain retained"
+        );
+        assert!(
+            !rotated_stats_path(&path, 3).exists(),
+            "retention must still prune generations beyond the configured limit"
+        );
+        assert!(
+            std::fs::metadata(&path).unwrap().len() <= policy.max_live_bytes,
+            "recovery must leave the live file within budget"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
