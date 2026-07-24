@@ -27,8 +27,9 @@
 use crate::deployments::DeploymentRuntime;
 use crate::identity::Sender;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{
     binding_state, channel, ci, comms, instance, restart, review_assignment, schedule, task,
@@ -112,6 +113,7 @@ pub(crate) type HandlerFn = fn(&HandlerCtx<'_>) -> Value;
 /// `send.message`, `delete_instance.instance`, action-based `task`/`decision`)
 /// keep their `required[]` and are hard-rejected here. A new tool that declares
 /// a field its handler defaults will trip the pinning test below.
+#[allow(dead_code)]
 fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
     let schema = &def["inputSchema"];
     if let Some(required) = schema["required"].as_array() {
@@ -142,16 +144,51 @@ fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
     None
 }
 
-/// Small seam for proving that required-field metadata is reused across
-/// repeated dispatches. The GREEN implementation stores the field sets here;
-/// the RED test deliberately observes the current per-call definition path.
-#[derive(Default)]
-struct RequiredFieldCache;
+type RequiredFieldSets = HashMap<&'static str, Vec<String>>;
+
+struct RequiredFieldCache {
+    fields: OnceLock<RequiredFieldSets>,
+}
 
 impl RequiredFieldCache {
-    fn definition(&self, entry: &crate::mcp::registry::ToolEntry) -> Value {
-        (entry.definition)()
+    const fn new() -> Self {
+        Self {
+            fields: OnceLock::new(),
+        }
     }
+
+    fn required_fields(&self, entries: &[crate::mcp::registry::ToolEntry]) -> &RequiredFieldSets {
+        self.fields.get_or_init(|| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let definition = (entry.definition)();
+                    let required = definition["inputSchema"]["required"]
+                        .as_array()
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (entry.name, required)
+                })
+                .collect()
+        })
+    }
+}
+
+fn validate_required_args(tool: &str, required: &[String], args: &Value) -> Option<Value> {
+    for req in required {
+        if args.get(req).is_none_or(Value::is_null) {
+            return Some(json!({
+                "error": format!("{tool}: missing required parameter '{req}'")
+            }));
+        }
+    }
+    None
 }
 
 fn try_dispatch_with_cache(
@@ -164,7 +201,12 @@ fn try_dispatch_with_cache(
         .iter()
         .find(|entry| entry.name == tool)
         .map(|entry| {
-            if let Some(err) = validate_args(entry.name, &cache.definition(entry), ctx.args) {
+            let required = cache
+                .required_fields(entries)
+                .get(entry.name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if let Some(err) = validate_required_args(entry.name, required, ctx.args) {
                 return err;
             }
             (entry.handler)(ctx)
@@ -175,7 +217,7 @@ fn try_dispatch_with_cache(
 /// on hit; returns `None` if the tool isn't registered — the caller
 /// falls back to the inline `match` in `mod.rs` for un-migrated arms.
 pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
-    static CACHE: RequiredFieldCache = RequiredFieldCache;
+    static CACHE: RequiredFieldCache = RequiredFieldCache::new();
     try_dispatch_with_cache(tool, ctx, crate::mcp::registry::all(), &CACHE)
 }
 
@@ -981,7 +1023,7 @@ mod tests {
             class: crate::mcp::registry::ToolClass::READ_ONLY,
         };
         let entries = [entry];
-        let cache = RequiredFieldCache;
+        let cache = RequiredFieldCache::new();
         let home = std::env::temp_dir();
 
         DEFINITION_CONSTRUCTIONS.with(|count| count.set(0));
