@@ -1583,16 +1583,20 @@ pub fn run_task_maintenance(home: &Path) {
             ),
         );
     }
+    // #2991: accumulate the advisory events and flush the run in one
+    // append/sync cycle. The inbox enqueue below stays per-item, so
+    // notification order and count are unchanged — only the audit write moves
+    // to the end of the loop.
+    let mut ask_events = Vec::with_capacity(asks.len());
     for a in &asks {
-        crate::event_log::log(
-            home,
+        ask_events.push(crate::event_log::event(
             "dispatch_stuck_ask",
             &a.to,
-            &format!(
+            format!(
                 "no report_result after {}min, querying assignee",
                 crate::dispatch_tracking::DISPATCH_ASK_MINUTES
             ),
-        );
+        ));
         let tid = a.task_id.as_deref().unwrap_or("unknown");
         let query = format!(
             "dispatch stuck check: still working on task_id={tid} (dispatched {}min ago)?",
@@ -1608,16 +1612,20 @@ pub fn run_task_maintenance(home: &Path) {
             a.to
         );
     }
+    crate::event_log::log_many(home, &ask_events);
     // 24h orphan sweep
-    for orphan in crate::dispatch_tracking::sweep_orphans(home) {
-        let tid = orphan.task_id.as_deref().unwrap_or("unknown");
-        crate::event_log::log(
-            home,
-            "dispatch_orphaned",
-            &orphan.to,
-            &format!("task_id={tid} dispatched_at={}", orphan.delegated_at),
-        );
-    }
+    let orphan_events: Vec<_> = crate::dispatch_tracking::sweep_orphans(home)
+        .into_iter()
+        .map(|orphan| {
+            let tid = orphan.task_id.as_deref().unwrap_or("unknown");
+            crate::event_log::event(
+                "dispatch_orphaned",
+                &orphan.to,
+                format!("task_id={tid} dispatched_at={}", orphan.delegated_at),
+            )
+        })
+        .collect();
+    crate::event_log::log_many(home, &orphan_events);
     // M3: 30-day TTL cleanup for terminal dispatch entries
     crate::dispatch_tracking::gc_old_entries(home);
 }

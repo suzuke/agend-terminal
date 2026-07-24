@@ -66,14 +66,39 @@ pub(crate) fn caller_process_context() -> String {
     format!("pid={pid} ppid={ppid} cwd={cwd}")
 }
 
-/// Append an event to the log file. Rotates when size exceeds MAX_LOG_SIZE.
-pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
-    let event = Event {
+/// Build a timestamped event without writing it — the batching counterpart to
+/// [`log`], for callers that hand a run of events to [`log_many`].
+///
+/// #2991: the stamp is taken HERE, when the event is produced, not when the
+/// batch is flushed. That keeps the distinct per-event timestamps a per-item
+/// `log` loop wrote instead of collapsing a whole run onto one flush instant.
+pub fn event(kind: &'static str, instance: &str, detail: String) -> Event {
+    Event {
         timestamp: chrono::Utc::now().to_rfc3339(),
         kind,
         instance: instance.to_string(),
-        detail: detail.to_string(),
-    };
+        detail,
+    }
+}
+
+/// Append an event to the log file. Rotates when size exceeds MAX_LOG_SIZE.
+pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
+    log_many(home, &[event(kind, instance, detail.to_string())]);
+}
+
+/// Append a run of pre-built events in ONE lock + append + fsync cycle.
+///
+/// #2991: writes the same lines N successive [`log`] calls would, but pays the
+/// flock + open + fsync once for the run instead of N times (~4.2ms each on the
+/// measured daemon filesystem). The durability unit becomes the batch: a crash
+/// mid-run loses the whole run rather than a prefix. That trade is only sound
+/// for high-volume ADVISORY events — destructive-audit call sites that carry
+/// recovery data (e.g. `branch_sweep`'s `restore_hint`) must keep using [`log`]
+/// so each record is durable before the next destructive step runs.
+pub fn log_many(home: &Path, events: &[Event]) {
+    if events.is_empty() {
+        return;
+    }
 
     // H4: size-check + rotation under lock to prevent TOCTOU race
     if let Err(e) = append_lines_under_lock(home, "event-log", |path| {
@@ -82,9 +107,12 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
                 rotate(path);
             }
         }
-        Ok(vec![serde_json::to_string(&event)?])
+        events
+            .iter()
+            .map(|e| Ok(serde_json::to_string(e)?))
+            .collect()
     }) {
-        tracing::warn!(error = %e, "failed to write event log entry");
+        tracing::warn!(error = %e, count = events.len(), "failed to write event log entries");
     }
 }
 
