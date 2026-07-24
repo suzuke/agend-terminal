@@ -2339,6 +2339,69 @@ fn foreign_passthrough_action_matrix_1463() {
     );
 }
 
+// Sparse-pollution root fix (port of the 2026-07-20 agend-git local patch): a
+// repo-local CONFIG write (`sparse-checkout` / `config`) in a FOREIGN repo must
+// flip ChdirPass → Passthrough. Pre-fix, `sparse-checkout` falls to classify's
+// `_` default arm (bound → ChdirPass) and the converter has no config-write
+// predicate, so a third-party tool's cwd-targeted
+// `git sparse-checkout set plugins/<x>` (Claude Code's plugin marketplace sync)
+// is redirected into the caller's bound worktree, writes `core.sparseCheckout`
+// + cone patterns into `config.worktree`, and silently EMPTIES the agent's
+// working tree while `git status` keeps reporting clean (four fleet incidents,
+// pattern `plugins/grafana-mcp`; the fourth hit a worktree whose owner session
+// was NOT the one syncing).
+#[test]
+fn foreign_repo_config_write_passthrough_matrix() {
+    use Action::*;
+    let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // The live incident shape: sparse-checkout write with a foreign cwd.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            ChdirPass("wt".into()),
+            "sparse-checkout",
+            &a(&["sparse-checkout", "set", "plugins/grafana-mcp"]),
+            true,
+        ),
+        Passthrough,
+        "foreign-cwd sparse-checkout must run against THAT repo, not be \
+         redirected into the bound worktree (sparse-pollution vector)"
+    );
+    // `config` shares the repo-local-write shape. Defense in depth: classify
+    // currently passes `config` through unconditionally, but the converter
+    // must not depend on that staying true.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            ChdirPass("wt".into()),
+            "config",
+            &a(&["config", "core.sparseCheckout", "true"]),
+            true,
+        ),
+        Passthrough,
+        "foreign-cwd config write must not be redirected into the bound worktree"
+    );
+    // NOT foreign: unchanged ChdirPass — an agent's own sparse-checkout keeps
+    // operating on its bound worktree.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            ChdirPass("wt".into()),
+            "sparse-checkout",
+            &a(&["sparse-checkout", "set", "plugins/x"]),
+            false,
+        ),
+        ChdirPass("wt".into())
+    );
+    // Non-ChdirPass inputs stay verbatim.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            Deny("x".into()),
+            "sparse-checkout",
+            &a(&["sparse-checkout", "set", "p"]),
+            true,
+        ),
+        Deny("x".into())
+    );
+}
+
 // #2027 (§3.9): a ref-naming `branch`/`tag` in a FOREIGN repo must pass through
 // (run against THAT repo), never be ChdirPass'd into the worktree — the
 // worktree-redirect is the success-lie (silent no-op + exit 0 for a create; a
