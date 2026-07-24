@@ -1327,7 +1327,7 @@ fn app_teardown(
 /// whitespace (the fat-fingered-space case — a real draft always carries a
 /// non-space char that marks it, so #1675 protection is preserved). EXCEPTION:
 /// bracketed paste (`ESC [ 200 ~`) wraps PASTED TEXT and IS composing.
-fn is_text_composing_input(bytes: &[u8]) -> bool {
+pub(crate) fn is_text_composing_input(bytes: &[u8]) -> bool {
     if bytes.first() == Some(&0x1b) {
         return bytes.starts_with(b"\x1b[200~");
     }

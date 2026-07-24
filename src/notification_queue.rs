@@ -100,6 +100,14 @@ pub fn flush_pending_input_activity(home: &Path) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn pending_input_count_for(home: &Path) -> usize {
+    PENDING_INPUT
+        .lock()
+        .map(|p| p.iter().filter(|e| e.0 == home).count())
+        .unwrap_or(0)
+}
+
 pub fn record_submit_activity(home: &Path, agent_name: &str) {
     agent_ops::save_metadata(
         home,
@@ -1676,5 +1684,108 @@ mod tests {
              (got typed=0 — flush is a no-op or lost the entry)"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2965: N rapid keystrokes must coalesce into a single pending
+    /// entry (same agent), not N entries — proving the upsert, not
+    /// just the deferral.
+    #[test]
+    fn multiple_keystrokes_coalesce_to_one_pending_entry() {
+        let home = tmp_home("multi_coalesce");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        for _ in 0..10 {
+            record_input_activity(&home, "agent1");
+        }
+        assert_eq!(
+            pending_input_count_for(&home),
+            1,
+            "10 keystrokes for the same agent must coalesce to 1 pending entry"
+        );
+        flush_pending_input_activity(&home);
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0,
+            "coalesced timestamp must be persisted after flush"
+        );
+        assert_eq!(
+            pending_input_count_for(&home),
+            0,
+            "flush must drain all pending entries for this home"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2965: submit remains immediately durable and the ordering
+    /// (input < submit) produces no false live-draft after flush.
+    #[test]
+    fn submit_immediate_no_false_draft_after_flush() {
+        let home = tmp_home("submit_order");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        std::thread::sleep(Duration::from_millis(2));
+        record_submit_activity(&home, "agent1");
+        // Submit is on disk already; input is still pending.
+        let (typed_pre, submit_pre) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(typed_pre, 0, "input must still be pending (not flushed)");
+        assert!(submit_pre > 0, "submit must be immediately durable");
+        // Now flush input.
+        flush_pending_input_activity(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            submit >= typed,
+            "submit (called after input) must be >= typed — no false draft \
+             (got typed={typed} submit={submit})"
+        );
+        assert_ne!(
+            draft_state(&home, "agent1"),
+            DraftState::Drafting,
+            "after submit, draft state must not be Drafting"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2965: bracketed-paste bytes pass `is_text_composing_input` and
+    /// therefore follow the coalesced `record_input_activity` path —
+    /// exercised by verifying the paste lands in the pending buffer,
+    /// not on disk.
+    #[test]
+    fn bracketed_paste_follows_coalesced_path() {
+        let home = tmp_home("paste_coalesce");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        let paste = b"\x1b[200~pasted text\x1b[201~";
+        assert!(
+            crate::app::is_text_composing_input(paste),
+            "bracketed paste must be classified as composing input"
+        );
+        record_input_activity(&home, "agent1");
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            typed, 0,
+            "paste-triggered record_input_activity must coalesce (not flush)"
+        );
+        flush_pending_input_activity(&home);
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert!(typed > 0, "paste timestamp must be durable after flush");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2965 wiring guard: `write_to_focused` must call
+    /// `record_input_activity` and `sync_badges` must call
+    /// `flush_pending_input_activity`. A source-scan test (same
+    /// pattern as `test_setups_acquire_drain_lock_with_retry_not_raw`)
+    /// so a refactor that drops either call site breaks the test.
+    #[test]
+    fn wiring_guard_write_to_focused_records_sync_badges_flushes() {
+        let app_mod = std::fs::read_to_string("src/app/mod.rs").expect("read src/app/mod.rs");
+        assert!(
+            app_mod.contains("notification_queue::record_input_activity("),
+            "write_to_focused must call notification_queue::record_input_activity"
+        );
+        let app_state =
+            std::fs::read_to_string("src/app/app_state.rs").expect("read src/app/app_state.rs");
+        assert!(
+            app_state.contains("flush_pending_input_activity("),
+            "sync_badges must call flush_pending_input_activity"
+        );
     }
 }
