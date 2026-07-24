@@ -3220,6 +3220,18 @@ fn past_boot_grace() -> Instant {
     Instant::now() - crate::daemon::per_tick::NOTIFICATION_BOOT_GRACE - Duration::from_secs(1)
 }
 
+/// #2937: read seeded timestamps into the pre-computed map that
+/// `check_pane_input_not_submitted_for_agents` now expects.
+fn input_timestamps_for(home: &std::path::Path, agents: &[&str]) -> HashMap<String, (i64, i64)> {
+    agents
+        .iter()
+        .map(|a| {
+            let ts = crate::notification_queue::read_input_submit_timestamps(home, a);
+            (a.to_string(), ts)
+        })
+        .collect()
+}
+
 #[test]
 fn pane_input_not_submitted_emits_event_when_threshold_exceeded() {
     // Per-test unique agent name avoids cross-test sink_registry
@@ -3230,6 +3242,7 @@ fn pane_input_not_submitted_emits_event_when_threshold_exceeded() {
     // Typed 5 minutes ago, never submitted → must emit.
     let now_ms = chrono::Utc::now().timestamp_millis();
     seed_input_submit(&home, agent, now_ms - 300_000, 0);
+    let ts = input_timestamps_for(&home, &[agent]);
     let sink = std::sync::Arc::new(TestSink {
         events: parking_lot::Mutex::new(Vec::new()),
     });
@@ -3240,6 +3253,7 @@ fn pane_input_not_submitted_emits_event_when_threshold_exceeded() {
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     let events = sink.events.lock();
     let matched = events.iter().filter_map(|e| match e {
@@ -3262,6 +3276,7 @@ fn pane_input_not_submitted_skips_when_within_threshold() {
     // Typed 5s ago — well within default 60s threshold → no emit.
     let now_ms = chrono::Utc::now().timestamp_millis();
     seed_input_submit(&home, agent, now_ms - 5_000, 0);
+    let ts = input_timestamps_for(&home, &[agent]);
     let sink = std::sync::Arc::new(TestSink {
         events: parking_lot::Mutex::new(Vec::new()),
     });
@@ -3272,6 +3287,7 @@ fn pane_input_not_submitted_skips_when_within_threshold() {
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     let events = sink.events.lock();
     for e in events.iter() {
@@ -3292,6 +3308,7 @@ fn pane_input_not_submitted_skips_when_submit_caught_up() {
     // Typed 5min ago AND submitted 4min ago (submit > 0 and >= typed).
     let now_ms = chrono::Utc::now().timestamp_millis();
     seed_input_submit(&home, agent, now_ms - 300_000, now_ms - 240_000);
+    let ts = input_timestamps_for(&home, &[agent]);
     let sink = std::sync::Arc::new(TestSink {
         events: parking_lot::Mutex::new(Vec::new()),
     });
@@ -3302,6 +3319,7 @@ fn pane_input_not_submitted_skips_when_submit_caught_up() {
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     let events = sink.events.lock();
     for e in events.iter() {
@@ -3327,6 +3345,7 @@ fn pane_input_not_submitted_now_fires_for_non_claude_backend() {
     let home = fleet_with_backend("pin_nonclaude", agent, "kiro-cli");
     let now_ms = chrono::Utc::now().timestamp_millis();
     seed_input_submit(&home, agent, now_ms - 300_000, 0);
+    let ts = input_timestamps_for(&home, &[agent]);
     let sink = std::sync::Arc::new(TestSink {
         events: parking_lot::Mutex::new(Vec::new()),
     });
@@ -3337,6 +3356,7 @@ fn pane_input_not_submitted_now_fires_for_non_claude_backend() {
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     let events = sink.events.lock();
     let fired = events.iter().any(|e| {
@@ -3361,6 +3381,7 @@ fn pane_input_not_submitted_dedups_per_typed_timestamp() {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let typed_ms = now_ms - 300_000;
     seed_input_submit(&home, agent, typed_ms, 0);
+    let ts = input_timestamps_for(&home, &[agent]);
     let sink = std::sync::Arc::new(TestSink {
         events: parking_lot::Mutex::new(Vec::new()),
     });
@@ -3372,12 +3393,14 @@ fn pane_input_not_submitted_dedups_per_typed_timestamp() {
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     check_pane_input_not_submitted_for_agents(
         &home,
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     let events = sink.events.lock();
     let count = events
@@ -3411,6 +3434,7 @@ fn pane_input_not_submitted_suppressed_during_boot_grace() {
     let home = fleet_with_backend("pin_bootgrace", agent, "claude");
     let now_ms = chrono::Utc::now().timestamp_millis();
     seed_input_submit(&home, agent, now_ms - 300_000, 0);
+    let ts = input_timestamps_for(&home, &[agent]);
     let sink = std::sync::Arc::new(TestSink {
         events: parking_lot::Mutex::new(Vec::new()),
     });
@@ -3423,6 +3447,7 @@ fn pane_input_not_submitted_suppressed_during_boot_grace() {
         &[agent.to_string()],
         &mut tracks,
         Instant::now(),
+        &ts,
     );
     let fired_in_grace = sink.events.lock().iter().any(|e| {
         matches!(
@@ -3444,6 +3469,7 @@ fn pane_input_not_submitted_suppressed_during_boot_grace() {
         &[agent.to_string()],
         &mut tracks,
         past_boot_grace(),
+        &ts,
     );
     let count_after = sink
             .events
