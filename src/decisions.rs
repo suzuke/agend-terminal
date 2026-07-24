@@ -378,18 +378,63 @@ pub fn list_pending(home: &Path) -> Vec<Decision> {
 /// "you asked something" badge without each caller re-scanning `decisions/`
 /// (the same disk-I/O-storm shape `should_sync_notifications` already
 /// documents and throttles for the notification badge).
+#[derive(Clone)]
 pub struct PendingDecisionCounts {
     pub total: usize,
     pub by_author: std::collections::HashMap<String, usize>,
 }
 
+/// #3031: memoized result of the last [`count_pending`] scan, keyed by the
+/// decisions directory and its modified time.
+///
+/// The TUI badge re-tallies once a second (`app::DECISION_SYNC_INTERVAL`), and
+/// each tally previously re-read and re-parsed every file in `decisions/` — a
+/// cost that grows with total history, not with the pending count. Decisions
+/// mutate rarely compared to that cadence, so nearly every tally can be served
+/// from the previous one.
+///
+/// Keying on the directory mtime is sound because every canonical decision
+/// write goes through [`save`] → `store::atomic_write`, which lands a temp file
+/// in this same directory and `rename`s it into place; creates, updates and
+/// deletes all move the directory's mtime, including ones made by another
+/// process. A write that bypasses `atomic_write` does not, and is unsupported.
+static PENDING_COUNT_CACHE: std::sync::Mutex<
+    Option<(
+        std::path::PathBuf,
+        std::time::SystemTime,
+        PendingDecisionCounts,
+    )>,
+> = std::sync::Mutex::new(None);
+
 pub fn count_pending(home: &Path) -> PendingDecisionCounts {
+    let dir = decisions_dir(home);
+    // No readable mtime (directory absent, or a stat error): bypass the cache
+    // entirely rather than guessing — scan, and leave any existing entry alone.
+    let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+
+    if let Some(mtime) = mtime {
+        if let Ok(cache) = PENDING_COUNT_CACHE.lock() {
+            if let Some((cached_dir, cached_mtime, counts)) = cache.as_ref() {
+                if cached_dir == &dir && cached_mtime == &mtime {
+                    return counts.clone();
+                }
+            }
+        }
+    }
+
     let mut by_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for d in list_pending(home) {
         *by_author.entry(d.author).or_insert(0) += 1;
     }
     let total = by_author.values().sum();
-    PendingDecisionCounts { total, by_author }
+    let counts = PendingDecisionCounts { total, by_author };
+
+    if let Some(mtime) = mtime {
+        if let Ok(mut cache) = PENDING_COUNT_CACHE.lock() {
+            *cache = Some((dir, mtime, counts.clone()));
+        }
+    }
+    counts
 }
 
 pub fn list(home: &Path, args: &Value) -> Value {
