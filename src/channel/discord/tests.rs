@@ -1,5 +1,3 @@
-use super::*;
-
 use crate::channel::ChannelEvent;
 use serial_test::serial;
 

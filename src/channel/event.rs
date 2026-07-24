@@ -6,9 +6,8 @@
 //! and Slack's `channel_deleted` all map to
 //! [`ChannelEvent::BindingRevoked`] with an appropriate [`RevokeReason`].
 //!
-//! **Status (T1 prep scaffold):** types carry minimum-viable fields so the
-//! trait compiles. Expansion (reactions, attachment metadata, typing events)
-//! lands alongside concrete adapter ports in T1b / Stage B.
+//! The payloads stay transport-neutral; adapters map platform-specific events
+//! into these variants before the UX and daemon layers consume them.
 
 use super::BindingRef;
 use chrono::{DateTime, Utc};

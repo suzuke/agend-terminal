@@ -4,11 +4,8 @@
 //! Discord / Slack / Matrix adapters) implement. The public contract is
 //! documented in `docs/FEATURE-channels.md`.
 //!
-//! **Status (T1 prep scaffold):** this module is intentionally unused by any
-//! call site. PR2 in the T1 series (the atomic type cut-over) is the one that
-//! wires `Arc<Mutex<TelegramState>>` leaks through `Bootstrap` / `Daemon` /
-//! `App` onto this trait. Everything here carries `#[allow(dead_code)]` until
-//! then — the dead-code allow is consumed in PR2.
+//! The transport contract is shared by the configured channel adapters and the
+//! UX/event layer; concrete adapters register themselves during bootstrap.
 //!
 //! ## Design decisions frozen in this PR
 //!
@@ -25,10 +22,9 @@
 //!   Concrete adapters must opt-in per capability. This makes a new adapter's
 //!   feature matrix explicit at review time.
 
-// Entire module is scaffold-only in this PR — consumed in PR2 (T1 main
-// atomic cut-over). Silences dead-code on type defs and unused-imports
-// on the `pub use` re-exports below.
-#![allow(dead_code, unused_imports)]
+// The channel contract intentionally exposes forward-compatible adapter and UX
+// variants that are not all exercised by the current Telegram-only runtime.
+#![allow(dead_code)]
 
 pub mod auth;
 pub mod binding;
@@ -47,10 +43,13 @@ pub mod ux_event;
 
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};
+#[allow(unused_imports)]
 pub use event::{
     Attachment, AttachmentKind, ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User,
 };
+#[allow(unused_imports)]
 pub use sink_registry::{registry, UxSinkRegistry};
+#[allow(unused_imports)]
 pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxEventSink};
 
 use crate::agent::AgentRegistry;

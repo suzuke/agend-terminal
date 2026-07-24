@@ -24,10 +24,16 @@ pub(crate) use adapter::*;
 pub(crate) use bootstrap::*;
 pub(crate) use bot_api::*;
 pub(crate) use creds::*;
+#[allow(unused_imports)]
 pub(crate) use error::*;
+#[allow(unused_imports)]
 pub(crate) use inbound::*;
+#[allow(unused_imports)]
 pub(crate) use notify::*;
+#[allow(unused_imports)]
 pub(crate) use reply::*;
+#[allow(unused_imports)]
 pub(crate) use send::*;
+#[allow(unused_imports)]
 pub(crate) use state::*;
 pub(crate) use topic_registry::*;

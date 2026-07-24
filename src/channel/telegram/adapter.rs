@@ -11,8 +11,6 @@ use crate::channel::telegram::send::{
 use crate::channel::telegram::state::{block_on_value, lock_state, TelegramState};
 use crate::channel::telegram::topic_registry::{create_topic_for_instance, delete_topic};
 use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::MessageId;
@@ -440,7 +438,8 @@ impl crate::channel::Channel for TelegramChannel {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::channel::telegram::topic_registry::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn tmp_home(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

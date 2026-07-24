@@ -1,12 +1,5 @@
 use super::*;
-use crate::agent::AgentRegistry;
-use crate::channel::{
-    BindingRef, Channel, ChannelCapabilities, ChannelError, ChannelEvent, MarkdownDialect,
-    MentionStyle, MsgRef, OutMsg, RateBudget,
-};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::mpsc;
+use crate::channel::{BindingRef, ChannelEvent};
 
 // ---------------------------------------------------------------------------
 // Gateway frame parsing — maps raw JSON to typed payloads / events

@@ -49,13 +49,6 @@
 //! `sync_all`), named by a hash of the CANONICAL key only (no raw parts in the path),
 //! with a per-key `.lock` sidecar.
 
-// #2741 slice 1 is the delivery FOUNDATION only: this module's API is exercised by
-// its own tests and is wired into production by slice 2 (the reviewer-obligation
-// reconciler, which calls `deliver_once` and `gc_stale`). Until that lands there is
-// deliberately no production caller — allow dead_code so the unwired foundation
-// builds clean; the allow is removed when slice 2 wires it.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -65,6 +58,7 @@ use chrono::{DateTime, Utc};
 /// thus any review obligation that could re-attempt a delivery, can live. A ledger
 /// key MUST outlive every caller that might retry for its exact head, so retention
 /// is `>=` that bound (not the 24h handoff-track TTL).
+#[allow(dead_code)]
 pub(crate) fn ledger_retention() -> chrono::Duration {
     chrono::Duration::hours(crate::daemon::ci_watch::MAX_WATCH_AGE_HOURS)
 }
@@ -303,6 +297,7 @@ fn quarantine_corrupt_locked(path: &Path) {
 /// unreadable / corrupt / key-mismatched ⇒ false (eligible). Never mutates — a
 /// corrupt record is left for a lock-holding [`deliver_once`] / [`gc_stale`] to
 /// quarantine, so this read cannot race a concurrent publish.
+#[allow(dead_code)]
 pub(crate) fn is_delivered(home: &Path, key: &DeliveryKey) -> bool {
     classify(home, key) == Classification::Delivered
 }
@@ -346,6 +341,7 @@ where
 /// [`ledger_retention`]. Takes the same per-key lock as [`deliver_once`] before
 /// mutating; a lock-acquire FAILURE skips that key (never deletes fail-open). A
 /// corrupt record is quarantined (under the lock). Best-effort; never panics.
+#[allow(dead_code)]
 pub(crate) fn gc_stale(home: &Path, now: DateTime<Utc>) {
     let d = dir(home);
     let entries = match std::fs::read_dir(&d) {
