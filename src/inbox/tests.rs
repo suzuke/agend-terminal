@@ -915,6 +915,18 @@ fn drain_auto_acks_daemon_notifications() {
             "[channel-reply-discharged] general closed m-125 without a reply — \
              reason: stale, operator no longer needs an answer.",
         ),
+        // t-…-11 (2026-07-23 live sample): the stale-helper alert is a one-shot
+        // daemon FYI whose remedy is operator-side (reinstall helpers); the
+        // recipient has nothing to ack. Un-listed it looped: drain → delivering
+        // → reclaim-TTL (drains spaced past the TTL, so implicit ack never
+        // fired) → unread → poll-reminder re-nag, forever.
+        (
+            "helper_staleness_watchdog",
+            "system:helper_staleness_watchdog",
+            "[helper_staleness_watchdog] helper 'agend-mcp-bridge' is older \
+             than the daemon binary. Run `cargo install --path . --force` \
+             then restart the daemon.",
+        ),
     ] {
         let home = tmp_home(&format!("drain-{kind}-auto-ack"));
         let id = format!("m-{kind}");
@@ -1058,6 +1070,9 @@ fn reclaim_settles_stale_delivering_for_newly_audited_fire_and_forget_kinds() {
         // #2622 PR-2: the self-discharge operator notice — reclaim-level
         // consistency (in both #2636 lists from birth).
         "channel-reply-discharged",
+        // t-…-11: stale-helper alert — a pre-fix daemon left exactly such a
+        // row in `delivering`; reclaim must settle it, not re-deliver.
+        "helper_staleness_watchdog",
     ] {
         let home = tmp_home(&format!("reclaim-faf-{kind}"));
         enqueue(
