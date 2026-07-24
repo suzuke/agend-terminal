@@ -360,13 +360,6 @@ enum Commands {
         /// (kept as an alias for backward compatibility).
         #[arg(long, short = 'd')]
         detailed: bool,
-        /// #938: emit the pre-#938 JSON shape (`result.agents` top-level
-        /// passthrough) instead of the new `{"mode", "agents"}` envelope.
-        /// One-release-cycle deprecation window for operator JSON parsers
-        /// that hard-code the old shape. Removed after operator migration
-        /// completes. Has no effect without `--json`.
-        #[arg(long)]
-        legacy_json: bool,
     },
     /// Connect an external agent to the daemon
     Connect {
@@ -1055,11 +1048,7 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::List {
-            json,
-            detailed,
-            legacy_json,
-        }) => {
+        Some(Commands::List { json, detailed }) => {
             // Wave 1 CLI consolidation: `--detailed/-d` (or `--json`) shows
             // state/health/cmd via the daemon API. Plain `list` falls
             // back to scanning `*.port` files in the run dir — works
@@ -1067,9 +1056,7 @@ fn main() -> anyhow::Result<()> {
             // historical reason `list` and `status` were two commands).
             //
             // #938: plain output now surfaces a fallback-mode hint to
-            // stderr; JSON output gains a `mode` field. Operator JSON
-            // parsers pinning the pre-#938 shape can opt into
-            // `--legacy-json` for one release cycle.
+            // stderr; JSON output gains a `mode` field.
             let want_detailed = detailed || json;
             if want_detailed {
                 let api_resp = api::call(&home, &serde_json::json!({"method": api::method::LIST}));
@@ -1092,28 +1079,14 @@ fn main() -> anyhow::Result<()> {
                                 .collect(),
                         ),
                     };
-                    if legacy_json {
-                        // Pre-#938 shape passthrough: print
-                        // `{"agents": [...], ...}` exactly as the API
-                        // returned. One-release-cycle deprecation window.
-                        let payload = match &api_resp {
-                            Ok(resp) => resp["result"].clone(),
-                            Err(_) => serde_json::json!({"agents": agents_value}),
-                        };
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&payload).unwrap_or_default()
-                        );
-                    } else {
-                        let envelope = serde_json::json!({
-                            "mode": mode.as_str(),
-                            "agents": agents_value,
-                        });
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&envelope).unwrap_or_default()
-                        );
-                    }
+                    let envelope = serde_json::json!({
+                        "mode": mode.as_str(),
+                        "agents": agents_value,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&envelope).unwrap_or_default()
+                    );
                 } else {
                     // Detailed plain output: prefer rich API; fallback
                     // to flat names + mode hint if daemon offline.

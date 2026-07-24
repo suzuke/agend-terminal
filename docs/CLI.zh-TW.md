@@ -61,8 +61,8 @@ agend-terminal inject <name> <text...>
 daemon 的 in-memory registry 是判斷「哪些 agent 存在」的權威真實來源；`.port` 檔案是 TUI-bridge 的 per-agent socket 產物，只會在離線 fallback 中出現。需要權威輸出的 operator 腳本應透過管線使用 `--json`，而非去解析單純的 `list`。
 
 ```
-agend-terminal list [--detailed] [--json] [--legacy-json]
-agend-terminal ls   [--detailed] [--json] [--legacy-json]   # alias
+agend-terminal list [--detailed] [--json]
+agend-terminal ls   [--detailed] [--json]   # alias
 agend-terminal status                                       # alias of `list` (kept for back-compat; use --detailed for state/health/cmd)
 ```
 
@@ -82,8 +82,6 @@ agend-terminal status                                       # alias of `list` (k
 - `live` — daemon API 有回應；`agents` 為完整的 registry 回應（`state` / `health` / `backend` 欄位皆已填入）。
 - `fallback_daemon_stuck` — `.daemon` 的 PID 仍存活但 API 未回應（重啟途中、主迴圈卡住）。`agents` 攜帶來自 run-dir 掃描、僅含 `{name}` 的物件。可能是暫時性的；發出警報前請先重跑一次。若持續發生 → `agend-terminal admin cleanup-zombies`。
 - `fallback_daemon_absent` — 沒有 `.daemon` 檔案，或 PID 已死。請以 `agend-terminal app` / `agend-terminal start` 啟動一個 daemon。
-
-`--legacy-json` 可切回 #938 之前的結構（`{"agents": [...], ...}`，原樣透傳 API 回應，無 `mode` 欄位）。這是給硬編碼舊結構的 operator 解析器一個橫跨一個 release cycle 的棄用緩衝期；遷移後即移除。在沒有 `--json` 時此旗標無作用。
 
 當 `mode != live` 時，單純（非 JSON）的 `list` 會在 stderr 加上一行提示，讓互動式執行此指令的 operator 不必重跑 `--json` 也能看到 fallback 狀態。
 
