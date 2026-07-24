@@ -123,13 +123,19 @@ impl PerTickHandler for HangDetectionHandler {
             (hung, newly, left)
         };
 
-        // Phase 2/3: shared fleet snapshot — one load_arc per tick instead of
+        // Common case: no hung or left-hung agents → skip the fleet load entirely.
+        if hung_now.is_empty() && left_hung.is_empty() {
+            return;
+        }
+
+        // Phase 2/3: shared fleet snapshot — one load per tick instead of
         // O(hung) self_orch_status calls (each of which deep-clones the config).
-        // #1744-M7 fail-closed: Err → Unknown → escalate.
-        let fleet_arc =
-            crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home));
+        // Uses `try_load_fleet` semantics: missing fleet.yaml → determinate No
+        // (no teams configured), file-exists-but-unreadable → Unknown → escalate
+        // (#1744-M7 fail-closed).
+        let fleet_result = crate::teams::try_load_fleet(ctx.home);
         let self_orch = |name: &str| -> crate::teams::SelfOrchStatus {
-            match &fleet_arc {
+            match &fleet_result {
                 Ok(fleet) => {
                     match crate::teams::find_team_for_in(fleet, name).and_then(|t| t.orchestrator) {
                         Some(orch) if orch == name => crate::teams::SelfOrchStatus::Yes,
