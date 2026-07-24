@@ -64,6 +64,13 @@ pub fn record_input_activity(home: &Path, agent_name: &str) {
 /// timestamp. The daemon supervisor tick reads it via
 /// `last_submit_at_ms` and compares against `last_input_at_ms` for
 /// the typed-but-not-submitted detection.
+/// #2965: flush any in-memory pending input-activity timestamps to disk.
+/// Called from the ~1s `sync_badges` cadence so keystrokes coalesce into
+/// at most one durable metadata write per window instead of one per keystroke.
+pub fn flush_pending_input_activity(_home: &Path) {
+    // stub — production implementation in GREEN commit
+}
+
 pub fn record_submit_activity(home: &Path, agent_name: &str) {
     agent_ops::save_metadata(
         home,
@@ -1601,5 +1608,41 @@ mod tests {
             "drain-lock test setups must use `acquire_drain_lock` (retry-past-Err), \
              not a raw drain-lock `try_acquire_file_lock` — see #2666 / flake recurrence #3"
         );
+    }
+
+    // ── #2965: input-activity coalesce ──
+
+    /// RED: `record_input_activity` must NOT perform a durable metadata
+    /// write on every call — the write is deferred to
+    /// `flush_pending_input_activity`.
+    #[test]
+    fn input_activity_coalesced_not_flushed_immediately() {
+        let home = tmp_home("coalesce_not_imm");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            typed, 0,
+            "record_input_activity must not write to disk immediately — \
+             keystrokes coalesce until the next flush (got typed={typed})"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// RED: after an explicit flush the coalesced timestamp must be
+    /// durable on disk and readable by the draft-state machinery.
+    #[test]
+    fn coalesced_input_flushed_on_explicit_call() {
+        let home = tmp_home("coalesce_flush");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0,
+            "flush_pending_input_activity must persist the pending timestamp \
+             (got typed=0 — flush is a no-op or lost the entry)"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 }
