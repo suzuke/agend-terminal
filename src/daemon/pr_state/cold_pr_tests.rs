@@ -295,3 +295,81 @@ fn cold_pr_wrong_branch_fails_closed() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3040 RED: existing Unresolved state + diagnostic debounce → ensure_from_scm
+/// with resolved class must reconcile returned + persisted state, clear diagnostic,
+/// without calling SCM, preserving identity/CI/other state.
+#[test]
+fn ensure_reconciles_existing_unresolved() {
+    let home = tmp_home("t7-reconcile-unresolved");
+    let head = "f".repeat(40);
+
+    let mut s = new_for_branch("o/r", "feat/x", &head, ReviewClass::Unresolved);
+    s.pr_number = 10;
+    s.pr_author = "dev".into();
+    s.ci_state = CiState::Green {
+        sha: head.clone(),
+        observed_at: "2026-07-15T00:00:00Z".into(),
+    };
+    s.diagnostic_emitted_for_sha = Some(head.clone());
+    save(&home, &s).unwrap();
+
+    // No mock — fast path must not call SCM (would fail without a mock).
+    let state = ensure_from_scm(&home, "o/r", "feat/x", 10, &head, ReviewClass::Single)
+        .expect("existing state must succeed");
+
+    assert_eq!(
+        state.review_class,
+        ReviewClass::Single,
+        "Unresolved must reconcile to Single"
+    );
+    assert!(
+        state.diagnostic_emitted_for_sha.is_none(),
+        "diagnostic must clear on Unresolved → resolved"
+    );
+
+    let reloaded = load(&home, "o/r", "feat/x").expect("state file must exist");
+    assert_eq!(
+        reloaded.review_class,
+        ReviewClass::Single,
+        "persisted class must also be reconciled"
+    );
+    assert!(
+        reloaded.diagnostic_emitted_for_sha.is_none(),
+        "persisted diagnostic must also be cleared"
+    );
+
+    assert_eq!(state.repo, "o/r");
+    assert_eq!(state.branch, "feat/x");
+    assert_eq!(state.pr_number, 10);
+    assert_eq!(state.head_sha, head);
+    assert_eq!(state.pr_author, "dev");
+    assert!(
+        matches!(state.ci_state, CiState::Green { .. }),
+        "CI state must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3040: Dual floor must survive ensure_from_scm with Single — monotonic.
+#[test]
+fn ensure_preserves_dual_floor() {
+    let home = tmp_home("t8-dual-floor");
+    let head = "g".repeat(40);
+
+    let mut s = new_for_branch("o/r", "feat/x", &head, ReviewClass::Dual);
+    s.pr_number = 10;
+    save(&home, &s).unwrap();
+
+    let state = ensure_from_scm(&home, "o/r", "feat/x", 10, &head, ReviewClass::Single)
+        .expect("existing state must succeed");
+
+    assert_eq!(
+        state.review_class,
+        ReviewClass::Dual,
+        "Dual must be monotonic floor — Single must not downgrade"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
