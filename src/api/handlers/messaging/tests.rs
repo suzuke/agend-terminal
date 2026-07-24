@@ -3935,7 +3935,7 @@ fn cross_team_code_review_terminal_assignment_blocked_2957() {
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
     let assignment = seed_cross_team_review_subject(&home, reviewer_id);
 
-    crate::daemon::assignment_authority::record_terminal(
+    let _ = crate::daemon::assignment_authority::record_terminal(
         &home,
         "owner/repo",
         "fix/cross-team",
