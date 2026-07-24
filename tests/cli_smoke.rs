@@ -49,6 +49,18 @@ fn help_renders_known_subcommands() {
     );
 }
 
+/// The one-release compatibility window for `--legacy-json` has expired;
+/// the removed flag must fail at CLI parsing rather than silently selecting
+/// the pre-#938 payload.
+#[test]
+fn legacy_json_flag_is_rejected_after_sunset() {
+    cmd()
+        .args(["list", "--json", "--legacy-json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument '--legacy-json'"));
+}
+
 /// `agend bugreport` with a valid temp AGEND_HOME produces output under
 /// AGEND_HOME/bugreports rather than littering the caller's current directory.
 #[test]
