@@ -335,12 +335,25 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         // in any tracker's maybe_scan() doesn't kill the supervisor thread.
         // Mirrors the run_handlers_with_panic_guard pattern from per_tick.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // #2937: read input-submit timestamps once per tick for all live
+            // agents, then thread the map to both consumers (tick's
+            // awaiting-operator gate and the pane-input-not-submitted check).
+            let input_timestamps: HashMap<String, (i64, i64)> =
+                agent::live_agent_names_vec(&registry)
+                    .into_iter()
+                    .map(|name| {
+                        let ts =
+                            crate::notification_queue::read_input_submit_timestamps(&home, &name);
+                        (name, ts)
+                    })
+                    .collect();
             tick(
                 &home,
                 &registry,
                 &mut notify_tracks,
                 &mut pending_auth,
                 loop_started_at,
+                &input_timestamps,
             );
             process_error_recovery(
                 &home,
@@ -357,6 +370,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
                 &registry,
                 &mut pane_input_tracks,
                 loop_started_at,
+                &input_timestamps,
             );
             // W1.1 (#2050): the 12 inline tracker scans that ran here
             // (anti_stall … retention) moved to `PerTickHandler`s in
@@ -443,9 +457,16 @@ pub(crate) fn check_pane_input_not_submitted(
     registry: &AgentRegistry,
     tracks: &mut HashMap<String, PaneInputTrack>,
     loop_started_at: Instant,
+    input_timestamps: &HashMap<String, (i64, i64)>,
 ) {
     let agent_names = agent::live_agent_names_vec(registry);
-    check_pane_input_not_submitted_for_agents(home, &agent_names, tracks, loop_started_at);
+    check_pane_input_not_submitted_for_agents(
+        home,
+        &agent_names,
+        tracks,
+        loop_started_at,
+        input_timestamps,
+    );
 }
 
 /// Sprint 54 P2-3: pure-function variant of
@@ -458,6 +479,7 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
     agent_names: &[String],
     tracks: &mut HashMap<String, PaneInputTrack>,
     loop_started_at: Instant,
+    input_timestamps: &HashMap<String, (i64, i64)>,
 ) {
     // #1741 boot-grace: `tracks` (the per-agent last-emitted dedup) is in-memory
     // and zeroed on every daemon restart. Within the first ticks after a restart
@@ -479,8 +501,10 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
         if !pane_input_backend_supported(home, name) {
             continue;
         }
-        let (typed_ms, submit_ms) =
-            crate::notification_queue::read_input_submit_timestamps(home, name);
+        let (typed_ms, submit_ms) = input_timestamps
+            .get(name.as_str())
+            .copied()
+            .unwrap_or((0, 0));
         if typed_ms == 0 || typed_ms <= submit_ms {
             continue;
         }
@@ -661,6 +685,7 @@ fn tick(
     notify_tracks: &mut HashMap<String, NotifyTrack>,
     pending_auth: &mut HashMap<String, PendingAuthError>,
     loop_started_at: Instant,
+    input_timestamps: &HashMap<String, (i64, i64)>,
 ) {
     // Snapshot the agent names + handles so we can release the registry lock
     // before touching any per-agent core lock. Holding both at once risks
@@ -771,14 +796,15 @@ fn tick(
         // CR-2026-06-14 (concurrency): hoist the two per-agent disk reads that
         // feed the awaiting-operator gate OUT of the core lock. Both depend only
         // on (home, name), not on core state, so reading them lock-free here
-        // removes blocking file IO from the lock window. `read_input_submit_
-        // timestamps` was previously short-circuited behind `check_awaiting_
-        // operator`; computing it unconditionally is a cheap notification-queue
-        // read and the value is still only USED inside that gate, so behavior is
-        // unchanged.
+        // removes blocking file IO from the lock window.
+        // #2937: `input_timestamps` is pre-computed once per tick in `run_loop`
+        // and shared with `check_pane_input_not_submitted` — single read per
+        // agent per tick instead of two.
         let idle_expectation = idle_expectation_for(home, &name);
-        let (typed_ms, _submit_ms) =
-            crate::notification_queue::read_input_submit_timestamps(home, &name);
+        let (typed_ms, _submit_ms) = input_timestamps
+            .get(name.as_str())
+            .copied()
+            .unwrap_or((0, 0));
         let action: Option<NoticeAction> = {
             let mut core = core.lock();
 
