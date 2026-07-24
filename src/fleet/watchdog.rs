@@ -40,6 +40,11 @@ pub struct WatchdogConfig {
     /// Recipients for task-stall warnings. Default `[general, lead]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_stall_recipients: Vec<String>,
+    /// Recipients for helper-staleness alerts. Default `[general, lead]`,
+    /// filtered against the `instances:` map (ghost-inbox guard) — see
+    /// [`resolve_helper_staleness_recipients`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helper_staleness_recipients: Vec<String>,
     /// Recipient for the decision-timeout auto-default (operator-proceed)
     /// emission. Default `general`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +149,52 @@ pub fn resolve_task_stall_recipients(home: &Path) -> Vec<String> {
         }
     }
     vec!["general".to_string(), "lead".to_string()]
+}
+
+/// Recipients for helper-staleness alerts. Default `[general, lead]`. No env
+/// fallback — the env layer is deprecated and this field is new.
+///
+/// Ghost-inbox guard (t-20260723093520705757-38191-14): the resolved list is
+/// filtered against the fleet.yaml `instances:` map before use — enqueueing to
+/// a recipient with no instance just grows `~/.agend/inbox/<name>.jsonl`
+/// forever with nobody to drain it. A missing/unparseable fleet.yaml skips the
+/// filter (no fleet = no restriction, mirroring `tasks::acl::instance_exists`).
+/// If the filter empties the list, the proactive page is dropped (warned,
+/// deduped per process) — the operator-pull `agend-terminal doctor` still
+/// surfaces the same staleness.
+pub fn resolve_helper_staleness_recipients(home: &Path) -> Vec<String> {
+    let base = match load(home) {
+        Some(w) if !w.helper_staleness_recipients.is_empty() => w.helper_staleness_recipients,
+        _ => vec!["general".to_string(), "lead".to_string()],
+    };
+    let Some(instances) = fleet_instance_names(home) else {
+        return base;
+    };
+    let (kept, dropped): (Vec<String>, Vec<String>) =
+        base.into_iter().partition(|r| instances.contains(r));
+    if !dropped.is_empty() {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                dropped = ?dropped,
+                "helper-staleness recipients without a fleet.yaml instance \
+                 skipped (ghost-inbox guard)"
+            );
+        }
+    }
+    kept
+}
+
+/// The fleet.yaml `instances:` name set; `None` when fleet.yaml is missing or
+/// unparseable — callers then skip existence filtering (permissive).
+fn fleet_instance_names(home: &Path) -> Option<std::collections::HashSet<String>> {
+    let p = fleet_yaml_path(home);
+    if !p.exists() {
+        return None;
+    }
+    FleetConfig::load(&p)
+        .ok()
+        .map(|c| c.instances.keys().cloned().collect())
 }
 
 /// Recipient for the decision-timeout auto-default emission. Default `general`.
@@ -328,5 +379,39 @@ instances: {}
         assert_eq!(resolve_dev_idle_recipient(&home), "env-dev");
         clear_env();
         fs::remove_dir_all(&home).ok();
+    }
+
+    /// Ghost-inbox guard edges: recipients missing from `instances:` are
+    /// dropped; a map naming NONE of them resolves empty (proactive page
+    /// skipped); a missing fleet.yaml skips the filter entirely. Separate
+    /// homes per shape — `FleetConfig::load` caches by mtime, and two writes
+    /// to one path within the same second could serve the stale parse.
+    #[test]
+    fn helper_staleness_recipients_filtered_by_instances() {
+        let _g = env_guard();
+        clear_env();
+        let partial = tmp_home("hs-filter-partial");
+        write_fleet(&partial, "instances:\n  general: {}\n");
+        assert_eq!(
+            resolve_helper_staleness_recipients(&partial),
+            vec!["general".to_string()],
+            "lead has no instance — must be dropped, general kept"
+        );
+        let all_ghost = tmp_home("hs-filter-all-ghost");
+        write_fleet(&all_ghost, "instances: {}\n");
+        assert_eq!(
+            resolve_helper_staleness_recipients(&all_ghost),
+            Vec::<String>::new(),
+            "no default recipient has an instance — resolve empty, page skipped"
+        );
+        let no_yaml = tmp_home("hs-filter-no-yaml");
+        assert_eq!(
+            resolve_helper_staleness_recipients(&no_yaml),
+            vec!["general".to_string(), "lead".to_string()],
+            "no fleet.yaml = no restriction — unfiltered built-in default"
+        );
+        for h in [partial, all_ghost, no_yaml] {
+            fs::remove_dir_all(&h).ok();
+        }
     }
 }
