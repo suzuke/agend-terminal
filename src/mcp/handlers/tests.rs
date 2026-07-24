@@ -3937,7 +3937,7 @@ fn inbox_clear_via_mcp_clears_terminal_task() {
 }
 
 /// §3.9 (MED-5): a `kind=query` send (legacy `kind` alias) that falls back to the
-/// inbox (daemon API unreachable) must carry `kind` through — else its
+/// inbox (daemon API unreachable) must carry `request_kind` through — else its
 /// InboxMessage lands with `kind=None`, `obligation_reason` treats it as noise,
 /// and `inbox action=clear` silently swallows an unanswered query. Proven
 /// transitively: a compact-clear KEEPS the query unread (an obligation). With
@@ -3947,10 +3947,10 @@ fn fallback_send_preserves_query_kind_survives_clear_med5() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("med5-fallback-kind");
     // No daemon in tests → api::call fails → handle_send_to_instance's inbox
-    // fallback (the fixed path). `kind` (not `request_kind`) routes here.
+    // fallback (the fixed path).
     let r = handle_tool_rt(
         "send",
-        &json!({"instance": "target", "message": "are you there?", "kind": "query"}),
+        &json!({"instance": "target", "message": "are you there?", "request_kind": "query"}),
         "sender",
     );
     assert!(is_ok_result(&r), "fallback send must succeed: {r}");
@@ -3958,7 +3958,7 @@ fn fallback_send_preserves_query_kind_survives_clear_med5() {
     let clear = handle_tool("inbox", &json!({"action": "clear"}), "target");
     assert_eq!(
         clear["kept_unread_count"], 1,
-        "MED-5: a fallback kind=query must be kept UNREAD by clear (obligation): {clear}"
+        "MED-5: a fallback request_kind=query must be kept UNREAD by clear (obligation): {clear}"
     );
     assert_eq!(
         clear["cleared_count"], 0,
