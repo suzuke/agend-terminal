@@ -1608,11 +1608,11 @@ fn bind_self_creates_binding_and_worktree() {
     // fail with "binding.json must exist after bind_self".
     let home = std::env::temp_dir().join(format!("agend-p17-self-{}-ok", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    p17_setup_repo(&home, "agent-self");
+    let repo = p17_setup_repo(&home, "agent-self");
 
     let resp = handle_bind_self(
         &home,
-        &json!({"repository": "owner/name", "branch": "feat/p17"}),
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/p17"}),
         &sender_for("agent-self"),
     );
     assert_eq!(
@@ -1660,11 +1660,11 @@ fn bind_self_creates_binding_and_worktree() {
 #[test]
 fn bind_self_response_worktree_path_matches_written_binding_2550_w3() {
     let home = tmp_home("resp-matches-binding");
-    p17_setup_repo(&home, "agent-match");
+    let repo = p17_setup_repo(&home, "agent-match");
 
     let resp = handle_bind_self(
         &home,
-        &json!({"repository": "owner/name", "branch": "feat/w3-match"}),
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/w3-match"}),
         &sender_for("agent-match"),
     );
     assert_eq!(
@@ -1716,9 +1716,9 @@ fn bind_self_idempotent_same_agent_same_branch() {
     // mutating state.
     let home = std::env::temp_dir().join(format!("agend-p17-self-{}-idem", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    p17_setup_repo(&home, "agent-idem");
+    let repo = p17_setup_repo(&home, "agent-idem");
 
-    let args = json!({"repository": "owner/name", "branch": "feat/idem"});
+    let args = json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/idem"});
     let r1 = handle_bind_self(&home, &args, &sender_for("agent-idem"));
     assert_eq!(r1["bound"].as_bool(), Some(true), "first bind: {r1}");
     let r2 = handle_bind_self(&home, &args, &sender_for("agent-idem"));
@@ -1742,11 +1742,11 @@ fn bind_self_rejects_main_branch_with_e4_5() {
     // mapped to a stable code so agents can branch on it.
     let home = std::env::temp_dir().join(format!("agend-p17-self-{}-e45", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    p17_setup_repo(&home, "agent-e45");
+    let repo = p17_setup_repo(&home, "agent-e45");
 
     let resp = handle_bind_self(
         &home,
-        &json!({"repository": "owner/name", "branch": "main"}),
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "main"}),
         &sender_for("agent-e45"),
     );
     assert!(
@@ -1816,11 +1816,11 @@ fn bind_self_then_release_worktree_clean_state() {
     // .agend-managed marker all gone after release.
     let home = std::env::temp_dir().join(format!("agend-p17-self-{}-cycle", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    p17_setup_repo(&home, "agent-cycle");
+    let repo = p17_setup_repo(&home, "agent-cycle");
 
     let resp = handle_bind_self(
         &home,
-        &json!({"repository": "owner/name", "branch": "feat/cycle"}),
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/cycle"}),
         &sender_for("agent-cycle"),
     );
     assert_eq!(resp["bound"].as_bool(), Some(true));

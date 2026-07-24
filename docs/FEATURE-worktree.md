@@ -94,7 +94,7 @@ unproven remote branch state fails closed and preserves the branch.
 }
 ```
 
-`bind_self` binds the calling instance only. Use it for recovery, a safe rebind, or when the repository is resolved from fleet configuration. `repository_path` and the legacy `repository` argument are mutually exclusive; prefer `repository_path`.
+`bind_self` binds the calling instance only. Use it for recovery, a safe rebind, or when the repository is resolved from fleet configuration. Pass `repository_path` to specify the source repository explicitly; omit it to resolve from fleet.yaml.
 
 `rebase_mode:true` first runs the guarded repair/rebind path. It does not authorize overwriting another live lease.
 
