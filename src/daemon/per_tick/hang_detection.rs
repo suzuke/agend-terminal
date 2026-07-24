@@ -15,6 +15,7 @@
 
 use super::{PerTickHandler, TickContext};
 use crate::agent;
+use std::sync::Arc;
 
 pub(crate) struct HangDetectionHandler;
 
@@ -55,10 +56,15 @@ impl PerTickHandler for HangDetectionHandler {
         // persist that CLEAR (else a restart rehydrates the stale anchor and the
         // next unrelated Hung re-entry's `get_or_insert` keeps it → false
         // immediate escalation. codex catch).
+        // #2944: Phase 1 now retains the `Arc<CoreMutex<AgentCore>>` for each
+        // hung/left agent so Phases 2/3 can use them directly without
+        // re-locking the registry.
+        type CoreArc = Arc<crate::sync_audit::CoreMutex<crate::agent::AgentCore>>;
+        #[allow(clippy::type_complexity)]
         let (hung_now, newly_hung, left_hung): (
-            Vec<String>,
+            Vec<(String, CoreArc)>,
             std::collections::HashSet<String>,
-            Vec<String>,
+            Vec<(String, CoreArc)>,
         ) = {
             let reg = agent::lock_registry_tracked(ctx.registry, "hang_detection");
             let mut hung = Vec::new();
@@ -104,116 +110,85 @@ impl PerTickHandler for HangDetectionHandler {
                 }
                 let now_hung = core.health.state == crate::health::HealthState::Hung;
                 if now_hung {
-                    hung.push(name.to_string());
+                    hung.push((name.to_string(), Arc::clone(&handle.core)));
                     if just_detected {
                         newly.insert(name.to_string());
                     }
                 } else if was_hung {
                     // Hung → not-Hung this tick: `check_hang` cleared `hung_since`.
-                    left.push(name.to_string());
+                    left.push((name.to_string(), Arc::clone(&handle.core)));
                 }
             }
             (hung, newly, left)
         };
 
-        // Phase 2/3 (#1701 Hung half): a self-orchestrator stuck Hung past the
-        // confirm-window has no peer to relay — escalate operator P0, INDEPENDENT
-        // of `hang_auto_recovery_enabled` (a leaderless team must page even in
-        // recovery shadow mode). `self_orch_status` is a teams-file read (done
-        // lock-free); the confirm-window + cooldown gate (`hung_escalation_due`)
-        // then runs under a brief per-candidate re-lock and stamps, so a
-        // persisting Hung pages at most once per cooldown. Self-orch Hung is rare,
-        // so the re-lock cost is negligible.
-        // #1744-M7: fail-closed — escalate on `Yes` OR `Unknown` (teams config
-        // unreadable). A no-peer Hung P0 is high-cost to miss, so an indeterminate
-        // read errs toward paging; only a determinate `No` skips.
-        for name in hung_now {
-            if crate::teams::self_orch_status(ctx.home, &name) == crate::teams::SelfOrchStatus::No {
+        // Phase 2/3: shared fleet snapshot — one load_arc per tick instead of
+        // O(hung) self_orch_status calls (each of which deep-clones the config).
+        // #1744-M7 fail-closed: Err → Unknown → escalate.
+        let fleet_arc =
+            crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home));
+        let self_orch = |name: &str| -> crate::teams::SelfOrchStatus {
+            match &fleet_arc {
+                Ok(fleet) => {
+                    match crate::teams::find_team_for_in(fleet, name).and_then(|t| t.orchestrator) {
+                        Some(orch) if orch == name => crate::teams::SelfOrchStatus::Yes,
+                        _ => crate::teams::SelfOrchStatus::No,
+                    }
+                }
+                Err(_) => crate::teams::SelfOrchStatus::Unknown,
+            }
+        };
+
+        // Phase 2 (#1701 Hung half): escalate self-orchestrators stuck past the
+        // confirm-window. Uses stored Arc<CoreMutex> from Phase 1 — no registry
+        // re-lock. #2944: lock_registry eliminated from this loop.
+        for (name, core_arc) in &hung_now {
+            if self_orch(name) == crate::teams::SelfOrchStatus::No {
                 continue;
             }
-            // Re-lock briefly: run the confirm-window + cooldown gate (which
-            // stamps the hung cooldown on fire) and snapshot the escalation state
-            // for persistence — both under one lock so the snapshot reflects the
-            // gate's stamp.
             let (due, snapshot) = {
-                let reg = agent::lock_registry(ctx.registry);
-                reg.values()
-                    .find(|h| h.name.as_str() == name)
-                    .map(|h| {
-                        let mut core = h.core.lock();
-                        let due = core.health.hung_escalation_due(HUNG_ESCALATE_AFTER);
-                        (due, Some(core.health.escalation_snapshot()))
-                    })
-                    .unwrap_or((false, None))
+                let mut core = core_arc.lock();
+                let due = core.health.hung_escalation_due(HUNG_ESCALATE_AFTER);
+                (due, core.health.escalation_snapshot())
             };
             if due {
-                notify_self_orch_hung(&name);
+                notify_self_orch_hung(name);
             }
-            // #1744-H2: persist on first Hung detection (anchor `hung_since`) and
-            // whenever the escalation fires (stamp the hung cooldown) — both must
-            // survive a restart. Between those the snapshot is unchanged, so this
-            // does not write every tick a self-orch stays Hung.
-            if let Some(snapshot) = snapshot {
-                if newly_hung.contains(&name) || due {
-                    crate::daemon::escalation_persist::persist(ctx.home, &name, &snapshot);
-                }
+            if newly_hung.contains(name) || due {
+                crate::daemon::escalation_persist::persist(ctx.home, name, &snapshot);
             }
         }
 
-        // #1744-H2 (codex HIGH): a self-orchestrator that just LEFT Hung had its
-        // `hung_since` cleared in memory by `check_hang` — persist that cleared
-        // snapshot so a restart does not rehydrate the stale anchor. Only when a
-        // store entry already exists (it escalated / was tracked while Hung):
-        // skip otherwise so a never-persisted agent that merely flickered through
-        // Hung doesn't spawn a store entry. The snapshot's `hung_since` is now
-        // None; its crash budget / cooldowns (which DO matter) are preserved.
-        for name in left_hung {
-            persist_or_clear_left_hung_anchor(ctx, &name);
+        // Phase 3 (#1744-H2): persist cleared anchor for left-Hung self-orchestrators.
+        // #2944: uses stored Arc from Phase 1 — no registry re-lock.
+        for (name, core_arc) in &left_hung {
+            persist_or_clear_left_hung_anchor(ctx, name, core_arc, &self_orch);
         }
     }
 }
 
-/// #1744-H2 + #1870-H2: persist a left-Hung self-orchestrator's cleared anchor,
-/// or clear it in place if the agent has already left the registry. Extracted
-/// from the `left_hung` loop so the absent-agent (TOCTOU) branch is testable
-/// through a real entry.
+/// #1744-H2 + #1870-H2: persist a left-Hung self-orchestrator's cleared anchor.
+/// #2944: takes a pre-retained `core_arc` from Phase 1 and a shared fleet
+/// closure — no registry re-lock, no per-agent fleet load.
 ///
-/// - `self_orch_status == No` → peer-relayable, not our concern → skip.
-/// - no persisted store entry → never tracked while Hung → skip (don't spawn one).
-/// - agent in registry → persist its escalation snapshot (`hung_since` is now
-///   `None`; crash budget / cooldowns preserved). (#1744-H2)
-/// - agent ABSENT from the registry (unregistered between the `load_for` check
-///   and this read — the #1870-H2 TOCTOU) → no snapshot to persist, so clear
-///   `hung_since` in place; pre-fix this skipped and LEFT a stale anchor that a
-///   restart rehydrated into a false Hung P0.
-fn persist_or_clear_left_hung_anchor(ctx: &TickContext<'_>, name: &str) {
-    // #1744-M7: `Yes`|`Unknown` proceed (clearing on an indeterminate read is
-    // harmless + correct); only a determinate `No` skips.
-    if crate::teams::self_orch_status(ctx.home, name) == crate::teams::SelfOrchStatus::No {
+/// The TOCTOU branch (#1870-H2, agent absent from registry between Phase 1 and
+/// now) can no longer occur: Phase 1's `Arc::clone` keeps the core alive even
+/// if the handle is removed from the registry, so we always have a snapshot.
+fn persist_or_clear_left_hung_anchor(
+    ctx: &TickContext<'_>,
+    name: &str,
+    core_arc: &Arc<crate::sync_audit::CoreMutex<crate::agent::AgentCore>>,
+    self_orch: &dyn Fn(&str) -> crate::teams::SelfOrchStatus,
+) {
+    if self_orch(name) == crate::teams::SelfOrchStatus::No {
         return;
     }
     if crate::daemon::escalation_persist::load_for(ctx.home, name).is_none() {
         return;
     }
-    let snapshot = {
-        let reg = agent::lock_registry(ctx.registry);
-        reg.values()
-            .find(|h| h.name.as_str() == name)
-            .map(|h| h.core.lock().health.escalation_snapshot())
-    };
-    match snapshot {
-        Some(snapshot) => {
-            crate::daemon::escalation_persist::persist(ctx.home, name, &snapshot);
-            tracing::debug!(agent = %name, "#1744-H2: persisted cleared hung anchor on Hung exit");
-        }
-        None => {
-            crate::daemon::escalation_persist::clear_hung_since(ctx.home, name);
-            tracing::debug!(
-                agent = %name,
-                "#1870-H2: cleared hung anchor for agent absent from registry on Hung exit"
-            );
-        }
-    }
+    let snapshot = core_arc.lock().health.escalation_snapshot();
+    crate::daemon::escalation_persist::persist(ctx.home, name, &snapshot);
+    tracing::debug!(agent = %name, "#1744-H2: persisted cleared hung anchor on Hung exit");
 }
 
 /// #1701: how long a self-orchestrator must stay Hung before its hang escalates
@@ -298,10 +273,7 @@ mod tests {
     }
 
     /// #2944: Phase 2 must use the stored `Arc<CoreMutex<AgentCore>>` from
-    /// Phase 1 — no per-candidate registry re-lock. RED: the Phase 2 loop
-    /// currently re-locks the registry per hung agent via
-    /// `agent::lock_registry`, so a source-scan that forbids a Phase-2
-    /// re-lock will fail.
+    /// Phase 1 — no per-candidate registry re-lock.
     #[test]
     fn phase2_does_not_relock_registry_per_hung_agent() {
         let src = include_str!("../per_tick/hang_detection.rs");
@@ -309,25 +281,34 @@ mod tests {
         let phase2_start = src
             .find(phase2_marker)
             .expect("Phase 2/3 comment must exist");
+        // Scan only up to the test module boundary so the assertion
+        // string itself doesn't self-match.
+        let test_mod = "#[cfg(test)]";
         let phase2_src = &src[phase2_start..];
-        // After Phase 2 starts, neither the hung_now loop nor
-        // persist_or_clear_left_hung_anchor should call lock_registry.
+        let prod_only = match phase2_src.find(test_mod) {
+            Some(i) => &phase2_src[..i],
+            None => phase2_src,
+        };
+        // Build the needle from parts to avoid self-matching.
+        let needle = ["lock_registry", "("].concat();
         assert!(
-            !phase2_src.contains("lock_registry("),
-            "#2944: Phase 2/3 must use stored Arc handles from Phase 1, not re-lock the registry"
+            !prod_only.contains(&needle),
+            "#2944: Phase 2/3 production code must not re-lock the registry"
         );
     }
 
-    /// §3.9 #1870-H2 (real branch): a self-orch with a persisted hung record that
-    /// has LEFT the registry (the TOCTOU end-state — unregistered between the
-    /// `load_for` check and the registry read) gets its `hung_since` cleared in
-    /// place, NOT skipped. Pre-fix this skipped → a restart rehydrated the stale
-    /// anchor → false Hung P0. No teams file → `self_orch_status` = Unknown →
-    /// proceeds (#1744-M7).
+    /// #1870-H2 + #2944: a self-orch that left Hung gets its stale anchor
+    /// cleared via the stored Arc (no registry re-lock). The old TOCTOU gap
+    /// (absent from registry) is structurally closed: Phase 1's Arc::clone
+    /// keeps the core alive even if the handle is removed.
     #[test]
-    fn left_hung_anchor_cleared_when_agent_absent_from_registry_1870_h2() {
+    fn left_hung_anchor_cleared_via_stored_arc_1870_h2() {
+        use crate::agent::{AgentCore, ApiActivity};
+        use crate::sync_audit::CoreMutex;
+        use crate::vterm::VTerm;
+
         let home = std::env::temp_dir().join(format!(
-            "agend-h2-absent-{}-{}",
+            "agend-h2-arc-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -335,13 +316,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&home).ok();
-        // Make orch-1 a self-orchestrator (orchestrator of its own team) so the
-        // #1744-M7 gate proceeds (a non-self-orch is peer-relayable → skipped).
         crate::teams::create(
             &home,
             &serde_json::json!({"name": "t", "members": ["orch-1"], "orchestrator": "orch-1"}),
         );
-        // Persisted hung record (the agent was tracked while Hung).
         crate::daemon::escalation_persist::persist(
             &home,
             "orch-1",
@@ -358,7 +336,16 @@ mod tests {
             "precondition: a stale anchor is persisted"
         );
 
-        // Empty registry = the agent is absent (it unregistered).
+        // Core with hung_since already cleared (agent left Hung in Phase 1).
+        let core_arc = Arc::new(CoreMutex::new(AgentCore {
+            vterm: VTerm::new(80, 24),
+            subscribers: Vec::new(),
+            state: crate::state::StateTracker::new(None),
+            health: crate::health::HealthTracker::new(),
+            api_activity: ApiActivity::default(),
+            observed_status: None,
+        }));
+
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
         let configs = Arc::new(Mutex::new(HashMap::new()));
@@ -369,14 +356,15 @@ mod tests {
             configs: &configs,
         };
 
-        persist_or_clear_left_hung_anchor(&ctx, "orch-1");
+        let self_orch = |_: &str| crate::teams::SelfOrchStatus::Yes;
+        persist_or_clear_left_hung_anchor(&ctx, "orch-1", &core_arc, &self_orch);
 
         assert!(
             crate::daemon::escalation_persist::load_for(&home, "orch-1")
                 .unwrap()
                 .hung_since_epoch_ms
                 .is_none(),
-            "#1870-H2: an absent agent's stale hung anchor must be CLEARED, not left for restart rehydrate"
+            "#1870-H2: stored Arc must persist a cleared hung anchor"
         );
         std::fs::remove_dir_all(&home).ok();
     }
