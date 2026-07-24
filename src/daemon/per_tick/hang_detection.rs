@@ -297,6 +297,27 @@ mod tests {
         assert_eq!(HangDetectionHandler::new().name(), "hang_detection");
     }
 
+    /// #2944: Phase 2 must use the stored `Arc<CoreMutex<AgentCore>>` from
+    /// Phase 1 — no per-candidate registry re-lock. RED: the Phase 2 loop
+    /// currently re-locks the registry per hung agent via
+    /// `agent::lock_registry`, so a source-scan that forbids a Phase-2
+    /// re-lock will fail.
+    #[test]
+    fn phase2_does_not_relock_registry_per_hung_agent() {
+        let src = include_str!("../per_tick/hang_detection.rs");
+        let phase2_marker = "Phase 2/3";
+        let phase2_start = src
+            .find(phase2_marker)
+            .expect("Phase 2/3 comment must exist");
+        let phase2_src = &src[phase2_start..];
+        // After Phase 2 starts, neither the hung_now loop nor
+        // persist_or_clear_left_hung_anchor should call lock_registry.
+        assert!(
+            !phase2_src.contains("lock_registry("),
+            "#2944: Phase 2/3 must use stored Arc handles from Phase 1, not re-lock the registry"
+        );
+    }
+
     /// §3.9 #1870-H2 (real branch): a self-orch with a persisted hung record that
     /// has LEFT the registry (the TOCTOU end-state — unregistered between the
     /// `load_for` check and the registry read) gets its `hung_since` cleared in
