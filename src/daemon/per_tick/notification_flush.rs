@@ -63,7 +63,8 @@ pub(crate) fn flush_all_with<F>(home: &Path, mut injector: F)
 where
     F: FnMut(&str, &str) -> anyhow::Result<()>,
 {
-    let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
+    let Ok(fleet) = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home))
+    else {
         return;
     };
     for agent in fleet.instances.keys() {
