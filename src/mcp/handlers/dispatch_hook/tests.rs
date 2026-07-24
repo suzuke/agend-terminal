@@ -4328,9 +4328,9 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
         Some(&serde_json::json!(true)),
         "F7 RED: response.degraded must be boolean true when arm fails. Got: {result}"
     );
-    let warning = result.get("warning").expect(&format!(
-        "F7 RED: response must contain a 'warning' object when arm fails. Got: {result}"
-    ));
+    let warning = result.get("warning").unwrap_or_else(|| {
+        panic!("F7 RED: response must contain a 'warning' object when arm fails. Got: {result}")
+    });
     assert_eq!(
         warning.get("code").and_then(|v| v.as_str()),
         Some("ci_watch_arm_failed"),
