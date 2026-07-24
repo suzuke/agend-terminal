@@ -188,10 +188,19 @@ fn handle_mcp_tool_inner(
 ) -> Value {
     static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 
-    // #3033: refuse if outstanding workers already at cap — a single
-    // connection repeatedly timing out against a stuck tool must not
-    // accumulate threads without bound.
-    if OUTSTANDING.load(Ordering::Relaxed) >= MAX_MCP_WORKERS {
+    // #3033: atomic bounded admission — a single CAS prevents the
+    // check-then-act race where two threads both read (cap-1), both
+    // pass, and both increment past the cap.
+    if OUTSTANDING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            if cur >= MAX_MCP_WORKERS {
+                None
+            } else {
+                Some(cur + 1)
+            }
+        })
+        .is_err()
+    {
         return json!({
             "ok": false,
             "error": format!(
@@ -200,7 +209,6 @@ fn handle_mcp_tool_inner(
             )
         });
     }
-    OUTSTANDING.fetch_add(1, Ordering::Relaxed);
 
     struct WorkerGuard;
     impl Drop for WorkerGuard {
@@ -1627,23 +1635,29 @@ mod tests {
 
     /// #3033: when outstanding MCP tool workers reach MAX_MCP_WORKERS, the
     /// next call must be refused (ok:false) instead of spawning unboundedly.
+    /// After workers complete, capacity is released and new calls succeed.
     #[test]
-    fn worker_cap_rejects_when_exceeded() {
-        use std::sync::{Arc, Barrier};
+    fn worker_cap_rejects_then_releases() {
+        use std::sync::{mpsc, Arc, Barrier};
 
-        let barrier = Arc::new(Barrier::new(MAX_MCP_WORKERS + 1));
+        // ready_tx: each worker signals when its executor has started.
+        // hold: barrier that keeps all workers blocked until we release them.
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let hold = Arc::new(Barrier::new(MAX_MCP_WORKERS + 1));
 
         let mut handles = Vec::new();
         for _ in 0..MAX_MCP_WORKERS {
-            let b = barrier.clone();
+            let tx = ready_tx.clone();
+            let b = hold.clone();
             let h = std::thread::spawn(move || {
                 handle_mcp_tool_inner(
                     "inbox",
                     json!({}),
                     "caller".to_string(),
-                    Duration::from_secs(10),
+                    Duration::from_secs(30),
                     None,
                     move |_, _, _| {
+                        let _ = tx.send(());
                         b.wait();
                         json!({})
                     },
@@ -1651,11 +1665,17 @@ mod tests {
             });
             handles.push(h);
         }
+        drop(ready_tx);
 
-        // Give workers time to spawn and block on the barrier.
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait for all MAX_MCP_WORKERS executors to signal ready —
+        // deterministic, no sleep.
+        for _ in 0..MAX_MCP_WORKERS {
+            ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("worker did not start in time");
+        }
 
-        // The (cap+1)th call must be refused, not spawned.
+        // The (cap+1)th call must be refused.
         let resp = handle_mcp_tool_inner(
             "inbox",
             json!({}),
@@ -1676,11 +1696,29 @@ mod tests {
             "error must mention worker limit: {resp}"
         );
 
-        // Unblock all workers so they exit cleanly.
-        barrier.wait();
+        // Release all workers and join — capacity is freed.
+        hold.wait();
         for h in handles {
-            h.join().ok();
+            h.join().expect("worker panicked");
         }
+
+        // After release, a new call must succeed (capacity recovered).
+        let resp = handle_mcp_tool_inner(
+            "inbox",
+            json!({}),
+            "caller".to_string(),
+            Duration::from_secs(5),
+            None,
+            |_, _, _| json!({"recovered": true}),
+        );
+        assert_eq!(
+            resp["ok"], true,
+            "must succeed after workers released: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["recovered"], true,
+            "must return real result after recovery: {resp}"
+        );
     }
 }
 
