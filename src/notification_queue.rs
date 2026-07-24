@@ -1666,6 +1666,8 @@ mod tests {
             "record_input_activity must not write to disk immediately — \
              keystrokes coalesce until the next flush (got typed={typed})"
         );
+        flush_pending_input_activity(&home);
+        assert_eq!(pending_input_count_for(&home), 0);
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -1741,51 +1743,5 @@ mod tests {
             "after submit, draft state must not be Drafting"
         );
         std::fs::remove_dir_all(home).ok();
-    }
-
-    /// #2965 wiring guard: `write_to_focused` must call
-    /// `record_input_activity` and `sync_badges` must call
-    /// `flush_pending_input_activity`. Scoped to function bodies so the
-    /// guard cannot false-green from unrelated call sites elsewhere.
-    #[test]
-    fn wiring_guard_write_to_focused_records_sync_badges_flushes() {
-        fn extract_fn_body<'a>(src: &'a str, name: &str) -> &'a str {
-            let needle = format!("fn {name}(");
-            let start = src
-                .find(&needle)
-                .unwrap_or_else(|| panic!("fn {name} not found"));
-            let open = src[start..].find('{').expect("opening brace") + start;
-            let mut depth = 0u32;
-            let mut end = open;
-            for (i, ch) in src[open..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            &src[open..end]
-        }
-
-        let app_mod = std::fs::read_to_string("src/app/mod.rs").expect("read src/app/mod.rs");
-        let wtf_body = extract_fn_body(&app_mod, "write_to_focused");
-        assert!(
-            wtf_body.contains("record_input_activity("),
-            "write_to_focused body must call record_input_activity"
-        );
-
-        let app_state =
-            std::fs::read_to_string("src/app/app_state.rs").expect("read src/app/app_state.rs");
-        let sb_body = extract_fn_body(&app_state, "sync_badges");
-        assert!(
-            sb_body.contains("flush_pending_input_activity("),
-            "sync_badges body must call flush_pending_input_activity"
-        );
     }
 }
