@@ -1911,6 +1911,10 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
                 | "ci-watch-resumed"
                 | "poll"
                 | "pr-merged"
+                // t-…-11: stale-helper alert — paired with its
+                // `auto_ack_on_drain_kind` entry so a row an older daemon left
+                // in `delivering` is settled by reclaim, not re-delivered.
+                | "helper_staleness_watchdog"
                 // #2412 follow-up (kind-taxonomy audit): the rest of the
                 // pr-state FYI class (already fire-and-forget in
                 // `auto_ack_on_drain_kind` since #2506, but missing here —
@@ -1998,6 +2002,15 @@ fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
                 // with the `known_fire_and_forget_kind` entry above so the
                 // notice is inert on BOTH the drain-settle and reclaim paths.
                 | "channel-reply-discharged"
+                // t-…-11 (2026-07-23 live sample m-20260723071523456845-43):
+                // the stale-helper alert is a one-shot daemon FYI (the remedy
+                // is an operator-side reinstall; the recipient agent has no
+                // ack-worthy action). Left out of this list it looped forever:
+                // drain → delivering → reclaim-TTL (drains arrive ~20 min
+                // apart, past the TTL, so the implicit next-drain ack never
+                // fired) → unread → poll-reminder re-nag. Third recurrence of
+                // the #2412/#2506 kind-taxonomy class.
+                | "helper_staleness_watchdog"
         )
     )
 }
