@@ -5,6 +5,17 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+std::thread_local! {
+    static STORE_READ_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn read_store(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    STORE_READ_COUNT.with(|count| count.set(count.get() + 1));
+    std::fs::read_to_string(path)
+}
+
 /// #1990 item 2: paths already surfaced this boot, so a corrupt store emits ONE
 /// operator-visible `event_log` entry per (boot, path) rather than one per tick.
 /// Boot-scoped (a restart re-surfaces — the corruption either healed or persists).
@@ -88,7 +99,7 @@ fn handle_corrupt_store(path: &Path, error: &str) {
 
 /// Load a JSON file into a typed struct, returning default if missing or invalid.
 pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
-    let content = match std::fs::read_to_string(path) {
+    let content = match read_store(path) {
         Ok(c) => c,
         Err(_) => return T::default(),
     };
@@ -404,7 +415,7 @@ pub trait SchemaVersioned {
 /// `current_version`. Newer files surface as default + an error log rather
 /// than being silently downgraded.
 pub fn load_versioned<T: DeserializeOwned + Default>(path: &Path, current_version: u32) -> T {
-    let content = match std::fs::read_to_string(path) {
+    let content = match read_store(path) {
         Ok(s) => s,
         Err(_) => return T::default(),
     };
@@ -889,6 +900,21 @@ mod tests {
         fs::write(&path, r#"{"payload": ["legacy"]}"#).expect("w");
         let got: VersionedTestStore = load_versioned(&path, VersionedTestStore::CURRENT);
         assert_eq!(got.payload, vec!["legacy".to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_versioned_reads_backing_file_once() {
+        let dir = tmp_dir("versioned_single_read");
+        let path = dir.join("v.json");
+        fs::write(&path, r#"{"schema_version": 2, "payload": ["keep"]}"#).expect("w");
+
+        STORE_READ_COUNT.with(|count| count.set(0));
+        let got: VersionedTestStore = load_versioned(&path, VersionedTestStore::CURRENT);
+        let reads = STORE_READ_COUNT.with(|count| count.replace(0));
+
+        assert_eq!(got.payload, vec!["keep".to_string()]);
+        assert_eq!(reads, 1, "versioned load must read the backing file once");
         fs::remove_dir_all(&dir).ok();
     }
 
