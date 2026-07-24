@@ -7,6 +7,7 @@
 //! Sprint 25 P1 F1: per-tool timeout overrides + request budget enforcement.
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{path::Path, time::Duration};
 
 use super::HandlerCtx;
@@ -185,6 +186,29 @@ fn handle_mcp_tool_inner(
     action: Option<String>,
     exec: impl FnOnce(&str, &Value, &str) -> Value + Send + 'static,
 ) -> Value {
+    static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+
+    // #3033: refuse if outstanding workers already at cap — a single
+    // connection repeatedly timing out against a stuck tool must not
+    // accumulate threads without bound.
+    if OUTSTANDING.load(Ordering::Relaxed) >= MAX_MCP_WORKERS {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "worker limit reached ({MAX_MCP_WORKERS} outstanding) — \
+                 tool '{tool}' rejected; stuck workers may be accumulating"
+            )
+        });
+    }
+    OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+
+    struct WorkerGuard;
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     let key = content_key(tool, &args);
     let tool_owned = tool.to_string();
 
@@ -202,6 +226,7 @@ fn handle_mcp_tool_inner(
     let handle = std::thread::Builder::new()
         .name(format!("mcp_tool_{tool_owned}"))
         .spawn(move || {
+            let _guard = WorkerGuard;
             let result = exec(&exec_tool, &args, &instance);
             let _ = tx.send(result);
         });
@@ -216,7 +241,10 @@ fn handle_mcp_tool_inner(
                 json!({"ok": false, "error": format!("tool '{tool}' thread panicked")})
             }
         },
-        Err(e) => json!({"ok": false, "error": format!("spawn failed: {e}")}),
+        Err(e) => {
+            OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+            json!({"ok": false, "error": format!("spawn failed: {e}")})
+        }
     }
 }
 
