@@ -1231,7 +1231,9 @@ fn serve_loop_post_select(
     externals: &crate::agent::ExternalRegistry,
     configs: &crate::api::ConfigRegistry,
 ) -> Option<crate::agent::AgentExitEvent> {
-    maintenance.run_once(home, registry, externals, configs);
+    if exit_event.is_none() {
+        maintenance.run_once(home, registry, externals, configs);
+    }
     exit_event
 }
 
