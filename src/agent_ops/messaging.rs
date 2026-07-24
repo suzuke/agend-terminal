@@ -111,6 +111,9 @@ pub(crate) fn execute_send(
         Ok(()) => false,
         Err(e) => {
             if !is_assignment_backed_code_review(home, &request, from, target) {
+                if let SendOutcome::Error { ref error, .. } = e {
+                    crate::event_log::log(home, "send_cross_team_blocked", from, error);
+                }
                 return e;
             }
             true
@@ -252,16 +255,6 @@ fn check_team_isolation(home: &Path, from: &str, target: &str) -> Result<(), Sen
                 ),
             );
         } else {
-            crate::event_log::log(
-                home,
-                "send_cross_team_blocked",
-                from,
-                &format!(
-                    "target={target}, sender_team={:?}, target_team={:?}",
-                    from_team.as_ref().map(|t| &t.name),
-                    target_team.as_ref().map(|t| &t.name),
-                ),
-            );
             return Err(SendOutcome::Error {
                 error: format!(
                     "cross-team send blocked: '{from}' (team={:?}) → '{target}' (team={:?}). \

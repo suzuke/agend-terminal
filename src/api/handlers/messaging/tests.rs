@@ -3852,6 +3852,10 @@ fn cross_team_code_review_report_with_valid_assignment_delivers_2957() {
         &home,
         "send_cross_team_allowed_assignment"
     ));
+    assert!(
+        !audit_log_contains(&home, "send_cross_team_blocked"),
+        "valid assignment bypass must not emit contradictory blocked audit"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
