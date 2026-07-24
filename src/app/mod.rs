@@ -2617,7 +2617,7 @@ mod tests {
             b"\x1b[5~",     // PageUp
             b"\x1b[6~",     // PageDown
             b"\x1b[3~",     // Delete
-            b"\x1b[Z",      // Shift+Tab (BackTab, if ever forwarded)
+            b"\x1b[Z",      // Shift+Tab (BackTab)
             b"\x1bOP",      // F1
             b"\x1b",        // Esc
             b"\x1ba",       // Alt+a

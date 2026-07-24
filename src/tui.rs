@@ -180,7 +180,13 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
+        // Shift+Tab: crossterm reports it as a dedicated `BackTab` code on the
+        // legacy protocol, but as `Tab` + SHIFT under the Kitty keyboard
+        // protocol — both must emit the back-tab sequence (CSI Z) or the child
+        // (e.g. Claude Code's permission-mode cycle) never sees it.
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[Z".to_vec(),
         KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => b"\x1b[A".to_vec(),
         KeyCode::Down => b"\x1b[B".to_vec(),
@@ -226,6 +232,26 @@ mod tests {
                 "SUPER+{c} must not produce PTY bytes, got {bytes:?}"
             );
         }
+    }
+
+    #[test]
+    fn backtab_forwards_csi_z() {
+        // t-…-13: crossterm delivers Shift+Tab as `BackTab`; pre-fix it fell
+        // into the `_ => vec![]` arm and was silently swallowed, so the child
+        // never saw ESC [ Z (Claude Code's permission-mode cycle was dead).
+        assert_eq!(
+            key_to_bytes(KeyCode::BackTab, KeyModifiers::NONE),
+            b"\x1b[Z".to_vec(),
+            "BackTab must forward ESC [ Z"
+        );
+        // Kitty keyboard protocol shape: Tab + SHIFT modifier.
+        assert_eq!(
+            key_to_bytes(KeyCode::Tab, KeyModifiers::SHIFT),
+            b"\x1b[Z".to_vec(),
+            "Shift+Tab (kitty protocol) must forward ESC [ Z"
+        );
+        // Plain Tab is unchanged.
+        assert_eq!(key_to_bytes(KeyCode::Tab, KeyModifiers::NONE), vec![b'\t']);
     }
 
     #[test]
