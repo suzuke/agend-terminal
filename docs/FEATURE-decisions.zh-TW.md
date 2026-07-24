@@ -256,7 +256,7 @@ retention:
 2. 跳過：已封存、建立不足 14 天、帶受保護標籤
 3. 符合過期條件的決策移至 `decisions/.archive/`
 
-需要設定環境變數 `AGEND_RETENTION_DECISIONS_CUTOVER=1` 才會啟用自動過期掃描(舊的 `AGEND_RETENTION_CUTOVER=1` 仍相容啟用,但已棄用,請改用新旗標)。
+設定環境變數 `AGEND_RETENTION_DECISIONS_CUTOVER=1` 才會啟用自動過期掃描。
 
 這不是刪除機制；它是在保留舊紀錄供稽核的同時，降低有效查詢介面雜訊的方式。
 

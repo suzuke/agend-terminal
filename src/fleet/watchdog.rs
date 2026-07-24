@@ -2,32 +2,22 @@
 //! receives each watchdog / anti-stall / decision-timeout notification.
 //!
 //! These are fleet *topology* (agent + recipient names), so their home is
-//! `fleet.yaml`, not env vars. Five `AGEND_*` env vars previously carried them;
-//! they remain as a **deprecated fallback for one window**, so existing setups
-//! keep working unchanged. Resolution precedence for every field:
-//!
-//! 1. `fleet.yaml` `watchdog:` block (when the field is set / non-empty)
-//! 2. the legacy `AGEND_*` env var (deprecated — warns once per process)
-//! 3. the built-in default
-//!
-//! Remove the env layer after operators have migrated to `fleet.yaml`.
+//! `fleet.yaml`, not env vars. An omitted field uses its built-in default.
 
 use super::{fleet_yaml_path, FleetConfig};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `fleet.yaml` top-level `watchdog:` block. Every field is optional; an omitted
-/// field falls through to the env fallback, then the built-in default (see module
-/// docs). Defaults reproduce the pre-migration hard-coded behaviour exactly, so a
-/// fleet.yaml without a `watchdog:` block is byte-for-byte unchanged.
+/// field uses the built-in default. Defaults reproduce the pre-migration
+/// hard-coded behaviour exactly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WatchdogConfig {
     /// Legacy **single-agent mode** override for the dev-vantage idle watchdog.
     /// When set, the watchdog watches ONLY this agent (with the global
     /// `dev_idle_threshold_secs`) instead of iterating every fleet instance —
-    /// identical to the old `AGEND_IDLE_WATCHDOG_AGENT` behaviour. Omit it
-    /// (the default) to keep the modern per-instance iteration. Default: unset.
+    /// Omit it (the default) to keep the modern per-instance iteration.
+    /// Default: unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_watchdog_agent: Option<String>,
     /// Recipient for dev-vantage idle alerts. Default `lead`.
@@ -48,7 +38,7 @@ pub struct WatchdogConfig {
 
 /// Load the `watchdog:` block from `fleet.yaml` (cached by mtime via
 /// [`FleetConfig::load`]). `None` when fleet.yaml is missing/unparseable — the
-/// resolvers then fall through to the env / default layers.
+/// resolvers then use built-in defaults.
 fn load(home: &Path) -> Option<WatchdogConfig> {
     FleetConfig::load(&fleet_yaml_path(home))
         .ok()
@@ -59,88 +49,31 @@ fn nonempty(s: Option<String>) -> Option<String> {
     s.filter(|s| !s.trim().is_empty())
 }
 
-fn env_nonempty(var: &str) -> Option<String> {
-    std::env::var(var).ok().filter(|s| !s.trim().is_empty())
-}
-
-/// Warn once per process that a watchdog topology value came from the deprecated
-/// env fallback rather than `fleet.yaml`. Called per-tick, so dedup is mandatory.
-fn warn_env_deprecated(var: &str, warned: &AtomicBool) {
-    if !warned.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            env = var,
-            "watchdog topology via env is deprecated — move it to the fleet.yaml \
-             `watchdog:` block. The env fallback will be removed after the \
-             deprecation window."
-        );
-    }
-}
-
 /// Single-agent override for the dev-vantage idle watchdog. `Some` switches the
 /// watchdog to legacy single-agent mode; `None` keeps per-instance iteration.
-/// Precedence: fleet `watchdog.idle_watchdog_agent` > `AGEND_IDLE_WATCHDOG_AGENT`.
 pub fn resolve_idle_watchdog_agent(home: &Path) -> Option<String> {
-    if let Some(v) = load(home).and_then(|w| nonempty(w.idle_watchdog_agent)) {
-        return Some(v);
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    match env_nonempty("AGEND_IDLE_WATCHDOG_AGENT") {
-        Some(v) => {
-            warn_env_deprecated("AGEND_IDLE_WATCHDOG_AGENT", &WARNED);
-            Some(v)
-        }
-        None => None,
-    }
+    load(home).and_then(|w| nonempty(w.idle_watchdog_agent))
 }
 
 /// Recipient for dev-vantage idle alerts. Default `lead`.
 pub fn resolve_dev_idle_recipient(home: &Path) -> String {
-    if let Some(v) = load(home).and_then(|w| nonempty(w.dev_recipient)) {
-        return v;
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    match env_nonempty("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT") {
-        Some(v) => {
-            warn_env_deprecated("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT", &WARNED);
-            v
-        }
-        None => "lead".to_string(),
-    }
+    load(home)
+        .and_then(|w| nonempty(w.dev_recipient))
+        .unwrap_or_else(|| "lead".to_string())
 }
 
 /// Recipient for fleet-vantage idle alerts. Default `lead` (#1563).
 pub fn resolve_fleet_idle_recipient(home: &Path) -> String {
-    if let Some(v) = load(home).and_then(|w| nonempty(w.fleet_recipient)) {
-        return v;
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    match env_nonempty("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT") {
-        Some(v) => {
-            warn_env_deprecated("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT", &WARNED);
-            v
-        }
-        None => "lead".to_string(),
-    }
+    load(home)
+        .and_then(|w| nonempty(w.fleet_recipient))
+        .unwrap_or_else(|| "lead".to_string())
 }
 
-/// Recipients for task-stall warnings. Default `[general, lead]`. The env form
-/// is comma-separated; entries are trimmed and empties filtered.
+/// Recipients for task-stall warnings. Default `[general, lead]`.
 pub fn resolve_task_stall_recipients(home: &Path) -> Vec<String> {
     if let Some(w) = load(home) {
         if !w.task_stall_recipients.is_empty() {
             return w.task_stall_recipients;
-        }
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if let Some(custom) = env_nonempty("AGEND_TASK_STALL_RECIPIENTS") {
-        let parsed: Vec<String> = custom
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !parsed.is_empty() {
-            warn_env_deprecated("AGEND_TASK_STALL_RECIPIENTS", &WARNED);
-            return parsed;
         }
     }
     vec!["general".to_string(), "lead".to_string()]
@@ -148,17 +81,9 @@ pub fn resolve_task_stall_recipients(home: &Path) -> Vec<String> {
 
 /// Recipient for the decision-timeout auto-default emission. Default `general`.
 pub fn resolve_decision_timeout_recipient(home: &Path) -> String {
-    if let Some(v) = load(home).and_then(|w| nonempty(w.decision_timeout_recipient)) {
-        return v;
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    match env_nonempty("AGEND_DECISION_TIMEOUT_RECIPIENT") {
-        Some(v) => {
-            warn_env_deprecated("AGEND_DECISION_TIMEOUT_RECIPIENT", &WARNED);
-            v
-        }
-        None => "general".to_string(),
-    }
+    load(home)
+        .and_then(|w| nonempty(w.decision_timeout_recipient))
+        .unwrap_or_else(|| "general".to_string())
 }
 
 #[cfg(test)]
@@ -233,7 +158,7 @@ instances: {}
 
     #[test]
     fn omitted_block_defaults_to_builtins() {
-        // Zero-migration: a fleet.yaml without `watchdog:` + no env → built-ins.
+        // A fleet.yaml without `watchdog:` uses built-ins.
         let _g = env_guard();
         clear_env();
         let home = tmp_home("defaults");
@@ -252,7 +177,7 @@ instances: {}
 
     #[test]
     fn fleet_config_wins_over_env() {
-        // Precedence: fleet.yaml value beats the env fallback.
+        // Expired env values cannot override fleet.yaml.
         let _g = env_guard();
         clear_env();
         std::env::set_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT", "env-dev");
@@ -278,36 +203,26 @@ instances: {}
     }
 
     #[test]
-    fn env_used_when_fleet_field_absent() {
-        // Deprecation fallback: with no fleet value, the env wins over default.
+    fn expired_env_is_ignored_when_fleet_field_absent() {
         let _g = env_guard();
         clear_env();
         std::env::set_var("AGEND_IDLE_WATCHDOG_AGENT", "single-dev");
         std::env::set_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT", "env-fleet");
         let home = tmp_home("env-fallback");
         write_fleet(&home, "watchdog: {}\ninstances: {}\n");
-        assert_eq!(
-            resolve_idle_watchdog_agent(&home),
-            Some("single-dev".to_string())
-        );
-        assert_eq!(resolve_fleet_idle_recipient(&home), "env-fleet");
+        assert_eq!(resolve_idle_watchdog_agent(&home), None);
+        assert_eq!(resolve_fleet_idle_recipient(&home), "lead");
         clear_env();
         fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn task_stall_env_comma_split_and_whitespace_filtered() {
+    fn expired_task_stall_env_is_ignored() {
         let _g = env_guard();
         clear_env();
         std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", " alice, bob ,, carol ");
         let home = tmp_home("stall-split");
         write_fleet(&home, "instances: {}\n");
-        assert_eq!(
-            resolve_task_stall_recipients(&home),
-            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
-        );
-        // Whitespace-only env falls back to the built-in default.
-        std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", "   ");
         assert_eq!(
             resolve_task_stall_recipients(&home),
             vec!["general".to_string(), "lead".to_string()]
@@ -317,15 +232,13 @@ instances: {}
     }
 
     #[test]
-    fn missing_fleet_yaml_falls_back_to_env_then_default() {
-        // No fleet.yaml at all (load fails) → env, then default.
+    fn missing_fleet_yaml_uses_default_even_with_expired_env() {
         let _g = env_guard();
         clear_env();
         let home = tmp_home("no-yaml");
-        // No fleet.yaml written.
         assert_eq!(resolve_dev_idle_recipient(&home), "lead");
         std::env::set_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT", "env-dev");
-        assert_eq!(resolve_dev_idle_recipient(&home), "env-dev");
+        assert_eq!(resolve_dev_idle_recipient(&home), "lead");
         clear_env();
         fs::remove_dir_all(&home).ok();
     }

@@ -7,6 +7,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Changed
+
+- **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
+
 ## [0.11.2] — 2026-07-23
 
 ### Changed

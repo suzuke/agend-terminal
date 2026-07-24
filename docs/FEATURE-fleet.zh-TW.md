@@ -200,17 +200,14 @@ instance 使用。
 控制 idle watchdog 監看哪個 agent，以及由誰接收各種 watchdog／
 anti-stall／decision-timeout 通知。這些是 agent／接收者**名稱**
 （fleet 拓撲），所以放在這裡而非 env vars。每個欄位皆為
-選填；省略整個區塊（或某個欄位）時會退回到舊版 `AGEND_*` env var
-（已棄用），再退回到內建預設值。解析優先順序：
-
-**`watchdog:` 值 > `AGEND_*` env var（已棄用，僅警告一次）> 內建預設值。**
+選填；省略整個區塊（或某個欄位）時使用內建預設值。
 
 ```yaml
 watchdog:
-  # Legacy SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
+  # SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
   # watchdog watches ONLY this agent (with the global dev_idle_threshold_secs)
   # instead of iterating every fleet instance. Omit it (default) to keep the
-  # modern per-instance iteration. Mirrors AGEND_IDLE_WATCHDOG_AGENT.
+  # modern per-instance iteration.
   idle_watchdog_agent: dev
   # Recipient for dev-vantage idle alerts. Default: lead.
   dev_recipient: lead
@@ -225,11 +222,6 @@ watchdog:
   # Default: general.
   decision_timeout_recipient: general
 ```
-
-對應的 env var（`AGEND_IDLE_WATCHDOG_AGENT`、`AGEND_IDLE_WATCHDOG_DEV_RECIPIENT`、
-`AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT`、`AGEND_TASK_STALL_RECIPIENTS`、
-`AGEND_DECISION_TIMEOUT_RECIPIENT`）皆已**棄用**——它們還能再運作一個
-版本週期，但之後會被移除；參見 `docs/env-vars.md` §8。
 
 ### 環境變數
 

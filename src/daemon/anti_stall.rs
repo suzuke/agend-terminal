@@ -727,8 +727,8 @@ mod tests {
     /// enqueue. Exercises the REAL bus emit→fan-out→subscriber wiring.
     #[test]
     fn gate_on_emit_subscriber_matches_legacy_direct_enqueue() {
-        // Serialize against the `AGEND_TASK_STALL_RECIPIENTS` override tests so the
-        // env (hence `stall_recipients()`) is stable across both delivery paths.
+        // Keep the expired env name unset so this parity test exercises the
+        // canonical fleet/default resolution path in both delivery modes.
         let _g = env_lock();
         std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
         let task = make_task(

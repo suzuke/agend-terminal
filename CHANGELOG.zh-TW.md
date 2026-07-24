@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **移除已過期的環境變數別名** — watchdog 拓樸現在只讀 `fleet.yaml` 的 `watchdog:` 區塊；worktree 封存 fallback 只讀 `AGEND_WORKTREE_ARCHIVE_FALLBACK`；decisions retention 只讀 `AGEND_RETENTION_DECISIONS_CUTOVER`。
+
 ## [0.11.2] — 2026-07-23
 
 ### Changed
