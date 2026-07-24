@@ -103,10 +103,14 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
         Ok(c) => c,
         Err(_) => return T::default(),
     };
+    decode_store_content(path, &content)
+}
+
+fn decode_store_content<T: DeserializeOwned + Default>(path: &Path, content: &str) -> T {
     if content.trim().is_empty() {
         return T::default();
     }
-    match serde_json::from_str(&content) {
+    match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
             // #1990 item 2 + #2008 #8: back up (robustly) + surface, then default.
@@ -421,9 +425,9 @@ pub fn load_versioned<T: DeserializeOwned + Default>(path: &Path, current_versio
     };
     // Peek the raw JSON first so we can inspect schema_version without
     // committing to a full deserialize (which could fail on unknown required
-    // fields and mask the version check). Then hand off to [`load`] for the
-    // real decode, keeping a single source of truth for missing-file / empty
-    // / corrupt fallbacks.
+    // fields and mask the version check). Then hand off to the shared content
+    // decoder for the real decode, keeping a single source of truth for empty
+    // / corrupt fallbacks without reopening the file.
     let peek: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
@@ -445,7 +449,7 @@ pub fn load_versioned<T: DeserializeOwned + Default>(path: &Path, current_versio
         );
         return T::default();
     }
-    load(path)
+    decode_store_content(path, &content)
 }
 
 /// Versioned variant of [`mutate`]. Rejects future-versioned files on load
