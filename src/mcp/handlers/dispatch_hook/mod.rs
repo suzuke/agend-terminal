@@ -43,6 +43,9 @@ pub struct DispatchOutcome {
     /// `from_ref` did not resolve locally. Surfaces network I/O so
     /// callers can correlate slow dispatches with fetch fallback.
     pub fetch_attempted: bool,
+    /// `true` when the post-bind ci-watch arm failed (F7). The primary
+    /// dispatch succeeded; callers surface a degraded warning.
+    pub ci_watch_arm_failed: bool,
 }
 
 /// #781 Piece 7: structured error. The string-only `Result<_, String>`
@@ -657,9 +660,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // (auto-create-exempt) reaches here with task_id="" and MUST still arm. bind_self
     // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1). The
     // arming body lives in `auto_watch.rs` (file-size split).
+    let mut ci_watch_arm_failed = false;
     if arm_ci_watch {
         if let Some(r) = resolved_repo {
-            auto_watch::arm(
+            ci_watch_arm_failed = auto_watch::arm(
                 home,
                 target,
                 &r,
@@ -675,6 +679,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         source_repo_tier,
         auto_created_branch,
         fetch_attempted,
+        ci_watch_arm_failed,
     })
 }
 
