@@ -1051,6 +1051,32 @@ mod tests {
         });
     }
 
+    #[test]
+    #[tracing_test::traced_test]
+    fn cached_validation_warns_for_unknown_property() {
+        let entry = crate::mcp::registry::ToolEntry {
+            name: "required-field-warning-probe",
+            definition: counted_definition,
+            handler: dispatch_list_instances,
+            class: crate::mcp::registry::ToolClass::READ_ONLY,
+        };
+        let entries = [entry];
+        let cache = RequiredFieldCache::new();
+        let home = std::env::temp_dir();
+        let args = json!({"token": "ok", "bogus": 1});
+        let ctx = ctx_for(&home, &args, "");
+
+        assert!(
+            try_dispatch_with_cache("required-field-warning-probe", &ctx, &entries, &cache)
+                .is_some(),
+            "unknown properties remain warn-only"
+        );
+        assert!(
+            logs_contain("#1602: unknown parameter (ignored)"),
+            "cached production validation must retain the unknown-key warning"
+        );
+    }
+
     // ── Rank8 bug-audit: present-but-JSON-null required field ───────────────
     // `{"message": null}` slipped through validation because `args.get(req)`
     // returns `Some(Value::Null)` (not `None`), so `is_none()` saw it as
