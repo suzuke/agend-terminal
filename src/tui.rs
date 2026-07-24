@@ -229,6 +229,26 @@ mod tests {
     }
 
     #[test]
+    fn backtab_forwards_csi_z() {
+        // t-…-13: crossterm delivers Shift+Tab as `BackTab`; pre-fix it fell
+        // into the `_ => vec![]` arm and was silently swallowed, so the child
+        // never saw ESC [ Z (Claude Code's permission-mode cycle was dead).
+        assert_eq!(
+            key_to_bytes(KeyCode::BackTab, KeyModifiers::NONE),
+            b"\x1b[Z".to_vec(),
+            "BackTab must forward ESC [ Z"
+        );
+        // Kitty keyboard protocol shape: Tab + SHIFT modifier.
+        assert_eq!(
+            key_to_bytes(KeyCode::Tab, KeyModifiers::SHIFT),
+            b"\x1b[Z".to_vec(),
+            "Shift+Tab (kitty protocol) must forward ESC [ Z"
+        );
+        // Plain Tab is unchanged.
+        assert_eq!(key_to_bytes(KeyCode::Tab, KeyModifiers::NONE), vec![b'\t']);
+    }
+
+    #[test]
     fn ctrl_c_still_sends_sigint_0x03() {
         // Ctrl+C must still produce 0x03 (SIGINT) — not swallowed by SUPER guard.
         let bytes = key_to_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL);
