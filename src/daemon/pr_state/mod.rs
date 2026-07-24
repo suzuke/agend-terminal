@@ -927,10 +927,17 @@ pub fn ensure_from_scm(
     expected_head: &str,
     review_class: ReviewClass,
 ) -> anyhow::Result<PrState> {
-    // Phase 1: fast path — file already exists. Return it as-is and let
-    // the caller do the identity check (preserves existing error codes).
-    if let Some(existing) = load(home, repo, branch) {
-        return Ok(existing);
+    // Phase 1: fast path — file already exists. Reconcile review_class
+    // under flock (#3040: persisted Unresolved must adopt resolved class).
+    if let Some(reconciled) = with_pr_state(home, repo, branch, |state| {
+        let was_unresolved = matches!(state.review_class, ReviewClass::Unresolved);
+        state.review_class = reconcile_review_class(state.review_class, review_class);
+        if was_unresolved && !matches!(state.review_class, ReviewClass::Unresolved) {
+            state.diagnostic_emitted_for_sha = None;
+        }
+        state.clone()
+    })? {
+        return Ok(reconciled);
     }
 
     // Phase 2: no local file — confirm identity against SCM provider.
