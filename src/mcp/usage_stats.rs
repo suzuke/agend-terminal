@@ -159,9 +159,6 @@ fn append_line_with_policy(
     let lock_path = path.with_extension("jsonl.lock");
     let _lock = crate::store::acquire_file_lock(&lock_path).map_err(std::io::Error::other)?;
 
-    rotate_if_needed(path, policy);
-    prune_rotated_stats(path, policy, now);
-
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
