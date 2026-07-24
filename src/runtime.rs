@@ -73,8 +73,7 @@ impl AgentListMode {
     /// Stable string identifier for JSON output / log fields. The string
     /// values are part of the public contract surfaced by
     /// `agend-terminal list --json` post-#938 and MUST NOT change
-    /// silently — any rename here is a JSON-shape break that operators
-    /// can pin via `--legacy-json`.
+    /// silently — any rename here is a JSON-shape break.
     pub fn as_str(self) -> &'static str {
         match self {
             AgentListMode::Live => "live",

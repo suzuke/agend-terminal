@@ -61,8 +61,8 @@ List running agents. Plain `list` queries the daemon's in-memory registry via `r
 The daemon's in-memory registry is the canonical source of truth for "which agents exist"; the `.port` files are TUI-bridge per-agent socket artifacts and only surface in the offline fallback. Operator scripts wanting authoritative output should pipe `--json` rather than parse plain `list`.
 
 ```
-agend-terminal list [--detailed] [--json] [--legacy-json]
-agend-terminal ls   [--detailed] [--json] [--legacy-json]   # alias
+agend-terminal list [--detailed] [--json]
+agend-terminal ls   [--detailed] [--json]   # alias
 agend-terminal status                                       # alias of `list` (kept for back-compat; use --detailed for state/health/cmd)
 ```
 
@@ -82,8 +82,6 @@ agend-terminal status                                       # alias of `list` (k
 - `live` — daemon API answered; `agents` is the rich registry response (`state` / `health` / `backend` fields populated).
 - `fallback_daemon_stuck` — `.daemon` PID is alive but the API didn't respond (mid-restart, wedged main loop). `agents` carries `{name}`-only objects from the run-dir scan. May be transient; rerun before alerting. Persistent → `agend-terminal admin cleanup-zombies`.
 - `fallback_daemon_absent` — no `.daemon` file or PID dead. Boot a daemon with `agend-terminal app` / `agend-terminal start`.
-
-`--legacy-json` opts back into the pre-#938 shape (`{"agents": [...], ...}` passthrough of the API response, no `mode` field). One-release-cycle deprecation window for operator parsers that hard-code the old shape; remove after migration. Has no effect without `--json`.
 
 Plain (non-JSON) `list` adds a one-line stderr hint when `mode != live` so an operator running the command interactively sees the fallback state without re-running with `--json`.
 

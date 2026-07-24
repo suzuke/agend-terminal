@@ -58,7 +58,35 @@ fn legacy_json_flag_is_rejected_after_sunset() {
         .args(["list", "--json", "--legacy-json"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unexpected argument '--legacy-json'"));
+        .stderr(predicate::str::contains(
+            "unexpected argument '--legacy-json'",
+        ));
+}
+
+/// `list --json` always emits the canonical mode envelope after the legacy
+/// compatibility flag is removed.
+#[test]
+fn list_json_emits_canonical_mode_envelope() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-cli-smoke-list-json-envelope-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).expect("create home dir");
+
+    let output = cmd()
+        .env("AGEND_HOME", &home)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON output");
+    assert_eq!(value["mode"], "fallback_daemon_absent");
+    assert!(
+        value["agents"].is_array(),
+        "agents must remain an array: {value}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// `agend bugreport` with a valid temp AGEND_HOME produces output under
