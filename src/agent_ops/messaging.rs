@@ -107,9 +107,18 @@ pub(crate) fn execute_send(
     }
 
     // Phase 2: Policy gates
-    if let Err(e) = check_team_isolation(home, from, target) {
-        return e;
-    }
+    let cross_team_bypassed = match check_team_isolation(home, from, target) {
+        Ok(()) => false,
+        Err(e) => {
+            if !is_assignment_backed_code_review(home, &request, from, target) {
+                if let SendOutcome::Error { ref error, .. } = e {
+                    crate::event_log::log(home, "send_cross_team_blocked", from, error);
+                }
+                return e;
+            }
+            true
+        }
+    };
     if let Err(e) = check_quota_gate(registry, home, target, request.kind.as_deref()) {
         return e;
     }
@@ -143,6 +152,14 @@ pub(crate) fn execute_send(
     msg.validated_code_review = report_auth.receipt;
     if let Some(receipt) = msg.validated_code_review.as_ref() {
         msg.reviewed_head = Some(receipt.summary().reviewed_head.clone());
+    }
+    if cross_team_bypassed && msg.validated_code_review.is_some() {
+        crate::event_log::log(
+            home,
+            "send_cross_team_allowed_assignment",
+            from,
+            &format!("target={target}"),
+        );
     }
     if let Err(e) = check_worktree_enforcement(home, target, &request) {
         return e;
@@ -238,16 +255,6 @@ fn check_team_isolation(home: &Path, from: &str, target: &str) -> Result<(), Sen
                 ),
             );
         } else {
-            crate::event_log::log(
-                home,
-                "send_cross_team_blocked",
-                from,
-                &format!(
-                    "target={target}, sender_team={:?}, target_team={:?}",
-                    from_team.as_ref().map(|t| &t.name),
-                    target_team.as_ref().map(|t| &t.name),
-                ),
-            );
             return Err(SendOutcome::Error {
                 error: format!(
                     "cross-team send blocked: '{from}' (team={:?}) → '{target}' (team={:?}). \
@@ -269,6 +276,39 @@ fn check_team_isolation(home: &Path, from: &str, target: &str) -> Result<(), Sen
         );
     }
     Ok(())
+}
+
+/// #2957: lightweight pre-check for a typed code_review report whose active
+/// assignment authorises the cross-team return path. Fail-closed: any parse,
+/// lookup, or identity mismatch returns `false` and the generic gate fires.
+fn is_assignment_backed_code_review(
+    home: &Path,
+    request: &SendRequest,
+    from: &str,
+    target: &str,
+) -> bool {
+    if request.kind.as_deref() != Some("report")
+        || request.report_purpose.as_deref() != Some("code_review")
+    {
+        return false;
+    }
+    let cr = match &request.code_review {
+        Some(v) => v,
+        None => return false,
+    };
+    let id = match cr.get("assignment_id").and_then(|v| v.as_str()) {
+        Some(s) => match uuid::Uuid::parse_str(s) {
+            Ok(id) => id,
+            Err(_) => return false,
+        },
+        None => return false,
+    };
+    let Ok(assignment) =
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(home, id)
+    else {
+        return false;
+    };
+    assignment.target == from && assignment.sender == target
 }
 
 fn check_quota_gate(

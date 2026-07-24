@@ -2870,6 +2870,7 @@ fn analysis_decision_verified_is_not_a_code_review_receipt_2760() {
 }
 
 const RECEIPT_HEAD_2760: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const RECEIPT_HEAD_2957: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
 fn write_typed_review_fleet(
     home: &std::path::Path,
@@ -3729,5 +3730,293 @@ fn flat_review_fields_rejected_before_typed_conversion_2454() {
             .is_some_and(|s| s.contains("inside the typed code_review object")),
         "nested code_review must NOT be rejected as flat smuggling: {result}"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- #2957: cross-team code_review return path ---
+
+fn write_cross_team_review_fleet(
+    home: &std::path::Path,
+    reviewer_id: crate::types::InstanceId,
+    lead_id: crate::types::InstanceId,
+) {
+    let imposter_id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(home),
+        format!(
+            "instances:\n  \
+               ct-lead:\n    backend: claude\n    id: {lead}\n  \
+               ct-reviewer:\n    backend: claude\n    id: {rev}\n  \
+               ct-imposter:\n    backend: claude\n    id: {imp}\n\
+             teams:\n  alpha:\n    members: [ct-lead]\n    orchestrator: ct-lead\n",
+            lead = lead_id.full(),
+            rev = reviewer_id.full(),
+            imp = imposter_id.full(),
+        ),
+    )
+    .unwrap();
+}
+
+fn seed_cross_team_review_subject(
+    home: &std::path::Path,
+    reviewer_id: crate::types::InstanceId,
+) -> crate::daemon::assignment_authority::ActiveAssignment {
+    use crate::daemon::pr_state;
+    pr_state::record_ci_result(
+        home,
+        "owner/repo",
+        "fix/cross-team",
+        RECEIPT_HEAD_2957,
+        pr_state::CiConclusion::Green,
+        vec!["ct-lead".into()],
+        pr_state::ReviewClass::Single,
+    );
+    pr_state::with_pr_state(home, "owner/repo", "fix/cross-team", |state| {
+        state.pr_number = 2957;
+    })
+    .unwrap();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/cross-team",
+        "ct-reviewer",
+        reviewer_id,
+        2957,
+        RECEIPT_HEAD_2957,
+        crate::review_receipt::ReviewSlot::Primary,
+        "ct-lead",
+        "t-cross-team-2957",
+        pr_state::ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "cross-team review",
+        None,
+        None,
+        "2026-07-24T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(home, &assignment).unwrap();
+    assignment
+}
+
+fn cross_team_review_params(assignment_id: uuid::Uuid, verdict: &str, text_token: &str) -> Value {
+    json!({
+        "from": "ct-reviewer",
+        "target": "ct-lead",
+        "text": crate::mcp::handlers::build_report_text(
+            &format!("{text_token} — cross-team review\n\n### Evidence\nran: cargo test → passed"),
+            Some("t-cross-team-2957"),
+            None,
+        ),
+        "kind": "report",
+        "correlation_id": "t-cross-team-2957",
+        "reviewed_head": "display-only-caller-value",
+        "report_purpose": "code_review",
+        "code_review": {
+            "assignment_id": assignment_id,
+            "verdict": verdict,
+            "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    })
+}
+
+/// #2957 RED: a teamless reviewer with a valid typed review_assignment must be
+/// able to send a code_review report back to the team orchestrator. Currently
+/// blocked by the generic cross-team gate before authorize_report runs.
+#[test]
+fn cross_team_code_review_report_with_valid_assignment_delivers_2957() {
+    let home = tmp_home("2957-cross-team-positive");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    let result = handle_send(
+        &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], true,
+        "#2957: assignment-backed cross-team code_review report must deliver: {result}"
+    );
+
+    let delivered = crate::inbox::drain(&home, "ct-lead");
+    assert_eq!(delivered.len(), 1, "one durable report row");
+    let msg = &delivered[0];
+    let receipt = msg
+        .validated_code_review
+        .as_ref()
+        .expect("receipt must be attached");
+    assert_eq!(receipt.summary().assignment_id, assignment.assignment_id);
+    assert_eq!(receipt.summary().reviewed_head, RECEIPT_HEAD_2957);
+    assert!(audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+    assert!(
+        !audit_log_contains(&home, "send_cross_team_blocked"),
+        "valid assignment bypass must not emit contradictory blocked audit"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: missing assignment → cross-team gate fires normally.
+#[test]
+fn cross_team_code_review_missing_assignment_blocked_2957() {
+    let home = tmp_home("2957-missing-assign");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+
+    let result = handle_send(
+        &cross_team_review_params(uuid::Uuid::new_v4(), "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], false,
+        "missing assignment must be blocked: {result}"
+    );
+    assert!(result["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("cross-team"));
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: wrong sender (ct-imposter, not assignment target) →
+/// assignment identity mismatch → cross-team gate fires.
+#[test]
+fn cross_team_code_review_wrong_sender_blocked_2957() {
+    let home = tmp_home("2957-wrong-sender");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    params["from"] = json!("ct-imposter");
+    let result = handle_send(&params, &test_ctx(&home));
+    assert_eq!(result["ok"], false, "wrong sender must fail: {result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cross-team"),
+        "must hit cross-team gate, not self-send: {result}"
+    );
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    let delivered = crate::inbox::drain(&home, "ct-lead");
+    assert!(delivered.is_empty(), "zero delivery side effect");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: wrong recipient (ct-imposter, not assignment issuer) →
+/// assignment identity mismatch → cross-team gate fires.
+#[test]
+fn cross_team_code_review_wrong_recipient_blocked_2957() {
+    let home = tmp_home("2957-wrong-recipient");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    params["target"] = json!("ct-imposter");
+    let result = handle_send(&params, &test_ctx(&home));
+    assert_eq!(result["ok"], false, "wrong recipient must fail: {result}");
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    let delivered = crate::inbox::drain(&home, "ct-imposter");
+    assert!(delivered.is_empty(), "zero delivery side effect");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: revoked (terminal) assignment → cross-team gate fires.
+#[test]
+fn cross_team_code_review_terminal_assignment_blocked_2957() {
+    let home = tmp_home("2957-terminal-assign");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+
+    let _ = crate::daemon::assignment_authority::record_terminal(
+        &home,
+        "owner/repo",
+        "fix/cross-team",
+        2957,
+        crate::daemon::assignment_authority::TerminalKind::Merged,
+    );
+
+    let result = handle_send(
+        &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], false,
+        "terminal assignment must be blocked: {result}"
+    );
+    assert!(!audit_log_contains(
+        &home,
+        "send_cross_team_allowed_assignment"
+    ));
+
+    let delivered = crate::inbox::drain(&home, "ct-lead");
+    assert!(delivered.is_empty(), "zero delivery side effect");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2957 negative: non-code_review report crosses team boundary → still blocked.
+#[test]
+fn cross_team_plain_report_still_blocked_2957() {
+    let home = tmp_home("2957-plain-report");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+
+    let result = handle_send(
+        &json!({
+            "from": "ct-reviewer",
+            "target": "ct-lead",
+            "text": "VERIFIED — plain report",
+            "kind": "report",
+            "report_purpose": "task_result"
+        }),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], false,
+        "plain report must still be blocked: {result}"
+    );
+    assert!(result["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("cross-team"));
+
     std::fs::remove_dir_all(&home).ok();
 }
