@@ -142,22 +142,41 @@ fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
     None
 }
 
-/// Look the `tool` name up in the registry. Returns `Some(value)`
-/// on hit; returns `None` if the tool isn't registered — the caller
-/// falls back to the inline `match` in `mod.rs` for un-migrated arms.
-pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
-    crate::mcp::registry::all()
+/// Small seam for proving that required-field metadata is reused across
+/// repeated dispatches. The GREEN implementation stores the field sets here;
+/// the RED test deliberately observes the current per-call definition path.
+#[derive(Default)]
+struct RequiredFieldCache;
+
+impl RequiredFieldCache {
+    fn definition(&self, entry: &crate::mcp::registry::ToolEntry) -> Value {
+        (entry.definition)()
+    }
+}
+
+fn try_dispatch_with_cache(
+    tool: &str,
+    ctx: &HandlerCtx<'_>,
+    entries: &[crate::mcp::registry::ToolEntry],
+    cache: &RequiredFieldCache,
+) -> Option<Value> {
+    entries
         .iter()
         .find(|entry| entry.name == tool)
         .map(|entry| {
-            // #1602: enforce the declared inputSchema at the single dispatch
-            // chokepoint — a missing required param is rejected with a clear
-            // named error instead of failing late inside the handler.
-            if let Some(err) = validate_args(entry.name, &(entry.definition)(), ctx.args) {
+            if let Some(err) = validate_args(entry.name, &cache.definition(entry), ctx.args) {
                 return err;
             }
             (entry.handler)(ctx)
         })
+}
+
+/// Look the `tool` name up in the registry. Returns `Some(value)`
+/// on hit; returns `None` if the tool isn't registered — the caller
+/// falls back to the inline `match` in `mod.rs` for un-migrated arms.
+pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
+    static CACHE: RequiredFieldCache = RequiredFieldCache;
+    try_dispatch_with_cache(tool, ctx, crate::mcp::registry::all(), &CACHE)
 }
 
 // ---------------------------------------------------------------------
@@ -509,6 +528,22 @@ pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    std::thread_local! {
+        static DEFINITION_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn counted_definition() -> Value {
+        DEFINITION_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        json!({
+            "name": "required-field-probe",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"]
+            }
+        })
+    }
 
     fn ctx_for<'a>(home: &'a Path, args: &'a Value, instance: &'a str) -> HandlerCtx<'a> {
         static EMPTY_SENDER: Option<Sender> = None;
@@ -935,6 +970,43 @@ mod tests {
             result["error"], "reply: missing required parameter 'message'",
             "dispatch must reject reply with no message: {result}"
         );
+    }
+
+    #[test]
+    fn repeated_validation_constructs_definition_once_and_preserves_required_checks() {
+        let entry = crate::mcp::registry::ToolEntry {
+            name: "required-field-probe",
+            definition: counted_definition,
+            handler: dispatch_list_instances,
+            class: crate::mcp::registry::ToolClass::READ_ONLY,
+        };
+        let entries = [entry];
+        let cache = RequiredFieldCache;
+        let home = std::env::temp_dir();
+
+        DEFINITION_CONSTRUCTIONS.with(|count| count.set(0));
+        let missing = json!({});
+        let ctx = ctx_for(&home, &missing, "");
+        let result = try_dispatch_with_cache("required-field-probe", &ctx, &entries, &cache)
+            .expect("registered probe must route");
+        assert_eq!(
+            result["error"],
+            "required-field-probe: missing required parameter 'token'"
+        );
+
+        let complete = json!({"token": "ok"});
+        let ctx = ctx_for(&home, &complete, "");
+        assert!(
+            try_dispatch_with_cache("required-field-probe", &ctx, &entries, &cache).is_some(),
+            "complete args must pass validation"
+        );
+        DEFINITION_CONSTRUCTIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "repeated validation must construct the live definition once"
+            )
+        });
     }
 
     // ── Rank8 bug-audit: present-but-JSON-null required field ───────────────
