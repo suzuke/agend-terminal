@@ -123,14 +123,13 @@ impl PerTickHandler for HangDetectionHandler {
             (hung, newly, left)
         };
 
-        // Phase 2/3: shared fleet snapshot — one load per tick instead of
+        // Phase 2/3: shared fleet snapshot — one load_arc per tick instead of
         // O(hung) self_orch_status calls (each of which deep-clones the config).
-        // Uses `try_load_fleet` semantics: missing fleet.yaml → determinate No
-        // (no teams configured), file-exists-but-unreadable → Unknown → escalate
-        // (#1744-M7 fail-closed).
-        let fleet_result = crate::teams::try_load_fleet(ctx.home);
+        // #1744-M7 fail-closed: Err → Unknown → escalate.
+        let fleet_arc =
+            crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home));
         let self_orch = |name: &str| -> crate::teams::SelfOrchStatus {
-            match &fleet_result {
+            match &fleet_arc {
                 Ok(fleet) => {
                     match crate::teams::find_team_for_in(fleet, name).and_then(|t| t.orchestrator) {
                         Some(orch) if orch == name => crate::teams::SelfOrchStatus::Yes,
@@ -353,14 +352,18 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Regression: missing fleet.yaml must produce determinate `No` (no teams
-    /// configured), NOT `Unknown`. `Unknown` would cause a false P0 escalation
-    /// on single-agent / no-fleet installations because the Hung path treats
-    /// `Unknown` as self-orchestrator (#1744-M7 fail-closed).
+    /// Regression through `HangDetectionHandler::run`: a left-Hung agent on a
+    /// system with NO fleet.yaml must NOT have its escalation store modified.
+    /// Missing fleet.yaml is a determinate `No` (no teams configured), not
+    /// `Unknown` — the `self_orch` gate skips non-self-orchestrators.
+    ///
+    /// RED proof: on the defective `load_arc` wiring, missing fleet.yaml
+    /// → Err → `Unknown` ≠ `No` → Phase 3 proceeds → `clear_hung_since`
+    /// fires → assertion fails.
     #[test]
-    fn missing_fleet_yaml_is_determinate_no_not_unknown() {
+    fn no_fleet_yaml_left_hung_agent_escalation_store_unchanged() {
         let home = std::env::temp_dir().join(format!(
-            "agend-nofleet-{}-{}",
+            "agend-nofleet-run-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -373,23 +376,47 @@ mod tests {
             "precondition: no fleet.yaml"
         );
 
-        let fleet_result = crate::teams::try_load_fleet(&home);
-        let self_orch = |name: &str| -> crate::teams::SelfOrchStatus {
-            match &fleet_result {
-                Ok(fleet) => {
-                    match crate::teams::find_team_for_in(fleet, name).and_then(|t| t.orchestrator) {
-                        Some(orch) if orch == name => crate::teams::SelfOrchStatus::Yes,
-                        _ => crate::teams::SelfOrchStatus::No,
-                    }
-                }
-                Err(_) => crate::teams::SelfOrchStatus::Unknown,
-            }
+        let id = crate::types::InstanceId::new();
+        let agent_name = format!("nofleet-test-{}", id);
+        let handle = crate::agent::mk_test_handle(&agent_name, id);
+        handle.core.lock().health.state = crate::health::HealthState::Hung;
+
+        crate::daemon::escalation_persist::persist(
+            &home,
+            &agent_name,
+            &crate::health::PersistedEscalation {
+                hung_since_epoch_ms: Some(1000),
+                ..Default::default()
+            },
+        );
+        assert!(
+            crate::daemon::escalation_persist::load_for(&home, &agent_name)
+                .unwrap()
+                .hung_since_epoch_ms
+                .is_some(),
+            "precondition: escalation store has hung_since"
+        );
+
+        let mut reg_map = HashMap::new();
+        reg_map.insert(id, handle);
+        let registry: AgentRegistry = Arc::new(Mutex::new(reg_map));
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
         };
 
-        assert_eq!(
-            self_orch("any-agent"),
-            crate::teams::SelfOrchStatus::No,
-            "missing fleet.yaml must be determinate No, not Unknown"
+        HangDetectionHandler::new().run(&ctx);
+
+        assert!(
+            crate::daemon::escalation_persist::load_for(&home, &agent_name)
+                .unwrap()
+                .hung_since_epoch_ms
+                .is_some(),
+            "missing fleet.yaml → No → Phase 3 must skip; escalation store unchanged"
         );
         std::fs::remove_dir_all(&home).ok();
     }
