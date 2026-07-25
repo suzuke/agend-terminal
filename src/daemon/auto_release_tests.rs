@@ -1133,6 +1133,34 @@ fn integration_expired_intent_dropped() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// #3005 ordering regression: `drain_queue` evaluates the 7-day `enqueued_at`
+/// expiry BEFORE the Unknown-probe deferral, so a stamp can never immortalize an
+/// intent. This drives the real `drain_queue` with an intent that is BOTH past
+/// expiry AND carrying a far-future `unknown_retry_after` — it must still be
+/// dropped. Reverse the two checks and the deferral's `continue` would skip the
+/// expiry entirely, keeping the file alive on every sweep until the stamp
+/// elapsed (and a re-stamp could extend it again).
+#[test]
+fn expired_intent_dropped_before_unknown_deferral_applies_3005() {
+    let home = tmp_home("itest-exp-vs-stamp");
+    std::fs::create_dir_all(queue_dir(&home)).unwrap();
+    let mut intent = sample_intent("t-exp-stamp");
+    intent.enqueued_at =
+        (chrono::Utc::now() - chrono::Duration::days(INTENT_EXPIRY_DAYS + 1)).to_rfc3339();
+    intent.unknown_retry_after =
+        Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339());
+    enqueue_intent(&home, &intent).unwrap();
+    assert_eq!(queue_len(&home), 1);
+    drain_queue(&home);
+    assert_eq!(
+        queue_len(&home),
+        0,
+        "#3005: expiry must be checked before the deferral — a future \
+         `unknown_retry_after` must not keep an expired intent alive"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// #P1b test git helper: run git in `dir` with bypass + inline identity.
 fn itest_git(dir: &Path, args: &[&str]) {
     std::process::Command::new("git")
@@ -1344,12 +1372,13 @@ fn integration_no_pr_transient_gh_fail_retains() {
 
 /// #3005: a done-but-unprovable branch (no pr_state → Unknown, not squash-merged,
 /// gh reports an existing PR → release cannot be proven) re-ran the ENTIRE
-/// expensive terminal-resolution probe — `default_branch` + `is_squash_merged`
-/// git spawns, the repo-wide `gh_poll`, and the head-scoped `branch_never_had_pr`
+/// expensive terminal-resolution probe — the `default_branch` and
+/// `is_squash_merged` git spawns plus the head-scoped `branch_never_had_pr` gh
 /// query — on EVERY sweep (≈30s), forever, until the 7-day expiry.
-/// `pr_list_calls` is the deterministic witness: TWO gh queries per sweep (the
-/// repo-wide poll inside `evaluate_pr_for_release` plus the no-PR probe), growing
-/// without bound and with no wall-clock sleep needed to observe it.
+/// (`evaluate_pr_for_release` itself issues no gh call: it is a local `pr_state`
+/// file read, `pr_state::load` → `read_to_string`.)
+/// `pr_list_calls` is the deterministic witness — it stops advancing once the
+/// deferral holds, with no wall-clock sleep needed to observe it.
 ///
 /// Post-fix a single `unknown_retry_after` stamp defers the next probe by a fixed
 /// 5 minutes, while still RETAINING both the intent and the binding — and a fresh
@@ -1379,7 +1408,8 @@ fn unknown_probe_backs_off_and_new_evidence_wakes_it_immediately() {
     let per_sweep = provider.pr_list_calls();
     assert_eq!(
         per_sweep, 2,
-        "one Unknown sweep costs two gh queries: the repo-wide poll + the no-PR probe"
+        "baseline: the unprovable path reaches gh (the head-scoped no-PR probe) — \
+         pinned as an exact count so the post-fix assertion below is meaningful"
     );
     assert_eq!(queue_len(&home), 1, "unprovable intent RETAINED");
     assert!(bound(&home, "dev"), "unprovable → never false-released");
