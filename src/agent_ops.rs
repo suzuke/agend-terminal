@@ -437,6 +437,26 @@ pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static METADATA_RMW_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_metadata_rmw() {
+    METADATA_RMW_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_rmw_count() {
+    METADATA_RMW_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_metadata_rmw_count() -> usize {
+    METADATA_RMW_COUNT.with(|count| count.replace(0))
+}
+
 /// Persist a single metadata key/value for an instance.
 ///
 /// #1886 C2: locked read-modify-write (flock spans load→modify→write) so two
@@ -448,6 +468,8 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
     // #1647: log on failure — this metadata is read back by `merge_metadata`, and
     // the MCP set_* handlers return OK regardless, so a dropped write was a silent
     // operator-set-but-lost.
@@ -481,6 +503,8 @@ pub fn update_metadata(
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
     persist_or_log!(
         crate::store::with_json_state_or_create::<Value, _, _, _>(
             &meta_path,
@@ -502,6 +526,8 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
     // #1647: log on failure — see save_metadata.
     persist_or_log!(
         crate::store::with_json_state_or_create::<Value, _, _, _>(

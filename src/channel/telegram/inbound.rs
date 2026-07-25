@@ -1070,6 +1070,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_persists_pickup_and_last_message_in_one_metadata_rmw_2974() {
+        let home = tmp_home("single-metadata-rmw");
+        let state = state_with_allowlist(&home, vec![1000]);
+        let msg = telegram_text_message(1000, "hello");
+
+        crate::agent_ops::reset_metadata_rmw_count();
+        handle_message(&state, &msg).await;
+        assert_eq!(
+            crate::agent_ops::take_metadata_rmw_count(),
+            1,
+            "one inbound message must persist both metadata fields in one locked RMW"
+        );
+
+        let mut metadata = serde_json::json!({});
+        crate::agent_ops::merge_metadata(&home, "general", &mut metadata);
+        assert_eq!(metadata["last_message_id"], serde_json::json!(1));
+        assert_eq!(
+            metadata["pending_pickup_ids"],
+            serde_json::json!([{"kind": "telegram", "msg_id": "1"}])
+        );
+    }
+
+    #[tokio::test]
     async fn unauthorized_status_keyword_enqueues_no_summary() {
         // RED before fix: the status-keyword path ran ahead of the allowlist
         // gate, so a non-allowlisted sender's "status" injected the fleet
