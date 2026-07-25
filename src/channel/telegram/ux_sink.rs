@@ -20,7 +20,7 @@ impl crate::channel::ux_event::UxEventSink for TelegramChannel {
                 msg,
                 emoji,
             } => {
-                if let Err(e) = try_telegram_react(&home, &instance, emoji, Some(&msg.id)) {
+                if let Err(e) = try_telegram_react(&self.state, &instance, emoji, Some(&msg.id)) {
                     tracing::warn!(%e, %instance, msg_id = %msg.id, emoji, "UxEventSink: react failed");
                 }
             }

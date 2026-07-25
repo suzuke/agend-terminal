@@ -112,10 +112,10 @@ pub(crate) fn resolve_channel_only_from(home: &std::path::Path) -> anyhow::Resul
     resolve_channel_from(home).map(|(ch, _)| ch)
 }
 
-/// #2975: per-call config-resolution counter. Every `Bot::new` on a
-/// transport-helper path is immediately preceded by a
-/// `resolve_channel_only_from` in the same function, so counting resolutions
-/// counts per-call bot construction. `#[cfg(test)]` — compiled out of release.
+// #2975: per-call config-resolution counter. Every `Bot::new` on a
+// transport-helper path is immediately preceded by a
+// `resolve_channel_only_from` in the same function, so counting resolutions
+// counts per-call bot construction. `#[cfg(test)]` — compiled out of release.
 #[cfg(test)]
 std::thread_local! {
     static CHANNEL_RESOLVE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

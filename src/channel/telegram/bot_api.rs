@@ -25,16 +25,26 @@ pub(super) fn map_emoji_name(name: &str) -> &str {
     }
 }
 
-/// React to a message with an emoji.
+/// React to a message with an emoji, using the `Bot` the state already owns.
+///
+/// #2975: this used to `resolve_channel_only_from` (a fleet.yaml read) and
+/// `Bot::new` on every call — a fresh reqwest client and connection pool per
+/// 👀/✅. The transport now comes from the state owner, which is also where
+/// config reload republishes it. The state lock is held only long enough to
+/// clone the handle and is released before any async I/O.
 pub(crate) fn try_telegram_react(
-    home: &std::path::Path,
+    state: &std::sync::Arc<parking_lot::Mutex<TelegramState>>,
     instance_name: &str,
     emoji: &str,
     message_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let ch = resolve_channel_only_from(home)?;
+    let (bot, chat_id, home) = {
+        let s = lock_state(state);
+        (s.bot.clone(), s.group_id, s.home.clone())
+    };
+    let bot = bot.ok_or_else(|| anyhow::anyhow!("telegram bot not initialized (react)"))?;
     let mid: i32 = message_id.and_then(|m| m.parse().ok()).unwrap_or_else(|| {
-        let meta_path = crate::agent_ops::metadata_path_resolved(home, instance_name);
+        let meta_path = crate::agent_ops::metadata_path_resolved(&home, instance_name);
         std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
@@ -46,8 +56,6 @@ pub(crate) fn try_telegram_react(
     }
     let emoji_char = map_emoji_name(emoji).to_string();
     spawn_or_block_on(async move {
-        let bot = teloxide::Bot::new(&ch.token);
-        let chat_id = teloxide::types::ChatId(ch.group_id);
         let msg_id = teloxide::types::MessageId(mid);
         let reaction = teloxide::types::ReactionType::Emoji { emoji: emoji_char };
         bot.set_message_reaction(chat_id, msg_id)

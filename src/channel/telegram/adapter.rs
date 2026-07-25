@@ -411,7 +411,7 @@ impl crate::channel::Channel for TelegramChannel {
                 })
             }
             crate::channel::AgentOutboundOp::React { emoji, message_id } => {
-                try_telegram_react(&home, agent, &emoji, message_id.as_deref())
+                try_telegram_react(&self.state, agent, &emoji, message_id.as_deref())
                     .map_err(ChannelError::Other)?;
                 Ok(empty_msg_ref())
             }
