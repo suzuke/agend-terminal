@@ -673,35 +673,48 @@ mod test_hooks {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
 
-    /// #2967/#2978/#2979 test seam: counts, in THIS process, of every
-    /// queue-directory `read_dir` (`QueueDirSnapshot::scan` AND the
-    /// pre-existing `list_draining_files`) and every queue-FILE content read
-    /// (`QueueDirSnapshot::pending_count`, the module-level `pending_count`,
-    /// AND `read_drain_file`, which `drain` itself uses). Instrumenting all
-    /// the real call sites — not just the new snapshot type — is what makes
-    /// the RED tests measure the actual end-to-end syscall shape `flush_all_with`
-    /// produces, both pre- and post-fix. Global (not path-keyed) — every RED
-    /// test in this family drives a single real pass over a fresh `home` and
-    /// wants the exact per-pass call count, so a bare counter is the direct
-    /// measurement; reset before each assertion window.
-    static DIR_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static CONTENT_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // #2967/#2978/#2979 test seam: counts, on THIS THREAD, of every
+    // queue-directory `read_dir` (`QueueDirSnapshot::scan` AND the
+    // pre-existing `list_draining_files`) and every queue-FILE content read
+    // (`QueueDirSnapshot::pending_count`, the module-level `pending_count`,
+    // AND `read_drain_file`, which `drain` itself uses). Instrumenting all
+    // the real call sites — not just the new snapshot type — is what makes
+    // the RED tests measure the actual end-to-end syscall shape
+    // `flush_all_with` produces, both pre- and post-fix.
+    //
+    // THREAD-LOCAL, matching the house seam pattern (`agent_ops.rs`'s
+    // `METADATA_RMW_COUNT`, `dispatch_idle`'s `LIST_PENDING_CALLS`). A
+    // process-global counter would be perturbed by any sibling test touching
+    // the queue on another thread under the plain threaded `cargo test`
+    // runner, which would have made these exact-count assertions depend on
+    // the harness rather than on the code — and needing `#[serial]` to hide
+    // that is the smell the pattern exists to avoid.
+    //
+    // Sound here because every assertion window is single-threaded: each
+    // counter-asserting test resets, drives the real pass synchronously on
+    // the test thread, and asserts on that same thread. The thread-spawning
+    // tests in this module (concurrent-drain races) never read these
+    // counters, so no increment is stranded on a worker thread.
+    std::thread_local! {
+        static DIR_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     pub(super) fn note_dir_scan() {
-        DIR_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DIR_SCANS.with(|count| count.set(count.get() + 1));
     }
     pub(super) fn note_content_read() {
-        CONTENT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CONTENT_READS.with(|count| count.set(count.get() + 1));
     }
-    pub(crate) fn dir_scan_count() -> u64 {
-        DIR_SCANS.load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn dir_scan_count() -> usize {
+        DIR_SCANS.with(|count| count.get())
     }
-    pub(crate) fn content_read_count() -> u64 {
-        CONTENT_READS.load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn content_read_count() -> usize {
+        CONTENT_READS.with(|count| count.get())
     }
     pub(crate) fn reset_scan_counters() {
-        DIR_SCANS.store(0, std::sync::atomic::Ordering::Relaxed);
-        CONTENT_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIR_SCANS.with(|count| count.set(0));
+        CONTENT_READS.with(|count| count.set(0));
     }
 
     /// Upper bound on retries past a transient `Err`; ~128ms at 2ms/step. Past
