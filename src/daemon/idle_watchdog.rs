@@ -570,6 +570,22 @@ pub(crate) fn fleet_ack_status() -> Option<i64> {
     }
 }
 
+/// #3026 test seam: seed the sidecar at an arbitrary instant so the coalescing
+/// window is exercisable from the real caller's tests without a wall-clock
+/// sleep. Compiles out of release builds.
+#[cfg(test)]
+pub(crate) fn seed_activity_at(home: &Path, agent: &str, ts: chrono::DateTime<chrono::Utc>) {
+    let _ = std::fs::create_dir_all(activity_dir(home));
+    let payload = ActivitySidecar {
+        schema_version: SCHEMA_VERSION,
+        agent: agent.to_string(),
+        last_active_at: ts.to_rfc3339(),
+    };
+    if let Ok(body) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(activity_path(home, agent), body);
+    }
+}
+
 /// #1076: clear fleet ack (used by tests).
 #[cfg(test)]
 fn clear_fleet_ack() {
@@ -967,18 +983,7 @@ mod tests {
     /// Helper: write an activity sidecar with a back-dated timestamp
     /// so tests can simulate elapsed time without sleeping.
     fn write_activity_at(home: &Path, agent: &str, ts: chrono::DateTime<chrono::Utc>) {
-        let dir = activity_dir(home);
-        std::fs::create_dir_all(&dir).unwrap();
-        let payload = ActivitySidecar {
-            schema_version: SCHEMA_VERSION,
-            agent: agent.to_string(),
-            last_active_at: ts.to_rfc3339(),
-        };
-        std::fs::write(
-            activity_path(home, agent),
-            serde_json::to_string_pretty(&payload).unwrap(),
-        )
-        .unwrap();
+        super::seed_activity_at(home, agent, ts);
     }
 
     /// #1438 test helper: create an Open task on the board owned by `owner`.

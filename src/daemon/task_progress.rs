@@ -207,6 +207,23 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
     None
 }
 
+/// #3026 test seam: seed the sidecar at an arbitrary instant so the coalescing
+/// window is exercisable from the real caller's tests without a wall-clock
+/// sleep. Compiles out of release builds.
+#[cfg(test)]
+pub(crate) fn seed_progress_at(home: &Path, task_id: &str, ts: chrono::DateTime<chrono::Utc>) {
+    let _ = std::fs::create_dir_all(progress_dir(home));
+    let payload = ProgressSidecar {
+        schema_version: SCHEMA_VERSION,
+        task_id: task_id.to_string(),
+        last_progress_at: ts.to_rfc3339(),
+        source: ProgressSource::Broadcast.as_str().to_string(),
+    };
+    if let Ok(body) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(progress_path(home, task_id), body);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
