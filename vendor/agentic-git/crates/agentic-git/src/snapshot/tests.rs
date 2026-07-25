@@ -576,19 +576,10 @@ fn list_snapshots_and_parse_round_trip_on_a_real_ref() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Decision `d-20260725211528579625-71`: `<seq>` must be allocated across the
-/// whole `(who, <utc-ts>)` bucket, not per op slug.
-///
-/// `unique_ref_name` probes the FULL ref name, which embeds `<op-slug>`, so a
-/// seq is only "taken" for the op that took it. Two different destructive ops
-/// in the same second therefore both land on seq 0 in the same bucket — and
-/// `resolve_restore_target` orders by `(<utc-ts>, <seq>)`, so that pair ties
-/// and the winner falls out of `for-each-ref`'s refname order (the slug
-/// alphabet), not creation order. Restore can hand back the older snapshot
-/// while the CLI promises strict newest.
-///
-/// Deterministic: a literal bucket, a seeded ref, one call. No clock, no sleep,
-/// no retry.
+/// `<seq>` must be allocated across the whole `(who, <utc-ts>)` bucket, not per
+/// op slug: `resolve_restore_target` orders on `(<utc-ts>, <seq>)`, so two ops
+/// sharing a seq in one bucket tie and the winner falls out of `for-each-ref`
+/// order instead of creation order.
 #[test]
 fn unique_ref_name_allocates_seq_across_op_slugs_in_one_bucket() {
     let git = resolve_real_git();

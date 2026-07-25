@@ -387,14 +387,38 @@ fn ref_exists(git: &str, dir: &Path, refname: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Allocate the first free `<seq>` in the `(who, <utc-ts>)` bucket. A seq is
+/// taken by ANY op slug there, not just by `op_slug`: `resolve_restore_target`
+/// orders on `(<utc-ts>, <seq>)`, so two ops that share a seq in one bucket tie
+/// and the winner falls out of `for-each-ref` order instead of creation order.
+/// One listing of the bucket answers every seq; an unreadable listing yields an
+/// empty set, degrading to the previous first-free-for-this-slug behaviour.
+///
+/// List-then-`update-ref`, with no global lock: two allocations that genuinely
+/// overlap in time can both see the same seq free and both take it, whatever
+/// `who` they run as. That is unchanged from the probe-then-write it replaces,
+/// and serialising allocation is deliberately out of scope here.
 fn unique_ref_name(git: &str, dir: &Path, who: &str, utc_ts: &str, op_slug: &str) -> Option<String> {
-    for seq in 0..1000u64 {
-        let candidate = snapshot_ref_name(who, utc_ts, seq, op_slug);
-        if !ref_exists(git, dir, &candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    let listed = git_bypass(git)
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("{SNAPSHOT_REF_PREFIX}{who}/{utc_ts}-*"),
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let taken: HashSet<u64> = listed
+        .lines()
+        .map(|refname| snapshot_order_key(refname).1)
+        .collect();
+    (0..1000u64)
+        .find(|seq| !taken.contains(seq))
+        .map(|seq| snapshot_ref_name(who, utc_ts, seq, op_slug))
 }
 
 /// Parse `who`/`op` back out of a snapshot ref's own name (authoritative —
@@ -416,13 +440,13 @@ fn parse_snapshot_ref(refname: &str) -> Option<(String, String)> {
 ///
 /// Contract for the ref names we create: `<utc-ts>` is a fixed-width
 /// `%Y%m%dT%H%M%SZ` UTC stamp, so comparing it as a string is chronological,
-/// and `<seq>` restarts at 0 for each new `(who, <utc-ts>, <op-slug>)` triple —
-/// `unique_ref_name` probes the WHOLE name, so it counts within one op's
-/// series, not across a timestamp bucket. Within a single such series
-/// `(ts, seq)` is creation order, and inside one bucket it orders exactly as
-/// `<seq>` did; `<seq>` alone is not, because a series split across adjacent
-/// buckets ties at 0. Two series that share a second (different `<op-slug>`,
-/// same `<utc-ts>`, both at seq 0) still tie — see `resolve_restore_target`.
+/// and `<seq>` is allocated across the whole `(who, <utc-ts>)` bucket by
+/// `unique_ref_name`, whatever the op slug. For allocations that happen one
+/// after another, `(ts, seq)` is therefore creation order within a bucket, and
+/// orders exactly as `<seq>` alone did; across buckets `<seq>` alone is not,
+/// because it restarts at 0 in each new one. Allocations that genuinely overlap
+/// can still land on the same seq (`unique_ref_name` takes no lock), and such a
+/// pair ties here.
 fn snapshot_order_key(refname: &str) -> (&str, u64) {
     let Some(rest) = refname.strip_prefix(SNAPSHOT_REF_PREFIX) else {
         return ("", 0);
@@ -671,10 +695,11 @@ fn resolve_restore_target(git: &str, dir: &Path, opts: &RestoreOpts) -> Result<S
     // (Δd) — so two ops in the same second tie. Break the tie by the ref's own
     // `(<utc-ts>, <seq>)` creation order (see `snapshot_order_key`), so
     // "newest" is the genuinely-last snapshot, not whichever `for-each-ref`
-    // happened to list last. Two residual same-second ties remain best-effort
-    // and fall back to `for-each-ref` order: across `who` (truly concurrent),
-    // and across `<op-slug>` — `<seq>` counts per op series, so two DIFFERENT
-    // destructive ops in one second both sit at seq 0 in the same bucket.
+    // happened to list last, for snapshots allocated one after another. The
+    // residual best-effort case is any pair whose allocations genuinely
+    // OVERLAPPED — regardless of `who`, since `unique_ref_name` lists then
+    // writes without a lock, so both can take the same seq. Those fall back to
+    // `for-each-ref` order; serialising allocation is out of scope here.
     rows.sort_by(|a, b| {
         b.when
             .cmp(&a.when)
