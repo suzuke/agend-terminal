@@ -31,6 +31,7 @@ struct MergeMock {
     merge_state: &'static str,
     checks_pass: bool,
     recorded: Arc<Mutex<Option<MergeOpts>>>,
+    view_calls: Option<Arc<Mutex<Vec<Vec<String>>>>>,
 }
 
 impl MergeMock {
@@ -43,12 +44,24 @@ impl MergeMock {
             merge_state: "CLEAN",
             checks_pass: true,
             recorded,
+            view_calls: None,
         }
+    }
+
+    fn with_view_calls(mut self, view_calls: Arc<Mutex<Vec<Vec<String>>>>) -> Self {
+        self.view_calls = Some(view_calls);
+        self
     }
 }
 
 impl ScmProvider for MergeMock {
     fn pr_view(&self, _r: &str, _p: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
+        if let Some(view_calls) = &self.view_calls {
+            view_calls
+                .lock()
+                .unwrap()
+                .push(fields.iter().map(|field| (*field).to_string()).collect());
+        }
         // verify_merge_landed reads state+mergeCommit → report a landed PR.
         if fields.contains(&"state") {
             return Ok(PrSummary {
@@ -175,6 +188,51 @@ fn normal_merge_pins_expected_head_sha() {
         "P0-4: merge must be pinned to the acquired head; got {:?}",
         opts.expected_head_sha
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3022: the normal merge path may issue only two pre-mutation metadata reads:
+/// the initial exact head/base snapshot and the mandatory exact identity
+/// recheck. The merge-state and freshness gates reuse the initial snapshot;
+/// post-mutation landed verification remains a distinct authoritative read.
+#[test]
+fn normal_merge_reuses_pre_merge_metadata_queries_3022() {
+    let home = tmp_home("metadata-reuse");
+    let recorded = Arc::new(Mutex::new(None));
+    let view_calls = Arc::new(Mutex::new(Vec::new()));
+    let mock = MergeMock::new(recorded).with_view_calls(view_calls.clone());
+    let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
+
+    let r = super::handle_merge_repo(&home, &base_args(), "dev");
+    assert_eq!(r["merged"].as_bool(), Some(true), "should merge: {r}");
+
+    let calls = view_calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected initial metadata, exact recheck, and distinct landed verification; got {calls:?}"
+    );
+    assert_eq!(
+        calls[0],
+        vec![
+            "headRefOid",
+            "baseRefOid",
+            "headRefName",
+            "mergeStateStatus"
+        ],
+        "initial metadata read must include every pre-merge field"
+    );
+    assert_eq!(
+        calls[1],
+        vec!["headRefOid", "baseRefOid", "headRefName", "mergeStateStatus"],
+        "exact identity recheck remains a separate metadata read"
+    );
+    assert_eq!(
+        calls[2],
+        vec!["state", "mergeCommit", "mergedAt", "mergeStateStatus"],
+        "landed verification must remain authoritative and post-mutation"
+    );
+
     std::fs::remove_dir_all(&home).ok();
 }
 
