@@ -98,11 +98,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let mut fetch_attempted = false;
     if bind {
         let src = Path::new(&source_path);
-        // #2703: omitted `from_ref` follows the repo default (origin/HEAD via
-        // `default_branch`), preserving explicit overrides and origin/main behavior.
-        // #3023: `expected_ref` wins the creation base whenever it is present, so
-        // resolve the `from_ref` fallback only when it is absent — otherwise
-        // `default_branch` spawns git for a string that is immediately discarded.
+        // #2703: omitted `from_ref` follows the repo default (`origin/<default_branch>`).
+        // #3023: resolve that fallback only when `expected_ref` is absent — else it is discarded.
         let creation_ref = expected_ref.unwrap_or_else(|| {
             args["from_ref"]
                 .as_str()
