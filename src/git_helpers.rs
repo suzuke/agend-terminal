@@ -314,6 +314,8 @@ pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> bool {
 /// Reads `refs/remotes/origin/HEAD` → extracts branch name.
 /// Falls back to "main" if detection fails.
 pub fn default_branch(repo_dir: &Path) -> String {
+    record_default_branch_call();
+
     let remote = primary_remote(repo_dir);
     let ref_path = format!("refs/remotes/{remote}/HEAD");
     // #1897: bounded (was an unbounded `.output()`) — a stuck local git falls
@@ -388,6 +390,25 @@ fn _scrub_agent_session_env_at_test_load_2481() {
             std::env::remove_var(key);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEFAULT_BRANCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_default_branch_call() {
+    DEFAULT_BRANCH_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_default_branch_call() {}
+
+#[cfg(test)]
+pub(crate) fn test_default_branch_calls() -> usize {
+    DEFAULT_BRANCH_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

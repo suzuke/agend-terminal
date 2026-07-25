@@ -1769,6 +1769,53 @@ fn checkout_bind_true_auto_creates_branch_from_origin_main_when_missing() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #3023: an explicit `from_ref` must bypass default-branch resolution in
+/// both the expected-head preflight and the branch-creation path.
+#[test]
+#[cfg(unix)]
+fn checkout_explicit_from_ref_does_not_resolve_default_branch_3023() {
+    let home = p778_tmp_home("3023-explicit");
+    let parent = p778_tmp_home("3023-explicit-src");
+    let source = p780_setup_source_no_feature_branch(&parent);
+    let agent = "checkout-3023-agent";
+    let expected_head = std::process::Command::new("git")
+        .args(["rev-parse", "main"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git spawn");
+    assert!(
+        expected_head.status.success(),
+        "rev-parse main must succeed"
+    );
+    let expected_head = String::from_utf8_lossy(&expected_head.stdout)
+        .trim()
+        .to_string();
+    let before = crate::git_helpers::test_default_branch_calls();
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/3023-explicit",
+            "bind": true,
+            "from_ref": "main",
+            "expected_head": expected_head,
+        }),
+        agent,
+    );
+
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+    assert_eq!(
+        crate::git_helpers::test_default_branch_calls() - before,
+        0,
+        "explicit from_ref must bypass default_branch in preflight and creation: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 #[cfg(unix)]
 fn checkout_bind_true_existing_branch_ignores_from_ref() {
