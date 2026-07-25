@@ -411,19 +411,29 @@ fn parse_snapshot_ref(refname: &str) -> Option<(String, String)> {
     Some((who.to_string(), op.to_string()))
 }
 
-/// The `<seq>` field of a snapshot ref (the monotonic same-second
-/// disambiguator), or 0 if the name isn't one of ours / is malformed. Used
-/// only as a tiebreak when ordering by the second-granular committer date.
-fn snapshot_seq(refname: &str) -> u64 {
+/// The `<utc-ts>` and `<seq>` fields of a snapshot ref, compared as a pair to
+/// break a same-second committer-date tie.
+///
+/// Contract for the ref names we create: `<utc-ts>` is a fixed-width
+/// `%Y%m%dT%H%M%SZ` UTC stamp, so comparing it as a string is chronological,
+/// and `<seq>` restarts at 0 for each new `(who, <utc-ts>, <op-slug>)` triple —
+/// `unique_ref_name` probes the WHOLE name, so it counts within one op's
+/// series, not across a timestamp bucket. Within a single such series
+/// `(ts, seq)` is creation order, and inside one bucket it orders exactly as
+/// `<seq>` did; `<seq>` alone is not, because a series split across adjacent
+/// buckets ties at 0. Two series that share a second (different `<op-slug>`,
+/// same `<utc-ts>`, both at seq 0) still tie — see `resolve_restore_target`.
+fn snapshot_order_key(refname: &str) -> (&str, u64) {
     let Some(rest) = refname.strip_prefix(SNAPSHOT_REF_PREFIX) else {
-        return 0;
+        return ("", 0);
     };
     let Some((_who, tail)) = rest.split_once('/') else {
-        return 0;
+        return ("", 0);
     };
     let mut parts = tail.splitn(3, '-');
-    let _ts = parts.next();
-    parts.next().and_then(|s| s.parse().ok()).unwrap_or(0)
+    let ts = parts.next().unwrap_or("");
+    let seq = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (ts, seq)
 }
 
 // ── Prune (lazy, no daemon) ──────────────────────────────────────────────
@@ -659,13 +669,16 @@ fn resolve_restore_target(git: &str, dir: &Path, opts: &RestoreOpts) -> Result<S
     // `iso-strict` timestamps sort lexicographically == chronologically, but
     // are only second-granular AND every snapshot's date is forced to `now`
     // (Δd) — so two ops in the same second tie. Break the tie by the ref's own
-    // `<seq>` (monotonic within a `<who>/<ts>` bucket), so "newest" is the
-    // genuinely-last snapshot, not whichever `for-each-ref` happened to list
-    // last. (Cross-`who` same-second ties are truly concurrent — best-effort.)
+    // `(<utc-ts>, <seq>)` creation order (see `snapshot_order_key`), so
+    // "newest" is the genuinely-last snapshot, not whichever `for-each-ref`
+    // happened to list last. Two residual same-second ties remain best-effort
+    // and fall back to `for-each-ref` order: across `who` (truly concurrent),
+    // and across `<op-slug>` — `<seq>` counts per op series, so two DIFFERENT
+    // destructive ops in one second both sit at seq 0 in the same bucket.
     rows.sort_by(|a, b| {
         b.when
             .cmp(&a.when)
-            .then_with(|| snapshot_seq(&b.refname).cmp(&snapshot_seq(&a.refname)))
+            .then_with(|| snapshot_order_key(&b.refname).cmp(&snapshot_order_key(&a.refname)))
     });
     match rows.len() {
         0 => Err(RestoreError::NoSnapshots),
