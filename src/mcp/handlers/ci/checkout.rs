@@ -98,11 +98,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let mut fetch_attempted = false;
     if bind {
         let src = Path::new(&source_path);
-        // #2703: when the caller omits `from_ref`, default to the repo's DEFAULT
-        // branch (origin/HEAD via `default_branch`), not a hard-coded origin/main —
-        // mirrors the dispatch-path fix (dispatch_hook/mod.rs). An explicit
-        // `from_ref` override is unchanged. Main-default repos: default_branch →
-        // "main" → "origin/main", byte-identical to the prior literal.
+        // #2703: omitted `from_ref` follows the repo default (origin/HEAD via
+        // `default_branch`), preserving explicit overrides and origin/main behavior.
         let from_ref = args["from_ref"]
             .as_str()
             .map(str::to_owned)
