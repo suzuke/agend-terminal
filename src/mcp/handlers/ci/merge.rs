@@ -192,16 +192,39 @@ pub(crate) fn base_drift_refusal(merge_state_status: &str) -> Option<(&'static s
     }
 }
 
-/// P0 exact-head: read the PR's current `(head, base)` OIDs in one `gh pr view`.
-/// Returns `None` if either is missing or the read errors — the caller MUST fail
-/// closed (a merge that cannot identify its exact head+base is unsafe, even under
-/// `force`). `base_ref_oid` is the base BRANCH's current tip (it advances as the
-/// base moves), so comparing it gate-vs-pre-merge detects a base advance by EXACT
-/// identity — `mergeStateStatus` is derived + laggy and cannot prove base identity.
-fn acquire_head_base(repo: &str, pr: u64) -> Option<(String, String, String)> {
-    let s = crate::scm::make_scm_provider(repo, None)
-        .pr_view(repo, pr, &["headRefOid", "baseRefOid", "headRefName"])
-        .ok()?;
+/// P0 exact-head: read the PR's current `(head, base)` OIDs and pre-merge
+/// metadata in one `gh pr view`. Returns `None` if either OID is missing or the
+/// read errors — the caller MUST fail closed (a merge that cannot identify its
+/// exact head+base is unsafe, even under `force`). `base_ref_oid` is the base
+/// BRANCH's current tip (it advances as the base moves), so comparing it
+/// gate-vs-pre-merge detects a base advance by EXACT identity —
+/// `mergeStateStatus` is derived + laggy and cannot prove base identity.
+/// `include_merge_state` is true only for the initial policy snapshot; the
+/// exact identity recheck intentionally requests identity fields only.
+fn acquire_head_base(
+    repo: &str,
+    pr: u64,
+    include_merge_state: bool,
+) -> Option<(String, String, String, Option<String>)> {
+    let provider = crate::scm::make_scm_provider(repo, None);
+    let s = if include_merge_state {
+        provider
+            .pr_view(
+                repo,
+                pr,
+                &[
+                    "headRefOid",
+                    "baseRefOid",
+                    "headRefName",
+                    "mergeStateStatus",
+                ],
+            )
+            .ok()?
+    } else {
+        provider
+            .pr_view(repo, pr, &["headRefOid", "baseRefOid", "headRefName"])
+            .ok()?
+    };
     let head = s
         .head_ref_oid
         .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
@@ -209,7 +232,7 @@ fn acquire_head_base(repo: &str, pr: u64) -> Option<(String, String, String)> {
         .base_ref_oid
         .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
     let branch = s.head_ref.unwrap_or_default();
-    Some((head, base, branch))
+    Some((head, base, branch, s.merge_state_status))
 }
 
 pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
@@ -236,7 +259,9 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // head+base it INTENDS; if either can't be read, fail closed (never merge a
     // head/base we cannot identify). `force` relaxes only the CI/verdict/freshness
     // POLICY below, never this acquisition nor the pre-merge identity recheck.
-    let (gated_head, gated_base, pr_branch) = match acquire_head_base(&repo, pr) {
+    let (gated_head, gated_base, pr_branch, gated_merge_state) = match acquire_head_base(
+        &repo, pr, true,
+    ) {
         Some(hb) => hb,
         None => {
             return json!({
@@ -304,15 +329,11 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         // `--admin` merge BYPASSES branch-protection's
         // `required_status_checks.strict`, so GitHub will NOT block these — the
         // daemon must. Any other state (CLEAN/UNSTABLE/BLOCKED/UNKNOWN) or a
-        // pr_view error → fail-OPEN (proceed): GitHub may still be computing
-        // mergeability and we must not block a real merge on a transient (the #813
-        // mergeable-check pattern). Reuses the same `pr_view` path
-        // `verify_merge_landed` uses — no new infra. `force=true` bypasses (the
-        // audit block below logs it, like the CI gate).
-        if let Ok(summary) =
-            crate::scm::make_scm_provider(&repo, None).pr_view(&repo, pr, &["mergeStateStatus"])
-        {
-            let mss = summary.merge_state_status.as_deref().unwrap_or("");
+        // A missing merge-state field remains fail-OPEN (proceed): GitHub may
+        // still be computing mergeability and we must not block a real merge on
+        // a transient (#813 mergeable-check pattern). The initial exact-head
+        // metadata snapshot supplies this field, avoiding a redundant query.
+        if let Some(mss) = gated_merge_state.as_deref() {
             if let Some((why, hint)) = base_drift_refusal(mss) {
                 return json!({
                     "error": format!("base is stale — merge refused: {why}"),
@@ -322,7 +343,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             }
         }
         // #2140: deterministic freshness gate (logic in ci/merge_freshness.rs).
-        if let Some(refusal) = super::merge_freshness::gate(&repo, pr) {
+        if let Some(refusal) = super::merge_freshness::gate(&repo, &gated_head) {
             return refusal;
         }
     }
@@ -363,7 +384,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // residual — true base atomicity awaits a merge-queue (separate spike). Note:
     // `verify_merge_landed` proves only that the PR LANDED, not that the merge was
     // free of a semantic phantom-reversion; it is NOT a base-race backstop.
-    let (head_now, base_now, _) = match acquire_head_base(&repo, pr) {
+    let (head_now, base_now, _, _) = match acquire_head_base(&repo, pr, false) {
         Some(hb) => hb,
         None => {
             return json!({

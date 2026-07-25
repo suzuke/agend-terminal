@@ -103,19 +103,15 @@ pub(super) fn check_merge_freshness(
 }
 
 /// #2140: the `handle_merge_repo` entry point — kept all-in-one here so ci/mod.rs
-/// (just trimmed to its LOC ceiling) gains only a single call. Resolves the PR
-/// head SHA, runs the deterministic freshness check against `main`, and returns
-/// the refusal JSON when the PR is stale on a whole-tree-invariant input — else
-/// `None` (proceed to merge). Fail-open: an unresolvable head / API error → `None`
-/// (a transient gh hiccup must not block a real merge; `check_merge_freshness`
-/// already fails open internally).
-pub(super) fn gate(repo: &str, pr: u64) -> Option<Value> {
+/// (just trimmed to its LOC ceiling) gains only a single call. Runs the
+/// deterministic freshness check against `main` using the already-acquired PR
+/// head, and returns the refusal JSON when the PR is stale on a whole-tree-
+/// invariant input — else `None` (proceed to merge). Fail-open: a compare/API
+/// error → `None` (a transient gh hiccup must not block a real merge;
+/// `check_merge_freshness` already fails open internally).
+pub(super) fn gate(repo: &str, head: &str) -> Option<Value> {
     let provider = crate::scm::make_scm_provider(repo, None);
-    let head = provider
-        .pr_view(repo, pr, &["headRefOid"])
-        .ok()?
-        .head_ref_oid?;
-    match check_merge_freshness(provider.as_ref(), repo, &head, "main") {
+    match check_merge_freshness(provider.as_ref(), repo, head, "main") {
         FreshnessVerdict::Fresh => None,
         FreshnessVerdict::StaleRisky { behind_by, files } => Some(json!({
             "error": format!(

@@ -81,6 +81,7 @@ impl ScmProvider for MergeMock {
             return Ok(PrSummary {
                 head_ref_oid: Some(self.heads[i.min(self.heads.len() - 1)].to_string()),
                 base_ref_oid: Some(self.bases[i.min(self.bases.len() - 1)].to_string()),
+                merge_state_status: Some(self.merge_state.into()),
                 ..Default::default()
             });
         }
@@ -224,7 +225,7 @@ fn normal_merge_reuses_pre_merge_metadata_queries_3022() {
     );
     assert_eq!(
         calls[1],
-        vec!["headRefOid", "baseRefOid", "headRefName", "mergeStateStatus"],
+        vec!["headRefOid", "baseRefOid", "headRefName"],
         "exact identity recheck remains a separate metadata read"
     );
     assert_eq!(
@@ -242,7 +243,7 @@ fn head_move_between_gate_and_write_refuses() {
     let home = tmp_home("headmove");
     let recorded = Arc::new(Mutex::new(None));
     let mut mock = MergeMock::new(recorded.clone());
-    mock.heads = vec![H0, H0, H1]; // acquire, merge_freshness, recheck → moved
+    mock.heads = vec![H0, H1]; // acquire, recheck → moved
     mock.bases = vec![B0];
     let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
     let r = super::handle_merge_repo(&home, &base_args(), "dev");
@@ -262,7 +263,7 @@ fn base_oid_move_with_clean_status_refuses() {
     let recorded = Arc::new(Mutex::new(None));
     let mut mock = MergeMock::new(recorded.clone());
     mock.heads = vec![H0]; // head stable
-    mock.bases = vec![B0, B0, B1]; // acquire, merge_freshness, recheck → base moved
+    mock.bases = vec![B0, B1]; // acquire, recheck → base moved
     mock.merge_state = "CLEAN"; // status UNCHANGED — a status-only check would miss it
     let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
     let r = super::handle_merge_repo(&home, &base_args(), "dev");
