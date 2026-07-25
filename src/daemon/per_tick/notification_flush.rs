@@ -67,9 +67,14 @@ where
     else {
         return;
     };
+    // #2978/#2979: ONE read_dir of the shared queue directory for the whole
+    // pass, instead of one per fleet agent — the idle fast-path gate below
+    // reads NO file contents (`has_pending`), so a productive agent's queue
+    // bytes are read exactly once total, by `flush_agent_queue`'s own drain.
+    let snapshot = crate::notification_queue::QueueDirSnapshot::scan(home);
     for agent in fleet.instances.keys() {
-        // Idle fast path: a read_dir + line count of any existing queue files.
-        if crate::notification_queue::pending_count(home, agent) == 0 {
+        // Idle fast path: does this agent have anything queued at all?
+        if !snapshot.has_pending(agent) {
             continue;
         }
         // Shared core applies the SAME draft/busy/typing gating + MAX_DEFER
