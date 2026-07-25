@@ -90,7 +90,7 @@ provenance、未知 task state，或無法證明 remote branch 狀態時一律 f
 }
 ```
 
-`bind_self` 只會綁定呼叫者本身。適用於復原、安全重新綁定，或從 fleet 設定解析 repository 的情境。`repository_path` 與舊版 `repository` 參數互斥；請優先使用 `repository_path`。
+`bind_self` 只會綁定呼叫者本身。適用於復原、安全重新綁定，或從 fleet 設定解析 repository 的情境。傳入 `repository_path` 可明確指定來源 repository；省略則從 fleet.yaml 解析。
 
 `rebase_mode:true` 會先走受保護的修復／重新綁定路徑；它不授權覆寫其他仍有效的 lease。
 

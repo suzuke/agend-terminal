@@ -10,6 +10,11 @@
 ### Changed
 
 - **移除已過期的環境變數別名** — watchdog 拓樸現在只讀 `fleet.yaml` 的 `watchdog:` 區塊；worktree 封存 fallback 只讀 `AGEND_WORKTREE_ARCHIVE_FALLBACK`；decisions retention 只讀 `AGEND_RETENTION_DECISIONS_CUTOVER`。
+- **熱路徑不再重複做同一件事** — 通知、派工、分支掃描、watchdog、checkout、merge 與訊息路徑，現在會重用先前每筆或每次呼叫都重做一遍的掃描、client 或 metadata 讀取（#2967、#2975–#2979、#2990、#2991、#2999、#3001、#3005、#3022、#3023、#3026、#3031）。
+
+### Removed
+
+- **移除已過期的公開介面別名** — `agend list --legacy-json` 以及 MCP 參數別名 `command`、`repository`、`kind` 在棄用週期結束後已移除；請改用 `--json`、`backend`、`repository_path` 與 `request_kind`（#2960、#2961）。
 
 ## [0.11.2] — 2026-07-23
 

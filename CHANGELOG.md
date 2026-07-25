@@ -10,6 +10,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 ### Changed
 
 - **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
+- **Hot paths repeat less work** — notification, dispatch, branch-sweep, watchdog, checkout, merge, and messaging paths now reuse a scan, client, or metadata read they previously repeated per item or per call (#2967, #2975–#2979, #2990, #2991, #2999, #3001, #3005, #3022, #3023, #3026, #3031).
+
+### Removed
+
+- **Expired public-surface aliases** — `agend list --legacy-json` and the MCP argument aliases `command`, `repository`, and `kind` are gone after their deprecation cycle; use `--json`, `backend`, `repository_path`, and `request_kind` (#2960, #2961).
 
 ## [0.11.2] — 2026-07-23
 
