@@ -942,9 +942,7 @@ pub(crate) fn emit_delete_batch_with_context(
     {
         name_to_candidate.insert(cand.name.as_str(), cand);
     }
-    // Query the bounded open-PR inventory once per branch sweep. An unknown
-    // snapshot remains fail-closed for every terminal candidate.
-    let open_pr_inventory = open_pr_snapshot(repo, base);
+    let mut open_pr_inventory: Option<OpenPrSnapshot> = None;
     let category_of = |name: &str| -> &'static str {
         if categories.clean_merged.iter().any(|c| c.name == name) {
             "clean_merged"
@@ -992,7 +990,8 @@ pub(crate) fn emit_delete_batch_with_context(
             crate::worktree::disposition::BranchProvenance::Unknown
         );
         let open_pr = if terminal {
-            match open_pr_inventory.status_for(name) {
+            let inventory = open_pr_inventory.get_or_insert_with(|| open_pr_snapshot(repo, base));
+            match inventory.status_for(name) {
                 OpenPrStatus::Open => Some(true),
                 OpenPrStatus::NotOpen => Some(false),
                 OpenPrStatus::Unknown => None,
