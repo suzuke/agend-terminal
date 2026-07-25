@@ -100,16 +100,20 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         let src = Path::new(&source_path);
         // #2703: omitted `from_ref` follows the repo default (origin/HEAD via
         // `default_branch`), preserving explicit overrides and origin/main behavior.
-        let from_ref = args["from_ref"]
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)));
-        let creation_ref = expected_ref.as_deref().unwrap_or(from_ref.as_str());
+        // #3023: `expected_ref` wins the creation base whenever it is present, so
+        // resolve the `from_ref` fallback only when it is absent — otherwise
+        // `default_branch` spawns git for a string that is immediately discarded.
+        let creation_ref = expected_ref.unwrap_or_else(|| {
+            args["from_ref"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)))
+        });
         match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
             home,
             src,
             branch,
-            creation_ref,
+            &creation_ref,
             instance_name,
         ) {
             Ok((created, fetched)) => {
