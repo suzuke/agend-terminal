@@ -622,6 +622,12 @@ fn drain_queue(home: &Path) {
             let _ = std::fs::remove_file(&path);
             continue;
         }
+        // #3005: an intent whose Unknown-only probe already ran without proving
+        // release carries a deferral stamp — leave the file untouched until the
+        // deadline instead of re-spawning git + two gh queries every sweep.
+        if unknown_probe_deferred(&intent) {
+            continue;
+        }
         match process_intent(home, &intent) {
             // Released / terminal skip → delete.
             IntentOutcome::Done => {
@@ -629,8 +635,42 @@ fn drain_queue(home: &Path) {
             }
             // Not-yet-releasable (PR open / dirty) → retain for the next sweep.
             IntentOutcome::Retry => {}
+            // #3005: the expensive Unknown-only fallback ran and still could not
+            // prove release → retain, but defer its next probe by a fixed
+            // interval. Rewrites the SAME queue file (`enqueue_intent` is keyed
+            // on task_id and renames atomically).
+            IntentOutcome::RetryAfterUnknownProbe => {
+                let mut deferred = intent.clone();
+                deferred.unknown_retry_after = Some(
+                    (chrono::Utc::now() + chrono::Duration::minutes(UNKNOWN_RETRY_MINS))
+                        .to_rfc3339(),
+                );
+                if let Err(e) = enqueue_intent(home, &deferred) {
+                    // Stamp write failed → the intent stays as-is and is simply
+                    // probed again next sweep (today's behavior). Never fatal.
+                    tracing::warn!(task_id = %intent.task_id, error = %e,
+                        "auto_release: could not stamp Unknown-probe deferral — will re-probe next sweep");
+                }
+            }
         }
     }
+}
+
+/// #3005: fixed deferral between Unknown-only probes that could not prove
+/// release. One flat interval — deliberately not exponential, not configurable,
+/// and not a cache: the 7-day `enqueued_at` expiry still bounds the whole retry
+/// life, and any fresh enqueue clears the stamp.
+const UNKNOWN_RETRY_MINS: i64 = 5;
+
+/// #3005: true while a stamped intent is still inside its deferral window. An
+/// absent or unparseable stamp probes now (fail-open toward liveness).
+fn unknown_probe_deferred(intent: &AutoReleaseIntent) -> bool {
+    intent
+        .unknown_retry_after
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|deadline| chrono::Utc::now() < deadline.with_timezone(&chrono::Utc))
+        .unwrap_or(false)
 }
 
 /// t-worktree-leak (PR-1) Q2: retry-intent age ceiling. Past this, the intent is
@@ -658,6 +698,10 @@ enum IntentOutcome {
     /// Not-yet-releasable but might become so (PR still open, dirty worktree) →
     /// retain for retry on a later sweep (subject to the queue expiry).
     Retry,
+    /// #3005: same as `Retry`, but the expensive Unknown-only terminal-resolution
+    /// fallback just ran and still could not prove release — so the caller stamps
+    /// a fixed deferral before the next probe.
+    RetryAfterUnknownProbe,
 }
 
 fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
@@ -741,6 +785,8 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         return IntentOutcome::Retry;
     }
     let (mut releasable, mut confidence) = releasable_by_invariant(home, &repo, &branch);
+    // #3005: witness for "the expensive Unknown-only fallback below actually ran".
+    let mut unknown_probe_ran = false;
     // #P1b (t-…24962-1): the fleet-standard merge flow is `--delete-branch`, after
     // which the pr_state scanner deletes the pr_state doc (scanner.rs
     // `ScanAction::Remove`) → `evaluate_pr_for_release` falls to `Unknown` and the
@@ -754,6 +800,9 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         && all_branch_tasks_done(home, &repo, &branch)
     {
         if let Some(src) = binding.get("source_repo").and_then(|v| v.as_str()) {
+            // #3005: from here the sweep spawns git (`default_branch`,
+            // `is_squash_merged`) and may query gh (`branch_never_had_pr`).
+            unknown_probe_ran = true;
             let src = Path::new(src);
             let default = crate::git_helpers::default_branch(src);
             if crate::branch_sweep::is_squash_merged(src, &default, &branch) {
@@ -795,7 +844,14 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
             true
         } else {
             tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
-            return IntentOutcome::Retry;
+            // #3005: only the Unknown-only probe path is deferred. Every other
+            // retain reason (open PR, unresolved route, repo/branch unresolved)
+            // keeps its unchanged every-sweep cadence.
+            return if unknown_probe_ran {
+                IntentOutcome::RetryAfterUnknownProbe
+            } else {
+                IntentOutcome::Retry
+            };
         }
     } else {
         false
