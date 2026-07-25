@@ -157,10 +157,36 @@ pub(crate) fn gc_stale_activity_sidecars(home: &Path) {
     }
 }
 
+/// #3026: every accepted send from a named sender lands here, paying mkdir +
+/// flock + `atomic_write` — and `atomic_write` fsyncs twice on Unix (temp file,
+/// then parent dir after the rename). Suppress the rewrite while the PERSISTED
+/// stamp is younger than this window. Value equality cannot be used instead:
+/// the payload embeds `Utc::now()`, so it differs on every call.
+///
+/// The trade is bounded and one-directional — the watchdogs can see a stamp up
+/// to this many seconds stale against thresholds of
+/// [`FLEET_IDLE_THRESHOLD_SECS`] (1800) and [`DEV_IDLE_THRESHOLD_SECS`] (3600),
+/// so an agent can never be misjudged idle because of it.
+const COALESCE_WINDOW_SECS: i64 = 5;
+
+/// True when `prev` is recent enough to skip the rewrite. Anything uncertain
+/// writes: a missing/malformed/future-version sidecar reads as `None`, and a
+/// stamp dated in the FUTURE (clock skew, restored backup) yields a negative
+/// elapsed and is rejected too — otherwise a bad stamp could suppress every
+/// future touch and silently freeze the agent's liveness signal.
+fn within_coalesce_window(prev: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let Some(prev) = prev else { return false };
+    let elapsed = chrono::Utc::now().signed_duration_since(prev);
+    elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::seconds(COALESCE_WINDOW_SECS)
+}
+
 /// Touch agent activity — atomically write `last_active_at = now()`.
 /// Best-effort; IO failures are logged and swallowed.
 pub(crate) fn touch_agent_activity(home: &Path, agent: &str) {
     if agent.is_empty() {
+        return;
+    }
+    if within_coalesce_window(read_agent_last_active(home, agent)) {
         return;
     }
     let dir = activity_dir(home);

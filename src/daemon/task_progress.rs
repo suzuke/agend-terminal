@@ -93,6 +93,30 @@ fn progress_path(home: &Path, task_id: &str) -> PathBuf {
     progress_dir(home).join(format!("{task_id}.json"))
 }
 
+/// #3026: a send is the hottest tool in the fleet and every one carrying a
+/// task_id lands here, paying mkdir + flock + `atomic_write` — and
+/// `atomic_write` fsyncs twice on Unix (temp file, then parent dir after the
+/// rename). Suppress the rewrite while the PERSISTED stamp is younger than this
+/// window. Value equality cannot be used instead: the payload embeds
+/// `Utc::now()`, so it differs on every call.
+///
+/// The trade is bounded and one-directional — a consumer can see a stamp up to
+/// this many seconds stale, three orders of magnitude below the tightest floor
+/// that reads it (`idle_watchdog::FLEET_IDLE_THRESHOLD_SECS` 1800,
+/// `DEV_IDLE_THRESHOLD_SECS` 3600, anti-stall `eta_secs * 1.5`).
+const COALESCE_WINDOW_SECS: i64 = 5;
+
+/// True when `prev` is recent enough to skip the rewrite. Anything uncertain
+/// writes: a missing/malformed/future-version sidecar reads as `None`, and a
+/// stamp dated in the FUTURE (clock skew, restored backup) yields a negative
+/// elapsed and is rejected too — otherwise a bad stamp could suppress every
+/// future touch and silently freeze the liveness signal.
+fn within_coalesce_window(prev: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let Some(prev) = prev else { return false };
+    let elapsed = chrono::Utc::now().signed_duration_since(prev);
+    elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::seconds(COALESCE_WINDOW_SECS)
+}
+
 /// Touch progress for a task — writes (or overwrites) the sidecar
 /// with `last_progress_at = now()` and the supplied `source` tag.
 /// Atomic via temp + fsync + rename. Per-task lock prevents
@@ -104,6 +128,9 @@ fn progress_path(home: &Path, task_id: &str) -> PathBuf {
 /// the broadcast dispatch path is not.
 pub(crate) fn touch(home: &Path, task_id: &str, source: ProgressSource) {
     if task_id.is_empty() {
+        return;
+    }
+    if within_coalesce_window(read_last_progress_at(home, task_id)) {
         return;
     }
     let dir = progress_dir(home);
@@ -261,9 +288,12 @@ mod tests {
     #[test]
     fn touch_subsequent_overwrites_with_latest_timestamp() {
         let home = tmp_home("touch-overwrite");
-        touch(&home, "t-test-2", ProgressSource::Broadcast);
-        let first = read_last_progress_at(&home, "t-test-2").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // #3026: the previous 1100ms sleep no longer separates the two touches
+        // — that gap is inside the coalescing window, so the second write would
+        // (correctly) be suppressed. Seed a stamp older than the window instead;
+        // this asserts the same overwrite contract and drops a wall-clock sleep.
+        let first = chrono::Utc::now() - chrono::Duration::seconds(COALESCE_WINDOW_SECS + 1);
+        seed_progress_at(&home, "t-test-2", first);
         touch(&home, "t-test-2", ProgressSource::CiPush);
         let second = read_last_progress_at(&home, "t-test-2").unwrap();
         assert!(
