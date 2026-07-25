@@ -1457,6 +1457,44 @@ fn hook_fixup_team_dispatch_records_pending_via_default_threshold() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3001 RED: a new correlated dispatch currently scans all pending sidecars
+/// once for deduplication and again for stale-handoff cleanup. Refreshing an
+/// existing intent already returns after the first scan and must stay that way.
+#[test]
+fn correlated_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
+    let home = tmp_home("3001-single-pending-scan");
+    write_fixup_fleet(&home, &["sender-3001", "target-3001"]);
+    let ctx = test_ctx(&home);
+    let params = json!({
+        "from": "sender-3001",
+        "target": "target-3001",
+        "text": "dispatch",
+        "kind": "task",
+        "task_id": "t-3001-scan",
+        "expect_reply_within_secs": 600,
+    });
+
+    crate::daemon::dispatch_idle::reset_list_pending_call_count();
+    let result = handle_send(&params, &ctx);
+    assert_eq!(result["ok"], true, "new dispatch must succeed: {result}");
+    assert_eq!(
+        crate::daemon::dispatch_idle::take_list_pending_call_count(),
+        2,
+        "RED: a new correlated dispatch should expose the duplicate pending scans"
+    );
+
+    crate::daemon::dispatch_idle::reset_list_pending_call_count();
+    let result = handle_send(&params, &ctx);
+    assert_eq!(result["ok"], true, "refresh dispatch must succeed: {result}");
+    assert_eq!(
+        crate::daemon::dispatch_idle::take_list_pending_call_count(),
+        1,
+        "refreshing an existing intent must retain its one-scan early return"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// RED: a task dispatch must key delivery tracking by its leaf `task_id`, not
 /// by a stale umbrella `correlation_id`; a terminal report then closes the leaf
 /// while leaving the legitimate umbrella task open.
