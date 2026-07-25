@@ -2523,6 +2523,14 @@ mod tests {
     }
 
     #[test]
+    fn read_scrollback_trims_leading_blanks_before_full_window_2963() {
+        let mut vt = VTerm::new(80, 3);
+        vt.process(b"\r\n\r\nB");
+
+        assert_eq!(vt.read_scrollback(2), "B");
+    }
+
+    #[test]
     fn read_scrollback_zero_lines_does_not_scan() {
         let mut vt = VTerm::new(80, 5);
         vt.process(b"content\r\n");
