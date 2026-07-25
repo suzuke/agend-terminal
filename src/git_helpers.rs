@@ -406,7 +406,7 @@ fn record_default_branch_call() {
 #[inline(always)]
 fn record_default_branch_call() {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_default_branch_calls() -> usize {
     DEFAULT_BRANCH_CALLS.with(std::cell::Cell::get)
 }
