@@ -803,10 +803,26 @@ fn privileged_rearm_clears_notification_only_flag() {
 fn find_watch_with_sha(watch_dir: &std::path::Path, sha: &str) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(watch_dir).ok()?;
     for entry in entries.flatten() {
-        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-            if content.contains(sha) {
-                return Some(entry.path());
-            }
+        // #3060: canonical watch files only. `store::atomic_write` leaves a
+        // sibling `<name>.json.<pid>.<seq>.tmp` in this directory until its
+        // rename lands, and the watch dir also holds `.lock` files; scanning
+        // those let a parallel-load run return an in-flight temp file.
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        // Match only a COMPLETE document: bytes can carry the SHA without
+        // parsing, which is what made the callers panic on trailing characters.
+        if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+            continue;
+        }
+        if content.contains(sha) {
+            return Some(entry.path());
         }
     }
     None
