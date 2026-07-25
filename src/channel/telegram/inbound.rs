@@ -565,25 +565,23 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         // append could read a stale set, then write its precomputed array back
         // AFTER the filter had removed a processed id — resurrecting it (a
         // processed pickup re-confirmed). Both the append (here) and the filter
-        // now run as `update_metadata` locked RMWs on the same key, so they
+        // now run as locked metadata RMWs on the same key, so they
         // serialize and neither clobbers the other.
-        crate::agent_ops::update_metadata(&home, &instance_name, "pending_pickup_ids", |current| {
+        crate::agent_ops::update_metadata_object(&home, &instance_name, |metadata| {
+            let current = metadata
+                .get("pending_pickup_ids")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let mut ids: Vec<serde_json::Value> = current.as_array().cloned().unwrap_or_default();
             ids.push(entry);
             // M2: cap to prevent unbounded growth (keep newest 100)
             if ids.len() > 100 {
                 ids = ids.split_off(ids.len() - 100);
             }
-            serde_json::json!(ids)
+            metadata["pending_pickup_ids"] = serde_json::json!(ids);
+            metadata["last_message_id"] = serde_json::json!(msg.id.0);
         });
     }
-    // Also store as last_message_id for the `react` MCP tool's fallback.
-    crate::agent_ops::save_metadata(
-        &home,
-        &instance_name,
-        "last_message_id",
-        serde_json::json!(msg.id.0),
-    );
 
     // Download inbound attachment if present (async — avoids nested runtime panic).
     let attachments: Vec<crate::channel::event::Attachment> = if let Some(f) = inbound_file {
