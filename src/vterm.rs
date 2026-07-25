@@ -825,6 +825,7 @@ impl VTerm {
         // but never retain the whole scrollback grid.
         let mut lines: Vec<String> = Vec::new();
         let mut started = false;
+        let mut reached_top = false;
         let mut row = bot;
         loop {
             #[cfg(test)]
@@ -851,13 +852,22 @@ impl VTerm {
                 }
             }
             if row == top {
+                reached_top = true;
                 break;
             }
             row -= 1;
         }
 
         lines.reverse();
-        lines.join("\n")
+        let first = if reached_top {
+            lines
+                .iter()
+                .position(|line| !line.is_empty())
+                .unwrap_or(lines.len())
+        } else {
+            0
+        };
+        lines[first..].join("\n")
     }
 
     /// Return the last `n` visible rows of the screen as plain text,
