@@ -1440,6 +1440,85 @@ fn mock_success_run_updates_watch_state() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// d-20260725074908427354-47 (the #3063 handoff break): an explicit `ci watch`
+/// that re-arms a zero-subscriber unwatch TOMBSTONE must start a FRESH
+/// notification epoch. The poll-owned dedup cursors describe notifications
+/// delivered to the PREVIOUS epoch's subscribers; if they survive the re-arm, a
+/// still-terminal run at the SAME head is suppressed by
+/// `last_notified_by_workflow` (and the legacy `last_notified_*` gates), so the
+/// new subscriber is never told CI finished.
+///
+/// Drives the REAL entries — `handle_watch_ci` → `handle_unwatch_ci` (tombstone)
+/// → `handle_watch_ci` → one provider poll — and counts inbox deliveries, the
+/// same way `mock_success_run_updates_watch_state` above does.
+#[test]
+fn tombstone_rearm_notifies_same_terminal_head_once() {
+    let dir = tmp_dir("tombstone-rearm-epoch");
+    let args = serde_json::json!({"repository": "o/r", "branch": "feat"});
+    let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+    // Inbox is one JSONL per recipient, so a line count is BOTH the exact
+    // delivery count and the routing evidence (which agent was told).
+    let delivered = |d: &Path, agent: &str| -> usize {
+        std::fs::read_to_string(d.join("inbox").join(format!("{agent}.jsonl")))
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    };
+    let terminal_run = || {
+        vec![CiRun {
+            run_attempt: 1,
+            id: 100,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+            name: String::new(),
+        }]
+    };
+    let read_watch = |p: &Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    };
+
+    // Epoch 1: real subscribe, then one poll of the terminal run notifies dev-1.
+    crate::mcp::handlers::ci::handle_watch_ci(&dir, &args, "dev-1");
+    run_ci_check(
+        &dir,
+        &read_watch(&watch_path),
+        &MockCiProvider::with_runs(terminal_run()),
+    )
+    .unwrap();
+    let dev1_epoch1 = delivered(&dir, "dev-1");
+    assert!(
+        dev1_epoch1 > 0,
+        "epoch 1 must deliver the terminal-run notification to dev-1"
+    );
+
+    // Explicit unwatch leaves the zero-subscriber tombstone, then a DIFFERENT
+    // agent re-arms it. The run has not changed — it is still the same
+    // already-terminal head.
+    crate::mcp::handlers::ci::handle_unwatch_ci(&dir, &args, "dev-1");
+    crate::mcp::handlers::ci::handle_watch_ci(&dir, &args, "dev-2");
+    let before = delivered(&dir, "dev-2");
+    run_ci_check(
+        &dir,
+        &read_watch(&watch_path),
+        &MockCiProvider::with_runs(terminal_run()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        delivered(&dir, "dev-2"),
+        before + 1,
+        "a tombstone re-arm starts a fresh notification epoch — the re-armed \
+         subscriber must be told about the already-terminal run EXACTLY once \
+         (was {before}), otherwise the CI handoff is silently lost or doubled"
+    );
+    assert_eq!(
+        delivered(&dir, "dev-1"),
+        dev1_epoch1,
+        "the departed subscriber must not be re-notified by the new epoch"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// #2008 (codex review): poller-LEVEL regression — proves the real wiring
 /// (correlation-key construction `repo@branch`, the poll gate, provider PR data)
 /// that the direct `resolve_head_advanced` unit tests can't. A pending ci-handoff

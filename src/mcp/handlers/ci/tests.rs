@@ -3177,6 +3177,156 @@ fn rewatch_clears_tombstone_optout_1991() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Seed the poll-owned notification cursors a completed poll would have left,
+/// plus a routing/backoff field set, on an existing watch file. Returns the
+/// pre-seed `generation_id`.
+fn seed_notify_cursors(path: &Path) -> String {
+    let mut w = read_watch(path);
+    let gen = w["generation_id"]
+        .as_str()
+        .expect("watch carries a generation_id")
+        .to_string();
+    w["last_run_id"] = serde_json::json!(100);
+    w["last_notified_head_sha"] = serde_json::json!("abc");
+    w["last_notified_conclusion"] = serde_json::json!("success");
+    w["last_notified_run_attempt"] = serde_json::json!(1);
+    w["last_notified_run_conclusion"] = serde_json::json!("success");
+    w["last_terminal_seen_at"] = serde_json::json!("2026-07-25T00:00:00+00:00");
+    w["terminal_since"] = serde_json::json!("2026-07-25T00:00:00+00:00");
+    w["last_notified_by_workflow"] = serde_json::json!({
+        "#run:100": {"run_id": 100, "run_attempt": 1, "conclusion": "success"}
+    });
+    // Routing / backoff state the re-arm must NOT disturb.
+    w["required_checks"] = serde_json::json!(["build"]);
+    w["rate_limit_until"] = serde_json::json!(1784000000);
+    w["rate_limit_remaining"] = serde_json::json!(17);
+    w["consecutive_skips"] = serde_json::json!(3);
+    w["effective_interval_secs"] = serde_json::json!(120);
+    std::fs::write(path, serde_json::to_string_pretty(&w).unwrap()).unwrap();
+    gen
+}
+
+const NOTIFY_CURSORS: &[&str] = &[
+    "last_run_id",
+    "last_notified_head_sha",
+    "last_notified_conclusion",
+    "last_notified_run_attempt",
+    "last_notified_run_conclusion",
+    "last_terminal_seen_at",
+    "terminal_since",
+];
+
+/// d-20260725074908427354-47: re-arming a zero-subscriber unwatch TOMBSTONE must
+/// start a fresh notification epoch — clear the poll-owned dedup cursors and
+/// rotate `generation_id` in the same write — while preserving every
+/// routing/config/backoff field. Without the cursor reset a still-terminal run at
+/// the same head is suppressed (#3063's lost handoff); without the rotation an
+/// in-flight OLD-generation poll flush would pass the `flush_watch_state` CAS and
+/// restore exactly the cursors this clears.
+#[test]
+fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
+    let home = watch_test_home("tombstone-rearm-epoch");
+    let args = serde_json::json!({"repository": "o/r", "branch": "feat/x"});
+    super::handle_watch_ci(&home, &args, "dev-1");
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    let gen_before = seed_notify_cursors(&path);
+
+    super::handle_unwatch_ci(&home, &args, "dev-1");
+    // The tombstone still carries the previous epoch's cursors.
+    let tombstone = read_watch(&path);
+    assert_eq!(tombstone["auto_arm_optout"], true);
+    assert_eq!(tombstone["last_run_id"].as_u64(), Some(100));
+
+    super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r", "branch": "feat/x",
+            "task_id": "t-1", "review_class": "dual", "next_after_ci": "lead",
+        }),
+        "dev-2",
+    );
+
+    let v = read_watch(&path);
+    for k in NOTIFY_CURSORS {
+        assert!(
+            v.get(*k).map(|x| x.is_null()).unwrap_or(true),
+            "tombstone re-arm must clear `{k}` (was carried from the previous \
+             notification epoch): {v}"
+        );
+    }
+    assert!(
+        v.get("last_notified_by_workflow")
+            .map(|m| m.as_object().map(|o| o.is_empty()).unwrap_or(false))
+            .unwrap_or(true),
+        "tombstone re-arm must clear the per-workflow notify cursors: {v}"
+    );
+    assert_ne!(
+        v["generation_id"].as_str(),
+        Some(gen_before.as_str()),
+        "tombstone re-arm must rotate generation_id so an in-flight \
+         old-generation flush cannot restore the cleared cursors: {v}"
+    );
+
+    // Routing / config / backoff preserved (and the caller's new routing applied).
+    assert_eq!(v["required_checks"], serde_json::json!(["build"]));
+    assert_eq!(v["rate_limit_until"].as_i64(), Some(1784000000));
+    assert_eq!(v["rate_limit_remaining"].as_u64(), Some(17));
+    assert_eq!(v["consecutive_skips"].as_u64(), Some(3));
+    assert_eq!(v["effective_interval_secs"].as_u64(), Some(120));
+    assert_eq!(v["task_id"], "t-1");
+    assert_eq!(v["review_class"], "dual");
+    // Single target is stored in its scalar form by `next_after_ci_json`.
+    assert_eq!(v["next_after_ci"], serde_json::json!("lead"));
+    assert!(v.get("auto_arm_optout").is_none(), "optout cleared: {v}");
+    assert_eq!(
+        crate::daemon::ci_watch::parse_subscribers(&v),
+        vec!["dev-2".to_string()]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The complement of the test above, and the regression risk of the reset: an
+/// ORDINARY resubscribe (no tombstone — the watch still has a live subscriber)
+/// must NOT touch the notification cursors or the generation. Only the
+/// zero-subscriber tombstone path starts a new epoch.
+#[test]
+fn ordinary_resubscribe_preserves_notify_cursors_and_generation() {
+    let home = watch_test_home("ordinary-resubscribe-epoch");
+    let args = serde_json::json!({"repository": "o/r", "branch": "feat/x"});
+    super::handle_watch_ci(&home, &args, "dev-1");
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    let gen_before = seed_notify_cursors(&path);
+
+    // dev-1 is still subscribed; dev-2 joins, and dev-1 re-subscribes.
+    super::handle_watch_ci(&home, &args, "dev-2");
+    super::handle_watch_ci(&home, &args, "dev-1");
+
+    let v = read_watch(&path);
+    assert_eq!(
+        v["last_run_id"].as_u64(),
+        Some(100),
+        "ordinary resubscribe must not clear poll cursors: {v}"
+    );
+    assert_eq!(v["last_notified_head_sha"], "abc");
+    assert_eq!(v["terminal_since"], "2026-07-25T00:00:00+00:00");
+    assert!(
+        v["last_notified_by_workflow"]["#run:100"].is_object(),
+        "per-workflow cursors survive an ordinary resubscribe: {v}"
+    );
+    assert_eq!(
+        v["generation_id"].as_str(),
+        Some(gen_before.as_str()),
+        "generation_id is creation identity — an ordinary resubscribe must not \
+         rotate it: {v}"
+    );
+    // And no duplicate subscriber rows.
+    assert_eq!(
+        crate::daemon::ci_watch::parse_subscribers(&v),
+        vec!["dev-1".to_string(), "dev-2".to_string()]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ---------------------------------------------------------------------------
 // Arch-14 item 10: repo release canonical delegation (real dispatch entry)
 // ---------------------------------------------------------------------------
