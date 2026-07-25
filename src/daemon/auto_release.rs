@@ -92,6 +92,15 @@ pub(crate) struct AutoReleaseIntent {
     /// re-leased to a different task between enqueue and sweep → skip.
     #[serde(default)]
     pub lease: Option<LeaseIdentity>,
+    /// #3005: RFC3339 deadline before which this intent's next probe is skipped.
+    /// Stamped ONLY when the expensive Unknown-only terminal-resolution fallback
+    /// actually ran and still could not prove release — the one case that
+    /// otherwise re-spawns git + two gh queries every sweep until the 7-day
+    /// expiry. Absent ⟹ probe on the next sweep (legacy intents deserialize this
+    /// way). Every fresh enqueue writes `None`, so new evidence wakes the probe
+    /// immediately instead of waiting out the interval.
+    #[serde(default)]
+    pub unknown_retry_after: Option<String>,
 }
 
 /// t-worktree-leak (PR-1): the stable identity of a worktree lease, snapshotted
@@ -952,6 +961,8 @@ pub(crate) fn enqueue_release_recompute(home: &Path, repo: &str, branch: &str, e
         repo: (!repo.is_empty()).then(|| repo.to_string()),
         branch: Some(branch.to_string()),
         lease: Some(LeaseIdentity::from_binding(&agent, &binding)),
+        // #3005: a fresh enqueue IS new evidence — never inherit a deferral.
+        unknown_retry_after: None,
     };
     if let Err(e) = enqueue_intent(home, &intent) {
         tracing::warn!(repo = %repo, branch = %branch, event = %event_kind, error = %e,

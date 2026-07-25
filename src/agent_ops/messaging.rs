@@ -623,6 +623,8 @@ pub(crate) fn process_verdicts(home: &Path, msg: &crate::inbox::InboxMessage) ->
             repo: None,
             branch: None,
             lease: None,
+            // #3005: a fresh verdict IS new evidence — never inherit a deferral.
+            unknown_retry_after: None,
         };
         if let Err(e) = crate::daemon::auto_release::enqueue_intent(home, &intent) {
             tracing::warn!(task_id = %task_id, error = %e, "#870 auto_release: enqueue failed");

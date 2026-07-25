@@ -30,6 +30,7 @@ fn sample_intent(task_id: &str) -> AutoReleaseIntent {
         repo: None,
         branch: None,
         lease: None,
+        unknown_retry_after: None,
     }
 }
 
@@ -1338,6 +1339,79 @@ fn integration_no_pr_transient_gh_fail_retains() {
         "transient gh failure → binding preserved (no false-release)"
     );
     assert_eq!(queue_len(&home), 1, "unconfirmed intent RETAINED for retry");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #3005: a done-but-unprovable branch (no pr_state → Unknown, not squash-merged,
+/// gh reports an existing PR → release cannot be proven) re-ran the ENTIRE
+/// expensive terminal-resolution probe — `default_branch` + `is_squash_merged`
+/// git spawns, the repo-wide `gh_poll`, and the head-scoped `branch_never_had_pr`
+/// query — on EVERY sweep (≈30s), forever, until the 7-day expiry.
+/// `pr_list_calls` is the deterministic witness: TWO gh queries per sweep (the
+/// repo-wide poll inside `evaluate_pr_for_release` plus the no-PR probe), growing
+/// without bound and with no wall-clock sleep needed to observe it.
+///
+/// Post-fix a single `unknown_retry_after` stamp defers the next probe by a fixed
+/// 5 minutes, while still RETAINING both the intent and the binding — and a fresh
+/// enqueue (new evidence) clears the stamp so the very next sweep probes again
+/// immediately, with no wait.
+#[test]
+fn unknown_probe_backs_off_and_new_evidence_wakes_it_immediately() {
+    let home = tmp_home("itest-unknown-backoff");
+    write_fleet(&home, "dev");
+    let repo = itest_source_repo(&home, "owner/repo");
+    let branch = "feat/backoff";
+    let wt = itest_lease(&home, &repo, "dev", branch, "t-bo", false);
+    // A real UNMERGED branch commit → is_squash_merged = false.
+    std::fs::write(wt.join("feature.txt"), "unmerged work").unwrap();
+    itest_git(&wt, &["add", "feature.txt"]);
+    itest_git(&wt, &["commit", "-m", "unmerged feat"]);
+    // No pr_state → Unknown; gh reports an existing (open) PR →
+    // branch_never_had_pr = Some(false) → neither terminal-resolution path can
+    // prove release → retain. Deterministic mock, no real gh call.
+    let provider = crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Prs(1));
+    let _scm = crate::scm::set_test_scm_provider(provider.clone());
+
+    task_done_via_handler(&home, "dev", "t-bo");
+    assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
+
+    drain_queue(&home);
+    let per_sweep = provider.pr_list_calls();
+    assert_eq!(
+        per_sweep, 2,
+        "one Unknown sweep costs two gh queries: the repo-wide poll + the no-PR probe"
+    );
+    assert_eq!(queue_len(&home), 1, "unprovable intent RETAINED");
+    assert!(bound(&home, "dev"), "unprovable → never false-released");
+
+    // Second sweep fired immediately (no wall-clock sleep): within the fixed
+    // 5-minute window the expensive probe must be skipped entirely.
+    drain_queue(&home);
+    assert_eq!(
+        provider.pr_list_calls(),
+        per_sweep,
+        "#3005: inside the 5-minute Unknown backoff the expensive probe must NOT re-run"
+    );
+    assert_eq!(
+        queue_len(&home),
+        1,
+        "#3005: a backed-off intent is RETAINED, never dropped"
+    );
+    assert!(
+        bound(&home, "dev"),
+        "#3005: backoff must not release or drop the binding"
+    );
+
+    // Fresh evidence (a merge event) re-enqueues the intent with no stamp, so the
+    // next sweep probes immediately instead of waiting out the 5 minutes.
+    crate::daemon::auto_release::enqueue_release_recompute(&home, "owner/repo", branch, "merge");
+    drain_queue(&home);
+    assert_eq!(
+        provider.pr_list_calls(),
+        per_sweep * 2,
+        "#3005: a fresh enqueue clears the backoff — new evidence wakes the probe immediately"
+    );
+    assert!(bound(&home, "dev"), "still unprovable → still not released");
     let _ = std::fs::remove_dir_all(&home);
 }
 
