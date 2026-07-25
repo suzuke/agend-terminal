@@ -857,11 +857,7 @@ impl VTerm {
         }
 
         lines.reverse();
-        let first = lines
-            .iter()
-            .position(|line| !line.is_empty())
-            .unwrap_or(lines.len());
-        lines[first..].join("\n")
+        lines.join("\n")
     }
 
     /// Return the last `n` visible rows of the screen as plain text,
