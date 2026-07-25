@@ -130,9 +130,6 @@ pub(crate) fn touch(home: &Path, task_id: &str, source: ProgressSource) {
     if task_id.is_empty() {
         return;
     }
-    if within_coalesce_window(read_last_progress_at(home, task_id)) {
-        return;
-    }
     let dir = progress_dir(home);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!(error = %e, dir = %dir.display(), "task_progress: mkdir failed");
@@ -147,6 +144,13 @@ pub(crate) fn touch(home: &Path, task_id: &str, source: ProgressSource) {
             return;
         }
     };
+    // #3026 (r1): the freshness decision must be made UNDER the sidecar lock.
+    // Read outside it and two concurrent callers can both observe the same stale
+    // stamp and both proceed to write — the coalescing would then silently not
+    // hold under exactly the concurrency it exists to damp.
+    if within_coalesce_window(read_last_progress_at(home, task_id)) {
+        return;
+    }
     record_sidecar_write(task_id);
     let payload = ProgressSidecar {
         schema_version: SCHEMA_VERSION,

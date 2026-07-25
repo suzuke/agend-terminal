@@ -186,9 +186,6 @@ pub(crate) fn touch_agent_activity(home: &Path, agent: &str) {
     if agent.is_empty() {
         return;
     }
-    if within_coalesce_window(read_agent_last_active(home, agent)) {
-        return;
-    }
     let dir = activity_dir(home);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -198,6 +195,13 @@ pub(crate) fn touch_agent_activity(home: &Path, agent: &str) {
         Ok(l) => l,
         Err(_) => return,
     };
+    // #3026 (r1): the freshness decision must be made UNDER the sidecar lock.
+    // Read outside it and two concurrent callers can both observe the same stale
+    // stamp and both proceed to write — the coalescing would then silently not
+    // hold under exactly the concurrency it exists to damp.
+    if within_coalesce_window(read_agent_last_active(home, agent)) {
+        return;
+    }
     record_sidecar_write(agent);
     let payload = ActivitySidecar {
         schema_version: SCHEMA_VERSION,
