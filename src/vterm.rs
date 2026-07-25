@@ -826,6 +826,7 @@ impl VTerm {
         let mut lines: Vec<String> = Vec::new();
         let mut started = false;
         let mut reached_top = false;
+        let mut look_behind = false;
         let mut row = bot;
         loop {
             #[cfg(test)]
@@ -844,11 +845,19 @@ impl VTerm {
                 col += 1;
             }
             let trimmed = line.trim_end();
-            if started || !trimmed.is_empty() {
+            if look_behind {
+                if !trimmed.is_empty() {
+                    break;
+                }
+            } else if started || !trimmed.is_empty() {
                 started = true;
                 lines.push(trimmed.to_string());
                 if lines.len() == max_lines {
-                    break;
+                    if lines.last().is_some_and(|line| line.is_empty()) {
+                        look_behind = true;
+                    } else {
+                        break;
+                    }
                 }
             }
             if row == top {
