@@ -942,6 +942,9 @@ pub(crate) fn emit_delete_batch_with_context(
     {
         name_to_candidate.insert(cand.name.as_str(), cand);
     }
+    // Query the bounded open-PR inventory once per branch sweep. An unknown
+    // snapshot remains fail-closed for every terminal candidate.
+    let open_pr_inventory = open_pr_snapshot(repo, base);
     let category_of = |name: &str| -> &'static str {
         if categories.clean_merged.iter().any(|c| c.name == name) {
             "clean_merged"
@@ -989,7 +992,7 @@ pub(crate) fn emit_delete_batch_with_context(
             crate::worktree::disposition::BranchProvenance::Unknown
         );
         let open_pr = if terminal {
-            match open_pr_status(repo, base, name) {
+            match open_pr_inventory.status_for(name) {
                 OpenPrStatus::Open => Some(true),
                 OpenPrStatus::NotOpen => Some(false),
                 OpenPrStatus::Unknown => None,
@@ -1407,12 +1410,14 @@ mod tests {
     }
 
     fn four_merged_sweep_candidates(repo: &Path) -> Categories {
-        for branch in ["feat-open", "feat-closed-a", "feat-closed-b", "feat-unknown"] {
+        for branch in [
+            "feat-open",
+            "feat-closed-a",
+            "feat-closed-b",
+            "feat-unknown",
+        ] {
             create_branch_with_commit(repo, branch, &format!("merge candidate {branch}"));
-            git_run(
-                repo,
-                &["merge", "--no-ff", "-m", "merge candidate", branch],
-            );
+            git_run(repo, &["merge", "--no-ff", "-m", "merge candidate", branch]);
         }
         scan(repo, "main", STALE_IDLE_DEFAULT_DAYS, chrono::Utc::now()).expect("scan")
     }
@@ -1924,9 +1929,9 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-    /// #2999 RED: the real multi-candidate apply path currently performs one
-    /// provider open-PR lookup per terminal branch. It must preserve the
-    /// open branch while deleting the three closed branches.
+    /// #2999: the real multi-candidate apply path uses one bounded provider
+    /// inventory while preserving the open branch and deleting the three
+    /// closed branches.
     #[test]
     fn apply_batches_open_pr_snapshot_and_preserves_open_disposition_2999() {
         let repo = setup_repo("2999-open-pr-batch");
@@ -1942,9 +1947,10 @@ mod tests {
         );
         let categories = four_merged_sweep_candidates(&repo);
         let confirm_ids = categories.deletable_ids().into_iter().collect();
-        let provider = crate::scm::MockScmProvider::with_pr_list(
-            crate::scm::MockPrList::Branches(vec!["feat-open".into()]),
-        );
+        let provider =
+            crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+                "feat-open".into(),
+            ]));
         let _provider_guard = crate::scm::set_test_scm_provider(provider.clone());
 
         let (deleted, skipped) = emit_delete_batch_with_context(
@@ -1959,8 +1965,8 @@ mod tests {
 
         assert_eq!(
             provider.pr_list_calls(),
-            4,
-            "RED: each terminal candidate currently performs its own provider lookup"
+            1,
+            "one provider inventory must cover every terminal candidate"
         );
         assert_eq!(deleted, 3, "closed branches remain deletable: {skipped:?}");
         assert_eq!(skipped.len(), 1, "only the open branch should be skipped");
@@ -1970,9 +1976,8 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-    /// #2999 RED: a provider inventory failure must preserve every terminal
-    /// candidate, while the eventual snapshot-based implementation performs
-    /// only one fail-closed provider call for the whole sweep.
+    /// #2999: a provider inventory failure preserves every terminal candidate
+    /// while the snapshot remains fail-closed for the whole sweep.
     #[test]
     fn apply_batches_open_pr_snapshot_and_fails_closed_on_provider_error_2999() {
         let repo = setup_repo("2999-open-pr-failure");
@@ -1988,9 +1993,9 @@ mod tests {
         );
         let categories = four_merged_sweep_candidates(&repo);
         let confirm_ids = categories.deletable_ids().into_iter().collect();
-        let provider = crate::scm::MockScmProvider::with_pr_list(
-            crate::scm::MockPrList::Fail("offline".into()),
-        );
+        let provider = crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Fail(
+            "offline".into(),
+        ));
         let _provider_guard = crate::scm::set_test_scm_provider(provider.clone());
 
         let (deleted, skipped) = emit_delete_batch_with_context(
@@ -2005,8 +2010,8 @@ mod tests {
 
         assert_eq!(
             provider.pr_list_calls(),
-            4,
-            "RED: provider errors are currently repeated per candidate"
+            1,
+            "one failed provider inventory must cover the whole sweep"
         );
         assert_eq!(deleted, 0, "provider failure must fail closed");
         assert_eq!(skipped.len(), 4, "every candidate must be preserved");
