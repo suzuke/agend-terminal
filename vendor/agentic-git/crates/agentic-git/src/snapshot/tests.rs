@@ -575,3 +575,47 @@ fn list_snapshots_and_parse_round_trip_on_a_real_ref() {
     assert!(!rows[0].when.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Decision `d-20260725211528579625-71`: `<seq>` must be allocated across the
+/// whole `(who, <utc-ts>)` bucket, not per op slug.
+///
+/// `unique_ref_name` probes the FULL ref name, which embeds `<op-slug>`, so a
+/// seq is only "taken" for the op that took it. Two different destructive ops
+/// in the same second therefore both land on seq 0 in the same bucket — and
+/// `resolve_restore_target` orders by `(<utc-ts>, <seq>)`, so that pair ties
+/// and the winner falls out of `for-each-ref`'s refname order (the slug
+/// alphabet), not creation order. Restore can hand back the older snapshot
+/// while the CLI promises strict newest.
+///
+/// Deterministic: a literal bucket, a seeded ref, one call. No clock, no sleep,
+/// no retry.
+#[test]
+fn unique_ref_name_allocates_seq_across_op_slugs_in_one_bucket() {
+    let git = resolve_real_git();
+    let dir = tempdir("seq-bucket");
+    init_repo(&git, &dir, true);
+    let who = "agent-seq";
+    let ts = "20260726T041500Z";
+
+    // A snapshot already exists in this bucket, taken by a DIFFERENT op.
+    let head = rev_parse(&git, &dir, "HEAD");
+    let taken = snapshot_ref_name(who, ts, 0, "checkout");
+    assert!(
+        git_real(&git, &["update-ref", &taken, &head], &dir)
+            .status
+            .success(),
+        "seeding the existing bucket ref must succeed"
+    );
+
+    let allocated =
+        unique_ref_name(&git, &dir, who, ts, "reset").expect("a name must be allocatable");
+
+    assert_eq!(
+        allocated,
+        snapshot_ref_name(who, ts, 1, "reset"),
+        "seq 0 is already taken in this bucket (by `{taken}`), so the next op \
+         must get seq 1 — a per-slug seq leaves both at 0 and ties the \
+         restore order"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
