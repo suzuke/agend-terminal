@@ -302,6 +302,7 @@ pub(crate) fn record_dispatch(
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
+    let pending = correlation_id.map(|_| list_pending(home));
     // t-dispatchidle-clear-on-report (2): dedup by (dispatcher, target,
     // correlation_id). Re-dispatching the SAME task (same task_id) used to create a
     // fresh duplicate sidecar each call (`next_dispatch_id()`), so 142 correlation
@@ -318,7 +319,10 @@ pub(crate) fn record_dispatch(
                 && d.target == target
                 && d.correlation_id.as_deref() == Some(corr)
         };
-        if let Some(mut existing) = list_pending(home).into_iter().find(is_same_intent) {
+        if let Some(mut existing) = pending
+            .as_ref()
+            .and_then(|pending| pending.iter().find(|d| is_same_intent(d)).cloned())
+        {
             existing.issued_at = chrono::Utc::now().to_rfc3339();
             existing.status = DispatchStatus::Pending;
             existing.nudge_sent_at = None;
@@ -404,7 +408,7 @@ pub(crate) fn record_dispatch(
         correlation_id,
         chrono::DateTime::parse_from_rfc3339(&payload.issued_at),
     ) {
-        for stale in list_pending(home).into_iter().filter(|d| {
+        for stale in pending.unwrap_or_default().into_iter().filter(|d| {
             matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
                 && d.dispatcher == dispatcher
                 && d.target == target

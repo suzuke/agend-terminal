@@ -1457,9 +1457,9 @@ fn hook_fixup_team_dispatch_records_pending_via_default_threshold() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #3001 RED: a new correlated dispatch currently scans all pending sidecars
-/// once for deduplication and again for stale-handoff cleanup. Refreshing an
-/// existing intent already returns after the first scan and must stay that way.
+/// #3001: a correlated dispatch uses one pending-sidecar snapshot for
+/// deduplication and stale-handoff cleanup. Refreshing an existing intent
+/// returns after that same one-scan early return.
 #[test]
 fn correlated_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
     let home = tmp_home("3001-single-pending-scan");
@@ -1479,13 +1479,16 @@ fn correlated_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
     assert_eq!(result["ok"], true, "new dispatch must succeed: {result}");
     assert_eq!(
         crate::daemon::dispatch_idle::take_list_pending_call_count(),
-        2,
-        "RED: a new correlated dispatch should expose the duplicate pending scans"
+        1,
+        "a new correlated dispatch must scan pending sidecars once"
     );
 
     crate::daemon::dispatch_idle::reset_list_pending_call_count();
     let result = handle_send(&params, &ctx);
-    assert_eq!(result["ok"], true, "refresh dispatch must succeed: {result}");
+    assert_eq!(
+        result["ok"], true,
+        "refresh dispatch must succeed: {result}"
+    );
     assert_eq!(
         crate::daemon::dispatch_idle::take_list_pending_call_count(),
         1,
