@@ -177,9 +177,11 @@ mod tests {
     }
 
     /// #3026 — past the window BOTH writes must happen, and the worst-case
-    /// staleness the window leaves stays orders of magnitude below the tightest
-    /// consumer floor (idle watchdogs at 1800s / 3600s; anti-stall at
-    /// `eta_secs * 1.5`).
+    /// staleness it leaves is bounded by the window. That is three orders of
+    /// magnitude under the fixed idle floors (1800s / 3600s); against
+    /// anti-stall's `eta_secs * 1.5` it need not be smaller (eta may be 1), but
+    /// the direction is fail-loud — an older stamp can only make a stall warning
+    /// fire early, never hide one.
     #[test]
     fn send_after_window_persists_both_and_stays_fresh_3026() {
         let home = tmp_home_3026("after");
@@ -208,7 +210,8 @@ mod tests {
             assert!(
                 lag <= 5,
                 "{label} staleness must stay within the 5s window (lag={lag}s) — \
-                 far below the 1800s idle floor"
+                 three orders under the 1800s idle floor; against anti-stall the \
+                 direction is fail-loud, never suppressing"
             );
         }
         std::fs::remove_dir_all(&home).ok();

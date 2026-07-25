@@ -100,10 +100,19 @@ fn progress_path(home: &Path, task_id: &str) -> PathBuf {
 /// window. Value equality cannot be used instead: the payload embeds
 /// `Utc::now()`, so it differs on every call.
 ///
-/// The trade is bounded and one-directional — a consumer can see a stamp up to
-/// this many seconds stale, three orders of magnitude below the tightest floor
-/// that reads it (`idle_watchdog::FLEET_IDLE_THRESHOLD_SECS` 1800,
-/// `DEV_IDLE_THRESHOLD_SECS` 3600, anti-stall `eta_secs * 1.5`).
+/// The trade is bounded and FAIL-LOUD. A consumer can see a stamp up to this
+/// many seconds stale. Against the fixed idle floors that is three orders of
+/// magnitude of headroom (`idle_watchdog::FLEET_IDLE_THRESHOLD_SECS` 1800,
+/// `DEV_IDLE_THRESHOLD_SECS` 3600). Against anti-stall it is NOT automatically
+/// smaller — that threshold is `eta_secs * 1.5`, and an `eta_secs` of 1 puts it
+/// at 1.5s, well inside this window. That is safe in the direction that matters:
+/// an older stamp makes elapsed-since-progress look LARGER, so a stall warning
+/// can fire early but can never be suppressed.
+///
+/// `ProgressSource` is forensic-only (it records which hook kept a task fresh).
+/// A source transition occurring inside the window is coalesced away, so the
+/// recorded source can lag the true latest hook by up to this many seconds.
+/// Accepted deliberately — no separate metadata channel is added for it.
 const COALESCE_WINDOW_SECS: i64 = 5;
 
 /// True when `prev` is recent enough to skip the rewrite. Anything uncertain
