@@ -807,19 +807,26 @@ impl VTerm {
     }
 
     /// Read scrollback history + visible screen as plain text (ANSI stripped).
-    /// Returns the last `max_lines` lines. Walks from `topmost_line()` to
-    /// `bottommost_line()` via `safe_cell` — same pattern as `tail_lines`.
+    /// Returns the last `max_lines` lines. Scans upward from `bottommost_line()`
+    /// via `safe_cell`, skipping trailing blank rows and stopping after the
+    /// requested window.
     pub fn read_scrollback(&self, max_lines: usize) -> String {
         let grid = self.term.grid();
         let cols = grid.columns();
         let top = grid.topmost_line();
         let bot = grid.bottommost_line();
 
-        // Read ALL lines first (trim blanks before windowing so content
-        // above trailing blank padding is not lost — gemini-banner case).
+        if max_lines == 0 || top > bot {
+            return String::new();
+        }
+
+        // Read upward from the last non-blank row. Keep blank rows inside the
+        // requested window so the result matches trimming before windowing,
+        // but never retain the whole scrollback grid.
         let mut lines: Vec<String> = Vec::new();
-        let mut row = top;
-        while row <= bot {
+        let mut started = false;
+        let mut row = bot;
+        loop {
             #[cfg(test)]
             self.read_scrollback_rows
                 .set(self.read_scrollback_rows.get() + 1);
@@ -835,29 +842,26 @@ impl VTerm {
                 line.push(ch);
                 col += 1;
             }
-            lines.push(line.trim_end().to_string());
-            row += 1;
+            let trimmed = line.trim_end();
+            if started || !trimmed.is_empty() {
+                started = true;
+                lines.push(trimmed.to_string());
+                if lines.len() == max_lines {
+                    break;
+                }
+            }
+            if row == top {
+                break;
+            }
+            row -= 1;
         }
 
-        // Trim blank lines at both ends BEFORE windowing
+        lines.reverse();
         let first = lines
             .iter()
-            .position(|l| !l.is_empty())
+            .position(|line| !line.is_empty())
             .unwrap_or(lines.len());
-        let last = lines
-            .iter()
-            .rposition(|l| !l.is_empty())
-            .map(|i| i + 1)
-            .unwrap_or(first);
-        let trimmed = &lines[first..last];
-
-        // Window to last max_lines
-        let result = if trimmed.len() > max_lines {
-            &trimmed[trimmed.len() - max_lines..]
-        } else {
-            trimmed
-        };
-        result.join("\n")
+        lines[first..].join("\n")
     }
 
     /// Return the last `n` visible rows of the screen as plain text,
@@ -2493,6 +2497,29 @@ mod tests {
             vt.read_scrollback_rows.get() < 100,
             "read_scrollback(1) must not scan the retained history, visited {} rows",
             vt.read_scrollback_rows.get()
+        );
+    }
+
+    #[test]
+    fn read_scrollback_zero_lines_does_not_scan() {
+        let mut vt = VTerm::new(80, 5);
+        vt.process(b"content\r\n");
+
+        assert_eq!(vt.read_scrollback(0), "");
+        assert_eq!(vt.read_scrollback_rows.get(), 0);
+    }
+
+    #[test]
+    fn read_scrollback_skips_wide_char_spacers() {
+        let mut vt = VTerm::new(20, 2);
+        vt.process("中A\r\nB".as_bytes());
+
+        let text = vt.read_scrollback(10);
+
+        assert!(text.contains("中A"), "wide char text must be preserved");
+        assert!(
+            !text.contains("中 A"),
+            "wide char spacer must not add a space: {text:?}"
         );
     }
 
