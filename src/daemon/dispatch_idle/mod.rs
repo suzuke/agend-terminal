@@ -21,26 +21,8 @@ pub(crate) mod team_nudge;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use std::cell::Cell;
-
 const PENDING_DIR: &str = "pending-dispatches";
 const SCHEMA_VERSION: u32 = 1;
-
-#[cfg(test)]
-thread_local! {
-    static LIST_PENDING_CALLS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_list_pending_call_count() {
-    LIST_PENDING_CALLS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn take_list_pending_call_count() -> usize {
-    LIST_PENDING_CALLS.with(|count| count.replace(0))
-}
 
 /// #1018: correlation_id sentinels that the watchdog treats as
 /// placeholder values (no real task-board cross-reference possible).
@@ -436,8 +418,7 @@ pub(crate) fn record_dispatch(
 /// Read all pending dispatch sidecars from disk. Forward-compat: skips
 /// any sidecar whose `schema_version` is unknown.
 pub(crate) fn list_pending(home: &Path) -> Vec<PendingDispatch> {
-    #[cfg(test)]
-    LIST_PENDING_CALLS.with(|count| count.set(count.get() + 1));
+    note_list_pending();
 
     let dir = pending_dir(home);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1242,6 +1223,29 @@ pub(crate) fn scan_and_emit(home: &Path) {
             emit_exceeded_event(home, &current, elapsed_secs);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIST_PENDING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_list_pending() {
+    LIST_PENDING_CALLS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_list_pending() {}
+
+#[cfg(test)]
+pub(crate) fn reset_list_pending_call_count() {
+    LIST_PENDING_CALLS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_list_pending_call_count() -> usize {
+    LIST_PENDING_CALLS.with(|count| count.replace(0))
 }
 
 /// #1018 (A): classify whether a sidecar is stale (eligible for

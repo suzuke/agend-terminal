@@ -1457,42 +1457,91 @@ fn hook_fixup_team_dispatch_records_pending_via_default_threshold() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #3001: a correlated dispatch uses one pending-sidecar snapshot for
-/// deduplication and stale-handoff cleanup. Refreshing an existing intent
-/// returns after that same one-scan early return.
+/// #3001: a new correlated dispatch reuses one pending-sidecar snapshot for
+/// deduplication and stale-handoff cleanup. An older same-route sidecar with a
+/// different correlation forces both pre-fix scans; refresh and no-correlation
+/// gates remain one and zero scans respectively.
 #[test]
-fn correlated_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
+fn record_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
     let home = tmp_home("3001-single-pending-scan");
-    write_fixup_fleet(&home, &["sender-3001", "target-3001"]);
-    let ctx = test_ctx(&home);
-    let params = json!({
-        "from": "sender-3001",
-        "target": "target-3001",
-        "text": "dispatch",
-        "kind": "task",
-        "task_id": "t-3001-scan",
-        "expect_reply_within_secs": 600,
-    });
+    let old_id = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "sender-3001",
+        "target-3001",
+        Some("t-3001-old"),
+        "task",
+        600,
+    )
+    .expect("old sidecar");
+    let old_path = crate::daemon::dispatch_idle::pending_path(&home, &old_id);
+    let mut old: crate::daemon::dispatch_idle::PendingDispatch =
+        serde_json::from_str(&std::fs::read_to_string(&old_path).expect("read old sidecar"))
+            .expect("parse old sidecar");
+    old.issued_at = "2020-01-01T00:00:00Z".to_string();
+    crate::store::atomic_write(
+        &old_path,
+        serde_json::to_string_pretty(&old)
+            .expect("serialize old sidecar")
+            .as_bytes(),
+    )
+    .expect("rewrite old sidecar");
 
     crate::daemon::dispatch_idle::reset_list_pending_call_count();
-    let result = handle_send(&params, &ctx);
-    assert_eq!(result["ok"], true, "new dispatch must succeed: {result}");
+    let new_id = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "sender-3001",
+        "target-3001",
+        Some("t-3001-new"),
+        "task",
+        600,
+    )
+    .expect("new sidecar");
     assert_eq!(
         crate::daemon::dispatch_idle::take_list_pending_call_count(),
-        1,
-        "a new correlated dispatch must scan pending sidecars once"
+        2,
+        "RED: an older same-route sidecar must expose both pre-fix scans"
     );
+    let pending = crate::daemon::dispatch_idle::list_pending(&home);
+    assert!(
+        pending.iter().all(|p| p.dispatch_id != old_id),
+        "new dispatch must retire the older same-route sidecar"
+    );
+    assert!(pending.iter().any(|p| p.dispatch_id == new_id));
 
     crate::daemon::dispatch_idle::reset_list_pending_call_count();
-    let result = handle_send(&params, &ctx);
+    let refreshed = crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "sender-3001",
+        "target-3001",
+        Some("t-3001-new"),
+        "task",
+        600,
+    )
+    .expect("refresh sidecar");
     assert_eq!(
-        result["ok"], true,
-        "refresh dispatch must succeed: {result}"
+        refreshed, new_id,
+        "refresh must preserve the existing dispatch id"
     );
     assert_eq!(
         crate::daemon::dispatch_idle::take_list_pending_call_count(),
         1,
         "refreshing an existing intent must retain its one-scan early return"
+    );
+
+    crate::daemon::dispatch_idle::reset_list_pending_call_count();
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "sender-3001",
+        "target-3001",
+        None,
+        "task",
+        600,
+    )
+    .expect("uncorrelated sidecar");
+    assert_eq!(
+        crate::daemon::dispatch_idle::take_list_pending_call_count(),
+        0,
+        "uncorrelated dispatches must not scan for dedup or stale handoff"
     );
 
     std::fs::remove_dir_all(&home).ok();
