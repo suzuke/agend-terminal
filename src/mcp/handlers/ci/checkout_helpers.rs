@@ -226,9 +226,11 @@ pub(super) fn validate_expected_head(
     let actual = if let Ok(sha) = branch_exists {
         sha.trim().to_string()
     } else {
-        let default_base = format!("origin/{}", crate::git_helpers::default_branch(src));
-        let from_ref = args["from_ref"].as_str().unwrap_or(&default_base);
-        crate::git_helpers::git_cmd(src, &["rev-parse", from_ref])
+        let from_ref = args["from_ref"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)));
+        crate::git_helpers::git_cmd(src, &["rev-parse", from_ref.as_str()])
             .unwrap_or_default()
             .trim()
             .to_string()

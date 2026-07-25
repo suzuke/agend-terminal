@@ -103,9 +103,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         // mirrors the dispatch-path fix (dispatch_hook/mod.rs). An explicit
         // `from_ref` override is unchanged. Main-default repos: default_branch →
         // "main" → "origin/main", byte-identical to the prior literal.
-        let default_base = format!("origin/{}", crate::git_helpers::default_branch(src));
-        let from_ref = args["from_ref"].as_str().unwrap_or(&default_base);
-        let creation_ref = expected_ref.as_deref().unwrap_or(from_ref);
+        let from_ref = args["from_ref"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)));
+        let creation_ref = expected_ref.as_deref().unwrap_or(from_ref.as_str());
         match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
             home,
             src,
