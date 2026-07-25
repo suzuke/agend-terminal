@@ -1,6 +1,19 @@
 use crate::channel::ChannelEvent;
 use serial_test::serial;
 
+#[test]
+fn discord_gateway_requests_only_mapped_event_types_2983() {
+    use twilight_gateway::EventTypeFlags;
+
+    let expected =
+        EventTypeFlags::READY | EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::CHANNEL_DELETE;
+    assert_eq!(super::GATEWAY_EVENT_TYPES, expected);
+    assert!(
+        !super::GATEWAY_EVENT_TYPES.contains(EventTypeFlags::GUILD_CREATE),
+        "unmapped events must not be deserialized"
+    );
+}
+
 /// §3.5.10 wire-format fixture: Discord Gateway READY payload
 /// (tests/fixtures/discord-gateway-ready.json) is deserialized via
 /// twilight-model and mapped to `ChannelEvent::Connected`.
