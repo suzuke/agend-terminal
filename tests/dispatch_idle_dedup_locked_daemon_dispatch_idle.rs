@@ -19,10 +19,9 @@
 //! takes the same per-file flock the rest of the module uses), NOT a bare
 //! `atomic_write` of the existing sidecar's `pending_path`.
 //!
-//! RED now: the `if let Some(mut existing) = list_pending(home)` dedup block
-//! contains `atomic_write` (unlocked) and no `with_json_state` → assertion fails.
-//! GREEN after fix: routing the refresh through `with_json_state::<PendingDispatch,_,_>`
-//! removes the bare `atomic_write` from that block and adds `with_json_state`.
+//! The dedup-refresh block is located from its current pending-snapshot form,
+//! `if let Some(mut existing) = pending`, so this invariant follows the
+//! one-scan production hoist without weakening the lock-shape assertions below.
 
 use std::path::PathBuf;
 
@@ -72,7 +71,7 @@ fn record_dispatch_dedup_refresh_uses_locked_rmw_daemon_dispatch_idle() {
     };
 
     // The in-place dedup-refresh branch in `record_dispatch`.
-    let block = block_after(prod, "if let Some(mut existing) = list_pending(home)");
+    let block = block_after(prod, "if let Some(mut existing) = pending");
 
     // Sanity: this is the refresh block (mutates the reborn-episode fields).
     assert!(
