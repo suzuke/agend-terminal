@@ -2423,6 +2423,8 @@ pub fn has_drained_blocker_for_correlation(
     agent_name: &str,
     correlation_id: &str,
 ) -> bool {
+    #[cfg(test)]
+    super::record_blocker_scan(agent_name);
     let path = inbox_path_resolved(home, agent_name);
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     for msg in parse_inbox_messages(&content) {

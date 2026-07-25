@@ -846,6 +846,144 @@ fn same_team_codex_update_absorbed() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── Issue #2977: gate the drained-blocker lookup to the Codex path ──────
+
+/// #2977 RED: `has_drained_blocker_for_correlation` is a whole-inbox read plus a
+/// full `InboxMessage` parse (text bodies included), and its result feeds ONLY
+/// the Codex ack-absorption branch. A non-Codex target must never pay for it.
+///
+/// Drives the real `handle_send` → `route_and_deliver` seam. The target is
+/// declared in fleet.yaml but never spawned, so it is non-Codex AND not in the
+/// registry — the case that used to scan anyway, because the lookup was computed
+/// eagerly ABOVE the `!target_in_registry` early return.
+#[test]
+fn noncodex_update_skips_blocker_scan_2977() {
+    let home = tmp_home("2977-noncodex-no-scan");
+    let target = "noncodex-2977";
+    let sender = "sender-2977";
+    setup_team_env(&home, &[target, sender], &[("dev", &[target, sender])]);
+
+    let before = crate::inbox::blocker_scans_for(target);
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({"from": sender, "target": target, "kind": "update",
+                "correlation_id": "t-2977-corr", "text": "status update"}),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "send must succeed: {result}");
+    assert_eq!(
+        crate::inbox::blocker_scans_for(target) - before,
+        0,
+        "a non-Codex update carrying a correlation_id must NOT scan the target \
+         inbox for a drained blocker — the result cannot affect its routing"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2977 positive control: gating the lookup must not weaken the #982 override.
+/// A Codex target that already received a blocking `query` on this correlation
+/// still gets the reply INJECTED (`pty`), not absorbed — and the lookup is still
+/// reached exactly once on that path.
+#[test]
+fn codex_drained_blocker_still_overrides_absorption_2977() {
+    let home = tmp_home("2977-codex-override");
+    let target = "codex-2977";
+    let sender = "sender-2977b";
+    setup_team_env(&home, &[target, sender], &[("dev", &[target, sender])]);
+    let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let yaml = yaml.replace(
+        &format!("  {target}:\n    backend: claude"),
+        &format!("  {target}:\n    backend: codex"),
+    );
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
+
+    // The blocking dispatch the reply answers: a `query` already handed to the
+    // agent (drain sets `delivering_at`), sharing the reply's correlation_id.
+    let corr = "t-2977-blocker";
+    let mut blocker = crate::inbox::InboxMessage {
+        schema_version: 1,
+        id: Some("m-2977-blk".to_string()),
+        from: sender.to_string(),
+        text: "blocking question".to_string(),
+        kind: Some("query".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    blocker.correlation_id = Some(corr.to_string());
+    crate::inbox::enqueue(&home, target, blocker).unwrap();
+    crate::inbox::drain(&home, target); // unread → delivering
+
+    let registry: &'static agent::AgentRegistry =
+        Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+    let spawn_cfg = crate::agent::SpawnConfig {
+        name: target,
+        backend: None,
+        backend_command: crate::default_shell(),
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+    {
+        let mut reg = agent::lock_registry(registry);
+        if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == target) {
+            h.backend_command = "codex".to_string();
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let configs: &'static crate::api::ConfigRegistry =
+        Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+    let externals: &'static agent::ExternalRegistry =
+        Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+    let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+    let ctx = HandlerCtx {
+        registry,
+        configs,
+        externals,
+        notifier: None,
+        home: home_ref,
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        shutdown: None,
+    };
+
+    let before = crate::inbox::blocker_scans_for(target);
+    let result = handle_send(
+        &json!({"from": sender, "target": target, "kind": "update",
+                "correlation_id": corr, "text": "answering the blocker"}),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "send must succeed: {result}");
+    assert_eq!(
+        result["delivery_mode"].as_str(),
+        Some("pty"),
+        "a reply on a delivered blocking query must override Codex ack-absorption: {result}"
+    );
+    assert_eq!(
+        crate::inbox::blocker_scans_for(target) - before,
+        1,
+        "the Codex path must still reach the drained-blocker lookup exactly once"
+    );
+
+    let reg = agent::lock_registry(registry);
+    if let Some(h) = reg.values().find(|h| h.name.as_str() == target) {
+        let _ = h.child.lock().kill();
+    }
+    drop(reg);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn cross_team_message_not_absorbed() {
     let home = tmp_home("cross-team-no-absorb");

@@ -81,6 +81,30 @@ pub(crate) fn settle_parent_after_successful_send(
     }
 }
 
+/// #2977 test seam: every [`storage::has_drained_blocker_for_correlation`] call
+/// records its `agent_name` here. Keyed by agent rather than a bare counter so a
+/// concurrently running test scanning a DIFFERENT agent cannot perturb an
+/// assertion. Lives here, not in `storage.rs`, to keep that file under the
+/// 2500-LOC anti-monolith ceiling (`tests/src_file_size_invariant.rs`).
+#[cfg(test)]
+static BLOCKER_SCANS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn record_blocker_scan(agent_name: &str) {
+    BLOCKER_SCANS.lock().push(agent_name.to_string());
+}
+
+/// #2977: how many times the drained-blocker lookup has scanned `agent_name`'s
+/// inbox in this process.
+#[cfg(test)]
+pub(crate) fn blocker_scans_for(agent_name: &str) -> usize {
+    BLOCKER_SCANS
+        .lock()
+        .iter()
+        .filter(|a| a.as_str() == agent_name)
+        .count()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests.rs"]
