@@ -1459,8 +1459,8 @@ fn hook_fixup_team_dispatch_records_pending_via_default_threshold() {
 
 /// #3001: a new correlated dispatch reuses one pending-sidecar snapshot for
 /// deduplication and stale-handoff cleanup. An older same-route sidecar with a
-/// different correlation forces both pre-fix scans; refresh and no-correlation
-/// gates remain one and zero scans respectively.
+/// different correlation is covered by one shared scan; refresh and
+/// no-correlation gates remain one and zero scans respectively.
 #[test]
 fn record_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
     let home = tmp_home("3001-single-pending-scan");
@@ -1498,8 +1498,8 @@ fn record_dispatch_reuses_pending_scan_for_stale_cleanup_3001() {
     .expect("new sidecar");
     assert_eq!(
         crate::daemon::dispatch_idle::take_list_pending_call_count(),
-        2,
-        "RED: an older same-route sidecar must expose both pre-fix scans"
+        1,
+        "an older same-route sidecar must be covered by one shared scan"
     );
     let pending = crate::daemon::dispatch_idle::list_pending(&home);
     assert!(
