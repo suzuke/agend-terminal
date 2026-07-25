@@ -449,12 +449,104 @@ pub fn pending_count(home: &Path, agent_name: &str) -> usize {
     let mut paths = list_draining_files(home, agent_name);
     paths.push(queue_path(home, agent_name));
     for path in paths {
+        #[cfg(test)]
+        test_hooks::note_content_read();
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
         count += content.lines().count();
     }
     count
+}
+
+/// #2967/#2978/#2979: ONE `read_dir` of the shared `notification-queue/`
+/// directory per pass. The per-agent accessors below apply the SAME
+/// predicates the per-agent helpers (`queue_path` / `list_draining_files`)
+/// always used, against this in-memory listing instead of re-enumerating the
+/// shared directory once per agent — turning F `read_dir` calls per pass
+/// (one per fleet agent) into one.
+pub struct QueueDirSnapshot {
+    /// The `notification-queue/` dir the snapshot was scanned from — content
+    /// reads (`pending_count`) join file names back onto this.
+    dir: PathBuf,
+    /// `(file_name, byte_len)` for every entry directly under `dir` at scan
+    /// time. File names only (not full paths) — every predicate below
+    /// matches on the name, exactly like `list_draining_files`/`queue_path`
+    /// always did.
+    entries: Vec<(String, u64)>,
+}
+
+impl QueueDirSnapshot {
+    /// ONE `read_dir`. Absent/unreadable directory → empty snapshot (the same
+    /// fail-soft behavior `list_draining_files` already has).
+    pub fn scan(home: &Path) -> Self {
+        #[cfg(test)]
+        test_hooks::note_dir_scan();
+        let dir = home.join("notification-queue");
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            return Self {
+                dir,
+                entries: Vec::new(),
+            };
+        };
+        let entries = read
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let len = e.metadata().ok()?.len();
+                Some((name, len))
+            })
+            .collect();
+        Self { dir, entries }
+    }
+
+    /// This agent's queue file name (mirrors `queue_path`'s exact-match name).
+    fn queue_file_name(agent_name: &str) -> String {
+        format!("{agent_name}.jsonl")
+    }
+
+    /// This agent's draining-file prefix (mirrors `list_draining_files`).
+    /// Deliberately does NOT match `<agent>.drain.lock` — see that fn's doc
+    /// comment for why the lock file must never be counted as queue content.
+    fn draining_prefix(agent_name: &str) -> String {
+        format!("{agent_name}.draining")
+    }
+
+    fn agent_files(&self, agent_name: &str) -> impl Iterator<Item = &(String, u64)> {
+        let queue_name = Self::queue_file_name(agent_name);
+        let draining_prefix = Self::draining_prefix(agent_name);
+        self.entries
+            .iter()
+            .filter(move |(name, _)| *name == queue_name || name.starts_with(&draining_prefix))
+    }
+
+    /// True iff this agent has any queue or draining file with non-zero
+    /// length. Reads NO file contents.
+    ///
+    /// Correctness: for these files, `metadata_len > 0` ⟺
+    /// `content.lines().count() >= 1` (an empty file yields 0 lines; any
+    /// non-empty file yields ≥1 — `lines()` never returns 0 for non-empty
+    /// content since a trailing newline doesn't add a phantom empty line and
+    /// content with no newline is still one line). So gating on `has_pending`
+    /// is EXACTLY equivalent to the current `pending_count(..) == 0` gate
+    /// while reading zero bytes.
+    pub fn has_pending(&self, agent_name: &str) -> bool {
+        self.agent_files(agent_name).any(|(_, len)| *len > 0)
+    }
+
+    /// Exact line count across this agent's queue + draining files —
+    /// reads contents, byte-for-byte the same arithmetic as `pending_count`.
+    pub fn pending_count(&self, agent_name: &str) -> usize {
+        self.agent_files(agent_name)
+            .map(|(name, _)| {
+                #[cfg(test)]
+                test_hooks::note_content_read();
+                std::fs::read_to_string(self.dir.join(name))
+                    .map(|c| c.lines().count())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
 }
 
 /// A foreign draining file older than this is a crashed drainer's leftover and
@@ -477,6 +569,8 @@ fn draining_claim_path(home: &Path, agent_name: &str) -> PathBuf {
 /// matches the legacy fixed `<agent>.draining` name written by older binaries
 /// (crash recovery must still pick those up after an upgrade).
 fn list_draining_files(home: &Path, agent_name: &str) -> Vec<PathBuf> {
+    #[cfg(test)]
+    test_hooks::note_dir_scan();
     let dir = home.join("notification-queue");
     let prefix = format!("{agent_name}.draining");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -563,6 +657,13 @@ fn acquire_drain_lock(lock_path: &Path) -> anyhow::Result<Option<crate::store::F
     }
 }
 
+/// #2967/#2978/#2979 test seam: re-exported so callers outside this module
+/// (`daemon::per_tick::notification_flush`, `app::mod` tests) can read the
+/// per-process scan/read counters without reaching into `test_hooks`
+/// directly.
+#[cfg(test)]
+pub(crate) use test_hooks::{content_read_count, dir_scan_count, reset_scan_counters};
+
 /// Path-keyed test seams for the drain-lock acquire. Keyed by the lock PATH
 /// (every test uses a unique `home` → unique path) so arming/counting for one
 /// test never touches another running in parallel — no `serial` needed.
@@ -571,6 +672,37 @@ mod test_hooks {
     use parking_lot::Mutex;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
+
+    /// #2967/#2978/#2979 test seam: counts, in THIS process, of every
+    /// queue-directory `read_dir` (`QueueDirSnapshot::scan` AND the
+    /// pre-existing `list_draining_files`) and every queue-FILE content read
+    /// (`QueueDirSnapshot::pending_count`, the module-level `pending_count`,
+    /// AND `read_drain_file`, which `drain` itself uses). Instrumenting all
+    /// the real call sites — not just the new snapshot type — is what makes
+    /// the RED tests measure the actual end-to-end syscall shape `flush_all_with`
+    /// produces, both pre- and post-fix. Global (not path-keyed) — every RED
+    /// test in this family drives a single real pass over a fresh `home` and
+    /// wants the exact per-pass call count, so a bare counter is the direct
+    /// measurement; reset before each assertion window.
+    static DIR_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CONTENT_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) fn note_dir_scan() {
+        DIR_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(super) fn note_content_read() {
+        CONTENT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn dir_scan_count() -> u64 {
+        DIR_SCANS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn content_read_count() -> u64 {
+        CONTENT_READS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn reset_scan_counters() {
+        DIR_SCANS.store(0, std::sync::atomic::Ordering::Relaxed);
+        CONTENT_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// Upper bound on retries past a transient `Err`; ~128ms at 2ms/step. Past
     /// this the original `Err` propagates (loud real-failure, never a hang).
@@ -768,6 +900,8 @@ pub fn requeue_all(home: &Path, agent_name: &str, notifications: &[QueuedNotific
 }
 
 fn read_drain_file(path: &Path) -> Vec<QueuedNotification> {
+    #[cfg(test)]
+    test_hooks::note_content_read();
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -1042,6 +1176,192 @@ mod tests {
         enqueue(&home, "agent1", "a").expect("enqueue a");
         enqueue(&home, "agent1", "b").expect("enqueue b");
         assert_eq!(pending_count(&home, "agent1"), 2);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #2967/#2978/#2979: QueueDirSnapshot — preservation ──
+    //
+    // These must pass BOTH before AND after the snapshot-consumer rewire
+    // (they exercise `pending_count`/`QueueDirSnapshot` directly, not the
+    // rewired call sites) — they pin that the new one-`read_dir` accessors
+    // agree with the pre-existing per-call `pending_count` in every shape
+    // that function ever handled.
+
+    #[test]
+    fn snapshot_agrees_with_pending_count_empty_dir_2978() {
+        let home = tmp_home("snap-empty-dir");
+        std::fs::remove_dir_all(&home).ok();
+        // No notification-queue/ dir created at all.
+        let snap = QueueDirSnapshot::scan(&home);
+        assert_eq!(pending_count(&home, "agent1"), 0);
+        assert_eq!(snap.pending_count("agent1"), 0);
+        assert!(!snap.has_pending("agent1"));
+    }
+
+    #[test]
+    fn snapshot_agrees_with_pending_count_empty_file_2978() {
+        let home = tmp_home("snap-empty-file");
+        std::fs::remove_dir_all(&home).ok();
+        let path = queue_path(&home, "agent1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap(); // zero-length queue file
+        let snap = QueueDirSnapshot::scan(&home);
+        assert_eq!(pending_count(&home, "agent1"), 0);
+        assert_eq!(snap.pending_count("agent1"), 0);
+        assert!(
+            !snap.has_pending("agent1"),
+            "a zero-length file must not read as pending"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn snapshot_agrees_with_pending_count_one_item_2978() {
+        let home = tmp_home("snap-one");
+        std::fs::remove_dir_all(&home).ok();
+        enqueue(&home, "agent1", "a").expect("enqueue");
+        let snap = QueueDirSnapshot::scan(&home);
+        assert_eq!(pending_count(&home, "agent1"), 1);
+        assert_eq!(snap.pending_count("agent1"), 1);
+        assert!(snap.has_pending("agent1"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn snapshot_agrees_with_pending_count_ten_items_2978() {
+        let home = tmp_home("snap-ten");
+        std::fs::remove_dir_all(&home).ok();
+        for i in 0..10 {
+            enqueue(&home, "agent1", &format!("msg-{i}")).expect("enqueue");
+        }
+        let snap = QueueDirSnapshot::scan(&home);
+        assert_eq!(pending_count(&home, "agent1"), 10);
+        assert_eq!(snap.pending_count("agent1"), 10);
+        assert!(snap.has_pending("agent1"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn snapshot_agrees_with_pending_count_stale_draining_leftover_2978() {
+        let home = tmp_home("snap-stale-draining");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        enqueue(&home, "agent1", "crashed-claim").expect("enqueue");
+        std::fs::rename(queue_path(&home, "agent1"), draining_path(&home, "agent1"))
+            .expect("simulate crashed drainer's leftover claim");
+        let snap = QueueDirSnapshot::scan(&home);
+        assert_eq!(
+            pending_count(&home, "agent1"),
+            1,
+            "a leftover draining file still counts as pending"
+        );
+        assert_eq!(snap.pending_count("agent1"), 1);
+        assert!(snap.has_pending("agent1"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn snapshot_agrees_with_pending_count_ignores_drain_lock_2978() {
+        let home = tmp_home("snap-drain-lock");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        // A drain.lock with NO queue/draining content — the #1944-adjacent
+        // rule `list_draining_files`' doc comment protects: the lock file
+        // must never be mistaken for queue content.
+        std::fs::create_dir_all(home.join("notification-queue")).unwrap();
+        std::fs::write(drain_lock_path(&home, "agent1"), b"lock").unwrap();
+        let snap = QueueDirSnapshot::scan(&home);
+        assert_eq!(
+            pending_count(&home, "agent1"),
+            0,
+            "a bare .drain.lock file must never be counted as queue content"
+        );
+        assert_eq!(snap.pending_count("agent1"), 0);
+        assert!(!snap.has_pending("agent1"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2979: no message loss — a concurrent enqueue landing AFTER the
+    /// snapshot is taken must still be delivered by `drain` in the same pass
+    /// (the snapshot only decides whether to bother LOOKING; the actual
+    /// delivery path — `drain`/`try_drain_with_stale_threshold` — always
+    /// claims and reads the LIVE queue file, completely independent of what
+    /// the snapshot saw). This is the untouched-by-design half of the
+    /// contract: the snapshot has no bearing on `drain`'s correctness because
+    /// `drain` never consults it. A stale-at-scan-time snapshot (`has_pending`
+    /// false at scan) followed by an enqueue must still see that item
+    /// delivered — proving a productive agent is never skipped just because
+    /// the gate ran before the enqueue.
+    #[test]
+    fn snapshot_taken_then_concurrent_enqueue_is_not_lost_2979() {
+        let home = tmp_home("snap-concurrent-enqueue");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        let snap = QueueDirSnapshot::scan(&home); // taken while queue is empty
+        assert!(!snap.has_pending("agent1"), "empty at scan time");
+        // Enqueue AFTER the snapshot was taken. `drain` never consults the
+        // snapshot, so once a drain runs the late arrival is delivered — the
+        // snapshot cannot hide it from the claim protocol. (Whether THIS pass
+        // reaches the drain is a separate question, pinned honestly by
+        // `enqueue_after_scan_is_invisible_to_that_pass_2979` below.)
+        enqueue(&home, "agent1", "late-arrival").expect("enqueue after snapshot");
+        let drained = drain_settled(&home, "agent1", 1);
+        assert_eq!(drained.len(), 1, "the late arrival is drained, not lost");
+        assert_eq!(drained[0].text, "late-arrival");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// The ONE behavioural consequence of gating a pass on a per-pass
+    /// snapshot, pinned deliberately rather than left for someone to discover:
+    /// an item enqueued AFTER a pass took its snapshot is invisible to THAT
+    /// pass's gate, so its delivery moves to the next pass. Bounded by exactly
+    /// one flush interval and never lost — and the pre-snapshot code was
+    /// already arbitrary here, since `pending_count` ran at each agent's turn
+    /// in the fleet iteration, so whether a mid-pass arrival was seen depended
+    /// on where that agent happened to sit in the loop.
+    #[test]
+    fn enqueue_after_scan_is_invisible_to_that_pass_2979() {
+        let home = tmp_home("snap-late-arrival-gate");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+
+        let this_pass = QueueDirSnapshot::scan(&home);
+        enqueue(&home, "agent1", "late-arrival").expect("enqueue after snapshot");
+
+        assert!(
+            !this_pass.has_pending("agent1"),
+            "a pass gates on ITS OWN snapshot: an arrival after the scan is not \
+             visible to that pass"
+        );
+        let next_pass = QueueDirSnapshot::scan(&home);
+        assert!(
+            next_pass.has_pending("agent1"),
+            "the next pass's snapshot sees it — the delay is bounded by one \
+             flush interval, and nothing is lost"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Single-drainer ordering under the new snapshot-gated call sites is
+    /// unaffected — `QueueDirSnapshot` never touches `drain`'s claim/rename
+    /// protocol, so the existing `concurrent_drains_deliver_exactly_once`
+    /// (above) IS this preservation test; nothing new to add here beyond
+    /// re-asserting the invariant it already pins stays untouched by this
+    /// change (the snapshot has no write path and never claims a file).
+    #[test]
+    fn snapshot_has_no_write_path_2979() {
+        let home = tmp_home("snap-read-only");
+        std::fs::remove_dir_all(&home).ok();
+        enqueue(&home, "agent1", "a").expect("enqueue");
+        let before = std::fs::read_to_string(queue_path(&home, "agent1")).unwrap();
+        let _snap = QueueDirSnapshot::scan(&home);
+        let _ = _snap.pending_count("agent1");
+        let _ = _snap.has_pending("agent1");
+        let after = std::fs::read_to_string(queue_path(&home, "agent1")).unwrap();
+        assert_eq!(
+            before, after,
+            "scanning/reading a snapshot must not mutate the queue file"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
