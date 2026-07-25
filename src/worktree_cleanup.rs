@@ -750,6 +750,7 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
 }
 
 pub(crate) fn branch_has_active_binding(home: &Path, repo: &Path, branch: &str) -> Option<bool> {
+    note_binding_active_probe();
     branch_has_other_active_binding(home, repo, branch, None)
 }
 
@@ -876,13 +877,28 @@ fn prune_orphaned_branches_with_home(
         } else {
             crate::worktree::disposition::BranchProvenance::Unknown
         };
-        let task_active = match home {
-            Some(h) => crate::branch_sweep::branch_has_active_task(h, branch),
-            None => Some(false),
-        };
-        let binding_active = match home {
-            Some(h) => branch_has_active_binding(h, repo_root, branch),
-            None => Some(false),
+        let terminal = merged || squash || scaffold;
+        // #3011: a NON-terminal candidate is already a Keep — `branch_lifecycle_disposition`
+        // returns Keep on `!terminal` before it reads task/holder/PR evidence
+        // (worktree/disposition.rs:151-161) — so the strict task-ledger replay and the
+        // binding scan cannot change its outcome. Skip both, exactly as the `open_pr`
+        // field below already skips its network probe for the same reason. `None` (not
+        // `Some(false)`) is the honest "unresolved" value and is the fail-closed input.
+        // Terminal candidates still probe FRESHLY, per candidate — deliberately NOT a
+        // sweep-wide snapshot.
+        let (task_active, binding_active) = if terminal {
+            (
+                match home {
+                    Some(h) => crate::branch_sweep::branch_has_active_task(h, branch),
+                    None => Some(false),
+                },
+                match home {
+                    Some(h) => branch_has_active_binding(h, repo_root, branch),
+                    None => Some(false),
+                },
+            )
+        } else {
+            (None, None)
         };
         let active_holder = match (wt_branches.contains(branch), binding_active) {
             (true, _) | (_, Some(true)) => Some(true),
@@ -903,7 +919,7 @@ fn prune_orphaned_branches_with_home(
         let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
             &crate::worktree::disposition::BranchLifecycleInput {
                 provenance,
-                terminal: merged || squash || scaffold,
+                terminal,
                 active_holder,
                 task_active,
                 open_pr,
@@ -983,6 +999,28 @@ fn prune_stale_worktrees(repo_root: &Path, dry_run: bool) {
     }
     // W1.2: best-effort prune (result was already ignored).
     let _ = crate::git_helpers::git_ok(repo_root, &["worktree", "prune"]);
+}
+
+// #3011: counts calls into `branch_has_active_binding`, to prove that
+// non-terminal candidates in `prune_orphaned_branches_with_home` skip the
+// per-agent binding scan.
+#[cfg(test)]
+std::thread_local! {
+    static BINDING_ACTIVE_PROBE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_binding_active_probe() {
+    BINDING_ACTIVE_PROBE_COUNT.with(|count| count.set(count.get() + 1));
+}
+#[cfg(not(test))]
+fn note_binding_active_probe() {}
+
+/// Read the count and zero it — so a caller can also use this as the "start
+/// from zero" setup step, with no separate reset accessor.
+#[cfg(test)]
+pub(crate) fn take_binding_active_probe_count() -> usize {
+    BINDING_ACTIVE_PROBE_COUNT.with(|count| count.replace(0))
 }
 
 #[cfg(test)]

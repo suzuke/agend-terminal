@@ -1494,3 +1494,122 @@ fn auto_cleanup_opt_out_produces_no_tasks_v1() {
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", branch])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// #3011: a NON-terminal candidate is already a Keep decision at
+/// `branch_lifecycle_disposition` (`!input.terminal` short-circuits before
+/// task/holder evidence is even read) — the strict task-ledger replay
+/// (`branch_has_active_task`) and the per-agent binding scan
+/// (`branch_has_active_binding`) must not be reached for it at all.
+#[test]
+fn nonterminal_candidates_skip_task_and_binding_probes_3011() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("3011-skip");
+    let home = tmp_home("3011-skip");
+
+    // Several genuinely non-terminal branches: unmerged, not squash-merged
+    // (different files, no cherry-pick relationship to main), not stale
+    // review scaffolding (name doesn't match the reviewer-checkout pattern).
+    for name in ["feat/wip-a", "feat/wip-b", "feat/wip-c"] {
+        git_in(&repo, &["checkout", "-b", name]);
+        std::fs::write(repo.join("wip.txt"), name).ok();
+        git_in(&repo, &["add", "."]);
+        git_commit_dated(&repo, "wip", "2024-01-01T00:00:00 +0000");
+        git_in(&repo, &["checkout", "main"]);
+    }
+
+    // take-and-zero doubles as the reset: discard whatever the fixture setup
+    // above happened to cost, so the sweep below starts from zero.
+    let _ = crate::branch_sweep::take_active_task_probe_count();
+    let _ = take_binding_active_probe_count();
+
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert_eq!(
+        crate::branch_sweep::take_active_task_probe_count(),
+        0,
+        "#3011: non-terminal candidates must not reach branch_has_active_task \
+         (the strict task-ledger replay)"
+    );
+    assert_eq!(
+        take_binding_active_probe_count(),
+        0,
+        "#3011: non-terminal candidates must not reach branch_has_active_binding \
+         (the per-agent binding scan)"
+    );
+    assert!(
+        pruned.is_empty(),
+        "non-terminal candidates must all be KEEP: {pruned:?}"
+    );
+    for name in ["feat/wip-a", "feat/wip-b", "feat/wip-c"] {
+        assert!(
+            branch_exists(&repo, name),
+            "non-terminal branch {name} must survive the sweep"
+        );
+    }
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3011 positive control: a TERMINAL (merged) candidate must still probe
+/// task/binding state FRESHLY, once per candidate — proving the skip above
+/// is not a sweep-wide hoisted snapshot (which would produce a count of 1
+/// no matter how many terminal candidates exist).
+#[test]
+fn terminal_candidate_still_probes_freshly_3011() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("3011-terminal");
+    let home = tmp_home("3011-terminal");
+
+    make_old_dated_branch(&repo, "feat/done-a", "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["merge", "feat/done-a"]);
+    make_old_dated_branch(&repo, "feat/done-b", "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["merge", "feat/done-b"]);
+    make_old_dated_branch(&repo, "feat/done-c", "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["merge", "feat/done-c"]);
+
+    // take-and-zero doubles as the reset: discard whatever the fixture setup
+    // above happened to cost, so the sweep below starts from zero.
+    let _ = crate::branch_sweep::take_active_task_probe_count();
+    let _ = take_binding_active_probe_count();
+
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert_eq!(
+        crate::branch_sweep::take_active_task_probe_count(),
+        3,
+        "#3011: each terminal candidate must probe branch_has_active_task \
+         freshly — 3 candidates, not 0 (skipped) and not 1 (a forbidden \
+         hoisted sweep-wide snapshot)"
+    );
+    assert_eq!(
+        take_binding_active_probe_count(),
+        3,
+        "#3011: each terminal candidate must probe branch_has_active_binding \
+         freshly — 3 candidates, not 0 (skipped) and not 1 (a forbidden \
+         hoisted sweep-wide snapshot)"
+    );
+    for name in ["feat/done-a", "feat/done-b", "feat/done-c"] {
+        assert!(
+            pruned.iter().any(|(b, r)| b == name && *r == "merged"),
+            "terminal candidate {name} must actually be pruned: {pruned:?}"
+        );
+        assert!(
+            !branch_exists(&repo, name),
+            "terminal candidate {name} must actually be deleted"
+        );
+    }
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}

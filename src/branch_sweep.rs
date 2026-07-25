@@ -1160,6 +1160,7 @@ fn branch_is_checked_out(repo: &Path, branch: &str) -> Option<bool> {
 }
 
 pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> Option<bool> {
+    note_active_task_probe();
     let tasks = crate::tasks::list_all_strict(home).ok()?;
     Some(tasks.iter().any(|task| {
         task.branch.as_deref() == Some(branch)
@@ -1214,6 +1215,28 @@ pub(crate) fn prepare_branch_recovery(
         );
     }
     Ok(identity)
+}
+
+// #3011: counts calls into `branch_has_active_task`, to prove that
+// non-terminal candidates in `prune_orphaned_branches_with_home` skip the
+// strict task-ledger replay.
+#[cfg(test)]
+std::thread_local! {
+    static ACTIVE_TASK_PROBE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_active_task_probe() {
+    ACTIVE_TASK_PROBE_COUNT.with(|count| count.set(count.get() + 1));
+}
+#[cfg(not(test))]
+fn note_active_task_probe() {}
+
+/// Read the count and zero it — so a caller can also use this as the "start
+/// from zero" setup step, with no separate reset accessor.
+#[cfg(test)]
+pub(crate) fn take_active_task_probe_count() -> usize {
+    ACTIVE_TASK_PROBE_COUNT.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
