@@ -1406,6 +1406,17 @@ mod tests {
         sha
     }
 
+    fn four_merged_sweep_candidates(repo: &Path) -> Categories {
+        for branch in ["feat-open", "feat-closed-a", "feat-closed-b", "feat-unknown"] {
+            create_branch_with_commit(repo, branch, &format!("merge candidate {branch}"));
+            git_run(
+                repo,
+                &["merge", "--no-ff", "-m", "merge candidate", branch],
+            );
+        }
+        scan(repo, "main", STALE_IDLE_DEFAULT_DAYS, chrono::Utc::now()).expect("scan")
+    }
+
     fn bind_handler_repo(home: &Path, repo: &Path, agent: &str) {
         let binding_dir = home.join("runtime").join(agent);
         std::fs::create_dir_all(&binding_dir).expect("mkdir binding");
@@ -1909,6 +1920,99 @@ mod tests {
         // NOT merged + NOT squash-merged.
         assert!(!cats.clean_merged.iter().any(|c| c.name == "old-wip"));
         assert!(!cats.squash_merged.iter().any(|c| c.name == "old-wip"));
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// #2999 RED: the real multi-candidate apply path currently performs one
+    /// provider open-PR lookup per terminal branch. It must preserve the
+    /// open branch while deleting the three closed branches.
+    #[test]
+    fn apply_batches_open_pr_snapshot_and_preserves_open_disposition_2999() {
+        let repo = setup_repo("2999-open-pr-batch");
+        let home = repo.parent().unwrap().to_path_buf();
+        git_run(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        let categories = four_merged_sweep_candidates(&repo);
+        let confirm_ids = categories.deletable_ids().into_iter().collect();
+        let provider = crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Branches(vec!["feat-open".into()]),
+        );
+        let _provider_guard = crate::scm::set_test_scm_provider(provider.clone());
+
+        let (deleted, skipped) = emit_delete_batch_with_context(
+            Some(&home),
+            &repo,
+            "main",
+            &categories,
+            &confirm_ids,
+            "RED: preserve open PR",
+        )
+        .expect("apply");
+
+        assert_eq!(
+            provider.pr_list_calls(),
+            4,
+            "RED: each terminal candidate currently performs its own provider lookup"
+        );
+        assert_eq!(deleted, 3, "closed branches remain deletable: {skipped:?}");
+        assert_eq!(skipped.len(), 1, "only the open branch should be skipped");
+        assert_eq!(skipped[0]["branch"], "feat-open");
+        assert_eq!(skipped[0]["blocker"], "open_pr");
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// #2999 RED: a provider inventory failure must preserve every terminal
+    /// candidate, while the eventual snapshot-based implementation performs
+    /// only one fail-closed provider call for the whole sweep.
+    #[test]
+    fn apply_batches_open_pr_snapshot_and_fails_closed_on_provider_error_2999() {
+        let repo = setup_repo("2999-open-pr-failure");
+        let home = repo.parent().unwrap().to_path_buf();
+        git_run(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        let categories = four_merged_sweep_candidates(&repo);
+        let confirm_ids = categories.deletable_ids().into_iter().collect();
+        let provider = crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Fail("offline".into()),
+        );
+        let _provider_guard = crate::scm::set_test_scm_provider(provider.clone());
+
+        let (deleted, skipped) = emit_delete_batch_with_context(
+            Some(&home),
+            &repo,
+            "main",
+            &categories,
+            &confirm_ids,
+            "RED: preserve on provider error",
+        )
+        .expect("apply");
+
+        assert_eq!(
+            provider.pr_list_calls(),
+            4,
+            "RED: provider errors are currently repeated per candidate"
+        );
+        assert_eq!(deleted, 0, "provider failure must fail closed");
+        assert_eq!(skipped.len(), 4, "every candidate must be preserved");
+        assert!(skipped
+            .iter()
+            .all(|entry| entry["blocker"] == "open_pr_status_unknown"));
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
