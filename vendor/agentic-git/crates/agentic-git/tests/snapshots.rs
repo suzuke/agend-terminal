@@ -1137,6 +1137,108 @@ fn restore_cli_refuses_to_guess_then_yes_takes_newest() {
     cleanup(&root);
 }
 
+// ── R3b. `--yes` must still take the newest across adjacent ref buckets ──
+/// Decision `d-20260725192803110494-68`. `snapshots restore --yes` promises the
+/// NEWEST snapshot, but two snapshots can share one second-granular committer
+/// date while landing in ADJACENT ref timestamp buckets: `create_snapshot`
+/// reads the committer date before `commit-tree` and the ref timestamp after,
+/// so a second boundary falling between them splits the pair. `unique_ref_name`
+/// restarts `<seq>` at 0 in each new bucket, and the restore tie-break reads
+/// `<seq>` alone — so both rows carry seq 0, the tie is never broken, and
+/// `for-each-ref`'s refname-ascending order leaves the OLDER snapshot first.
+/// `--yes` then restores V1.
+///
+/// This is the pair `restore_cli_refuses_to_guess_then_yes_takes_newest` hits
+/// only when its two back-to-back snapshots happen to straddle a second — the
+/// macOS CI flake. Here it is constructed instead of waited for: the clock is
+/// read ONCE and both bucket names plus the single forced committer date derive
+/// from that instant, then the two refs are written with the same plumbing
+/// production uses (`commit-tree` + `update-ref`). No sleep, no timing race.
+#[test]
+fn restore_yes_takes_newest_across_adjacent_ref_buckets_seq0() {
+    let root = tempdir("restore-buckets");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let real_git = resolve_setup_real_git();
+    init_repo(&real_git, &repo);
+    let wt = worktree_of(&root, &real_git, &repo, "agent/rbuckets");
+
+    // ONE clock read; both buckets and the shared committer second derive from
+    // it, so the pathological pair is deterministic rather than raced for.
+    let base = chrono::Utc::now();
+    let bucket_old = base.format("%Y%m%dT%H%M%SZ").to_string();
+    let bucket_new = (base + chrono::Duration::seconds(1))
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+    let committer_date = base.to_rfc3339();
+
+    // One snapshot commit per content version, both forced to the SAME
+    // committer second — what a pair straddling a second boundary looks like.
+    let commit_for = |content: &str| -> String {
+        std::fs::write(wt.join("README.md"), content).unwrap();
+        setup_git(&real_git, &["add", "-A"], &wt);
+        let tree = String::from_utf8_lossy(&setup_git(&real_git, &["write-tree"], &wt).stdout)
+            .trim()
+            .to_string();
+        let out = Command::new(&real_git)
+            .args(["commit-tree", &tree, "-m", "snapshot"])
+            .current_dir(&wt)
+            .env("AGENTIC_GIT_BYPASS", "1")
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_DATE", &committer_date)
+            .env("GIT_COMMITTER_DATE", &committer_date)
+            .output()
+            .expect("commit-tree");
+        assert!(
+            out.status.success(),
+            "commit-tree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let old_sha = commit_for("V1\n");
+    let new_sha = commit_for("V2\n");
+
+    let old_ref = format!("refs/agentic-git/snapshots/agent-rb/{bucket_old}-0-reset");
+    let new_ref = format!("refs/agentic-git/snapshots/agent-rb/{bucket_new}-0-reset");
+    setup_git(&real_git, &["update-ref", &old_ref, &old_sha], &repo);
+    setup_git(&real_git, &["update-ref", &new_ref, &new_sha], &repo);
+
+    // Fixture preconditions — if any stops holding, the test is no longer
+    // exercising the cross-bucket tie it claims to.
+    assert_eq!(snapshot_refs(&real_git, &repo).len(), 2);
+    assert_eq!(
+        committer_epoch(&real_git, &repo, &old_ref),
+        committer_epoch(&real_git, &repo, &new_ref),
+        "both snapshots must share one committer second"
+    );
+    assert!(
+        old_ref.ends_with("-0-reset") && new_ref.ends_with("-0-reset"),
+        "both refs must carry seq 0 — the seq tie-break must be a no-op here"
+    );
+    assert_ne!(
+        bucket_old, bucket_new,
+        "the two ref buckets must differ (adjacent seconds)"
+    );
+
+    // The worktree holds neither version, so the restore is a real write.
+    std::fs::write(wt.join("README.md"), "V0\n").unwrap();
+
+    let yes = run_cli(&wt, &real_git, &["snapshots", "restore", "--yes"]);
+    assert!(
+        yes.status.success(),
+        "restore --yes: {}",
+        String::from_utf8_lossy(&yes.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "V2\n",
+        "--yes must restore the NEWEST snapshot; the older bucket wins while the \
+         tie-break reads `<seq>` without the ref timestamp"
+    );
+    cleanup(&root);
+}
+
 // ── R4. a non-snapshot ref is refused (never restores a branch/tag) ──────
 #[test]
 fn restore_cli_rejects_non_snapshot_ref() {
