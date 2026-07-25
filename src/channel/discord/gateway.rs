@@ -3,7 +3,9 @@ use crate::channel::ChannelEvent;
 use std::sync::mpsc;
 
 pub(super) const GATEWAY_EVENT_TYPES: twilight_gateway::EventTypeFlags =
-    twilight_gateway::EventTypeFlags::all();
+    twilight_gateway::EventTypeFlags::READY
+        .union(twilight_gateway::EventTypeFlags::MESSAGE_CREATE)
+        .union(twilight_gateway::EventTypeFlags::CHANNEL_DELETE);
 
 // ---------------------------------------------------------------------------
 // Gateway connection (#2562 P0)

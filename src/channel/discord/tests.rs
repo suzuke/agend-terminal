@@ -2,9 +2,10 @@ use crate::channel::ChannelEvent;
 use serial_test::serial;
 
 #[test]
-fn discord_gateway_requests_only_mapped_event_types_2983() {
+fn discord_gateway_requests_required_event_types_2983() {
     use twilight_gateway::EventTypeFlags;
 
+    // twilight-gateway 0.17.1 aliases READY and MESSAGE_POLL_VOTE_ADD to bit 28.
     let expected =
         EventTypeFlags::READY | EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::CHANNEL_DELETE;
     assert_eq!(super::GATEWAY_EVENT_TYPES, expected);
