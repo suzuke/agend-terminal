@@ -26,6 +26,21 @@
 
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_TEST_PROBE_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn cleanup_test_probe_mask() -> u8 {
+    CLEANUP_TEST_PROBE_MASK.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn cleanup_test_probe(mask: u8) {
+    CLEANUP_TEST_PROBE_MASK.with(|probes| probes.set(probes.get() | mask));
+}
+
 /// PR-A preservation classification is dry-run observability only. None of
 /// these values participate in `candidate_ids`, confirmation, or apply.
 #[derive(Debug, serde::Serialize)]
@@ -977,13 +992,19 @@ pub(crate) fn emit_delete_batch_with_context(
             // remains fail-closed in the shared classifier.
             crate::worktree::disposition::BranchProvenance::Unknown
         };
+        #[cfg(test)]
+        cleanup_test_probe(0b001);
         let binding_active =
             home.and_then(|h| crate::worktree_cleanup::branch_has_active_binding(h, repo, name));
+        #[cfg(test)]
+        cleanup_test_probe(0b010);
         let active_holder = match (branch_is_checked_out(repo, name), binding_active) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
             _ => None,
         };
+        #[cfg(test)]
+        cleanup_test_probe(0b100);
         let task_active = home.and_then(|h| branch_has_active_task(h, name));
         let terminal = !matches!(
             provenance,
@@ -2293,6 +2314,59 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.name == "wip-active"),
             "active_unknown branch must remain after explicit confirmation"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// RED #3011: a non-terminal candidate is already a disposition KEEP, so
+    /// applying it must not gather binding, holder, or task evidence first.
+    #[test]
+    fn non_terminal_apply_skips_lifecycle_probes_3011() {
+        CLEANUP_TEST_PROBE_MASK.with(|mask| mask.set(0));
+        let repo = setup_repo("non-terminal-probes-3011");
+        let home = repo.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let branch = "wip-non-terminal";
+        let tip_sha = create_branch_with_commit(&repo, branch, "non-terminal work");
+
+        let categories = Categories {
+            active_unknown: vec![Candidate {
+                name: branch.to_string(),
+                tip_sha,
+                reason: "active_unknown".to_string(),
+            }],
+            ..Default::default()
+        };
+        let confirm_ids = std::iter::once(branch.to_string()).collect();
+
+        let (applied, skipped) = emit_delete_batch_with_context(
+            Some(&home),
+            &repo,
+            "main",
+            &categories,
+            &confirm_ids,
+            "#3011 RED",
+        )
+        .expect("apply");
+
+        assert_eq!(applied, 0, "non-terminal branch must remain preserved");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "non-terminal branch must be reported skipped"
+        );
+        assert_eq!(
+            cleanup_test_probe_mask(),
+            0,
+            "non-terminal branch must not inspect binding, holder, or task state"
+        );
+        assert!(
+            enumerate_branches(&repo)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.name == branch),
+            "non-terminal branch must remain present"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
