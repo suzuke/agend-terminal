@@ -509,19 +509,23 @@ fn route_and_deliver(
     let is_orchestrator = crate::teams::find_team_for(home, target)
         .and_then(|t| t.orchestrator)
         .is_some_and(|orch| orch == target);
-    let is_reply_to_drained_blocker = matches!(kind, "update" | "report")
-        && req
+    // #2977: the drained-blocker lookup reads the target's WHOLE inbox and runs
+    // a full `InboxMessage` parse, yet it can only change the outcome once every
+    // preceding conjunct already holds. Evaluate it last, inside the `&&` chain,
+    // rather than eagerly above: identical boolean result (the lookup is a pure
+    // read), but non-Codex / cross-team / orchestrator / non-update|report
+    // targets stop paying for a scan that could never affect their routing.
+    let skip_inject = is_codex
+        && matches!(kind, "update" | "report")
+        && !is_cross_team
+        && !is_orchestrator
+        && !req
             .correlation_id
             .as_deref()
             .filter(|s| !s.is_empty())
             .is_some_and(|corr| {
                 crate::inbox::has_drained_blocker_for_correlation(home, target, corr)
             });
-    let skip_inject = is_codex
-        && matches!(kind, "update" | "report")
-        && !is_cross_team
-        && !is_orchestrator
-        && !is_reply_to_drained_blocker;
 
     if !target_in_registry {
         crate::inbox::enqueue(home, target, msg)?;
