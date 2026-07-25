@@ -107,5 +107,31 @@ pub(crate) fn resolve_token_value(bot_token_env: &str) -> Option<String> {
 /// test creating a team via the API, reaching the topic helper, and the
 /// unscoped resolver loading the real fleet.yaml instead of the test's.
 pub(crate) fn resolve_channel_only_from(home: &std::path::Path) -> anyhow::Result<TelegramCreds> {
+    #[cfg(test)]
+    note_channel_resolve();
     resolve_channel_from(home).map(|(ch, _)| ch)
+}
+
+/// #2975: per-call config-resolution counter. Every `Bot::new` on a
+/// transport-helper path is immediately preceded by a
+/// `resolve_channel_only_from` in the same function, so counting resolutions
+/// counts per-call bot construction. `#[cfg(test)]` — compiled out of release.
+#[cfg(test)]
+std::thread_local! {
+    static CHANNEL_RESOLVE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_channel_resolve() {
+    CHANNEL_RESOLVE_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_channel_resolve_count() {
+    CHANNEL_RESOLVE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_channel_resolve_count() -> usize {
+    CHANNEL_RESOLVE_COUNT.with(|count| count.replace(0))
 }
