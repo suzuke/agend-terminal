@@ -129,3 +129,108 @@ pub(crate) fn handle_ack_handoff_ci(home: &Path, args: &Value, instance_name: &s
         "watch_preserved": true
     })
 }
+
+pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let repository = match args["repository"].as_str().filter(|s| !s.is_empty()) {
+        Some(r) => r,
+        None => {
+            return json!({"error": "missing required 'repository'", "code": "missing_repository"})
+        }
+    };
+    let branch = match args["branch"].as_str().filter(|s| !s.is_empty()) {
+        Some(b) => b,
+        None => return json!({"error": "missing required 'branch'", "code": "missing_branch"}),
+    };
+    let correlation = format!("{repository}@{branch}");
+    let episode = match args["episode"].as_str().filter(|s| !s.is_empty()) {
+        Some(e) => e,
+        None => return json!({"error": "missing required 'episode'", "code": "missing_episode"}),
+    };
+    let wake_task_id = match args["wake_task_id"].as_str().filter(|s| !s.is_empty()) {
+        Some(t) => t,
+        None => {
+            return json!({"error": "missing required 'wake_task_id'", "code": "missing_wake_task_id"})
+        }
+    };
+    let reason = match args["reason"].as_str().filter(|s| !s.is_empty()) {
+        Some(r) => r,
+        None => {
+            return json!({"error": "missing required non-empty 'reason'", "code": "missing_reason"})
+        }
+    };
+    let defer_secs = match args["defer_secs"].as_i64() {
+        Some(s) if (60..=3600).contains(&s) => s,
+        Some(s) => {
+            return json!({
+                "error": format!("defer_secs {s} outside 60..3600"),
+                "code": "invalid_defer_secs"
+            })
+        }
+        None => {
+            return json!({
+                "error": "missing required 'defer_secs'",
+                "code": "missing_defer_secs"
+            })
+        }
+    };
+    match crate::tasks::load_routed(home, wake_task_id) {
+        Ok(rt) => {
+            if matches!(
+                rt.record().status,
+                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
+            ) {
+                return json!({
+                    "error": format!("wake_task_id '{wake_task_id}' is already terminal"),
+                    "code": "wake_task_terminal"
+                });
+            }
+        }
+        Err(_) => {
+            return json!({
+                "error": format!("wake_task_id '{wake_task_id}' not found"),
+                "code": "wake_task_not_found"
+            });
+        }
+    }
+
+    let tracks = crate::daemon::ci_handoff_track::list(home);
+    let track = tracks.iter().find(|(_, t)| {
+        t.correlation == correlation.as_str()
+            && t.ci_handoff_episode.as_deref() == Some(episode)
+            && (instance_name.is_empty() || t.target == instance_name)
+    });
+    let Some((_, track)) = track else {
+        return json!({"error": "no matching track found", "code": "track_not_found"});
+    };
+    let target = &track.target;
+
+    use crate::daemon::ci_handoff_track::{DeferOutcome, DeferRequest};
+    let req = DeferRequest {
+        target,
+        correlation: &correlation,
+        episode,
+        deferred_by: if instance_name.is_empty() {
+            "operator"
+        } else {
+            instance_name
+        },
+        wake_task_id,
+        reason,
+        defer_secs,
+    };
+    match crate::daemon::ci_handoff_track::defer_track(home, &req) {
+        DeferOutcome::Deferred => json!({"ok": true, "deferred": true}),
+        DeferOutcome::AlreadyDeferred => {
+            json!({"ok": true, "deferred": true, "already_deferred": true})
+        }
+        DeferOutcome::EpisodeMismatch => {
+            json!({"error": "episode mismatch (CAS)", "code": "episode_mismatch"})
+        }
+        DeferOutcome::TrackNotFound => {
+            json!({"error": "track not found under lock", "code": "track_not_found"})
+        }
+        DeferOutcome::LockFailed => {
+            json!({"error": "lock acquisition failed", "code": "lock_failed"})
+        }
+    }
+}
