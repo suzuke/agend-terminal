@@ -164,9 +164,13 @@ pub(crate) fn gc_stale_activity_sidecars(home: &Path) {
 /// the payload embeds `Utc::now()`, so it differs on every call.
 ///
 /// The trade is bounded and one-directional — the watchdogs can see a stamp up
-/// to this many seconds stale against thresholds of
-/// [`FLEET_IDLE_THRESHOLD_SECS`] (1800) and [`DEV_IDLE_THRESHOLD_SECS`] (3600),
-/// so an agent can never be misjudged idle because of it.
+/// to this many seconds stale. Those thresholds are configured, not fixed:
+/// `fleet_idle_threshold_secs` and `dev_idle_threshold_secs` default to 1800 and
+/// 3600 but are overridable via runtime-config.json (#1085), and the per-agent
+/// scan narrows further to an instance's own `timeout_secs`. Even a short
+/// override stays safe in the direction that matters: skipping the rewrite
+/// leaves the OLDER stamp, so idleness reads LARGER — an alert may fire early,
+/// it cannot be suppressed.
 const COALESCE_WINDOW_SECS: i64 = 5;
 
 /// True when `prev` is recent enough to skip the rewrite. Anything uncertain

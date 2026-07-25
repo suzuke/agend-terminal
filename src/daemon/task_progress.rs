@@ -101,13 +101,15 @@ fn progress_path(home: &Path, task_id: &str) -> PathBuf {
 /// `Utc::now()`, so it differs on every call.
 ///
 /// The trade is bounded and FAIL-LOUD. A consumer can see a stamp up to this
-/// many seconds stale. Against the fixed idle floors that is three orders of
-/// magnitude of headroom (`idle_watchdog::FLEET_IDLE_THRESHOLD_SECS` 1800,
-/// `DEV_IDLE_THRESHOLD_SECS` 3600). Against anti-stall it is NOT automatically
-/// smaller — that threshold is `eta_secs * 1.5`, and an `eta_secs` of 1 puts it
-/// at 1.5s, well inside this window. That is safe in the direction that matters:
-/// an older stamp makes elapsed-since-progress look LARGER, so a stall warning
-/// can fire early but can never be suppressed.
+/// many seconds stale. The idle thresholds are configured rather than fixed
+/// floors: they default to 1800s (fleet) and 3600s (dev), which leaves three
+/// orders of magnitude of headroom, but runtime-config.json can lower them and
+/// the per-agent scan uses an instance's own `timeout_secs` when set, so that
+/// headroom is not guaranteed. Against anti-stall it is not automatically
+/// smaller either — that threshold is `eta_secs * 1.5`, and an `eta_secs` of 1
+/// puts it at 1.5s, well inside this window. Every one of those cases fails in
+/// the safe direction: an older stamp makes elapsed-since-progress look LARGER,
+/// so a stall warning can fire early but can never be suppressed.
 ///
 /// `ProgressSource` is forensic-only (it records which hook kept a task fresh).
 /// A source transition occurring inside the window is coalesced away, so the
