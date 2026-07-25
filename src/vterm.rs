@@ -2505,6 +2505,14 @@ mod tests {
     }
 
     #[test]
+    fn read_scrollback_trims_true_leading_blanks_at_top_2963() {
+        let mut vt = VTerm::new(80, 3);
+        vt.process(b"\r\n\r\nB");
+
+        assert_eq!(vt.read_scrollback(10), "B");
+    }
+
+    #[test]
     fn read_scrollback_zero_lines_does_not_scan() {
         let mut vt = VTerm::new(80, 5);
         vt.process(b"content\r\n");
