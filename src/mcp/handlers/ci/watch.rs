@@ -149,10 +149,17 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
 
     let now_rfc3339 = chrono::Utc::now().to_rfc3339();
 
-    let mut watch = std::fs::read_to_string(&watch_path)
+    let existing = std::fs::read_to_string(&watch_path)
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_else(|| {
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    // Re-arming an unwatch TOMBSTONE? Same predicate as `sweep.rs`
+    // (`auto_arm_optout` + no subscribers), read from the PRE-EXISTING file —
+    // before this call appends its subscriber or removes the optout below.
+    let tombstone_rearm = existing.as_ref().is_some_and(|w| {
+        w.get("auto_arm_optout").and_then(|v| v.as_bool()) == Some(true)
+            && crate::daemon::ci_watch::parse_subscribers(w).is_empty()
+    });
+    let mut watch = existing.unwrap_or_else(|| {
             json!({
                 "repo": repo,
                 "branch": branch,
@@ -234,6 +241,32 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // the human/agent decision to watch again clears the auto-arm optout.
     if let Some(obj) = watch.as_object_mut() {
         obj.remove("auto_arm_optout");
+        // A tombstone re-arm starts a fresh notification epoch: these cursors
+        // record what the previous epoch's (now gone) subscribers were already
+        // told, so keeping them suppresses a still-terminal run at the same
+        // head. Rotating `generation_id` in this SAME write makes an in-flight
+        // old-generation poll lose the `flush_watch_state` CAS instead of
+        // restoring them. Keys are removed, not nulled: every field is
+        // `#[serde(default)]` and `last_notified_by_workflow` is a plain
+        // `BTreeMap`, so a null would make the watch unreadable to the poller.
+        if tombstone_rearm {
+            for key in [
+                "last_notified_by_workflow",
+                "last_run_id",
+                "last_notified_head_sha",
+                "last_notified_conclusion",
+                "last_notified_run_attempt",
+                "last_notified_run_conclusion",
+                "last_terminal_seen_at",
+                "terminal_since",
+            ] {
+                obj.remove(key);
+            }
+            obj.insert(
+                "generation_id".to_string(),
+                json!(uuid::Uuid::new_v4().to_string()),
+            );
+        }
     }
     // Refresh expires_at on each subscribe — keeps the watch alive
     // as long as at least one agent stays interested.
