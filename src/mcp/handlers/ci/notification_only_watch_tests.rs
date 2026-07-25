@@ -811,3 +811,119 @@ fn find_watch_with_sha(watch_dir: &std::path::Path, sha: &str) -> Option<std::pa
     }
     None
 }
+
+// ── #3060: the helper above must not select atomic-write temp siblings ──────
+//
+// `store::atomic_write` writes `<name>.json.<pid>.<seq>.tmp` next to its target
+// and renames it into place (`src/store.rs:208-225`), and the watch writer uses
+// it (`src/daemon/ci_watch/poller.rs:282`). Under full-suite parallel load the
+// scan above could read one of those in-flight temp files and return it, after
+// which the callers' `serde_json::from_str` panicked on trailing characters
+// (#3060: 2 failures in 3 full-suite runs, 12/12 green standalone).
+//
+// These pins are deterministic and sleep-free: they build the directory state
+// directly instead of racing a real writer, so neither the failure nor the fix
+// depends on `read_dir` ordering.
+
+/// The exact name `atomic_write` would use for an in-flight write of
+/// `<sha>.json` — `Path::with_extension` replaces `json`, so the resulting file
+/// has extension `tmp`.
+fn atomic_write_tmp_sibling(watch_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
+    watch_dir
+        .join(format!("{sha}.json"))
+        .with_extension(format!("json.{}.0.tmp", std::process::id()))
+}
+
+fn watch_json_body(sha: &str) -> String {
+    format!(
+        "{{\"repo\":\"suzuke/agend-terminal\",\"branch\":\"fix/x\",\"head_sha\":\"{sha}\",\
+         \"notification_only\":true}}"
+    )
+}
+
+/// #3060 RED: a temp sibling carrying the target SHA must be invisible to the
+/// helper. Deterministic because the canonical `.json` present in the directory
+/// belongs to a DIFFERENT sha, so the temp file is the only textual match —
+/// pre-fix the scan returns it on every `read_dir` order, post-fix nothing
+/// matches.
+#[test]
+fn find_watch_with_sha_ignores_atomic_write_tmp_sibling_3060() {
+    let home = tmp_home("3060-tmp-sibling");
+    let watch_dir = home.join("ci-watches");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    let target = "a".repeat(64);
+    let other = "b".repeat(64);
+
+    std::fs::write(
+        watch_dir.join(format!("{other}.json")),
+        watch_json_body(&other),
+    )
+    .unwrap();
+    let tmp = atomic_write_tmp_sibling(&watch_dir, &target);
+    std::fs::write(&tmp, watch_json_body(&target)).unwrap();
+
+    assert_eq!(
+        find_watch_with_sha(&watch_dir, &target),
+        None,
+        "an atomic-write temp sibling must never be selected as a watch file \
+         (found via {})",
+        tmp.display()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3060 RED: the SHA match must run on a COMPLETE document. A file whose bytes
+/// contain the SHA but do not parse is exactly what made the callers panic, so
+/// the parse has to gate the match rather than happen afterwards at the call
+/// site. Deterministic: the truncated file is the only textual match.
+#[test]
+fn find_watch_with_sha_ignores_incomplete_json_3060() {
+    let home = tmp_home("3060-incomplete");
+    let watch_dir = home.join("ci-watches");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    let target = "c".repeat(64);
+
+    let body = watch_json_body(&target);
+    let truncated = &body[..body.len() - 12];
+    assert!(
+        truncated.contains(&target)
+            && serde_json::from_str::<serde_json::Value>(truncated).is_err(),
+        "fixture must be a SHA-bearing but unparseable document"
+    );
+    std::fs::write(watch_dir.join(format!("{target}.json")), truncated).unwrap();
+
+    assert_eq!(
+        find_watch_with_sha(&watch_dir, &target),
+        None,
+        "a SHA-bearing but incomplete document must not be selected"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3060 positive control: with both a canonical watch file and its temp
+/// sibling carrying the same SHA, the canonical `.json` is what comes back —
+/// the filter must not turn the fix into "find nothing". Deterministic once the
+/// temp file is filtered out (pre-fix this depended on `read_dir` order, which
+/// is the bug).
+#[test]
+fn find_watch_with_sha_returns_canonical_beside_tmp_3060() {
+    let home = tmp_home("3060-canonical");
+    let watch_dir = home.join("ci-watches");
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    let target = "d".repeat(64);
+
+    let canonical = watch_dir.join(format!("{target}.json"));
+    std::fs::write(&canonical, watch_json_body(&target)).unwrap();
+    std::fs::write(
+        atomic_write_tmp_sibling(&watch_dir, &target),
+        watch_json_body(&target),
+    )
+    .unwrap();
+
+    assert_eq!(
+        find_watch_with_sha(&watch_dir, &target),
+        Some(canonical),
+        "the canonical .json must still be found when a temp sibling exists"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
