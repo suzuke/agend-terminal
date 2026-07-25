@@ -1816,6 +1816,61 @@ fn checkout_explicit_from_ref_does_not_resolve_default_branch_3023() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #3023 follow-up: when `expected_head` pins a NEW branch and `from_ref` is
+/// omitted, the creation base is `expected_ref` — so the `origin/<default>`
+/// fallback string is built and immediately discarded. Only the preflight's
+/// load-bearing resolution (which decides whether `expected_head` matches) may
+/// spawn `default_branch`; the creation block must not resolve it a second time.
+#[test]
+#[cfg(unix)]
+fn checkout_expected_ref_skips_discarded_default_branch_fallback_3023() {
+    let home = p778_tmp_home("3023-discarded");
+    let parent = p778_tmp_home("3023-discarded-src");
+    let source = p780_setup_source_no_feature_branch(&parent);
+    let agent = "checkout-3023-discard-agent";
+    let expected_head = std::process::Command::new("git")
+        .args(["rev-parse", "main"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git spawn");
+    assert!(
+        expected_head.status.success(),
+        "rev-parse main must succeed"
+    );
+    let expected_head = String::from_utf8_lossy(&expected_head.stdout)
+        .trim()
+        .to_string();
+    let before = crate::git_helpers::test_default_branch_calls();
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/3023-discarded",
+            "bind": true,
+            "expected_head": expected_head,
+        }),
+        agent,
+    );
+
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+    assert_eq!(
+        resp["auto_created_branch"].as_bool(),
+        Some(true),
+        "the expected_ref creation path requires a newly created branch: {resp}"
+    );
+    assert_eq!(
+        crate::git_helpers::test_default_branch_calls() - before,
+        1,
+        "expected_ref wins the creation base, so only the preflight may resolve \
+         default_branch; a second resolution is computed then discarded: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 #[cfg(unix)]
 fn checkout_bind_true_existing_branch_ignores_from_ref() {
