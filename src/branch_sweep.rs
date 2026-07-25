@@ -992,35 +992,36 @@ pub(crate) fn emit_delete_batch_with_context(
             // remains fail-closed in the shared classifier.
             crate::worktree::disposition::BranchProvenance::Unknown
         };
-        #[cfg(test)]
-        cleanup_test_probe(0b001);
-        let binding_active =
-            home.and_then(|h| crate::worktree_cleanup::branch_has_active_binding(h, repo, name));
-        #[cfg(test)]
-        cleanup_test_probe(0b010);
-        let active_holder = match (branch_is_checked_out(repo, name), binding_active) {
-            (Some(true), _) | (_, Some(true)) => Some(true),
-            (Some(false), Some(false)) => Some(false),
-            _ => None,
-        };
-        #[cfg(test)]
-        cleanup_test_probe(0b100);
-        let task_active = home.and_then(|h| branch_has_active_task(h, name));
         let terminal = !matches!(
             provenance,
             crate::worktree::disposition::BranchProvenance::Unknown
         );
-        let open_pr = if terminal {
+        let (active_holder, task_active, open_pr) = if !terminal {
+            // Unknown provenance is already a KEEP decision; do not probe
+            // binding, holder, task, or external SCM state for it.
+            (None, None, Some(false))
+        } else {
+            #[cfg(test)]
+            cleanup_test_probe(0b001);
+            let binding_active = home
+                .and_then(|h| crate::worktree_cleanup::branch_has_active_binding(h, repo, name));
+            #[cfg(test)]
+            cleanup_test_probe(0b010);
+            let active_holder = match (branch_is_checked_out(repo, name), binding_active) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+            #[cfg(test)]
+            cleanup_test_probe(0b100);
+            let task_active = home.and_then(|h| branch_has_active_task(h, name));
             let inventory = open_pr_inventory.get_or_insert_with(|| open_pr_snapshot(repo, base));
-            match inventory.status_for(name) {
+            let open_pr = match inventory.status_for(name) {
                 OpenPrStatus::Open => Some(true),
                 OpenPrStatus::NotOpen => Some(false),
                 OpenPrStatus::Unknown => None,
-            }
-        } else {
-            // Unknown provenance is already a KEEP decision; do not probe an
-            // external SCM surface for a branch that cannot be deleted.
-            Some(false)
+            };
+            (active_holder, task_active, open_pr)
         };
         // Reviewer residue is only deleted after a recovery ref is prepared
         // below; all other proven terminal categories are already preserved
