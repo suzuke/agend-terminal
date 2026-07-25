@@ -193,7 +193,7 @@ Drain 或管理 caller 的 durable inbox。
 
 將 caller 復原或重新綁定到 branch worktree。新工作請優先使用 `repo action=checkout bind:true`。
 
-- 必填：`branch`；可選 `repository_path`、與它互斥的 legacy `repository`、`rebase_mode` 與 `task_id`。
+- 必填：`branch`；可選 `repository_path`、`rebase_mode` 與 `task_id`。
 - 受保護分支與跨 agent lease conflict 會被拒絕；它不會默默建立 CI continuation。
 
 ### `release_worktree`

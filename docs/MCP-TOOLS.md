@@ -193,7 +193,7 @@ Read-only folded alias. Actions: `list`, `pane_snapshot`; semantics match the st
 
 Recover or rebind the calling instance to a branch worktree. Prefer `repo action=checkout bind:true` for fresh work.
 
-- Required: `branch`; optional `repository_path`, legacy mutually exclusive `repository`, `rebase_mode`, and `task_id`.
+- Required: `branch`; optional `repository_path`, `rebase_mode`, and `task_id`.
 - Rejects protected branches and cross-agent lease conflicts. It does not silently create a CI continuation.
 
 ### `release_worktree`
