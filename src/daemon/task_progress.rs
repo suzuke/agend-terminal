@@ -147,6 +147,7 @@ pub(crate) fn touch(home: &Path, task_id: &str, source: ProgressSource) {
             return;
         }
     };
+    record_sidecar_write(task_id);
     let payload = ProgressSidecar {
         schema_version: SCHEMA_VERSION,
         task_id: task_id.to_string(),
@@ -232,6 +233,37 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
         return Some(task_id.to_string());
     }
     None
+}
+
+/// #3026 (r1) test seam: every sidecar WRITE that survives the under-lock
+/// freshness check records its task_id here. Keyed by task rather than a bare
+/// counter so a concurrently running test touching a DIFFERENT task cannot
+/// perturb an assertion.
+/// #3026 (r1): record a sidecar write. The CALL SITE is unconditional on
+/// purpose — an inline test-only cfg attribute above the `last_alerted`
+/// anchors would truncate the source scan in
+/// `tests/idle_watchdog_last_alerted_gc_daemon_dispatch_idle.rs`, which slices
+/// production source at the FIRST such attribute (and would match it inside a
+/// doc comment too, hence the prose here).
+#[cfg(not(test))]
+fn record_sidecar_write(_key: &str) {}
+
+#[cfg(test)]
+fn record_sidecar_write(key: &str) {
+    WRITES.lock().push(key.to_string());
+}
+
+#[cfg(test)]
+static WRITES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// #3026 (r1): how many sidecar writes `task_id` has taken in this process.
+#[cfg(test)]
+pub(crate) fn writes_for(task_id: &str) -> usize {
+    WRITES
+        .lock()
+        .iter()
+        .filter(|t| t.as_str() == task_id)
+        .count()
 }
 
 /// #3026 test seam: seed the sidecar at an arbitrary instant so the coalescing

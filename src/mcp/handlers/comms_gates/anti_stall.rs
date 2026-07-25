@@ -214,6 +214,54 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #3026 (r1) — the freshness decision must be made UNDER the sidecar lock.
+    /// Read outside it and N concurrent senders can all observe the same stale
+    /// stamp and all proceed to write, so the coalescing would silently fail in
+    /// exactly the concurrency it exists to damp. Deterministic and sleep-free:
+    /// a `Barrier` releases every thread at once, and the write recorders are
+    /// keyed by task/agent so a parallel test touching different names cannot
+    /// perturb the counts.
+    #[test]
+    fn concurrent_sends_write_each_sidecar_once_3026() {
+        const THREADS: usize = 8;
+        let home = tmp_home_3026("concurrent");
+        let task = "t-3026-conc";
+        let agent = "agent-3026-conc";
+        // Seed both stale, so every thread would otherwise decide to write.
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(6);
+        crate::daemon::task_progress::seed_progress_at(&home, task, stale);
+        crate::daemon::idle_watchdog::seed_activity_at(&home, agent, stale);
+        let progress_before = crate::daemon::task_progress::writes_for(task);
+        let activity_before = crate::daemon::idle_watchdog::writes_for(agent);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let home = home.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    send_3026(&home, task, agent);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+
+        assert_eq!(
+            crate::daemon::task_progress::writes_for(task) - progress_before,
+            1,
+            "{THREADS} concurrent sends must produce exactly ONE progress write"
+        );
+        assert_eq!(
+            crate::daemon::idle_watchdog::writes_for(agent) - activity_before,
+            1,
+            "{THREADS} concurrent sends must produce exactly ONE activity write"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #3026 — the coalescing must live in the shared owners (`touch` /
     /// `touch_agent_activity`), NOT in this gate:
     /// `comms_delegate::handle_delegate_task` is a second production caller of
