@@ -26,9 +26,11 @@ pub fn write_tagged(w: &mut impl Write, tag: u8, data: &[u8]) -> std::io::Result
             "frame too large",
         ));
     }
-    w.write_all(&[tag])?;
-    w.write_all(&(data.len() as u32).to_be_bytes())?;
-    w.write_all(data)?;
+    let mut frame = Vec::with_capacity(1 + 4 + data.len());
+    frame.push(tag);
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    frame.extend_from_slice(data);
+    w.write_all(&frame)?;
     w.flush()
 }
 
