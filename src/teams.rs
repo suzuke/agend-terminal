@@ -824,6 +824,47 @@ mod tests {
     }
 
     #[test]
+    fn team_create_preserves_operator_comments_3111() {
+        let home = tmp_home("preserve-comments-3111");
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            "# operator fleet notes\ninstances: {}\nteams:\n  # keep the existing team documented\n  existing: # existing team owner notes\n    # this roster is maintained by the operator\n    members:\n      - existing-agent # keep primary member\n",
+        )
+        .unwrap();
+
+        let created = create(
+            &home,
+            &serde_json::json!({"name": "new-team", "members": ["new-agent"]}),
+        );
+        assert_eq!(created["status"], "created", "{created}");
+        let updated = update(
+            &home,
+            &serde_json::json!({"name": "existing", "add": ["second-agent"]}),
+        );
+        assert_eq!(updated["status"], "updated", "{updated}");
+
+        let persisted = std::fs::read_to_string(&fleet_path).unwrap();
+        for comment in [
+            "# operator fleet notes",
+            "# keep the existing team documented",
+            "# existing team owner notes",
+            "# this roster is maintained by the operator",
+            "# keep primary member",
+        ] {
+            assert_eq!(
+                persisted.matches(comment).count(),
+                1,
+                "fleet.yaml mutation erased or duplicated operator comment {comment:?}:\n{persisted}"
+            );
+        }
+        let fleet = crate::fleet::FleetConfig::load(&fleet_path).unwrap();
+        assert!(fleet.teams.contains_key("existing"));
+        assert!(fleet.teams.contains_key("new-team"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn team_disband_cancels_member_tasks_no_double_event_1903() {
         // #1903 §3.9 (b): disbanding a team must CANCEL each member's live tasks
         // (no survivor to take over), and — proving the cancel-BEFORE-cascade

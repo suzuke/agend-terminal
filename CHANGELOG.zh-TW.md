@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fleet.yaml` mutation 不再抹除 operator 註解** — team 與 instance 更新會依原順序保留註解文字；由於語意化 YAML 序列化仍會正規化呈現方式，保留的註解會集中到文件開頭，不承諾維持原本的縮排或 key 歸屬（#3111）。
+
 ## [0.11.3] — 2026-07-26
 
 ### Added

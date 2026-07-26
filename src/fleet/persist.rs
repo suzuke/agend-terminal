@@ -2,13 +2,57 @@ use super::{fleet_yaml_path, InstanceYamlEntry, TeamConfig};
 use anyhow::{Context, Result};
 use std::path::Path;
 
-fn atomic_write_yaml(home: &Path, doc: &serde_yaml_ng::Value) -> Result<()> {
-    let yaml = serde_yaml_ng::to_string(doc).context("Failed to serialize fleet.yaml")?;
+fn atomic_write_yaml(home: &Path, original: &str, doc: &serde_yaml_ng::Value) -> Result<()> {
+    let serialized = serde_yaml_ng::to_string(doc).context("Failed to serialize fleet.yaml")?;
+    let yaml = preserve_yaml_comments(original, &serialized);
     let fleet_path = fleet_yaml_path(home);
     let result = crate::store::atomic_write(&fleet_path, yaml.as_bytes())
         .context("Failed to atomic-write fleet.yaml");
     super::invalidate_cache();
     result
+}
+
+/// Keep operator comment text and order across the serde round-trip.
+/// Indentation and attachment to a particular YAML key are intentionally not
+/// preserved; comments are emitted as a document header.
+fn preserve_yaml_comments(original: &str, serialized: &str) -> String {
+    let comments = original
+        .lines()
+        .filter_map(|line| yaml_comment(line.trim_start()))
+        .collect::<Vec<_>>();
+    if comments.is_empty() {
+        return serialized.to_owned();
+    }
+
+    let mut output = comments.join("\n");
+    output.push('\n');
+    output.push_str(serialized);
+    output
+}
+
+fn yaml_comment(line: &str) -> Option<&str> {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '\\' if double_quoted => escaped = !escaped,
+            '"' if !single_quoted && !escaped => double_quoted = !double_quoted,
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '#' if !single_quoted
+                && !double_quoted
+                && (index == 0
+                    || line[..index]
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_whitespace)) =>
+            {
+                return Some(&line[index..]);
+            }
+            _ => escaped = false,
+        }
+    }
+    None
 }
 
 fn acquire_lock(home: &Path) -> Result<crate::store::FileFlockGuard> {
@@ -54,7 +98,7 @@ pub(crate) fn mutate_fleet_yaml(
         serde_yaml_ng::from_str(&content).context("Failed to parse fleet.yaml")?;
     let changed = mutate(&mut doc)?;
     if changed {
-        atomic_write_yaml(home, &doc)
+        atomic_write_yaml(home, &content, &doc)
     } else {
         Ok(())
     }
@@ -764,6 +808,13 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn comment_preservation_ignores_hashes_inside_quotes_3111() {
+        let original = "double: \"# data\"\nsingle: '# data too' # real comment\n";
+        let output = preserve_yaml_comments(original, "instances: {}\n");
+        assert_eq!(output, "# real comment\ninstances: {}\n");
     }
 
     #[test]
