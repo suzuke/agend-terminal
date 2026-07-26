@@ -3454,6 +3454,29 @@ fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
         &head,
         crate::daemon::pr_state::ReviewClass::Unresolved,
     );
+    state.pr_number = 3114;
+    state.ci_state = crate::daemon::pr_state::CiState::Green {
+        sha: head.clone(),
+        observed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.validated_review_receipts.push(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:3114-positive".into(),
+            source_id: "3114-positive".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "reviewer".into(),
+            repo: "o/r".into(),
+            pr_number: 3114,
+            branch: "feat/x".into(),
+            task_id: "t-3114-positive".into(),
+            reviewed_head: head.clone(),
+            review_class: crate::daemon::pr_state::ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        },
+    );
     state.diagnostic_emitted_for_sha = Some(head);
     crate::daemon::pr_state::save(&home, &state).unwrap();
 
@@ -3484,6 +3507,11 @@ fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
     assert_eq!(
         reconciled.review_class,
         crate::daemon::pr_state::ReviewClass::Single
+    );
+    assert_eq!(
+        reconciled.merge_state,
+        crate::daemon::pr_state::MergeState::MergeReady,
+        "resolving the class must recompute the already-green, already-reviewed PR gate"
     );
     assert!(
         reconciled.diagnostic_emitted_for_sha.is_none(),
