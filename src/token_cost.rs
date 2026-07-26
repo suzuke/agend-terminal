@@ -2,8 +2,9 @@
 //!
 //! No daemon ingester and no intermediate `token_events.jsonl`: the Claude Code
 //! session transcript (`~/.claude/projects/<sanitised-cwd>/<session>.jsonl`) IS
-//! the persistent source, so the `tokens` MCP tool scans it on demand at query
-//! time. Each assistant line carries a `message.usage` block; this module
+//! the persistent source, so the operator `admin tokens` command scans it on
+//! demand at query time. Each assistant line carries a `message.usage` block;
+//! this module
 //!
 //!   1. attributes each line to a fleet instance via its authoritative `cwd`
 //!      field (deterministic — no fragile timestamp correlation),
@@ -553,7 +554,8 @@ fn parse_since(since: Option<&str>, now_ms: i64) -> Option<i64> {
     }
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num.parse().ok()?;
-    // CR-2026-06-14: `since` flows straight from the MCP `tokens` tool args, so a
+    // CR-2026-06-14: `since` flows straight from the operator `admin tokens`
+    // CLI arguments, so a
     // parseable-but-absurd value (e.g. `100000000000000d`) overflows the unit
     // multiply — a panic under debug `overflow-checks`, a wrapped bogus cutoff in
     // release. Use checked arithmetic and fail closed (None) on any overflow.
@@ -1003,7 +1005,7 @@ fn render_by_task(
     })
 }
 
-/// MCP `tokens` handler. Shape `ha` — `(home, args)`.
+/// Operator `admin tokens` implementation. Shape `ha` — `(home, args)`.
 pub(crate) fn handle_tokens(home: &Path, args: &Value) -> Value {
     let action = args
         .get("action")

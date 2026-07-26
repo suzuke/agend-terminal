@@ -10,6 +10,7 @@
 ### Fixed
 
 - **`fleet.yaml` mutation 不再抹除 operator 註解** — team 與 instance 更新會依原順序保留註解文字；由於語意化 YAML 序列化仍會正規化呈現方式，保留的註解會集中到文件開頭，不承諾維持原本的縮排或 key 歸屬（#3111）。
+- **移除未使用的 transcript context estimator** — 刪除未被呼叫的實作與測試；基於 statusline 的 context 回報與警報行為維持不變（#3100 Phase A）。
 
 ## [0.11.3] — 2026-07-26
 
