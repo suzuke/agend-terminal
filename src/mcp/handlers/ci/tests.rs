@@ -73,14 +73,24 @@ fn validate_release_path_refuses_non_worktree_deep_dir_83936() {
 // ── #t-…83936-6 P0: NEVER release a primary/main working tree ───────────────
 // The 2026-07-06 canonical-deletion incident: `repo release path=<canonical>`
 // → validate passed → `git worktree remove` refused the main tree → the
-// `remove_dir_all` fallback deleted the ENTIRE repo. Fixtures live under $HOME
-// (a plain path like the real incident) NOT temp_dir — `/var`→`/private` is
+// `remove_dir_all` fallback deleted the ENTIRE repo. Fixtures live under a
+// plain path like the real incident, NOT temp_dir — `/var`→`/private` is
 // already system-prefix-rejected and would MASK the guard under test.
+//
+// The anchor is derived at COMPILE TIME from `CARGO_MANIFEST_DIR`, not from the
+// runtime `$HOME`: `$HOME` is process-global and sibling tests reassign it
+// mid-run (the GitLab/Bitbucket auth-token tests in
+// `daemon/ci_watch/poller_tests.rs` point it at a temp dir and later drop that
+// dir), so a fixture created under whichever `$HOME` happened to be current
+// could vanish underneath a still-running release-guard test. It anchors at the
+// manifest's PARENT, not inside `target/`: everything under the manifest dir is
+// in this worktree, where `just-a-dir` WOULD be git-classifiable and the
+// non-repo guard below could no longer be exercised.
 
 #[cfg(unix)]
 fn release_guard_tmp(tag: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME").expect("HOME must be set");
-    let d = std::path::PathBuf::from(home).join(format!(
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let d = manifest.parent().unwrap_or(manifest).join(format!(
         ".agend-release-guard-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -90,6 +100,44 @@ fn release_guard_tmp(tag: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&d).ok();
     d
+}
+
+/// The fixtures must sit on a compile-time-stable path that no `$HOME`-mutating
+/// sibling can move, and outside ANY git repository — inside one, the non-repo
+/// guard above would test a path git can classify. Both halves are asserted
+/// here so a future anchor change fails loudly instead of silently masking the
+/// guard. The repository half is proven by classification failing outright, not
+/// by comparing against this repo: a parent that sat inside some OTHER repo
+/// would still classify, and a this-repo-only check would pass while the guard
+/// was masked.
+#[cfg(unix)]
+#[test]
+fn release_guard_tmp_is_stable_and_outside_this_repo() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = release_guard_tmp("anchor");
+    assert!(dir.is_dir(), "helper must create the fixture dir: {dir:?}");
+    assert!(
+        dir.starts_with(manifest.parent().unwrap_or(manifest)),
+        "fixture must be anchored off the compile-time manifest dir, not a runtime-mutable $HOME: {dir:?}"
+    );
+    assert!(
+        !dir.starts_with(manifest),
+        "fixture must live OUTSIDE this worktree or the non-repo guard is masked: {dir:?}"
+    );
+    let classified = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&dir)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    assert!(
+        classified.is_none(),
+        "git must not classify the fixture as being in ANY repository (got {classified:?}) \
+         — inside one, the non-repo guard is masked: {dir:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(unix)]
