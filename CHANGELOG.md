@@ -7,13 +7,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
-### Fixed
-
-- **`fleet.yaml` mutations no longer erase operator comments** — team and instance updates retain comment text in its original order; because semantic YAML serialization still normalizes presentation, retained comments are emitted as a document header rather than preserving their original indentation or key attachment (#3111).
-- **Removed the unused transcript context estimator** — deleted its uncalled implementation and tests; statusline-based context reporting and alerts are unchanged (#3100 Phase A).
-- **Resolving a CI watch's review class no longer leaves the merge gate stuck** — an explicit class now repairs an existing unresolved PR state directly, without replaying an already-delivered CI result or `ci-ready` handoff (#3114).
-
-## [0.11.3] — 2026-07-26
+## [0.11.3] — 2026-07-27
 
 ### Added
 
@@ -30,6 +24,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Fixed
 
+- **`fleet.yaml` mutations no longer erase operator comments** — team and instance updates retain comment text in its original order; because semantic YAML serialization still normalizes presentation, retained comments are emitted as a document header rather than preserving their original indentation or key attachment (#3111).
+- **Removed the unused transcript context estimator** — deleted its uncalled implementation and tests; statusline-based context reporting and alerts are unchanged (#3100 Phase A).
+- **Resolving a CI watch's review class no longer leaves the merge gate stuck** — an explicit class now repairs an existing unresolved PR state directly, without replaying an already-delivered CI result or `ci-ready` handoff (#3114).
 - **`agentic-git` guarded-git correctness** — a foreign-cwd `sparse-checkout`/`config` write is routed to the repository it names instead of being denied, and `snapshots restore --yes` now returns the genuinely newest snapshot when several share one second (#2950, #3069, #3070).
 - **Shift+Tab reaches the pane** — the TUI forwards `BackTab` to the pane PTY instead of swallowing it (#2933).
 - **`waiting_on` stale alerts no longer repeat or misroute** — the alert is delivered to the instance's configured name (so it reaches the agent's inbox and its team orchestrator) instead of an id-named file nothing reads, it respects the 30-minute re-alert interval instead of firing every 5-minute scan, and metadata left behind by an instance the fleet no longer runs is skipped (#3077).
