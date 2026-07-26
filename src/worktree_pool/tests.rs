@@ -5351,12 +5351,20 @@ fn live_task_review_branch_records_retry_intent_3090() {
         branch_exists(&repo, branch),
         "branch must survive while its task is live"
     );
-    // …but the retry must be recorded, or the existing terminal sweep is blind.
+    // …but the retry must be recorded, and recorded where the sweep that has to
+    // consume it can see it. A DRY-RUN reconcile is the sweep's own view:
+    // the branch must appear as a candidate, still preserved because the task
+    // is live.
+    let seen = crate::cleanup_intents::reconcile_terminal_review_intents(&home, true);
     assert!(
-        crate::cleanup_intents::has_intent(&home, &repo.display().to_string(), branch),
+        seen.candidates.iter().any(|c| c.branch == branch),
         "a branch preserved only because its task is live must record a cleanup \
-         intent so the terminal reconcile sweep can settle it later: {:?}",
+         intent visible to the terminal reconcile sweep: {seen:?} / {:?}",
         out.branch_cleanup_skipped_reason
+    );
+    assert_eq!(
+        seen.settled, 0,
+        "a live task must not settle anything yet: {seen:?}"
     );
 
     // Second half — the intent must be CONSUMABLE, not merely present. Drive
