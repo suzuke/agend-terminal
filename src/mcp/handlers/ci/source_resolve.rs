@@ -69,21 +69,34 @@ pub(super) fn resolve_checkout_source_path(
         Ok(p) => p,
         Err(e) => return Err(json!({"error": format!("invalid source path: {e}")})),
     };
-    if source_canonical.starts_with("/etc")
-        || source_canonical.starts_with("/usr")
-        || source_canonical.starts_with("/sys")
-        || source_canonical.starts_with("/proc")
-    {
-        return Err(json!({"error": "source path rejected: system directory"}));
+    if is_system_dir(&source_canonical) {
+        return Err(system_dir_rejection());
     }
     // Git repository identity, not filesystem identity: `canonicalize` resolves
     // symlinks but keeps a linked worktree as itself, so the same (repo, branch)
     // would split across spellings of the path. A path that is not a working tree
     // is left exactly as before — this normalizes, it rejects nothing new.
     match canonical_repo_root(&source_canonical) {
+        // Normalization can move the admitted path: an allowed linked worktree may
+        // be owned by a repo root inside a protected directory. The guard above
+        // cleared the INPUT, so the same policy must clear what is RETURNED.
+        Some(root) if is_system_dir(&root) => Err(system_dir_rejection()),
         Some(root) => Ok((root.display().to_string(), root)),
         None => Ok((source_path, source_canonical)),
     }
+}
+
+/// The system-directory policy, applied to every path this module hands back.
+fn is_system_dir(p: &Path) -> bool {
+    p.starts_with("/etc")
+        || p.starts_with("/usr")
+        || p.starts_with("/sys")
+        || p.starts_with("/proc")
+}
+
+/// The contracted rejection — error string preserved byte-for-byte (any matcher/test).
+fn system_dir_rejection() -> Value {
+    json!({"error": "source path rejected: system directory"})
 }
 
 /// The canonical root of the repository that OWNS `path` — R for R itself, for a
