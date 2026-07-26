@@ -362,6 +362,17 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             {
                 state.diagnostic_emitted_for_sha = None;
             }
+            if !matches!(
+                state.merge_state,
+                crate::daemon::pr_state::MergeState::Merged { .. }
+                    | crate::daemon::pr_state::MergeState::ClosedUnmerged { .. }
+            ) {
+                state.merge_state = if crate::daemon::pr_state::is_merge_ready(state) {
+                    crate::daemon::pr_state::MergeState::MergeReady
+                } else {
+                    crate::daemon::pr_state::MergeState::NotReady
+                };
+            }
         }) {
             return json!({
                 "error": format!("review class reconciliation failed: {e}"),

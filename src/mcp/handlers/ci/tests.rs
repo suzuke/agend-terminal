@@ -3459,8 +3459,9 @@ fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
         sha: head.clone(),
         observed_at: chrono::Utc::now().to_rfc3339(),
     };
-    state.validated_review_receipts.push(
-        crate::review_receipt::ReviewReceiptSummary {
+    state
+        .validated_review_receipts
+        .push(crate::review_receipt::ReviewReceiptSummary {
             receipt_id: "review-receipt:3114-positive".into(),
             source_id: "3114-positive".into(),
             evidence_digest: "a".repeat(64),
@@ -3475,8 +3476,7 @@ fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
             review_class: crate::daemon::pr_state::ReviewClass::Single,
             slot: crate::review_receipt::ReviewSlot::Primary,
             verdict: crate::review_receipt::ReviewVerdict::Verified,
-        },
-    );
+        });
     state.diagnostic_emitted_for_sha = Some(head);
     crate::daemon::pr_state::save(&home, &state).unwrap();
 
