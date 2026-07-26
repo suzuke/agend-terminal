@@ -114,7 +114,7 @@ jobs:
       # the binary strictly alongside the other agend-terminal targets.
       - name: Clippy (our targets, strict)
         timeout-minutes: 15
-        run: cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
+        run: cargo clippy -p agend-terminal --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
 
       - name: Build
         timeout-minutes: 20
