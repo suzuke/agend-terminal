@@ -717,6 +717,51 @@ fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
     }
 }
 
+/// Record the cleanup intent for a branch that survived a release, so the
+/// existing terminal-review reconcile sweep can settle it later. Recording is
+/// not a deletion decision: `cleanup_intents::reconcile_terminal_review_intents`
+/// independently re-verifies task terminality, holders and the head CAS.
+fn persist_cleanup_intent(
+    home: &Path,
+    sr_str: &str,
+    branch: &str,
+    task_id: &str,
+    out: &mut ReleaseOutcome,
+) {
+    let Some(tip) = crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
+        .ok()
+        .map(|s| s.trim().to_string())
+    else {
+        return;
+    };
+    let scm_slug = crate::git_helpers::git_cmd(Path::new(sr_str), &["remote", "get-url", "origin"])
+        .ok()
+        .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
+    // Derive PR number from task metadata for generation identity.
+    let pr_number = if !task_id.is_empty() {
+        crate::tasks::load_routed(home, task_id)
+            .ok()
+            .and_then(|rt| rt.task.metadata.get("pr_number").and_then(|v| v.as_u64()))
+    } else {
+        None
+    };
+    if let Err(e) = crate::cleanup_intents::persist_intent(
+        home,
+        sr_str,
+        branch,
+        &tip,
+        task_id,
+        scm_slug.as_deref(),
+        pr_number,
+    ) {
+        tracing::warn!(
+            %branch, error = %e,
+            "cleanup intent persistence failed — branch may leak"
+        );
+        out.intent_persist_error = Some(e);
+    }
+}
+
 fn resolve_branch_cleanup(
     home: &Path,
     binding: &serde_json::Value,
@@ -817,6 +862,16 @@ fn resolve_branch_cleanup(
                 lifecycle,
                 crate::worktree::disposition::BranchLifecycleDisposition::Delete
             ) {
+                // #3090: a LIVE task is a temporary blocker — this is managed
+                // review residue that becomes reapable the moment the task goes
+                // terminal, and the release attempt is the only automatic one,
+                // firing at the one moment the evidence cannot yet be terminal.
+                // Record the intent so the existing terminal-review reconcile
+                // sweep gets that second chance. Every other blocker still
+                // preserves with no intent, exactly as before.
+                if task_active == Some(true) && !dry_run {
+                    persist_cleanup_intent(home, sr_str, branch, task_id, out);
+                }
                 out.branch_cleanup_skipped_reason = Some(format!(
                     "authority-proven review branch '{branch}' lifecycle evidence is not terminal — preserved (fail-closed)"
                 ));
@@ -852,41 +907,7 @@ fn resolve_branch_cleanup(
         // intent so it can be settled on pr-merged event or periodic sweep.
         // Dirty branches get no intent (preserved permanently).
         if !deleted && !was_dirty && !dry_run {
-            if let Some(tip) =
-                crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            {
-                let scm_slug = crate::git_helpers::git_cmd(
-                    Path::new(sr_str),
-                    &["remote", "get-url", "origin"],
-                )
-                .ok()
-                .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
-                // Derive PR number from task metadata for generation identity.
-                let pr_number = if !task_id.is_empty() {
-                    crate::tasks::load_routed(home, task_id)
-                        .ok()
-                        .and_then(|rt| rt.task.metadata.get("pr_number").and_then(|v| v.as_u64()))
-                } else {
-                    None
-                };
-                if let Err(e) = crate::cleanup_intents::persist_intent(
-                    home,
-                    sr_str,
-                    branch,
-                    &tip,
-                    task_id,
-                    scm_slug.as_deref(),
-                    pr_number,
-                ) {
-                    tracing::warn!(
-                        %branch, error = %e,
-                        "cleanup intent persistence failed — branch may leak"
-                    );
-                    out.intent_persist_error = Some(e);
-                }
-            }
+            persist_cleanup_intent(home, sr_str, branch, task_id, out);
         }
     } else if branch.is_empty() {
         out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());

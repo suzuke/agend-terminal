@@ -5288,3 +5288,77 @@ fn disposable_review_terminal_task_with_subject_branch_deletes_review_branch() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// Seed a LIVE (non-terminal) task that owns `branch`, so
+/// `task_active_for_branch` resolves to `Some(true)`.
+fn seed_active_task_for_branch(home: &Path, task_id: &str, branch: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).ok();
+    let _ = crate::task_events::append(
+        &board,
+        &InstanceName::from("test"),
+        TaskEvent::Created {
+            task_id: TaskId(task_id.to_string()),
+            title: "live review".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            tags: Vec::new(),
+            owner: None,
+            depends_on: Vec::new(),
+            parent_id: None,
+            branch: Some(branch.to_string()),
+            due_at: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    );
+}
+
+/// RED #3090: a managed-review branch preserved ONLY because its task is still
+/// live records no cleanup intent, so `reconcile_terminal_review_intents` — the
+/// sweep that already exists to settle exactly this residue once the task goes
+/// terminal — never learns the branch exists. The release-time attempt is the
+/// only automatic one, and it fires at the one moment the evidence cannot be
+/// terminal, so the branch leaks forever.
+#[test]
+fn live_task_review_branch_records_retry_intent_3090() {
+    let home = tmp_home("3090-retry-home");
+    let repo = tmp_repo("3090-retry");
+    let branch = "review/retry-3090";
+    let tip = make_review_branch(&repo, branch);
+    seed_active_task_for_branch(&home, "T-3090", branch);
+
+    let mut binding = binding_with_lease(
+        branch,
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-uuid-3090"),
+        Some(&tip),
+    );
+    binding["task_id"] = serde_json::json!("T-3090");
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    // The live task still preserves the branch — that part is correct and stays.
+    assert!(
+        !out.branch_deleted,
+        "a live task must still preserve the branch at release time"
+    );
+    assert!(
+        branch_exists(&repo, branch),
+        "branch must survive while its task is live"
+    );
+    // …but the retry must be recorded, or the existing terminal sweep is blind.
+    assert!(
+        crate::cleanup_intents::has_intent(&home, &repo.display().to_string(), branch),
+        "a branch preserved only because its task is live must record a cleanup \
+         intent so the terminal reconcile sweep can settle it later: {:?}",
+        out.branch_cleanup_skipped_reason
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
