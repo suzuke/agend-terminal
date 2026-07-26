@@ -25,6 +25,7 @@
 - **`waiting_on` 逾時提醒不再重複發送或送錯地方** — 提醒會送到該 instance 在設定中的名稱（因此進得了 agent 的 inbox，也到得了團隊 orchestrator），而不是寫進一個沒有任何人讀取、以 id 命名的檔案；它會遵守 30 分鐘的重發間隔，而不是每 5 分鐘掃描就發一次；已不在 fleet 運行的 instance 所遺留的 metadata 則會被略過。
 - **`repo checkout` 把同一個 repository 當成同一個** — 指向 linked worktree 或子目錄的 `repository_path`，現在會解析到擁有它的 canonical repo root；同一個 repository 與分支不會再因為路徑寫法不同而占用兩個受管 worktree 或兩把 lease lock，跨 agent 的分支租約檢查也無法再靠換個寫法繞過（#3078）。
 - **`agend verify` 不再回報假的 `create_delete` 失敗** — 該 smoke 會先把動態測試 agent 寫進測試 fleet，直接呈現 API 自己的錯誤而不只看傳輸層失敗，並改用終結性的 delete 交易來斷言移除，而非設計上會保留 registry 項目的 `kill`（#3080）。
+- **`agend verify --json` 在有檢查失敗時以非零狀態結束** — JSON envelope 維持不變，但 `failed > 0` 的執行現在會留下失敗的 exit status，而不是以 0 結束；只看狀態碼的腳本或 CI 步驟，不會再把失敗的 smoke 當成通過（#3082）。
 
 ## [0.11.2] — 2026-07-23
 
