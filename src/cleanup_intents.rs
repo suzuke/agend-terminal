@@ -291,6 +291,53 @@ pub(crate) fn intent_repos(home: &Path) -> Vec<String> {
 }
 
 #[allow(dead_code)]
+/// Record the cleanup intent for a branch that survived a worktree release, so
+/// [`reconcile_terminal_review_intents`] can settle it later. Returns the error
+/// message when persistence fails, `None` on success (or when the branch tip is
+/// unreadable, which leaves nothing to record).
+///
+/// Recording is not a deletion decision: the reconcile sweep re-verifies task
+/// terminality, holders, checkout state and the head CAS on its own.
+pub(crate) fn persist_release_intent(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    task_id: &str,
+) -> Option<String> {
+    let tip = crate::git_helpers::git_cmd(Path::new(repo), &["rev-parse", branch])
+        .ok()
+        .map(|s| s.trim().to_string())?;
+    let scm_slug = crate::git_helpers::git_cmd(Path::new(repo), &["remote", "get-url", "origin"])
+        .ok()
+        .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
+    // Derive PR number from task metadata for generation identity.
+    let pr_number = if task_id.is_empty() {
+        None
+    } else {
+        crate::tasks::load_routed(home, task_id)
+            .ok()
+            .and_then(|rt| rt.task.metadata.get("pr_number").and_then(|v| v.as_u64()))
+    };
+    match persist_intent(
+        home,
+        repo,
+        branch,
+        &tip,
+        task_id,
+        scm_slug.as_deref(),
+        pr_number,
+    ) {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!(
+                %branch, error = %e,
+                "cleanup intent persistence failed — branch may leak"
+            );
+            Some(e)
+        }
+    }
+}
+
 pub(crate) fn has_intent(home: &Path, repo: &str, branch: &str) -> bool {
     let key = intent_key(repo, branch);
     intents_dir(home).join(format!("{key}.json")).exists()
