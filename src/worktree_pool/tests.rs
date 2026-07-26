@@ -5359,6 +5359,56 @@ fn live_task_review_branch_records_retry_intent_3090() {
         out.branch_cleanup_skipped_reason
     );
 
+    // Second half — the intent must be CONSUMABLE, not merely present. Drive
+    // the REAL existing path: task goes terminal, the reconcile sweep runs.
+    seed_task_done(&home, "T-3090");
+    let result = crate::cleanup_intents::reconcile_terminal_review_intents(&home, false);
+    assert!(
+        result.settled >= 1,
+        "a terminal task must let the recorded intent settle: {result:?}"
+    );
+    assert!(
+        !branch_exists(&repo, branch),
+        "the exact review branch must be deleted once its task is terminal: {result:?}"
+    );
+    // The recovery ref must protect the exact tip that was deleted. Scanned at
+    // `refs/agend/recovery/` — the common root of both namespaces, since the
+    // reconcile path and `branch_sweep::prepare_branch_recovery` nest differently.
+    let recovery_tips = crate::git_helpers::git_cmd(
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/agend/recovery/",
+        ],
+    )
+    .expect("list recovery refs");
+    assert!(
+        recovery_tips.lines().any(|line| line.trim() == tip),
+        "a recovery ref must protect the exact deleted tip {tip}, got: {recovery_tips:?}"
+    );
+
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Transition a seeded task to Done — the terminal state
+/// `reconcile_terminal_review_intents` requires. Cancelled is deliberately not
+/// used here: its semantics are unchanged by this fix.
+fn seed_task_done(home: &Path, task_id: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    let emitter = InstanceName::from("test");
+    let _ = crate::task_events::append(
+        &board,
+        &emitter,
+        TaskEvent::Done {
+            task_id: TaskId(task_id.to_string()),
+            by: emitter.clone(),
+            source: crate::task_events::DoneSource::ReportAutoClose {
+                report_summary: "review complete".into(),
+                closed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        },
+    );
 }
