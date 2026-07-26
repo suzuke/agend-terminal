@@ -14,8 +14,9 @@
 $EDITOR Cargo.toml          # version = "X.Y.Z"
 cargo update -w             # refresh Cargo.lock for the new version
 
-# 2. changelog
-$EDITOR CHANGELOG.md        # move [Unreleased] items into a new "## [X.Y.Z] — YYYY-MM-DD"
+# 2. changelog — 兩份都要改；gate 只 grep 英文版，zh-TW 那份得自己顧
+$EDITOR CHANGELOG.md CHANGELOG.zh-TW.md
+                            # move [Unreleased] items into a new "## [X.Y.Z] — YYYY-MM-DD"
                             # section AND add the compare link at the bottom:
                             #   [X.Y.Z]: .../compare/vPREV...vX.Y.Z
                             #   point [Unreleased] at vX.Y.Z...HEAD
