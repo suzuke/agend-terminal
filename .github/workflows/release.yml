@@ -35,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version=1 | jq -er '.packages[] | select(.name == "agend-terminal") | .version')"
           if [ "$TAG" != "$CARGO_VERSION" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION} — bump Cargo.toml (and Cargo.lock via 'cargo update -w') before tagging"
             exit 1
