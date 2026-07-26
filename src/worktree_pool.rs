@@ -5,6 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+mod legacy_release;
+use legacy_release::{
+    legacy_flat_target_path, registered_detached_target, require_clean_legacy_target,
+};
+
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,
     pub audit_reason: &'a str,
@@ -1762,57 +1767,6 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
         sender,
         permit,
     )
-}
-
-/// Absent-binding arm of the S2 force transaction.  The branch lease is held
-/// by the caller; A/B are acquired here and the binding is re-read as truly
-/// absent before the managed target is removed.
-fn legacy_flat_target_path(home: &Path, target: &Path, agent: &str) -> bool {
-    let Ok(root) = daemon_managed_worktree_root(home).canonicalize() else {
-        return false;
-    };
-    target.parent() == Some(root.as_path())
-        && target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&format!("{agent}-")))
-}
-
-fn registered_detached_target(source_repo: &Path, target: &Path) -> bool {
-    let Ok(target) = target.canonicalize() else {
-        return false;
-    };
-    let Ok(entries) = crate::git_worktree::list_porcelain_exact(source_repo) else {
-        return false;
-    };
-    entries.into_iter().any(|(path, branch)| {
-        branch.is_none() && path.canonicalize().ok().as_ref() == Some(&target)
-    })
-}
-
-fn require_clean_legacy_target(target: &Path) -> Result<(), String> {
-    let status = crate::git_helpers::git_cmd(
-        target,
-        &[
-            "--no-optional-locks",
-            "status",
-            "--porcelain",
-            "--ignore-submodules=none",
-        ],
-    )
-    .map_err(|e| {
-        format!("legacy target cleanliness is unverifiable: {e} — refusing (state preserved)")
-    })?;
-    if status
-        .lines()
-        .any(|line| line.get(3..).map(str::trim) != Some(crate::worktree_pool::MANAGED_MARKER))
-    {
-        return Err(
-            "legacy target is dirty beyond its managed marker — refusing (state preserved)"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
