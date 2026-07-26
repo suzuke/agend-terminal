@@ -17,12 +17,19 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// Resolve `source` to `(source_path, source_canonical)` — the resolved
-/// pre-canonical string (used by the caller as the git cwd + echoed in the
-/// `source` response field) and the canonicalized validated `PathBuf` — or return
-/// a ready-to-emit error `Value`. Behaviour-preserving for the two legitimate arms
-/// (absolute/`~`, known agent name) + the canonicalize / system-dir guards; the
-/// ONLY new behaviour is the fail-closed reject of a non-absolute agent-name miss.
+/// Resolve `source` to `(source_path, source_canonical)` — the path the caller
+/// uses as the git cwd (also echoed in the `source` response field) and the
+/// canonicalized validated `PathBuf` — or return a ready-to-emit error `Value`.
+/// Behaviour-preserving for the two legitimate arms (absolute/`~`, known agent
+/// name) + the canonicalize / system-dir guards; the fail-closed reject of a
+/// non-absolute agent-name miss (#2158) is unchanged.
+///
+/// `d-20260726055029475978-81`: when the resolved path names a working tree, both
+/// halves are normalized to the OWNING canonical repository root, so a linked
+/// worktree of R and a subdirectory of R name R exactly as R itself does. This is
+/// the sole source admission point of `handle_checkout_repo`, so the normalized
+/// root is what every downstream identity keys on (target mangling, git cwd,
+/// lease key, marker/binding, journal, rollback, reuse).
 pub(super) fn resolve_checkout_source_path(
     home: &Path,
     source: &str,
@@ -69,7 +76,49 @@ pub(super) fn resolve_checkout_source_path(
     {
         return Err(json!({"error": "source path rejected: system directory"}));
     }
-    Ok((source_path, source_canonical))
+    // Git repository identity, not filesystem identity: `canonicalize` resolves
+    // symlinks but keeps a linked worktree as itself, so the same (repo, branch)
+    // would split across spellings of the path. A path that is not a working tree
+    // is left exactly as before — this normalizes, it rejects nothing new.
+    match canonical_repo_root(&source_canonical) {
+        Some(root) => Ok((root.display().to_string(), root)),
+        None => Ok((source_path, source_canonical)),
+    }
+}
+
+/// The canonical root of the repository that OWNS `path` — R for R itself, for a
+/// subdirectory of R, and for a linked worktree of R. `None` when `path` is not a
+/// non-bare working tree, so the caller keeps the plain filesystem path.
+fn canonical_repo_root(path: &Path) -> Option<PathBuf> {
+    let common_dir = repo_common_dir(path)?;
+    // `<repo>/.git` ⇒ the owning repo root. A `--separate-git-dir` common dir has
+    // an unrelated parent, so only normalize when the derived root verifiably owns
+    // the SAME repository (fail-safe: otherwise leave the path untouched).
+    let root = common_dir.parent()?;
+    (repo_common_dir(root)? == common_dir).then(|| root.to_path_buf())
+}
+
+/// Canonical `--git-common-dir` of the non-bare working tree at `path`. Git's own
+/// resolution is the authority (never lexical gitlink arithmetic — cf. the
+/// canonical-identity rule in `ci/release.rs`); `--path-format=absolute` makes the
+/// answer directly canonicalizable however the gitlink is spelled.
+fn repo_common_dir(path: &Path) -> Option<PathBuf> {
+    let out = crate::git_helpers::git_cmd(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--is-bare-repository",
+        ],
+    )
+    .ok()?;
+    match out.lines().map(str::trim).collect::<Vec<_>>().as_slice() {
+        // A bare repo has no working tree to admit, and its parent directory is
+        // not a repo root — leave it to the existing downstream guards.
+        [common_dir, "false"] => std::fs::canonicalize(common_dir).ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

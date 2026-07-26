@@ -1294,6 +1294,11 @@ fn redact_paths_strips_absolute_paths_only() {
 /// The `(instance, source)` → worktree-dir mangling `handle_checkout_repo` uses.
 #[cfg(unix)] // Used only by the Unix-only real-checkout tests below.
 fn mangled_for(instance: &str, source: &Path) -> String {
+    // d-20260726055029475978-81: the handler mangles the RESOLVED source — the
+    // canonical repo root — so this mirror must canonicalize too.
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     format!(
         "{}-{}",
         instance,

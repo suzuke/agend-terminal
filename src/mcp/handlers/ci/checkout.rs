@@ -63,18 +63,18 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             return e;
         }
     }
-    // Windows-safe path mangling collapses separators and drive-letter colons.
-    let worktree_dir = home.join("worktrees").join(format!(
-        "{}-{}",
-        instance_name,
-        source.replace(['/', '\\', ':'], "_").replace('~', "")
-    ));
     // #2158: source resolution is fail-closed and isolated in `source_resolve`.
     let (source_path, source_canonical) =
         match super::source_resolve::resolve_checkout_source_path(home, source) {
             Ok(pair) => pair,
             Err(e) => return e,
         };
+    // Windows-safe mangling (separators + drive colons) of the RESOLVED canonical root.
+    let worktree_dir = home.join("worktrees").join(format!(
+        "{}-{}",
+        instance_name,
+        source_path.replace(['/', '\\', ':'], "_").replace('~', "")
+    ));
     if let Some(e) = validate_expected_head(args, &source_path, branch) {
         return e;
     }

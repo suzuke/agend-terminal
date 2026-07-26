@@ -166,6 +166,12 @@ fn configure_local_github_origin(repo: &Path, parent: &Path) {
 
 #[cfg(unix)]
 fn derived_worktree(home: &Path, instance: &str, source: &Path) -> std::path::PathBuf {
+    // d-20260726055029475978-81: the handler mangles the RESOLVED source — the
+    // canonical repo root — so this mirror must canonicalize too (these are
+    // negative existence assertions; a stale derivation would pass vacuously).
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     home.join("worktrees").join(format!(
         "{instance}-{}",
         source

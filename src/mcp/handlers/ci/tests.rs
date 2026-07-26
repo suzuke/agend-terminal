@@ -2027,6 +2027,11 @@ fn p780_setup_source_broken_origin(parent: &Path) -> std::path::PathBuf {
 
 #[cfg(unix)]
 fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::PathBuf {
+    // d-20260726055029475978-81: the handler mangles the RESOLVED source — the
+    // canonical repo root — so this mirror must canonicalize too.
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
     home.join("worktrees").join(format!(
         "{}-{}",
         agent,
