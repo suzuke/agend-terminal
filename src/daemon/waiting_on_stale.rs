@@ -45,13 +45,13 @@ impl Default for WaitingOnStaleTracker {
 }
 
 impl WaitingOnStaleTracker {
-    pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
+    pub(crate) fn maybe_scan(&mut self, home: &Path, live: &HashMap<String, String>) -> bool {
         if !self.gate.fire() {
             return false;
         }
         let seeding = !self.seeded;
         self.seeded = true;
-        scan_and_emit(home, &mut self.last_alerted_at, seeding);
+        scan_and_emit(home, &mut self.last_alerted_at, seeding, live);
         true
     }
 
@@ -61,8 +61,9 @@ impl WaitingOnStaleTracker {
     /// went stale, and a same-name redeploy inherits a stale dedup timestamp
     /// that can false-suppress a real alert. Driven each tick from
     /// `WaitingOnStaleHandler::run`.
-    pub(crate) fn retain_active(&mut self, active: &std::collections::HashSet<String>) {
-        self.last_alerted_at.retain(|name, _| active.contains(name));
+    pub(crate) fn retain_active(&mut self, active: &HashMap<String, String>) {
+        self.last_alerted_at
+            .retain(|stem, _| active.contains_key(stem));
     }
 }
 
@@ -72,6 +73,7 @@ pub(crate) fn scan_and_emit(
     home: &Path,
     last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
     seeding: bool,
+    live: &HashMap<String, String>,
 ) {
     let now = chrono::Utc::now();
     let meta_dir = home.join("metadata");
@@ -84,6 +86,19 @@ pub(crate) fn scan_and_emit(
             continue;
         }
         let Some(agent) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Deliver by NAME, not by stem. `inbox::notify_system` →
+        // `inbox_path_resolved` → `fleet::resolve_uuid(home, name)` maps a
+        // configured instance onto its `inbox/<uuid>.jsonl`, so a raw id stem
+        // can land in the right FILE by coincidence — but it is not the
+        // canonical recipient: `teams::find_team_for` matches membership by
+        // name, so the orchestrator copy is lost, and the alert text and
+        // correlation carry a UUID instead of the agent's name. A stem absent
+        // from the map has no live instance behind it, so there is no
+        // recipient at all — skip it. The metadata file is left alone;
+        // reaping it is not this handler's concern.
+        let Some(recipient) = live.get(agent) else {
             continue;
         };
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -123,7 +138,7 @@ pub(crate) fn scan_and_emit(
             crate::daemon::event_bus::global().emit(
                 home,
                 crate::daemon::event_bus::EventKind::WaitingOnStale {
-                    agent: agent.to_string(),
+                    agent: recipient.clone(),
                     condition: condition.to_string(),
                     elapsed_min,
                 },
@@ -218,6 +233,16 @@ mod tests {
         std::env::temp_dir().join(format!("agend-test-waiting-stale-{tag}-{id}"))
     }
 
+    /// The stem -> name map a direct `scan_and_emit` call runs under. These
+    /// unit tests drive the scan below the handler, so they state the map the
+    /// handler would have built for them.
+    fn live_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(stem, name)| ((*stem).to_string(), (*name).to_string()))
+            .collect()
+    }
+
     fn write_metadata(home: &Path, agent: &str, waiting_on: &str, since: &str) {
         let dir = home.join("metadata");
         std::fs::create_dir_all(&dir).unwrap();
@@ -240,7 +265,12 @@ mod tests {
         std::fs::create_dir_all(home.join("inbox")).unwrap();
 
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            false,
+            &live_map(&[("dev-1", "dev-1")]),
+        );
 
         assert!(last_alerted.contains_key("dev-1"));
         let inbox_file = home.join("inbox").join("dev-1.jsonl");
@@ -265,7 +295,12 @@ mod tests {
 
         let mut last_alerted = HashMap::new();
         // seeding scan: record the existing stale waiter, but do NOT emit.
-        scan_and_emit(&home, &mut last_alerted, true);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            true,
+            &live_map(&[("dev-bs", "dev-bs")]),
+        );
         assert!(
             last_alerted.contains_key("dev-bs"),
             "boot-seed must record the existing stale waiter in the dedup"
@@ -276,7 +311,12 @@ mod tests {
              removing the `if !seeding` gate makes this fire)"
         );
         // next normal scan: the seeded waiter stays suppressed (no boot-burst).
-        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            false,
+            &live_map(&[("dev-bs", "dev-bs")]),
+        );
         assert!(
             !home.join("inbox").join("dev-bs.jsonl").exists(),
             "seeded waiter must remain suppressed on the next scan within REALERT"
@@ -291,7 +331,12 @@ mod tests {
         write_metadata(&home, "dev-2", "CI result", &since);
 
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            false,
+            &live_map(&[("dev-2", "dev-2")]),
+        );
 
         assert!(!last_alerted.contains_key("dev-2"));
         let _ = std::fs::remove_dir_all(&home);
@@ -305,7 +350,12 @@ mod tests {
         std::fs::create_dir_all(home.join("inbox")).unwrap();
 
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            false,
+            &live_map(&[("dev-3", "dev-3")]),
+        );
         assert!(last_alerted.contains_key("dev-3"));
 
         let count_lines = || {
@@ -316,7 +366,12 @@ mod tests {
         };
         let first_count = count_lines();
 
-        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            false,
+            &live_map(&[("dev-3", "dev-3")]),
+        );
         assert_eq!(
             count_lines(),
             first_count,
@@ -331,10 +386,10 @@ mod tests {
         let home = tmp_home("throttle");
         let mut tracker = WaitingOnStaleTracker::default();
         for _ in 0..29 {
-            assert!(!tracker.maybe_scan(&home));
+            assert!(!tracker.maybe_scan(&home, &live_map(&[])));
         }
-        assert!(tracker.maybe_scan(&home));
-        assert!(!tracker.maybe_scan(&home));
+        assert!(tracker.maybe_scan(&home, &live_map(&[])));
+        assert!(!tracker.maybe_scan(&home, &live_map(&[])));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -397,7 +452,12 @@ mod tests {
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-gateoff", "blocker", &since);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(
+            &home,
+            &mut last_alerted,
+            false,
+            &live_map(&[("dev-gateoff", "dev-gateoff")]),
+        );
         assert!(
             !drained_payloads(&home, "dev-gateoff").is_empty(),
             "#event-bus Option A: gate-off must deliver via the legacy path (no regression)"
@@ -405,23 +465,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ── Ghost-metadata re-alert loop (RED) ──────────────────────────────
+    // ── Stem key-space: re-alert loop + delivery routing ────────────────
     //
-    // `scan_and_emit` keys its REALERT dedup on the metadata FILE STEM
-    // (`path.file_stem()` above). Since Sprint 46 P2 those stems are
-    // `InstanceId`s — `agent_ops::metadata_path_resolved` writes
-    // `metadata/<id>.json` for every instance carrying an id in fleet.yaml.
-    // But `WaitingOnStaleHandler::run` prunes that same map on EVERY tick via
-    // `retain_active(&live_agent_names(registry))`, and `live_agent_names`
-    // yields `AgentHandle.name`. Ids never equal names, so the entry inserted
-    // at the end of a scan is dropped one tick later and
-    // `REALERT_INTERVAL_SECS` is structurally unreachable — for a live agent
-    // as much as for an abandoned one. Observed in production as six
-    // 72–76-day-old metadata files re-alerting every ~5m.
+    // Dedup is keyed by metadata FILE STEM, which is an `InstanceId` once an
+    // instance carries an id in fleet.yaml. Pruning that key space against
+    // names alone dropped every id-stemmed entry one tick after a scan wrote
+    // it, so `REALERT_INTERVAL_SECS` was unreachable and the waiter re-alerted
+    // every cadence (six 72–76-day-old files did exactly that in production).
     //
     // These drive the REAL per-tick handler, not `scan_and_emit` directly, so
-    // the prune sits in the loop exactly as it does in the daemon. No sleeps:
-    // the cadence is a tick counter, not wall clock.
+    // the prune sits in the loop as it does in the daemon. No sleeps: the
+    // cadence is a tick counter, not wall clock.
 
     use crate::agent::{AgentRegistry, ExternalRegistry};
     use crate::daemon::per_tick::supervisor_trackers::WaitingOnStaleHandler;
@@ -438,12 +492,14 @@ mod tests {
         (chrono::Utc::now() - chrono::Duration::minutes(mins)).to_rfc3339()
     }
 
-    /// Delivered alerts, counted from the recipient's inbox — the same
-    /// observable the older tests in this module use.
-    fn alert_rows(home: &Path, stem: &str) -> usize {
-        std::fs::read_to_string(home.join("inbox").join(format!("{stem}.jsonl")))
-            .map(|s| s.lines().filter(|l| l.contains("waiting_on_stale")).count())
-            .unwrap_or(0)
+    /// Alerts actually delivered to `recipient`, read through the production
+    /// drain path so the name→id inbox resolution is the real one rather than
+    /// a re-implementation. Drains, so call once per recipient per assertion.
+    fn alert_rows(home: &Path, recipient: &str) -> usize {
+        crate::inbox::drain(home, recipient)
+            .into_iter()
+            .filter(|m| m.kind.as_deref() == Some("waiting_on_stale"))
+            .count()
     }
 
     /// Drive `cadences` whole scan cadences through the real handler, with the
@@ -452,6 +508,21 @@ mod tests {
         for _ in 0..(cadences * TICKS_PER_SCAN as usize) {
             handler.run(ctx);
         }
+    }
+
+    /// Minimal fleet.yaml. A configured `id` is what makes an instance's
+    /// metadata stem id-shaped (`agent_ops::metadata_path_resolved`); without
+    /// one the stem is the name. `teams` is appended verbatim.
+    fn write_fleet(home: &Path, instances: &[(&str, &str)], teams: &str) {
+        let mut y = String::new();
+        if !instances.is_empty() {
+            y.push_str("instances:\n");
+            for (name, id) in instances {
+                y.push_str(&format!("  {name}:\n    id: {id}\n"));
+            }
+        }
+        y.push_str(teams);
+        std::fs::write(home.join("fleet.yaml"), y).unwrap();
     }
 
     /// One live agent. Returns its `InstanceId`, which is ALSO its metadata
@@ -499,17 +570,33 @@ mod tests {
         );
     }
 
-    /// RED + over-fix lock: a LIVE agent whose metadata stem is its
-    /// `InstanceId` (the production shape) must alert exactly once and then be
-    /// suppressed. Today it re-alerts like any other stem. Note this also
-    /// fails at 0 if a fix filters stems by live agent NAMES — the live
-    /// agent's own alerts would be silenced, which is not the contract.
+    /// A LIVE agent whose metadata stem is its `InstanceId` (the production
+    /// shape) must alert exactly once, be suppressed for the rest of
+    /// `REALERT_INTERVAL_SECS`, and be delivered by NAME.
+    ///
+    /// The recipient half is the point. A configured instance's inbox IS
+    /// `inbox/<uuid>.jsonl` (`inbox_path_resolved` →
+    /// `fleet::resolve_uuid(home, name)`), so emitting the raw stem is not
+    /// caught by the agent's own row count — it is caught by the ORCHESTRATOR
+    /// row, because `teams::find_team_for` matches membership by name and a
+    /// UUID matches no team. Hence the assertion covers both recipients. It is
+    /// also the over-fix lock: filtering stems by live agent NAMES alone
+    /// silences the live agent entirely and both counts read 0.
     #[test]
-    fn live_agent_id_stem_alerts_once_then_stays_suppressed() {
+    fn live_agent_id_stem_alerts_once_to_the_agent_and_orchestrator() {
         let home = tmp_home("live-id-stem");
         std::fs::create_dir_all(home.join("inbox")).unwrap();
 
         let (registry, id) = registry_with_live();
+        // Configured id ⇒ id-shaped stem; team wiring so the orchestrator copy
+        // travels the real subscriber path (`teams::find_team_for`).
+        write_fleet(
+            &home,
+            &[(LIVE_NAME, &id.full())],
+            &format!(
+                "teams:\n  ops:\n    members: [{LIVE_NAME}, lead-x]\n    orchestrator: lead-x\n"
+            ),
+        );
         let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
         let configs = Arc::new(Mutex::new(HashMap::new()));
         let ctx = TickContext {
@@ -528,14 +615,14 @@ mod tests {
         // Cadence 2 alerts; cadence 3 must be suppressed by REALERT.
         run_cadences(&handler, &ctx, 2);
 
-        let rows = alert_rows(&home, &live_stem);
+        let observed = (alert_rows(&home, LIVE_NAME), alert_rows(&home, "lead-x"));
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(
-            rows, 1,
-            "a live agent's id-stemmed metadata must alert once then stay \
-             suppressed for REALERT_INTERVAL_SECS (observed: {rows} — 2 means \
-             the prune is dropping live dedup entries too; 0 would mean a fix \
-             wrongly silenced a live agent by filtering on names)"
+            observed,
+            (1, 1),
+            "id-stemmed metadata must reach the agent and its team orchestrator \
+             exactly once — emitting the raw stem instead of the name would \
+             reach neither; observed (agent, orchestrator) = {observed:?}"
         );
     }
 
@@ -549,6 +636,7 @@ mod tests {
 
         let (registry, id) = registry_with_live();
         let live_stem = id.full();
+        write_fleet(&home, &[(LIVE_NAME, &live_stem)], "");
         write_metadata(&home, GHOST_STEM, "operator direction", &stale_since(20));
         write_metadata(&home, &live_stem, "review from reviewer", &stale_since(20));
 
@@ -571,6 +659,170 @@ mod tests {
             (0, 0),
             "#1739 boot seed must record pre-existing stale waiters without \
              emitting, for both an abandoned and a live stem"
+        );
+    }
+
+    /// Control (passes before and after the id-key correction): an instance
+    /// with no id in fleet.yaml keeps a NAME-stemmed metadata file
+    /// (`metadata_path_resolved`'s legacy fallback), and its dedup entry must
+    /// survive the prune too. Retaining only the registry's `InstanceId` keys
+    /// would start re-alerting these every scan — this pins that both stem
+    /// shapes stay retained.
+    #[test]
+    fn legacy_name_stem_alerts_once_then_stays_suppressed() {
+        let home = tmp_home("legacy-name-stem");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+
+        let (registry, _id) = registry_with_live();
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        let handler = WaitingOnStaleHandler::new();
+
+        run_cadences(&handler, &ctx, 1);
+        write_metadata(&home, LIVE_NAME, "review from reviewer", &stale_since(20));
+        run_cadences(&handler, &ctx, 2);
+
+        let rows = alert_rows(&home, LIVE_NAME);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            rows, 1,
+            "a live agent's legacy name-stemmed metadata must alert once then \
+             stay suppressed (observed: {rows})"
+        );
+    }
+
+    /// A hyphenated UUID is a legal instance name, so agent A may be NAMED
+    /// exactly agent B's `InstanceId`. The snapshot inserts name aliases first
+    /// and id entries second, so B's own `metadata/<B_id>.json` deterministically
+    /// reaches B and team-B, never A.
+    #[test]
+    fn id_stem_colliding_with_another_agents_name_routes_to_the_id_owner() {
+        let home = tmp_home("stem-collision");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+
+        let id_b = crate::types::InstanceId::new();
+        let colliding_name = id_b.full(); // agent A is NAMED B's InstanceId
+        let id_a = crate::types::InstanceId::new();
+
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut reg = crate::agent::lock_registry(&registry);
+            reg.insert(id_a, crate::agent::mk_test_handle(&colliding_name, id_a));
+            reg.insert(id_b, crate::agent::mk_test_handle("dev-b", id_b));
+        }
+        // Both configured, so both stems are id-shaped; distinct teams so a
+        // misroute shows up in the escalation too.
+        write_fleet(
+            &home,
+            &[(&colliding_name, &id_a.full()), ("dev-b", &id_b.full())],
+            &format!(
+                "teams:\n  team-a:\n    members: [{colliding_name}, lead-a]\n    \
+                 orchestrator: lead-a\n  team-b:\n    members: [dev-b, lead-b]\n    \
+                 orchestrator: lead-b\n"
+            ),
+        );
+
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        let handler = WaitingOnStaleHandler::new();
+
+        run_cadences(&handler, &ctx, 1);
+        write_metadata(
+            &home,
+            &colliding_name,
+            "review from reviewer",
+            &stale_since(20),
+        );
+        run_cadences(&handler, &ctx, 2);
+
+        let observed = (
+            alert_rows(&home, "dev-b"),
+            alert_rows(&home, "lead-b"),
+            alert_rows(&home, &colliding_name),
+            alert_rows(&home, "lead-a"),
+        );
+        // `colliding_name` is A's NAME, so the drain above resolves A's own
+        // inbox, not B's id file.
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            observed,
+            (1, 1, 0, 0),
+            "an id-shaped stem must reach its id owner B and team-B exactly \
+             once, never the agent merely NAMED that UUID; observed \
+             (b, lead_b, a, lead_a) = {observed:?}"
+        );
+    }
+
+    /// The absent-owner half of the same collision: B has LEFT the registry but
+    /// its `metadata/<B_id>.json` remains, while live A is NAMED `B_UUID`. The
+    /// orphan must be skipped, never revived as A's alert — resolving each live
+    /// agent's single authoritative stem is what makes that fail closed, since
+    /// A's own stem is its configured id, not its name.
+    #[test]
+    fn orphaned_id_stem_never_falls_back_to_a_live_agent_named_that_uuid() {
+        let home = tmp_home("orphan-no-fallback");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+
+        let departed_b = crate::types::InstanceId::new(); // B: no registry entry
+        let colliding_name = departed_b.full(); // A is NAMED B's id
+        let id_a = crate::types::InstanceId::new();
+
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        crate::agent::lock_registry(&registry)
+            .insert(id_a, crate::agent::mk_test_handle(&colliding_name, id_a));
+        write_fleet(
+            &home,
+            &[(&colliding_name, &id_a.full())],
+            &format!(
+                "teams:\n  team-a:\n    members: [{colliding_name}, lead-a]\n    \
+                 orchestrator: lead-a\n"
+            ),
+        );
+
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        let handler = WaitingOnStaleHandler::new();
+
+        // Boot/seed BEFORE the orphan exists, so a later delivery cannot be
+        // excused as restart backlog.
+        run_cadences(&handler, &ctx, 1);
+        write_metadata(
+            &home,
+            &colliding_name,
+            "review from reviewer",
+            &stale_since(20),
+        );
+        run_cadences(&handler, &ctx, 2);
+
+        let observed = (
+            alert_rows(&home, &colliding_name),
+            alert_rows(&home, "lead-a"),
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            observed,
+            (0, 0),
+            "a departed instance's orphaned id-stemmed metadata must be skipped, \
+             not delivered to the live agent that merely happens to be NAMED \
+             that UUID; observed (agent_a, lead_a) = {observed:?}"
         );
     }
 }

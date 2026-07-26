@@ -22,6 +22,7 @@
 
 - **`agentic-git` 受控 git 的正確性** — 指向其他 repository 的 `sparse-checkout`／`config` 寫入會被路由到它所指名的 repository，而不是直接拒絕；`snapshots restore --yes` 在多個 snapshot 共用同一秒時，也會取到真正最新的那個（#2950、#3069、#3070）。
 - **Shift+Tab 會送進 pane** — TUI 現在會把 `BackTab` 轉發給 pane PTY，不再吞掉（#2933）。
+- **`waiting_on` 逾時提醒不再重複發送或送錯地方** — 提醒會送到該 instance 在設定中的名稱（因此進得了 agent 的 inbox，也到得了團隊 orchestrator），而不是寫進一個沒有任何人讀取、以 id 命名的檔案；它會遵守 30 分鐘的重發間隔，而不是每 5 分鐘掃描就發一次；已不在 fleet 運行的 instance 所遺留的 metadata 則會被略過。
 
 ## [0.11.2] — 2026-07-23
 

@@ -176,13 +176,41 @@ impl PerTickHandler for WaitingOnStaleHandler {
         "waiting_on_stale"
     }
     fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
+        // A metadata stem is the instance's CONFIGURED `InstanceId` when
+        // fleet.yaml carries one, else its name — `metadata_path_resolved`
+        // (Sprint 46 P2). Delivery keys on the NAME (`inbox_path_resolved`,
+        // `teams::find_team_for`). So resolve each live agent's ONE
+        // authoritative stem by the writer's own rule: a stem then belongs to
+        // exactly one instance, and an id-shaped stem left behind by a
+        // departed instance can never fall back onto a live agent that merely
+        // happens to be NAMED that UUID (a hyphenated UUID is a legal name).
+        // fleet.yaml is read before the registry lock is taken; `load_arc` is
+        // mtime+size cached, so the per-tick cost is a cache hit.
+        let cfg =
+            crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
+        let live: std::collections::HashMap<String, String> =
+            crate::agent::lock_registry(ctx.registry)
+                .values()
+                .map(|handle| {
+                    let name = handle.name.to_string();
+                    let stem = cfg
+                        .as_ref()
+                        .and_then(|c| c.instances.get(&name))
+                        .and_then(|i| i.id.as_deref())
+                        .and_then(crate::types::InstanceId::parse)
+                        .map(|id| id.full())
+                        .unwrap_or_else(|| name.clone());
+                    (stem, name)
+                })
+                .collect();
+        self.tracker.lock().maybe_scan(ctx.home, &live);
         // CR-2026-06-14: prune the dedup map to live agents each tick (mirrors
         // ConflictNotifyHandler's #1923 G5 cleanup below) so `last_alerted_at`
         // doesn't leak one permanent entry per ever-stale agent, and a same-name
         // redeploy can't inherit a stale dedup timestamp that false-suppresses a
-        // real alert.
-        let live = crate::agent::live_agent_names(ctx.registry);
+        // real alert. Same map as the scan: pruning against a NARROWER key
+        // space than the scan is what let an entry be dropped one tick after
+        // the scan wrote it, making `REALERT_INTERVAL_SECS` unreachable.
         self.tracker.lock().retain_active(&live);
     }
 }
