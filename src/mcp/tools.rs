@@ -48,7 +48,7 @@ pub(crate) fn def_send() -> Value {
             "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
             "team": {"type": "string", "description": "Team name (broadcast to team)"},
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
-            "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query). Required unless message_from_file is provided."},
+            "message": {"type": "string", "description": "Canonical message text routed to the corresponding task, report, or query handler. Required unless message_from_file is provided."},
             "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
             "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
             "report_purpose": {"type": "string", "enum": ["task_result", "analysis_decision", "source_spike", "rca", "code_review"], "description": "Typed purpose for request_kind=report. New report callers should always set it. Missing legacy values remain ordinary LegacyUntyped reports with zero code-review authority."},

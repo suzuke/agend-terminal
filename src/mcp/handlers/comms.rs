@@ -62,10 +62,8 @@ pub(super) fn handle_unified_send(
     }
 
     fn lift_message(args: &mut Value, dst: &str) {
-        if args.get(dst).is_none() {
-            if let Some(msg) = args.get("message").cloned() {
-                args[dst] = msg;
-            }
+        if let Some(msg) = args.get("message").cloned() {
+            args[dst] = msg;
         }
     }
     match args["request_kind"].as_str().unwrap_or("") {
