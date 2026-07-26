@@ -5,6 +5,7 @@ members = [
     "vendor/agentic-git/crates/agentic-git-core",
     "vendor/agentic-git/crates/agentic-git",
 ]
+default-members = ["."]
 
 [workspace.package]
 version = "0.2.1"
