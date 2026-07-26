@@ -4825,6 +4825,172 @@ fn send_message_from_file_delivers_content() {
 }
 
 #[test]
+fn unified_send_message_wins_over_routed_fields_3079() {
+    let _g = fleet_test_guard();
+    let cases = [
+        (
+            "task",
+            "task",
+            "canonical task",
+            "canonical task",
+            "stale task",
+            "task",
+            "t-3079-task",
+        ),
+        (
+            "query",
+            "query",
+            "canonical query",
+            "canonical query",
+            "stale question",
+            "question",
+            "",
+        ),
+        (
+            "report",
+            "report",
+            "canonical report",
+            "canonical report",
+            "stale summary",
+            "summary",
+            "",
+        ),
+        (
+            "report-file",
+            "report",
+            "inline message loses",
+            "canonical report from file",
+            "stale summary",
+            "summary",
+            "",
+        ),
+    ];
+
+    for (label, kind, message, expected, stale, routed_field, task_id) in cases {
+        let home = tmp_home(&format!("send-canonical-{kind}"));
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  sender-agent:\n    backend: claude\n  target-agent:\n    backend: claude\n",
+        )
+        .unwrap();
+        let sender = crate::identity::Sender::new("sender-agent").unwrap();
+        let mut args = json!({
+            "instance": "target-agent",
+            "message": message,
+            "request_kind": kind,
+        });
+        args[routed_field] = json!(stale);
+        if !task_id.is_empty() {
+            args["task_id"] = json!(task_id);
+        }
+        if label == "report-file" {
+            let file_path = home.join("canonical-report.txt");
+            std::fs::write(&file_path, expected).unwrap();
+            args["message_from_file"] = json!(file_path);
+        }
+
+        let result = super::comms::handle_unified_send(
+            &home,
+            &args,
+            &Some(sender),
+            Some(&minimal_test_runtime()),
+        );
+        assert!(is_ok_result(&result), "{label} send failed: {result}");
+        let messages = crate::inbox::drain(&home, "target-agent");
+        assert_eq!(messages.len(), 1, "{label} must deliver one message");
+        assert!(
+            messages[0].text.contains(expected),
+            "{label} must deliver canonical message body: {:?}",
+            messages[0].text
+        );
+        assert!(
+            !messages[0].text.contains(stale),
+            "{label} must not deliver stale routed field: {:?}",
+            messages[0].text
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[test]
+fn unified_send_typed_code_review_scans_canonical_message_3079() {
+    let _g = fleet_test_guard();
+    const HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let home = tmp_home("send-canonical-code-review");
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  sender-agent:\n    backend: claude\n    id: {}\n  target-agent:\n    backend: claude\n    id: {}\nteams:\n  archfix:\n    members: [sender-agent, target-agent]\n    orchestrator: target-agent\n",
+            reviewer_id.full(),
+            lead_id.full(),
+        ),
+    )
+    .unwrap();
+    crate::daemon::pr_state::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/typed",
+        HEAD,
+        crate::daemon::pr_state::CiConclusion::Green,
+        vec!["target-agent".into()],
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
+    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/typed", |state| {
+        state.pr_number = 3079;
+    })
+    .unwrap();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/typed",
+        "sender-agent",
+        reviewer_id,
+        3079,
+        HEAD,
+        crate::review_receipt::ReviewSlot::Primary,
+        "target-agent",
+        "t-3079-review",
+        crate::daemon::pr_state::ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review exact head",
+        None,
+        None,
+        "2026-07-26T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+
+    let sender = crate::identity::Sender::new("sender-agent").unwrap();
+    let result = super::comms::handle_unified_send(
+        &home,
+        &json!({
+            "instance": "target-agent",
+            "message": "VERIFIED — canonical review\n\n### Evidence\nran: cargo test → passed",
+            "summary": "VERIFIED — stale review without evidence",
+            "request_kind": "report",
+            "report_purpose": "code_review",
+            "correlation_id": "t-3079-review",
+            "code_review": {
+                "assignment_id": assignment.assignment_id,
+                "verdict": "verified",
+                "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }),
+        &Some(sender),
+        Some(&minimal_test_runtime()),
+    );
+    assert!(
+        is_ok_result(&result),
+        "typed code review must deliver: {result}"
+    );
+    let messages = crate::inbox::drain(&home, "target-agent");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].text.contains("### Evidence"));
+    assert!(messages[0].validated_code_review.is_some());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn send_message_from_file_missing() {
     let _g = fleet_test_guard();
     let home = tmp_home("send-msg-file-missing");
