@@ -4733,3 +4733,159 @@ fn arch14_absent_binding_seam_head_drift_refused() {
     );
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// RED for decision `d-20260726055029475978-81`: a `repo action=checkout` whose
+/// `repository_path` names a LINKED WORKTREE of repo R must resolve to R's
+/// canonical root everywhere the daemon persists or keys on repository identity.
+///
+/// `source_resolve::resolve_checkout_source_path` canonicalizes the FILESYSTEM
+/// path only (`Path::canonicalize`) and has no notion of git repository
+/// identity, so a linked worktree path survives as itself. Everything keyed on
+/// that value then splits: `binding.json`'s `source_repo` records the linked
+/// path, and the per-lease flock is keyed `sha256(source_repo\0branch)`
+/// (`binding.rs:96-106`), so the SAME logical (repo, branch) lease acquires two
+/// different lock files depending on which path the caller happened to name.
+///
+/// Both requests below are the same repository and the same branch, so they must
+/// be one target, one lease and one binding, all naming R.
+#[test]
+#[cfg(unix)]
+fn checkout_via_linked_worktree_binds_canonical_repo_root_and_keeps_one_lease() {
+    let home = p778_tmp_home("linked-canon");
+    let parent = p778_tmp_home("linked-canon-src");
+    let r = p778_setup_source_repo(&parent, "feat/linked");
+    let agent = "linked-canon-dev";
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+
+    // A REAL linked worktree of R (not a copy): `git worktree add`. This one
+    // fixture step must reach the real binary — `git` on PATH is the shim, and
+    // it denies a mutating `worktree` even under bypass (stray-worktree vector).
+    let real_git = std::env::var("AGENTIC_GIT_REAL_GIT").unwrap_or_else(|_| "/usr/bin/git".into());
+    let l = parent.join("linked-wt");
+    let add = std::process::Command::new(&real_git)
+        .args(["worktree", "add", "--detach", l.to_str().unwrap(), "main"])
+        .current_dir(&r)
+        .env(bypass.0, bypass.1)
+        .output()
+        .expect("git worktree add");
+    assert!(
+        add.status.success() && l.join(".git").exists(),
+        "fixture: linked worktree must exist: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "feat/linked"])
+        .current_dir(&r)
+        .env(bypass.0, bypass.1)
+        .output()
+        .expect("rev-parse");
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let canonical_r = r.canonicalize().expect("canonicalize R");
+
+    let lease_locks = |home: &std::path::Path| -> usize {
+        std::fs::read_dir(crate::paths::runtime_dir(home).join(".lease-locks"))
+            .map(|d| d.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    };
+    let managed_targets = |home: &std::path::Path| -> usize {
+        std::fs::read_dir(home.join("worktrees"))
+            .map(|d| d.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    };
+    let bound_source = |home: &std::path::Path| -> String {
+        crate::binding::read(home, agent)
+            .and_then(|b| {
+                b.get("source_repo")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+    };
+
+    // 1. Checkout naming the LINKED worktree.
+    let via_l = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": l.display().to_string(),
+            "branch": "feat/linked",
+            "bind": true,
+            "expected_head": head,
+        }),
+        agent,
+    );
+    assert!(
+        via_l.get("error").is_none(),
+        "checkout via the linked worktree must succeed: {via_l}"
+    );
+    assert_eq!(via_l["bound"].as_bool(), Some(true), "must bind: {via_l}");
+    assert_eq!(
+        bound_source(&home),
+        canonical_r.display().to_string(),
+        "the binding must record the CANONICAL repo root, not the linked worktree path"
+    );
+
+    // 2. The identical request naming R itself: same repo, same branch.
+    let via_r = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": r.display().to_string(),
+            "branch": "feat/linked",
+            "bind": true,
+            "expected_head": head,
+        }),
+        agent,
+    );
+    assert!(
+        via_r.get("error").is_none(),
+        "the same checkout named via R must succeed: {via_r}"
+    );
+    assert_eq!(
+        via_r["path"].as_str(),
+        via_l["path"].as_str(),
+        "naming the same repository two ways must reuse ONE target: {via_r}"
+    );
+    assert_eq!(
+        bound_source(&home),
+        canonical_r.display().to_string(),
+        "the binding must still record the canonical repo root after the R-named request"
+    );
+
+    // 3. Bounded control on the same surface: a SUBDIRECTORY of R is still R.
+    let sub = r.join("subdir");
+    std::fs::create_dir_all(&sub).expect("mkdir subdir");
+    let via_sub = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": sub.display().to_string(),
+            "branch": "feat/linked",
+            "bind": true,
+            "expected_head": head,
+        }),
+        agent,
+    );
+    assert!(
+        via_sub.get("error").is_none(),
+        "a subdirectory of R names R and must succeed: {via_sub}"
+    );
+    assert_eq!(
+        bound_source(&home),
+        canonical_r.display().to_string(),
+        "a subdirectory of R must resolve to the canonical repo root"
+    );
+
+    // 4. One repository + one branch ⇒ one lease and one managed target.
+    assert_eq!(
+        lease_locks(&home),
+        1,
+        "one (repo, branch) lease must hold one lock file, not one per spelling of the path"
+    );
+    assert_eq!(
+        managed_targets(&home),
+        1,
+        "no nested or duplicate managed target may be provisioned for the same repo+branch"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
