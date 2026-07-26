@@ -1881,9 +1881,25 @@ type MockCapture = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
 
 /// RAII guard that saves/restores GITLAB_TOKEN + HOME env vars.
 /// Also holds a static mutex to serialize env-var-touching tests.
+/// A private home for a provider config-token test. Unique per call, so the
+/// config-file paths these tests read are theirs alone and nothing global is
+/// repointed.
+fn provider_token_tmp_home(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "agend-provider-token-{}-{}-{}",
+        std::process::id(),
+        tag,
+        id
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir provider token home");
+    dir
+}
+
 struct GitlabTokenGuard {
     prev_token: Option<std::ffi::OsString>,
-    prev_home: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1891,22 +1907,18 @@ impl GitlabTokenGuard {
     fn clear() -> Self {
         let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev_token = std::env::var_os("GITLAB_TOKEN");
-        let prev_home = std::env::var_os("HOME");
         std::env::remove_var("GITLAB_TOKEN");
         Self {
             prev_token,
-            prev_home,
             _lock: lock,
         }
     }
     fn set(val: &str) -> Self {
         let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev_token = std::env::var_os("GITLAB_TOKEN");
-        let prev_home = std::env::var_os("HOME");
         std::env::set_var("GITLAB_TOKEN", val);
         Self {
             prev_token,
-            prev_home,
             _lock: lock,
         }
     }
@@ -1916,9 +1928,6 @@ impl Drop for GitlabTokenGuard {
         match &self.prev_token {
             Some(v) => std::env::set_var("GITLAB_TOKEN", v),
             None => std::env::remove_var("GITLAB_TOKEN"),
-        }
-        if let Some(v) = &self.prev_home {
-            std::env::set_var("HOME", v);
         }
     }
 }
@@ -2097,45 +2106,34 @@ fn gitlab_auth_env_token_sends_private_token_header() {
     );
 }
 
-/// B4 state 2: env absent + glab CLI config present → token from config.
+/// B4 state 2: env absent → the glab CLI config supplies the token. Exercised
+/// against an EXPLICIT home, so no test has to point the process-global `HOME`
+/// at a temp dir it later deletes — that mutation was visible to every other
+/// test in the process and took unrelated fixtures down with it. Header wiring
+/// stays covered by the env-token HTTP test above.
 #[test]
-fn gitlab_auth_glab_config_fallback_sends_private_token_header() {
-    let fixture = include_str!("../../../tests/fixtures/gitlab-pipelines-response.json");
-    let (port, handle, captured) = gitlab_mock_server(fixture);
-
-    // Guard serializes + saves/restores GITLAB_TOKEN + HOME.
-    let mut guard = GitlabTokenGuard::clear();
-    // Setup temp HOME with glab config.
-    let temp = std::env::temp_dir().join(format!("agend-glab-test-{}", std::process::id()));
-    let glab_dir = temp.join(".config").join("glab-cli");
-    std::fs::create_dir_all(&glab_dir).ok();
+fn gitlab_glab_config_token_parsed_from_explicit_home() {
+    let home = provider_token_tmp_home("glab");
+    let glab_dir = home.join(".config").join("glab-cli");
+    std::fs::create_dir_all(&glab_dir).expect("mkdir glab config");
     std::fs::write(
         glab_dir.join("config.yml"),
         "hosts:\n  gitlab.com:\n    token: glab_config_token_abc\n",
     )
     .expect("write glab config");
-    // Override HOME so resolve_token finds the temp config.
-    guard.prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &temp);
 
-    let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
-        .expect("provider");
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
-    let _ = rt.block_on(provider.poll_runs("foo/bar", "main"));
-    handle.join().expect("mock");
-
-    let (_, request) = captured.lock().expect("lock").take().expect("captured");
-    assert!(
-        request.contains("private-token: glab_config_token_abc")
-            || request.contains("PRIVATE-TOKEN: glab_config_token_abc"),
-        "must send PRIVATE-TOKEN from glab config: {request}"
+    assert_eq!(
+        super::GitLabCiProvider::resolve_token_from_home(&home),
+        Some("glab_config_token_abc".to_string()),
+        "glab config token must be parsed from the given home"
+    );
+    assert_eq!(
+        super::GitLabCiProvider::resolve_token_from_home(&home.join("absent")),
+        None,
+        "a home without a glab config must yield no token"
     );
 
-    std::fs::remove_dir_all(&temp).ok();
-    // guard drop restores HOME + GITLAB_TOKEN
+    std::fs::remove_dir_all(&home).ok();
 }
 
 // ── Bitbucket Cloud CiProvider tests (Sprint 39 PR-2) ───────────
@@ -2143,7 +2141,6 @@ fn gitlab_auth_glab_config_fallback_sends_private_token_header() {
 /// Env guard for BITBUCKET_TOKEN + HOME (mirrors GitlabTokenGuard).
 struct BitbucketTokenGuard {
     prev_token: Option<std::ffi::OsString>,
-    prev_home: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 static BB_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2151,22 +2148,18 @@ impl BitbucketTokenGuard {
     fn clear() -> Self {
         let lock = BB_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev_token = std::env::var_os("BITBUCKET_TOKEN");
-        let prev_home = std::env::var_os("HOME");
         std::env::remove_var("BITBUCKET_TOKEN");
         Self {
             prev_token,
-            prev_home,
             _lock: lock,
         }
     }
     fn set(val: &str) -> Self {
         let lock = BB_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev_token = std::env::var_os("BITBUCKET_TOKEN");
-        let prev_home = std::env::var_os("HOME");
         std::env::set_var("BITBUCKET_TOKEN", val);
         Self {
             prev_token,
-            prev_home,
             _lock: lock,
         }
     }
@@ -2176,9 +2169,6 @@ impl Drop for BitbucketTokenGuard {
         match &self.prev_token {
             Some(v) => std::env::set_var("BITBUCKET_TOKEN", v),
             None => std::env::remove_var("BITBUCKET_TOKEN"),
-        }
-        if let Some(v) = &self.prev_home {
-            std::env::set_var("HOME", v);
         }
     }
 }
@@ -2353,35 +2343,28 @@ fn bitbucket_token_warning_when_no_token() {
     assert!(warning.expect("w").contains("BITBUCKET_TOKEN"));
 }
 
-/// Auth state 2: env absent + bb CLI config → Basic auth from config.
+/// Auth state 2: env absent → the bb CLI config supplies the token, parsed
+/// from an EXPLICIT home rather than by repointing the process-global `HOME`.
+/// Header wiring stays covered by the env-token HTTP test above.
 #[test]
-fn bitbucket_auth_bb_config_fallback_sends_basic_header() {
-    let fixture = include_str!("../../../tests/fixtures/bitbucket-pipelines-response.json");
-    let (port, handle, captured) = gitlab_mock_server(fixture);
-    let mut guard = BitbucketTokenGuard::clear();
-    // Setup temp HOME with bb config.
-    let temp = std::env::temp_dir().join(format!("agend-bb-test-{}", std::process::id()));
-    let bb_dir = temp.join(".config").join("bb");
-    std::fs::create_dir_all(&bb_dir).ok();
-    std::fs::write(bb_dir.join("config"), "token: bbuser:bb_app_pass\n").expect("write");
-    guard.prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &temp);
+fn bitbucket_bb_config_token_parsed_from_explicit_home() {
+    let home = provider_token_tmp_home("bb");
+    let bb_dir = home.join(".config").join("bb");
+    std::fs::create_dir_all(&bb_dir).expect("mkdir bb config");
+    std::fs::write(bb_dir.join("config"), "token: bbuser:bb_app_pass\n").expect("write bb config");
 
-    let provider = super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
-        .expect("provider");
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("rt");
-    let _ = rt.block_on(provider.poll_runs("foo/bar", "main"));
-    handle.join().expect("mock");
-
-    let (_, request) = captured.lock().expect("lock").take().expect("captured");
-    assert!(
-        request.contains("authorization: Basic") || request.contains("Authorization: Basic"),
-        "must send Basic auth from bb config: {request}"
+    assert_eq!(
+        super::BitbucketCiProvider::resolve_token_from_home(&home),
+        Some("bbuser:bb_app_pass".to_string()),
+        "bb config token must be parsed from the given home"
     );
-    std::fs::remove_dir_all(&temp).ok();
+    assert_eq!(
+        super::BitbucketCiProvider::resolve_token_from_home(&home.join("absent")),
+        None,
+        "a home without a bb config must yield no token"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// Smoke: constructors.
