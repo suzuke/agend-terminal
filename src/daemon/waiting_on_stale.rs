@@ -404,4 +404,173 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    // ── Ghost-metadata re-alert loop (RED) ──────────────────────────────
+    //
+    // `scan_and_emit` keys its REALERT dedup on the metadata FILE STEM
+    // (`path.file_stem()` above). Since Sprint 46 P2 those stems are
+    // `InstanceId`s — `agent_ops::metadata_path_resolved` writes
+    // `metadata/<id>.json` for every instance carrying an id in fleet.yaml.
+    // But `WaitingOnStaleHandler::run` prunes that same map on EVERY tick via
+    // `retain_active(&live_agent_names(registry))`, and `live_agent_names`
+    // yields `AgentHandle.name`. Ids never equal names, so the entry inserted
+    // at the end of a scan is dropped one tick later and
+    // `REALERT_INTERVAL_SECS` is structurally unreachable — for a live agent
+    // as much as for an abandoned one. Observed in production as six
+    // 72–76-day-old metadata files re-alerting every ~5m.
+    //
+    // These drive the REAL per-tick handler, not `scan_and_emit` directly, so
+    // the prune sits in the loop exactly as it does in the daemon. No sleeps:
+    // the cadence is a tick counter, not wall clock.
+
+    use crate::agent::{AgentRegistry, ExternalRegistry};
+    use crate::daemon::per_tick::supervisor_trackers::WaitingOnStaleHandler;
+    use crate::daemon::per_tick::{PerTickHandler, TickContext};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// An abandoned instance's metadata stem: a well-formed `InstanceId` that
+    /// is simply absent from the registry.
+    const GHOST_STEM: &str = "8f9cf087-1d98-4139-9372-0292c0164094";
+    const LIVE_NAME: &str = "dev-live";
+
+    fn stale_since(mins: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::minutes(mins)).to_rfc3339()
+    }
+
+    /// Delivered alerts, counted from the recipient's inbox — the same
+    /// observable the older tests in this module use.
+    fn alert_rows(home: &Path, stem: &str) -> usize {
+        std::fs::read_to_string(home.join("inbox").join(format!("{stem}.jsonl")))
+            .map(|s| s.lines().filter(|l| l.contains("waiting_on_stale")).count())
+            .unwrap_or(0)
+    }
+
+    /// Drive `cadences` whole scan cadences through the real handler, with the
+    /// per-tick prune running on every tick (that prune is half of the defect).
+    fn run_cadences(handler: &WaitingOnStaleHandler, ctx: &TickContext<'_>, cadences: usize) {
+        for _ in 0..(cadences * TICKS_PER_SCAN as usize) {
+            handler.run(ctx);
+        }
+    }
+
+    /// One live agent. Returns its `InstanceId`, which is ALSO its metadata
+    /// stem in production — the distinction this defect turns on.
+    fn registry_with_live() -> (AgentRegistry, crate::types::InstanceId) {
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let id = crate::types::InstanceId::new();
+        crate::agent::lock_registry(&registry)
+            .insert(id, crate::agent::mk_test_handle(LIVE_NAME, id));
+        (registry, id)
+    }
+
+    /// RED: an abandoned stem is seeded by the #1739 boot latch and must then
+    /// stay silent for at least `REALERT_INTERVAL_SECS`. Today the per-tick
+    /// prune drops its dedup entry, so every 5-minute scan re-emits it.
+    #[test]
+    fn ghost_metadata_must_not_realert_after_boot_seed() {
+        let home = tmp_home("ghost-realert");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        write_metadata(&home, GHOST_STEM, "operator direction", &stale_since(20));
+
+        let (registry, _id) = registry_with_live();
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        // Cadence 1 = #1739 boot seed (records, must not emit). Cadences 2 and
+        // 3 are normal scans, both well inside REALERT_INTERVAL_SECS.
+        run_cadences(&WaitingOnStaleHandler::new(), &ctx, 3);
+
+        let rows = alert_rows(&home, GHOST_STEM);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            rows, 0,
+            "a stem seeded by the boot latch must not re-alert within \
+             REALERT_INTERVAL_SECS; the per-tick \
+             `retain_active(&live_agent_names(..))` prune compares NAMES against \
+             id-shaped metadata stems, so the dedup entry is dropped every tick \
+             and each scan re-emits (observed: {rows})"
+        );
+    }
+
+    /// RED + over-fix lock: a LIVE agent whose metadata stem is its
+    /// `InstanceId` (the production shape) must alert exactly once and then be
+    /// suppressed. Today it re-alerts like any other stem. Note this also
+    /// fails at 0 if a fix filters stems by live agent NAMES — the live
+    /// agent's own alerts would be silenced, which is not the contract.
+    #[test]
+    fn live_agent_id_stem_alerts_once_then_stays_suppressed() {
+        let home = tmp_home("live-id-stem");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+
+        let (registry, id) = registry_with_live();
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        let handler = WaitingOnStaleHandler::new();
+        let live_stem = id.full();
+
+        // Boot seed with nothing stale yet, so the live agent going stale
+        // afterwards is a genuine new alert rather than restart backlog.
+        run_cadences(&handler, &ctx, 1);
+        write_metadata(&home, &live_stem, "review from reviewer", &stale_since(20));
+        // Cadence 2 alerts; cadence 3 must be suppressed by REALERT.
+        run_cadences(&handler, &ctx, 2);
+
+        let rows = alert_rows(&home, &live_stem);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            rows, 1,
+            "a live agent's id-stemmed metadata must alert once then stay \
+             suppressed for REALERT_INTERVAL_SECS (observed: {rows} — 2 means \
+             the prune is dropping live dedup entries too; 0 would mean a fix \
+             wrongly silenced a live agent by filtering on names)"
+        );
+    }
+
+    /// Control (passes today, must keep passing): the #1739 boot latch
+    /// swallows the first cadence for every stem, live or abandoned — so the
+    /// repeats the RED above counts provably come from later scans, not boot.
+    #[test]
+    fn boot_seed_cadence_emits_for_neither_stem() {
+        let home = tmp_home("boot-latch-both");
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+
+        let (registry, id) = registry_with_live();
+        let live_stem = id.full();
+        write_metadata(&home, GHOST_STEM, "operator direction", &stale_since(20));
+        write_metadata(&home, &live_stem, "review from reviewer", &stale_since(20));
+
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        run_cadences(&WaitingOnStaleHandler::new(), &ctx, 1);
+
+        let (ghost_rows, live_rows) =
+            (alert_rows(&home, GHOST_STEM), alert_rows(&home, &live_stem));
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            (ghost_rows, live_rows),
+            (0, 0),
+            "#1739 boot seed must record pre-existing stale waiters without \
+             emitting, for both an abandoned and a live stem"
+        );
+    }
 }
