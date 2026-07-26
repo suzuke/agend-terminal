@@ -291,6 +291,11 @@ pub(crate) fn intent_repos(home: &Path) -> Vec<String> {
 }
 
 #[allow(dead_code)]
+pub(crate) fn has_intent(home: &Path, repo: &str, branch: &str) -> bool {
+    let key = intent_key(repo, branch);
+    intents_dir(home).join(format!("{key}.json")).exists()
+}
+
 /// Record the cleanup intent for a branch that survived a worktree release, so
 /// [`reconcile_terminal_review_intents`] can settle it later. Returns the error
 /// message when persistence fails, `None` on success (or when the branch tip is
@@ -336,11 +341,6 @@ pub(crate) fn persist_release_intent(
             Some(e)
         }
     }
-}
-
-pub(crate) fn has_intent(home: &Path, repo: &str, branch: &str) -> bool {
-    let key = intent_key(repo, branch);
-    intents_dir(home).join(format!("{key}.json")).exists()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
