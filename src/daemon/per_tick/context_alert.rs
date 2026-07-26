@@ -7,11 +7,11 @@
 //! `pattern` ONLY — a pane whose statusline can't be read is honestly
 //! `unknown` (no alert, `null` in LIST).
 //!
-//! #1945-disable (operator decision, 2026-06-10): the transcript-estimate
-//! fallback is DISABLED — its first live minute fired a triple false 100%
-//! alert (window misjudge). The corrected estimator survives, tested but
-//! uncalled, in `token_cost::estimate_context_pct`; re-enable ONLY after
-//! validating its readings against statusline ground truth.
+//! #1945-disable (operator decision, 2026-06-10): the former
+//! transcript-estimate fallback was retired after its first live minute fired
+//! a triple false 100% alert (window misjudge). Context alerts remain
+//! statusline-pattern-only until a separately validated replacement is
+//! approved.
 //!
 //! Dedup/hysteresis: an alert fires on crossing `>= threshold` while armed;
 //! firing disarms; re-arming requires dropping below `threshold -

@@ -1194,12 +1194,11 @@ impl StateTracker {
     /// dropped rather than trusted — `None` = honestly unknown, no alert.
     ///
     /// #1945-disable (operator decision, 2026-06-10): the transcript-estimate
-    /// fallback ("transcript" source) is DISABLED — its first live minute
-    /// produced a triple false 100% alert (window misjudge: transcript model
-    /// ids carry no `[1m]` suffix → 1M sessions resolved against 200k). The
-    /// corrected estimator + its root-cause record live on in
-    /// `token_cost::estimate_context_pct` (tested, uncalled); re-enable ONLY
-    /// after validating its readings against statusline ground truth.
+    /// fallback was retired after its first live minute produced a triple
+    /// false 100% alert (window misjudge: transcript model ids carry no
+    /// `[1m]` suffix → 1M sessions resolved against 200k). Context remains
+    /// intentionally statusline-pattern-only until a separately validated
+    /// replacement is approved.
     pub fn resolved_context(&self) -> Option<(f32, &'static str)> {
         if let Some((pct, at)) = self.context_pct {
             if at.elapsed() < CONTEXT_FRESH {
