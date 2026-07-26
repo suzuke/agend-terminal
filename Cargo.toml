@@ -1,6 +1,6 @@
 [package]
 name = "agend-terminal"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2021"
 rust-version = "1.88"
 description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 32 MCP tools"
@@ -158,7 +158,7 @@ hex = "0.4"
 # LOAD-BEARING (reviewer4 cond #1): exactly ONE agentic-git-core in Cargo.lock —
 # enforced by tests/agentic_core_single_source.rs (RED-first).
 agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core", version = "0.2.1" }
-agentic-git = { path = "vendor/agentic-git/crates/agentic-git", version = "0.2.4" }
+agentic-git = { path = "vendor/agentic-git/crates/agentic-git", version = "0.2.5" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"

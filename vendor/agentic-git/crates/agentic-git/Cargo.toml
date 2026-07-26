@@ -1,7 +1,7 @@
 [package]
 name = "agentic-git"
 description = "A guarded, transparent git for AI coding agents — a PATH shim over the real git with per-agent worktree routing, a deny guardrail matrix, commit provenance, and audited bypass"
-version = "0.2.4"
+version = "0.2.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

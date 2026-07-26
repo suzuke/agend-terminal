@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-26
+
 ### Changed
 
 - **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
@@ -15,6 +17,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 ### Removed
 
 - **Expired public-surface aliases** — `agend list --legacy-json` and the MCP argument aliases `command`, `repository`, and `kind` are gone after their deprecation cycle; use `--json`, `backend`, `repository_path`, and `request_kind` (#2960, #2961).
+
+### Fixed
+
+- **`agentic-git` guarded-git correctness** — a foreign-cwd `sparse-checkout`/`config` write is routed to the repository it names instead of being denied, and `snapshots restore --yes` now returns the genuinely newest snapshot when several share one second (#2950, #3069, #3070).
+- **Shift+Tab reaches the pane** — the TUI forwards `BackTab` to the pane PTY instead of swallowing it (#2933).
 
 ## [0.11.2] — 2026-07-23
 
@@ -701,7 +708,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0

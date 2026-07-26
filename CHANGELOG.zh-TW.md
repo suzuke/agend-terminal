@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-26
+
 ### Changed
 
 - **移除已過期的環境變數別名** — watchdog 拓樸現在只讀 `fleet.yaml` 的 `watchdog:` 區塊；worktree 封存 fallback 只讀 `AGEND_WORKTREE_ARCHIVE_FALLBACK`；decisions retention 只讀 `AGEND_RETENTION_DECISIONS_CUTOVER`。
@@ -15,6 +17,11 @@
 ### Removed
 
 - **移除已過期的公開介面別名** — `agend list --legacy-json` 以及 MCP 參數別名 `command`、`repository`、`kind` 在棄用週期結束後已移除；請改用 `--json`、`backend`、`repository_path` 與 `request_kind`（#2960、#2961）。
+
+### Fixed
+
+- **`agentic-git` 受控 git 的正確性** — 指向其他 repository 的 `sparse-checkout`／`config` 寫入會被路由到它所指名的 repository，而不是直接拒絕；`snapshots restore --yes` 在多個 snapshot 共用同一秒時，也會取到真正最新的那個（#2950、#3069、#3070）。
+- **Shift+Tab 會送進 pane** — TUI 現在會把 `BackTab` 轉發給 pane PTY，不再吞掉（#2933）。
 
 ## [0.11.2] — 2026-07-23
 
@@ -623,7 +630,8 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
