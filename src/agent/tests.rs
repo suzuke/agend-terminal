@@ -259,6 +259,48 @@ fn sweep_child_tree_kills_grandchild_via_process_group() {
     sweep_child_tree_body(&pid_file);
 }
 
+#[cfg(unix)]
+struct PtyPermit(std::sync::Arc<parking_lot::Mutex<usize>>);
+
+#[cfg(unix)]
+impl PtyPermit {
+    fn acquire(sem: std::sync::Arc<parking_lot::Mutex<usize>>, max: usize) -> Self {
+        loop {
+            let mut held = sem.lock();
+            if *held < max {
+                *held += 1;
+                drop(held);
+                return Self(sem);
+            }
+            drop(held);
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyPermit {
+    fn drop(&mut self) {
+        *self.0.lock() -= 1;
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_permit_releases_on_panic() {
+    let sem = std::sync::Arc::new(parking_lot::Mutex::new(0));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+        let sem = std::sync::Arc::clone(&sem);
+        move || {
+            let _permit = PtyPermit::acquire(sem, 1);
+            panic!("simulate a failed stress iteration");
+        }
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(*sem.lock(), 0, "panic must release the PTY permit");
+}
+
 /// 2026-05-18 race-class C0 anchor (RED on main HEAD): concurrent
 /// stress runner for the pid_file write-vs-read race. Spawns 8
 /// threads, each running the body 6 times against unique pid_file
@@ -299,18 +341,11 @@ fn sweep_child_tree_kills_grandchild_concurrent_stress() {
                                 "agend-sweep-stress-{}-{tid}-{i}.pid",
                                 std::process::id()
                             ));
-                            // Acquire a permit — spin-lock bounded, brief.
-                            loop {
-                                let mut held = sem.lock();
-                                if *held < MAX_CONCURRENT_PTYS {
-                                    *held += 1;
-                                    break;
-                                }
-                                drop(held);
-                                std::thread::yield_now();
-                            }
+                            let _permit = PtyPermit::acquire(
+                                std::sync::Arc::clone(&sem),
+                                MAX_CONCURRENT_PTYS,
+                            );
                             sweep_child_tree_body(&path);
-                            *sem.lock() -= 1;
                         }
                     }
                 })
@@ -415,17 +450,17 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
     sweep_child_tree(&agent_id, &registry);
 
     // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
-    // Without wait(), the shell shows as "alive" even after SIGKILL
-    // because we are its parent and never collected its exit status.
-    {
-        let reg = &registry.lock();
-        if let Some(h) = reg.get(&agent_id) {
-            {
-                let mut c = h.child.lock();
-                let _ = c.wait();
-            }
-        }
-    }
+    // Use the bounded try_wait loop so a stuck child fails this iteration
+    // locally instead of blocking the whole stress suite indefinitely.
+    let child = registry
+        .lock()
+        .get(&agent_id)
+        .map(|h| Arc::clone(&h.child))
+        .expect("shell child must remain registered after sweep");
+    assert!(
+        crate::daemon::lifecycle::wait_for_child_exit(&child),
+        "shell child did not exit within the bounded reap timeout"
+    );
 
     // #934: §3.20 SOP 1 — poll-with-deadline against post-condition.
     //
@@ -447,7 +482,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
     // Fix: poll with deadline. `poll_until_dead` (promoted to
     // `pub(crate)` for this PR) returns true within the window or
     // false on timeout. shell_pid uses a 5s deadline (we reap
-    // directly via `child.wait()` above so the gap is short).
+    // directly via bounded `try_wait` polling above so the gap is short).
     // sleep_pid uses a 10s deadline for init / launchd reap-cycle
     // worst case — see deadline doc in `cleanup_zombies::poll_until_dead`
     // for OS-conditional rationale.
@@ -456,8 +491,8 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
             shell_pid,
             std::time::Duration::from_secs(5),
         ),
-        "shell leader did not die within 5s post-sweep — we reap directly \
-             via child.wait() so the kernel-pid-cleanup gap is normally <1s; \
+        "shell leader did not die within 5s post-sweep — we reap via bounded \
+             try_wait polling so the kernel-pid-cleanup gap is normally <1s; \
              timing this slow indicates a deeper issue"
     );
     assert!(
