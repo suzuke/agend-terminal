@@ -12,6 +12,24 @@ use std::sync::atomic::Ordering;
 /// can set readonly=true and a concurrently-running enqueue test panics.
 static READONLY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+struct TestReadonlyGuard {
+    previous: bool,
+}
+
+impl TestReadonlyGuard {
+    fn new() -> Self {
+        Self {
+            previous: DISK_READONLY.swap(true, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for TestReadonlyGuard {
+    fn drop(&mut self) {
+        DISK_READONLY.store(self.previous, Ordering::Relaxed);
+    }
+}
+
 fn tmp_home(suffix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agend-inbox-{}-{}", suffix, std::process::id()));
     fs::remove_dir_all(&dir).ok();
@@ -651,7 +669,7 @@ fn test_readonly_on_disk_full() {
     let home = tmp_home("readonly");
     enqueue(&home, "agent1", make_msg("a", "before")).ok();
 
-    DISK_READONLY.store(true, Ordering::Relaxed);
+    let _readonly = TestReadonlyGuard::new();
     let result = enqueue(&home, "agent1", make_msg("b", "blocked"));
     assert!(result.is_err(), "enqueue must fail in readonly mode");
     assert!(
@@ -664,7 +682,6 @@ fn test_readonly_on_disk_full() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].from, "a");
 
-    DISK_READONLY.store(false, Ordering::Relaxed);
     fs::remove_dir_all(&home).ok();
 }
 
@@ -3761,7 +3778,7 @@ fn t5_enqueue_failure_skips_hint_emit() {
     let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("982-t5");
     // Force readonly so enqueue fails.
-    DISK_READONLY.store(true, Ordering::Relaxed);
+    let _readonly = TestReadonlyGuard::new();
     let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let emitted_clone = emitted.clone();
     let result = enqueue_with_idle_hint_with_emitter(
@@ -3772,11 +3789,41 @@ fn t5_enqueue_failure_skips_hint_emit() {
             emitted_clone.store(true, Ordering::Relaxed);
         },
     );
-    DISK_READONLY.store(false, Ordering::Relaxed);
     assert!(result.is_err(), "enqueue must propagate readonly error");
     assert!(
         !emitted.load(Ordering::Relaxed),
         "hint emit must be skipped on enqueue failure"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn enqueue_with_idle_hint_readonly_override_is_thread_isolated() {
+    let home = tmp_home("982-readonly-thread-isolation");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let readonly_barrier = barrier.clone();
+    let readonly = std::thread::spawn(move || {
+        let _readonly = TestReadonlyGuard::new();
+        readonly_barrier.wait();
+        readonly_barrier.wait();
+    });
+
+    let writer_barrier = barrier;
+    let writer_home = home.clone();
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        let result =
+            enqueue_with_idle_hint(&writer_home, "agent1", make_msg("system:thread", "write"));
+        writer_barrier.wait();
+        result
+    });
+
+    let result = writer.join().expect("writer thread must not panic");
+    readonly.join().expect("readonly thread must not panic");
+    assert!(
+        result.is_ok(),
+        "a readonly override in another thread must not block enqueue_with_idle_hint: {result:?}"
     );
     fs::remove_dir_all(&home).ok();
 }
