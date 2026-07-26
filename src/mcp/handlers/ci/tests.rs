@@ -3440,6 +3440,77 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn changed_review_class_starts_fresh_notification_epoch_3114() {
+    let home = watch_test_home("review-class-change-epoch");
+    let args = serde_json::json!({"repository": "o/r", "branch": "feat/x"});
+    super::handle_watch_ci(&home, &args, "dev-1");
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    let gen_before = seed_notify_cursors(&path);
+
+    super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/x",
+            "review_class": "single",
+        }),
+        "dev-1",
+    );
+
+    let v = read_watch(&path);
+    for k in NOTIFY_CURSORS {
+        assert!(
+            v.get(*k).map(|x| x.is_null()).unwrap_or(true),
+            "changing review_class must clear `{k}` so the already-terminal run \
+             can be delivered under the resolved merge gate: {v}"
+        );
+    }
+    assert!(
+        v.get("last_notified_by_workflow")
+            .map(|m| m.as_object().map(|o| o.is_empty()).unwrap_or(false))
+            .unwrap_or(true),
+        "changing review_class must clear per-workflow notification cursors: {v}"
+    );
+    assert_ne!(
+        v["generation_id"].as_str(),
+        Some(gen_before.as_str()),
+        "changing review_class must rotate generation_id so an in-flight old \
+         poll cannot restore cleared cursors: {v}"
+    );
+    assert_eq!(v["review_class"], "single");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn unchanged_review_class_preserves_notification_epoch_3114() {
+    let home = watch_test_home("review-class-unchanged-epoch");
+    let args = serde_json::json!({
+        "repository": "o/r",
+        "branch": "feat/x",
+        "review_class": "single",
+    });
+    super::handle_watch_ci(&home, &args, "dev-1");
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    let gen_before = seed_notify_cursors(&path);
+
+    super::handle_watch_ci(&home, &args, "dev-1");
+
+    let v = read_watch(&path);
+    assert_eq!(v["last_run_id"].as_u64(), Some(100));
+    assert!(
+        v["last_notified_by_workflow"]["#run:100"].is_object(),
+        "an unchanged review_class must not redeliver a terminal run: {v}"
+    );
+    assert_eq!(
+        v["generation_id"].as_str(),
+        Some(gen_before.as_str()),
+        "an unchanged review_class must preserve the notification epoch: {v}"
+    );
+    assert_eq!(v["review_class"], "single");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// The complement of the test above, and the regression risk of the reset: an
 /// ORDINARY resubscribe (no tombstone — the watch still has a live subscriber)
 /// must NOT touch the notification cursors or the generation. Only the
