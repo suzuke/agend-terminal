@@ -1083,10 +1083,16 @@ impl GitLabCiProvider {
         }
         // Fallback: glab CLI config file at $HOME/.config/glab-cli/config.yml.
         let home = std::env::var("HOME").ok()?;
-        let config_path = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("glab-cli")
-            .join("config.yml");
+        Self::resolve_token_from_home(std::path::Path::new(&home))
+    }
+
+    /// The config-file half of [`Self::resolve_token`], against an EXPLICIT
+    /// home. Split out only so a test can exercise this path without pointing
+    /// the process-global `HOME` at a temp dir — that mutation was visible to
+    /// every other test in the process. `resolve_token` still reads `$HOME`,
+    /// so the production chain (env, then config, then `None`) is unchanged.
+    pub(super) fn resolve_token_from_home(home: &std::path::Path) -> Option<String> {
+        let config_path = home.join(".config").join("glab-cli").join("config.yml");
         let content = std::fs::read_to_string(config_path).ok()?;
         // glab config stores token as `token: <value>` under hosts.
         for line in content.lines() {
@@ -1316,10 +1322,15 @@ impl BitbucketCiProvider {
             return Some(token);
         }
         let home = std::env::var("HOME").ok()?;
-        let config_path = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("bb")
-            .join("config");
+        Self::resolve_token_from_home(std::path::Path::new(&home))
+    }
+
+    /// The config-file half of [`Self::resolve_token`], against an EXPLICIT
+    /// home — same rationale as the GitLab counterpart: a test can read a
+    /// config it planted without repointing the process-global `HOME`.
+    /// `resolve_token` still reads `$HOME`, so production is unchanged.
+    pub(super) fn resolve_token_from_home(home: &std::path::Path) -> Option<String> {
+        let config_path = home.join(".config").join("bb").join("config");
         let content = std::fs::read_to_string(config_path).ok()?;
         for line in content.lines() {
             let trimmed = line.trim();

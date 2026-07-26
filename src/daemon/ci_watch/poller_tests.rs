@@ -1879,8 +1879,6 @@ fn rate_limit_backoff_skips_polling() {
 /// Captured request from mock server: (path, full_request).
 type MockCapture = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
 
-/// RAII guard that saves/restores GITLAB_TOKEN + HOME env vars.
-/// Also holds a static mutex to serialize env-var-touching tests.
 /// A private home for a provider config-token test. Unique per call, so the
 /// config-file paths these tests read are theirs alone and nothing global is
 /// repointed.
@@ -1898,6 +1896,8 @@ fn provider_token_tmp_home(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// RAII guard that saves/restores the GITLAB_TOKEN env var.
+/// Also holds a static mutex to serialize the tests that touch it.
 struct GitlabTokenGuard {
     prev_token: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -2138,7 +2138,7 @@ fn gitlab_glab_config_token_parsed_from_explicit_home() {
 
 // ── Bitbucket Cloud CiProvider tests (Sprint 39 PR-2) ───────────
 
-/// Env guard for BITBUCKET_TOKEN + HOME (mirrors GitlabTokenGuard).
+/// Env guard for BITBUCKET_TOKEN (mirrors GitlabTokenGuard).
 struct BitbucketTokenGuard {
     prev_token: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
