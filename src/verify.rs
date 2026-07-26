@@ -260,6 +260,9 @@ fn finalize_results(
                 "tests": items,
             }))?
         );
+        if failed > 0 {
+            std::process::exit(1);
+        }
     } else {
         println!("\n{:=<50}", "= AgEnD Terminal Verify ");
         for r in &results {
@@ -813,5 +816,39 @@ mod tests {
         let r = test_inbox(&home);
         assert!(r.passed, "inbox: {}", r.detail);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn json_failure_preserves_envelope_and_exits_nonzero() {
+        if std::env::var_os("AGEND_VERIFY_JSON_EXIT_CHILD").is_some() {
+            let home =
+                std::env::temp_dir().join(format!("verify-json-exit-child-{}", std::process::id()));
+            finalize_results(
+                &home,
+                vec![TestResult::fail("injected", "deterministic failure")],
+                true,
+            )
+            .unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "verify::tests::json_failure_preserves_envelope_and_exits_nonzero",
+                "--nocapture",
+            ])
+            .env("AGEND_VERIFY_JSON_EXIT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "child status: {}", output.status);
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let start = stdout.find("{\n").unwrap();
+        let end = stdout[start..].find("\n}\n").unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stdout[start..start + end + 2]).unwrap();
+        assert_eq!(envelope["failed"], 1);
+        assert_eq!(envelope["tests"][0]["passed"], false);
     }
 }
