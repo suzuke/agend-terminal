@@ -1,4 +1,3 @@
-use super::disk::DISK_READONLY;
 use super::notify::route_notification;
 use super::storage::{inbox_path, inbox_path_for_id};
 use super::*;
@@ -7,11 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-/// Serializes tests that touch the global DISK_READONLY flag or rely on
-/// enqueue not being blocked by it. Without this, `test_readonly_on_disk_full`
-/// can set readonly=true and a concurrently-running enqueue test panics.
-static READONLY_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 struct TestReadonlyGuard {
     previous: bool,
 }
@@ -19,14 +13,14 @@ struct TestReadonlyGuard {
 impl TestReadonlyGuard {
     fn new() -> Self {
         Self {
-            previous: DISK_READONLY.swap(true, Ordering::Relaxed),
+            previous: super::disk::set_test_readonly(true),
         }
     }
 }
 
 impl Drop for TestReadonlyGuard {
     fn drop(&mut self) {
-        DISK_READONLY.store(self.previous, Ordering::Relaxed);
+        super::disk::set_test_readonly(self.previous);
     }
 }
 
@@ -664,7 +658,6 @@ fn test_load_legacy_without_schema_version() {
 
 #[test]
 fn test_readonly_on_disk_full() {
-    let _guard = READONLY_TEST_LOCK.lock();
     // When DISK_READONLY is set, enqueue must fail and drain must still work.
     let home = tmp_home("readonly");
     enqueue(&home, "agent1", make_msg("a", "before")).ok();
@@ -2166,7 +2159,6 @@ fn keep_query_and_task(m: &InboxMessage) -> Option<String> {
 
 #[test]
 fn clear_compact_keeps_obligations_clears_rest() {
-    let _g = READONLY_TEST_LOCK.lock();
     let home = tmp_home("clear-oblig");
     enqueue(
         &home,
@@ -2242,7 +2234,6 @@ fn clear_compact_keeps_obligations_clears_rest() {
 
 #[test]
 fn clear_compact_summaries_bounded() {
-    let _g = READONLY_TEST_LOCK.lock();
     let home = tmp_home("clear-bound");
     for i in 0..250 {
         enqueue(
@@ -2273,7 +2264,6 @@ fn clear_compact_summaries_bounded() {
 
 #[test]
 fn clear_compact_preview_single_line_bounded() {
-    let _g = READONLY_TEST_LOCK.lock();
     let home = tmp_home("clear-preview");
     let long = format!("line one\nline two\t{}", "z".repeat(200));
     enqueue(
@@ -2396,7 +2386,6 @@ fn test_describe_message_status_three_states() {
 
 #[test]
 fn test_enqueue_concurrent_same_agent() {
-    let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("concurrent-same");
     let home_arc = std::sync::Arc::new(home.clone());
     let mut handles = vec![];
@@ -2425,7 +2414,6 @@ fn test_enqueue_concurrent_same_agent() {
 
 #[test]
 fn test_enqueue_vs_drain_no_lost_msg() {
-    let _guard = READONLY_TEST_LOCK.lock();
     // Thread A enqueues 10 messages; thread B drains after each.
     // Total drained must equal 10 — no lost messages.
     let home = tmp_home("enqueue-vs-drain");
@@ -2471,7 +2459,6 @@ fn test_enqueue_vs_drain_no_lost_msg() {
 
 #[test]
 fn test_concurrent_drain_no_duplicates() {
-    let _guard = READONLY_TEST_LOCK.lock();
     // #1940: two threads drain the same inbox simultaneously; the inbox lock
     // must serialize them so each of the 3 messages is returned EXACTLY ONCE
     // (no duplicate delivery under contention) — the exactly-once contract a
@@ -3702,9 +3689,6 @@ fn t1_idle_recipient_receives_hint() {
 
 #[test]
 fn t2_composing_recipient_defers_hint_via_notification_queue() {
-    // Lock the global notification_dedup so the composing→deferred
-    // hint isn't suppressed by a sibling test's ledger entry.
-    let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("982-t2");
     mark_composing(&home, "agent1");
     let msg = make_msg("system:t2", "composing test");
@@ -3775,7 +3759,6 @@ fn t4_caller_supplied_id_preserved() {
 
 #[test]
 fn t5_enqueue_failure_skips_hint_emit() {
-    let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("982-t5");
     // Force readonly so enqueue fails.
     let _readonly = TestReadonlyGuard::new();
@@ -3996,7 +3979,6 @@ fn t11_successive_enqueues_carry_distinct_ids() {
 #[test]
 fn t12_pty_state_kind_matrix() {
     // Lead Q7: explicit (pty_state × msg_kind) matrix coverage.
-    let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("982-t12");
     let kinds = ["query", "task", "report", "update", "waiting_on_stale"];
 
@@ -4048,7 +4030,6 @@ fn t12_pty_state_kind_matrix() {
 
 #[test]
 fn t13_notification_queue_flush_releases_deferred_hint() {
-    let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("982-t13");
     mark_composing(&home, "agent1");
 
@@ -4105,7 +4086,6 @@ fn t15_composing_flush_uses_submit_aware_inject() {
     // Structural pin: verify the post-fix wiring builds the
     // submit-aware payload shape exactly. Identical contract test
     // pattern to `inject_with_submit_sends_raw_false`.
-    let _guard = READONLY_TEST_LOCK.lock();
     let home = tmp_home("982-t15");
     mark_composing(&home, "agent1");
     let mut msg = make_msg("system:t15", "deferred update");

@@ -1,8 +1,21 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 /// Global readonly flag — set when available disk space drops below threshold.
 pub(super) static DISK_READONLY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DISK_READONLY: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_readonly(readonly: bool) -> bool {
+    TEST_DISK_READONLY.with(|state| state.replace(readonly))
+}
 
 /// Default minimum free disk space floor (1 GiB) before entering readonly mode.
 const DEFAULT_LOW_DISK_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
@@ -54,6 +67,10 @@ pub fn check_disk_space(home: &Path) {
 
 /// Returns true when inbox is in readonly mode (disk full).
 pub fn is_readonly() -> bool {
+    #[cfg(test)]
+    if TEST_DISK_READONLY.with(Cell::get) {
+        return true;
+    }
     DISK_READONLY.load(Ordering::Relaxed)
 }
 
