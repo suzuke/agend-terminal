@@ -9,6 +9,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [0.11.3] — 2026-07-26
 
+### Added
+
+- **`message_from_file` inputs** — `send` and `reply` now accept file-backed message bodies, so large or multiline content need not be embedded directly in arguments (#3083, #3084).
+
 ### Changed
 
 - **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
@@ -22,10 +26,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 - **`agentic-git` guarded-git correctness** — a foreign-cwd `sparse-checkout`/`config` write is routed to the repository it names instead of being denied, and `snapshots restore --yes` now returns the genuinely newest snapshot when several share one second (#2950, #3069, #3070).
 - **Shift+Tab reaches the pane** — the TUI forwards `BackTab` to the pane PTY instead of swallowing it (#2933).
-- **`waiting_on` stale alerts no longer repeat or misroute** — the alert is delivered to the instance's configured name (so it reaches the agent's inbox and its team orchestrator) instead of an id-named file nothing reads, it respects the 30-minute re-alert interval instead of firing every 5-minute scan, and metadata left behind by an instance the fleet no longer runs is skipped.
+- **`waiting_on` stale alerts no longer repeat or misroute** — the alert is delivered to the instance's configured name (so it reaches the agent's inbox and its team orchestrator) instead of an id-named file nothing reads, it respects the 30-minute re-alert interval instead of firing every 5-minute scan, and metadata left behind by an instance the fleet no longer runs is skipped (#3077).
 - **`repo checkout` treats one repository as one repository** — a `repository_path` naming a linked worktree or a subdirectory now resolves to the owning canonical repo root, so the same repository and branch can no longer occupy two managed worktrees or two lease locks depending on how the path was spelled, and the cross-agent branch-lease check can no longer be bypassed by naming the same repository differently (#3078).
 - **`agend verify` no longer reports a false `create_delete` failure** — the smoke seeds its dynamic test agent into the test fleet, surfaces the API's own error instead of only a transport failure, and asserts removal through the terminal delete transaction rather than `kill`, which retains the registry entry by design (#3080).
 - **`agend verify --json` exits nonzero when a check fails** — the JSON envelope is unchanged, but a run reporting `failed > 0` now leaves a failing exit status instead of exiting 0, so a script or CI step that reads only the status no longer treats a failed smoke as a pass (#3082).
+- **Watchdog alerts settle against the real inbox and recipient** — helper-staleness and the remaining watchdogs now resolve live roster recipients and settle delivered alerts on first drain, so ghost instances do not receive stale notices (#2932, #2951, #3007).
+- **CI-watch arm and re-arm failures are visible** — failed watch arming is surfaced as a degraded warning, and tombstone re-arm starts a fresh notification epoch instead of silently reusing stale state (#2949, #3067).
+- **Cross-team reviewer returns honor assignment-backed code review** — valid assignment-backed returns pass cross-team checks without contradictory blocked logs (#2957, #2958).
+- **Registered flat orphan worktrees can be released safely** — `repo release` proves Git linkage, detached registration, ownership, holder state, and cleanliness before reclaiming a managed flat orphan (#2878, #3087).
+- **Pane scrollback scanning is bounded** — scrollback reads now cap their scan and avoid unbounded work on large panes (#3050, #2963).
+- **MCP proxy worker growth is capped** — outstanding MCP tool workers are admitted through a bounded cap and reject excess work instead of accumulating without limit (#3033, #3043).
+- **Keystroke activity writes are coalesced** — per-keystroke writes are merged to roughly one-second cadence while preserving submit ordering and paste behavior (#3042, #2965).
+- **Existing `Unresolved` review classes are reconciled** — PR-state sync now repairs existing `Unresolved` rows during SCM reconciliation (#3040, #3045).
+- **Missing-fleet hang detection fails safe** — hang detection returns with no candidates and restores the fleet-load fallback instead of misclassifying missing `fleet.yaml` (#2944, #2956).
+- **Canonical unified message body takes precedence** — canonical send body fields are no longer overridden by legacy aliases when both are present (#3079, #3093).
+- **Live-task review branch cleanup records a retry intent** — release preserves a live task's review branch and records a consumable cleanup intent for later reconciliation (#3090, #3092).
 
 ## [0.11.2] — 2026-07-23
 

@@ -9,6 +9,10 @@
 
 ## [0.11.3] — 2026-07-26
 
+### Added
+
+- **`message_from_file` 輸入** — `send` 與 `reply` 現在支援從檔案讀取訊息本文，大型或多行內容不必直接嵌在參數中（#3083、#3084）。
+
 ### Changed
 
 - **移除已過期的環境變數別名** — watchdog 拓樸現在只讀 `fleet.yaml` 的 `watchdog:` 區塊；worktree 封存 fallback 只讀 `AGEND_WORKTREE_ARCHIVE_FALLBACK`；decisions retention 只讀 `AGEND_RETENTION_DECISIONS_CUTOVER`。
@@ -22,10 +26,21 @@
 
 - **`agentic-git` 受控 git 的正確性** — 指向其他 repository 的 `sparse-checkout`／`config` 寫入會被路由到它所指名的 repository，而不是直接拒絕；`snapshots restore --yes` 在多個 snapshot 共用同一秒時，也會取到真正最新的那個（#2950、#3069、#3070）。
 - **Shift+Tab 會送進 pane** — TUI 現在會把 `BackTab` 轉發給 pane PTY，不再吞掉（#2933）。
-- **`waiting_on` 逾時提醒不再重複發送或送錯地方** — 提醒會送到該 instance 在設定中的名稱（因此進得了 agent 的 inbox，也到得了團隊 orchestrator），而不是寫進一個沒有任何人讀取、以 id 命名的檔案；它會遵守 30 分鐘的重發間隔，而不是每 5 分鐘掃描就發一次；已不在 fleet 運行的 instance 所遺留的 metadata 則會被略過。
+- **`waiting_on` 逾時提醒不再重複發送或送錯地方** — 提醒會送到該 instance 在設定中的名稱（因此進得了 agent 的 inbox，也到得了團隊 orchestrator），而不是寫進一個沒有任何人讀取、以 id 命名的檔案；它會遵守 30 分鐘的重發間隔，而不是每 5 分鐘掃描就發一次；已不在 fleet 運行的 instance 所遺留的 metadata 則會被略過（#3077）。
 - **`repo checkout` 把同一個 repository 當成同一個** — 指向 linked worktree 或子目錄的 `repository_path`，現在會解析到擁有它的 canonical repo root；同一個 repository 與分支不會再因為路徑寫法不同而占用兩個受管 worktree 或兩把 lease lock，跨 agent 的分支租約檢查也無法再靠換個寫法繞過（#3078）。
 - **`agend verify` 不再回報假的 `create_delete` 失敗** — 該 smoke 會先把動態測試 agent 寫進測試 fleet，直接呈現 API 自己的錯誤而不只看傳輸層失敗，並改用終結性的 delete 交易來斷言移除，而非設計上會保留 registry 項目的 `kill`（#3080）。
 - **`agend verify --json` 在有檢查失敗時以非零狀態結束** — JSON envelope 維持不變，但 `failed > 0` 的執行現在會留下失敗的 exit status，而不是以 0 結束；只看狀態碼的腳本或 CI 步驟，不會再把失敗的 smoke 當成通過（#3082）。
+- **Watchdog 提醒會結清真正的 inbox 與收件者** — helper-staleness 與其餘 watchdog 現在會解析仍在 roster 的收件者，並在首次 drain 後結清已送達的提醒，不會再把過期通知送給 ghost instance（#2932、#2951、#3007）。
+- **CI-watch 的 arm 與 re-arm 失敗會顯示出來** — watch arm 失敗現在會以 degraded warning 呈現，tombstone re-arm 也會啟動新的通知 epoch，不再靜默重用過期狀態（#2949、#3067）。
+- **跨 team reviewer 回傳遵循 assignment-backed code review** — 有效的 assignment-backed 回傳現在可通過跨 team 檢查，不會再留下矛盾的 blocked log（#2957、#2958）。
+- **可安全釋放已註冊的 flat orphan worktree** — `repo release` 會在回收受管 flat orphan 前驗證 Git linkage、detached registration、擁有者、holder 狀態與乾淨度（#2878、#3087）。
+- **Pane scrollback 掃描受到上限控制** — scrollback 讀取現在會限制掃描範圍，避免大型 pane 產生無界工作量（#3050、#2963）。
+- **MCP proxy worker 數量受到上限控制** — 未完成的 MCP tool worker 現在經由有界上限核准，超過上限的工作會被拒絕，不再無限制累積（#3033、#3043）。
+- **Keystroke activity 寫入會合併** — 每次按鍵的寫入現在合併為約每秒一次，同時保留 submit 順序與貼上行為（#3042、#2965）。
+- **既有的 `Unresolved` review class 會被 reconcile** — PR-state 同步現在會在 SCM reconciliation 期間修復既有的 `Unresolved` 列（#3040、#3045）。
+- **缺少 fleet 時的 hang detection 會安全失敗** — 沒有候選項目時 hang detection 會直接返回，並恢復 fleet 載入 fallback，不會把缺少的 `fleet.yaml` 誤判成其他狀態（#2944、#2956）。
+- **canonical unified message body 優先** — 同時存在時，canonical send body 欄位不再被 legacy alias 覆寫（#3079、#3093）。
+- **live task 的 review branch cleanup 會記錄 retry intent** — release 會保留 live task 的 review branch，並記錄可供後續 reconciliation 消費的 cleanup intent（#3090、#3092）。
 
 ## [0.11.2] — 2026-07-23
 
