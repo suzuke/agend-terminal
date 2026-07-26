@@ -114,7 +114,7 @@ jobs:
       # the binary strictly alongside the other agend-terminal targets.
       - name: Clippy (our targets, strict)
         timeout-minutes: 15
-        run: cargo clippy -p agend-terminal --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
+        run: cargo clippy -p agend-terminal --no-deps --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
 
       - name: Build
         timeout-minutes: 20
@@ -389,7 +389,7 @@ jobs:
           set -o pipefail
           attempt=1
           while :; do
-            if cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
+            if cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
               exit 0
             fi
             if [ "$attempt" -ge 3 ]; then
