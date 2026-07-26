@@ -1,3 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "vendor/agentic-git/crates/agentic-git-core",
+    "vendor/agentic-git/crates/agentic-git",
+]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/suzuke/agend-terminal"
+
 [package]
 name = "agend-terminal"
 version = "0.11.3"
