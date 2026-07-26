@@ -1767,6 +1767,54 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
 /// Absent-binding arm of the S2 force transaction.  The branch lease is held
 /// by the caller; A/B are acquired here and the binding is re-read as truly
 /// absent before the managed target is removed.
+fn legacy_flat_target_path(home: &Path, target: &Path, agent: &str) -> bool {
+    let Ok(root) = daemon_managed_worktree_root(home).canonicalize() else {
+        return false;
+    };
+    target.parent() == Some(root.as_path())
+        && target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!("{agent}-")))
+}
+
+fn registered_detached_target(source_repo: &Path, target: &Path) -> bool {
+    let Ok(target) = target.canonicalize() else {
+        return false;
+    };
+    let Ok(entries) = crate::git_worktree::list_porcelain_exact(source_repo) else {
+        return false;
+    };
+    entries.into_iter().any(|(path, branch)| {
+        branch.is_none() && path.canonicalize().ok().as_ref() == Some(&target)
+    })
+}
+
+fn require_clean_legacy_target(target: &Path) -> Result<(), String> {
+    let status = crate::git_helpers::git_cmd(
+        target,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    )
+    .map_err(|e| {
+        format!("legacy target cleanliness is unverifiable: {e} — refusing (state preserved)")
+    })?;
+    if status
+        .lines()
+        .any(|line| line.get(3..).map(str::trim) != Some(crate::worktree_pool::MANAGED_MARKER))
+    {
+        return Err(
+            "legacy target is dirty beyond its managed marker — refusing (state preserved)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn release_absent_target_under_branch_lock(
     home: &Path,
@@ -1777,6 +1825,59 @@ pub(crate) fn release_absent_target_under_branch_lock(
     sender: Option<&str>,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     nested_discard: Option<&NestedDirtDiscard<'_>>,
+) -> ReleaseOutcome {
+    release_absent_target_impl(
+        home,
+        agent,
+        branch,
+        target,
+        source_repo,
+        sender,
+        permit,
+        nested_discard,
+        false,
+    )
+}
+
+/// Explicit repo-release arm for a full-marker legacy flat target.  The
+/// caller has already proved the marker's source identity to acquire the
+/// branch lease; this variant adds the target-shape, Git-registration,
+/// detached-HEAD, no-holder, and clean-tree gates before reusing the same
+/// removal transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn release_registered_legacy_target_under_branch_lock(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    target: &Path,
+    source_repo: &Path,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_absent_target_impl(
+        home,
+        agent,
+        branch,
+        target,
+        source_repo,
+        sender,
+        permit,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn release_absent_target_impl(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    target: &Path,
+    source_repo: &Path,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+    nested_discard: Option<&NestedDirtDiscard<'_>>,
+    registered_legacy_flat: bool,
 ) -> ReleaseOutcome {
     if !permit.authorizes(home, agent) {
         return ReleaseOutcome {
@@ -1846,11 +1947,45 @@ pub(crate) fn release_absent_target_under_branch_lock(
                 match crate::git_helpers::git_cmd(target, &["rev-parse", "--abbrev-ref", "HEAD"]) {
                     Ok(out) => {
                         let actual = out.trim();
-                        if actual != branch {
+                        let detached_legacy = registered_legacy_flat && actual == "HEAD";
+                        if actual != branch && !detached_legacy {
                             return opaque_release(format!(
                             "target actual HEAD branch '{actual}' does not match requested branch \
                              '{branch}' — refusing (post-seam identity drift; state preserved)"
                         ));
+                        }
+                        if registered_legacy_flat {
+                            if !legacy_flat_target_path(home, target, agent) {
+                                return opaque_release(
+                                    "legacy target is not an exact flat managed worktree path — refusing (state preserved)".to_string(),
+                                );
+                            }
+                            if !registered_detached_target(source_repo, target) {
+                                return opaque_release(
+                                    "legacy target is not registered as a detached Git worktree — refusing (state preserved)".to_string(),
+                                );
+                            }
+                            match crate::worktree_cleanup::branch_has_other_active_binding(
+                                home,
+                                source_repo,
+                                branch,
+                                None,
+                            ) {
+                                Some(false) => {}
+                                Some(true) => {
+                                    return opaque_release(
+                                        "legacy target branch has an active holder — refusing (state preserved)".to_string(),
+                                    )
+                                }
+                                None => {
+                                    return opaque_release(
+                                        "legacy target branch holder state is opaque — refusing (state preserved)".to_string(),
+                                    )
+                                }
+                            }
+                            if let Err(reason) = require_clean_legacy_target(target) {
+                                return opaque_release(reason);
+                            }
                         }
                     }
                     Err(e) => {

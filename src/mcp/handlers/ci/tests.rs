@@ -4574,6 +4574,192 @@ fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// RED for #2878: an old flat checkout can be fully identified even after its
+/// binding disappears.  The target is still registered by Git, deliberately
+/// detached, clean apart from the daemon marker, and addressed explicitly via
+/// the public repo-release entry.
+#[cfg(unix)]
+fn legacy_flat_registered_fixture(
+    tag: &str,
+    agent: &str,
+    branch: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let base = release_guard_tmp(tag);
+    let home = base.join("home");
+    let repo = base.join("source");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    std::fs::create_dir_all(&repo).expect("mkdir source");
+    git_init(&repo);
+    let branch_ref = std::process::Command::new("git")
+        .args(["branch", branch])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("create branch ref");
+    assert!(
+        branch_ref.status.success(),
+        "fixture branch creation failed: {}",
+        String::from_utf8_lossy(&branch_ref.stderr)
+    );
+
+    let mangled_source = repo
+        .display()
+        .to_string()
+        .replace(['/', '\\', ':'], "_")
+        .replace('~', "");
+    let target = home
+        .join("worktrees")
+        .join(format!("{agent}-{mangled_source}"));
+    let real_git = std::env::var("AGENTIC_GIT_REAL_GIT").unwrap_or_else(|_| "/usr/bin/git".into());
+    let add = std::process::Command::new(&real_git)
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            target.to_str().unwrap(),
+            branch,
+        ])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("create detached legacy worktree");
+    assert!(
+        add.status.success(),
+        "fixture worktree add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .expect("write managed marker");
+    (base, home, repo, target)
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_flat_registered_detached_explicit_release_2878() {
+    let agent = "legacy-flat-2878";
+    let branch = "feat/legacy-flat-2878";
+    let (base, home, repo, target) =
+        legacy_flat_registered_fixture("2878-flat-explicit", agent, branch);
+
+    let r = dispatch_repo_release(&home, agent, target.to_str().unwrap());
+    assert!(
+        r["released"].as_bool() == Some(true) && r.get("error").and_then(|e| e.as_str()).is_none(),
+        "registered clean detached legacy target must release: {r}"
+    );
+    assert!(!target.exists(), "released target must be removed: {r}");
+
+    let recheckout = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": repo.display().to_string(),
+            "branch": branch,
+            "bind": true,
+        }),
+        agent,
+    );
+    assert!(
+        recheckout.get("error").is_none(),
+        "a fresh checkout must succeed after the collision is cleared: {recheckout}"
+    );
+    let recreated = recheckout["path"].as_str().expect("recreated path");
+    assert!(
+        std::path::Path::new(recreated).exists(),
+        "fresh checkout target must exist: {recheckout}"
+    );
+    let cleanup = dispatch_repo_release(&home, agent, recreated);
+    assert!(
+        cleanup["released"].as_bool() == Some(true),
+        "fresh checkout cleanup must succeed: {cleanup}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_flat_dirty_target_stays_preserved_2878() {
+    let agent = "legacy-flat-dirty-2878";
+    let branch = "feat/legacy-flat-dirty-2878";
+    let (base, home, _repo, target) =
+        legacy_flat_registered_fixture("2878-flat-dirty", agent, branch);
+    std::fs::write(target.join("wip.txt"), "uncommitted").expect("write dirty fixture");
+
+    let r = dispatch_repo_release(&home, agent, target.to_str().unwrap());
+    assert!(
+        r.get("error").is_some(),
+        "dirty legacy target must refuse: {r}"
+    );
+    assert!(target.exists(), "dirty target must remain preserved: {r}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_flat_active_holder_stays_preserved_2878() {
+    let agent = "legacy-flat-held-2878";
+    let branch = "feat/legacy-flat-held-2878";
+    let (base, home, repo, target) =
+        legacy_flat_registered_fixture("2878-flat-holder", agent, branch);
+    let holder_path = base.join("active-holder");
+    std::fs::create_dir_all(&holder_path).expect("mkdir active holder");
+    crate::binding::bind_full(
+        &home,
+        "other-active-holder",
+        "",
+        branch,
+        &holder_path,
+        &repo,
+        false,
+    )
+    .expect("bind active holder");
+
+    let r = dispatch_repo_release(&home, agent, target.to_str().unwrap());
+    assert!(
+        r.get("error").is_some(),
+        "active holder must block release: {r}"
+    );
+    assert!(
+        target.exists(),
+        "active-holder collision must preserve target: {r}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn full_marker_unproven_nested_target_stays_preserved_2878() {
+    let (base, home, repo, target) = managed_wt_fixture("2878-unproven-nested");
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=legacy-nested-2878\nbranch=feat/test\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .expect("write full marker");
+
+    let r = dispatch_repo_release(&home, "legacy-nested-2878", target.to_str().unwrap());
+    assert!(
+        r.get("error").is_some(),
+        "unproven nested target must refuse: {r}"
+    );
+    assert!(
+        target.exists(),
+        "unproven target must remain preserved: {r}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// Over-correction guard (green today, must stay green): ABSENT binding +
 /// a marker missing ONLY the branch= line stays refused and preserved — the
 /// absent-binding arm must never derive identity without a branch to match.

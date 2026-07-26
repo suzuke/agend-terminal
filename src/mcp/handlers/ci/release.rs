@@ -119,9 +119,10 @@ fn delegate_managed_release(
 }
 
 /// arch14 absent-binding arm (d-20260720044124067125-6): a LEGACY marker —
-/// non-empty agent AND branch, source_repo LINE MISSING (pre-#2860 producer
-/// format) — whose binding no longer exists may release via the target's own
-/// verified Git linkage. Everything else keeps the fail-closed
+/// non-empty agent AND branch, with either a missing source_repo line
+/// (pre-#2860 producer format) or a full marker on an exact registered flat
+/// target (#2878) — whose binding no longer exists may release via verified
+/// Git linkage. Everything else keeps the fail-closed
 /// `managed_release_no_binding` refusal. Caller authority is the SAME set as
 /// the bound path (marker agent / its orchestrator / anonymous operator).
 /// Identity is path-anchored: the gitlink names the source, the checked-out
@@ -149,11 +150,13 @@ fn absent_binding_legacy_release(
     let Some((_, mk_branch, mk_source)) = parse_managed_marker(canonical) else {
         return refuse_no_binding();
     };
-    // Only the missing-LINE legacy shape qualifies; an explicit (even blank)
-    // source_repo value or a branchless marker stays refused.
-    if mk_source.is_some() || mk_branch.is_empty() {
+    // A branchless marker or an explicit blank source_repo stays refused. A
+    // non-empty source_repo is admitted only for the exact flat/registered
+    // legacy target, proved again inside the canonical transaction below.
+    if mk_branch.is_empty() || mk_source.as_deref() == Some("") {
         return refuse_no_binding();
     }
+    let registered_flat = mk_source.is_some();
     if !caller.is_empty()
         && caller != marker_agent
         && !crate::teams::is_orchestrator_of(home, caller, marker_agent)
@@ -218,7 +221,7 @@ fn absent_binding_legacy_release(
             });
         }
     };
-    if head_branch != mk_branch {
+    if head_branch != mk_branch && !(registered_flat && head_branch == "HEAD") {
         return json!({
             "error": format!(
                 "legacy marker branch '{mk_branch}' does not match checked-out branch '{head_branch}' — refusing"
@@ -258,16 +261,34 @@ fn absent_binding_legacy_release(
             }
         };
     let sender = (!caller.is_empty()).then_some(caller);
-    let outcome = crate::worktree_pool::release_absent_target_under_branch_lock(
-        home,
-        marker_agent,
-        &mk_branch,
-        canonical,
-        &source_canonical,
-        sender,
-        &permit,
-        nested_discard,
-    );
+    if registered_flat && nested_discard.is_some() {
+        return json!({
+            "error": "nested dirt discard is not supported for registered flat legacy releases; resolve nested dirt in place before releasing",
+            "code": "discard_unsupported_release_path",
+        });
+    }
+    let outcome = if registered_flat {
+        crate::worktree_pool::release_registered_legacy_target_under_branch_lock(
+            home,
+            marker_agent,
+            &mk_branch,
+            canonical,
+            &source_canonical,
+            sender,
+            &permit,
+        )
+    } else {
+        crate::worktree_pool::release_absent_target_under_branch_lock(
+            home,
+            marker_agent,
+            &mk_branch,
+            canonical,
+            &source_canonical,
+            sender,
+            &permit,
+            nested_discard,
+        )
+    };
     let mut resp = json!({
         "path": canonical.display().to_string(),
         "legacy_absent_binding": true,
