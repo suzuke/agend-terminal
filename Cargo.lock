@@ -88,6 +88,7 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "serde_json",
+ "syn 2.0.118",
  "which",
 ]
 
