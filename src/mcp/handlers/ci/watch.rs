@@ -152,12 +152,18 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let existing = std::fs::read_to_string(&watch_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let requested_review_class = args["review_class"].as_str().filter(|s| !s.is_empty());
     // Re-arming an unwatch TOMBSTONE? Same predicate as `sweep.rs`
     // (`auto_arm_optout` + no subscribers), read from the PRE-EXISTING file —
     // before this call appends its subscriber or removes the optout below.
     let tombstone_rearm = existing.as_ref().is_some_and(|w| {
         w.get("auto_arm_optout").and_then(|v| v.as_bool()) == Some(true)
             && crate::daemon::ci_watch::parse_subscribers(w).is_empty()
+    });
+    let review_class_changed = requested_review_class.is_some_and(|requested| {
+        existing
+            .as_ref()
+            .is_some_and(|w| w.get("review_class").and_then(|v| v.as_str()) != Some(requested))
     });
     let mut watch = existing.unwrap_or_else(|| {
             json!({
@@ -249,7 +255,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         // restoring them. Keys are removed, not nulled: every field is
         // `#[serde(default)]` and `last_notified_by_workflow` is a plain
         // `BTreeMap`, so a null would make the watch unreadable to the poller.
-        if tombstone_rearm {
+        if tombstone_rearm || review_class_changed {
             for key in [
                 "last_notified_by_workflow",
                 "last_run_id",
@@ -291,7 +297,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["task_id"] = json!(tid);
     }
     // #972: persist review_class for §3.5 dual-review gate.
-    if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(rc) = requested_review_class {
         watch["review_class"] = json!(rc);
     }
     // S1: persist the (validated, lowercased) exact-head pin. Its PRESENCE marks

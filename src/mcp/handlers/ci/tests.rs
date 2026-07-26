@@ -3513,8 +3513,8 @@ fn unchanged_review_class_preserves_notification_epoch_3114() {
 
 /// The complement of the test above, and the regression risk of the reset: an
 /// ORDINARY resubscribe (no tombstone — the watch still has a live subscriber)
-/// must NOT touch the notification cursors or the generation. Only the
-/// zero-subscriber tombstone path starts a new epoch.
+/// with no review-class change must NOT touch the notification cursors or the
+/// generation.
 #[test]
 fn ordinary_resubscribe_preserves_notify_cursors_and_generation() {
     let home = watch_test_home("ordinary-resubscribe-epoch");
