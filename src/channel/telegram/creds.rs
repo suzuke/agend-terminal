@@ -57,7 +57,10 @@ pub(crate) fn resolve_channel_from(
             let fallback = std::env::var(fallback_name);
             if fallback.is_ok() {
                 if fallback_name == LEGACY {
-                    tracing::warn!("AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env}");
+                    tracing::warn!(
+                        "AGEND_BOT_TOKEN is a supported compatibility name — \
+                         {bot_token_env} is preferred for new installs"
+                    );
                 } else {
                     tracing::warn!(
                         "fleet.yaml bot_token_env '{bot_token_env}' is not set; using \

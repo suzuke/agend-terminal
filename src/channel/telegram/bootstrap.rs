@@ -52,7 +52,8 @@ pub fn init_from_config(
                 Ok(t) => {
                     if fallback == "AGEND_BOT_TOKEN" {
                         tracing::warn!(
-                            "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env} in fleet.yaml"
+                            "AGEND_BOT_TOKEN is a supported compatibility name — set \
+                             {bot_token_env} in fleet.yaml for new installs"
                         );
                     }
                     t

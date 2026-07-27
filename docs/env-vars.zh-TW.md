@@ -42,9 +42,9 @@
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_TELEGRAM_BOT_TOKEN` | 存放 Telegram bot token 的環境變數的預設名稱。 | 設定欄位預設指向名稱 `AGEND_TELEGRAM_BOT_TOKEN`；若讀取當下該變數未設定，則退回舊版 `AGEND_BOT_TOKEN`（並發出 deprecation 警告）。 | Telegram bot token 字串。 | `src/fleet/mod.rs:227`（預設名稱）；於 `src/channel/telegram/creds.rs:23` 讀取 | 🔒 Secret。面向 operator。 |
+| `AGEND_TELEGRAM_BOT_TOKEN` | 存放 Telegram bot token 的環境變數的預設名稱。 | 設定欄位預設指向名稱 `AGEND_TELEGRAM_BOT_TOKEN`；若讀取當下該變數未設定，則退回受支援的相容名稱 `AGEND_BOT_TOKEN`（並發出提示）。 | Telegram bot token 字串。 | `src/fleet/mod.rs:227`（預設名稱）；於 `src/channel/telegram/creds.rs:23` 讀取 | 🔒 Secret。面向 operator。 |
 | `AGEND_DISCORD_BOT_TOKEN` | 存放 Discord bot token 的環境變數的預設名稱。 | token 變數未設定 → Discord channel 不啟用（走「無憑證」分支）。 | Discord bot token 字串。 | `src/fleet/mod.rs:230`（預設名稱）；於 `src/channel/telegram/creds.rs:23` 解參考讀取 | 🔒 Secret。面向 operator。與 telegram channel 共用同一套 token 間接機制。 |
-| `AGEND_BOT_TOKEN` | **舊版／fallback** 的 Telegram bot token，只有在設定的 `bot_token_env` 變數未設定時才讀取；會發出 deprecation 警告，引導 operator 改用 `bot_token_env`。 | 兩者都未設定 → 出現「bot token env not set」錯誤；telegram verify 測試會被略過。 | Telegram bot token 字串。 | `src/channel/telegram/creds.rs:25`；`src/channel/telegram/bootstrap.rs:39` | 🔒 Secret。**已棄用（Deprecated）**——僅作為讀取時的 fallback。`quickstart` 現在會寫入正式的 `AGEND_TELEGRAM_BOT_TOKEN`（並在重新執行時把舊版那一行遷移掉）；建議在 fleet.yaml 改用 `bot_token_env`。 |
+| `AGEND_BOT_TOKEN` | **受支援的相容** Telegram bot token，只有在設定的 `bot_token_env` 變數未設定時才讀取；會發出提示，建議 operator 改用 `bot_token_env`。 | 兩者都未設定 → 出現「bot token env not set」錯誤；telegram verify 測試會被略過。 | Telegram bot token 字串。 | `src/channel/telegram/creds.rs:25`；`src/channel/telegram/bootstrap.rs:39` | 🔒 Secret。**受支援的相容名稱**——僅作為讀取時的 fallback。`quickstart` 現在會寫入正式的 `AGEND_TELEGRAM_BOT_TOKEN`（並在重新執行時把舊版那一行遷移掉）；建議在 fleet.yaml 改用 `bot_token_env`。 |
 | `AGEND_TELEGRAM_GROUP_ID` | `quickstart` 讀取的 Telegram supergroup id（若有設定），用來在產生的 fleet.yaml 中填入 `group_id`，讓 onboarding 可以從環境預先帶入 channel 綁定。 | 未設定 → `quickstart` 不會填入 `group_id`（由 operator 在 fleet.yaml／透過 topic 綁定自行填寫）。 | Telegram chat/supergroup id 字串（例如 `-100…`）。 | `src/quickstart.rs:174` | 面向 operator，只在 `quickstart` onboarding 時讀取（不在 hot path 上）。非機密。 |
 
 ---
