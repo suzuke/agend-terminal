@@ -778,6 +778,41 @@ fn lease_bound(home: &Path, repo: &Path, agent: &str, branch: &str) -> WorktreeL
     l
 }
 
+/// Build the surviving flat `repo action=checkout bind:false` shape: the
+/// worktree is daemon-marked and Git-registered, but no binding exists.
+fn flat_unbound_registered_fixture(
+    tag: &str,
+    agent: &str,
+    branch: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let home = tmp_home(&format!("{tag}-home"));
+    let repo = tmp_repo(&format!("{tag}-repo"));
+    let target = daemon_managed_worktree_root(&home).join(format!("{agent}-flat"));
+    std::fs::create_dir_all(daemon_managed_worktree_root(&home)).unwrap();
+    let branch_result = crate::git_helpers::git_bypass(&repo, &["branch", branch]);
+    assert!(
+        branch_result.as_ref().is_ok_and(|out| out.status.success()),
+        "fixture branch creation failed: {branch_result:?}"
+    );
+    let target_str = target.to_str().expect("UTF-8 target");
+    let add_result =
+        crate::git_helpers::git_bypass(&repo, &["worktree", "add", "--detach", target_str, branch]);
+    assert!(
+        add_result.as_ref().is_ok_and(|out| out.status.success()),
+        "fixture worktree add failed: {add_result:?}"
+    );
+    std::fs::write(
+        target.join(MANAGED_MARKER),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    assert!(crate::binding::read(&home, agent).is_none());
+    (home, repo, target)
+}
+
 #[test]
 fn lease_main_branch_rejected() {
     let home = tmp_home("main-reject");
@@ -1370,6 +1405,85 @@ fn p0x_release_full_missing_binding_graceful() {
     assert!(!outcome.worktree_removed);
     assert!(!outcome.binding_removed);
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3124 RED: default release must not report idempotent success while a
+/// registered flat bind:false worktree survives without a binding. The
+/// explicit typed repo-release route remains the actionable recovery path.
+#[test]
+fn release_full_flat_unbound_registered_fails_closed() {
+    let agent = "agent-3124-flat";
+    let branch = "feat/3124-flat";
+    let (home, repo, target) = flat_unbound_registered_fixture("3124-clean", agent, branch);
+    let before = worktree_list(&repo);
+    assert_eq!(
+        before
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        2,
+        "fixture must be Git-registered before release: {before}"
+    );
+
+    let outcome = release_full(&home, agent, false);
+
+    assert!(
+        !outcome.released,
+        "surviving flat managed worktree must not be reported released: {outcome:?}"
+    );
+    let error = outcome.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("repo action=release")
+            && error.contains(target.to_str().unwrap())
+            && error.contains("repository_path")
+            && error.contains(repo.to_str().unwrap()),
+        "refusal must name the existing typed recovery route and both paths: {outcome:?}"
+    );
+    assert!(
+        target.exists(),
+        "failed-closed release must preserve target"
+    );
+    let after = worktree_list(&repo);
+    assert_eq!(
+        after.lines().filter(|l| l.starts_with("worktree ")).count(),
+        2,
+        "failed-closed release must preserve Git registration: {after}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3124 dirty control: a surviving flat candidate remains untouched and
+/// refuses the same default release route.
+#[test]
+fn release_full_flat_unbound_dirty_preserves_candidate() {
+    let agent = "agent-3124-dirty";
+    let branch = "feat/3124-dirty";
+    let (home, repo, target) = flat_unbound_registered_fixture("3124-dirty", agent, branch);
+    std::fs::write(target.join("WIP.txt"), "uncommitted\n").unwrap();
+    let before = worktree_list(&repo);
+
+    let outcome = release_full(&home, agent, false);
+
+    assert!(
+        !outcome.released,
+        "dirty flat candidate must not be reported released: {outcome:?}"
+    );
+    assert!(
+        outcome.error.is_some(),
+        "dirty flat candidate must return an actionable refusal: {outcome:?}"
+    );
+    assert!(target.exists(), "dirty candidate must remain preserved");
+    assert!(target.join("WIP.txt").exists(), "dirty content must remain");
+    assert_eq!(
+        worktree_list(&repo),
+        before,
+        "dirty refusal must preserve Git registration"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
