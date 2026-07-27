@@ -7565,6 +7565,109 @@ fn exact_head_success_resolves_target_ignoring_newer_branch_run() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// RED: a delivered terminal failure at the pinned SHA must keep the exact-head
+/// watch armed so a rerun can produce a later success notification.
+#[test]
+fn exact_head_terminal_failure_keeps_watch_armed_for_rerun() {
+    let dir = tmp_dir("s1-exact-head-failure");
+    let provider = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &provider).unwrap();
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "a delivered terminal failure must keep the exact-head watch armed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RED: a same-run rerun with an advanced attempt must notify on success and
+/// then clear the exact-head watch.
+#[test]
+fn exact_head_rerun_success_notifies_and_clears_after_failure() {
+    let dir = tmp_dir("s1-exact-head-rerun");
+    let failure = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &failure).unwrap();
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "the failed first attempt must leave the watch armed"
+    );
+    let after_failure: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(exact_head_watch_path(&dir)).unwrap())
+            .unwrap();
+    let success = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 2, Some("success"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &after_failure, &success).unwrap();
+    assert!(
+        !exact_head_watch_path(&dir).exists(),
+        "a successful rerun must clear the exact-head watch"
+    );
+    let inbox = std::fs::read_to_string(dir.join("inbox").join("reviewer-x.jsonl"))
+        .expect("rerun success must notify the subscriber");
+    assert_eq!(
+        inbox
+            .lines()
+            .filter(|line| line.contains("[ci-ready-for-action]"))
+            .count(),
+        1,
+        "the successful rerun must produce one ready-for-action notification: {inbox}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RED: an unchanged terminal failure must remain quiet and must not refresh
+/// either the activity marker or the TTL while the watch stays armed.
+#[test]
+fn exact_head_unchanged_failure_keeps_watch_without_refreshing_ttl() {
+    let dir = tmp_dir("s1-exact-head-unchanged-failure");
+    let first = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &first).unwrap();
+    let watch_path = exact_head_watch_path(&dir);
+    let after_first: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    let expires_at = after_first["expires_at"].clone();
+    let last_terminal_seen_at = after_first["last_terminal_seen_at"].clone();
+    let second = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &after_first, &second).unwrap();
+    assert!(
+        watch_path.exists(),
+        "an unchanged terminal failure must keep the exact-head watch armed"
+    );
+    let after_second: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        after_second["expires_at"], expires_at,
+        "an unchanged terminal failure must not refresh the watch TTL"
+    );
+    assert_eq!(
+        after_second["last_terminal_seen_at"], last_terminal_seen_at,
+        "an unchanged terminal failure must not refresh activity"
+    );
+    let inbox = std::fs::read_to_string(dir.join("inbox").join("reviewer-x.jsonl"))
+        .expect("first failure must notify the subscriber");
+    assert_eq!(
+        inbox
+            .lines()
+            .filter(|line| line.contains("[ci-fail]"))
+            .count(),
+        1,
+        "an unchanged terminal failure must not re-notify: {inbox}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Target SHA still PENDING (by-SHA) while the branch page shows a newer green.
 /// The watch must stay ARMED — a newer unrelated green never completes it.
 #[test]
@@ -7960,10 +8063,10 @@ fn arch14_exact_head_blocked_inbox_keeps_watch_armed() {
 }
 
 /// Supplemental RED B: after the blocked poll, a healthy retry delivers the
-/// exact-head terminal notification EXACTLY once and only then removes the
-/// watch (settlement-gated clear).
+/// exact-head terminal failure EXACTLY once and keeps the watch armed for a
+/// later successful rerun.
 #[test]
-fn arch14_exact_head_retry_delivers_then_clears() {
+fn arch14_exact_head_retry_delivers_and_keeps_failure_armed() {
     let dir = tmp_dir("arch14-eh-retry");
     let ci_dir = dir.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
@@ -7992,8 +8095,8 @@ fn arch14_exact_head_retry_delivers_then_clears() {
         "exact-head retry must deliver exactly once: {body}"
     );
     assert!(
-        !watch_path.exists(),
-        "exact-head watch is removed only AFTER the delivery settled"
+        watch_path.exists(),
+        "a delivered exact-head failure remains armed for a successful rerun"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
