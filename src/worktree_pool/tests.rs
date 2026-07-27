@@ -785,6 +785,15 @@ fn flat_unbound_registered_fixture(
     agent: &str,
     branch: &str,
 ) -> (PathBuf, PathBuf, PathBuf) {
+    flat_unbound_fixture(tag, agent, branch, true)
+}
+
+fn flat_unbound_fixture(
+    tag: &str,
+    agent: &str,
+    branch: &str,
+    detached: bool,
+) -> (PathBuf, PathBuf, PathBuf) {
     let home = tmp_home(&format!("{tag}-home"));
     let repo = tmp_repo(&format!("{tag}-repo"));
     let target = daemon_managed_worktree_root(&home).join(format!("{agent}-flat"));
@@ -795,8 +804,12 @@ fn flat_unbound_registered_fixture(
         "fixture branch creation failed: {branch_result:?}"
     );
     let target_str = target.to_str().expect("UTF-8 target");
-    let add_result =
-        crate::git_helpers::git_bypass(&repo, &["worktree", "add", "--detach", target_str, branch]);
+    let add_args = if detached {
+        vec!["worktree", "add", "--detach", target_str, branch]
+    } else {
+        vec!["worktree", "add", target_str, branch]
+    };
+    let add_result = crate::git_helpers::git_bypass(&repo, &add_args);
     assert!(
         add_result.as_ref().is_ok_and(|out| out.status.success()),
         "fixture worktree add failed: {add_result:?}"
@@ -810,6 +823,28 @@ fn flat_unbound_registered_fixture(
     )
     .unwrap();
     assert!(crate::binding::read(&home, agent).is_none());
+    (home, repo, target)
+}
+
+fn flat_unbound_path_only_fixture(
+    tag: &str,
+    agent: &str,
+    branch: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let (home, repo, target) = flat_unbound_registered_fixture(tag, agent, branch);
+    let gitlink = std::fs::read_to_string(target.join(".git")).expect("read .git gitlink");
+    let gitdir = gitlink
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))
+        .map(PathBuf::from)
+        .expect("gitdir pointer");
+    std::fs::remove_dir_all(gitdir).expect("remove Git worktree registration");
+    std::fs::remove_file(target.join(".git")).expect("remove dangling Git pointer");
+    std::fs::write(
+        target.join(MANAGED_MARKER),
+        format!("agent={agent}\nbranch={branch}\n"),
+    )
+    .expect("rewrite path-only marker");
     (home, repo, target)
 }
 
@@ -1480,6 +1515,123 @@ fn release_full_flat_unbound_dirty_preserves_candidate() {
         worktree_list(&repo),
         before,
         "dirty refusal must preserve Git registration"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3124 RED: a flat marker-owned worktree registered on its named branch is
+/// still a surviving candidate and must not be reported as an absent no-op.
+#[test]
+fn release_full_flat_unbound_branch_registered_fails_closed() {
+    let agent = "agent-3124-branch";
+    let branch = "feat/3124-branch";
+    let (home, repo, target) = flat_unbound_fixture("3124-branch", agent, branch, false);
+    let before = worktree_list(&repo);
+    assert_eq!(
+        before
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        2,
+        "fixture must be Git-registered before release: {before}"
+    );
+
+    let outcome = release_full(&home, agent, false);
+
+    assert!(
+        !outcome.released,
+        "branch survivor must refuse release: {outcome:?}"
+    );
+    let error = outcome.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("repo action=release")
+            && error.contains(target.to_str().unwrap())
+            && error.contains("repository_path")
+            && error.contains(repo.to_str().unwrap()),
+        "refusal must name typed recovery for exact source: {outcome:?}"
+    );
+    assert!(
+        target.exists(),
+        "failed-closed release must preserve target"
+    );
+    assert_eq!(
+        worktree_list(&repo),
+        before,
+        "failed-closed release must preserve branch registration"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3124 RED: a marker-owned flat path can survive after Git registration and
+/// its source pointer are gone; default release must still refuse success and
+/// direct the operator to preserve it for GC/archive recovery.
+#[test]
+fn release_full_flat_unbound_path_only_fails_closed() {
+    let agent = "agent-3124-path";
+    let branch = "feat/3124-path";
+    let (home, repo, target) = flat_unbound_path_only_fixture("3124-path", agent, branch);
+    assert_eq!(
+        worktree_list(&repo)
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        1,
+        "path-only fixture must have no surviving Git registration"
+    );
+
+    let outcome = release_full(&home, agent, false);
+
+    assert!(
+        !outcome.released,
+        "path-only survivor must refuse release: {outcome:?}"
+    );
+    let error = outcome.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("preserved") && error.contains("GC/archive"),
+        "refusal must give preservation/GC guidance without source proof: {outcome:?}"
+    );
+    assert!(target.exists(), "failed-closed release must preserve path");
+    assert!(
+        target.join(MANAGED_MARKER).exists(),
+        "failed-closed release must preserve ownership marker"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3124 RED: a similarly-prefixed agent's flat target and mismatched marker
+/// remain outside the requested agent's ownership proof and keep idempotence.
+#[test]
+fn release_full_flat_unbound_prefix_collision_is_idempotent() {
+    let requested_agent = "agent-3124";
+    let owned_agent = "agent-31240";
+    let branch = "feat/3124-prefix";
+    let (home, repo, target) = flat_unbound_registered_fixture("3124-prefix", owned_agent, branch);
+
+    let outcome = release_full(&home, requested_agent, false);
+
+    assert!(
+        outcome.released,
+        "unrelated prefix must remain an absent no-op"
+    );
+    assert!(
+        outcome.already_released,
+        "prefix collision must be idempotent"
+    );
+    assert!(outcome.error.is_none(), "unrelated marker must not refuse");
+    assert!(target.exists(), "unrelated target must remain untouched");
+    assert_eq!(
+        worktree_list(&repo)
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        2,
+        "unrelated target registration must remain untouched"
     );
 
     std::fs::remove_dir_all(&home).ok();
