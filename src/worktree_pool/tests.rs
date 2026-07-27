@@ -1459,6 +1459,8 @@ fn release_full_flat_unbound_registered_fails_closed() {
         2,
         "fixture must be Git-registered before release: {before}"
     );
+    let expected_target = dunce::canonicalize(&target).expect("canonicalize expected target");
+    let expected_repo = dunce::canonicalize(&repo).expect("canonicalize expected repository");
 
     let outcome = release_full(&home, agent, false);
 
@@ -1469,9 +1471,9 @@ fn release_full_flat_unbound_registered_fails_closed() {
     let error = outcome.error.as_deref().unwrap_or("");
     assert!(
         error.contains("repo action=release")
-            && error.contains(target.to_str().unwrap())
+            && error.contains(expected_target.to_str().unwrap())
             && error.contains("repository_path")
-            && error.contains(repo.to_str().unwrap()),
+            && error.contains(expected_repo.to_str().unwrap()),
         "refusal must name the existing typed recovery route and both paths: {outcome:?}"
     );
     assert!(
@@ -1537,6 +1539,8 @@ fn release_full_flat_unbound_branch_registered_fails_closed() {
         2,
         "fixture must be Git-registered before release: {before}"
     );
+    let expected_target = dunce::canonicalize(&target).expect("canonicalize expected target");
+    let expected_repo = dunce::canonicalize(&repo).expect("canonicalize expected repository");
 
     let outcome = release_full(&home, agent, false);
 
@@ -1547,9 +1551,9 @@ fn release_full_flat_unbound_branch_registered_fails_closed() {
     let error = outcome.error.as_deref().unwrap_or("");
     assert!(
         error.contains("repo action=release")
-            && error.contains(target.to_str().unwrap())
+            && error.contains(expected_target.to_str().unwrap())
             && error.contains("repository_path")
-            && error.contains(repo.to_str().unwrap()),
+            && error.contains(expected_repo.to_str().unwrap()),
         "refusal must name typed recovery for exact source: {outcome:?}"
     );
     assert!(
