@@ -241,6 +241,9 @@ Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一
 - 新 MCP tool → 更新 `docs/MCP-TOOLS.md` 和 `README.md` 中的 MCP Tools 表。
 - 重大的使用者面向變更 → 在 `CHANGELOG.md` 的 `## [Unreleased]` 底下加一條。
 - Plan / eval 文件（`docs/PLAN-*.md`、`docs/EVAL-*.md`）代表的是某個時間點的意圖——工作交付後,更新狀態或把該文件併入。
+- 規範性行為以英文為準——`docs/FLEET-DEV-PROTOCOL.md` 由 `src/protocol.rs` 的 `include_str!` 編譯進 binary,因此兩種語言不一致時,以英文檔為正確,zh-TW 檔即是待修的錯誤。
+- 每份納管的 Markdown 都是強制的雙語配對——`tests/docs_bilingual_invariant.rs` 會在缺少對應檔時失敗,標題、code fence、表格、連結、release key 或 `AGEND_*` 結構不一致時亦然。它比對的是結構而非散文,因此讓文字語意保持同步仍是人的責任。
+- 只修正翻譯的變更不需要動英文版。
 
 ## 發布
 

@@ -252,6 +252,9 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
 - New MCP tool → update `docs/MCP-TOOLS.md` and the MCP Tools table in `README.md`.
 - Major user-facing change → add an entry to `CHANGELOG.md` under `## [Unreleased]`.
 - Plan / eval docs (`docs/PLAN-*.md`, `docs/EVAL-*.md`) represent intent at a point in time — when work ships, update status or fold the doc.
+- English is canonical for normative behavior — `docs/FLEET-DEV-PROTOCOL.md` is compiled into the binary by `include_str!` in `src/protocol.rs`, so where the two languages disagree, the English file is correct and the zh-TW file is the bug.
+- Every tracked Markdown file is a mandatory bilingual pair — `tests/docs_bilingual_invariant.rs` fails on a missing sibling, and on divergent heading, code-fence, table, link, release-key, or `AGEND_*` structure. It compares structure, not prose, so keeping the wording in sync stays a human responsibility.
+- A translation-only correction needs no English counterpart.
 
 ## Releasing
 
