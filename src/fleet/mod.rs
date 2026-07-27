@@ -260,8 +260,8 @@ pub enum ChannelConfig {
     #[serde(rename = "telegram")]
     Telegram {
         /// Env var name containing the bot token. Defaults to
-        /// `AGEND_TELEGRAM_BOT_TOKEN`; falls back to legacy `AGEND_BOT_TOKEN`
-        /// with a deprecation warning.
+        /// `AGEND_TELEGRAM_BOT_TOKEN`; falls back to the supported
+        /// compatibility name `AGEND_BOT_TOKEN` with a notice.
         #[serde(default = "default_telegram_bot_token_env")]
         bot_token_env: String,
         /// Telegram group chat ID.
