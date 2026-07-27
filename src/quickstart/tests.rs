@@ -753,6 +753,7 @@ fn clear_token_envs() {
 /// entry must succeed. Pre-#2005 the template pinned the legacy name and
 /// this exact shape failed at daemon startup.
 #[test]
+#[serial_test::serial]
 fn fresh_install_channel_resolves_2005() {
     let _g = token_env_guard();
     clear_token_envs();
@@ -777,6 +778,7 @@ fn fresh_install_channel_resolves_2005() {
 /// Old-install shape: new template + an old `.env` still carrying the
 /// LEGACY key → resolves via the legacy fallback (deprecation warn).
 #[test]
+#[serial_test::serial]
 fn old_install_legacy_env_still_resolves_2005() {
     let _g = token_env_guard();
     clear_token_envs();
@@ -797,6 +799,7 @@ fn old_install_legacy_env_still_resolves_2005() {
 /// fallback retried the SAME legacy name (dead code) and resolution
 /// failed; the symmetric fallback must now find the canonical var.
 #[test]
+#[serial_test::serial]
 fn old_template_fleet_with_canonical_env_resolves_2005() {
     let _g = token_env_guard();
     clear_token_envs();
@@ -819,6 +822,7 @@ fn old_template_fleet_with_canonical_env_resolves_2005() {
 
 /// Negative: neither env set → clear error naming the configured var.
 #[test]
+#[serial_test::serial]
 fn no_token_env_errors_clearly_2005() {
     let _g = token_env_guard();
     clear_token_envs();

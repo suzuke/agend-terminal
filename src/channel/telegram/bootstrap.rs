@@ -40,18 +40,29 @@ pub fn init_from_config(
     };
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
-        Err(_) => match std::env::var("AGEND_BOT_TOKEN") {
-            Ok(t) => {
-                tracing::warn!(
-                    "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env} in fleet.yaml"
-                );
-                t
+        // #2005 symmetric fallback: the OTHER of canonical/legacy. Retrying the
+        // configured name (the old literal) is a guaranteed miss.
+        Err(_) => {
+            let fallback = if bot_token_env == "AGEND_TELEGRAM_BOT_TOKEN" {
+                "AGEND_BOT_TOKEN"
+            } else {
+                "AGEND_TELEGRAM_BOT_TOKEN"
+            };
+            match std::env::var(fallback) {
+                Ok(t) => {
+                    if fallback == "AGEND_BOT_TOKEN" {
+                        tracing::warn!(
+                            "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env} in fleet.yaml"
+                        );
+                    }
+                    t
+                }
+                Err(_) => {
+                    tracing::info!(env = %bot_token_env, "bot token env not set, skipping");
+                    return None;
+                }
             }
-            Err(_) => {
-                tracing::info!(env = %bot_token_env, "bot token env not set, skipping");
-                return None;
-            }
-        },
+        }
     };
     match user_allowlist {
         None => tracing::warn!(
@@ -231,5 +242,67 @@ pub(super) fn resolve_fleet_binding(
             tracing::error!(error = %e, %name, "failed to create fleet_binding topic");
             None
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::fleet::FleetConfig;
+
+    /// #2005 left the symmetric fallback in `creds.rs` only; this site kept a
+    /// legacy-ward literal, so a fleet pinning `bot_token_env: AGEND_BOT_TOKEN`
+    /// whose `.env` had been migrated to the canonical key retried the SAME
+    /// missing name and skipped Telegram — while `creds::resolve_token_value`
+    /// (the doctor pre-flight gate) resolved it. Only that row regressed; the
+    /// other three are already covered by the #2005 pins in
+    /// `quickstart::tests`.
+    ///
+    /// Drives the real `init_from_config`, which on a resolving row reaches
+    /// `start_polling` with a fake token exactly as the sibling reply/topic
+    /// tests in this module do; teloxide answers `Invalid bot token` and stops
+    /// without retrying, so nothing is awaited here.
+    #[test]
+    #[serial_test::serial]
+    fn legacy_bot_token_env_resolves_canonical_var_at_startup_3099() {
+        const CANONICAL: &str = "AGEND_TELEGRAM_BOT_TOKEN";
+        const LEGACY: &str = "AGEND_BOT_TOKEN";
+        let saved_c = std::env::var(CANONICAL).ok();
+        let saved_l = std::env::var(LEGACY).ok();
+        std::env::set_var(CANONICAL, "123:canonical");
+        std::env::remove_var(LEGACY);
+
+        let home = std::env::temp_dir().join(format!("agend-tg-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // No instances and no fleet_binding: both auto-create loops stay empty,
+        // so the resolved path performs no Telegram API call.
+        let config = FleetConfig {
+            channel: Some(ChannelConfig::Telegram {
+                bot_token_env: LEGACY.into(),
+                group_id: -100123,
+                mode: "topic".into(),
+                user_allowlist: Some(vec![crate::fleet::AllowlistEntry::Id(42)]),
+                fleet_binding: None,
+            }),
+            ..Default::default()
+        };
+        let started = init_from_config(&config, &home, HashMap::new());
+
+        std::fs::remove_dir_all(&home).ok();
+        match saved_c {
+            Some(v) => std::env::set_var(CANONICAL, v),
+            None => std::env::remove_var(CANONICAL),
+        }
+        if let Some(v) = saved_l {
+            std::env::set_var(LEGACY, v);
+        }
+
+        assert!(
+            started.is_some(),
+            "legacy bot_token_env + canonical-only env must resolve at startup, \
+             not skip — the doctor gate already resolves this row"
+        );
     }
 }
