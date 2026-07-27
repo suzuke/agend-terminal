@@ -6,6 +6,7 @@ use std::process::Command;
 const ROOT_GITIGNORE: &str = include_str!("../.gitignore");
 
 fn git_check_ignored(repo: &Path, path: &str) -> bool {
+    // allow: raw-git-subprocess — hermetic temp-repo ignore probe with bypass env
     Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .env("AGENTIC_GIT_BYPASS", "1")
@@ -23,6 +24,7 @@ fn branch_cleanup_log_is_ignored_without_hiding_regular_logs() {
     std::fs::create_dir_all(&repo).expect("temporary Git repository directory must be created");
     std::fs::write(repo.join(".gitignore"), ROOT_GITIGNORE)
         .expect("temporary Git repository .gitignore must be written");
+    // allow: raw-git-subprocess — hermetic temp-repo setup with bypass env
     let init = Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .env("AGENTIC_GIT_BYPASS", "1")
