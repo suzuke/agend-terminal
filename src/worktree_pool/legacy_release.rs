@@ -3,24 +3,37 @@ use std::path::{Path, PathBuf};
 /// A missing binding is normally an idempotent no-op. A surviving flat
 /// `repo action=checkout bind:false` worktree is the exception: preserve it
 /// and point the caller at the existing typed path-addressed release route.
-/// The candidate scan is read-only and requires the existing marker, flat
-/// layout, source identity, and detached Git registration proofs.
+/// The candidate scan is read-only and requires only the exact marker-owned
+/// flat layout; source/linkage proofs select typed recovery guidance.
 pub(super) fn absent_release_outcome(home: &Path, agent: &str) -> super::ReleaseOutcome {
-    let Some((target, source_repo)) = find_flat_registered_candidate(home, agent) else {
+    let Some(candidate) = find_flat_candidate(home, agent) else {
         return super::idempotent_absent();
     };
-    super::ReleaseOutcome {
-        error: Some(format!(
+    let error = if let Some(source_repo) = candidate.source_repo {
+        format!(
             "release refused: flat daemon-managed worktree for '{agent}' survives at '{}'; use repo action=release with path='{}' repository_path='{}'",
-            target.display(),
-            target.display(),
+            candidate.target.display(),
+            candidate.target.display(),
             source_repo.display()
-        )),
+        )
+    } else {
+        format!(
+            "release refused: owned flat daemon-managed worktree for '{agent}' survives at '{}'; repository identity is unproven — path is preserved for GC/archive recovery",
+            candidate.target.display()
+        )
+    };
+    super::ReleaseOutcome {
+        error: Some(error),
         ..super::ReleaseOutcome::default()
     }
 }
 
-fn find_flat_registered_candidate(home: &Path, agent: &str) -> Option<(PathBuf, PathBuf)> {
+struct FlatCandidate {
+    target: PathBuf,
+    source_repo: Option<PathBuf>,
+}
+
+fn find_flat_candidate(home: &Path, agent: &str) -> Option<FlatCandidate> {
     let mut candidates = Vec::new();
     super::collect_managed_worktrees(
         &super::daemon_managed_worktree_root(home),
@@ -34,13 +47,13 @@ fn find_flat_registered_candidate(home: &Path, agent: &str) -> Option<(PathBuf, 
         {
             return None;
         }
-        let source_repo = super::marker_source_repo(&target)?.canonicalize().ok()?;
-        if !super::target_source_repo_matches(&target, &source_repo)
-            || !registered_detached_target(&source_repo, &target)
-        {
-            return None;
-        }
-        Some((target, source_repo))
+        let source_repo = super::marker_source_repo(&target)
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|source_repo| super::target_source_repo_matches(&target, source_repo));
+        Some(FlatCandidate {
+            target,
+            source_repo,
+        })
     })
 }
 
