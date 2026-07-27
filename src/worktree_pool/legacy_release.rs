@@ -58,7 +58,7 @@ fn find_flat_candidate(home: &Path, agent: &str) -> Option<FlatCandidate> {
 }
 
 pub(super) fn legacy_flat_target_path(home: &Path, target: &Path, agent: &str) -> bool {
-    let Ok(root) = super::daemon_managed_worktree_root(home).canonicalize() else {
+    let Ok(root) = dunce::canonicalize(super::daemon_managed_worktree_root(home)) else {
         return false;
     };
     target.parent() == Some(root.as_path())
