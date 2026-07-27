@@ -1455,10 +1455,10 @@ struct NotifyOutcome {
 /// the end when state has changed.
 /// S1 exact-head one-shot terminal-clear. An exact-head watch fires ONE post-merge
 /// notification for its pinned SHA, then must disappear. Once EVERY run at the
-/// target SHA has concluded (aggregate terminal), remove the watch so it doesn't
-/// linger to TTL. No-op for a non-exact-head watch or a still-pending / runless
-/// target (which stays armed). Returns true when it removed the watch — the caller
-/// must then NOT flush/refresh the now-deleted file.
+/// target SHA has concluded successfully (aggregate success), remove the watch.
+/// No-op for a non-exact-head watch or a runless, pending, or non-success target
+/// (which stays armed). Returns true when it removed the watch — the caller must
+/// then NOT flush/refresh the now-deleted file.
 fn maybe_clear_exact_head_terminal(
     ctx: &CiCheckCtx<'_>,
     state: &WatchState,
@@ -1467,11 +1467,8 @@ fn maybe_clear_exact_head_terminal(
     if state.target_head_sha.is_none() {
         return false;
     }
-    let target = || pr.runs.iter().filter(|r| r.head_sha == pr.current_sha);
-    if target().next().is_none() || target().any(|r| r.conclusion.is_none()) {
-        // No run for the target yet, or a workflow at the target is still in
-        // progress — keep armed (matches the multi-workflow aggregate contract:
-        // never resolve while one workflow is pending).
+    if aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha) != Some("success") {
+        // Runless, pending, and non-success targets remain armed for reruns.
         return false;
     }
     super::remove_watch(
