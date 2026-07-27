@@ -48,7 +48,7 @@ fn find_flat_candidate(home: &Path, agent: &str) -> Option<FlatCandidate> {
             return None;
         }
         let source_repo = super::marker_source_repo(&target)
-            .and_then(|path| path.canonicalize().ok())
+            .and_then(|path| dunce::canonicalize(path).ok())
             .filter(|source_repo| super::target_source_repo_matches(&target, source_repo));
         Some(FlatCandidate {
             target,
