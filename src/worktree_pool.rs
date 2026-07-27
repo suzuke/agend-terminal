@@ -892,6 +892,50 @@ fn idempotent_absent() -> ReleaseOutcome {
     }
 }
 
+/// A missing binding is normally an idempotent no-op. A surviving flat
+/// `repo action=checkout bind:false` worktree is the exception: preserve it
+/// and point the caller at the existing typed path-addressed release route.
+/// The candidate scan is read-only and requires the existing marker, flat
+/// layout, source identity, and detached Git registration proofs.
+fn absent_release_outcome(home: &Path, agent: &str) -> ReleaseOutcome {
+    let Some((target, source_repo)) = find_flat_registered_candidate(home, agent) else {
+        return idempotent_absent();
+    };
+    ReleaseOutcome {
+        error: Some(format!(
+            "release refused: flat daemon-managed worktree for '{agent}' survives at '{}'; use repo action=release with path='{}' repository_path='{}'",
+            target.display(),
+            target.display(),
+            source_repo.display()
+        )),
+        ..ReleaseOutcome::default()
+    }
+}
+
+fn find_flat_registered_candidate(home: &Path, agent: &str) -> Option<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::new();
+    collect_managed_worktrees(
+        &daemon_managed_worktree_root(home),
+        MARKER_WALK_MAX_DEPTH,
+        &mut candidates,
+    );
+    candidates.into_iter().find_map(|target| {
+        let target = dunce::canonicalize(target).ok()?;
+        if !legacy_flat_target_path(home, &target, agent)
+            || crate::binding::managed_marker_agent(&target).as_deref() != Some(agent)
+        {
+            return None;
+        }
+        let source_repo = marker_source_repo(&target)?.canonicalize().ok()?;
+        if !target_source_repo_matches(&target, &source_repo)
+            || !registered_detached_target(&source_repo, &target)
+        {
+            return None;
+        }
+        Some((target, source_repo))
+    })
+}
+
 fn opaque_release(reason: String) -> ReleaseOutcome {
     ReleaseOutcome {
         error: Some(format!(
@@ -1103,7 +1147,7 @@ fn release_full_guarded(
 
     let (snapshot, fingerprint) = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
-        Ok(GuardedBinding::Absent) => return idempotent_absent(),
+        Ok(GuardedBinding::Absent) => return absent_release_outcome(home, agent),
         Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
         Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
     };
@@ -1134,7 +1178,7 @@ fn release_full_guarded(
         Err(e) => return opaque_release(e),
     };
     let current = match crate::binding::guarded_binding_disk_fresh(home, agent) {
-        GuardedBinding::Absent => return idempotent_absent(),
+        GuardedBinding::Absent => return absent_release_outcome(home, agent),
         GuardedBinding::Opaque(reason) => return opaque_release(reason),
         GuardedBinding::Known {
             value,
