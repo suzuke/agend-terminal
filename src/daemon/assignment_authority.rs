@@ -1101,14 +1101,14 @@ fn revoke_under_lock(
             return Ok(false);
         }
     };
-    if preserve_task_id != Some(record.task_id.as_str()) {
-        if crate::tasks::cancel_review_assignment_task(
+    if preserve_task_id != Some(record.task_id.as_str())
+        && crate::tasks::cancel_review_assignment_task(
             home,
             &record.task_id,
             "review assignment authority revoked",
-        )? {
-            *cleanup_task = Some(record.task_id.clone());
-        }
+        )?
+    {
+        *cleanup_task = Some(record.task_id.clone());
     }
     let successor = format!("revoked-{}", record.assignment_id);
     let outcome = crate::inbox::storage::supersede_by_nonce_strict(
