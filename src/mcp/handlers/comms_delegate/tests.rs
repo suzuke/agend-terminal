@@ -239,6 +239,40 @@ mod review_assignment_marker_tests {
         .unwrap();
     }
 
+    fn seed_review_task(home: &std::path::Path, task_id: &str) {
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName("system:test".into()),
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId(task_id.into()),
+                title: "review task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(crate::task_events::InstanceName("system:test".into())),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/x".into()),
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        let meta = crate::tasks::handle(
+            home,
+            "system:test",
+            &json!({
+                "action": "metadata_set",
+                "id": task_id,
+                "metadata_key": "review_class",
+                "metadata_value": "dual"
+            }),
+        );
+        assert!(meta.get("error").is_none(), "seed task metadata: {meta}");
+    }
+
     fn marker_checks(
         review_author: Option<ReviewAuthor>,
         pr_number: Option<u64>,
@@ -736,6 +770,80 @@ mod review_assignment_marker_tests {
             crate::daemon::pr_state::ReviewClass::Dual
         );
         assert_eq!(envelope.slot, crate::review_receipt::ReviewSlot::Primary);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The real durable store dispatch path replaces a reviewer assignment at the
+    /// same repo/branch/target key. The predecessor's distinct task must be
+    /// cancelled before the replacement overwrites its authority; the successor
+    /// remains actionable. This is the RED reproduction for the system invariant.
+    #[test]
+    fn c11_double_dispatch_cancels_predecessor_only() {
+        use super::super::review_assignment::dispatch_review_assignment_via_store;
+        use super::super::ComposedDelegate;
+        let home = tmp_home("c11-double-dispatch");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        seed_exact_subject(&home);
+        seed_review_task(&home, "t-rev-2");
+        let sender = Sender::new("lead").unwrap();
+        let checks = marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42));
+        let composed = ComposedDelegate {
+            msg: "[delegate_task] review the PR".to_string(),
+            force_meta_json: None,
+            second_reviewer: false,
+            plan_ack_required: 0,
+        };
+
+        let first_args = marker_args("owner/repo", 42);
+        dispatch_review_assignment_via_store(
+            &home,
+            &sender,
+            "reviewer",
+            "review the PR",
+            &first_args,
+            &checks,
+            &composed,
+            "owner/repo",
+        );
+        let mut successor_args = marker_args("owner/repo", 42);
+        successor_args["task_id"] = Value::String("t-rev-2".into());
+        dispatch_review_assignment_via_store(
+            &home,
+            &sender,
+            "reviewer",
+            "review the PR",
+            &successor_args,
+            &checks,
+            &composed,
+            "owner/repo",
+        );
+
+        let state = crate::task_events::replay(&home).unwrap();
+        assert_eq!(
+            state
+                .tasks
+                .get(&crate::task_events::TaskId("t-rev-1".into()))
+                .map(|task| task.status),
+            Some(crate::task_events::TaskStatus::Cancelled),
+            "distinct predecessor task must be cancelled"
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&crate::task_events::TaskId("t-rev-2".into()))
+                .map(|task| task.status),
+            Some(crate::task_events::TaskStatus::Open),
+            "successor task remains actionable"
+        );
+        assert_eq!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .map(|record| record.task_id),
+            Some("t-rev-2".into()),
+            "replacement authority belongs to the successor task"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

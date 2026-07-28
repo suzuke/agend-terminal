@@ -289,6 +289,38 @@ mod tests {
         pr_state::save(home, &s).unwrap();
     }
 
+    fn seed_open_task(home: &Path, task_id: &str) {
+        crate::task_events::append(
+            home,
+            &InstanceName::from("system:test"),
+            TaskEvent::Created {
+                task_id: TaskId::from(task_id),
+                title: "review task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from("lead")),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/x".into()),
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn task_status(home: &Path, task_id: &str) -> crate::task_events::TaskStatus {
+        crate::task_events::replay(home)
+            .unwrap()
+            .tasks
+            .get(&TaskId::from(task_id))
+            .map(|record| record.status)
+            .unwrap()
+    }
+
     /// Simulate the reviewer having READ the inbox row carrying `nonce` (set
     /// `read_at`), making it NON-actionable. Post-B2, `repair_row` only triggers
     /// the append-only nonce-rotation repair for missing/superseded rows — tests
@@ -849,6 +881,7 @@ mod tests {
     #[test]
     fn head_advance_no_receipt_retires() {
         let home = tmp_home("p0-1");
+        seed_open_task(&home, "t-rev-1");
         let rec = mk_with_head(
             "o/r",
             "feat/x",
@@ -867,6 +900,39 @@ mod tests {
         assert!(
             store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
             "assignment must be retired when PrState head contradicts reviewed_head"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The real head-advance reconcile must terminalize the task before removing
+    /// the obsolete assignment. This is the invariant's RED reproduction: the
+    /// pre-fix reconcile retires the authority but leaves its task actionable.
+    #[test]
+    fn head_advance_cancels_owned_task_before_retire() {
+        let home = tmp_home("task-terminality-head-advance");
+        seed_open_task(&home, "t-rev-1");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+
+        assert_eq!(
+            task_status(&home, "t-rev-1"),
+            crate::task_events::TaskStatus::Cancelled,
+            "head advance must cancel the predecessor task before retirement"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "head advance still retires the obsolete assignment"
         );
         std::fs::remove_dir_all(&home).ok();
     }
