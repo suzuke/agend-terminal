@@ -951,6 +951,48 @@ fn already_terminal_review_task_cancellation_is_idempotent() {
 }
 
 #[test]
+fn review_assignment_cancellation_clears_dispatch_obligations() {
+    let home = tmp_home("task-cleanup");
+    seed_open_task(&home, "t-cleanup");
+    let mut record = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+    record.task_id = "t-cleanup".into();
+    persist(&home, &record).unwrap();
+
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "reviewer",
+        Some("t-cleanup"),
+        "task",
+        900,
+    );
+    crate::dispatch_tracking::track_dispatch(
+        &home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some("t-cleanup".into()),
+            from: "lead".into(),
+            to: "reviewer".into(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".into(),
+        },
+    );
+
+    revoke(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:10Z").unwrap();
+
+    assert_eq!(
+        task_status(&home, "t-cleanup"),
+        crate::task_events::TaskStatus::Cancelled
+    );
+    assert!(crate::daemon::dispatch_idle::list_pending(&home)
+        .iter()
+        .all(|entry| entry.correlation_id.as_deref() != Some("t-cleanup")));
+    assert!(!crate::dispatch_tracking::active_target_names(&home).contains(&"reviewer".to_string()));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn route_failure_preserves_replaced_assignment_authority() {
     let home = tmp_home("task-route-failure");
     seed_open_task(&home, "t-route");

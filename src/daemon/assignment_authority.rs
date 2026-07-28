@@ -814,47 +814,56 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
     if record.pr_number == 0 {
         anyhow::bail!("assignment_authority::persist: pr_number must be nonzero (generation-bound at dispatch)");
     }
-    let _lock = lock_branch(home, &record.repo, &record.branch)?;
-    let path = record_file(home, &record.repo, &record.branch, &record.target);
-    // B1 — atomic revoke-and-replace under the one branch lock: if a record ALREADY
-    // exists at this key with a DIFFERENT assignment_id, RETIRE its outbox row BEFORE
-    // overwriting it, so the old actionable delivery_nonce is not orphaned. A corrupt
-    // existing record FAILS CLOSED (bail) — never blindly overwrite/lose it (B4). A
-    // same-id re-persist is idempotent (no self-supersede).
-    if let Some(old) = read_record(&path)? {
-        if old.assignment_id != record.assignment_id {
-            if old.task_id != record.task_id {
-                crate::tasks::cancel_review_assignment_task(
-                    home,
-                    &old.task_id,
-                    "review assignment authority replaced by a different task",
-                )?;
-            }
-            let successor = format!("superseded-{}", record.assignment_id);
-            let outcome = crate::inbox::storage::supersede_by_nonce(
-                home,
-                &record.target,
-                &old.delivery_nonce,
-                &successor,
-            );
-            // Mirror the A8 revoke path: a row the reviewer had already READ is not
-            // retracted by the supersede alone — surface a durable revocation notice
-            // for the retired assignment (I21). Clock-injected via the new record's
-            // `created_at` (persist takes no separate `now`).
-            if outcome.was_read {
-                let nonce = revocation_nonce(old.assignment_id);
-                if !revocation_nonce_present(home, &record.target, &nonce) {
-                    crate::inbox::storage::enqueue(
+    let mut cleanup_task = None;
+    let result = (|| {
+        let _lock = lock_branch(home, &record.repo, &record.branch)?;
+        let path = record_file(home, &record.repo, &record.branch, &record.target);
+        // B1 — atomic revoke-and-replace under the one branch lock: if a record ALREADY
+        // exists at this key with a DIFFERENT assignment_id, RETIRE its outbox row BEFORE
+        // overwriting it, so the old actionable delivery_nonce is not orphaned. A corrupt
+        // existing record FAILS CLOSED (bail) — never blindly overwrite/lose it (B4). A
+        // same-id re-persist is idempotent (no self-supersede).
+        if let Some(old) = read_record(&path)? {
+            if old.assignment_id != record.assignment_id {
+                if old.task_id != record.task_id
+                    && crate::tasks::cancel_review_assignment_task(
                         home,
-                        &record.target,
-                        build_revocation_notice(&old, &record.created_at, &nonce),
-                    )?;
+                        &old.task_id,
+                        "review assignment authority replaced by a different task",
+                    )?
+                {
+                    cleanup_task = Some(old.task_id.clone());
+                }
+                let successor = format!("superseded-{}", record.assignment_id);
+                let outcome = crate::inbox::storage::supersede_by_nonce(
+                    home,
+                    &record.target,
+                    &old.delivery_nonce,
+                    &successor,
+                );
+                // Mirror the A8 revoke path: a row the reviewer had already READ is not
+                // retracted by the supersede alone — surface a durable revocation notice
+                // for the retired assignment (I21). Clock-injected via the new record's
+                // `created_at` (persist takes no separate `now`).
+                if outcome.was_read {
+                    let nonce = revocation_nonce(old.assignment_id);
+                    if !revocation_nonce_present(home, &record.target, &nonce) {
+                        crate::inbox::storage::enqueue(
+                            home,
+                            &record.target,
+                            build_revocation_notice(&old, &record.created_at, &nonce),
+                        )?;
+                    }
                 }
             }
         }
+        atomic_write_json(&path, record)?;
+        Ok(())
+    })();
+    if let Some(task_id) = cleanup_task {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
     }
-    atomic_write_json(&path, record)?;
-    Ok(())
+    result
 }
 
 /// A2 — durable enqueue. If the record's CURRENT nonce is already actionable in
@@ -982,8 +991,15 @@ pub(crate) fn revoke(
     target: &str,
     now: &str,
 ) -> anyhow::Result<bool> {
-    let _lock = lock_branch(home, repo, branch)?;
-    revoke_under_lock(home, repo, branch, target, now, None)
+    let mut cleanup_task = None;
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        revoke_under_lock(home, repo, branch, target, now, None, &mut cleanup_task)
+    })();
+    if let Some(task_id) = cleanup_task {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
+    result
 }
 
 /// P0: CAS-retire an assignment ONLY if its on-disk `assignment_id` still equals
@@ -1005,50 +1021,59 @@ pub(crate) fn retire_if_id_matches(
     expected_id: uuid::Uuid,
     now: &str,
 ) -> anyhow::Result<bool> {
-    let _lock = lock_branch(home, repo, branch)?;
-    let path = record_file(home, repo, branch, target);
-    let record = match read_record(&path) {
-        Ok(Some(r)) if r.assignment_id == expected_id => r,
-        _ => return Ok(false), // absent, corrupt, or replaced — no-op
-    };
+    let mut cleanup_task = None;
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        let path = record_file(home, repo, branch, target);
+        let record = match read_record(&path) {
+            Ok(Some(r)) if r.assignment_id == expected_id => r,
+            _ => return Ok(false), // absent, corrupt, or replaced — no-op
+        };
 
-    crate::tasks::cancel_review_assignment_task(
-        home,
-        &record.task_id,
-        "review assignment authority retired",
-    )?;
-
-    // Step 1: durably supersede the stale inbox row. If this fails the
-    // authority stays intact — the reviewer may still pick it up, which is
-    // strictly better than a dangling actionable row with no authority.
-    let successor = format!("retired-{}", expected_id);
-    let outcome = crate::inbox::storage::supersede_by_nonce_strict(
-        home,
-        target,
-        &record.delivery_nonce,
-        &successor,
-    )?;
-
-    // Step 2: if the reviewer had already read the assignment, enqueue a
-    // deterministic revocation notice so they learn it was retracted.
-    // Stable nonce + any-state dedup: if a prior attempt already enqueued
-    // the notice (but delete failed), the nonce is already present and we
-    // skip the duplicate append.
-    if outcome.was_read {
-        let nonce = revocation_nonce(expected_id);
-        if !revocation_nonce_present(home, target, &nonce) {
-            crate::inbox::storage::enqueue(
-                home,
-                target,
-                build_revocation_notice(&record, now, &nonce),
-            )?;
+        if crate::tasks::cancel_review_assignment_task(
+            home,
+            &record.task_id,
+            "review assignment authority retired",
+        )? {
+            cleanup_task = Some(record.task_id.clone());
         }
-    }
 
-    // Step 3: NOW safe to delete the authority — the stale inbox state has
-    // been durably superseded (or was already non-actionable).
-    let removed = remove_if_assignment_matches_strict(&path, expected_id)?;
-    Ok(removed)
+        // Step 1: durably supersede the stale inbox row. If this fails the
+        // authority stays intact — the reviewer may still pick it up, which is
+        // strictly better than a dangling actionable row with no authority.
+        let successor = format!("retired-{}", expected_id);
+        let outcome = crate::inbox::storage::supersede_by_nonce_strict(
+            home,
+            target,
+            &record.delivery_nonce,
+            &successor,
+        )?;
+
+        // Step 2: if the reviewer had already read the assignment, enqueue a
+        // deterministic revocation notice so they learn it was retracted.
+        // Stable nonce + any-state dedup: if a prior attempt already enqueued
+        // the notice (but delete failed), the nonce is already present and we
+        // skip the duplicate append.
+        if outcome.was_read {
+            let nonce = revocation_nonce(expected_id);
+            if !revocation_nonce_present(home, target, &nonce) {
+                crate::inbox::storage::enqueue(
+                    home,
+                    target,
+                    build_revocation_notice(&record, now, &nonce),
+                )?;
+            }
+        }
+
+        // Step 3: NOW safe to delete the authority — the stale inbox state has
+        // been durably superseded (or was already non-actionable).
+        let removed = remove_if_assignment_matches_strict(&path, expected_id)?;
+        Ok(removed)
+    })();
+    if let Some(task_id) = cleanup_task {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
+    result
 }
 
 /// The revoke body WITHOUT acquiring the branch lock — the caller MUST already
@@ -1062,6 +1087,7 @@ fn revoke_under_lock(
     target: &str,
     now: &str,
     preserve_task_id: Option<&str>,
+    cleanup_task: &mut Option<String>,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
     let record = match read_record(&path) {
@@ -1076,11 +1102,13 @@ fn revoke_under_lock(
         }
     };
     if preserve_task_id != Some(record.task_id.as_str()) {
-        crate::tasks::cancel_review_assignment_task(
+        if crate::tasks::cancel_review_assignment_task(
             home,
             &record.task_id,
             "review assignment authority revoked",
-        )?;
+        )? {
+            *cleanup_task = Some(record.task_id.clone());
+        }
     }
     let successor = format!("revoked-{}", record.assignment_id);
     let outcome = crate::inbox::storage::supersede_by_nonce_strict(
@@ -1138,49 +1166,62 @@ pub(crate) fn transfer(
     new_target: &str,
     now: &str,
 ) -> anyhow::Result<()> {
-    let _lock = lock_branch(home, repo, branch)?;
-    // B4: `?` propagates a corrupt-record Err (fail closed — never transfer off a
-    // record we cannot read); `ok_or_else` handles a genuinely absent old target.
-    let old = read_record(&record_file(home, repo, branch, old_target))?.ok_or_else(|| {
-        anyhow::anyhow!("assignment_authority::transfer: no active assignment for old target")
-    })?;
-    // {revoke old} under the held lock.
-    revoke_under_lock(
-        home,
-        repo,
-        branch,
-        old_target,
-        now,
-        Some(old.task_id.as_str()),
-    )?;
-    // {persist new} — fresh assignment_id + nonce, SAME pr_number, authority
-    // carried over. Written directly (persist would re-lock the same branch).
-    let mut new_record = ActiveAssignment::new_pending(
-        repo,
-        branch,
-        new_target,
-        old.pr_number,
-        old.sender,
-        old.task_id,
-        old.review_class,
-        old.review_author,
-        old.text,
-        old.thread_id,
-        old.parent_id,
-        now,
-    );
-    if old.target_instance_id.is_some() || old.reviewed_head.is_some() || old.review_slot.is_some()
-    {
-        let target_instance_id = crate::fleet::resolve_uuid(home, new_target).ok_or_else(|| {
-            anyhow::anyhow!("assignment_authority::transfer: new target has no stable InstanceId")
+    let mut cleanup_task = None;
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        // B4: `?` propagates a corrupt-record Err (fail closed — never transfer off a
+        // record we cannot read); `ok_or_else` handles a genuinely absent old target.
+        let old = read_record(&record_file(home, repo, branch, old_target))?.ok_or_else(|| {
+            anyhow::anyhow!("assignment_authority::transfer: no active assignment for old target")
         })?;
-        new_record.schema_version = SCHEMA_VERSION;
-        new_record.target_instance_id = Some(target_instance_id);
-        new_record.reviewed_head = old.reviewed_head;
-        new_record.review_slot = old.review_slot;
+        // {revoke old} under the held lock.
+        revoke_under_lock(
+            home,
+            repo,
+            branch,
+            old_target,
+            now,
+            Some(old.task_id.as_str()),
+            &mut cleanup_task,
+        )?;
+        // {persist new} — fresh assignment_id + nonce, SAME pr_number, authority
+        // carried over. Written directly (persist would re-lock the same branch).
+        let mut new_record = ActiveAssignment::new_pending(
+            repo,
+            branch,
+            new_target,
+            old.pr_number,
+            old.sender,
+            old.task_id,
+            old.review_class,
+            old.review_author,
+            old.text,
+            old.thread_id,
+            old.parent_id,
+            now,
+        );
+        if old.target_instance_id.is_some()
+            || old.reviewed_head.is_some()
+            || old.review_slot.is_some()
+        {
+            let target_instance_id =
+                crate::fleet::resolve_uuid(home, new_target).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "assignment_authority::transfer: new target has no stable InstanceId"
+                    )
+                })?;
+            new_record.schema_version = SCHEMA_VERSION;
+            new_record.target_instance_id = Some(target_instance_id);
+            new_record.reviewed_head = old.reviewed_head;
+            new_record.review_slot = old.review_slot;
+        }
+        atomic_write_json(&record_file(home, repo, branch, new_target), &new_record)?;
+        Ok(())
+    })();
+    if let Some(task_id) = cleanup_task {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
     }
-    atomic_write_json(&record_file(home, repo, branch, new_target), &new_record)?;
-    Ok(())
+    result
 }
 
 /// A7 (store half) — record a terminal PR generation: add `pr_number` to the
@@ -1195,35 +1236,44 @@ pub(crate) fn record_terminal(
     pr_number: u64,
     kind: TerminalKind,
 ) -> anyhow::Result<usize> {
-    let _lock = lock_branch(home, repo, branch)?;
-    // 1) Add the marker to the RETAINED set (idempotent; NO compaction — I19). B4:
-    //    `?` propagates a corrupt-markers Err — a silent default-empty read here
-    //    would OVERWRITE the retained set with just this marker on the write below,
-    //    losing every prior terminal generation. Fail closed instead.
-    let mpath = markers_file(home, repo, branch);
-    let mut markers = read_markers(&mpath)?;
-    if !markers.contains(pr_number) {
-        markers.schema_version = SCHEMA_VERSION;
-        markers.markers.push(TerminalMarker { pr_number, kind });
-        atomic_write_json(&mpath, &markers)?;
-    }
-    // 2) CAS-tombstone ONLY records whose stored pr_number matches — NEVER a
-    //    different generation (B18/B19/I18).
-    let mut tombstoned = 0;
-    for record in list_active(home, repo, branch) {
-        if record.pr_number == pr_number {
-            crate::tasks::cancel_review_assignment_task(
-                home,
-                &record.task_id,
-                "review assignment PR generation became terminal",
-            )?;
-            let path = record_file(home, repo, branch, &record.target);
-            if remove_if_assignment_matches_strict(&path, record.assignment_id)? {
-                tombstoned += 1;
+    let mut cleanup_tasks = Vec::new();
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        // 1) Add the marker to the RETAINED set (idempotent; NO compaction — I19). B4:
+        //    `?` propagates a corrupt-markers Err — a silent default-empty read here
+        //    would OVERWRITE the retained set with just this marker on the write below,
+        //    losing every prior terminal generation. Fail closed instead.
+        let mpath = markers_file(home, repo, branch);
+        let mut markers = read_markers(&mpath)?;
+        if !markers.contains(pr_number) {
+            markers.schema_version = SCHEMA_VERSION;
+            markers.markers.push(TerminalMarker { pr_number, kind });
+            atomic_write_json(&mpath, &markers)?;
+        }
+        // 2) CAS-tombstone ONLY records whose stored pr_number matches — NEVER a
+        //    different generation (B18/B19/I18).
+        let mut tombstoned = 0;
+        for record in list_active(home, repo, branch) {
+            if record.pr_number == pr_number {
+                if crate::tasks::cancel_review_assignment_task(
+                    home,
+                    &record.task_id,
+                    "review assignment PR generation became terminal",
+                )? {
+                    cleanup_tasks.push(record.task_id.clone());
+                }
+                let path = record_file(home, repo, branch, &record.target);
+                if remove_if_assignment_matches_strict(&path, record.assignment_id)? {
+                    tombstoned += 1;
+                }
             }
         }
+        Ok(tombstoned)
+    })();
+    for task_id in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
     }
-    Ok(tombstoned)
+    result
 }
 
 // ─────────────────────────── C10/C12: live-wiring helpers ───────────────────────────
@@ -1245,48 +1295,59 @@ pub(crate) fn terminal_kind_of(state: &PrState) -> Option<TerminalKind> {
 /// I18/I19). Takes the branch lock internally; NEVER re-locks (call it top-level,
 /// never while already holding the branch lock). Returns the number tombstoned.
 pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) -> usize {
-    let Ok(_lock) = lock_branch(home, repo, branch) else {
-        return 0;
-    };
-    // B4: a corrupt markers file is NOT "zero terminals" — SKIP the pass (surface +
-    // return) rather than act on an unreliable empty set. Acting as if there are no
-    // terminals would fail to tombstone a replayed old-generation record (B20).
-    let markers = match read_markers(&markers_file(home, repo, branch)) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(repo, branch, error = %e,
-                "t-…-17 B4: A10a tombstone pass skipped — corrupt terminal markers (fail closed)");
+    let mut cleanup_tasks = Vec::new();
+    let result = (|| {
+        let Ok(_lock) = lock_branch(home, repo, branch) else {
+            return 0;
+        };
+        // B4: a corrupt markers file is NOT "zero terminals" — SKIP the pass (surface +
+        // return) rather than act on an unreliable empty set. Acting as if there are no
+        // terminals would fail to tombstone a replayed old-generation record (B20).
+        let markers = match read_markers(&markers_file(home, repo, branch)) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(repo, branch, error = %e,
+                    "t-…-17 B4: A10a tombstone pass skipped — corrupt terminal markers (fail closed)");
+                return 0;
+            }
+        };
+        if markers.markers.is_empty() {
             return 0;
         }
-    };
-    if markers.markers.is_empty() {
-        return 0;
-    }
-    let mut tombstoned = 0;
-    for record in list_active(home, repo, branch) {
-        if markers.contains(record.pr_number) {
-            if let Err(error) = crate::tasks::cancel_review_assignment_task(
-                home,
-                &record.task_id,
-                "review assignment PR generation became terminal",
-            ) {
-                tracing::error!(
-                    repo,
-                    branch,
-                    target = %record.target,
-                    task_id = %record.task_id,
-                    error = %error,
-                    "assignment tombstone skipped: task cancellation failed (fail closed)"
-                );
-                continue;
-            }
-            let path = record_file(home, repo, branch, &record.target);
-            if remove_if_assignment_matches(&path, record.assignment_id) {
-                tombstoned += 1;
+        let mut tombstoned = 0;
+        for record in list_active(home, repo, branch) {
+            if markers.contains(record.pr_number) {
+                match crate::tasks::cancel_review_assignment_task(
+                    home,
+                    &record.task_id,
+                    "review assignment PR generation became terminal",
+                ) {
+                    Ok(true) => cleanup_tasks.push(record.task_id.clone()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            repo,
+                            branch,
+                            target = %record.target,
+                            task_id = %record.task_id,
+                            error = %error,
+                            "assignment tombstone skipped: task cancellation failed (fail closed)"
+                        );
+                        continue;
+                    }
+                }
+                let path = record_file(home, repo, branch, &record.target);
+                if remove_if_assignment_matches(&path, record.assignment_id) {
+                    tombstoned += 1;
+                }
             }
         }
+        tombstoned
+    })();
+    for task_id in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
     }
-    tombstoned
+    result
 }
 
 /// A6/A10b — DERIVE the RESERVED set for `prstate` from the active assignment

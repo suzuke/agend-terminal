@@ -58,10 +58,10 @@ pub(crate) fn cancel_review_assignment_task(
     home: &Path,
     task_id: &str,
     reason: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let routed = match load_routed(home, task_id) {
         Ok(routed) => routed,
-        Err(TaskRouteError::NotFound) => return Ok(()),
+        Err(TaskRouteError::NotFound) => return Ok(false),
         Err(error) => {
             return Err(anyhow::anyhow!(
                 "review-assignment task route failed for '{task_id}': {error}"
@@ -94,7 +94,7 @@ pub(crate) fn cancel_review_assignment_task(
             }])
         }) {
         Ok(outcome) => outcome,
-        Err(TaskRouteError::NotFound) => return Ok(()),
+        Err(TaskRouteError::NotFound) => return Ok(false),
         Err(error) => {
             return Err(anyhow::anyhow!(
                 "review-assignment task write route failed for '{task_id}': {error}"
@@ -102,7 +102,7 @@ pub(crate) fn cancel_review_assignment_task(
         }
     };
     match outcome {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(events)) => Ok(!events.is_empty()),
         Ok(Err(reason)) => Err(anyhow::anyhow!(
             "review-assignment task cancellation refused for '{task_id}': {reason}"
         )),
