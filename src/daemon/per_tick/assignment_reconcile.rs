@@ -520,11 +520,10 @@ mod tests {
         // Marker for G=70 written while no record existed (tombstoned 0) — then the
         // record that SHOULD have been tombstoned appears (the crash-gap leftover).
         store::record_terminal(&home, "o/r", "feat/x", 70, TerminalKind::Merged).unwrap();
-        store::persist(
-            &home,
-            &mk("o/r", "feat/x", "reviewer", 70, "2026-07-13T00:00:00Z"),
-        )
-        .unwrap();
+        seed_open_task(&home, "t-restart");
+        let mut replayed = mk("o/r", "feat/x", "reviewer", 70, "2026-07-13T00:00:00Z");
+        replayed.task_id = "t-restart".into();
+        store::persist(&home, &replayed).unwrap();
         assert!(store::get(&home, "o/r", "feat/x", "reviewer").is_some());
 
         reconcile_all_collect(&home, "2026-07-13T00:05:00Z");
@@ -532,6 +531,11 @@ mod tests {
         assert!(
             store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
             "reconcile A10a tombstones the crash-gap record matching a retained marker"
+        );
+        assert_eq!(
+            task_status(&home, "t-restart"),
+            crate::task_events::TaskStatus::Cancelled,
+            "restart tombstone cancels the replayed assignment task"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1173,6 +1177,7 @@ mod tests {
     #[test]
     fn c2_current_head_engaged_unsatisfied_not_retired() {
         let home = tmp_home("p0-c2");
+        seed_open_task(&home, "t-rev-1");
         let instance_id = crate::types::InstanceId::new();
         let head = "a".repeat(40);
         let rec = store::ActiveAssignment::new_pending_typed(
@@ -1226,6 +1231,11 @@ mod tests {
         assert!(
             wakes.is_empty(),
             "EngagedUnsatisfied is a TRUE stop — no nudge"
+        );
+        assert_eq!(
+            task_status(&home, "t-rev-1"),
+            crate::task_events::TaskStatus::Open,
+            "current-head REJECTED must leave the owned task actionable"
         );
         std::fs::remove_dir_all(&home).ok();
     }

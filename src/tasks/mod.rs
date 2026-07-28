@@ -44,6 +44,74 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
 
+/// Cancel the task owned by a reviewer-assignment authority mutation.
+///
+/// The caller holds the assignment branch lock before entering this helper, so
+/// the lock order is branch → task-id → board. Strict routing is resolved once
+/// before the per-id lock and revalidated by [`RoutedTask::with_revalidated_computed`]
+/// under that lock; the board append then runs under the board writer lock. A
+/// missing task is already terminal-by-absence and permits the authority
+/// mutation to proceed. Any other route or append failure is returned so the
+/// caller preserves the assignment fail-closed. No notification or other IPC is
+/// performed while these locks are held.
+pub(crate) fn cancel_review_assignment_task(
+    home: &Path,
+    task_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let routed = match load_routed(home, task_id) {
+        Ok(routed) => routed,
+        Err(TaskRouteError::NotFound) => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "review-assignment task route failed for '{task_id}': {error}"
+            ))
+        }
+    };
+    let task_id_owned = task_id.to_string();
+    let reason_owned = reason.to_string();
+    let emitter = crate::task_events::InstanceName::from("system:review-assignment");
+    let event_emitter = emitter.clone();
+    let outcome = match routed.with_revalidated_computed(home, &emitter, move |state| {
+            let Some(record) = state
+                .tasks
+                .get(&crate::task_events::TaskId(task_id_owned.clone()))
+            else {
+                return Err(format!(
+                    "review-assignment task '{task_id_owned}' disappeared during write-time revalidation"
+                ));
+            };
+            if matches!(
+                record.status,
+                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
+            ) {
+                return Ok(Vec::new());
+            }
+            Ok(vec![crate::task_events::TaskEvent::Cancelled {
+                task_id: crate::task_events::TaskId(task_id_owned.clone()),
+                by: event_emitter.clone(),
+                reason: reason_owned.clone(),
+            }])
+        }) {
+        Ok(outcome) => outcome,
+        Err(TaskRouteError::NotFound) => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "review-assignment task write route failed for '{task_id}': {error}"
+            ))
+        }
+    };
+    match outcome {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(reason)) => Err(anyhow::anyhow!(
+            "review-assignment task cancellation refused for '{task_id}': {reason}"
+        )),
+        Err(error) => Err(anyhow::anyhow!(
+            "review-assignment task cancellation append failed for '{task_id}': {error}"
+        )),
+    }
+}
+
 pub use handler::handle;
 pub(crate) use handler::handle_with_live_instances;
 pub use handler::register_subscriber as register_cascade_subscriber;

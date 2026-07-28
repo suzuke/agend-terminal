@@ -823,6 +823,13 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
     // same-id re-persist is idempotent (no self-supersede).
     if let Some(old) = read_record(&path)? {
         if old.assignment_id != record.assignment_id {
+            if old.task_id != record.task_id {
+                crate::tasks::cancel_review_assignment_task(
+                    home,
+                    &old.task_id,
+                    "review assignment authority replaced by a different task",
+                )?;
+            }
             let successor = format!("superseded-{}", record.assignment_id);
             let outcome = crate::inbox::storage::supersede_by_nonce(
                 home,
@@ -976,7 +983,7 @@ pub(crate) fn revoke(
     now: &str,
 ) -> anyhow::Result<bool> {
     let _lock = lock_branch(home, repo, branch)?;
-    revoke_under_lock(home, repo, branch, target, now)
+    revoke_under_lock(home, repo, branch, target, now, None)
 }
 
 /// P0: CAS-retire an assignment ONLY if its on-disk `assignment_id` still equals
@@ -1004,6 +1011,12 @@ pub(crate) fn retire_if_id_matches(
         Ok(Some(r)) if r.assignment_id == expected_id => r,
         _ => return Ok(false), // absent, corrupt, or replaced — no-op
     };
+
+    crate::tasks::cancel_review_assignment_task(
+        home,
+        &record.task_id,
+        "review assignment authority retired",
+    )?;
 
     // Step 1: durably supersede the stale inbox row. If this fails the
     // authority stays intact — the reviewer may still pick it up, which is
@@ -1048,6 +1061,7 @@ fn revoke_under_lock(
     branch: &str,
     target: &str,
     now: &str,
+    preserve_task_id: Option<&str>,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
     let record = match read_record(&path) {
@@ -1061,10 +1075,20 @@ fn revoke_under_lock(
             return Ok(false);
         }
     };
-    let removed = remove_if_assignment_matches(&path, record.assignment_id);
+    if preserve_task_id != Some(record.task_id.as_str()) {
+        crate::tasks::cancel_review_assignment_task(
+            home,
+            &record.task_id,
+            "review assignment authority revoked",
+        )?;
+    }
     let successor = format!("revoked-{}", record.assignment_id);
-    let outcome =
-        crate::inbox::storage::supersede_by_nonce(home, target, &record.delivery_nonce, &successor);
+    let outcome = crate::inbox::storage::supersede_by_nonce_strict(
+        home,
+        target,
+        &record.delivery_nonce,
+        &successor,
+    )?;
     // A row the reviewer had already READ is not retracted by the supersede alone
     // (it is already non-actionable) — surface an explicit revocation notice (I21).
     if outcome.was_read {
@@ -1074,7 +1098,7 @@ fn revoke_under_lock(
             build_revocation_notice(&record, now, &revocation_nonce(record.assignment_id)),
         )?;
     }
-    Ok(removed)
+    remove_if_assignment_matches_strict(&path, record.assignment_id)
 }
 
 /// TEARDOWN hygiene — REVOKE every active reviewer assignment whose TARGET is the
@@ -1121,7 +1145,14 @@ pub(crate) fn transfer(
         anyhow::anyhow!("assignment_authority::transfer: no active assignment for old target")
     })?;
     // {revoke old} under the held lock.
-    revoke_under_lock(home, repo, branch, old_target, now)?;
+    revoke_under_lock(
+        home,
+        repo,
+        branch,
+        old_target,
+        now,
+        Some(old.task_id.as_str()),
+    )?;
     // {persist new} — fresh assignment_id + nonce, SAME pr_number, authority
     // carried over. Written directly (persist would re-lock the same branch).
     let mut new_record = ActiveAssignment::new_pending(
@@ -1181,8 +1212,13 @@ pub(crate) fn record_terminal(
     let mut tombstoned = 0;
     for record in list_active(home, repo, branch) {
         if record.pr_number == pr_number {
+            crate::tasks::cancel_review_assignment_task(
+                home,
+                &record.task_id,
+                "review assignment PR generation became terminal",
+            )?;
             let path = record_file(home, repo, branch, &record.target);
-            if remove_if_assignment_matches(&path, record.assignment_id) {
+            if remove_if_assignment_matches_strict(&path, record.assignment_id)? {
                 tombstoned += 1;
             }
         }
@@ -1229,6 +1265,21 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
     let mut tombstoned = 0;
     for record in list_active(home, repo, branch) {
         if markers.contains(record.pr_number) {
+            if let Err(error) = crate::tasks::cancel_review_assignment_task(
+                home,
+                &record.task_id,
+                "review assignment PR generation became terminal",
+            ) {
+                tracing::error!(
+                    repo,
+                    branch,
+                    target = %record.target,
+                    task_id = %record.task_id,
+                    error = %error,
+                    "assignment tombstone skipped: task cancellation failed (fail closed)"
+                );
+                continue;
+            }
             let path = record_file(home, repo, branch, &record.target);
             if remove_if_assignment_matches(&path, record.assignment_id) {
                 tombstoned += 1;
@@ -1649,6 +1700,38 @@ mod tests {
         )
     }
 
+    fn seed_open_task(home: &Path, task_id: &str) {
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName::from("system:test"),
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId::from(task_id),
+                title: "review task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(crate::task_events::InstanceName::from("lead")),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/x".into()),
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn task_status(home: &Path, task_id: &str) -> crate::task_events::TaskStatus {
+        crate::task_events::replay(home)
+            .unwrap()
+            .tasks
+            .get(&crate::task_events::TaskId::from(task_id))
+            .map(|record| record.status)
+            .unwrap()
+    }
+
     /// Read all inbox rows for `target` (any state), for row-level assertions.
     fn inbox_rows(home: &Path, target: &str) -> Vec<crate::inbox::InboxMessage> {
         let path = crate::inbox::storage::inbox_path_resolved(home, target);
@@ -1983,8 +2066,12 @@ mod tests {
     #[test]
     fn terminal_tombstones_only_matching_pr_number() {
         let home = tmp_home("terminal-pr");
-        let g = mk_record("o/r", "feat/x", "rev-g", 30, "2026-07-13T00:00:00Z");
-        let gp = mk_record("o/r", "feat/x", "rev-gp", 31, "2026-07-13T00:00:00Z");
+        seed_open_task(&home, "t-term-g");
+        seed_open_task(&home, "t-term-gp");
+        let mut g = mk_record("o/r", "feat/x", "rev-g", 30, "2026-07-13T00:00:00Z");
+        g.task_id = "t-term-g".into();
+        let mut gp = mk_record("o/r", "feat/x", "rev-gp", 31, "2026-07-13T00:00:00Z");
+        gp.task_id = "t-term-gp".into();
         persist(&home, &g).unwrap();
         persist(&home, &gp).unwrap();
 
@@ -2003,6 +2090,14 @@ mod tests {
         assert!(
             !terminal_markers(&home, "o/r", "feat/x").contains(31),
             "the surviving generation is NOT marked terminal"
+        );
+        assert_eq!(
+            task_status(&home, "t-term-g"),
+            crate::task_events::TaskStatus::Cancelled
+        );
+        assert_eq!(
+            task_status(&home, "t-term-gp"),
+            crate::task_events::TaskStatus::Open
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2466,6 +2561,92 @@ mod tests {
         assert!(
             crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &r1.delivery_nonce),
             "same-id re-persist keeps its own actionable row (idempotent, no self-supersede)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn review_assignment_replacement_same_task_preserves_task() {
+        let home = tmp_home("task-same");
+        seed_open_task(&home, "t-same");
+        let mut first = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+        first.task_id = "t-same".into();
+        persist(&home, &first).unwrap();
+        let mut successor = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:01:00Z");
+        successor.task_id = "t-same".into();
+        persist(&home, &successor).unwrap();
+
+        assert_eq!(
+            task_status(&home, "t-same"),
+            crate::task_events::TaskStatus::Open
+        );
+        assert_eq!(
+            get(&home, "o/r", "feat/x", "reviewer").unwrap().task_id,
+            "t-same"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn review_assignment_revoke_does_not_cancel_other_reviewer_task() {
+        let home = tmp_home("task-scope");
+        seed_open_task(&home, "t-scope-a");
+        seed_open_task(&home, "t-scope-b");
+        let mut a = mk_record("o/r", "feat/x", "rev-a", 42, "2026-07-13T00:00:00Z");
+        a.task_id = "t-scope-a".into();
+        let mut b = mk_record("o/r", "feat/x", "rev-b", 42, "2026-07-13T00:00:00Z");
+        b.task_id = "t-scope-b".into();
+        persist(&home, &a).unwrap();
+        persist(&home, &b).unwrap();
+
+        revoke(&home, "o/r", "feat/x", "rev-a", "2026-07-13T00:00:10Z").unwrap();
+
+        assert_eq!(
+            task_status(&home, "t-scope-a"),
+            crate::task_events::TaskStatus::Cancelled
+        );
+        assert_eq!(
+            task_status(&home, "t-scope-b"),
+            crate::task_events::TaskStatus::Open
+        );
+        assert!(get(&home, "o/r", "feat/x", "rev-b").is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn already_terminal_review_task_cancellation_is_idempotent() {
+        let home = tmp_home("task-terminal");
+        seed_open_task(&home, "t-terminal");
+        crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "test").unwrap();
+        crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "test-again").unwrap();
+
+        assert_eq!(
+            task_status(&home, "t-terminal"),
+            crate::task_events::TaskStatus::Cancelled
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn route_failure_preserves_replaced_assignment_authority() {
+        let home = tmp_home("task-route-failure");
+        seed_open_task(&home, "t-route");
+        let unreadable_board = crate::task_events::board_root(&home, "proj-unreadable");
+        std::fs::create_dir_all(unreadable_board.join("task_events.jsonl")).unwrap();
+
+        let mut old = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+        old.task_id = "t-route".into();
+        persist(&home, &old).unwrap();
+        let successor = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:01:00Z");
+        let error = persist(&home, &successor).expect_err("unreadable task route must fail closed");
+
+        assert!(error.to_string().contains("task route"));
+        assert_eq!(
+            get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .assignment_id,
+            old.assignment_id,
+            "authority remains when predecessor cancellation cannot prove its route"
         );
         std::fs::remove_dir_all(&home).ok();
     }

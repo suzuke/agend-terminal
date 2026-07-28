@@ -846,4 +846,57 @@ mod review_assignment_marker_tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn c11_double_dispatch_same_task_preserves_task() {
+        use super::super::review_assignment::dispatch_review_assignment_via_store;
+        use super::super::ComposedDelegate;
+        let home = tmp_home("c11-double-same-task");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        seed_exact_subject(&home);
+        let sender = Sender::new("lead").unwrap();
+        let checks = marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42));
+        let composed = ComposedDelegate {
+            msg: "[delegate_task] review the PR".to_string(),
+            force_meta_json: None,
+            second_reviewer: false,
+            plan_ack_required: 0,
+        };
+        let args = marker_args("owner/repo", 42);
+
+        dispatch_review_assignment_via_store(
+            &home,
+            &sender,
+            "reviewer",
+            "review the PR",
+            &args,
+            &checks,
+            &composed,
+            "owner/repo",
+        );
+        dispatch_review_assignment_via_store(
+            &home,
+            &sender,
+            "reviewer",
+            "review the PR",
+            &args,
+            &checks,
+            &composed,
+            "owner/repo",
+        );
+
+        assert_eq!(
+            crate::task_events::replay(&home)
+                .unwrap()
+                .tasks
+                .get(&crate::task_events::TaskId("t-rev-1".into()))
+                .map(|task| task.status),
+            Some(crate::task_events::TaskStatus::Open),
+            "same-task replacement must preserve the owned task"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
