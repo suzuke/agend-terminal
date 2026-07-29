@@ -300,6 +300,10 @@ fn kirocli_profile() -> BackendProfile {
                 r"context window overflow|compacting context",
             ),
             (
+                AgentState::ModelUnsupported,
+                r"(?m)^\s*The\s+model\s+'[^'\r\n]+'\s+is\s+not\s+available\.\s+Please\s+use\s+'/model'\s+to\s+select\s+a\s+different\s+model\s+and\s+try\s+again\.",
+            ),
+            (
                 AgentState::PermissionPrompt,
                 r"requires approval|ESC to close \| Tab to edit",
             ),

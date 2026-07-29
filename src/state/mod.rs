@@ -597,6 +597,16 @@ fn requires_red_anchor(state: AgentState) -> bool {
     )
 }
 
+/// Kiro's own unavailable-model banner is a complete UI sentence rendered in
+/// the default foreground. Its backend pattern matches the whole sentence, so
+/// it can safely use input-line exclusion instead of the generic red gate.
+fn is_kiro_model_unavailable_banner(state: AgentState, matched: &str) -> bool {
+    state == AgentState::ModelUnsupported
+        && matched.trim_start().starts_with("The")
+        && matched.contains("'/model'")
+        && matched.trim_end().ends_with("try again.")
+}
+
 fn hash_screen(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
@@ -1594,7 +1604,13 @@ impl StateTracker {
         high_fp: bool,
         usage_limit: bool,
     ) -> bool {
-        if requires_red_anchor(detected) {
+        if is_kiro_model_unavailable_banner(detected, matched) {
+            !crate::state::patterns::any_match_off_input_lines(
+                screen_text,
+                matched,
+                self.input_line_markers,
+            )
+        } else if requires_red_anchor(detected) {
             self.anchor_on_red && !fg.is_empty() && !matched_span_has_red(screen_text, matched, fg)
         } else if high_fp {
             !crate::state::patterns::in_error_line_excluding_input(

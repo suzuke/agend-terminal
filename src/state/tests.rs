@@ -3595,6 +3595,50 @@ fn codex_model_unsupported_red_anchor_fp_boundary_1634() {
     );
 }
 
+/// S1 live capture: Kiro renders its unavailable-model banner in the default
+/// foreground, so the generic red-only ModelUnsupported gate must not hide this
+/// backend-owned, full-line error signature.
+#[test]
+fn kiro_model_unavailable_plain_banner_latches_model_unsupported_s1() {
+    for screen in [
+        "The model 'claude-opus-4.6' is not available. Please use '/model' to select a different model and try again.",
+        "The model 'claude-opus-4.6' is not available. Please use '/model'\nto select a different model and try again.",
+    ] {
+        let mut tracker = StateTracker::new(Some(&Backend::KiroCli));
+        tracker.feed_with_fg(screen, &vec![CellFg::Default; screen.chars().count()]);
+        assert_eq!(
+            tracker.get_state(),
+            AgentState::ModelUnsupported,
+            "Kiro's exact unavailable-model banner must not be misreported as healthy/idle"
+        );
+    }
+}
+
+/// The narrow Kiro exception must still reject operator input and ordinary
+/// prose; ModelUnsupported never auto-clears, so broad matching is unsafe.
+#[test]
+fn kiro_model_unavailable_banner_keeps_input_and_prose_fp_boundary_s1() {
+    let banner = "The model 'claude-opus-4.6' is not available. Please use '/model' to select a different model and try again.";
+
+    let input = format!("> {banner}");
+    let mut input_tracker = StateTracker::new(Some(&Backend::KiroCli));
+    input_tracker.feed_with_fg(&input, &vec![CellFg::Default; input.chars().count()]);
+    assert_ne!(
+        input_tracker.get_state(),
+        AgentState::ModelUnsupported,
+        "an operator quoting the banner on Kiro's input line must stay prose"
+    );
+
+    let prose = "We should handle the case where a configured Kiro model is not available.";
+    let mut prose_tracker = StateTracker::new(Some(&Backend::KiroCli));
+    prose_tracker.feed_with_fg(prose, &vec![CellFg::Default; prose.chars().count()]);
+    assert_ne!(
+        prose_tracker.get_state(),
+        AgentState::ModelUnsupported,
+        "ordinary discussion of model availability must not latch"
+    );
+}
+
 /// #1634: the captured-incident fixture (codex error rendered RED) driven
 /// through the production vterm → `tail_lines_with_fg` → `feed_with_fg` path
 /// must latch `ModelUnsupported`. End-to-end regression pin for the real
