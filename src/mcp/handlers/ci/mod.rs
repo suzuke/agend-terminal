@@ -54,6 +54,8 @@ pub(crate) use watch::{handle_status_ci, handle_unwatch_ci, handle_watch_ci};
 #[cfg(test)]
 pub(crate) use checkout::checkout_source;
 #[cfg(test)]
+pub(crate) use merge::post_merge_receipt_and_watch;
+#[cfg(test)]
 pub(crate) use merge::{base_drift_refusal, classify_merge_summary, MergeVerdict};
 #[cfg(test)]
 pub(crate) use release::validate_release_path;

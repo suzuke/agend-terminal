@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::AgentRegistry;
+use crate::daemon::ci_watch::watch_filename_exact_head;
 
 #[test]
 fn ci_watches_dir_returns_expected_path() {
@@ -7530,6 +7531,193 @@ impl CiProvider for ExactHeadMock {
 
 const S1_TARGET_SHA: &str = "c4206950c4206950c4206950c4206950c4206950";
 const S1_NEWER_SHA: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+fn seed_post_merge_source(home: &Path) -> std::path::PathBuf {
+    let source_repo = home.join("post-merge-source");
+    std::fs::create_dir_all(&source_repo).unwrap();
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/suzuke/agend-terminal.git",
+        ])
+        .current_dir(&source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    source_repo
+}
+
+fn seed_post_merge_binding(
+    home: &Path,
+    agent: &str,
+    task_id: &str,
+    branch: &str,
+    source_repo: &Path,
+) {
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("binding.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "task_id": task_id,
+            "branch": branch,
+            "issued_at": "2026-07-29T00:00:00Z",
+            "worktree": "/tmp/fake-wt",
+            "source_repo": source_repo.display().to_string(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn seed_post_merge_fleet(home: &Path, with_named_authority: bool) {
+    let yaml = if with_named_authority {
+        "instances:\n  lead:\n    backend: claude\n  dev:\n    backend: claude\nteams:\n  post-merge-team:\n    members:\n      - lead\n    orchestrator: lead\n    created_at: \"2026-01-01T00:00:00Z\"\n"
+    } else {
+        "instances:\n  dev:\n    backend: claude\n"
+    };
+    std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+}
+
+fn poll_post_merge_watch(
+    home: &Path,
+    watch_path: &Path,
+    watch_json: serde_json::Value,
+    target: &str,
+) {
+    let state: WatchState = serde_json::from_value(watch_json.clone()).unwrap();
+    let subscribers = parse_subscribers(&watch_json);
+    let provider = ExactHeadMock::new(
+        vec![],
+        vec![CiRun {
+            run_attempt: 1,
+            id: 3139,
+            conclusion: Some("success".to_string()),
+            head_sha: S1_TARGET_SHA.to_string(),
+            url: "https://example/run/3139".to_string(),
+            name: String::new(),
+        }],
+    );
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        home,
+        watch_path,
+        state,
+        subscribers,
+        &registry,
+        &provider,
+    ))
+    .unwrap();
+
+    let messages = crate::inbox::drain(home, target);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.kind.as_deref() == Some("ci-ready-for-action")
+                && m.text.contains("suzuke/agend-terminal@main")),
+        "post-merge success must deliver correlated ci-ready to {target}: {messages:?}"
+    );
+    let tracks = crate::daemon::ci_handoff_track::list(home);
+    assert!(
+        tracks.iter().any(|(_, track)| {
+            track.target == target
+                && track.correlation == "suzuke/agend-terminal@main"
+                && track.task_id.as_deref() == Some("t-post-merge")
+        }),
+        "post-merge success must record the correlated handoff track for {target}: {tracks:?}"
+    );
+}
+
+/// RED: the real post-merge helper must arm a named-authority exact-head watch
+/// whose real poller success creates both the ci-ready row and handoff track.
+#[test]
+fn post_merge_named_authority_reaches_real_poller_delivery() {
+    let home = tmp_dir("post-merge-named-authority");
+    seed_post_merge_fleet(&home, true);
+    let source_repo = seed_post_merge_source(&home);
+    seed_post_merge_binding(
+        &home,
+        "dev",
+        "t-post-merge",
+        "fix/post-merge-named",
+        &source_repo,
+    );
+
+    let diag = crate::mcp::handlers::ci::post_merge_receipt_and_watch(
+        &home,
+        "suzuke/agend-terminal",
+        S1_TARGET_SHA,
+        3139,
+        "fix/post-merge-named",
+        "lead",
+    );
+    assert_eq!(
+        diag["watch"], "armed",
+        "named authority watch must arm: {diag}"
+    );
+    let watch_path = home.join("ci-watches").join(watch_filename_exact_head(
+        "suzuke/agend-terminal",
+        "main",
+        S1_TARGET_SHA,
+    ));
+    let watch_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(watch_json["next_after_ci"], "lead");
+    assert!(watch_json["notification_only"].is_null());
+    poll_post_merge_watch(&home, &watch_path, watch_json, "lead");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED: an operator/anonymous merge keeps the caller empty while routing the
+/// real post-merge poller handoff to the bound task assignee.
+#[test]
+fn post_merge_operator_reaches_assignee_real_poller_delivery() {
+    let home = tmp_dir("post-merge-operator-authority");
+    seed_post_merge_fleet(&home, false);
+    let source_repo = seed_post_merge_source(&home);
+    seed_post_merge_binding(
+        &home,
+        "dev",
+        "t-post-merge",
+        "fix/post-merge-operator",
+        &source_repo,
+    );
+
+    let diag = crate::mcp::handlers::ci::post_merge_receipt_and_watch(
+        &home,
+        "suzuke/agend-terminal",
+        S1_TARGET_SHA,
+        3139,
+        "fix/post-merge-operator",
+        "",
+    );
+    assert_eq!(diag["watch"], "armed", "operator watch must arm: {diag}");
+    let watch_path = home.join("ci-watches").join(watch_filename_exact_head(
+        "suzuke/agend-terminal",
+        "main",
+        S1_TARGET_SHA,
+    ));
+    let watch_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(watch_json["next_after_ci"], "dev");
+    assert!(watch_json["notification_only"].is_null());
+    assert!(parse_subscribers(&watch_json).is_empty());
+    poll_post_merge_watch(&home, &watch_path, watch_json, "dev");
+    std::fs::remove_dir_all(&home).ok();
+}
 
 fn exact_head_watch_json() -> serde_json::Value {
     serde_json::json!({
