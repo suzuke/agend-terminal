@@ -210,7 +210,11 @@ fn non_protected_branch_watch_unaffected_by_head_sha() {
 /// never mint an exact-head watch; this pins that even a leaked head_sha stays inert.
 #[test]
 fn head_sha_inert_on_non_protected_branch_no_target_persisted() {
-    let home = tmp_home("nonprot-no-persist");
+    let home = std::env::temp_dir().join(format!(
+        "agend-exact-head-nonprot-no-persist-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&home).expect("create unique temp home");
     let r = handle_watch_ci(
         &home,
         &json!({
@@ -227,8 +231,19 @@ fn head_sha_inert_on_non_protected_branch_no_target_persisted() {
         .flatten()
         .find(|e| e.path().extension().is_some_and(|x| x == "json"))
         .expect("a watch file was written");
-    let watch: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+    let raw = std::fs::read(entry.path()).unwrap_or_else(|error| {
+        panic!(
+            "watch JSON read failed: file={} error={error}",
+            entry.path().display()
+        )
+    });
+    let watch: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_else(|error| {
+        panic!(
+            "watch JSON parse failed: file={} bytes={} raw={raw:?} error={error}",
+            entry.path().display(),
+            raw.len()
+        )
+    });
     assert!(
         watch.get("target_head_sha").is_none(),
         "a non-protected-branch watch must never carry target_head_sha: {watch}"

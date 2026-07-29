@@ -483,11 +483,19 @@ fn notification_only_terminal_removal_consumes_receipt() {
 /// Pre-terminal repeat remains idempotent (receipt still live).
 #[test]
 fn notification_only_pre_terminal_repeat_idempotent() {
-    let home = tmp_home("pre-terminal-idem");
+    let home = std::env::temp_dir().join(format!(
+        "agend-notif-only-pre-terminal-idem-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&home).expect("create unique temp home");
     let sha = "e".repeat(40);
     seed_fleet(&home, &["dev"]);
     seed_binding(&home, "dev", "t-idem");
     seed_receipt(&home, REPO, &sha, "t-idem", "dev");
+    assert!(
+        crate::merge_receipt::find(&home, REPO, &sha, "t-idem").is_some(),
+        "fixture receipt must be readable before first arm"
+    );
 
     let args = json!({
         "repository": REPO, "branch": "main",
