@@ -386,12 +386,21 @@ fn t33_transfer_atomic_other_targets_untouched() {
 
 /// B18/B19/I18: a terminal marker tombstones ONLY records whose stored
 /// pr_number matches; a DIFFERENT-generation record on the same branch
-/// SURVIVES (no force-bind by branch, no unbound window).
+/// SURVIVES (no force-bind by branch, no unbound window). Assignment cleanup
+/// must not mutate the source task's lifecycle.
 #[test]
 fn terminal_tombstones_only_matching_pr_number() {
     let home = tmp_home("terminal-pr");
     seed_open_task(&home, "t-term-g");
     seed_open_task(&home, "t-term-gp");
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("lead"),
+        crate::task_events::TaskEvent::MovedToReview {
+            task_id: crate::task_events::TaskId::from("t-term-g"),
+        },
+    )
+    .unwrap();
     let mut g = mk_record("o/r", "feat/x", "rev-g", 30, "2026-07-13T00:00:00Z");
     g.task_id = "t-term-g".into();
     let mut gp = mk_record("o/r", "feat/x", "rev-gp", 31, "2026-07-13T00:00:00Z");
@@ -417,11 +426,40 @@ fn terminal_tombstones_only_matching_pr_number() {
     );
     assert_eq!(
         task_status(&home, "t-term-g"),
-        crate::task_events::TaskStatus::Cancelled
+        crate::task_events::TaskStatus::InReview,
+        "terminal review-assignment cleanup must preserve the source task"
     );
     assert_eq!(
         task_status(&home, "t-term-gp"),
         crate::task_events::TaskStatus::Open
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn terminal_restart_repair_preserves_source_task() {
+    let home = tmp_home("terminal-restart-task");
+    seed_open_task(&home, "t-restart");
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("lead"),
+        crate::task_events::TaskEvent::MovedToReview {
+            task_id: crate::task_events::TaskId::from("t-restart"),
+        },
+    )
+    .unwrap();
+    record_terminal(&home, "o/r", "feat/x", 30, TerminalKind::Merged).unwrap();
+
+    let mut record = mk_record("o/r", "feat/x", "rev", 30, "2026-07-13T00:00:00Z");
+    record.task_id = "t-restart".into();
+    persist(&home, &record).unwrap();
+
+    assert_eq!(tombstone_terminal_matches(&home, "o/r", "feat/x"), 1);
+    assert!(get(&home, "o/r", "feat/x", "rev").is_none());
+    assert_eq!(
+        task_status(&home, "t-restart"),
+        crate::task_events::TaskStatus::InReview,
+        "restart repair must not cancel the source task"
     );
     std::fs::remove_dir_all(&home).ok();
 }

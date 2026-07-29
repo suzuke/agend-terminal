@@ -534,8 +534,8 @@ mod tests {
         );
         assert_eq!(
             task_status(&home, "t-restart"),
-            crate::task_events::TaskStatus::Cancelled,
-            "restart tombstone cancels the replayed assignment task"
+            crate::task_events::TaskStatus::Open,
+            "restart repair must not cancel the replayed assignment task"
         );
         std::fs::remove_dir_all(&home).ok();
     }

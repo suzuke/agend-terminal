@@ -1227,7 +1227,8 @@ pub(crate) fn transfer(
 /// A7 (store half) — record a terminal PR generation: add `pr_number` to the
 /// RETAINED [`TerminalMarkers`] set (NO compaction — B20/I19) and CAS-tombstone
 /// ONLY records whose stored `pr_number == pr_number` (NEVER a different
-/// generation — B18/B19/I18). Returns the number of records tombstoned. (The
+/// generation — B18/B19/I18). This only retires review authority; the referenced
+/// task keeps its own lifecycle. Returns the number of records tombstoned. (The
 /// `record_ci_result` call-site wiring is a LATER slice.)
 pub(crate) fn record_terminal(
     home: &Path,
@@ -1236,8 +1237,7 @@ pub(crate) fn record_terminal(
     pr_number: u64,
     kind: TerminalKind,
 ) -> anyhow::Result<usize> {
-    let mut cleanup_tasks = Vec::new();
-    let result = (|| {
+    (|| {
         let _lock = lock_branch(home, repo, branch)?;
         // 1) Add the marker to the RETAINED set (idempotent; NO compaction — I19). B4:
         //    `?` propagates a corrupt-markers Err — a silent default-empty read here
@@ -1255,13 +1255,6 @@ pub(crate) fn record_terminal(
         let mut tombstoned = 0;
         for record in list_active(home, repo, branch) {
             if record.pr_number == pr_number {
-                if crate::tasks::cancel_review_assignment_task(
-                    home,
-                    &record.task_id,
-                    "review assignment PR generation became terminal",
-                )? {
-                    cleanup_tasks.push(record.task_id.clone());
-                }
                 let path = record_file(home, repo, branch, &record.target);
                 if remove_if_assignment_matches_strict(&path, record.assignment_id)? {
                     tombstoned += 1;
@@ -1269,11 +1262,7 @@ pub(crate) fn record_terminal(
             }
         }
         Ok(tombstoned)
-    })();
-    for task_id in cleanup_tasks {
-        crate::tasks::task_terminal_cleanup(home, &task_id);
-    }
-    result
+    })()
 }
 
 // ─────────────────────────── C10/C12: live-wiring helpers ───────────────────────────
@@ -1292,11 +1281,12 @@ pub(crate) fn terminal_kind_of(state: &PrState) -> Option<TerminalKind> {
 /// A10a store-half — TERMINAL RESTART-REPAIR. CAS-tombstone every active record of
 /// `(repo,branch)` whose stored `pr_number` is already in the RETAINED
 /// [`TerminalMarkers`] set (the A7 crash-gap / old-generation-replay backstop —
-/// I18/I19). Takes the branch lock internally; NEVER re-locks (call it top-level,
-/// never while already holding the branch lock). Returns the number tombstoned.
+/// I18/I19). This only retires review authority; the referenced task keeps its
+/// own lifecycle. Takes the branch lock internally; NEVER re-locks (call it
+/// top-level, never while already holding the branch lock). Returns the number
+/// tombstoned.
 pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) -> usize {
-    let mut cleanup_tasks = Vec::new();
-    let result = (|| {
+    (|| {
         let Ok(_lock) = lock_branch(home, repo, branch) else {
             return 0;
         };
@@ -1317,25 +1307,6 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
         let mut tombstoned = 0;
         for record in list_active(home, repo, branch) {
             if markers.contains(record.pr_number) {
-                match crate::tasks::cancel_review_assignment_task(
-                    home,
-                    &record.task_id,
-                    "review assignment PR generation became terminal",
-                ) {
-                    Ok(true) => cleanup_tasks.push(record.task_id.clone()),
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::error!(
-                            repo,
-                            branch,
-                            target = %record.target,
-                            task_id = %record.task_id,
-                            error = %error,
-                            "assignment tombstone skipped: task cancellation failed (fail closed)"
-                        );
-                        continue;
-                    }
-                }
                 let path = record_file(home, repo, branch, &record.target);
                 if remove_if_assignment_matches(&path, record.assignment_id) {
                     tombstoned += 1;
@@ -1343,11 +1314,7 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
             }
         }
         tombstoned
-    })();
-    for task_id in cleanup_tasks {
-        crate::tasks::task_terminal_cleanup(home, &task_id);
-    }
-    result
+    })()
 }
 
 /// A6/A10b — DERIVE the RESERVED set for `prstate` from the active assignment
