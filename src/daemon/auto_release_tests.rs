@@ -989,12 +989,19 @@ fn write_fleet(home: &Path, agent: &str) {
 }
 
 /// REAL task-done entry: the MCP handler (`task action=done`) — exercises the
-/// handler→enqueue wiring (codex gap ③ / §3.9). Asserts no error.
-fn task_done_via_handler(home: &Path, agent: &str, task_id: &str) {
+/// handler→enqueue wiring (codex gap ③ / §3.9). These policy fixtures model
+/// root's operator-forced terminalization, because their synthetic worktrees
+/// are often deliberately dirty, unpushed, or cross-leased. Asserts no error.
+fn task_done_via_handler(home: &Path, task_id: &str) {
     let r = crate::tasks::handle(
         home,
-        agent,
-        &serde_json::json!({ "action": "done", "id": task_id }),
+        "operator",
+        &serde_json::json!({
+            "action": "done",
+            "id": task_id,
+            "force": true,
+            "force_reason": "auto-release policy fixture"
+        }),
     );
     assert!(r.get("error").is_none(), "task action=done failed: {r}");
 }
@@ -1054,7 +1061,7 @@ fn integration_open_pr_retains_via_real_handler() {
         true,
     );
     // REAL entry: the task-done handler marks done + enqueues.
-    task_done_via_handler(&home, "dev", "t-o");
+    task_done_via_handler(&home, "t-o");
     assert_eq!(queue_len(&home), 1, "task-done handler→enqueue wiring");
     drain_queue(&home);
     assert!(
@@ -1073,7 +1080,7 @@ fn integration_no_pr_task_done_releases_via_real_handler() {
     itest_lease(&home, &repo, "dev", "feat/n", "t-n", false);
     write_pr_slug(&home, "owner/repo", "feat/n", MergeState::NotReady, 0, true); // polled, no PR
                                                                                  // REAL entry: task-done handler.
-    task_done_via_handler(&home, "dev", "t-n");
+    task_done_via_handler(&home, "t-n");
     drain_queue(&home);
     assert!(
         !bound(&home, "dev"),
@@ -1199,7 +1206,7 @@ fn integration_merged_dirty_wip_preserves_and_releases() {
         5,
         true,
     );
-    task_done_via_handler(&home, "dev", "t-md");
+    task_done_via_handler(&home, "t-md");
     assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
     drain_queue(&home);
     assert!(
@@ -1238,7 +1245,7 @@ fn integration_deleted_branch_merged_dirty_releases_via_squash_check() {
     // NO write_pr_slug → pr_state absent (== deleted after --delete-branch) →
     // evaluate = Unknown. Dirty (untracked, non-ignored) = build/handoff artifact.
     std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
-    task_done_via_handler(&home, "dev", "t-sm");
+    task_done_via_handler(&home, "t-sm");
     assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
     drain_queue(&home);
     assert!(
@@ -1274,7 +1281,7 @@ fn integration_unmerged_unknown_dirty_retains() {
     let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
         crate::scm::MockPrList::Prs(1),
     ));
-    task_done_via_handler(&home, "dev", "t-pg");
+    task_done_via_handler(&home, "t-pg");
     assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
     drain_queue(&home);
     assert!(
@@ -1358,7 +1365,7 @@ fn integration_no_pr_ever_dirty_releases_via_gh_confirm() {
     let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
         crate::scm::MockPrList::Prs(0),
     ));
-    task_done_via_handler(&home, "reviewer", "t-revy");
+    task_done_via_handler(&home, "t-revy");
     assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
     drain_queue(&home);
     assert!(
@@ -1387,7 +1394,7 @@ fn integration_no_pr_transient_gh_fail_retains() {
     let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
         crate::scm::MockPrList::Fail("gh: rate limited".into()),
     ));
-    task_done_via_handler(&home, "reviewer", "t-revz");
+    task_done_via_handler(&home, "t-revz");
     assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
     drain_queue(&home);
     assert!(
@@ -1429,7 +1436,7 @@ fn unknown_probe_backs_off_and_new_evidence_wakes_it_immediately() {
     let provider = crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Prs(1));
     let _scm = crate::scm::set_test_scm_provider(provider.clone());
 
-    task_done_via_handler(&home, "dev", "t-bo");
+    task_done_via_handler(&home, "t-bo");
     assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
 
     drain_queue(&home);
@@ -1536,22 +1543,9 @@ fn cross_lease_done_no_release_when_binding_task_mismatch() {
     itest_lease(&home, &repo, "dev-1", "feat/new", "t-new", false);
     // An OLD task (t-old / feat/old) also exists, owned by dev-1
     seed_task(&home, "t-old", "dev-1", "feat/old", false);
-    // Root marks t-old done (the stale cleanup scenario) through the explicit
-    // force path, which is the authority for a task outside the live lease.
-    let done = crate::tasks::handle(
-        &home,
-        "operator",
-        &serde_json::json!({
-            "action": "done",
-            "id": "t-old",
-            "force": true,
-            "force_reason": "stale task cleanup"
-        }),
-    );
-    assert!(
-        done.get("error").is_none(),
-        "forced stale task completion failed: {done}"
-    );
+    // Root marks t-old done (the stale cleanup scenario) through the shared
+    // operator-forced handler fixture.
+    task_done_via_handler(&home, "t-old");
     assert_eq!(
             queue_len(&home),
             0,
