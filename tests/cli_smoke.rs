@@ -246,6 +246,48 @@ fn connect_failed_spawn_deregisters_external_agent() {
     );
 }
 
+/// A second detached-default `start` must not mistake the first daemon's
+/// already-published run dir for evidence that its own child started.
+#[cfg(unix)]
+#[test]
+fn second_detached_start_rejects_existing_daemon() {
+    let stamp = std::process::id();
+    let home = std::env::temp_dir().join(format!("agend-cli-smoke-second-start-{stamp}"));
+    std::fs::create_dir_all(&home).expect("create home dir");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "defaults:\n  command: /bin/cat\ninstances:\n  probe: {}\n",
+    )
+    .expect("write fleet.yaml");
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::cargo_bin("agend-terminal")
+                .expect("binary must exist")
+                .env("AGEND_HOME", &self.0)
+                .arg("stop")
+                .output();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(home.clone());
+
+    cmd()
+        .env("AGEND_HOME", &home)
+        .arg("start")
+        .assert()
+        .success();
+    cmd()
+        .env("AGEND_HOME", &home)
+        .arg("start")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another agend-terminal daemon is already running",
+        ));
+}
+
 /// `agend app` without a TTY must fail with a clean, actionable error rather
 /// than panicking (exit 101) and leaking raw terminal escape sequences.
 #[test]

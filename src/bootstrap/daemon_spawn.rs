@@ -5,7 +5,7 @@
 //! redirects its stdio to a log file under `$AGEND_HOME`, and waits briefly
 //! for the child to publish its run dir so we know it actually started.
 //!
-//! Used by `agend-terminal start --detached` (daemon runs in the background,
+//! Used by `agend-terminal start` (daemon runs in the background by default,
 //! parent exits immediately).
 
 use anyhow::{Context, Result};
@@ -36,6 +36,14 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
     let exe = std::env::current_exe().context("resolve current_exe for detach spawn")?;
 
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
+    if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
+        let pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
+        anyhow::bail!(
+            "another agend-terminal daemon is already running (pid {}, run_dir {})",
+            pid,
+            run_dir.display()
+        );
+    }
     // #914: `log_path` is now the symlink the daemon child maintains
     // (Unix) or the operator-tail target. We no longer redirect the
     // child's stdio here — the child's in-process `tracing_appender::rolling`
@@ -78,23 +86,34 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn detached daemon: {} start", exe.display()))?;
     let spawn_pid = child.id();
-    // Forget the handle so the parent does not wait / reap the child at drop.
-    // The daemon is now a long-lived background process unrelated to us.
-    drop(child);
+    let expected_run_dir = crate::daemon::run_dir_for_pid(home, spawn_pid);
 
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
-            let daemon_pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(spawn_pid);
+        if crate::daemon::read_daemon_pid(&expected_run_dir) == Some(spawn_pid) {
             return Ok(DaemonHandle {
-                pid: daemon_pid,
-                run_dir,
+                pid: spawn_pid,
+                run_dir: expected_run_dir,
                 log_path,
             });
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("check detached daemon child status")?
+        {
+            if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
+                let pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
+                anyhow::bail!(
+                    "another agend-terminal daemon is already running (pid {}, run_dir {})",
+                    pid,
+                    run_dir.display()
+                );
+            }
+            anyhow::bail!("detached daemon exited before publishing its run dir ({status})");
         }
         if Instant::now() >= deadline {
             anyhow::bail!(

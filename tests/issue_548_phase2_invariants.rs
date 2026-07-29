@@ -10,6 +10,7 @@
 const MAIN_RS: &str = include_str!("../src/main.rs");
 const TRAY_MOD_RS: &str = include_str!("../src/tray/mod.rs");
 const DAEMON_MOD_RS: &str = include_str!("../src/daemon/mod.rs");
+const DAEMON_LIFECYCLE_SH: &str = include_str!("../scripts/e2e/daemon-lifecycle.sh");
 
 // ---------------------------------------------------------------------
 // Audit 1 (Q1): `Commands::Start` default flips to detached.
@@ -31,6 +32,15 @@ fn commands_start_default_is_detached() {
         !MAIN_RS.contains("detached: bool,"),
         "Wave 3 PR-2 (#548 Q1): Commands::Start must NOT declare `detached: bool` \
          — that's the pre-Wave-3-PR-2 opt-in field name. Q1 inverted the default."
+    );
+}
+
+#[test]
+fn daemon_lifecycle_uses_detached_default() {
+    assert!(
+        !DAEMON_LIFECYCLE_SH.contains("start --detached"),
+        "the lifecycle smoke must use `start`; detached is the default and \
+         `--detached` is no longer a valid flag"
     );
 }
 

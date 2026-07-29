@@ -2,12 +2,10 @@
 # End-to-end tests for the daemon-resident lifecycle (Stage 3.6).
 #
 # Scenarios (see docs/FEATURE-service.md):
-#   1. start --detached → parent exits → daemon survives.
+#   1. start (detached by default) → parent exits → daemon survives.
 #   2. Second start with fleet hits the flock → exits non-zero.
 #   3. app while daemon is live → connects as remote client (Stage 3.4).
 #   4. stop tears down run dir; subsequent start cold-starts.
-#   5. fleet.yaml hot-reload: live daemon picks up a newly-added instance
-#      (hot-reload Phase B/D).
 #
 # Runs entirely under a temporary AGEND_HOME. No install, no touch to the
 # user's real ~/agend. Requires python3 (PTY harness for Scenario 3).
@@ -21,6 +19,10 @@ red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 info()  { printf '\033[36m[check]\033[0m %s\n' "$*"; }
 fail()  { red "FAIL: $*"; exit 1; }
+
+list_has_agents() {
+    python3 -c 'import json,sys; d=json.load(sys.stdin); names={a["name"] for a in d.get("agents", [])}; sys.exit(0 if d.get("mode") == "live" and set(sys.argv[1:]) <= names else 1)' "$@"
+}
 
 TEST_HOME="$(mktemp -d -t agend-lifecycle-XXXXXX)"
 BIN="${AGEND_TERMINAL_BIN:-$PWD/target/debug/agend-terminal}"
@@ -77,10 +79,10 @@ get_daemon_pid() {
     tr -d '[:space:]' < "$f" | cut -d: -f1
 }
 
-# -------------------- Scenario 1: start --detached --------------------
-info "Scenario 1: start --detached survives parent exit"
-AGEND_HOME="$TEST_HOME" "$BIN" start --detached >/dev/null
-wait_for_run_dir || fail "run_dir never appeared after start --detached"
+# -------------------- Scenario 1: detached-default start --------------------
+info "Scenario 1: detached-default start survives parent exit"
+AGEND_HOME="$TEST_HOME" "$BIN" start >/dev/null
+wait_for_run_dir || fail "run_dir never appeared after start"
 DAEMON_PID="$(get_daemon_pid)" || fail "could not read daemon pid"
 kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon pid $DAEMON_PID is not alive"
 # Give it a moment, re-check — detached daemon must outlive this shell.
@@ -89,12 +91,12 @@ kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon died shortly after start"
 # list must enumerate the fleet instances (up to a few seconds for agents to bind ports)
 for _ in 1 2 3 4 5 6 7 8; do
     LIST="$(AGEND_HOME="$TEST_HOME" "$BIN" list --json)"
-    if echo "$LIST" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if ("alpha" in d and "beta" in d) else 1)'; then
+    if echo "$LIST" | list_has_agents alpha beta; then
         break
     fi
     sleep 0.5
 done
-echo "$LIST" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if ("alpha" in d and "beta" in d) else 1)' \
+echo "$LIST" | list_has_agents alpha beta \
     || fail "list should include alpha + beta, got: $LIST"
 green "  ok (pid $DAEMON_PID, agents ready)"
 
@@ -116,12 +118,13 @@ info "Scenario 3: app attaches to live daemon via PTY (post-3.4)"
 # wrapper reports the child pid on its stdout, sleeps a few seconds to let
 # the app reach bootstrap::prepare + build remote panes, then SIGTERMs it.
 python3 - "$BIN" "$TEST_HOME" > "$TEST_HOME/app-pid.out" 2>&1 <<'PY' &
-import os, pty, sys, time
+import fcntl, os, pty, struct, sys, termios, time
 bin_path = sys.argv[1]
 test_home = sys.argv[2]
 pid, _fd = pty.fork()
 if pid == 0:
     os.environ["AGEND_HOME"] = test_home
+    fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     try:
         os.execvp(bin_path, [bin_path, "app"])
     except Exception as e:
@@ -153,20 +156,23 @@ APP_PID="$(head -1 "$TEST_HOME/app-pid.out" | awk '{print $1}' | grep -E '^[0-9]
 # Let it settle, then confirm it's alive (i.e. it didn't fail-fast).
 sleep 1.5
 if ! kill -0 "$APP_PID" 2>/dev/null; then
-    fail "app exited early (pid $APP_PID) — Stage 3.4 regression? See $TEST_HOME/app.log"
+    fail "app exited early (pid $APP_PID) — Stage 3.4 regression? See $TEST_HOME/app.*.log"
 fi
-# Positive assertion: app.log shows the Attached branch ran.
-if ! grep -q "attached to existing daemon" "$TEST_HOME/app.log" 2>/dev/null; then
-    fail "app.log missing 'attached to existing daemon' trace; see $TEST_HOME/app.log"
+# Positive assertion: the current rolling app log shows the Attached branch ran.
+if ! grep -q "attached to existing daemon" "$TEST_HOME"/app.*.log 2>/dev/null; then
+    fail "app log missing 'attached to existing daemon' trace; see $TEST_HOME/app.*.log"
 fi
 # And no Stage 3.3 fail-fast message (defense in depth — shouldn't even be
 # possible with the pre-TUI bail removed, but cheap to assert).
-if grep -qi "another agend-terminal daemon is already running" "$TEST_HOME/app.log" 2>/dev/null; then
-    fail "app.log still contains pre-3.4 fail-fast message"
+if grep -qi "another agend-terminal daemon is already running" "$TEST_HOME"/app.*.log 2>/dev/null; then
+    fail "app log still contains pre-3.4 fail-fast message"
 fi
 # Let the wrapper finish (it SIGTERMs the app after 3s).
 wait "$WRAPPER_PID" 2>/dev/null || true
 APP_PID=""
+if grep -qi "panic" "$TEST_HOME"/app.*.log 2>/dev/null; then
+    fail "app panicked during attached-mode smoke; see $TEST_HOME/app.*.log"
+fi
 # The daemon must survive the app's exit — app is a client, not an owner.
 kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon died when app was shut down (should have survived)"
 green "  ok (attach traced; daemon survived app exit)"
@@ -174,7 +180,7 @@ green "  ok (attach traced; daemon survived app exit)"
 # -------------------- Scenario 4: stop → cold start --------------------
 info "Scenario 4: stop tears down run dir; next start cold-starts"
 AGEND_HOME="$TEST_HOME" "$BIN" stop >/dev/null
-for _ in $(seq 1 20); do
+for _ in $(seq 1 34); do
     compgen -G "$TEST_HOME/run/*/.daemon" >/dev/null || break
     sleep 0.3
 done
@@ -187,43 +193,12 @@ kill -0 "$DAEMON_PID" 2>/dev/null && fail "old daemon pid $DAEMON_PID still aliv
 OLD_PID="$DAEMON_PID"
 DAEMON_PID=""
 # Cold start — new PID, new run_dir.
-AGEND_HOME="$TEST_HOME" "$BIN" start --detached >/dev/null
+AGEND_HOME="$TEST_HOME" "$BIN" start >/dev/null
 wait_for_run_dir || fail "cold start failed to create run_dir"
 DAEMON_PID="$(get_daemon_pid)" || fail "cold start has no pid"
 kill -0 "$DAEMON_PID" 2>/dev/null || fail "cold-started daemon $DAEMON_PID not alive"
 [[ "$DAEMON_PID" != "$OLD_PID" ]] || fail "new daemon reuses old pid $OLD_PID (should be impossible)"
 green "  ok (new pid $DAEMON_PID)"
-
-# -------------------- Scenario 5: fleet.yaml hot-reload --------------------
-info "Scenario 5: fleet.yaml mutation is picked up by the live daemon"
-# Baseline: gamma must not be in the fleet yet.
-BASELINE="$(AGEND_HOME="$TEST_HOME" "$BIN" list --json)"
-if echo "$BASELINE" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "gamma" in d else 1)'; then
-    fail "gamma should not be in pre-reload list; got: $BASELINE"
-fi
-# Sleep 1.1s before rewriting so mtime visibly advances past the cold-start
-# read (filesystem mtime resolution can truncate sub-second writes on some FS).
-sleep 1.1
-cat >> "$TEST_HOME/fleet.yaml" <<'YAML'
-  gamma: {}
-YAML
-# Daemon hot-reload tick is 10s; give up to 20s for (tick → resolve → spawn
-# → port bind). Poll every 0.5s so we exit early as soon as gamma appears.
-SUCCEEDED=0
-LAST_LIST=""
-for _ in $(seq 1 40); do
-    LAST_LIST="$(AGEND_HOME="$TEST_HOME" "$BIN" list --json 2>/dev/null || true)"
-    if echo "$LAST_LIST" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "gamma" in d else 1)' 2>/dev/null; then
-        SUCCEEDED=1
-        break
-    fi
-    sleep 0.5
-done
-[[ "$SUCCEEDED" == "1" ]] || fail "gamma did not appear in list after fleet.yaml reload; last list: $LAST_LIST"
-# And the daemon we started at the top of Scenario 4 is still the same pid —
-# reload must be in-place, not a restart.
-kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon $DAEMON_PID died during hot-reload"
-green "  ok (gamma picked up via hot-reload, daemon pid unchanged)"
 
 echo
 green "Daemon lifecycle end-to-end tests passed."

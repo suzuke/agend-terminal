@@ -51,7 +51,7 @@ pub fn validate_fleet_config(config: &FleetConfig, home: &Path) -> Vec<Diagnosti
 /// Sprint 56 Track H2 (#525 item 5): Critical-severity diagnostics are
 /// ALSO mirrored to `eprintln!` so the operator sees them regardless of
 /// the daemon's tracing destination. The pre-Track-H2 path emitted only
-/// via `tracing::error!`; in `agend-terminal start --detached` mode the
+/// via `tracing::error!`; in detached-default `agend-terminal start` mode the
 /// daemon detaches stderr from the operator's terminal and tracing
 /// lands in a log file most operators never check, leaving D-class
 /// diagnostics silent for the failure modes they were built to defend.
