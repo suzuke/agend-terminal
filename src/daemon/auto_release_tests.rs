@@ -1536,8 +1536,22 @@ fn cross_lease_done_no_release_when_binding_task_mismatch() {
     itest_lease(&home, &repo, "dev-1", "feat/new", "t-new", false);
     // An OLD task (t-old / feat/old) also exists, owned by dev-1
     seed_task(&home, "t-old", "dev-1", "feat/old", false);
-    // Root marks t-old done (the stale cleanup scenario)
-    task_done_via_handler(&home, "dev-1", "t-old");
+    // Root marks t-old done (the stale cleanup scenario) through the explicit
+    // force path, which is the authority for a task outside the live lease.
+    let done = crate::tasks::handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "done",
+            "id": "t-old",
+            "force": true,
+            "force_reason": "stale task cleanup"
+        }),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "forced stale task completion failed: {done}"
+    );
     assert_eq!(
             queue_len(&home),
             0,
