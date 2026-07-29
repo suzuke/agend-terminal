@@ -2,7 +2,7 @@ use super::watch::handle_watch_ci;
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// #2812: post-merge receipt persistence + notification-only watch auto-arm.
+/// Post-merge receipt persistence + actionable exact-head watch auto-arm.
 /// Separated for testability — the merge handler calls this after
 /// `MergeVerdict::Confirmed`. Returns diagnostic fields to embed in the
 /// merge response. Merge success is truthful regardless of this outcome.
@@ -36,6 +36,11 @@ pub(crate) fn post_merge_receipt_and_watch(
     if let Err(e) = crate::merge_receipt::persist(home, &receipt) {
         return json!({"receipt_error": format!("receipt persist failed: {e}")});
     }
+    let (watch_caller, next_after_ci) = if merge_authority.is_empty() {
+        ("", assignee.as_str())
+    } else {
+        (merge_authority, merge_authority)
+    };
     let watch_result = handle_watch_ci(
         home,
         &json!({
@@ -43,9 +48,9 @@ pub(crate) fn post_merge_receipt_and_watch(
             "branch": "main",
             "head_sha": merge_commit,
             "task_id": &task_id,
-            "notification_only": true,
+            "next_after_ci": [next_after_ci],
         }),
-        &assignee,
+        watch_caller,
     );
     if watch_result.get("error").is_some() {
         json!({
