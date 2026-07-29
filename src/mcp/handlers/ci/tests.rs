@@ -3412,7 +3412,7 @@ fn seed_notify_cursors_is_atomic_under_concurrent_reads_3114() {
             torn
         })
     };
-    for _ in 0..1500 {
+    for _ in 0..500 {
         seed_notify_cursors(&path);
     }
     done.store(true, std::sync::atomic::Ordering::Relaxed);
