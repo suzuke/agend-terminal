@@ -524,6 +524,26 @@ mod tests {
     }
 
     #[test]
+    fn create_instance_backend_schema_lists_all_canonical_commands() {
+        let definition = def_create_instance();
+        let description = definition["inputSchema"]["properties"]["backend"]["description"]
+            .as_str()
+            .expect("backend description");
+
+        for backend in crate::backend::Backend::all() {
+            let command = backend.preset().command;
+            assert!(
+                description.contains(command),
+                "create_instance backend schema must advertise canonical command '{command}'"
+            );
+        }
+        assert!(
+            description.contains("grok"),
+            "create_instance backend schema must advertise the Grok CLI"
+        );
+    }
+
+    #[test]
     fn create_instance_name_not_required_command() {
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().expect("tools array");
