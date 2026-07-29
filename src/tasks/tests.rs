@@ -4952,7 +4952,6 @@ fn activity_timeline_returns_events_for_task() {
             "action": "create",
             "title": "implement widget",
             "assignee": "dev",
-            "branch": "feat/widget",
         }),
     );
     let task_id = create_result["id"].as_str().unwrap();

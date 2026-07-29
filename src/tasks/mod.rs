@@ -44,6 +44,100 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
 
+/// Gate completion by the assignee's bound branch state. Non-assignees (the
+/// orchestrator/system paths) and branchless tasks retain their existing ACL.
+pub(crate) fn assignee_completion_guard(
+    home: &Path,
+    task_id: &str,
+    caller: &str,
+    record: &crate::task_events::TaskRecord,
+) -> Result<(), String> {
+    let Some(branch) = record.branch.as_deref() else {
+        return Ok(());
+    };
+    if record.owner.as_ref().map(|owner| owner.0.as_str()) != Some(caller) {
+        return Ok(());
+    }
+
+    let binding = crate::binding::read(home, caller)
+        .ok_or_else(|| "assignee completion requires an exact live binding".to_string())?;
+    let binding_agent = binding["agent"].as_str();
+    let binding_task = binding["task_id"].as_str();
+    let binding_branch = binding["branch"].as_str();
+    let source_repo = binding["source_repo"].as_str().unwrap_or("");
+    let worktree = binding["worktree"].as_str().unwrap_or("");
+    if binding_agent != Some(caller)
+        || binding_task != Some(task_id)
+        || binding_branch != Some(branch)
+        || source_repo.is_empty()
+        || worktree.is_empty()
+    {
+        return Err("assignee completion binding does not exactly match the task".to_string());
+    }
+
+    let source_repo = Path::new(source_repo);
+    let worktree = Path::new(worktree);
+    if !source_repo.exists() || !worktree.exists() {
+        return Err("assignee completion binding points to a missing path".to_string());
+    }
+    if crate::worktree_pool::worktree_has_work_at_risk(worktree) {
+        return Err("assignee worktree has dirty or unpushed work".to_string());
+    }
+
+    let actual_branch = crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
+        .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
+    if actual_branch != branch {
+        return Err("assignee worktree branch does not match the task".to_string());
+    }
+
+    let provisioned_head = match (
+        binding["checkout_purpose"].as_str(),
+        binding["provenance"].as_str(),
+        binding["provisioned_head"].as_str(),
+    ) {
+        (Some("disposable_review"), Some("DaemonProvisionedReview"), Some(head)) => Some(head),
+        _ => None,
+    };
+    let disposable_review_at_provisioned_head = if let Some(expected_head) = provisioned_head {
+        let actual_head = crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"])
+            .map_err(|error| format!("assignee review HEAD check failed: {error}"))?;
+        actual_head == expected_head
+    } else {
+        false
+    };
+
+    if disposable_review_at_provisioned_head {
+        return Ok(());
+    }
+
+    let remote = crate::git_helpers::primary_remote(source_repo);
+    let remote_head_ref = format!("refs/remotes/{remote}/HEAD");
+    let remote_default =
+        crate::git_helpers::git_cmd(source_repo, &["symbolic-ref", &remote_head_ref])
+            .map_err(|error| format!("assignee remote default ref is unreadable: {error}"))?;
+    let remote_prefix = format!("refs/remotes/{remote}/");
+    if !remote_default.starts_with(&remote_prefix) || remote_default == remote_prefix {
+        return Err("assignee remote default ref is invalid".to_string());
+    }
+
+    let local_branch_ref = format!("refs/heads/{branch}");
+    let ahead = crate::git_helpers::git_cmd(
+        source_repo,
+        &[
+            "rev-list",
+            "--count",
+            &format!("{remote_default}..{local_branch_ref}"),
+        ],
+    )
+    .map_err(|error| format!("assignee feature ref comparison failed: {error}"))?
+    .parse::<u64>()
+    .map_err(|error| format!("assignee feature ref count is invalid: {error}"))?;
+    if ahead > 0 {
+        return Err("assignee feature branch is ahead of the remote default".to_string());
+    }
+    Ok(())
+}
+
 /// Cancel the task owned by a reviewer-assignment authority mutation.
 ///
 /// The caller holds the assignment branch lock before entering this helper, so

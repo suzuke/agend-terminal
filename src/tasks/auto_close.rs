@@ -59,6 +59,9 @@ pub fn auto_close_on_report(
     if assignee != reporter {
         return Ok(false);
     }
+    if super::assignee_completion_guard(home, correlation_id, reporter, record).is_err() {
+        return Ok(false);
+    }
     let summary = if report_text.chars().count() > 200 {
         let truncated: String = report_text.chars().take(200).collect();
         format!("{truncated}…")

@@ -602,6 +602,7 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
 
 mod workspace;
 pub(crate) use workspace::prepare_workspace_worktree_with_permit;
+pub(crate) use workspace::worktree_has_work_at_risk;
 #[allow(unused_imports)]
 pub use workspace::{
     checkout_workspace_branch, detach_workspace_to_holding, prepare_workspace_worktree,
@@ -611,7 +612,7 @@ pub use workspace::{
 #[cfg(test)]
 pub(crate) use workspace::{
     release_one_stale_holder, workspace_as_worktree_from_env, workspace_worktree_test_seam,
-    worktree_common_dir_matches, worktree_has_work_at_risk,
+    worktree_common_dir_matches,
 };
 
 fn clear_binding_state(
