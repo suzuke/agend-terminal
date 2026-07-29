@@ -3357,7 +3357,13 @@ fn seed_notify_cursors(path: &Path) -> String {
     w["rate_limit_remaining"] = serde_json::json!(17);
     w["consecutive_skips"] = serde_json::json!(3);
     w["effective_interval_secs"] = serde_json::json!(120);
-    std::fs::write(path, serde_json::to_string_pretty(&w).unwrap()).unwrap();
+    // #3114 S1: honor the same per-watch flock + atomic-rename contract as
+    // every production watch writer (watch.rs H5) — a bare in-place fs::write
+    // is torn-readable by any concurrent reader (Coverage run 30448683890).
+    let _lock =
+        crate::store::acquire_file_lock(&path.with_extension("lock")).expect("watch fixture lock");
+    crate::store::atomic_write(path, serde_json::to_string_pretty(&w).unwrap().as_bytes())
+        .expect("watch fixture atomic write");
     gen
 }
 
