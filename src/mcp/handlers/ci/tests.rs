@@ -3361,6 +3361,65 @@ fn seed_notify_cursors(path: &Path) -> String {
     gen
 }
 
+/// #3114 S1 (Coverage run 30448683890): `seed_notify_cursors` must uphold the
+/// per-watch flock + atomic-rename write contract every PRODUCTION watch writer
+/// honors (H5 / CR-2026-06-14) — a bare in-place `fs::write` is torn-readable
+/// by any concurrent reader, which is exactly the malformed-JSON class the
+/// coverage run caught in `read_watch`. This stress drives the REAL helper
+/// against a concurrent parser: with a non-atomic seed it observes partial
+/// JSON; with flock + `store::atomic_write` every observed generation is
+/// complete, so zero parse failures is the invariant.
+#[test]
+fn seed_notify_cursors_is_atomic_under_concurrent_reads_3114() {
+    let home = watch_test_home("seed-atomic-stress");
+    super::handle_watch_ci(
+        &home,
+        &serde_json::json!({"repository": "o/r", "branch": "feat/stress"}),
+        "dev-1",
+    );
+    let path = watch_path_for(&home, "o/r", "feat/stress");
+    // Widen the write window past a single page BEFORE the reader starts (this
+    // arrange-step write is sequential, so it cannot itself tear): the padding
+    // survives every subsequent whole-file rewrite the seed helper performs,
+    // making each seed write span many pages — the same multi-syscall shape a
+    // coverage-instrumented run gives even small files.
+    let mut w = read_watch(&path);
+    w["stress_padding"] = serde_json::json!("x".repeat(256 * 1024));
+    std::fs::write(&path, serde_json::to_string_pretty(&w).unwrap()).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let path = path.clone();
+        let done = done.clone();
+        // fire-and-forget: joined below before any assertion; bounded by `done`.
+        std::thread::spawn(move || {
+            let mut torn = 0u32;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    // An empty or unparsable observation is a torn state: after
+                    // the pre-reader arrange write the file is always complete,
+                    // and an atomic-rename writer can never expose either.
+                    if s.is_empty() || serde_json::from_str::<serde_json::Value>(&s).is_err() {
+                        torn += 1;
+                    }
+                }
+            }
+            torn
+        })
+    };
+    for _ in 0..1500 {
+        seed_notify_cursors(&path);
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let torn = reader.join().expect("reader thread");
+    assert_eq!(
+        torn, 0,
+        "a concurrent reader observed {torn} torn/partial watch JSON states — \
+         seed_notify_cursors must write under the watch flock via atomic rename, \
+         never a bare in-place fs::write"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 const NOTIFY_CURSORS: &[&str] = &[
     "last_run_id",
     "last_notified_head_sha",
