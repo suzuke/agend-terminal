@@ -1295,7 +1295,35 @@ fn auto_close_on_report_enqueues_release_recompute() {
     let home = tmp_home("itest-autoclose-enq");
     write_fleet(&home, "reviewer");
     let repo = itest_source_repo(&home, "owner/repo");
-    itest_lease(&home, &repo, "reviewer", "review/x", "t-rev", false);
+    let worktree = itest_lease(&home, &repo, "reviewer", "review/x", "t-rev", false);
+    let provisioned_head =
+        crate::git_helpers::git_cmd(&worktree, &["rev-parse", "HEAD"]).expect("review lease HEAD");
+    crate::binding::bind_full_with_provenance(
+        &home,
+        "reviewer",
+        "t-rev",
+        "review/x",
+        &worktree,
+        &repo,
+        false,
+        Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
+            provisioned_head: &provisioned_head,
+        }),
+    )
+    .expect("daemon-provisioned review binding");
+    let seeded_tracking_ref = crate::git_helpers::git_bypass(
+        &repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/review-subject",
+            &provisioned_head,
+        ],
+    )
+    .expect("seed synthetic review tracking ref");
+    assert!(
+        seeded_tracking_ref.status.success(),
+        "synthetic review tracking ref seeding failed"
+    );
     assert_eq!(queue_len(&home), 0, "no intent before the terminal report");
     let closed = crate::tasks::auto_close::auto_close_on_report(
         &home,
