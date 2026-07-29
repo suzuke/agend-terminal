@@ -3170,3 +3170,303 @@ fn update_acl_failure_no_sidecar_mutation() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path::PathBuf, String) {
+    let home = tmp_home(name);
+    let repo = home.join("repo");
+    let remote = home.join("remote.git");
+    std::fs::create_dir_all(&repo).expect("repo");
+    let branch = "fix/s1-control";
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&home)
+                .status()
+                .expect("git")
+                .success(),
+            "git command failed: {args:?}"
+        );
+    };
+    let r = repo.to_str().expect("repo path");
+    let origin = remote.to_str().expect("remote path");
+    git(&["init", "--bare", "-q", origin]);
+    git(&["-C", r, "init", "-q"]);
+    git(&["-C", r, "config", "user.name", "s1-test"]);
+    git(&["-C", r, "config", "user.email", "s1@example.invalid"]);
+    git(&["-C", r, "branch", "-M", "main"]);
+    git(&["-C", r, "remote", "add", "origin", origin]);
+    git(&["-C", r, "commit", "--allow-empty", "-qm", "base"]);
+    git(&["-C", r, "push", "-q", "-u", "origin", "main"]);
+    git(&[
+        "-C",
+        r,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    git(&["-C", r, "checkout", "-qb", branch]);
+    if matches!(
+        mode,
+        "pushed"
+            | "review"
+            | "review-dirty"
+            | "review-mismatch"
+            | "review-malformed"
+            | "review-unpushed"
+    ) {
+        git(&["-C", r, "commit", "--allow-empty", "-qm", "feature"]);
+    }
+    if matches!(
+        mode,
+        "pushed" | "review" | "review-dirty" | "review-mismatch" | "review-malformed"
+    ) {
+        git(&["-C", r, "push", "-q", "-u", "origin", branch]);
+    }
+    if matches!(mode, "dirty" | "review-dirty") {
+        std::fs::write(repo.join("dirty.txt"), "dirty").expect("dirty fixture");
+    }
+    if mode == "default-error" {
+        git(&[
+            "-C",
+            r,
+            "symbolic-ref",
+            "--delete",
+            "refs/remotes/origin/HEAD",
+        ]);
+    }
+    std::fs::write(
+        repo.join(".agend-managed"),
+        format!("agent=dev-agent\nbranch={branch}\nsource_repo={r}\n"),
+    )
+    .expect("managed marker");
+    let created = handle(
+        &home,
+        "test:operator",
+        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent","branch":branch}),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    let claimed = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"claim","id":id}),
+    );
+    assert!(claimed.get("error").is_none(), "claim failed: {claimed}");
+    let provisioned_head =
+        crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"]).expect("provisioned head");
+    let review_provenance = match mode {
+        "review" | "review-dirty" | "review-unpushed" => Some(provisioned_head.clone()),
+        "review-mismatch" => Some(
+            crate::git_helpers::git_cmd(&repo, &["rev-parse", "origin/main"])
+                .expect("mismatched provisioned head"),
+        ),
+        "review-malformed" => Some("not-a-commit".to_string()),
+        _ => None,
+    };
+    if let Some(provisioned_head) = review_provenance.as_deref() {
+        crate::binding::bind_full_with_provenance(
+            &home,
+            "dev-agent",
+            &id,
+            branch,
+            &repo,
+            &repo,
+            false,
+            Some(crate::binding::BindingProvenance::DaemonProvisionedReview { provisioned_head }),
+        )
+        .expect("binding");
+    } else {
+        crate::binding::bind_full(&home, "dev-agent", &id, branch, &repo, &repo, false)
+            .expect("binding");
+    }
+    if mode == "review" {
+        git(&["-C", r, "remote", "remove", "origin"]);
+    }
+    if mode == "git-error" {
+        std::fs::rename(repo.join(".git"), repo.join(".git-hidden")).expect("Git error fixture");
+    }
+    (home, id, repo, branch.to_string())
+}
+
+#[test]
+fn task_done_rejects_pushed_ahead_assignee_s1() {
+    let (home, id, _repo, _branch) = s1_fixture("s1-pushed", "pushed");
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    let done_status = read_task_record(&home, &id).expect("task").status;
+    assert!(
+        done.get("error").is_some(),
+        "RED: explicit done currently succeeds: {done}"
+    );
+    assert_eq!(done_status, crate::task_events::TaskStatus::Claimed);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn terminal_report_rejects_pushed_ahead_assignee_s1() {
+    let (home, id, _repo, _branch) = s1_fixture("s1-pushed-report", "pushed");
+    let closed = crate::tasks::auto_close::auto_close_on_report(
+        &home,
+        "report",
+        &id,
+        "dev-agent",
+        "terminal report",
+        true,
+    )
+    .expect("auto-close");
+    let status = read_task_record(&home, &id).expect("task").status;
+    assert!(!closed, "RED: terminal report currently returns true");
+    assert_eq!(status, crate::task_events::TaskStatus::Claimed);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn terminal_report_assignee_completion_provenance_controls_s1() {
+    let (home, id, _repo, _branch) = s1_fixture("s1-review-allowed", "review");
+    let closed = crate::tasks::auto_close::auto_close_on_report(
+        &home,
+        "report",
+        &id,
+        "dev-agent",
+        "terminal review report",
+        true,
+    )
+    .expect("auto-close");
+    assert!(
+        closed,
+        "exact daemon-provisioned review at provisioned HEAD should close: {closed}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    for (name, mode) in [
+        ("s1-review-mismatch", "review-mismatch"),
+        ("s1-review-malformed", "review-malformed"),
+        ("s1-review-dirty", "review-dirty"),
+        ("s1-review-unpushed", "review-unpushed"),
+    ] {
+        let (home, id, _repo, _branch) = s1_fixture(name, mode);
+        let closed = crate::tasks::auto_close::auto_close_on_report(
+            &home,
+            "report",
+            &id,
+            "dev-agent",
+            "terminal review report",
+            true,
+        )
+        .expect("auto-close");
+        assert!(!closed, "unsafe review provenance allowed for {mode}");
+        assert_eq!(
+            read_task_record(&home, &id).expect("task").status,
+            crate::task_events::TaskStatus::Claimed,
+            "unsafe review provenance changed task status for {mode}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[test]
+fn task_done_assignee_completion_controls_s1() {
+    let check = |name, mode, expected_error| {
+        let (home, id, _repo, _branch) = s1_fixture(name, mode);
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action":"done","id":id}),
+        );
+        let actual_error = result.get("error").is_some();
+        std::fs::remove_dir_all(&home).ok();
+        assert_eq!(actual_error, expected_error, "{name}: {result}");
+    };
+    check("s1-clean", "clean", false);
+    check("s1-dirty", "dirty", true);
+    check("s1-default-error", "default-error", true);
+    check("s1-git-error", "git-error", true);
+
+    let (home, id, repo, branch) = s1_fixture("s1-mismatch", "clean");
+    crate::binding::bind_full(&home, "dev-agent", "t-wrong", &branch, &repo, &repo, false)
+        .expect("mismatch binding");
+    let result = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        result.get("error").is_some(),
+        "mismatched binding allowed: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    let home = tmp_home("s1-missing");
+    let created = handle(
+        &home,
+        "test:operator",
+        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent","branch":"fix/missing"}),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"claim","id":id}),
+    );
+    let result = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        result.get("error").is_some(),
+        "missing binding allowed: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    let home = tmp_home("s1-branchless");
+    let created = handle(
+        &home,
+        "test:operator",
+        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent"}),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"claim","id":id}),
+    );
+    let result = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "branchless task denied: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    let (home, id, _repo, _branch) = s1_fixture("s1-force", "pushed");
+    let result = handle(
+        &home,
+        "other-agent",
+        &serde_json::json!({"action":"done","id":id,"force":true,"force_reason":"S1"}),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "force bypass denied: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    let (home, id, _repo, _branch) = s1_fixture("s1-orchestrator", "pushed");
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances:\n  dev-agent:\n    backend: codex\n  orchestrator:\n    backend: codex\nteams:\n  s1:\n    members: [dev-agent, orchestrator]\n    orchestrator: orchestrator\n").expect("fleet");
+    let result = handle(
+        &home,
+        "orchestrator",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "orchestrator bypass denied: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
