@@ -36,10 +36,10 @@ pub(crate) fn post_merge_receipt_and_watch(
     if let Err(e) = crate::merge_receipt::persist(home, &receipt) {
         return json!({"receipt_error": format!("receipt persist failed: {e}")});
     }
-    let (watch_caller, next_after_ci) = if merge_authority.is_empty() {
-        ("", assignee.as_str())
+    let next_after_ci = if merge_authority.is_empty() {
+        assignee.as_str()
     } else {
-        (merge_authority, merge_authority)
+        merge_authority
     };
     let watch_result = handle_watch_ci(
         home,
@@ -50,7 +50,7 @@ pub(crate) fn post_merge_receipt_and_watch(
             "task_id": &task_id,
             "next_after_ci": [next_after_ci],
         }),
-        watch_caller,
+        "",
     );
     if watch_result.get("error").is_some() {
         json!({

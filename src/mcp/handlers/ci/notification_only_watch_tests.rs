@@ -36,14 +36,6 @@ fn seed_fleet(home: &std::path::Path, instances: &[&str]) {
     std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
 }
 
-fn seed_self_orchestrator(home: &std::path::Path) {
-    std::fs::write(
-        crate::fleet::fleet_yaml_path(home),
-        "instances:\n  lead:\n    backend: claude\n  dev:\n    backend: claude\nteams:\n  post-merge-team:\n    members:\n      - lead\n    orchestrator: lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
-    )
-    .unwrap();
-}
-
 fn make_source_repo(home: &std::path::Path) -> std::path::PathBuf {
     let source_repo = home.join("source-repo");
     std::fs::create_dir_all(&source_repo).unwrap();
@@ -269,18 +261,18 @@ fn notification_only_valid_succeeds_and_idempotent() {
 
 // ── Production-seam tests for post_merge_receipt_and_watch ──
 
-/// Production seam: REAL TOPOLOGY — unbound orchestrator merges, developer
-/// is separately bound to the PR branch → receipt + watch armed for developer.
+/// Production seam: a named non-orchestrator merge authority merges while the
+/// developer is separately bound to the PR branch → receipt + watch armed.
 #[test]
-fn post_merge_orchestrator_merge_developer_bound_arms_watch() {
+fn post_merge_named_non_orchestrator_merge_developer_bound_arms_watch() {
     let home = tmp_home("post-merge-topology");
     let sha = "1".repeat(40);
-    seed_self_orchestrator(&home);
+    seed_fleet(&home, &["lead", "dev"]);
     let source_repo = make_source_repo(&home);
     seed_binding_with_source(&home, "dev", "t-merge", "fix/feature-x", &source_repo);
-    // Orchestrator (lead) has NO binding.
+    // Named merge authority (lead) has no binding and is not an orchestrator.
 
-    // Orchestrator calls merge → post_merge resolves developer from PR branch.
+    // Named authority calls merge → post_merge resolves developer from PR branch.
     let diag =
         super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 99, "fix/feature-x", "lead");
 
@@ -309,10 +301,7 @@ fn post_merge_orchestrator_merge_developer_bound_arms_watch() {
     assert!(watch["notification_only"].is_null());
     assert_eq!(watch["task_id"], "t-merge");
     assert_eq!(watch["target_head_sha"], sha);
-    assert_eq!(
-        crate::daemon::ci_watch::parse_subscribers(&watch),
-        vec!["lead".to_string()]
-    );
+    assert!(crate::daemon::ci_watch::parse_subscribers(&watch).is_empty());
     let receipt = crate::merge_receipt::find(&home, REPO, &sha, "t-merge");
     assert!(receipt.is_some(), "receipt must be findable on disk");
     let r = receipt.unwrap();

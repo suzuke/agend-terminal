@@ -7580,7 +7580,7 @@ fn seed_post_merge_binding(
 
 fn seed_post_merge_fleet(home: &Path, with_named_authority: bool) {
     let yaml = if with_named_authority {
-        "instances:\n  lead:\n    backend: claude\n  dev:\n    backend: claude\nteams:\n  post-merge-team:\n    members:\n      - lead\n    orchestrator: lead\n    created_at: \"2026-01-01T00:00:00Z\"\n"
+        "instances:\n  lead:\n    backend: claude\n  dev:\n    backend: claude\n"
     } else {
         "instances:\n  dev:\n    backend: claude\n"
     };
