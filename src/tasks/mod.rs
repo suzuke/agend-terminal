@@ -228,6 +228,13 @@ pub(crate) fn cancel_review_assignment_task(
                     .as_ref()
                     .is_some_and(|routed_to| routed_to.0 == target_owned);
             if !task_owned_by_target {
+                tracing::warn!(
+                    task_id = %task_id_owned,
+                    expected_target = %target_owned,
+                    owner = ?record.owner,
+                    routed_to = ?record.routed_to,
+                    "review-assignment cancellation skipped — task not owned by assignment target (preserved)"
+                );
                 return Ok(Vec::new());
             }
             Ok(vec![crate::task_events::TaskEvent::Cancelled {
