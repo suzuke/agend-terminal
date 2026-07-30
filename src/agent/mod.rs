@@ -2585,55 +2585,61 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
 
     if target.typed_inject {
         let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
+        let write_payload = || -> crate::error::Result<()> {
+            // Issue #658: system headers must be written atomically.
+            let is_system_header = stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX)
+                || stripped.starts_with(crate::inbox::AGENT_MSG_PREFIX);
+            let (atomic_part, chunk_part) = if is_system_header {
+                match all_bytes.iter().position(|&b| b == b'\n') {
+                    Some(pos) => all_bytes.split_at(pos + 1),
+                    None => (all_bytes.as_slice(), &[] as &[u8]),
+                }
+            } else {
+                (&[] as &[u8], all_bytes.as_slice())
+            };
 
-        // Issue #658: system headers must be written atomically.
-        let is_system_header = stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX)
-            || stripped.starts_with(crate::inbox::AGENT_MSG_PREFIX);
-        let (atomic_part, chunk_part) = if is_system_header {
-            match all_bytes.iter().position(|&b| b == b'\n') {
-                Some(pos) => all_bytes.split_at(pos + 1),
-                None => (all_bytes.as_slice(), &[] as &[u8]),
+            if !atomic_part.is_empty() {
+                write_with_timeout(&target.pty_writer, atomic_part)?;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    2 * atomic_part.len() as u64,
+                ));
             }
-        } else {
-            (&[] as &[u8], all_bytes.as_slice())
+
+            for chunk in chunk_part.chunks(64) {
+                if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
+                write_with_timeout(&target.pty_writer, chunk)?;
+                std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
+            }
+            Ok(())
         };
 
-        if !atomic_part.is_empty() {
-            write_with_timeout(&target.pty_writer, atomic_part)?;
-            std::thread::sleep(std::time::Duration::from_millis(
-                2 * atomic_part.len() as u64,
-            ));
-        }
-
-        for chunk in chunk_part.chunks(64) {
-            if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(());
+        write_payload()?;
+        if !readback_confirm_typed(target, &stripped) {
+            tracing::warn!(
+                tag = "#1912-readback-retry",
+                "typed inject was not rendered; retrying payload once before submit"
+            );
+            write_payload()?;
+            if !readback_confirm_typed(target, &stripped) {
+                return Err(crate::error::AgendError::PtyWrite(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "typed inject was not rendered after one retry; payload not submitted",
+                )));
             }
-            write_with_timeout(&target.pty_writer, chunk)?;
-            std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
     } else {
         let mut combined = Vec::with_capacity(prefix.len() + text_bytes.len());
         combined.extend_from_slice(prefix);
         combined.extend_from_slice(text_bytes);
         write_with_timeout(&target.pty_writer, &combined)?;
+        // claude `❯` bulk fast path — tolerates bulk bytes + `\r`; keep byte-identical.
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
-    }
-    // #1912: gate the pre-submit wait on the backend's input-widget style.
-    if target.typed_inject {
-        // Readback-confirm (#1912): poll the RENDERED input area until the typed
-        // line's tail-sentinel appears, THEN submit. Replaces the fixed-sleep
-        // "guess" that racing codex's re-rendering `›` widget required (every codex
-        // version re-tuned the magic number). FAIL-OPEN: on timeout we submit
-        // anyway (the helper warns) — this is the agent-wake lifeline, so an
-        // unconfirmed readback must never become "don't submit" (= agent never wakes).
-        let _confirmed = readback_confirm_typed(target, &stripped);
-    } else {
-        // claude `❯` bulk fast path — tolerates bulk bytes + `\r`; keep byte-identical.
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     write_with_timeout(&target.pty_writer, submit)?;
     // #1912: post-submit observability (log/metric-only, NEVER retries — a second
@@ -2673,8 +2679,9 @@ const POSTSUBMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 const READBACK_TAIL_ROWS: usize = 8;
 
 /// #1912: poll the rendered input area until the typed line's tail-sentinel
-/// renders, then return `true`. Returns `false` (FAIL-OPEN: caller submits anyway,
-/// this warns) if unconfirmed within the timeout. Acquires the core lock only
+/// renders, then return `true`. Returns `false` and warns if unconfirmed within
+/// the timeout; the caller retries once and never submits an unconfirmed payload.
+/// Acquires the core lock only
 /// briefly per poll (read `tail_lines`, drop) so the `pty_read_loop` renders the
 /// backend's echo of the typed chars between polls.
 fn readback_confirm_typed(target: &InjectTarget, stripped: &str) -> bool {
@@ -2712,7 +2719,7 @@ fn readback_confirm_typed_with(
                 tag = "#1912-readback-timeout",
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 sentinel_len = sentinel.len(),
-                "typed inject line not confirmed in input area within timeout — submitting anyway (fail-open)"
+                "typed inject line not confirmed in input area within timeout"
             );
             return false;
         }

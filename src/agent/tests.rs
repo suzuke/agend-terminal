@@ -1871,7 +1871,7 @@ fn readback_confirm_returns_true_when_line_rendered_1912() {
 }
 
 #[test]
-fn readback_confirm_times_out_fail_open_when_not_rendered_1912() {
+fn readback_confirm_reports_false_when_not_rendered_1912() {
     // Input area shows only the empty `›` prompt — the payload never rendered.
     let core = readback_test_core("\u{203a} ".as_bytes());
     let target = readback_test_target(core);
@@ -1885,7 +1885,7 @@ fn readback_confirm_times_out_fail_open_when_not_rendered_1912() {
     assert!(!confirmed, "unconfirmed within timeout must report false");
     assert!(
         start.elapsed() < std::time::Duration::from_secs(1),
-        "fail-open: must return promptly at timeout, never hang the wake path"
+        "must return promptly at timeout, never hang the wake path"
     );
 }
 
@@ -1918,6 +1918,97 @@ fn readback_confirm_waits_for_async_echo_then_confirms_1912() {
         "readback must poll until the async echo renders, then confirm"
     );
     echo.join().expect("echo thread");
+}
+
+struct RetryEchoWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    payload: Vec<u8>,
+    payload_writes: Arc<std::sync::atomic::AtomicUsize>,
+    core: Arc<CoreMutex<AgentCore>>,
+}
+
+impl std::io::Write for RetryEchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().extend_from_slice(buf);
+        if buf == self.payload {
+            let attempt = self
+                .payload_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if attempt == 2 {
+                let rendered = format!("\r\x1b[2K\u{203a} {}", String::from_utf8_lossy(buf));
+                self.core.lock().vterm.process(rendered.as_bytes());
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn typed_inject_retries_unrendered_payload_then_submits_once_s1() {
+    let payload = b"S1_AGY_DIALOG_RETRY";
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let payload_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RetryEchoWriter {
+        bytes: Arc::clone(&bytes),
+        payload: payload.to_vec(),
+        payload_writes: Arc::clone(&payload_writes),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    inject_with_target(&target, payload).expect("second rendered attempt should submit");
+
+    assert_eq!(
+        payload_writes.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "a transient startup dialog should cause one bounded retry"
+    );
+    assert_eq!(
+        bytes.lock().iter().filter(|&&byte| byte == b'\r').count(),
+        1,
+        "the recovered payload must be submitted exactly once"
+    );
+}
+
+#[test]
+fn typed_inject_never_submits_or_succeeds_without_readback_s1() {
+    let payload = b"S1_NEVER_RENDERED";
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&bytes),
+    })));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    assert!(
+        inject_with_target(&target, payload).is_err(),
+        "a persistently unrendered payload must not be reported as delivered"
+    );
+    assert_eq!(
+        bytes.lock().iter().filter(|&&byte| byte == b'\r').count(),
+        0,
+        "an unconfirmed payload must never be submitted"
+    );
 }
 
 #[test]
