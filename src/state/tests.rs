@@ -856,6 +856,70 @@ fn grok_always_approve_footer_is_not_an_idle_marker() {
     );
 }
 
+// Grok 0.2.117 rendered chrome fixtures. The resting footer changed from the
+// 0.2.93 affordances above; keep the exact adjacency line-anchored so quoted
+// or prefixed prose cannot make a pane look ready.
+const GROK_02117_RESTING: &str = concat!(
+    "╰──────────── Grok 4.5 (high) · always-approve ─╯\n",
+    "Shift+Tab:mode │ Ctrl+.:shortcuts"
+);
+const GROK_02117_QUEUE: &str = concat!(
+    "╰──────────── Grok 4.5 (high) · always-approve ─╯\n",
+    "Shift+Tab:mode │ Ctrl+;:queue"
+);
+const GROK_02117_WAITING: &str = concat!(
+    "╰──────────── Grok 4.5 (high) · always-approve ─╯\n",
+    "Shift+Tab:mode │ Esc:cancel"
+);
+
+#[test]
+fn grok_02117_resting_footer_is_idle() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    assert_eq!(patterns.detect(GROK_02117_RESTING), Some(AgentState::Idle));
+}
+
+#[test]
+fn grok_02117_queue_footer_is_active() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    assert_eq!(patterns.detect(GROK_02117_QUEUE), Some(AgentState::Active));
+}
+
+#[test]
+fn grok_02117_waiting_cancel_footer_is_active() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    assert_eq!(patterns.detect(GROK_02117_WAITING), Some(AgentState::Active));
+}
+
+#[test]
+fn grok_02117_trust_modal_precedes_resting_footer() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    let trust = "Run Grok Build in a project directory?\n";
+    assert_eq!(
+        patterns.detect(&format!("{trust}{GROK_02117_RESTING}")),
+        Some(AgentState::PermissionPrompt)
+    );
+}
+
+#[test]
+fn grok_02117_prefixed_or_quoted_resting_footer_is_not_idle() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    for text in [
+        "quoted: Shift+Tab:mode │ Ctrl+.:shortcuts",
+        "> Shift+Tab:mode │ Ctrl+.:shortcuts",
+    ] {
+        assert_ne!(patterns.detect(text), Some(AgentState::Idle), "{text:?}");
+    }
+}
+
+#[test]
+fn grok_02117_footer_only_always_approve_is_not_idle() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    assert_ne!(
+        patterns.detect("╰──────────── Grok 4.5 (high) · always-approve ─╯"),
+        Some(AgentState::Idle)
+    );
+}
+
 #[test]
 fn empty_input_no_change() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
