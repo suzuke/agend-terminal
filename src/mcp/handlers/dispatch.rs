@@ -1128,36 +1128,6 @@ mod tests {
         }
     }
 
-    // Machine-checkable schema test: message/message_from_file must use
-    // anyOf so that "at least one is required" is expressible in JSON Schema.
-    #[test]
-    fn schema_has_anyof_message_from_file() {
-        use crate::mcp::tools::*;
-        let reply = def_reply();
-        let send = def_send();
-        for (name, def) in [("reply", &reply), ("send", &send)] {
-            let schema = &def["inputSchema"];
-            assert!(
-                schema.get("anyOf").is_some(),
-                "{name} schema must have an anyOf clause"
-            );
-            let any_of = schema["anyOf"].as_array().unwrap();
-            assert_eq!(
-                any_of.len(),
-                2,
-                "{name} anyOf must have exactly two alternatives"
-            );
-            for alternative in any_of {
-                let required = alternative["required"].as_array().unwrap();
-                assert_eq!(
-                    required.len(),
-                    1,
-                    "{name} anyOf alternative must require exactly one field"
-                );
-            }
-        }
-    }
-
     // #2454 Slice 5 RED: task health/sweep must consume the live registry
     // forwarded through the real MCP task dispatcher.  The current handler
     // still self-IPC's through the API (or reads runtime state from disk), so

@@ -33,7 +33,7 @@ pub(crate) fn def_reply() -> Value {
             "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
             "task_id": {"type": "string", "description": "Optional task-board id ('t-...') this reply relates to. Recorded in the sent-message ledger so a later operator quote-reply (reply-to) to this message can be correlated back to its task. Omit for ordinary interactive replies with no task context."},
             "correlation_id": {"type": "string", "description": "Optional correlation id for this reply, recorded alongside task_id in the sent-message ledger for reply-to correlation. Omit when not applicable."}
-        }, "required": [], "anyOf": [{"required": ["message"]}, {"required": ["message_from_file"]}]}})
+        }, "required": []}})
 }
 
 pub(crate) fn def_download_attachment() -> Value {
@@ -86,7 +86,7 @@ pub(crate) fn def_send() -> Value {
             "no_report_expected": {"type": "boolean", "description": "#2099: set true on a fire-and-forget kind=task dispatch that intentionally expects NO kind=report back. The dispatch is recorded with a terminal-like status so the 30-min dispatch-stuck sweep never false-fires a 'dispatch stuck check' for it (the audit row is kept). Default false — every normal dispatch stays stuck-tracked. Distinct from `terminal`, which is the report-side auto-close signal."},
             "ack_inbox": {"type": "boolean", "description": "Set true on kind=report with correlation_id to auto-settle the sender's DELIVERING inbox messages whose task_id matches the correlation_id. Eliminates the need for a separate `inbox action=ack` call after sending a report — the daemon settles the dispatch message(s) atomically with the send. Only fires when the send succeeds. Default false (existing two-step flow still works)."},
             "triaged": {"type": "object", "description": "#2537/#2524 P6 PR-1: optional discharge-ledger record on kind=update/report — {head, job, reason?}. `head` and `job` must both be non-empty (or both omitted); `reason` is optional free-text context. Persists to a disk-backed ledger keyed by head_sha, recording that this notification obligation was explicitly triaged. PR-1 is data-layer only — no notification path reads the ledger yet (that's PR-2)."}
-        }, "required": [], "anyOf": [{"required": ["message"]}, {"required": ["message_from_file"]}]}})
+        }, "required": []}})
 }
 
 pub(crate) fn def_inbox() -> Value {
@@ -790,6 +790,22 @@ mod tests {
                 tool["inputSchema"].is_object(),
                 "tool '{name}' missing inputSchema"
             );
+        }
+    }
+
+    #[test]
+    fn exported_tool_schemas_have_no_top_level_combinators() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("?");
+            let schema = &tool["inputSchema"];
+            for keyword in ["oneOf", "anyOf", "allOf"] {
+                assert!(
+                    schema.get(keyword).is_none(),
+                    "exported tool '{name}' has top-level {keyword}"
+                );
+            }
         }
     }
 
