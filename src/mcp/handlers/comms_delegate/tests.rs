@@ -187,12 +187,16 @@ mod review_assignment_marker_tests {
     const EXACT_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn seed_exact_subject(home: &std::path::Path) {
+        seed_exact_subject_with_owner(home, "reviewer");
+    }
+
+    fn seed_exact_subject_with_owner(home: &std::path::Path, owner: &str) {
         let event = crate::task_events::TaskEvent::Created {
             task_id: crate::task_events::TaskId("t-rev-1".into()),
             title: "review task".into(),
             description: String::new(),
             priority: "normal".into(),
-            owner: Some(crate::task_events::InstanceName("system:test".into())),
+            owner: Some(crate::task_events::InstanceName(owner.into())),
             due_at: None,
             depends_on: Vec::new(),
             routed_to: None,
@@ -208,17 +212,17 @@ mod review_assignment_marker_tests {
             event,
         )
         .unwrap();
-        let meta = crate::tasks::handle(
+        crate::task_events::append(
             home,
-            "system:test",
-            &json!({
-                "action": "metadata_set",
-                "id": "t-rev-1",
-                "metadata_key": "review_class",
-                "metadata_value": "dual"
-            }),
-        );
-        assert!(meta.get("error").is_none(), "seed task metadata: {meta}");
+            &crate::task_events::InstanceName("system:test".into()),
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId("t-rev-1".into()),
+                by: crate::task_events::InstanceName("system:test".into()),
+                key: "review_class".into(),
+                value: json!("dual"),
+            },
+        )
+        .unwrap();
 
         let mut state = crate::daemon::pr_state::new_for_branch(
             "owner/repo",
@@ -248,7 +252,7 @@ mod review_assignment_marker_tests {
                 title: "review task".into(),
                 description: String::new(),
                 priority: "normal".into(),
-                owner: Some(crate::task_events::InstanceName("system:test".into())),
+                owner: Some(crate::task_events::InstanceName("reviewer".into())),
                 due_at: None,
                 depends_on: Vec::new(),
                 routed_to: None,
@@ -572,6 +576,56 @@ mod review_assignment_marker_tests {
             "marker reject must NOT auto-create a task: {board}"
         );
         assert!(out.get("auto_created_task_id").is_none(), "{out}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn review_assignment_rejects_task_owned_by_non_target_without_side_effects() {
+        let home = tmp_home("owner-mismatch");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        seed_exact_subject_with_owner(&home, "lead");
+        let sender = Some(Sender::new("lead").unwrap());
+        let out = handle_delegate_task(
+            &home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the PR",
+                "review_assignment": true,
+                "task_id": "t-rev-1",
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+                "reviewed_head": EXACT_HEAD,
+                "review_author": {"external": "octocat"}
+            }),
+            &sender,
+            None,
+        );
+        assert_eq!(
+            out["code"], "review_assignment_task_owner_mismatch",
+            "review dispatch must reject an implementation-owned task: {out}"
+        );
+        assert!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .is_none(),
+            "owner mismatch must not persist assignment authority"
+        );
+        assert!(
+            crate::daemon::assignment_authority::active_branches(&home).is_empty(),
+            "owner mismatch must not create a store branch"
+        );
+        assert_eq!(
+            crate::task_events::replay(&home)
+                .unwrap()
+                .tasks
+                .get(&crate::task_events::TaskId("t-rev-1".into()))
+                .map(|task| task.status),
+            Some(crate::task_events::TaskStatus::Open),
+            "the existing implementation task remains untouched"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

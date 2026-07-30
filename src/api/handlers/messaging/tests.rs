@@ -2984,6 +2984,113 @@ fn legacy_verdict_text_never_reverse_looks_up_review_task_2760() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_differs() {
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(status.status.success(), "git {:?} failed", args);
+    }
+
+    for (label, verdict, expected) in [
+        (
+            "verified",
+            "VERIFIED looks good",
+            crate::task_events::TaskStatus::Done,
+        ),
+        (
+            "rejected",
+            "REJECTED found a bug",
+            crate::task_events::TaskStatus::Claimed,
+        ),
+        (
+            "unverified",
+            "UNVERIFIED claimed but unproven",
+            crate::task_events::TaskStatus::Claimed,
+        ),
+    ] {
+        let home = tmp_home(&format!("t127-disposable-{label}"));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = home.join("review-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "test"]);
+        std::fs::write(repo.join("README"), "fixture\n").unwrap();
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "fixture"]);
+        git(&repo, &["switch", "-c", "review/pr-1"]);
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        crate::task_events::append_batch(
+            &home,
+            &crate::task_events::InstanceName::from("test:seed"),
+            vec![
+                crate::task_events::TaskEvent::Created {
+                    task_id: crate::task_events::TaskId::from("t-disposable-review"),
+                    title: "review PR".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some("feat/subject".into()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: Vec::new(),
+                    parent_id: None,
+                },
+                crate::task_events::TaskEvent::Claimed {
+                    task_id: crate::task_events::TaskId::from("t-disposable-review"),
+                    by: crate::task_events::InstanceName::from("reviewer"),
+                },
+            ],
+        )
+        .unwrap();
+        crate::binding::bind_full_with_provenance(
+            &home,
+            "reviewer",
+            "t-disposable-review",
+            "review/pr-1",
+            &repo,
+            &repo,
+            false,
+            Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
+                provisioned_head: &head,
+            }),
+        )
+        .unwrap();
+        let msg = t127_verdict(verdict, "t-disposable-review", "owner/repo@feat/subject");
+        let params = json!({
+            "from": "reviewer",
+            "target": "lead",
+            "kind": "report",
+            "correlation_id": "owner/repo@feat/subject",
+        });
+        crate::api::handlers::messaging::track_dispatch(&home, &params, "reviewer", "lead", &msg);
+        assert_eq!(
+            task_status_of(&home, "t-disposable-review"),
+            Some(expected),
+            "{label} must honor the verdict while allowing the isolated review branch"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
 /// F1 real-entry (spike t-…19288-1): a terminal correlated report driven through
 /// the REAL report handler (`track_dispatch`, the fn `handle_send` invokes) must
 /// end with the report body in the task's replayed `result`. Complements the
