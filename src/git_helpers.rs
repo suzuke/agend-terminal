@@ -349,7 +349,7 @@ pub fn default_branch(repo_dir: &Path) -> String {
 }
 
 /// Detect the primary remote name.
-/// Returns the first remote listed by `git remote`, typically "origin".
+/// Prefers `origin`; otherwise returns the first remote listed by `git remote`.
 /// Falls back to "origin" if detection fails.
 pub fn primary_remote(repo_dir: &Path) -> String {
     // #1897: bounded (was an unbounded `.output()`) — a stuck local git falls
@@ -357,7 +357,11 @@ pub fn primary_remote(repo_dir: &Path) -> String {
     match git_bypass_timeout(repo_dir, &["remote"], LOCAL_GIT_TIMEOUT) {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            s.lines().next().unwrap_or("origin").to_string()
+            if s.lines().any(|remote| remote == "origin") {
+                "origin".to_string()
+            } else {
+                s.lines().next().unwrap_or("origin").to_string()
+            }
         }
         _ => "origin".to_string(),
     }
@@ -626,6 +630,30 @@ mod tests {
         std::fs::create_dir_all(&fake).ok();
         assert_eq!(primary_remote(&fake), "origin");
         std::fs::remove_dir_all(&fake).ok();
+    }
+
+    #[test]
+    fn primary_remote_prefers_origin_over_alphabetically_first_contributor_s1() {
+        let repo = tmp_repo("primary-origin");
+        for (name, url) in [
+            ("blackhorseya", "https://example.invalid/contributor.git"),
+            ("origin", "https://example.invalid/canonical.git"),
+        ] {
+            let out = std::process::Command::new("git")
+                .env("AGEND_GIT_BYPASS", "1")
+                .args(["remote", "add", name, url])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+
+        assert_eq!(
+            primary_remote(&repo),
+            "origin",
+            "an alphabetically earlier contributor remote must not replace canonical origin"
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
