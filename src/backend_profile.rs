@@ -126,10 +126,8 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
     }
 }
 
-/// Grok Build CLI — detection profile. Active/Idle chrome RECALIBRATED against
-/// a live grok 0.2.93 soak (#2707, t-…64079-13) after the original one-shot
-/// smoke mis-anchored the busy state → systemic false-idle (see the Active
-/// pattern note below). Patterns stay deliberately thin: dispatch
+/// Grok Build CLI — detection profile. Active/Idle chrome is calibrated against
+/// the Grok 0.2.117 rendered footer. Patterns stay deliberately thin: dispatch
 /// ready/idle/active + the project-trust modal. Finer states (rate-limit, auth)
 /// have NO reliable screen signature and are deferred to the structured-log
 /// detector follow-up (`~/.grok/logs/unified.jsonl`), not screen regex.
@@ -142,27 +140,21 @@ fn grok_profile() -> BackendProfile {
                 AgentState::PermissionPrompt,
                 r"Run Grok Build in a project directory\?|Do you trust",
             ),
-            // Active turn chrome. #2707 (soak t-…64079-13): grok 0.2.93's real
-            // busy UI shows NEITHER `Thinking…`/`Responding…` NOR `esc to
-            // interrupt` — it renders the `[stop]` button + a `Ctrl+c:cancel`
-            // hint, both present across every busy sub-phase (thinking /
-            // responding / tool_running). These are busy-EXCLUSIVE; and because
-            // Active is checked before Idle (first-match-wins, `state/patterns.rs`
-            // `detect_with_match`), a correct Active match PREEMPTS the Idle
-            // fall-through that used to latch the permanent `always-approve`
-            // footer → the systemic false-idle (busy 席 mis-read idle → dispatch).
-            (AgentState::Active, r"\[stop\]|Ctrl\+c:cancel"),
-            // Idle / ready chrome. Keys on idle-ASSOCIATED anchors only: the
-            // turn-completion line and the resting prompt affordances.
-            // Deliberately NOT `always-approve` (a PERMANENT footer mode
-            // indicator with zero state semantics — present during busy too, N1)
-            // nor a bare `❯` (the input box renders during busy as well). On an
-            // unrecognized screen this yields `None`, not a confident Idle — the
-            // SAFE direction (a missed idle just delays dispatch; a false idle
-            // mis-dispatches a working 席).
+            // Active turn chrome. Grok 0.2.117 uses `[stop]`, `Esc:cancel`, or
+            // `Ctrl+;:queue` on busy frames; retain the legacy cancel hint for
+            // older rendered screens. These are checked before Idle so busy
+            // chrome always wins over a resting-footer match.
+            (
+                AgentState::Active,
+                r"\[stop\]|Ctrl\+c:cancel|Esc:cancel|Ctrl\+;:queue",
+            ),
+            // Idle / ready chrome. Grok 0.2.117's resting footer is an exact,
+            // line-anchored adjacency; prefixed or quoted prose must not count.
+            // Deliberately NOT `always-approve` (a permanent footer mode
+            // indicator with zero state semantics) nor a bare `❯`.
             (
                 AgentState::Idle,
-                r"Turn completed in \d|Space:prompt|Enter:open",
+                r"(?m)^Shift\+Tab:mode │ Ctrl\+\.:shortcuts$",
             ),
         ],
         behavioral: BehavioralConfig {

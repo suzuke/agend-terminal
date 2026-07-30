@@ -800,17 +800,15 @@ Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts";
 }
 
 #[test]
-fn grok_idle_screen_fires_idle() {
-    // REAL grok 0.2.93 idle capture (same soak): a completed turn at rest — no
-    // busy chrome. Idle keys on idle-associated anchors (`Turn completed in …` /
-    // `Space:prompt` / `Enter:open`), NOT the permanent `always-approve` footer
-    // (removed as an Idle marker, N1) nor the bare `❯` (present during busy too).
+fn grok_02117_idle_screen_fires_idle() {
+    // REAL Grok 0.2.117 resting chrome: no busy markers, and the exact
+    // `Shift+Tab:mode │ Ctrl+.:shortcuts` footer adjacency is the idle anchor.
+    // The permanent `always-approve` footer and bare `❯` remain non-signals.
     let patterns = StatePatterns::for_backend(&Backend::Grok);
     let idle = "已處理 gapfix-dev3 的純推理題：
-Turn completed in 14s.
 │ ❯ Build anything                                     │
 ╰──────────── Grok 4.5 (high) · always-approve ─╯
-Space:prompt  │  Enter:open  │  Ctrl+e:expand thinking  │  Ctrl+.:shortcuts";
+Shift+Tab:mode │ Ctrl+.:shortcuts";
     assert_eq!(
         patterns.detect(idle),
         Some(AgentState::Idle),
@@ -887,7 +885,10 @@ fn grok_02117_queue_footer_is_active() {
 #[test]
 fn grok_02117_waiting_cancel_footer_is_active() {
     let patterns = StatePatterns::for_backend(&Backend::Grok);
-    assert_eq!(patterns.detect(GROK_02117_WAITING), Some(AgentState::Active));
+    assert_eq!(
+        patterns.detect(GROK_02117_WAITING),
+        Some(AgentState::Active)
+    );
 }
 
 #[test]
