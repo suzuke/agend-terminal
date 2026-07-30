@@ -157,16 +157,34 @@ pub(crate) fn validate_review_assignment_marker(
     let branch = args["branch"].as_str().unwrap_or_default();
     let pr_number = checks.pr_number.unwrap_or_default();
     let task_id = args["task_id"].as_str().unwrap_or_default();
-    let task_review_class = crate::tasks::load_routed(home, task_id)
-        .ok()
-        .and_then(|routed| {
-            routed
-                .task
-                .metadata
-                .get("review_class")
-                .and_then(|value| value.as_str())
-                .map(|value| ReviewClass::parse_fail_closed(Some(value)))
-        })
+    let routed = match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => routed,
+        Err(_) => {
+            return Err(json!({
+                "error": "review_assignment task_id does not identify a routed task",
+                "code": "review_assignment_subject_mismatch",
+            }))
+        }
+    };
+    let task = routed.record();
+    let task_owned_by_target = task.owner.as_ref().is_some_and(|owner| owner.0 == target)
+        || task
+            .routed_to
+            .as_ref()
+            .is_some_and(|routed_to| routed_to.0 == target);
+    if !task_owned_by_target {
+        return Err(json!({
+            "error": format!(
+                "review_assignment task `{task_id}` is not owned or routed to reviewer target `{target}`"
+            ),
+            "code": "review_assignment_task_owner_mismatch",
+        }));
+    }
+    let task_review_class = task
+        .metadata
+        .get("review_class")
+        .and_then(|value| value.as_str())
+        .map(|value| ReviewClass::parse_fail_closed(Some(value)))
         .unwrap_or(ReviewClass::Unresolved);
     if matches!(task_review_class, ReviewClass::Unresolved) {
         return Err(json!({

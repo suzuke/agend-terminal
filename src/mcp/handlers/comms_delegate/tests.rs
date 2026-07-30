@@ -264,17 +264,17 @@ mod review_assignment_marker_tests {
             },
         )
         .unwrap();
-        let meta = crate::tasks::handle(
+        crate::task_events::append(
             home,
-            "system:test",
-            &json!({
-                "action": "metadata_set",
-                "id": task_id,
-                "metadata_key": "review_class",
-                "metadata_value": "dual"
-            }),
-        );
-        assert!(meta.get("error").is_none(), "seed task metadata: {meta}");
+            &crate::task_events::InstanceName("system:test".into()),
+            crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(task_id.into()),
+                by: crate::task_events::InstanceName("system:test".into()),
+                key: "review_class".into(),
+                value: json!("dual"),
+            },
+        )
+        .unwrap();
     }
 
     fn marker_checks(

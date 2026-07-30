@@ -12,6 +12,38 @@ pub fn auto_close_on_report(
     report_text: &str,
     terminal: bool,
 ) -> anyhow::Result<bool> {
+    auto_close_on_report_with_mode(
+        home,
+        kind,
+        correlation_id,
+        reporter,
+        report_text,
+        terminal,
+        false,
+    )
+}
+
+/// Auto-close the exact review task named by an already validated receipt.
+/// Disposable review worktrees may use an isolated branch unrelated to the PR
+/// subject branch; manual task completion remains on the strict path above.
+pub(crate) fn auto_close_on_validated_review(
+    home: &Path,
+    task_id: &str,
+    reporter: &str,
+    report_text: &str,
+) -> anyhow::Result<bool> {
+    auto_close_on_report_with_mode(home, "report", task_id, reporter, report_text, true, true)
+}
+
+fn auto_close_on_report_with_mode(
+    home: &Path,
+    kind: &str,
+    correlation_id: &str,
+    reporter: &str,
+    report_text: &str,
+    terminal: bool,
+    allow_disposable_review_branch_mismatch: bool,
+) -> anyhow::Result<bool> {
     if !terminal {
         return Ok(false);
     }
@@ -59,7 +91,12 @@ pub fn auto_close_on_report(
     if assignee != reporter {
         return Ok(false);
     }
-    if super::assignee_completion_guard(home, correlation_id, reporter, record).is_err() {
+    let completion_guard = if allow_disposable_review_branch_mismatch {
+        super::validated_review_completion_guard
+    } else {
+        super::assignee_completion_guard
+    };
+    if completion_guard(home, correlation_id, reporter, record).is_err() {
         return Ok(false);
     }
     let summary = if report_text.chars().count() > 200 {

@@ -119,8 +119,8 @@ fn bridge_verdict_to_review_task(
         summary.verdict,
         crate::review_receipt::ReviewVerdict::Verified
     ) {
-        let _ = crate::tasks::auto_close::auto_close_on_report(
-            home, "report", task_id, reporter, &msg.text, true,
+        let _ = crate::tasks::auto_close::auto_close_on_validated_review(
+            home, task_id, reporter, &msg.text,
         );
     }
 }

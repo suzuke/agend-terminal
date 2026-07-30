@@ -982,8 +982,9 @@ fn review_assignment_revoke_does_not_cancel_other_reviewer_task() {
 fn already_terminal_review_task_cancellation_is_idempotent() {
     let home = tmp_home("task-terminal");
     seed_open_task(&home, "t-terminal");
-    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "test").unwrap();
-    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "test-again").unwrap();
+    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "reviewer", "test").unwrap();
+    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "reviewer", "test-again")
+        .unwrap();
 
     assert_eq!(
         task_status(&home, "t-terminal"),
