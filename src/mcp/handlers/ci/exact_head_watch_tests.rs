@@ -77,6 +77,7 @@ fn exact_head_main_accepted_for_orchestrator() {
         "authorized exact-head main watch must be accepted: {r}"
     );
     assert!(r.get("error").is_none(), "no error on accept: {r}");
+    assert_eq!(r["subscribers"], json!([]));
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -92,6 +93,7 @@ fn exact_head_main_accepted_for_operator() {
         Some(true),
         "operator exact-head main watch must be accepted: {r}"
     );
+    assert_eq!(r["subscribers"], json!(["reviewer-x"]));
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -200,6 +202,29 @@ fn non_protected_branch_watch_unaffected_by_head_sha() {
         Some(true),
         "non-protected branch watch must still work: {r}"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// An anonymous caller on a feature branch is not the privileged protected-ref
+/// path; explicit next_after_ci targets must not be leaked into subscribers.
+#[test]
+fn anonymous_feature_branch_does_not_subscribe_next_after_ci_target() {
+    let home = tmp_home("nonprot-anonymous-no-leak");
+    let r = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": "suzuke/agend-terminal",
+            "branch": "feat/x",
+            "next_after_ci": ["reviewer-x"],
+        }),
+        "",
+    );
+    assert_eq!(
+        r["watching"].as_bool(),
+        Some(true),
+        "feature watch must arm: {r}"
+    );
+    assert_eq!(r["subscribers"], json!([]));
     std::fs::remove_dir_all(&home).ok();
 }
 

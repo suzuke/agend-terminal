@@ -7677,6 +7677,7 @@ fn post_merge_named_authority_reaches_real_poller_delivery() {
         serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
     assert_eq!(watch_json["next_after_ci"], "lead");
     assert!(watch_json["notification_only"].is_null());
+    assert_eq!(parse_subscribers(&watch_json), vec!["lead"]);
     poll_post_merge_watch(&home, &watch_path, watch_json, "lead");
     std::fs::remove_dir_all(&home).ok();
 }
@@ -7714,7 +7715,7 @@ fn post_merge_operator_reaches_assignee_real_poller_delivery() {
         serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
     assert_eq!(watch_json["next_after_ci"], "dev");
     assert!(watch_json["notification_only"].is_null());
-    assert!(parse_subscribers(&watch_json).is_empty());
+    assert_eq!(parse_subscribers(&watch_json), vec!["dev"]);
     poll_post_merge_watch(&home, &watch_path, watch_json, "dev");
     std::fs::remove_dir_all(&home).ok();
 }

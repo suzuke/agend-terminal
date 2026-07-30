@@ -301,7 +301,10 @@ fn post_merge_named_non_orchestrator_merge_developer_bound_arms_watch() {
     assert!(watch["notification_only"].is_null());
     assert_eq!(watch["task_id"], "t-merge");
     assert_eq!(watch["target_head_sha"], sha);
-    assert!(crate::daemon::ci_watch::parse_subscribers(&watch).is_empty());
+    assert_eq!(
+        crate::daemon::ci_watch::parse_subscribers(&watch),
+        vec!["lead"]
+    );
     let receipt = crate::merge_receipt::find(&home, REPO, &sha, "t-merge");
     assert!(receipt.is_some(), "receipt must be findable on disk");
     let r = receipt.unwrap();
@@ -339,7 +342,10 @@ fn post_merge_operator_fallback_arms_assignee_handoff() {
     .unwrap();
     assert_eq!(watch["next_after_ci"], "dev");
     assert!(watch["notification_only"].is_null());
-    assert!(crate::daemon::ci_watch::parse_subscribers(&watch).is_empty());
+    assert_eq!(
+        crate::daemon::ci_watch::parse_subscribers(&watch),
+        vec!["dev"]
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
