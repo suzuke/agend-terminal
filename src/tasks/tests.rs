@@ -3462,6 +3462,147 @@ fn test_task_create_without_branch_defaults_none() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn task_done_accepts_clean_squash_merged_branch_but_rejects_real_work() {
+    let home = tmp_home("done-squash-merged");
+    let repo = home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "task-test"]);
+    git(&["config", "user.email", "task-test@example.invalid"]);
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&["add", "base.txt"]);
+    git(&["commit", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/repo.git",
+    ]);
+    git(&["update-ref", "refs/remotes/origin/main", &base]);
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+
+    let branch = "feat/squash-terminal";
+    git(&["checkout", "-b", branch]);
+    std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+    git(&["add", "feature.txt"]);
+    git(&["commit", "-m", "feature one"]);
+    std::fs::write(repo.join("feature-two.txt"), "feature two\n").unwrap();
+    git(&["add", "feature-two.txt"]);
+    git(&["commit", "-m", "feature two"]);
+    let feature_head = git(&["rev-parse", "HEAD"]);
+    let feature_tree = git(&["rev-parse", "HEAD^{tree}"]);
+    let squash = git(&[
+        "commit-tree",
+        &feature_tree,
+        "-p",
+        &base,
+        "-m",
+        "squash feature",
+    ]);
+
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "squash terminal",
+            "assignee": "dev",
+            "branch": branch,
+        }),
+    );
+    let task_id = created["task"]["id"].as_str().unwrap().to_string();
+    let claimed = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    assert_eq!(claimed["task"]["status"], "claimed");
+
+    let runtime = crate::paths::runtime_dir(&home).join("dev");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "agent": "dev",
+            "task_id": task_id,
+            "branch": branch,
+            "worktree": repo,
+            "source_repo": repo,
+            "issued_at": "2026-07-30T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let ahead = {
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Prs(0),
+        ));
+        handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "done", "id": task_id}),
+        )
+    };
+    assert_eq!(
+        ahead["code"], "assignee_completion_blocked",
+        "a genuinely unmerged feature must remain blocked: {ahead}"
+    );
+
+    git(&["update-ref", "refs/remotes/origin/main", &squash]);
+    let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+        crate::scm::MockPrList::MergedHead {
+            base: "main".to_string(),
+            head_oid: feature_head,
+        },
+    ));
+    std::fs::write(repo.join("dirty.txt"), "uncommitted\n").unwrap();
+    let dirty = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": task_id}),
+    );
+    assert_eq!(
+        dirty["code"], "assignee_completion_blocked",
+        "uncommitted work must remain blocked even after squash merge: {dirty}"
+    );
+
+    std::fs::remove_file(repo.join("dirty.txt")).unwrap();
+    let done = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": task_id}),
+    );
+    assert_eq!(
+        done["status"], "done",
+        "a clean branch whose patch is on origin/main is safe to settle: {done}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // --- M4 r1-fix: ACL allow-list + state guard tests ---
 
 #[test]

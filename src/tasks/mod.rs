@@ -80,7 +80,7 @@ pub(crate) fn assignee_completion_guard(
     if !source_repo.exists() || !worktree.exists() {
         return Err("assignee completion binding points to a missing path".to_string());
     }
-    if crate::worktree_pool::worktree_has_work_at_risk(worktree) {
+    if crate::worktree::worktree_has_preservable_wip(worktree) {
         return Err("assignee worktree has dirty or unpushed work".to_string());
     }
 
@@ -107,6 +107,9 @@ pub(crate) fn assignee_completion_guard(
     };
 
     if disposable_review_at_provisioned_head {
+        if crate::worktree_pool::worktree_has_work_at_risk(worktree) {
+            return Err("assignee worktree has dirty or unpushed work".to_string());
+        }
         return Ok(());
     }
 
@@ -118,6 +121,13 @@ pub(crate) fn assignee_completion_guard(
     let remote_prefix = format!("refs/remotes/{remote}/");
     if !remote_default.starts_with(&remote_prefix) || remote_default == remote_prefix {
         return Err("assignee remote default ref is invalid".to_string());
+    }
+
+    if crate::branch_sweep::is_squash_merged(source_repo, &remote_default, branch) {
+        return Ok(());
+    }
+    if crate::worktree_pool::worktree_has_work_at_risk(worktree) {
+        return Err("assignee worktree has dirty or unpushed work".to_string());
     }
 
     let local_branch_ref = format!("refs/heads/{branch}");

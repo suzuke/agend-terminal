@@ -732,7 +732,7 @@ const RECOVERY_MAX_PER_BRANCH: usize = 3;
 /// rule in `retention::worktrees::maybe_remove_candidate`). Fail-closed
 /// (`Err => true`): a status failure attempts preservation rather than risk
 /// dropping WIP — a broken git then fails the snapshot gracefully (`None`).
-fn worktree_has_preservable_wip(wt_path: &Path) -> bool {
+pub(crate) fn worktree_has_preservable_wip(wt_path: &Path) -> bool {
     // P0/P1 (codex R2): force submodule dirt to SHOW (`--ignore-submodules=none`
     // overrides `submodule.<name>.ignore=all|dirty`, which would otherwise hide it
     // and make this classifier read Clean → the worktree removed → nested WIP lost)

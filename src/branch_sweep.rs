@@ -500,7 +500,11 @@ pub(crate) fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
         return true;
     }
     // Method 2: tree-diff comparison (works for GitHub squash-merge).
-    is_squash_merged_diff(repo, base, branch)
+    let pr_base = base
+        .strip_prefix("refs/remotes/")
+        .and_then(|rest| rest.split_once('/').map(|(_, branch)| branch))
+        .unwrap_or(base);
+    is_squash_merged_diff(repo, pr_base, branch)
 }
 
 /// `git cherry` based detection.

@@ -701,6 +701,8 @@ pub(crate) struct MockScmProvider {
 pub(crate) enum MockPrList {
     /// Return this many default PRs — non-empty ⇒ "the branch has/had a PR".
     Prs(usize),
+    /// Return one merged PR only when the exact base branch name matches.
+    MergedHead { base: String, head_oid: String },
     /// Return open PR summaries with the supplied head branch names.
     Branches(Vec<String>),
     /// Return an `Err` ⇒ a transient gh failure (a no-PR confirm must NOT release).
@@ -804,6 +806,15 @@ impl ScmProvider for MockScmProvider {
         );
         match &self.pr_list {
             Some(MockPrList::Prs(n)) => Ok(vec![PrSummary::default(); *n]),
+            Some(MockPrList::MergedHead { base, head_oid })
+                if filter.base.as_deref() == Some(base.as_str()) =>
+            {
+                Ok(vec![PrSummary {
+                    head_ref_oid: Some(head_oid.clone()),
+                    ..Default::default()
+                }])
+            }
+            Some(MockPrList::MergedHead { .. }) => Ok(vec![]),
             Some(MockPrList::Branches(branches)) => Ok(branches
                 .iter()
                 .filter(|branch| {
