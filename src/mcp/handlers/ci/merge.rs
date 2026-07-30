@@ -52,11 +52,19 @@ pub(crate) fn post_merge_receipt_and_watch(
         }),
         "",
     );
-    if watch_result.get("error").is_some() {
+    let has_subscribers = watch_result
+        .get("subscribers")
+        .and_then(Value::as_array)
+        .is_some_and(|subscribers| !subscribers.is_empty());
+    if watch_result.get("error").is_some() || !has_subscribers {
+        let watch_error = watch_result
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| json!("watch armed without subscribers"));
         json!({
             "receipt": "persisted",
             "assignee": &assignee,
-            "watch_error": watch_result["error"],
+            "watch_error": watch_error,
         })
     } else {
         json!({

@@ -193,6 +193,22 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if !subscribers.iter().any(|s| s == instance_name) && !instance_name.is_empty() {
         subscribers.push(instance_name.to_string());
     }
+    // Post-merge exact-head watches are armed by an anonymous privileged
+    // caller. Make their explicit handoff targets durable poll subscribers;
+    // named callers and feature-branch watches retain their existing behavior.
+    let add_exact_head_handoff_subscribers = exact_head_sha.is_some()
+        && instance_name.is_empty()
+        && !args["notification_only"].as_bool().unwrap_or(false);
+    if add_exact_head_handoff_subscribers {
+        let targets = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
+            args.get("next_after_ci").unwrap_or(&Value::Null),
+        );
+        for target in targets {
+            if !subscribers.iter().any(|subscriber| subscriber == &target) {
+                subscribers.push(target);
+            }
+        }
+    }
     let subscribers_json: Vec<Value> = subscribers
         .iter()
         .map(|name| {
