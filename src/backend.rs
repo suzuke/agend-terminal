@@ -682,15 +682,20 @@ impl Backend {
                 instructions_path: "AGENTS.md",
                 instructions_shared: true,
                 ready_timeout_secs: 30,
-                // Project trust modal fires on first tool use in a new workdir
-                // ("Run Grok Build in a project directory?"). Default cursor is
-                // the accept option → single Enter. Anchored per #468. The
-                // inject path submits with one CR; this dismiss covers the
-                // follow-up trust modal (empirically needed for a turn to run).
-                dismiss_patterns: &[DismissPattern {
-                    label: r"(?m)^[^A-Za-z\n]*Run Grok Build in a project directory\?",
-                    sequence: b"\r",
-                }],
+                // Grok 0.2.93 used the project-directory prompt with an
+                // Enter-selected default. 0.2.114 moved trust to startup and
+                // requires the explicit `y` hotkey. Keep both exact trust-only
+                // prompts; neither matches runtime tool approvals.
+                dismiss_patterns: &[
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Run Grok Build in a project directory",
+                        sequence: b"\r",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Do you trust the contents of this directory",
+                        sequence: b"y\r",
+                    },
+                ],
                 // configure_grok writes <workdir>/.grok/config.toml
                 // [mcp_servers.agend-terminal] (project-scoped; no HOME write).
                 fleet_mcp_supported: true,
@@ -1618,6 +1623,12 @@ mod tests {
             .find(|dp| dp.label.contains("project directory"))
             .expect("Grok must dismiss project-directory trust modal");
         assert_eq!(trust.sequence, b"\r");
+        let directory_trust = p
+            .dismiss_patterns
+            .iter()
+            .find(|dp| dp.label.contains("contents of this directory"))
+            .expect("Grok 0.2.114 directory-trust modal must be dismissed");
+        assert_eq!(directory_trust.sequence, b"y\r");
         assert_eq!(Backend::Grok.input_prompt_marker(), Some("❯"));
         assert_eq!(Backend::Grok.credential_env_keys(), &["XAI_API_KEY"]);
     }

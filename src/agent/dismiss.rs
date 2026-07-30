@@ -136,7 +136,11 @@ fn dismiss_literal_hint(pattern: &str) -> &str {
 /// approval modal — stealing the operator's decision. A new trust prompt that
 /// must survive the latch is added here by its literal hint, deliberately, in
 /// one place.
-const REARM_PAST_LATCH_TRUST_HINTS: &[&str] = &["Yes, I trust"];
+const REARM_PAST_LATCH_TRUST_HINTS: &[&str] = &[
+    "Yes, I trust",
+    "Run Grok Build in a project directory",
+    "Do you trust the contents of this directory",
+];
 
 fn is_rearm_past_latch_hint(literal_hint: &str) -> bool {
     REARM_PAST_LATCH_TRUST_HINTS.contains(&literal_hint)
@@ -442,6 +446,50 @@ mod tests {
         assert!(try_dismiss_dialog("t", &screen, &test_writer(), &patterns));
     }
 
+    #[test]
+    fn grok_02114_directory_trust_matches_real_modal() {
+        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        let screen = "\
+                  Do you trust the contents of this directory?
+/private/tmp/agend-s1/workspace/s1-grok
+
+                         Yes, proceed                 y
+                         No, quit                     n
+
+                                                      Grok Build  0.2.114 Beta";
+        assert!(try_dismiss_dialog(
+            "grok-02114-trust",
+            screen,
+            &test_writer(),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn grok_02114_directory_trust_does_not_match_runtime_approval() {
+        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        let screen = "\
+Requesting permission for: rm -rf build
+Yes, proceed                 y
+No, cancel                   n";
+        assert!(!try_dismiss_dialog(
+            "grok-02114-runtime",
+            screen,
+            &test_writer(),
+            &patterns
+        ));
+    }
+
     // ── Issue #468: dismiss precision regression tests ─────────────────
     //
     // Hotfix #468 replaces `screen.contains(pattern)` substring match with
@@ -651,6 +699,21 @@ Should we add a dismiss_pattern?
         assert_eq!(
             trust_count, 1,
             "claude must have exactly ONE re-arm-eligible (workspace-trust) dismiss pattern"
+        );
+
+        let grok: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        assert_eq!(
+            prepare_dismiss_patterns(&grok)
+                .iter()
+                .filter(|p| p.rearm_past_latch)
+                .count(),
+            2,
+            "both Grok workspace-trust variants must re-arm past startup"
         );
     }
 
