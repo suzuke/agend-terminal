@@ -77,7 +77,7 @@ fn exact_head_main_accepted_for_orchestrator() {
         "authorized exact-head main watch must be accepted: {r}"
     );
     assert!(r.get("error").is_none(), "no error on accept: {r}");
-    assert_eq!(r["subscribers"], json!([]));
+    assert_eq!(r["subscribers"], json!(["lead"]));
     std::fs::remove_dir_all(&home).ok();
 }
 
