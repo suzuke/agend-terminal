@@ -136,6 +136,7 @@ fn if_condition_desc(cond: &syn::Expr) -> String {
 /// match a whitelist entry — fail-closed).
 fn pattern_variant(pat: &syn::Pat) -> String {
     match pat {
+        syn::Pat::Guard(p) => pattern_variant(&p.pat),
         syn::Pat::Path(p) => p
             .path
             .segments
@@ -220,7 +221,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_arm(&mut self, node: &'ast syn::Arm) {
         self.frames.push(Frame::Arm {
             variant: pattern_variant(&node.pat),
-            guarded: node.guard.is_some(),
+            guarded: matches!(&node.pat, syn::Pat::Guard(_)),
         });
         visit::visit_arm(self, node);
         self.frames.pop();
@@ -510,5 +511,133 @@ fn removed_call_site_is_detected() {
     assert!(
         err.contains("MISSING"),
         "violation report must flag missing entries, got:\n{err}"
+    );
+}
+
+// F1: a call in a real parsed arm guard must remain visible and classified as
+// guarded, rather than being skipped with the old Arm::guard field.
+#[test]
+fn syn3_guard_expression_is_scanned() {
+    let src = r#"
+        fn fixture(action: Action) {
+            match action {
+                Action::ChdirPass(args) if exec_real_git(&args, None) => {}
+                _ => {}
+            }
+        }
+    "#;
+    let err = diff_against_whitelist(&scan_source("fixture.rs", src))
+        .expect_err("exec call in a guard must violate the fixture whitelist");
+    assert!(
+        err.contains(
+            "fixture.rs :: fixture :: call exec_real_git @ dispatch-arm ChdirPass (guarded)"
+        ),
+        "guard call must retain the guarded arm context, got:\n{err}"
+    );
+}
+
+// F2: unwrapping Pat::Guard must preserve the underlying dispatch variant for
+// the arm body; collapsing it to '?' would hide a relocated call site.
+#[test]
+fn syn3_guarded_arm_preserves_variant_fidelity() {
+    let src = r#"
+        fn fixture(action: Action) {
+            match action {
+                Action::ChdirPass(args) if is_conflict_capable(&args) => {
+                    exec_real_git(&args, None);
+                }
+                _ => {}
+            }
+        }
+    "#;
+    let err = diff_against_whitelist(&scan_source("fixture.rs", src))
+        .expect_err("exec call in a guarded arm body must violate the fixture whitelist");
+    assert!(
+        err.contains(
+            "fixture.rs :: fixture :: call exec_real_git @ dispatch-arm ChdirPass (guarded)"
+        ),
+        "guarded body call must retain its variant, got:\n{err}"
+    );
+    assert!(
+        !err.contains("dispatch-arm ? (guarded)"),
+        "guarded body call must not collapse its variant to '?', got:\n{err}"
+    );
+}
+
+// F3: an or-pattern wrapped by a guard must unwrap in both layers and retain
+// every variant in the structural context.
+#[test]
+fn syn3_or_pattern_guard_preserves_all_variants() {
+    let src = r#"
+        fn fixture(action: Action) {
+            match action {
+                Action::Passthrough(_) | Action::ChdirPass(_)
+                    if is_conflict_capable(&action) => {
+                    exec_real_git(&[], None);
+                }
+                _ => {}
+            }
+        }
+    "#;
+    let err = diff_against_whitelist(&scan_source("fixture.rs", src))
+        .expect_err("exec call in a guarded or-pattern must violate the fixture whitelist");
+    assert!(
+        err.contains(
+            "fixture.rs :: fixture :: call exec_real_git @ dispatch-arm Passthrough|ChdirPass (guarded)"
+        ),
+        "guarded or-pattern must retain both variants, got:\n{err}"
+    );
+}
+
+// F4: an unguarded arm must not inherit the guarded classification from the
+// Pat::Guard representation used by a neighboring arm.
+#[test]
+fn syn3_unguarded_arm_remains_unguarded() {
+    let src = r#"
+        fn fixture(action: Action) {
+            match action {
+                Action::ChdirPass(args) => {
+                    exec_real_git(&args, None);
+                }
+                _ => {}
+            }
+        }
+    "#;
+    let err = diff_against_whitelist(&scan_source("fixture.rs", src))
+        .expect_err("exec call in an unguarded arm must violate the fixture whitelist");
+    assert!(
+        err.contains(
+            "fixture.rs :: fixture :: call exec_real_git @ dispatch-arm ChdirPass (unguarded)"
+        ),
+        "unguarded body call must be marked unguarded, got:\n{err}"
+    );
+    assert!(
+        !err.lines().any(|line| {
+            line.contains("fixture.rs :: fixture ::")
+                && line.ends_with("dispatch-arm ChdirPass (guarded)")
+        }),
+        "unguarded body call must not be marked guarded, got:\n{err}"
+    );
+}
+
+// F5: ordinary guarded control flow with no exec capability must not create a
+// false positive merely because Syn 3 represents the guard as a pattern node.
+#[test]
+fn syn3_non_exec_guard_is_negative() {
+    let src = r#"
+        fn fixture(action: Action) {
+            match action {
+                Action::ChdirPass(args) if is_conflict_capable(&args) => {
+                    safe_helper(&args);
+                }
+                _ => {}
+            }
+        }
+
+        fn safe_helper(_args: &[String]) {}
+    "#;
+    assert!(
+        scan_source("fixture.rs", src).is_empty(),
+        "non-exec guarded fixture must not report an exec occurrence"
     );
 }
