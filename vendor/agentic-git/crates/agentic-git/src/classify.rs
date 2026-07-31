@@ -71,6 +71,18 @@ pub(crate) fn cwd_is_foreign_repo(binding: &Binding) -> bool {
     paths_are_foreign(&cwd, Path::new(wt))
 }
 
+/// #3142: a bound agent's read-only git command must stay in a cwd that is not
+/// inside any repository. `paths_are_foreign` intentionally fails closed when
+/// the cwd has no commondir; that is correct for foreign-repo mutation policy,
+/// but a read-only `rev-parse`/`status` would otherwise be redirected into the
+/// bound worktree and report a false repository. The caller uses this only for
+/// the bare cwd path; leading `-C` target policy remains unchanged.
+pub(crate) fn cwd_is_nonrepo() -> bool {
+    env::current_dir()
+        .map(|cwd| find_git_dir(&cwd).is_none())
+        .unwrap_or(false)
+}
+
 /// #2234 (C): pure decision — is `cwd` the agent's stale WORKSPACE clone rather
 /// than its bound worktree? True iff `cwd` is rooted in the agent's configured
 /// workspace dir (`<home>/workspace/<agent>`) AND that dir is a git object store
@@ -360,6 +372,41 @@ pub(crate) fn apply_foreign_repo_passthrough(
         return Action::Passthrough;
     }
     action
+}
+
+/// #3142: convert only the bound read-only commands to passthrough when the
+/// caller cwd is not inside a repository. Mutating commands retain their
+/// existing bound-worktree policy; leading `-C` routing is handled separately.
+pub(crate) fn apply_nonrepo_read_passthrough(
+    action: Action,
+    subcmd: &str,
+    cwd_nonrepo: bool,
+) -> Action {
+    if cwd_nonrepo
+        && matches!(action, Action::ChdirPass(_))
+        && matches!(
+            subcmd,
+            "status"
+                | "log"
+                | "diff"
+                | "show"
+                | "blame"
+                | "ls-files"
+                | "ls-tree"
+                | "rev-parse"
+                | "fetch"
+                | "remote"
+                | "branch"
+                | "tag"
+                | "describe"
+                | "shortlog"
+                | "reflog"
+        )
+    {
+        Action::Passthrough
+    } else {
+        action
+    }
 }
 
 /// #1463: index of the real subcommand in `args` — the first non-option token,

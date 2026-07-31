@@ -337,17 +337,21 @@ fn shim_main() {
     // repo (separate object store — e.g. a test scratch repo) should operate on
     // THAT repo, not be redirected into the worktree. Post-process the classify
     // result so the (unchanged, unit-tested) `classify` stays cwd-agnostic.
-    let action = apply_foreign_repo_passthrough(
-        classify_argv(
-            &args,
-            &binding,
-            parent_is_gh,
-            canonical_cwd,
-            is_agent_caller,
+    let action = apply_nonrepo_read_passthrough(
+        apply_foreign_repo_passthrough(
+            classify_argv(
+                &args,
+                &binding,
+                parent_is_gh,
+                canonical_cwd,
+                is_agent_caller,
+            ),
+            subcommand,
+            norm_args,
+            cwd_is_foreign_repo(&binding),
         ),
         subcommand,
-        norm_args,
-        cwd_is_foreign_repo(&binding),
+        cwd_is_nonrepo(),
     );
 
     // #4: pre-destructive-op snapshot, BEFORE the op executes. Only actions
