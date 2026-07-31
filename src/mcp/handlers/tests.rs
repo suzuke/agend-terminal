@@ -3779,7 +3779,10 @@ teams:
     };
 
     let first = dispatch();
-    assert!(is_ok_result(&first), "first typed dispatch must succeed: {first}");
+    assert!(
+        is_ok_result(&first),
+        "first typed dispatch must succeed: {first}"
+    );
     let first_task_id = first["auto_created_task_id"]
         .as_str()
         .expect("first dispatch must auto-create a task")
@@ -3809,7 +3812,11 @@ teams:
         "target",
         &json!({"action": "claim", "id": first_task_id}),
     );
-    assert_eq!(claim["status"].as_str(), Some("claimed"), "claim must succeed: {claim}");
+    assert_eq!(
+        claim["status"].as_str(),
+        Some("claimed"),
+        "claim must succeed: {claim}"
+    );
 
     let after_claim_retry = dispatch();
     assert!(

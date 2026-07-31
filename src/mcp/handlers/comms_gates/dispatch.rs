@@ -116,14 +116,38 @@ pub(crate) fn run_dispatch_pre_checks(
 ) -> Result<DispatchPreChecks, Value> {
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let force_reason = args.get("force_reason").and_then(|v| v.as_str());
-    let claimed_tasks: Vec<_> = crate::tasks::list_all(home)
-        .into_iter()
-        .filter(|t| {
-            t.assignee.as_deref() == Some(target)
-                && (t.status == crate::task_events::TaskStatus::Claimed
-                    || t.status == crate::task_events::TaskStatus::InProgress)
-        })
-        .collect();
+    // #3141: dispatch auto-create routes a target's task to that target's
+    // project board, while the legacy default-board list hides it.  Use the
+    // strict all-board authority view so sequential retries see the same
+    // task regardless of which project board owns it.  An incomplete view is
+    // unsafe for deduplication, so reject explicitly rather than fail open.
+    let active_tasks: Vec<_> = match crate::tasks::list_all_strict(home) {
+        Ok(tasks) => tasks
+            .into_iter()
+            .filter(|t| {
+                t.assignee.as_deref() == Some(target)
+                    && matches!(
+                        t.status,
+                        crate::task_events::TaskStatus::Open
+                            | crate::task_events::TaskStatus::Claimed
+                            | crate::task_events::TaskStatus::InProgress
+                    )
+            })
+            .collect(),
+        Err(error) => {
+            tracing::error!(
+                %target,
+                %error,
+                "#3141 dispatch preflight rejected — task authority view unresolved"
+            );
+            return Err(json!({
+                "ok": false,
+                "error": format!("dispatch task view could not be resolved: {error}"),
+                "code": "dispatch_task_view_unresolved",
+                "remediation": "repair or disambiguate the task boards, then re-dispatch",
+            }));
+        }
+    };
     // #1496 Option 1: a send(kind=task) whose `task_id` is already one of the
     // target's active tasks is ENRICHING that in-flight dispatch (finally
     // delivering its context), not opening a competing one — let it through the
@@ -132,12 +156,12 @@ pub(crate) fn run_dispatch_pre_checks(
     let enriching_active = args["task_id"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .is_some_and(|tid| claimed_tasks.iter().any(|t| t.id.as_str() == tid));
+        .is_some_and(|tid| active_tasks.iter().any(|t| t.id.as_str() == tid));
     // #1286: branch-specific dispatch dedup — reject if target already has
     // an active task on the same branch (more specific than generic busy).
     if !force && !enriching_active {
         if let Some(branch) = args["branch"].as_str() {
-            if let Some(dup) = claimed_tasks
+            if let Some(dup) = active_tasks
                 .iter()
                 .find(|t| t.branch.as_deref() == Some(branch))
             {
@@ -150,13 +174,13 @@ pub(crate) fn run_dispatch_pre_checks(
             }
         }
     }
-    if !claimed_tasks.is_empty() && !enriching_active {
+    if !active_tasks.is_empty() && !enriching_active {
         if force {
             if force_reason.is_none() || force_reason == Some("") {
                 return Err(json!({"error": "force=true requires a non-empty 'force_reason'"}));
             }
         } else {
-            let current = &claimed_tasks[0];
+            let current = &active_tasks[0];
             let age_secs = chrono::DateTime::parse_from_rfc3339(&current.updated_at)
                 .ok()
                 .map(|dt| {
@@ -290,6 +314,17 @@ mod tests {
         assert!(!out.force);
         assert!(out.force_reason.is_none());
         assert!(!out.second_reviewer);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unresolved_task_view_rejects_dispatch_fail_closed_3141() {
+        let home = gate_home("unresolved-view");
+        std::fs::write(home.join("boards"), "not a directory").unwrap();
+        let err = run(&home, &json!({"instance": "target"}))
+            .expect_err("an unreadable task view must reject dispatch");
+        assert_eq!(err["code"], "dispatch_task_view_unresolved", "{err}");
+        assert_eq!(err["ok"], false, "{err}");
         std::fs::remove_dir_all(&home).ok();
     }
 
