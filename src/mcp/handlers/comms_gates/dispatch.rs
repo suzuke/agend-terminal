@@ -121,19 +121,8 @@ pub(crate) fn run_dispatch_pre_checks(
     // strict all-board authority view so sequential retries see the same
     // task regardless of which project board owns it.  An incomplete view is
     // unsafe for deduplication, so reject explicitly rather than fail open.
-    let active_tasks: Vec<_> = match crate::tasks::list_all_strict(home) {
-        Ok(tasks) => tasks
-            .into_iter()
-            .filter(|t| {
-                t.assignee.as_deref() == Some(target)
-                    && matches!(
-                        t.status,
-                        crate::task_events::TaskStatus::Open
-                            | crate::task_events::TaskStatus::Claimed
-                            | crate::task_events::TaskStatus::InProgress
-                    )
-            })
-            .collect(),
+    let all_tasks = match crate::tasks::list_all_strict(home) {
+        Ok(tasks) => tasks,
         Err(error) => {
             tracing::error!(
                 %target,
@@ -148,6 +137,32 @@ pub(crate) fn run_dispatch_pre_checks(
             }));
         }
     };
+    // The same-board branch dedup sees Open tasks so a pre-claim retry is
+    // rejected. Generic busy and explicit-task enrichment retain their
+    // pre-#3141 lifecycle semantics and only see claimed/in-progress work.
+    let dedup_candidates: Vec<_> = all_tasks
+        .iter()
+        .filter(|t| {
+            t.assignee.as_deref() == Some(target)
+                && matches!(
+                    t.status,
+                    crate::task_events::TaskStatus::Open
+                        | crate::task_events::TaskStatus::Claimed
+                        | crate::task_events::TaskStatus::InProgress
+                )
+        })
+        .collect();
+    let busy_candidates: Vec<_> = all_tasks
+        .iter()
+        .filter(|t| {
+            t.assignee.as_deref() == Some(target)
+                && matches!(
+                    t.status,
+                    crate::task_events::TaskStatus::Claimed
+                        | crate::task_events::TaskStatus::InProgress
+                )
+        })
+        .collect();
     // #1496 Option 1: a send(kind=task) whose `task_id` is already one of the
     // target's active tasks is ENRICHING that in-flight dispatch (finally
     // delivering its context), not opening a competing one — let it through the
@@ -156,12 +171,12 @@ pub(crate) fn run_dispatch_pre_checks(
     let enriching_active = args["task_id"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .is_some_and(|tid| active_tasks.iter().any(|t| t.id.as_str() == tid));
+        .is_some_and(|tid| busy_candidates.iter().any(|t| t.id.as_str() == tid));
     // #1286: branch-specific dispatch dedup — reject if target already has
     // an active task on the same branch (more specific than generic busy).
     if !force && !enriching_active {
         if let Some(branch) = args["branch"].as_str() {
-            if let Some(dup) = active_tasks
+            if let Some(dup) = dedup_candidates
                 .iter()
                 .find(|t| t.branch.as_deref() == Some(branch))
             {
@@ -174,13 +189,13 @@ pub(crate) fn run_dispatch_pre_checks(
             }
         }
     }
-    if !active_tasks.is_empty() && !enriching_active {
+    if !busy_candidates.is_empty() && !enriching_active {
         if force {
             if force_reason.is_none() || force_reason == Some("") {
                 return Err(json!({"error": "force=true requires a non-empty 'force_reason'"}));
             }
         } else {
-            let current = &active_tasks[0];
+            let current = busy_candidates[0];
             let age_secs = chrono::DateTime::parse_from_rfc3339(&current.updated_at)
                 .ok()
                 .map(|dt| {

@@ -3763,7 +3763,7 @@ teams:
     .unwrap();
     std::env::set_var("AGEND_HOME", &home);
 
-    let dispatch = || {
+    let dispatch = |branch: &str| {
         handle_tool_rt(
             "send",
             &json!({
@@ -3771,14 +3771,14 @@ teams:
                 "task": "implement #3141",
                 "message": "implement #3141",
                 "request_kind": "task",
-                "branch": "fix/3141",
+                "branch": branch,
                 "bind": false,
             }),
             "sender",
         )
     };
 
-    let first = dispatch();
+    let first = dispatch("fix/3141-a");
     assert!(
         is_ok_result(&first),
         "first typed dispatch must succeed: {first}"
@@ -3793,7 +3793,21 @@ teams:
         "first dispatch must deliver exactly one target message"
     );
 
-    let before_claim_retry = dispatch();
+    // An unrelated branch remains allowed while the target has only Open
+    // work.  Check both rejection fields: busy replies intentionally omit
+    // `error`, so an error-only success helper would miss this regression.
+    let distinct_branch = dispatch("fix/3141-b");
+    assert!(
+        distinct_branch.get("busy").is_none() && distinct_branch.get("error").is_none(),
+        "distinct Open branch must dispatch successfully: {distinct_branch}"
+    );
+    assert_eq!(
+        crate::inbox::drain(&home, "target").len(),
+        1,
+        "distinct branch must deliver exactly one target message"
+    );
+
+    let before_claim_retry = dispatch("fix/3141-a");
     assert!(
         before_claim_retry["error"]
             .as_str()
@@ -3818,7 +3832,7 @@ teams:
         "claim must succeed: {claim}"
     );
 
-    let after_claim_retry = dispatch();
+    let after_claim_retry = dispatch("fix/3141-a");
     assert!(
         after_claim_retry["error"]
             .as_str()
@@ -3839,7 +3853,7 @@ teams:
             "task": "urgent override",
             "message": "urgent override",
             "request_kind": "task",
-            "branch": "fix/3141",
+            "branch": "fix/3141-a",
             "bind": false,
             "force": true,
             "force_reason": "operator-approved retry",
@@ -3860,7 +3874,7 @@ teams:
             "message": "add context",
             "request_kind": "task",
             "task_id": first_task_id,
-            "branch": "fix/3141",
+            "branch": "fix/3141-a",
             "bind": false,
         }),
         "sender",
