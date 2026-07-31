@@ -3736,6 +3736,138 @@ fn send_kind_task_without_task_id_auto_creates_board_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3141 RED/GREEN: the real typed `send` entry must see an auto-created task
+/// on the target's project board when deciding whether a sequential retry is a
+/// duplicate.  The first dispatch is intentionally left Open; after claiming
+/// it, the same branch must remain deduped.  Force+reason and explicit-task
+/// enrichment are retained as the two documented escape hatches.
+#[test]
+fn typed_send_deduplicates_cross_board_sequential_retry_3141() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("3141-cross-board-sequential");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"instances:
+  target:
+    backend: claude
+  sender:
+    backend: claude
+teams:
+  target-team:
+    members:
+      - target
+      - sender
+    source_repo: /repos/org/proj
+"#,
+    )
+    .unwrap();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let dispatch = || {
+        handle_tool_rt(
+            "send",
+            &json!({
+                "instance": "target",
+                "task": "implement #3141",
+                "message": "implement #3141",
+                "request_kind": "task",
+                "branch": "fix/3141",
+                "bind": false,
+            }),
+            "sender",
+        )
+    };
+
+    let first = dispatch();
+    assert!(is_ok_result(&first), "first typed dispatch must succeed: {first}");
+    let first_task_id = first["auto_created_task_id"]
+        .as_str()
+        .expect("first dispatch must auto-create a task")
+        .to_string();
+    assert_eq!(
+        crate::inbox::drain(&home, "target").len(),
+        1,
+        "first dispatch must deliver exactly one target message"
+    );
+
+    let before_claim_retry = dispatch();
+    assert!(
+        before_claim_retry["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already has active task"),
+        "same target+branch retry must reject before claim: {before_claim_retry}"
+    );
+    assert_eq!(
+        crate::inbox::drain(&home, "target").len(),
+        0,
+        "deduped retry must not deliver a second target message"
+    );
+
+    let claim = crate::tasks::handle(
+        &home,
+        "target",
+        &json!({"action": "claim", "id": first_task_id}),
+    );
+    assert_eq!(claim["status"].as_str(), Some("claimed"), "claim must succeed: {claim}");
+
+    let after_claim_retry = dispatch();
+    assert!(
+        after_claim_retry["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already has active task"),
+        "same target+branch retry must reject after claim: {after_claim_retry}"
+    );
+    assert_eq!(
+        crate::inbox::drain(&home, "target").len(),
+        0,
+        "post-claim deduped retry must not deliver"
+    );
+
+    let forced = handle_tool_rt(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "urgent override",
+            "message": "urgent override",
+            "request_kind": "task",
+            "branch": "fix/3141",
+            "bind": false,
+            "force": true,
+            "force_reason": "operator-approved retry",
+        }),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&forced),
+        "force=true with force_reason must bypass dedup: {forced}"
+    );
+    assert_eq!(crate::inbox::drain(&home, "target").len(), 1);
+
+    let enriched = handle_tool_rt(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "add context",
+            "message": "add context",
+            "request_kind": "task",
+            "task_id": first_task_id,
+            "branch": "fix/3141",
+            "bind": false,
+        }),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&enriched),
+        "explicit task_id enrichment must bypass dedup: {enriched}"
+    );
+    assert_eq!(crate::inbox::drain(&home, "target").len(), 1);
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn send_kind_task_broadcast_path_also_requires_task_id() {
     // Defensive bonus: the gate runs BEFORE broadcast routing in
