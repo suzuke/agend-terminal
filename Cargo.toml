@@ -246,6 +246,8 @@ predicates = "3.1"
 insta = "1.39"
 proptest = "1.4"
 serial_test = "3"
+# Test-only reusable loopback listener for harness port-reuse regression coverage.
+socket2 = "0.6"
 # Used only for asserting that codex_trust_directory writes syntactically
 # valid TOML — the prod code appends raw text, it doesn't depend on this crate.
 toml = "1.1"

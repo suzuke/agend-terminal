@@ -191,15 +191,77 @@ fn poll_group_gone(pgid: i32, tries: u32, interval: std::time::Duration) -> bool
     false
 }
 
+/// Bind a loopback listener with address reuse enabled so a just-closed daemon
+/// port can be deterministically recycled even when its old connections are
+/// still in TIME_WAIT.
+#[cfg(unix)]
+fn bind_squatter(port: u16, reuse_address: bool) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(reuse_address)?;
+    socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+    socket.listen(1)?;
+    Ok(socket.into())
+}
+
+#[cfg(unix)]
+fn bind_reusable_squatter(port: u16) -> std::io::Result<std::net::TcpListener> {
+    bind_squatter(port, true)
+}
+
+/// Recreate the closed-connection/TIME_WAIT premise from the coverage failure,
+/// then prove the reusable socket can reclaim that exact port without a delay.
+#[cfg(unix)]
+#[test]
+fn reusable_squatter_reclaims_time_wait_port() {
+    use std::io::Read;
+
+    // Tokio/Mio's daemon listener sets SO_REUSEADDR on Unix; mirror that
+    // lifecycle so this control exercises the same TIME_WAIT behavior.
+    let listener = bind_squatter(0, true).expect("bind source listener");
+    let address = listener.local_addr().expect("source listener address");
+    let client = std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).expect("connect source listener");
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).expect("read source EOF"), 0);
+    });
+    let (server, _) = listener.accept().expect("accept source connection");
+    drop(server);
+    drop(listener);
+    client.join().expect("source client thread");
+
+    let port = address.port();
+    let error = bind_squatter(port, false).expect_err("closed source must be TIME_WAIT");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    let squatter = match bind_reusable_squatter(port) {
+        Ok(listener) => Some(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            assert!(
+                std::net::TcpStream::connect(address).is_ok(),
+                "TIME_WAIT port was not reclaimable and is not connectable: {error}"
+            );
+            None
+        }
+        Err(error) => panic!("reuse must reclaim TIME_WAIT port: {error}"),
+    };
+    assert!(
+        std::net::TcpStream::connect(address).is_ok(),
+        "reclaimed TIME_WAIT port must be connectable"
+    );
+    drop(squatter);
+}
+
 /// Regression for the #2159 Coverage-job flake: prove the process-liveness
 /// contract is IMMUNE to ephemeral-port reuse, where the old port-connect proxy
 /// false-failed.
 ///
-/// After the daemon's group is gone, we bind a fresh listener on the just-freed
-/// port (simulating a concurrent daemon's `bind(0)` recycling it). The port is
-/// now connectable again — exactly the condition that fooled the old
-/// `connect(port).is_err()` proxy (red) — yet `kill(-pgid, 0)` still reports
-/// ESRCH, so the new contract passes (green).
+/// After the daemon's group is gone, we observe a listener on the just-freed
+/// port (simulating a concurrent daemon's `bind(0)` recycling it). If another
+/// test has already recycled the port, its listener is the squatter; otherwise
+/// this test binds one itself. The port is now connectable again — exactly the
+/// condition that fooled the old `connect(port).is_err()` proxy (red) — yet
+/// `kill(-pgid, 0)` still reports ESRCH, so the new contract passes (green).
 #[cfg(unix)]
 #[test]
 fn harness_drop_liveness_immune_to_port_reuse() {
@@ -216,9 +278,22 @@ fn harness_drop_liveness_immune_to_port_reuse() {
         "daemon process group {pgid} must be gone after drop"
     );
 
-    // Simulate a concurrent daemon grabbing the freed ephemeral port.
-    let _squatter = std::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .expect("rebind freed port (simulating concurrent-daemon ephemeral-port reuse)");
+    // Simulate a concurrent daemon grabbing the freed ephemeral port. A
+    // parallel daemon may already have recycled it, in which case EADDRINUSE
+    // is the race under test rather than a test failure.
+    let _squatter = match bind_reusable_squatter(port) {
+        Ok(listener) => Some(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            assert!(
+                std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok(),
+                "EADDRINUSE port {port} is not connectable; neither a live squatter nor reusable TIME_WAIT"
+            );
+            None
+        }
+        Err(error) => {
+            panic!("rebind freed port (simulating concurrent-daemon ephemeral-port reuse): {error}")
+        }
+    };
 
     // The OLD proxy would now FALSE-fail: the port IS connectable again.
     assert!(
