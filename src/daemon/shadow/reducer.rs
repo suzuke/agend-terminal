@@ -276,6 +276,7 @@ impl AgentRuntime {
                 self.rate_limit_active = true;
                 self.last_rate_limit_evidence_ms = ev.at_ms;
             }
+            EvidenceKind::UsageLimit => {}
             EvidenceKind::Responding => {
                 self.last_responding_ms = ev.at_ms;
                 if !self.episode_open {
@@ -555,6 +556,7 @@ fn evidence_kind_tag(kind: &EvidenceKind) -> &'static str {
         EvidenceKind::ToolEnded => "tool_ended",
         EvidenceKind::ApprovalRequired => "approval_required",
         EvidenceKind::RateLimited { .. } => "rate_limited",
+        EvidenceKind::UsageLimit => "usage_limit",
         EvidenceKind::TokenUsage { .. } => "token_usage",
         EvidenceKind::PromptReady => "prompt_ready",
         EvidenceKind::SessionExited => "session_exited",

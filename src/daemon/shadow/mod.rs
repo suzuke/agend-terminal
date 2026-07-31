@@ -19,6 +19,7 @@
 
 pub mod evidence;
 pub(crate) mod gate;
+pub(crate) mod grok;
 pub mod kiro;
 pub mod opencode;
 pub(crate) mod reconcile_log;

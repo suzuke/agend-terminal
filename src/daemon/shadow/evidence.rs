@@ -54,6 +54,9 @@ pub enum EvidenceKind {
     /// the API plane's signal); the local plane never emits this — kept in the shared
     /// contract so the API plane can.
     RateLimited { retry_at_ms: Option<u64> },
+    /// A durable provider quota wall. Unlike `RateLimited`, this is not retryable
+    /// by the observer; it remains in force until genuine later progress.
+    UsageLimit,
     /// Token accounting for a turn (API plane).
     TokenUsage { input: u64, output: u64 },
     /// The agent is idle at a ready prompt (claude `Notification{idle_prompt}`).
