@@ -252,9 +252,9 @@ fn maybe_auto_bind_lease(
     args: &Value,
     target: &str,
     second_reviewer: bool,
-) -> Result<bool, Value> {
+) -> Result<Option<dispatch_hook::CiWatchOutcome>, Value> {
     let Some(branch) = args["branch"].as_str() else {
-        return Ok(false);
+        return Ok(None);
     };
     let task_id_val = args["task_id"].as_str().unwrap_or("");
     if dispatch_should_skip_auto_bind(args) {
@@ -262,7 +262,7 @@ fn maybe_auto_bind_lease(
             %target, %branch, task_id = %task_id_val,
             "dispatch_auto_bind_lease skipped (bind: false)"
         );
-        return Ok(false);
+        return Ok(None);
     }
     let next_after_ci =
         crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
@@ -377,7 +377,7 @@ fn maybe_auto_bind_lease(
         Some(armed_review_class),
         true,
     )
-    .map(|outcome| outcome.ci_watch_arm_failed)
+    .map(|outcome| outcome.ci_watch)
     .map_err(|e| json!({"ok": false, "error": format!("dispatch rejected: {e}")}))
 }
 
@@ -546,10 +546,10 @@ pub(crate) fn handle_delegate_task(
         None
     };
 
-    let mut ci_watch_arm_failed = false;
+    let mut ci_watch = None;
     if !checks.review_assignment && runtime.is_some() {
         match maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
-            Ok(arm_failed) => ci_watch_arm_failed = arm_failed,
+            Ok(outcome) => ci_watch = outcome,
             Err(e) => return e,
         }
     }
@@ -598,17 +598,27 @@ pub(crate) fn handle_delegate_task(
     };
     let result = deliver_delegate(&ctx, runtime);
     let mut result = track_delegate_success(&ctx, result);
-    if ci_watch_arm_failed && is_ok_result(&result) {
+    if let Some(watch) = ci_watch {
+        let degraded = !watch.armed && is_ok_result(&result);
         if let Some(obj) = result.as_object_mut() {
-            obj.insert("degraded".into(), json!(true));
             obj.insert(
-                "warning".into(),
+                "ci_watch".into(),
                 json!({
-                    "code": "ci_watch_arm_failed",
-                    "remediation": "CI watch could not be armed for this dispatch; \
-                        run `ci action=watch` manually to enable CI-ready notifications",
+                    "armed": watch.armed,
+                    "next_after_ci": watch.next_after_ci,
                 }),
             );
+            if degraded {
+                obj.insert("degraded".into(), json!(true));
+                obj.insert(
+                    "warning".into(),
+                    json!({
+                        "code": "ci_watch_arm_failed",
+                        "remediation": "CI watch could not be armed for this dispatch; \
+                        run `ci action=watch` manually to enable CI-ready notifications",
+                    }),
+                );
+            }
         }
     }
     result

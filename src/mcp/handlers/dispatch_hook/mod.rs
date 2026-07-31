@@ -46,6 +46,20 @@ pub struct DispatchOutcome {
     /// `true` when the post-bind ci-watch arm failed (F7). The primary
     /// dispatch succeeded; callers surface a degraded warning.
     pub ci_watch_arm_failed: bool,
+    /// The truthful result of an attempted dispatch-time ci-watch arm. `None`
+    /// means that no watch was attempted (for example `bind:false` or an
+    /// unresolved repository), while `Some` preserves the normalized chain
+    /// targets echoed by the typed send response.
+    pub ci_watch: Option<CiWatchOutcome>,
+}
+
+/// Result of an attempted dispatch-time ci-watch arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiWatchOutcome {
+    /// Whether the watch sidecar was armed successfully.
+    pub armed: bool,
+    /// The normalized chain targets passed to the watch arm.
+    pub next_after_ci: Vec<String>,
 }
 
 /// #781 Piece 7: structured error. The string-only `Result<_, String>`
@@ -661,6 +675,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1). The
     // arming body lives in `auto_watch.rs` (file-size split).
     let mut ci_watch_arm_failed = false;
+    let mut ci_watch = None;
     if arm_ci_watch {
         if let Some(r) = resolved_repo {
             ci_watch_arm_failed = auto_watch::arm(
@@ -672,6 +687,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 review_class,
                 task_id,
             );
+            ci_watch = Some(CiWatchOutcome {
+                armed: !ci_watch_arm_failed,
+                next_after_ci: next_after_ci.to_vec(),
+            });
         }
     }
 
@@ -680,6 +699,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         auto_created_branch,
         fetch_attempted,
         ci_watch_arm_failed,
+        ci_watch,
     })
 }
 
