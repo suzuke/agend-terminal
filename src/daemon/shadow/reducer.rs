@@ -82,6 +82,8 @@ pub enum ObservedState {
     /// Blocked awaiting a human decision — the proxy-invisible state.
     WaitingForUser,
     RateLimited,
+    /// A durable provider quota wall, distinct from a retryable throttle.
+    UsageLimit,
 }
 
 impl ObservedState {
@@ -170,6 +172,10 @@ pub struct AgentRuntime {
     /// Epoch-ms of the newest `RateLimited` evidence — bounds `rate_limit_active` to the observer
     /// freshness window (a long-silent latch expires → screen baseline takes over, as elsewhere).
     last_rate_limit_evidence_ms: u64,
+    /// A durable provider quota wall. Cleared only by genuinely newer lifecycle
+    /// progress, never by time or accounting-only evidence.
+    usage_limit_active: bool,
+    usage_limit_at_ms: u64,
     /// Newest real-time OBSERVER-plane evidence timestamp (`Hook` for claude, `Stream` for
     /// codex) — drives the freshness fallback. #2413 Phase D generalized this from Hook-only
     /// so the codex rollout (`Stream`) plane gets parity; claude has ONLY `Hook`, so its
@@ -215,17 +221,7 @@ impl AgentRuntime {
         // lifecycle/progress evidence (turn/tool/responding/idle/approval) is a NEWER recovery
         // signal that supersedes it. `TokenUsage` is accounting-only (no lifecycle meaning) and
         // must NOT count as recovery.
-        if !matches!(
-            ev.kind,
-            EvidenceKind::RateLimited { .. } | EvidenceKind::TokenUsage { .. }
-        ) {
-            self.rate_limit_active = false;
-        }
-        // #2470 (r6 round-3): track REAL-PROGRESS freshness separately from `last_observer_ms`.
-        // Only a genuine lifecycle/progress signal advances it — NOT `TokenUsage` (accounting,
-        // which would otherwise prop `observer_fresh` and mis-clear a still-rate-limited agent
-        // after the latch expires) and NOT `RateLimited` (the state we reconcile against).
-        if matches!(
+        let is_progress = matches!(
             ev.kind,
             EvidenceKind::TurnStarted
                 | EvidenceKind::ToolStarted { .. }
@@ -233,8 +229,22 @@ impl AgentRuntime {
                 | EvidenceKind::Responding
                 | EvidenceKind::PromptReady
                 | EvidenceKind::TurnEnded { .. }
+        );
+        if !matches!(
+            ev.kind,
+            EvidenceKind::RateLimited { .. } | EvidenceKind::TokenUsage { .. }
         ) {
-            self.last_progress_ms = ev.at_ms;
+            self.rate_limit_active = false;
+        }
+        if is_progress && self.usage_limit_active && ev.at_ms > self.usage_limit_at_ms {
+            self.usage_limit_active = false;
+        }
+        // #2470 (r6 round-3): track REAL-PROGRESS freshness separately from `last_observer_ms`.
+        // Only a genuine lifecycle/progress signal advances it — NOT `TokenUsage` (accounting,
+        // which would otherwise prop `observer_fresh` and mis-clear a still-rate-limited agent
+        // after the latch expires) and NOT `RateLimited` (the state we reconcile against).
+        if is_progress {
+            self.last_progress_ms = self.last_progress_ms.max(ev.at_ms);
         }
         match &ev.kind {
             EvidenceKind::TurnStarted => {
@@ -276,7 +286,14 @@ impl AgentRuntime {
                 self.rate_limit_active = true;
                 self.last_rate_limit_evidence_ms = ev.at_ms;
             }
-            EvidenceKind::UsageLimit => {}
+            EvidenceKind::UsageLimit => {
+                // A rewound/replayed session file must not resurrect an older
+                // quota wall after newer progress has already proved recovery.
+                if ev.at_ms > self.last_progress_ms {
+                    self.usage_limit_active = true;
+                    self.usage_limit_at_ms = self.usage_limit_at_ms.max(ev.at_ms);
+                }
+            }
             EvidenceKind::Responding => {
                 self.last_responding_ms = ev.at_ms;
                 if !self.episode_open {
@@ -369,6 +386,17 @@ impl AgentRuntime {
         // baseline wins downstream. (#2413 Phase D: generalized from Hook-only to {Hook|Stream}.)
         let observer_fresh = now_ms.saturating_sub(self.last_observer_ms) <= HOOK_FRESHNESS_MS
             && self.last_observer_ms > 0;
+
+        // A structured Grok quota wall is durable and outranks the raw screen
+        // heuristic. It is deliberately distinct from the retryable rate-limit
+        // arm below, so raw Idle cannot make an exhausted account look healthy.
+        if self.usage_limit_active {
+            return (
+                ObservedState::UsageLimit,
+                self.last_observer_authority.unwrap_or(Authority::Stream),
+                Confidence::Strong,
+            );
+        }
 
         // (P1) Rate-limited: a HOOK-confirmed retry window still open, or the screen says so —
         // EXCEPT a STALE ServerRateLimit banner the agent has already moved past. #2470:

@@ -18,7 +18,7 @@
 //!   then `start_owner_stream_observers(…, &OwnerMonitoringStarted, …)` → `OwnerServicesStarted`.
 //!   The phase-2 `&OwnerMonitoringStarted` parameter makes "monitoring runs before stream
 //!   observers" a COMPILE dependency (you cannot call phase 2 without phase 1's token).
-//! - the five low-level spawns require a private `OwnerServicePermit`, so a host-body
+//! - the six low-level spawns require a private `OwnerServicePermit`, so a host-body
 //!   direct spawn cannot compile (structural I4 — no host-local copy).
 //! - `OwnerServicesStarted` is retained by each owner host (app: held by the
 //!   owned-only `OwnedMaintenanceCycle`; daemon: held in `TickKeepalive`), so a host
@@ -42,7 +42,7 @@ pub(crate) enum OwnerRole {
     Attached,
 }
 
-/// Capability token gating the five owner-service spawns. The single field is
+/// Capability token gating the six owner-service spawns. The single field is
 /// PRIVATE to this module, so only `owner_services` code can mint one: other
 /// modules may name `&OwnerServicePermit` in a signature but cannot construct it,
 /// which makes a host-body direct spawn fail to compile (structural I4 — the
@@ -73,11 +73,12 @@ pub(crate) struct OwnerMonitoringStarters<'a> {
     pub api_activity_probe: &'a dyn Fn(&OwnerServicePermit, &AgentRegistry),
 }
 
-/// Injected phase-2 starters. Three REQUIRED fields (I1 completeness for phase 2).
+/// Injected phase-2 starters. Four REQUIRED fields (I1 completeness for phase 2).
 pub(crate) struct OwnerStreamStarters<'a> {
     pub rollout: &'a dyn Fn(&OwnerServicePermit, &Path, &AgentRegistry),
     pub opencode: &'a dyn Fn(&OwnerServicePermit, &Path, &AgentRegistry),
     pub kiro: &'a dyn Fn(&OwnerServicePermit, &Path, &AgentRegistry),
+    pub grok: &'a dyn Fn(&OwnerServicePermit, &Path, &AgentRegistry),
 }
 
 impl OwnerMonitoringStarters<'static> {
@@ -98,6 +99,7 @@ impl OwnerStreamStarters<'static> {
             rollout: &real_rollout,
             opencode: &real_opencode,
             kiro: &real_kiro,
+            grok: &real_grok,
         }
     }
 }
@@ -128,6 +130,11 @@ fn real_kiro(permit: &OwnerServicePermit, home: &Path, registry: &AgentRegistry)
     crate::daemon::shadow::kiro::spawn(permit, Arc::clone(registry), home.to_path_buf());
 }
 
+/// Read-only Grok structured-session observer (`~/.grok/sessions/.../updates.jsonl`).
+fn real_grok(permit: &OwnerServicePermit, home: &Path, registry: &AgentRegistry) {
+    crate::daemon::shadow::grok::spawn(permit, Arc::clone(registry), home.to_path_buf());
+}
+
 /// Phase 1: owner monitoring services (`instance_monitor` + `api_activity_probe`).
 /// `Owned` starts them via the injected starters; `Attached` starts none. Returns
 /// the `OwnerMonitoringStarted` token phase 2 requires. No-op / no threads under
@@ -146,7 +153,7 @@ pub(crate) fn start_owner_monitoring(
     OwnerMonitoringStarted(())
 }
 
-/// Phase 2: owner Shadow-Observer stream planes (rollout + opencode + kiro).
+/// Phase 2: owner Shadow-Observer stream planes (rollout + opencode + kiro + grok).
 /// Requires `&OwnerMonitoringStarted` so it cannot be called before phase 1
 /// (compile-enforced ordering). `Owned` starts them; `Attached` starts none.
 /// Returns the final `OwnerServicesStarted` witness. Each observer is itself a
@@ -165,6 +172,7 @@ pub(crate) fn start_owner_stream_observers(
         (starters.rollout)(&permit, home, registry);
         (starters.opencode)(&permit, home, registry);
         (starters.kiro)(&permit, home, registry);
+        (starters.grok)(&permit, home, registry);
     }
     OwnerServicesStarted(())
 }
@@ -198,6 +206,7 @@ mod tests {
             rollout: &|_p, _h, _r| log.borrow_mut().push("rollout"),
             opencode: &|_p, _h, _r| log.borrow_mut().push("opencode"),
             kiro: &|_p, _h, _r| log.borrow_mut().push("kiro"),
+            grok: &|_p, _h, _r| log.borrow_mut().push("grok"),
         };
         let mon = start_owner_monitoring(role, tmp(), &reg, &monitoring);
         let _services = start_owner_stream_observers(role, &mon, tmp(), &reg, &stream);
@@ -205,13 +214,13 @@ mod tests {
         started
     }
 
-    /// I1 completeness + PHASE ORDER: owned mode starts exactly the five owner
-    /// services, monitoring pair BEFORE stream trio, in this exact order.
+    /// I1 completeness + PHASE ORDER: owned mode starts exactly the six owner
+    /// services, monitoring pair BEFORE stream observers, in this exact order.
     /// Reverse-mutation: omitting/reordering a starter, or a stub that starts
     /// nothing, turns this RED. (Swapping the two phase CALLS won't even compile —
     /// phase 2 requires the phase-1 token.)
     #[test]
-    fn owned_two_phases_start_all_five_in_order() {
+    fn owned_two_phases_start_all_six_in_order() {
         assert_eq!(
             run_both_phases(OwnerRole::Owned),
             [
@@ -219,9 +228,10 @@ mod tests {
                 "api_activity_probe",
                 "rollout",
                 "opencode",
-                "kiro"
+                "kiro",
+                "grok"
             ],
-            "owned mode must start exactly the five owner services, monitoring before stream"
+            "owned mode must start exactly the six owner services, monitoring before stream"
         );
     }
 

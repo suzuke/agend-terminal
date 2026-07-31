@@ -82,6 +82,7 @@ fn observed_to_agent_state(state: ObservedState) -> Option<AgentState> {
         | ObservedState::Active => AgentState::Active,
         ObservedState::WaitingForUser => AgentState::AwaitingOperator,
         ObservedState::RateLimited => AgentState::RateLimit,
+        ObservedState::UsageLimit => AgentState::UsageLimit,
         ObservedState::Idle => return None,
     })
 }
@@ -444,6 +445,10 @@ mod tests {
         assert_eq!(
             observed_to_agent_state(ObservedState::RateLimited),
             Some(AgentState::RateLimit)
+        );
+        assert_eq!(
+            observed_to_agent_state(ObservedState::UsageLimit),
+            Some(AgentState::UsageLimit)
         );
         assert_eq!(observed_to_agent_state(ObservedState::Idle), None);
     }

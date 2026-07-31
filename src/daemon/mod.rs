@@ -2906,6 +2906,7 @@ mod tests {
             rollout: &|_, _, _| {},
             opencode: &|_, _, _| {},
             kiro: &|_, _, _| {},
+            grok: &|_, _, _| {},
         };
         let phase_one = start_owner_monitoring(
             OwnerRole::Owned,
