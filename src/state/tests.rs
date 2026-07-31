@@ -800,15 +800,17 @@ Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts";
 }
 
 #[test]
-fn grok_02117_idle_screen_fires_idle() {
-    // REAL Grok 0.2.117 resting chrome: no busy markers, and the exact
-    // `Shift+Tab:mode │ Ctrl+.:shortcuts` footer adjacency is the idle anchor.
-    // The permanent `always-approve` footer and bare `❯` remain non-signals.
+fn grok_idle_screen_fires_idle() {
+    // REAL grok 0.2.93 idle capture (same soak): a completed turn at rest — no
+    // busy chrome. Idle keys on idle-associated anchors (`Turn completed in …` /
+    // `Space:prompt` / `Enter:open`), NOT the permanent `always-approve` footer
+    // (removed as an Idle marker, N1) nor the bare `❯` (present during busy too).
     let patterns = StatePatterns::for_backend(&Backend::Grok);
     let idle = "已處理 gapfix-dev3 的純推理題：
+Turn completed in 14s.
 │ ❯ Build anything                                     │
 ╰──────────── Grok 4.5 (high) · always-approve ─╯
-Shift+Tab:mode │ Ctrl+.:shortcuts";
+Space:prompt  │  Enter:open  │  Ctrl+e:expand thinking  │  Ctrl+.:shortcuts";
     assert_eq!(
         patterns.detect(idle),
         Some(AgentState::Idle),
@@ -861,6 +863,10 @@ const GROK_02117_RESTING: &str = concat!(
     "╰──────────── Grok 4.5 (high) · always-approve ─╯\n",
     "Shift+Tab:mode │ Ctrl+.:shortcuts"
 );
+const GROK_02117_RESTING_SPACED: &str = concat!(
+    "╰──────────── Grok 4.5 (high) · always-approve ─╯\n",
+    "  Shift+Tab:mode  │  Ctrl+.:shortcuts  "
+);
 const GROK_02117_QUEUE: &str = concat!(
     "╰──────────── Grok 4.5 (high) · always-approve ─╯\n",
     "Shift+Tab:mode │ Ctrl+;:queue"
@@ -874,6 +880,15 @@ const GROK_02117_WAITING: &str = concat!(
 fn grok_02117_resting_footer_is_idle() {
     let patterns = StatePatterns::for_backend(&Backend::Grok);
     assert_eq!(patterns.detect(GROK_02117_RESTING), Some(AgentState::Idle));
+}
+
+#[test]
+fn grok_02117_resting_footer_allows_horizontal_spacing() {
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    assert_eq!(
+        patterns.detect(GROK_02117_RESTING_SPACED),
+        Some(AgentState::Idle)
+    );
 }
 
 #[test]

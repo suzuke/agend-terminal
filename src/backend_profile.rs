@@ -126,11 +126,12 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
     }
 }
 
-/// Grok Build CLI — detection profile. Active/Idle chrome is calibrated against
-/// the Grok 0.2.117 rendered footer. Patterns stay deliberately thin: dispatch
-/// ready/idle/active + the project-trust modal. Finer states (rate-limit, auth)
-/// have NO reliable screen signature and are deferred to the structured-log
-/// detector follow-up (`~/.grok/logs/unified.jsonl`), not screen regex.
+/// Grok Build CLI — detection profile. Active/Idle chrome includes the verified
+/// 0.2.93 markers plus the 0.2.117 rendered footer. Patterns stay deliberately
+/// thin: dispatch ready/idle/active + the project-trust modal. Finer states
+/// (rate-limit, auth) have NO reliable screen signature and are deferred to the
+/// structured-log detector follow-up (`~/.grok/logs/unified.jsonl`), not screen
+/// regex.
 fn grok_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
@@ -148,13 +149,19 @@ fn grok_profile() -> BackendProfile {
                 AgentState::Active,
                 r"\[stop\]|Ctrl\+c:cancel|Esc:cancel|Ctrl\+;:queue",
             ),
-            // Idle / ready chrome. Grok 0.2.117's resting footer is an exact,
-            // line-anchored adjacency; prefixed or quoted prose must not count.
-            // Deliberately NOT `always-approve` (a permanent footer mode
-            // indicator with zero state semantics) nor a bare `❯`.
+            // Legacy 0.2.93 idle / ready chrome. Keep these verified markers
+            // while adding the 0.2.117 footer below.
             (
                 AgentState::Idle,
-                r"(?m)^Shift\+Tab:mode │ Ctrl\+\.:shortcuts$",
+                r"Turn completed in \d|Space:prompt|Enter:open",
+            ),
+            // 0.2.117 resting footer: exact line-anchored adjacency, with only
+            // horizontal whitespace flexible around the separator and edges.
+            // Prefixed or quoted prose, and a queue segment between the hints,
+            // must not count. Deliberately NOT `always-approve` nor bare `❯`.
+            (
+                AgentState::Idle,
+                r"(?m)^[ \t]*Shift\+Tab:mode[ \t]*│[ \t]*Ctrl\+\.:shortcuts[ \t]*$",
             ),
         ],
         behavioral: BehavioralConfig {
