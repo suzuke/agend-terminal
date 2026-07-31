@@ -245,7 +245,7 @@ assert_cmd = "2.0"
 predicates = "3.1"
 insta = "1.39"
 proptest = "1.4"
-serial_test = "3"
+serial_test = "4"
 # Test-only reusable loopback listener for harness port-reuse regression coverage.
 socket2 = "0.6"
 # Used only for asserting that codex_trust_directory writes syntactically
