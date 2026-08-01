@@ -3283,6 +3283,216 @@ fn typed_review_params(assignment_id: uuid::Uuid, verdict: &str, text_token: &st
     })
 }
 
+/// S1 smoke regression: after a rejected review is reissued under a replacement
+/// task, the disposable review worktree still carries the predecessor task id.
+/// A validated receipt for the replacement must repair that typed identity before
+/// the ordinary exact-binding completion guard runs; the guard itself stays strict.
+#[test]
+fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1() {
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn seed_claimed_review_task(
+        home: &std::path::Path,
+        task_id: &str,
+        reviewer: &str,
+        subject_branch: &str,
+    ) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let tid = TaskId(task_id.into());
+        crate::task_events::append_batch(
+            home,
+            &InstanceName::from("test:seed"),
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "review replacement assignment".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some(subject_branch.into()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: Vec::new(),
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: tid,
+                    by: InstanceName::from(reviewer),
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    use crate::daemon::pr_state::{self, ReviewClass};
+    use crate::review_receipt::ReviewSlot;
+
+    let home = tmp_home("s1-review-reissue-binding-task");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+
+    let repo = home.join("review-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "user.name", "test"]);
+    std::fs::write(repo.join("README"), "fixture\n").unwrap();
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-m", "fixture"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    git(&repo, &["switch", "-c", "review/pr-reissue"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let subject_branch = "fix/reissue";
+    let old_task = "t-review-reissue-old";
+    let new_task = "t-review-reissue-new";
+    seed_claimed_review_task(&home, old_task, "typed-reviewer", subject_branch);
+    seed_claimed_review_task(&home, new_task, "typed-reviewer", subject_branch);
+    pr_state::record_ci_result(
+        &home,
+        "owner/repo",
+        subject_branch,
+        &head,
+        pr_state::CiConclusion::Green,
+        vec!["fixup-lead".into()],
+        ReviewClass::Single,
+    );
+    pr_state::with_pr_state(&home, "owner/repo", subject_branch, |state| {
+        state.pr_number = 3160;
+    })
+    .unwrap();
+
+    let old_assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        subject_branch,
+        "typed-reviewer",
+        reviewer_id,
+        3160,
+        &head,
+        ReviewSlot::Primary,
+        "fixup-lead",
+        old_task,
+        ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review exact head",
+        None,
+        None,
+        "2026-08-01T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &old_assignment).unwrap();
+    crate::binding::bind_full_with_provenance(
+        &home,
+        "typed-reviewer",
+        old_task,
+        "review/pr-reissue",
+        &repo,
+        &repo,
+        false,
+        Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
+            provisioned_head: &head,
+        }),
+    )
+    .unwrap();
+    crate::binding::try_augment_review_lease(
+        &home,
+        "typed-reviewer",
+        old_task,
+        "review/pr-reissue",
+        &repo,
+    );
+    assert_eq!(
+        crate::binding::read(&home, "typed-reviewer").unwrap()["review_assignment_id"],
+        old_assignment.assignment_id.to_string()
+    );
+
+    let new_assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        subject_branch,
+        "typed-reviewer",
+        reviewer_id,
+        3160,
+        &head,
+        ReviewSlot::Primary,
+        "fixup-lead",
+        new_task,
+        ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review corrected head",
+        None,
+        None,
+        "2026-08-01T00:00:01Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &new_assignment).unwrap();
+    assert_eq!(
+        task_status_of(&home, old_task),
+        Some(crate::task_events::TaskStatus::Cancelled),
+        "replacement authority must retire the predecessor task"
+    );
+    assert_eq!(
+        crate::binding::read(&home, "typed-reviewer").unwrap()["task_id"],
+        old_task,
+        "precondition: the already-checked-out review binding still names the predecessor"
+    );
+
+    let result = handle_send(
+        &json!({
+            "from": "typed-reviewer",
+            "target": "fixup-lead",
+            "text": crate::mcp::handlers::build_report_text(
+                "VERIFIED — corrected review\n\n### Evidence\nran: cargo test → passed",
+                Some(new_task),
+                None,
+            ),
+            "kind": "report",
+            "correlation_id": new_task,
+            "report_purpose": "code_review",
+            "code_review": {
+                "assignment_id": new_assignment.assignment_id,
+                "verdict": "verified",
+                "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }),
+        &test_ctx(&home),
+    );
+    assert_eq!(
+        result["ok"], true,
+        "validated review must deliver: {result}"
+    );
+    assert_eq!(
+        task_status_of(&home, new_task),
+        Some(crate::task_events::TaskStatus::Done),
+        "the replacement review task must close on its exact validated receipt"
+    );
+    let binding = crate::binding::read(&home, "typed-reviewer").unwrap();
+    assert_eq!(binding["task_id"], new_task);
+    assert_eq!(
+        binding["review_assignment_id"],
+        new_assignment.assignment_id.to_string()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Positive production entry plus A2/exact-once replay: the authenticated API
 /// sink assigns the message/source/receipt identities, applies only the exact
 /// assignment subject, and a replay of that durable receipt is inert.
