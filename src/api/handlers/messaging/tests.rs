@@ -3361,6 +3361,7 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
             "https://github.com/owner/repo.git",
         ],
     );
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
     git(&repo, &["switch", "-c", "review/pr-reissue"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
 

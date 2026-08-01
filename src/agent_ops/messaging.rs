@@ -753,8 +753,21 @@ fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox
         summary.verdict,
         crate::review_receipt::ReviewVerdict::Verified
     ) {
-        let _ = crate::tasks::auto_close::auto_close_on_validated_review(
+        if let Err(error) =
+            crate::binding::retarget_disposable_review_binding_for_receipt(home, summary)
+        {
+            tracing::warn!(%reporter, %task_id, %error,
+                "validated review task binding repair refused; task auto-close stays fail-closed");
+            return;
+        }
+        match crate::tasks::auto_close::auto_close_on_validated_review(
             home, task_id, reporter, &msg.text,
-        );
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(%reporter, %task_id,
+                "validated review receipt did not close its exact task"),
+            Err(error) => tracing::warn!(%reporter, %task_id, %error,
+                "validated review task auto-close failed"),
+        }
     }
 }
