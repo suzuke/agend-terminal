@@ -237,6 +237,11 @@ fn txn_phase_order_and_worktree_existence() {
 fn txn_journal_persists_and_loads() {
     let home = tmp_home("txn-persist");
     let mangled = "agent-co-_src";
+    assert_eq!(
+        super::checkout_txn::journal_key(&home, mangled),
+        mangled,
+        "short legacy journal identities remain compatible"
+    );
     let mut j = sample_journal();
     j.advance(Phase::WorktreeAdded);
     j.save(&home, mangled).expect("save");
@@ -248,6 +253,48 @@ fn txn_journal_persists_and_loads() {
     assert!(
         Journal::load(&home, mangled).is_none(),
         "clear removes journal"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Long Windows-style source identities use a bounded durable directory key, while
+/// the journal remains readable/absent through the same save/load/clear lifecycle.
+#[test]
+fn txn_long_journal_identity_is_bounded_and_round_trips() {
+    let home = tmp_home("txn-long");
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    assert_ne!(key, mangled, "oversized legacy identity must be bounded");
+    assert!(key.starts_with("journal-"), "bounded key is typed: {key}");
+    let path = super::checkout_txn::journal_path(&home, &key);
+    assert!(
+        path.to_string_lossy().chars().count() < 240,
+        "bounded journal path must remain short: {}",
+        path.display()
+    );
+
+    let mut journal = sample_journal();
+    journal.advance(Phase::WorktreeAdded);
+    journal.save(&home, &key).expect("bounded journal saves");
+    let loaded = Journal::load(&home, &key).expect("bounded journal loads");
+    assert_eq!(loaded.nonce, journal.nonce);
+    Journal::clear(&home, &key);
+    assert!(Journal::load(&home, &key).is_none(), "clear leaves absent");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Bounding the journal identity must not turn an existing unreadable record into
+/// Absent: recovery remains fail-closed for the same long identity.
+#[test]
+fn txn_long_journal_identity_unreadable_still_fails_closed() {
+    let home = tmp_home("txn-long-unread");
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, &key)).unwrap();
+    let r = recover_stale(&home, &key, &home.join("wt"), "/src", fixed_now(), || true);
+    assert!(
+        r.is_err(),
+        "bounded but unreadable journal must still fail closed: {r:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -12,7 +12,8 @@
 //! - **Committed is the durable linearization point**: the caller returns
 //!   success ONLY after a `Committed` journal is durably written
 //!   ([`store::atomic_write`]); a write failure aborts into rollback.
-//! - The journal (keyed by the `<instance>-<source>` mangled name) and its
+//! - The journal (keyed by a bounded identity derived from the `<instance>-<source>`
+//!   mangled name) and its
 //!   provisioning lock (keyed by the NORMALIZED target PATH, so any consumer —
 //!   checkout/bind/release/GC — derives the same domain from the path alone) live
 //!   OUTSIDE the worktree in a daemon-owned area — so a `remove --force` of the
@@ -248,9 +249,29 @@ pub(crate) fn txn_root(home: &Path) -> PathBuf {
     home.join("checkout_txn")
 }
 
-/// Journal file for `mangled` (the `<instance>-<source>` worktree key).
-pub(crate) fn journal_path(home: &Path, mangled: &str) -> PathBuf {
-    txn_root(home).join(mangled).join("journal.json")
+/// Keep legacy human-readable journal directories while their full path is safely
+/// bounded. Oversized identities use a stable SHA-256 directory key so a long
+/// Windows temp/home path cannot make the journal itself exceed filesystem limits.
+const LEGACY_JOURNAL_PATH_MAX: usize = 240;
+
+/// Resolve the durable directory key for a worktree's `<instance>-<source>` name.
+/// Existing short identities retain their legacy path for compatibility; only
+/// identities whose legacy journal path is too long move to the bounded key.
+pub(crate) fn journal_key(home: &Path, mangled: &str) -> String {
+    let legacy = txn_root(home).join(mangled).join("journal.json");
+    if legacy.to_string_lossy().chars().count() <= LEGACY_JOURNAL_PATH_MAX {
+        return mangled.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    format!(
+        "journal-{}",
+        hex::encode(Sha256::digest(mangled.as_bytes()))
+    )
+}
+
+/// Journal file for a resolved durable directory key.
+pub(crate) fn journal_path(home: &Path, journal_key: &str) -> PathBuf {
+    txn_root(home).join(journal_key).join("journal.json")
 }
 
 /// #2755 R3 (root + independent review): QUARANTINE a corrupt journal instead of
