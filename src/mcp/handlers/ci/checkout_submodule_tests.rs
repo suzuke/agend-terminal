@@ -305,6 +305,18 @@ fn txn_long_journal_identity_is_bounded_and_round_trips() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Pin the durable full-digest encoding against an independently derived vector.
+#[test]
+fn txn_journal_key_matches_sha256_base64url_vector() {
+    let home = tmp_home("txn-key-vector");
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    assert_eq!(
+        super::checkout_txn::journal_key(&home, &mangled),
+        "journal-yPqPYt6MXKHcDOVFX3bn_0W8TzyiYLu8x6GFXdm3d2I"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// The bounded key must fit a normal deep Windows CI home while retaining a
 /// collision-resistant identity for an oversized legacy worktree name.
 #[test]
