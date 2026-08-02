@@ -605,15 +605,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         branch,
                     );
                 }
-                if checkout_purpose.is_none() {
-                    crate::binding::try_augment_review_lease(
-                        home,
-                        instance_name,
-                        task_id,
-                        branch,
-                        &source_canonical,
-                    );
-                }
+                crate::binding::try_augment_review_lease(
+                    home,
+                    instance_name,
+                    task_id,
+                    branch,
+                    &source_canonical,
+                );
                 bound_fingerprint =
                     match crate::binding::snapshot_guarded_binding(home, instance_name) {
                         Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
