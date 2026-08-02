@@ -3,7 +3,7 @@
 //! at its file_size ceiling) so the security boundary is isolated + reviewable.
 //!
 //! A `source` is valid ONLY as:
-//!   1. an ABSOLUTE path (`/…`) or a `~`-relative home path, OR
+//!   1. an ABSOLUTE platform-native path or a `~`-relative home path, OR
 //!   2. a known AGENT NAME, resolved to that agent's `working_directory`
 //!      (the #1447 peer-workdir-by-name form).
 //!
@@ -34,7 +34,7 @@ pub(super) fn resolve_checkout_source_path(
     home: &Path,
     source: &str,
 ) -> Result<(String, PathBuf), Value> {
-    let source_path = if source.starts_with('/') || source.starts_with('~') {
+    let source_path = if Path::new(source).is_absolute() || source.starts_with('~') {
         source
             .strip_prefix("~/")
             .map(|rest| format!("{}/{rest}", crate::user_home_dir().display()))
@@ -171,13 +171,11 @@ mod tests {
     /// to (pre-canonical string, canonical PathBuf) — the fix only rejects the
     /// non-absolute agent-name MISS, not absolute callers.
     ///
-    /// `#[cfg(unix)]`: the absolute arm is `/`-prefixed (Unix semantics); a Windows
-    /// drive path (`C:`-rooted) is not `/`-absolute, so the helper routes it through
-    /// the agent-name arm — the `/`-absolute path is a Unix-only contract. The input
-    /// is canonicalized FIRST so symlink resolution on CI (e.g. macOS `/var` →
-    /// `/private/var`) can't skew a literal-string comparison (cf. #2226/#2231
-    /// cross-platform test fragility — compare canonicalized forms, not raw strings).
-    #[cfg(unix)]
+    /// The input is canonicalized FIRST so symlink resolution on CI (e.g. macOS
+    /// `/var` → `/private/var`) can't skew a literal-string comparison (cf.
+    /// #2226/#2231 cross-platform test fragility — compare canonicalized forms,
+    /// not raw strings).
+    #[cfg(any(unix, windows))]
     #[test]
     fn absolute_existing_path_still_resolves_2158() {
         let abs = std::env::temp_dir()
