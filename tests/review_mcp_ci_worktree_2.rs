@@ -81,28 +81,58 @@ fn mcp_ci_watch_handlers_hold_per_watch_flock_mcp_ci_worktree() {
     collect_rs(&src, &mut files);
     assert!(!files.is_empty(), "no src/*.rs files found");
 
-    // Locate the ci MCP handler module that owns the two RMW handlers.
-    let ci_watch = files
-        .iter()
-        .find(|p| p.ends_with(Path::new("mcp/handlers/ci/watch.rs")))
-        .cloned()
-        .expect("src/mcp/handlers/ci/watch.rs must exist");
-    let text = std::fs::read_to_string(&ci_watch).expect("read ci/watch.rs");
-
     // The two handlers that perform a read→mutate→atomic_write RMW on the watch
     // file. Each must serialize that window under the SAME flock the daemon-side
     // writers use (`crate::store::acquire_file_lock`).
+    //
+    // #3159: `handle_unwatch_ci` moved to the sibling `mcp/handlers/ci/unwatch.rs`
+    // when `watch.rs` hit the handler LOC ceiling, so the invariant no longer
+    // assumes a fixed file — it LOCATES each handler wherever it lives under
+    // `mcp/handlers/ci/`. That is strictly stronger than the old hard-coded path:
+    // a future move cannot silently take a handler out of this guard's scope.
     let targets = [
         ("fn handle_watch_ci", "handle_watch_ci"),
         ("fn handle_unwatch_ci", "handle_unwatch_ci"),
     ];
+    let ci_files: Vec<_> = files
+        .iter()
+        .filter(|p| {
+            let s = p.to_string_lossy().to_string();
+            // Production handlers only — test modules legitimately mention the
+            // handler names (same skip rule the file-size invariant uses).
+            s.contains("mcp/handlers/ci/")
+                && !p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("test"))
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !ci_files.is_empty(),
+        "no src/mcp/handlers/ci/*.rs files found"
+    );
 
     let mut unguarded = Vec::new();
     for (sig, label) in targets {
-        let body = fn_body_after(&text, sig);
+        let mut body = String::new();
+        let mut owner = String::new();
+        for path in &ci_files {
+            let text = std::fs::read_to_string(path).expect("read ci handler file");
+            let candidate = fn_body_after(&text, sig);
+            if !candidate.is_empty() {
+                assert!(
+                    body.is_empty(),
+                    "`{sig}` defined in BOTH {owner} and {} — ambiguous ownership",
+                    path.display()
+                );
+                owner = path.display().to_string();
+                body = candidate;
+            }
+        }
         assert!(
             !body.is_empty(),
-            "could not locate `{sig}` in ci/watch.rs — re-check signature drift"
+            "could not locate `{sig}` anywhere under src/mcp/handlers/ci/ — re-check signature drift"
         );
         // Sanity: this body really does an atomic_write RMW (so the guard is
         // load-bearing, not vacuously satisfied).
