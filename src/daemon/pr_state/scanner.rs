@@ -426,7 +426,7 @@ pub fn scan_and_emit_with(
                         release_after_unlock = Some((state.branch.clone(), "merge"));
                         let author = resolve_author(state);
                         let body = format!(
-                            "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
+                            "[pr-merged] {}@{} (head_sha {}, merged_at {})\n\n\
                              ⚠ Action checklist:\n\
                              1. `gh issue close` (if linked issue)\n\
                              2. `task action=done` (if correlation_id present)\n\
@@ -1054,10 +1054,13 @@ fn apply_gh_observations(
                     apply(
                         state,
                         Event::MergedObserved {
-                            // gh CLI doesn't return the merge commit hash
-                            // in `pr list`; use head_sha as best-effort
-                            // identifier. Operator can `gh pr view` for
-                            // the real commit hash.
+                            // #3162: this carries the PR HEAD, not the merge
+                            // commit — the `pr list` query deliberately does
+                            // not request `mergeCommit`, so no authoritative
+                            // OID is available here. The field name is kept
+                            // for on-disk/dedup-key compatibility; the
+                            // `[pr-merged]` body labels it `head_sha` so the
+                            // notice never claims an identity we never saw.
                             merge_commit: &state.head_sha.clone(),
                             merged_at: merged_at.to_string(),
                         },
@@ -1078,6 +1081,7 @@ fn apply_gh_observations(
                 apply(
                     state,
                     Event::MergedObserved {
+                        // #3162: PR head, not the merge commit — see above.
                         merge_commit: &state.head_sha.clone(),
                         merged_at: merged_at.to_string(),
                     },

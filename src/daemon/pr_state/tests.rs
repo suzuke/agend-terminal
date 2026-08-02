@@ -2123,6 +2123,61 @@ fn t10_merged_observation_fires_pr_merged_event() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// #3162: the `[pr-merged]` payload carries the PR HEAD — `gh pr list` is never
+/// asked for the authoritative merge commit — so the body must not present that
+/// head as a `merge_commit`. `MERGE_OID` is the identity the daemon does NOT
+/// have: asserting its absence pins the honesty boundary, so a future change
+/// that starts carrying the real merge commit has to update this test rather
+/// than silently re-label the same value. Terminal dedup is unchanged.
+#[test]
+fn pr_merged_payload_labels_head_not_merge_commit_3162() {
+    const HEAD_OID: &str = "1111111111111111111111111111111111111111";
+    const MERGE_OID: &str = "2222222222222222222222222222222222222222";
+
+    let mut s = new_state(HEAD_OID, ReviewClass::Single);
+    s.pr_author = String::new();
+    let home = home_with_state("merged-label-3162", s);
+    let merged_meta = GhPrMetadata {
+        number: 3162,
+        author_login: "dev".into(),
+        head_ref: "feat/test".into(),
+        is_cross_repository: false,
+        is_draft: false,
+        state: GhPrState::Merged,
+        merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
+    };
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()])]);
+
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    let msgs = crate::inbox::drain(&home, "dev");
+    assert_eq!(msgs.len(), 1, "one [pr-merged]");
+    let body = &msgs[0].text;
+    assert!(
+        body.contains(&format!("head_sha {}", &HEAD_OID[..8])),
+        "head must be surfaced under the honest label, got:\n{body}"
+    );
+    assert!(
+        !body.contains("merge_commit"),
+        "payload must not claim an authoritative merge commit, got:\n{body}"
+    );
+    assert!(
+        !body.contains(&MERGE_OID[..8]),
+        "payload cannot carry an identity the daemon never observed, got:\n{body}"
+    );
+
+    // Dedup is keyed independently of the label — still exactly once.
+    let poller2 = MockGhPoller::new(vec![Ok(vec![merged_meta])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller2);
+    assert!(
+        crate::inbox::drain(&home, "dev").is_empty(),
+        "terminal dedup must stay once-only"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// [C1 / #1842] §3.9: a merged PR is announced ONCE even across the
 /// scan-`remove` → lingering-CI-`_or_create` re-create loop. The recreated
 /// state file has `ready_emitted_for_sha = None` (the reset that drove the 8×
