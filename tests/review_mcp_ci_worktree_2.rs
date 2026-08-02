@@ -97,10 +97,17 @@ fn mcp_ci_watch_handlers_hold_per_watch_flock_mcp_ci_worktree() {
     let ci_files: Vec<_> = files
         .iter()
         .filter(|p| {
-            let s = p.to_string_lossy().to_string();
+            // Separator-agnostic: `collect_rs` builds paths with the platform
+            // separator (`src\mcp\handlers\ci\watch.rs` on Windows), so a raw
+            // string `contains("mcp/handlers/ci/")` matches nothing there.
+            // `Path::ends_with` compares COMPONENTS — the same idiom the
+            // sibling invariants use — and `ancestors()` keeps the "anywhere
+            // under the dir" scope.
+            //
             // Production handlers only — test modules legitimately mention the
             // handler names (same skip rule the file-size invariant uses).
-            s.contains("mcp/handlers/ci/")
+            p.ancestors()
+                .any(|a| a.ends_with(Path::new("mcp/handlers/ci")))
                 && !p
                     .file_name()
                     .and_then(|n| n.to_str())
