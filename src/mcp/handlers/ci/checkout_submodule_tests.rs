@@ -299,6 +299,42 @@ fn txn_long_journal_identity_unreadable_still_fails_closed() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A pre-existing oversized legacy directory is discovered and migrated rather
+/// than silently replaced by a fresh hash journal (Unix can still read this path;
+/// Windows uses the bounded-new-write path because the legacy path is too long).
+#[cfg(unix)]
+#[test]
+fn txn_long_legacy_journal_migrates_before_recovery() {
+    let home = tmp_home("txn-long-legacy");
+    let mut mangled = "agent-C_".to_string();
+    while super::checkout_txn::journal_path(&home, &mangled)
+        .to_string_lossy()
+        .len()
+        <= 240
+    {
+        mangled.push_str("source_");
+    }
+    assert!(
+        mangled.len() < 255,
+        "legacy directory component must fit: {mangled}"
+    );
+    let legacy_path = super::checkout_txn::journal_path(&home, &mangled);
+    let mut journal = sample_journal();
+    journal.advance(Phase::WorktreeAdded);
+    journal.save(&home, &mangled).expect("legacy journal saves");
+    let key =
+        super::checkout_txn::resolve_journal_key(&home, &mangled).expect("legacy journal migrates");
+    assert_ne!(key, mangled);
+    assert!(
+        !legacy_path.parent().unwrap().exists(),
+        "legacy path migrated"
+    );
+    let loaded = Journal::load(&home, &key).expect("migrated journal remains readable");
+    assert_eq!(loaded.nonce, journal.nonce);
+    Journal::clear(&home, &key);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A minimal on-disk record (pre-rollback fields absent) loads with defaults —
 /// forward/back compat via serde(default).
 #[test]

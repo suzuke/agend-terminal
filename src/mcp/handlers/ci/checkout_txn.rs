@@ -259,7 +259,7 @@ const LEGACY_JOURNAL_PATH_MAX: usize = 240;
 /// identities whose legacy journal path is too long move to the bounded key.
 pub(crate) fn journal_key(home: &Path, mangled: &str) -> String {
     let legacy = txn_root(home).join(mangled).join("journal.json");
-    if legacy.to_string_lossy().chars().count() <= LEGACY_JOURNAL_PATH_MAX {
+    if journal_path_length(&legacy) <= LEGACY_JOURNAL_PATH_MAX {
         return mangled.to_string();
     }
     use sha2::{Digest, Sha256};
@@ -267,6 +267,69 @@ pub(crate) fn journal_key(home: &Path, mangled: &str) -> String {
         "journal-{}",
         hex::encode(Sha256::digest(mangled.as_bytes()))
     )
+}
+
+/// Resolve and, when necessary, migrate an oversized legacy journal directory.
+/// This runs under the provisioning path lock: an existing legacy directory is
+/// never silently ignored in favor of a new hash key, and any discovery/migration
+/// uncertainty remains a fail-closed checkout error.
+pub(crate) fn resolve_journal_key(home: &Path, mangled: &str) -> Result<String, String> {
+    let key = journal_key(home, mangled);
+    if key == mangled {
+        return Ok(key);
+    }
+    let root = txn_root(home);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(key),
+        Err(e) => {
+            return Err(format!(
+                "checkout journal storage could not be inspected: {e}"
+            ))
+        }
+    };
+    let mut legacy_dir = None;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("checkout journal storage could not be inspected: {e}"))?;
+        if entry.file_name().to_str() == Some(mangled) {
+            legacy_dir = Some(entry.path());
+            break;
+        }
+    }
+    let Some(legacy_dir) = legacy_dir else {
+        return Ok(key);
+    };
+    if !std::fs::symlink_metadata(&legacy_dir)
+        .map_err(|e| format!("legacy checkout journal could not be inspected: {e}"))?
+        .is_dir()
+    {
+        return Err("legacy checkout journal identity is not a directory".into());
+    }
+    let bounded_dir = root.join(&key);
+    match std::fs::symlink_metadata(&bounded_dir) {
+        Ok(_) => return Err("legacy and bounded checkout journals both exist".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "bounded checkout journal could not be inspected: {e}"
+            ))
+        }
+    }
+    std::fs::rename(&legacy_dir, &bounded_dir)
+        .map_err(|e| format!("legacy checkout journal could not be migrated: {e}"))?;
+    Ok(key)
+}
+
+fn journal_path_length(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().encode_utf16().count()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().len()
+    }
 }
 
 /// Journal file for a resolved durable directory key.

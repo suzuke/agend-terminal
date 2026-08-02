@@ -181,7 +181,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string();
-    let journal_key = super::checkout_txn::journal_key(home, &mangled);
     let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
         Ok(g) => g,
         Err(e) => {
@@ -204,6 +203,16 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             "branch": branch,
         });
     }
+    let journal_key = match super::checkout_txn::resolve_journal_key(home, &mangled) {
+        Ok(key) => key,
+        Err(e) => {
+            return json!({
+                "error": redact_paths(&e),
+                "code": "stale_txn_rollback",
+                "branch": branch,
+            })
+        }
+    };
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path (removes a
     // stale worktree so a fresh add — or the reuse check below — sees clean state).
