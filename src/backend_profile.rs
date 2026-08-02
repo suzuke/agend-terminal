@@ -511,7 +511,7 @@ fn claudecode_profile() -> BackendProfile {
             ),
             (
                 AgentState::UsageLimit,
-                r"You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
+                r"⎿[ \t]+You've reached your Fable 5 limit\. Run /usage-credits to continue or switch models with /model\.|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
             ),
             (
                 // #2090 P2: the broad `context.*(full|limit)` arm is replaced by a
