@@ -283,6 +283,11 @@ fn txn_long_journal_identity_is_bounded_and_round_trips() {
     let key = super::checkout_txn::journal_key(&home, &mangled);
     assert_ne!(key, mangled, "oversized legacy identity must be bounded");
     assert!(key.starts_with("journal-"), "bounded key is typed: {key}");
+    assert_eq!(
+        key.len(),
+        "journal-".len() + 43,
+        "bounded key is genuinely short"
+    );
     let path = super::checkout_txn::journal_path(&home, &key);
     assert!(
         path.to_string_lossy().chars().count() < 240,
@@ -298,6 +303,34 @@ fn txn_long_journal_identity_is_bounded_and_round_trips() {
     Journal::clear(&home, &key);
     assert!(Journal::load(&home, &key).is_none(), "clear leaves absent");
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// The bounded key must fit a normal deep Windows CI home while retaining a
+/// collision-resistant identity for an oversized legacy worktree name.
+#[test]
+fn txn_long_journal_identity_fits_normal_deep_home() {
+    let base = tmp_home("txn-deep-normal");
+    let home = base.join("a".repeat(30)).join("b".repeat(30));
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    assert_eq!(key.len(), "journal-".len() + 43);
+    assert_ne!(key, mangled);
+    assert!(
+        super::checkout_txn::journal_path(&home, &key)
+            .to_string_lossy()
+            .chars()
+            .count()
+            <= 240,
+        "bounded key must fit a normal deep home: {}",
+        super::checkout_txn::journal_path(&home, &key).display()
+    );
+    let journal = sample_journal();
+    journal
+        .save(&home, &key)
+        .expect("short bounded journal saves");
+    assert!(Journal::load(&home, &key).is_some());
+    Journal::clear(&home, &key);
+    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Bounding the journal identity must not turn an existing unreadable record into

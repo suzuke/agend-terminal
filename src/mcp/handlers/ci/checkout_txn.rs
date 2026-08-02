@@ -250,9 +250,12 @@ pub(crate) fn txn_root(home: &Path) -> PathBuf {
 }
 
 /// Keep legacy human-readable journal directories while their full path is safely
-/// bounded. Oversized identities use a stable SHA-256 directory key so a long
-/// Windows temp/home path cannot make the journal itself exceed filesystem limits.
+/// bounded. Oversized identities use a stable URL-safe base64 encoding of the
+/// full SHA-256 digest (43 characters) so a long Windows temp/home path cannot
+/// make the journal itself exceed filesystem limits while retaining the full
+/// collision-resistant identity.
 const LEGACY_JOURNAL_PATH_MAX: usize = 240;
+const JOURNAL_KEY_PREFIX: &str = "journal-";
 
 /// Resolve the durable directory key for a worktree's `<instance>-<source>` name.
 /// Existing short identities retain their legacy path for compatibility; only
@@ -263,10 +266,25 @@ pub(crate) fn journal_key(home: &Path, mangled: &str) -> String {
         return mangled.to_string();
     }
     use sha2::{Digest, Sha256};
-    format!(
-        "journal-{}",
-        hex::encode(Sha256::digest(mangled.as_bytes()))
-    )
+    let digest = Sha256::digest(mangled.as_bytes());
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(43);
+    let mut buffer = 0u16;
+    let mut bits = 0u8;
+    for byte in digest {
+        buffer = (buffer << 8) | u16::from(byte);
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            encoded.push(alphabet[((buffer >> bits) & 0x3f) as usize] as char);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    if bits != 0 {
+        encoded.push(alphabet[((buffer << (6 - bits)) & 0x3f) as usize] as char);
+    }
+    debug_assert_eq!(encoded.len(), 43);
+    format!("{JOURNAL_KEY_PREFIX}{encoded}")
 }
 
 /// Resolve and, when necessary, migrate an oversized legacy journal directory.
