@@ -265,11 +265,12 @@ mod tests {
 
         let (source_path, canonical) =
             resolve_checkout_source_path(&home, "dev").expect("known agent name resolves");
+        let expected = dunce::canonicalize(&work).expect("canonical expected work");
+        #[cfg(windows)]
+        assert_eq!(source_path, expected.display().to_string());
+        #[cfg(not(windows))]
         assert_eq!(source_path, work.display().to_string());
-        assert_eq!(
-            canonical,
-            dunce::canonicalize(&work).expect("canonical work")
-        );
+        assert_eq!(canonical, expected);
 
         std::fs::remove_dir_all(&home).ok();
     }
