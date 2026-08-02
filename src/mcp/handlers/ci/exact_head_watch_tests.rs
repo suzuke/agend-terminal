@@ -572,7 +572,7 @@ fn notification_only_assignee_unsubscribes_without_erasing_co_subscribers_3159()
 /// whole-branch unwatch.
 #[test]
 fn exact_head_unwatch_present_but_malformed_never_falls_back_3159() {
-    for bad in [json!(""), json!(42), json!(true), json!(["x"])] {
+    for bad in [json!(null), json!(""), json!(42), json!(true), json!(["x"])] {
         let home = tmp_home("eh-unwatch-present-bad");
         arm_two(&home);
         let r = handle_unwatch_ci(
@@ -702,5 +702,73 @@ fn exact_head_unwatch_identity_mismatch_fails_closed_3159() {
         crate::daemon::ci_watch::watch_filename("suzuke/agend-terminal", "main"),
     );
     assert!(!generic.exists(), "no generic fallback mutation");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3159 correction: dropping the LAST subscriber of a notification_only watch
+/// must TOMBSTONE it (generic-path terminal rule) — otherwise a subscriberless
+/// watch stays poll-invalid while `exact_head_remaining` still counts it armed.
+#[test]
+fn notification_only_sole_assignee_removal_tombstones_3159() {
+    let home = tmp_home("eh-unwatch-sole");
+    seed_team(&home, "lead", "dev");
+    let task_id = "t-notif-sole";
+    crate::merge_receipt::persist(
+        &home,
+        &crate::merge_receipt::MergeReceipt {
+            repo: "suzuke/agend-terminal".into(),
+            merge_sha: SHA_A.into(),
+            task_id: task_id.into(),
+            task_assignee: "dev".into(),
+            merge_authority: "lead".into(),
+            pr_number: 11,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: (chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap())
+                .to_rfc3339(),
+        },
+    )
+    .unwrap();
+    let repo_dir = home.join("srcrepo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    crate::binding::bind_full(&home, "dev", task_id, "feat/x", &repo_dir, &repo_dir, false)
+        .unwrap();
+    let armed = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": "suzuke/agend-terminal",
+            "branch": "main",
+            "head_sha": SHA_A,
+            "task_id": task_id,
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert_eq!(armed["watching"].as_bool(), Some(true), "arm: {armed}");
+    assert_eq!(armed_exact_heads(&home), vec![SHA_A]);
+
+    // The assignee is the SOLE subscriber; removing itself must not leave a
+    // subscriberless zombie.
+    let r = handle_unwatch_ci(
+        &home,
+        &json!({"repository": "suzuke/agend-terminal", "branch": "main", "head_sha": SHA_A}),
+        "dev",
+    );
+    assert!(r.get("error").is_none(), "sole assignee unsubscribe: {r}");
+    assert_eq!(r["unsubscribed"].as_bool(), Some(true), "{r}");
+    assert_eq!(r["watching"].as_bool(), Some(false), "{r}");
+    assert_eq!(
+        r["disarmed"].as_bool(),
+        Some(true),
+        "last-subscriber removal must report an honest disarm: {r}"
+    );
+    assert_eq!(
+        r["exact_head_remaining"].as_u64(),
+        Some(0),
+        "tombstoned watch must not be counted as armed: {r}"
+    );
+    assert!(
+        armed_exact_heads(&home).is_empty(),
+        "no armed exact-head watch may remain"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

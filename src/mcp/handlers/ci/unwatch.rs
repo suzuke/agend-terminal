@@ -145,6 +145,17 @@ pub(super) fn unwatch_exact_head(
             .collect();
         watch["subscribers"] = json!(subscribers_json);
         watch["instance"] = json!(subscribers.first().cloned().unwrap_or_default());
+        // Terminal rule, mirroring the generic path: dropping the LAST
+        // subscriber leaves a watch the poller classifies Invalid
+        // (subscriberless) — an armed-looking zombie that `armed_exact_head_count`
+        // would keep counting. Tombstone it instead, so state and response agree.
+        // No collateral principal is affected: by construction nobody else is
+        // subscribed here.
+        let tombstoned = subscribers.is_empty();
+        if tombstoned {
+            watch["auto_arm_optout"] = json!(true);
+            watch["unwatched_at"] = json!(chrono::Utc::now().to_rfc3339());
+        }
         if let Err(e) = crate::store::atomic_write(
             &path,
             serde_json::to_string_pretty(&watch)
@@ -162,7 +173,7 @@ pub(super) fn unwatch_exact_head(
             "scope": "exact_head",
             "head_sha": sha,
             "watching": !subscribers.is_empty(),
-            "disarmed": false,
+            "disarmed": tombstoned,
             "unsubscribed": was_subscribed,
             "subscribers": subscribers,
             "exact_head_remaining": armed_exact_head_count(home, repo, branch),
@@ -207,17 +218,14 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
     let branch = args["branch"].as_str().unwrap_or("main");
     // #3159: an addressed exact-head disarm is a DIFFERENT key space; it never
     // touches — nor falls back to — the generic `repo:branch` watch below.
-    // PRESENCE of the key is the selector, NOT its validity: an empty string, a
-    // non-string, or a malformed SHA must fail closed inside `unwatch_exact_head`
-    // rather than silently degrade into a whole-branch generic unwatch. A JSON
-    // `null` is the one exception — this transport carries absent optionals as
-    // inert nulls (cf. the `nonreport transport nulls are inert` contract), so a
-    // null is treated as "not supplied".
-    match args.get("head_sha") {
-        Some(raw) if !raw.is_null() => {
-            return unwatch_exact_head(home, repo, branch, raw, instance_name)
-        }
-        _ => {}
+    // PRESENCE of the key is the whole selector: an empty string, a non-string,
+    // an explicit `null`, or a malformed SHA all fail closed inside
+    // `unwatch_exact_head`. Downgrading ANY present-but-unusable selector to a
+    // whole-branch unwatch is the exact footgun this feature exists to remove,
+    // and the ci schema declares `head_sha` as a string, so a null is a caller
+    // error rather than an inert transport artifact.
+    if let Some(raw) = args.get("head_sha") {
+        return unwatch_exact_head(home, repo, branch, raw, instance_name);
     }
     // Caller identity for selective removal is ALWAYS the MCP-validated sender.
     // (#2622-followup t-20260705161926295621-30532-2 ②, decision
