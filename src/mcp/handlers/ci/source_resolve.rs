@@ -65,10 +65,15 @@ pub(super) fn resolve_checkout_source_path(
     };
     // H2: validate source_path — reject path traversal and system paths. The
     // contracted error strings are preserved byte-for-byte (any matcher/test).
-    let source_canonical = match Path::new(&source_path).canonicalize() {
+    let source_canonical = match dunce::canonicalize(Path::new(&source_path)) {
         Ok(p) => p,
         Err(e) => return Err(json!({"error": format!("invalid source path: {e}")})),
     };
+    // Windows' filesystem canonicalizer returns `\\?\` verbatim paths. Keep
+    // all downstream checkout identities (worktree, lease, binding, journal)
+    // on the same non-verbatim spelling used by the validated canonical path.
+    #[cfg(windows)]
+    let source_path = source_canonical.display().to_string();
     if is_system_dir(&source_canonical) {
         return Err(system_dir_rejection());
     }
@@ -99,7 +104,7 @@ fn is_system_dir(p: &Path) -> bool {
     {
         let system_root = std::env::var_os("SystemRoot")
             .or_else(|| std::env::var_os("WINDIR"))
-            .and_then(|root| PathBuf::from(root).canonicalize().ok());
+            .and_then(|root| dunce::canonicalize(PathBuf::from(root)).ok());
         if let Some(root) = system_root {
             return p.starts_with(root);
         }
@@ -142,7 +147,7 @@ fn repo_common_dir(path: &Path) -> Option<PathBuf> {
     match out.lines().map(str::trim).collect::<Vec<_>>().as_slice() {
         // A bare repo has no working tree to admit, and its parent directory is
         // not a repo root — leave it to the existing downstream guards.
-        [common_dir, "false"] => std::fs::canonicalize(common_dir).ok(),
+        [common_dir, "false"] => dunce::canonicalize(common_dir).ok(),
         _ => None,
     }
 }
@@ -191,9 +196,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn absolute_existing_path_still_resolves_2158() {
-        let abs = std::env::temp_dir()
-            .canonicalize()
-            .expect("temp dir canonicalizes");
+        let abs = dunce::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
         let abs_str = abs.display().to_string();
         let (src_path, canonical) = resolve_checkout_source_path(&abs, &abs_str)
             .expect("absolute existing path must still resolve (legit arm preserved)");
@@ -208,11 +211,34 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_absolute_source_has_non_verbatim_checkout_identity() {
+        let verbatim = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir canonicalizes with the Windows filesystem API");
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "Windows regression input must exercise the verbatim form: {verbatim:?}"
+        );
+        let (source_path, canonical) =
+            resolve_checkout_source_path(&std::env::temp_dir(), &verbatim.display().to_string())
+                .expect("native absolute path must resolve");
+        assert!(!source_path.starts_with(r"\\?\"), "{source_path}");
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{canonical:?}"
+        );
+        assert!(
+            !source_path.contains('?'),
+            "invalid identity component: {source_path}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_system_root_is_rejected() {
         let root = std::env::var_os("SystemRoot")
             .or_else(|| std::env::var_os("WINDIR"))
             .map(PathBuf::from)
-            .and_then(|path| path.canonicalize().ok())
+            .and_then(|path| dunce::canonicalize(path).ok())
             .expect("Windows system root");
         assert!(is_system_dir(&root));
         let err = resolve_checkout_source_path(&std::env::temp_dir(), &root.display().to_string())
@@ -240,7 +266,10 @@ mod tests {
         let (source_path, canonical) =
             resolve_checkout_source_path(&home, "dev").expect("known agent name resolves");
         assert_eq!(source_path, work.display().to_string());
-        assert_eq!(canonical, work.canonicalize().expect("canonical work"));
+        assert_eq!(
+            canonical,
+            dunce::canonicalize(&work).expect("canonical work")
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
