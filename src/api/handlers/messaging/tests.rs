@@ -3352,7 +3352,10 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
     let remote = home.join("github.com/owner/repo.git");
     std::fs::create_dir_all(&remote).unwrap();
     git(&remote, &["init", "--bare"]);
-    git(&repo, &["remote", "add", "origin", &remote.display().to_string()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", &remote.display().to_string()],
+    );
     git(&repo, &["push", "origin", "main"]);
     git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
@@ -3418,8 +3421,7 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
     );
     let producer_binding = crate::binding::read(&home, "typed-reviewer").unwrap();
     assert_eq!(
-        producer_binding["lease_kind"],
-        "review",
+        producer_binding["lease_kind"], "review",
         "producer must publish a typed lease before receipt bridge: {producer_binding}"
     );
 
