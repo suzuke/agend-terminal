@@ -284,7 +284,8 @@ fn head_sha_inert_on_non_protected_branch_no_target_persisted() {
 // exact identity only, never a generic fallback, authority no weaker than
 // the arm that created it, and an honest scoped response.
 
-use super::watch::{handle_status_ci, handle_unwatch_ci};
+use super::unwatch::handle_unwatch_ci;
+use super::watch::handle_status_ci;
 
 const SHA_A: &str = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
 const SHA_B: &str = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
@@ -563,5 +564,143 @@ fn notification_only_assignee_unsubscribes_without_erasing_co_subscribers_3159()
         persisted["auto_arm_optout"].as_bool() != Some(true),
         "assignee unsubscribe must not tombstone: {persisted}"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3159 correction 1: PRESENCE of `head_sha` selects the exact-head path, so an
+/// empty string / non-string must fail closed — never degrade into a generic
+/// whole-branch unwatch.
+#[test]
+fn exact_head_unwatch_present_but_malformed_never_falls_back_3159() {
+    for bad in [json!(""), json!(42), json!(true), json!(["x"])] {
+        let home = tmp_home("eh-unwatch-present-bad");
+        arm_two(&home);
+        let r = handle_unwatch_ci(
+            &home,
+            &json!({
+                "repository": "suzuke/agend-terminal",
+                "branch": "main",
+                "head_sha": bad,
+            }),
+            "lead",
+        );
+        assert_eq!(
+            r["code"].as_str(),
+            Some("exact_head_unwatch_invalid_sha"),
+            "head_sha={bad} must fail closed: {r}"
+        );
+        assert_eq!(
+            armed_exact_heads(&home),
+            vec![SHA_A, SHA_B],
+            "no watch may change for head_sha={bad}"
+        );
+        // And the generic watch key must be untouched (no tombstone written).
+        let generic = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+            crate::daemon::ci_watch::watch_filename("suzuke/agend-terminal", "main"),
+        );
+        assert!(
+            !generic.exists(),
+            "generic watch must not be created/tombstoned by a bad exact-head selector"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #3159 correction 2: on a notification_only watch the ORCHESTRATOR still holds
+/// full-disarm authority (proven via the receipt's merge authority), while the
+/// assignee remains limited to its own subscription.
+#[test]
+fn orchestrator_full_disarms_notification_only_watch_3159() {
+    let home = tmp_home("eh-unwatch-orch-notif");
+    seed_team(&home, "lead", "dev");
+    let task_id = "t-notif-orch";
+    crate::merge_receipt::persist(
+        &home,
+        &crate::merge_receipt::MergeReceipt {
+            repo: "suzuke/agend-terminal".into(),
+            merge_sha: SHA_A.into(),
+            task_id: task_id.into(),
+            task_assignee: "dev".into(),
+            merge_authority: "lead".into(),
+            pr_number: 9,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: (chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap())
+                .to_rfc3339(),
+        },
+    )
+    .unwrap();
+    let repo_dir = home.join("srcrepo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    crate::binding::bind_full(&home, "dev", task_id, "feat/x", &repo_dir, &repo_dir, false)
+        .unwrap();
+    let armed = handle_watch_ci(
+        &home,
+        &json!({
+            "repository": "suzuke/agend-terminal",
+            "branch": "main",
+            "head_sha": SHA_A,
+            "task_id": task_id,
+            "notification_only": true,
+        }),
+        "dev",
+    );
+    assert_eq!(armed["watching"].as_bool(), Some(true), "arm: {armed}");
+
+    let r = handle_unwatch_ci(
+        &home,
+        &json!({"repository": "suzuke/agend-terminal", "branch": "main", "head_sha": SHA_A}),
+        "lead",
+    );
+    assert!(
+        r.get("error").is_none(),
+        "orchestrator must be authorized: {r}"
+    );
+    assert_eq!(
+        r["disarmed"].as_bool(),
+        Some(true),
+        "orchestrator holds FULL-disarm authority even on notification_only: {r}"
+    );
+    assert!(
+        armed_exact_heads(&home).is_empty(),
+        "watch must be disarmed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3159 correction 3: a persisted `target_head_sha` that disagrees with the
+/// addressed filename fails closed and mutates nothing (no generic fallback).
+#[test]
+fn exact_head_unwatch_identity_mismatch_fails_closed_3159() {
+    let home = tmp_home("eh-unwatch-identity");
+    arm_two(&home);
+    // Corrupt ONLY the addressed file's persisted identity.
+    let path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename_exact_head("suzuke/agend-terminal", "main", SHA_A),
+    );
+    let mut w: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    w["target_head_sha"] = json!(SHA_B);
+    std::fs::write(&path, serde_json::to_string_pretty(&w).unwrap()).unwrap();
+
+    let r = handle_unwatch_ci(
+        &home,
+        &json!({"repository": "suzuke/agend-terminal", "branch": "main", "head_sha": SHA_A}),
+        "lead",
+    );
+    assert_eq!(
+        r["code"].as_str(),
+        Some("exact_head_unwatch_identity_mismatch"),
+        "{r}"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        after["auto_arm_optout"].as_bool() != Some(true),
+        "mismatched file must not be tombstoned: {after}"
+    );
+    let generic = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("suzuke/agend-terminal", "main"),
+    );
+    assert!(!generic.exists(), "no generic fallback mutation");
     std::fs::remove_dir_all(&home).ok();
 }

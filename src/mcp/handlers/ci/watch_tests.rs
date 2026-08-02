@@ -1,5 +1,6 @@
 use super::*;
 use crate::mcp::handlers::ci::handle_ack_handoff_ci;
+use crate::mcp::handlers::ci::unwatch::handle_unwatch_ci;
 
 fn seed_ack_handoff(
     home: &Path,
