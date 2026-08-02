@@ -911,14 +911,14 @@ where
     crate::store::with_json_state_or_create(&data_path, default_fn, mutate)
 }
 
-/// #2800: ensure a PrState exists for a cold PR whose CI has not yet
-/// reached terminal. Two-phase: (1) check local file; (2) if missing,
-/// confirm PR identity against the SCM provider, then CAS-create with
-/// `CiState::Pending`. The pr-state/file lock is NOT held across the
-/// network call — the provider query runs unlocked, and
-/// `with_pr_state_or_create` does the CAS afterwards. On a concurrent
-/// creator the CAS converges: if the file already exists with matching
-/// identity, the caller gets the existing state; a mismatch fails closed.
+/// #2800/#3168: ensure a PrState exists for a PR whose CI has not yet
+/// reached terminal. Two-phase: (1) check local file; (2) for a complete
+/// state, return without SCM; for a missing or identity-incomplete state,
+/// confirm PR identity against the SCM provider, then CAS-create or
+/// CAS-hydrate. The pr-state/file lock is NOT held across the network call —
+/// the provider query runs unlocked, and the second locked operation checks
+/// the observed snapshot before mutating. A mismatch or concurrent mutation
+/// fails closed.
 pub fn ensure_from_scm(
     home: &std::path::Path,
     repo: &str,
@@ -929,22 +929,41 @@ pub fn ensure_from_scm(
 ) -> anyhow::Result<PrState> {
     // Phase 1: fast path — file already exists. Reconcile review_class
     // under flock (#3040: persisted Unresolved must adopt resolved class).
-    if let Some(reconciled) = with_pr_state(home, repo, branch, |state| {
+    let existing = with_pr_state(home, repo, branch, |state| {
         let was_unresolved = matches!(state.review_class, ReviewClass::Unresolved);
         state.review_class = reconcile_review_class(state.review_class, review_class);
         if was_unresolved && !matches!(state.review_class, ReviewClass::Unresolved) {
             state.diagnostic_emitted_for_sha = None;
         }
         state.clone()
-    })? {
-        return Ok(reconciled);
-    }
+    })?;
+    let provisional_snapshot = match existing {
+        Some(reconciled) if reconciled.pr_number != 0 => return Ok(reconciled),
+        Some(reconciled) => Some(reconciled),
+        None => None,
+    };
 
-    // Phase 2: no local file — confirm identity against SCM provider.
+    // Phase 2: an existing identity-incomplete state needs the same SCM
+    // confirmation as a cold PR, but the network call must remain outside the
+    // state flock. The snapshot is used as the CAS precondition below: any
+    // concurrent mutation, including a competing hydrate, fails closed.
+    //
+    // A complete existing state intentionally returned above without SCM —
+    // preserving the no-network fast path for the normal warm case.
     let provider = crate::scm::make_scm_provider(repo, None);
     let pr = provider
-        .pr_view(repo, pr_number, &["number", "headRefOid", "headRefName"])
+        .pr_view(
+            repo,
+            pr_number,
+            &["number", "headRefOid", "headRefName", "author"],
+        )
         .map_err(|e| anyhow::anyhow!("SCM pr_view failed for PR #{pr_number}: {e}"))?;
+    if pr.number != pr_number {
+        anyhow::bail!(
+            "SCM PR number mismatch: requested #{pr_number}, SCM reports #{}",
+            pr.number
+        );
+    }
     let scm_head = pr
         .head_ref_oid
         .as_deref()
@@ -964,7 +983,36 @@ pub fn ensure_from_scm(
         );
     }
 
-    // Phase 3: CAS-create with Pending CI.
+    if let Some(snapshot) = provisional_snapshot {
+        // Phase 3: CAS-hydrate an existing provisional state under flock. Do
+        // not blind-write the request's identity: the file content must still
+        // equal the snapshot observed before the unlocked SCM query.
+        let hydrated = with_pr_state(home, repo, branch, |state| {
+            if *state != snapshot {
+                return Err(anyhow::anyhow!(
+                    "concurrent pr-state mutation while hydrating PR #{pr_number}"
+                ));
+            }
+            if state.repo != repo
+                || state.branch != branch
+                || !state.head_sha.eq_ignore_ascii_case(expected_head)
+                || state.pr_number != 0
+            {
+                return Err(anyhow::anyhow!(
+                    "pr-state identity changed while hydrating PR #{pr_number}"
+                ));
+            }
+            state.pr_number = pr_number;
+            state.pr_author = pr.author_login.clone().unwrap_or_default();
+            Ok(state.clone())
+        })?;
+        let Some(hydrated) = hydrated else {
+            anyhow::bail!("pr-state disappeared while hydrating PR #{pr_number}");
+        };
+        return hydrated;
+    }
+
+    // Phase 4: no local file — CAS-create with Pending CI.
     let state = with_pr_state_or_create(
         home,
         repo,

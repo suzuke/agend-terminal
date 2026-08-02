@@ -192,8 +192,9 @@ pub(crate) fn validate_review_assignment_marker(
             "code": "review_assignment_subject_mismatch",
         }));
     }
-    // #2800: ensure a PrState exists even for a cold PR (CI still pending).
-    // Two-phase: local miss → SCM-confirm identity → CAS-create Pending.
+    // #2800/#3168: ensure a PrState exists even for a cold or provisional PR
+    // (CI still pending). Complete state stays on the no-SCM fast path;
+    // missing/provisional state uses SCM-confirmed CAS-create/hydrate.
     // The pr-state/file lock is NOT held across the SCM network call.
     let state = crate::daemon::pr_state::ensure_from_scm(
         home,

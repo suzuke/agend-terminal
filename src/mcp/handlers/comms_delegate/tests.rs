@@ -159,7 +159,10 @@ mod review_assignment_marker_tests {
     use super::super::{handle_delegate_task, DispatchPreChecks};
     use crate::identity::Sender;
     use crate::mcp::handlers::comms_gates::ReviewAuthor;
+    use crate::scm::{PrSummary, ScmProvider};
     use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::Arc;
 
     fn tmp_home(label: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -243,6 +246,75 @@ mod review_assignment_marker_tests {
         .unwrap();
     }
 
+    fn seed_provisional_subject(home: &std::path::Path) {
+        seed_exact_subject(home);
+        let mut state =
+            crate::daemon::pr_state::load(home, "owner/repo", "feat/x").expect("seeded pr-state");
+        state.pr_number = 0;
+        state.pr_author.clear();
+        crate::daemon::pr_state::save(home, &state).unwrap();
+    }
+
+    struct ProvisionalPrMock {
+        summary: PrSummary,
+        before_return: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl ScmProvider for ProvisionalPrMock {
+        fn pr_view(&self, _repo: &str, _pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
+            assert_eq!(
+                fields,
+                &["number", "headRefOid", "headRefName", "author"],
+                "provisional hydration must request every persisted identity field"
+            );
+            if let Some(hook) = &self.before_return {
+                hook();
+            }
+            Ok(self.summary.clone())
+        }
+
+        fn pr_checks(&self, _repo: &str, _pr: u64) -> anyhow::Result<Vec<crate::scm::CheckState>> {
+            unimplemented!()
+        }
+
+        fn pr_list(
+            &self,
+            _repo: &str,
+            _filter: &crate::scm::ListFilter,
+            _fields: &[&str],
+            _cwd: Option<&Path>,
+        ) -> anyhow::Result<Vec<PrSummary>> {
+            unimplemented!()
+        }
+
+        fn pr_merge(
+            &self,
+            _repo: &str,
+            _pr: u64,
+            _opts: &crate::scm::MergeOpts,
+        ) -> anyhow::Result<crate::scm::MergeOutcome> {
+            unimplemented!()
+        }
+
+        fn issue_view(
+            &self,
+            _repo: &str,
+            _number: u64,
+            _fields: &[&str],
+        ) -> anyhow::Result<crate::scm::IssueSummary> {
+            unimplemented!()
+        }
+
+        fn compare(
+            &self,
+            _repo: &str,
+            _base: &str,
+            _head: &str,
+        ) -> anyhow::Result<crate::scm::CompareResult> {
+            unimplemented!()
+        }
+    }
+
     fn seed_review_task(home: &std::path::Path, task_id: &str) {
         crate::task_events::append(
             home,
@@ -302,6 +374,130 @@ mod review_assignment_marker_tests {
             "pr_number": pr_number,
             "reviewed_head": EXACT_HEAD,
         })
+    }
+
+    fn seed_real_review_assignment_home(label: &str) -> std::path::PathBuf {
+        let home = tmp_home(label);
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n      - reviewer\n    source_repo: owner/repo\n",
+        );
+        seed_provisional_subject(&home);
+        home
+    }
+
+    fn run_real_review_assignment(home: &std::path::Path) -> Value {
+        let sender = Some(Sender::new("lead").unwrap());
+        handle_delegate_task(
+            home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the PR",
+                "review_assignment": true,
+                "task_id": "t-rev-1",
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+                "reviewed_head": EXACT_HEAD,
+                "review_author": {"external": "octocat"},
+                "force": true,
+                "force_reason": "3168 regression"
+            }),
+            &sender,
+            None,
+        )
+    }
+
+    #[test]
+    fn real_review_assignment_hydrates_existing_provisional_state_3168() {
+        let home = seed_real_review_assignment_home("3168-provisional");
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(EXACT_HEAD.into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+        let out = run_real_review_assignment(&home);
+        assert_eq!(out["review_assignment"], true, "{out}");
+        let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
+            .expect("hydrated pr-state");
+        assert_eq!(state.pr_number, 42);
+        assert_eq!(state.pr_author, "octocat");
+        assert!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .is_some(),
+            "real marker path must persist the assignment after hydration"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn real_review_assignment_rejects_scm_mismatch_3168() {
+        let home = seed_real_review_assignment_home("3168-mismatch");
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+
+        let out = run_real_review_assignment(&home);
+
+        assert_eq!(
+            out["code"], "review_assignment_subject_unavailable",
+            "{out}"
+        );
+        let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
+            .expect("provisional state remains after mismatch");
+        assert_eq!(state.pr_number, 0);
+        assert!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .is_none(),
+            "mismatch must not persist an assignment"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn real_review_assignment_rejects_concurrent_mutation_3168() {
+        let home = seed_real_review_assignment_home("3168-concurrent");
+        let hook_home = home.clone();
+        let hook = Arc::new(move || {
+            let mut changed =
+                crate::daemon::pr_state::load(&hook_home, "owner/repo", "feat/x").unwrap();
+            changed.head_sha = "cccccccccccccccccccccccccccccccccccccccc".into();
+            crate::daemon::pr_state::save(&hook_home, &changed).unwrap();
+        });
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(EXACT_HEAD.into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: Some(hook),
+        }));
+
+        let out = run_real_review_assignment(&home);
+
+        assert_eq!(
+            out["code"], "review_assignment_subject_unavailable",
+            "{out}"
+        );
+        let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
+            .expect("concurrent state remains after rejection");
+        assert_eq!(state.pr_number, 0);
+        assert_eq!(state.head_sha, "cccccccccccccccccccccccccccccccccccccccc");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// T2: sender is the SOLE CURRENT orchestrator of the team owning the repo ⇒ allow.

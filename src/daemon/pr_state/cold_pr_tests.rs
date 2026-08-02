@@ -85,6 +85,47 @@ impl ScmProvider for NotFoundMock {
     }
 }
 
+struct HydrateMock {
+    summary: PrSummary,
+    before_return: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ScmProvider for HydrateMock {
+    fn pr_view(&self, _r: &str, _p: u64, _f: &[&str]) -> anyhow::Result<PrSummary> {
+        if let Some(hook) = &self.before_return {
+            hook();
+        }
+        Ok(self.summary.clone())
+    }
+
+    fn pr_checks(&self, _r: &str, _p: u64) -> anyhow::Result<Vec<scm::CheckState>> {
+        unimplemented!()
+    }
+    fn pr_list(
+        &self,
+        _r: &str,
+        _f: &scm::ListFilter,
+        _fl: &[&str],
+        _c: Option<&Path>,
+    ) -> anyhow::Result<Vec<PrSummary>> {
+        unimplemented!()
+    }
+    fn pr_merge(
+        &self,
+        _r: &str,
+        _p: u64,
+        _o: &scm::MergeOpts,
+    ) -> anyhow::Result<scm::MergeOutcome> {
+        unimplemented!()
+    }
+    fn issue_view(&self, _r: &str, _n: u64, _f: &[&str]) -> anyhow::Result<scm::IssueSummary> {
+        unimplemented!()
+    }
+    fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<scm::CompareResult> {
+        unimplemented!()
+    }
+}
+
 fn tmp_home(name: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
         "agend-cold-pr-{name}-{}-{}",
@@ -207,6 +248,91 @@ fn existing_pr_state_is_noop() {
         matches!(state.ci_state, CiState::Green { .. }),
         "existing CiState must be preserved (not overwritten to Pending)"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3168 treatment: an existing identity-incomplete state must hydrate through
+/// the same SCM-verified path as a cold PR, then preserve its non-identity state.
+#[test]
+fn existing_incomplete_pr_state_hydrates() {
+    let home = tmp_home("t3168-hydrate");
+    let head = "h".repeat(40);
+    let mut provisional = new_for_branch("o/r", "feat/x", &head, ReviewClass::Single);
+    provisional.pr_author.clear();
+    save(&home, &provisional).unwrap();
+    let _guard = scm::set_test_scm_provider(Arc::new(ColdPrMock {
+        pr_number: 42,
+        head_sha: head.clone(),
+        head_ref: "feat/x".into(),
+        author: "dev".into(),
+    }));
+
+    let state = ensure_from_scm(&home, "o/r", "feat/x", 42, &head, ReviewClass::Single)
+        .expect("matching provisional state must hydrate");
+
+    assert_eq!(state.pr_number, 42);
+    assert_eq!(state.pr_author, "dev");
+    assert_eq!(load(&home, "o/r", "feat/x").unwrap().pr_number, 42);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3168 mismatch control: an existing provisional state must not hydrate from
+/// an SCM response whose PR number or head differs from the request.
+#[test]
+fn existing_incomplete_pr_state_mismatch_fails_closed() {
+    let home = tmp_home("t3168-mismatch");
+    let head = "i".repeat(40);
+    let provisional = new_for_branch("o/r", "feat/x", &head, ReviewClass::Single);
+    save(&home, &provisional).unwrap();
+    let _guard = scm::set_test_scm_provider(Arc::new(ColdPrMock {
+        pr_number: 42,
+        head_sha: "j".repeat(40),
+        head_ref: "feat/x".into(),
+        author: "dev".into(),
+    }));
+
+    let result = ensure_from_scm(&home, "o/r", "feat/x", 42, &head, ReviewClass::Single);
+
+    assert!(result.is_err(), "SCM mismatch must fail closed");
+    assert_eq!(load(&home, "o/r", "feat/x").unwrap().pr_number, 0);
+    assert_eq!(load(&home, "o/r", "feat/x").unwrap().head_sha, head);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3168 concurrent control: an unlocked SCM query must not overwrite a state
+/// that changed before the hydrate CAS reacquires the file flock.
+#[test]
+fn existing_incomplete_pr_state_concurrent_mutation_fails_closed() {
+    let home = tmp_home("t3168-concurrent");
+    let head = "k".repeat(40);
+    let provisional = new_for_branch("o/r", "feat/x", &head, ReviewClass::Single);
+    save(&home, &provisional).unwrap();
+    let hook_home = home.clone();
+    let hook = Arc::new(move || {
+        let mut changed = load(&hook_home, "o/r", "feat/x").unwrap();
+        changed.head_sha = "l".repeat(40);
+        save(&hook_home, &changed).unwrap();
+    });
+    let _guard = scm::set_test_scm_provider(Arc::new(HydrateMock {
+        summary: PrSummary {
+            number: 42,
+            head_ref_oid: Some(head.clone()),
+            head_ref: Some("feat/x".into()),
+            author_login: Some("dev".into()),
+            ..Default::default()
+        },
+        before_return: Some(hook),
+    }));
+
+    let result = ensure_from_scm(&home, "o/r", "feat/x", 42, &head, ReviewClass::Single);
+
+    assert!(
+        result.is_err(),
+        "concurrent state mutation must fail closed"
+    );
+    let state = load(&home, "o/r", "feat/x").unwrap();
+    assert_eq!(state.pr_number, 0);
+    assert_eq!(state.head_sha, "l".repeat(40));
     std::fs::remove_dir_all(&home).ok();
 }
 
