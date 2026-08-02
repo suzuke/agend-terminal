@@ -467,13 +467,15 @@ mod review_assignment_marker_tests {
     }
 
     #[test]
-    fn real_review_assignment_rejects_concurrent_mutation_3168() {
+    fn real_review_assignment_rejects_cas_only_mutation_3168() {
         let home = seed_real_review_assignment_home("3168-concurrent");
         let hook_home = home.clone();
         let hook = Arc::new(move || {
             let mut changed =
                 crate::daemon::pr_state::load(&hook_home, "owner/repo", "feat/x").unwrap();
-            changed.head_sha = "cccccccccccccccccccccccccccccccccccccccc".into();
+            // Change only a field outside the identity re-check. This control
+            // must exercise the in-flock snapshot CAS independently.
+            changed.review_class = crate::daemon::pr_state::ReviewClass::Single;
             crate::daemon::pr_state::save(&hook_home, &changed).unwrap();
         });
         let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
@@ -496,7 +498,49 @@ mod review_assignment_marker_tests {
         let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
             .expect("concurrent state remains after rejection");
         assert_eq!(state.pr_number, 0);
-        assert_eq!(state.head_sha, "cccccccccccccccccccccccccccccccccccccccc");
+        assert_eq!(state.head_sha, EXACT_HEAD);
+        assert_eq!(
+            state.review_class,
+            crate::daemon::pr_state::ReviewClass::Single
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn real_review_assignment_rejects_identity_only_mismatch_3168() {
+        let home = seed_real_review_assignment_home("3168-identity-only");
+        let mut stale = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
+            .expect("seeded provisional state");
+        // The provisional snapshot is stable, but its persisted identity does
+        // not match the exact subject supplied by the review assignment.
+        stale.head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        crate::daemon::pr_state::save(&home, &stale).unwrap();
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(EXACT_HEAD.into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+
+        let out = run_real_review_assignment(&home);
+
+        assert_eq!(
+            out["code"], "review_assignment_subject_unavailable",
+            "{out}"
+        );
+        let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
+            .expect("identity mismatch must leave the provisional state unchanged");
+        assert_eq!(state.pr_number, 0);
+        assert_eq!(state.head_sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .is_none(),
+            "identity mismatch must not persist an assignment"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
