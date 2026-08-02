@@ -1052,6 +1052,7 @@ fn init_daemon_services(
     home: &Path,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<DaemonContext> {
+    const API_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     // #1487: source the operator timezone from fleet.yaml `display_timezone:`
     // (reusing the same operator-tz concept as ci_watch / display_time) for the
     // `now=` header field; `None`/empty → system local time.
@@ -1099,10 +1100,11 @@ fn init_daemon_services(
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
+    let (api_ready_tx, api_ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
-            crate::api::serve(
+            crate::api::serve_with_ready(
                 &api_home,
                 api_reg,
                 api_shutdown,
@@ -1111,8 +1113,21 @@ fn init_daemon_services(
                 None,
                 crate::api::RestartCapability::Daemon,
                 None, // #2453 R2: no app-restart channel on the headless daemon
+                api_ready_tx,
             )
         })?;
+
+    match api_ready_rx.recv_timeout(API_READY_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => anyhow::bail!("API server failed to start: {error}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => anyhow::bail!(
+            "API server did not publish a ready listener within {}s",
+            API_READY_TIMEOUT.as_secs()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("API server exited before reporting readiness")
+        }
+    }
 
     Ok(DaemonContext {
         registry,
