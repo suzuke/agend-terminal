@@ -467,6 +467,38 @@ mod review_assignment_marker_tests {
     }
 
     #[test]
+    fn real_review_assignment_rejects_scm_number_mismatch_3168() {
+        let home = seed_real_review_assignment_home("3168-number-mismatch");
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 41,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(EXACT_HEAD.into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+
+        let out = run_real_review_assignment(&home);
+
+        assert_eq!(
+            out["code"], "review_assignment_subject_unavailable",
+            "{out}"
+        );
+        let state = crate::daemon::pr_state::load(&home, "owner/repo", "feat/x")
+            .expect("number mismatch must leave the provisional state unchanged");
+        assert_eq!(state.pr_number, 0);
+        assert_eq!(state.head_sha, EXACT_HEAD);
+        assert!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .is_none(),
+            "number mismatch must not persist an assignment"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn real_review_assignment_rejects_cas_only_mutation_3168() {
         let home = seed_real_review_assignment_home("3168-concurrent");
         let hook_home = home.clone();
