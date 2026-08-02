@@ -43,6 +43,8 @@ mod release;
 mod watch;
 
 pub(super) use checkout::handle_checkout_repo;
+#[cfg(test)]
+pub(crate) use checkout::handle_checkout_repo as handle_checkout_repo_for_test;
 pub(super) use cleanup::handle_cleanup_init_commits;
 pub(crate) use cleanup::handle_cleanup_merged_branches;
 pub(crate) use handoff_ack::{handle_ack_handoff_ci, handle_defer_ci};

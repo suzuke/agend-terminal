@@ -3299,40 +3299,37 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    fn seed_claimed_review_task(
+    fn seed_review_task(
         home: &std::path::Path,
         task_id: &str,
         reviewer: &str,
         subject_branch: &str,
+        claimed: bool,
     ) {
         use crate::task_events::{InstanceName, TaskEvent, TaskId};
         let tid = TaskId(task_id.into());
-        crate::task_events::append_batch(
-            home,
-            &InstanceName::from("test:seed"),
-            vec![
-                TaskEvent::Created {
-                    task_id: tid.clone(),
-                    title: "review replacement assignment".into(),
-                    description: String::new(),
-                    priority: "normal".into(),
-                    owner: None,
-                    due_at: None,
-                    depends_on: Vec::new(),
-                    routed_to: None,
-                    branch: Some(subject_branch.into()),
-                    bind: None,
-                    eta_secs: None,
-                    tags: Vec::new(),
-                    parent_id: None,
-                },
-                TaskEvent::Claimed {
-                    task_id: tid,
-                    by: InstanceName::from(reviewer),
-                },
-            ],
-        )
-        .unwrap();
+        let mut events = vec![TaskEvent::Created {
+            task_id: tid.clone(),
+            title: "review replacement assignment".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(InstanceName::from(reviewer)),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some(subject_branch.into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        }];
+        if claimed {
+            events.push(TaskEvent::Claimed {
+                task_id: tid,
+                by: InstanceName::from(reviewer),
+            });
+        }
+        crate::task_events::append_batch(home, &InstanceName::from("test:seed"), events).unwrap();
     }
 
     use crate::daemon::pr_state::{self, ReviewClass};
@@ -3352,24 +3349,19 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
     std::fs::write(repo.join("README"), "fixture\n").unwrap();
     git(&repo, &["add", "README"]);
     git(&repo, &["commit", "-m", "fixture"]);
-    git(
-        &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/owner/repo.git",
-        ],
-    );
+    let remote = home.join("github.com/owner/repo.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "--bare"]);
+    git(&repo, &["remote", "add", "origin", &remote.display().to_string()]);
+    git(&repo, &["push", "origin", "main"]);
     git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    git(&repo, &["switch", "-c", "review/pr-reissue"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
 
     let subject_branch = "fix/reissue";
     let old_task = "t-review-reissue-old";
     let new_task = "t-review-reissue-new";
-    seed_claimed_review_task(&home, old_task, "typed-reviewer", subject_branch);
-    seed_claimed_review_task(&home, new_task, "typed-reviewer", subject_branch);
+    seed_review_task(&home, old_task, "typed-reviewer", subject_branch, true);
+    seed_review_task(&home, new_task, "typed-reviewer", subject_branch, false);
     pr_state::record_ci_result(
         &home,
         "owner/repo",
@@ -3402,29 +3394,33 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
         "2026-08-01T00:00:00Z",
     );
     crate::daemon::assignment_authority::persist(&home, &old_assignment).unwrap();
-    crate::binding::bind_full_with_provenance(
+    let checkout = crate::mcp::handlers::ci::handle_checkout_repo_for_test(
         &home,
-        "typed-reviewer",
-        old_task,
-        "review/pr-reissue",
-        &repo,
-        &repo,
-        false,
-        Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
-            provisioned_head: &head,
+        &json!({
+            "repository_path": repo.display().to_string(),
+            "branch": "review/pr-reissue",
+            "bind": true,
+            "task_id": old_task,
+            "expected_head": &head,
+            "from_ref": "main",
+            "checkout_purpose": "disposable_review",
         }),
-    )
-    .unwrap();
-    crate::binding::try_augment_review_lease(
-        &home,
         "typed-reviewer",
-        old_task,
-        "review/pr-reissue",
-        &repo,
+    );
+    assert!(
+        checkout.get("error").is_none(),
+        "real disposable review checkout must succeed: {checkout}"
     );
     assert_eq!(
-        crate::binding::read(&home, "typed-reviewer").unwrap()["review_assignment_id"],
-        old_assignment.assignment_id.to_string()
+        crate::binding::read(&home, "typed-reviewer").unwrap()["task_id"],
+        old_task,
+        "precondition: the real disposable checkout still names the predecessor"
+    );
+    let producer_binding = crate::binding::read(&home, "typed-reviewer").unwrap();
+    assert_eq!(
+        producer_binding["lease_kind"],
+        "review",
+        "producer must publish a typed lease before receipt bridge: {producer_binding}"
     );
 
     let new_assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
