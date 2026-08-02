@@ -257,6 +257,23 @@ fn txn_journal_persists_and_loads() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[cfg(unix)]
+fn oversized_legacy_mangled(home: &Path) -> String {
+    let mut mangled = "agent-C_".to_string();
+    while super::checkout_txn::journal_path(home, &mangled)
+        .to_string_lossy()
+        .len()
+        <= 240
+    {
+        mangled.push_str("source_");
+    }
+    assert!(
+        mangled.len() < 255,
+        "legacy directory component must fit: {mangled}"
+    );
+    mangled
+}
+
 /// Long Windows-style source identities use a bounded durable directory key, while
 /// the journal remains readable/absent through the same save/load/clear lifecycle.
 #[test]
@@ -299,6 +316,66 @@ fn txn_long_journal_identity_unreadable_still_fails_closed() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A deeply nested home can make even the bounded key exceed the safe path
+/// limit; resolution must fail closed rather than silently use an unsafe path.
+#[test]
+fn txn_deep_home_bounded_key_fails_closed() {
+    let base = tmp_home("txn-deep-home");
+    let home = base
+        .join("a".repeat(80))
+        .join("b".repeat(80))
+        .join("c".repeat(80));
+    let mangled = "agent";
+    let key = super::checkout_txn::journal_key(&home, mangled);
+    assert_ne!(key, mangled);
+    assert!(
+        super::checkout_txn::journal_path(&home, &key)
+            .to_string_lossy()
+            .chars()
+            .count()
+            > 240
+    );
+    let err = super::checkout_txn::resolve_journal_key(&home, mangled).unwrap_err();
+    assert!(err.contains("safe path limit"), "{err}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A legacy directory and its bounded replacement cannot coexist: recovery must
+/// fail closed instead of choosing one journal authority.
+#[cfg(unix)]
+#[test]
+fn txn_long_legacy_and_bounded_collision_fails_closed() {
+    let home = tmp_home("txn-long-collision");
+    let mangled = oversized_legacy_mangled(&home);
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, &mangled)).unwrap();
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, &key)).unwrap();
+    let err = super::checkout_txn::resolve_journal_key(&home, &mangled).unwrap_err();
+    assert!(err.contains("both"), "collision must fail closed: {err}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A legacy identity that is not a directory is ambiguous storage, not an absent
+/// journal; resolution must fail closed before selecting the bounded key.
+#[cfg(unix)]
+#[test]
+fn txn_long_legacy_non_directory_fails_closed() {
+    let home = tmp_home("txn-long-nondir");
+    let mangled = oversized_legacy_mangled(&home);
+    std::fs::create_dir_all(super::checkout_txn::txn_root(&home)).unwrap();
+    std::fs::write(
+        super::checkout_txn::txn_root(&home).join(&mangled),
+        "not a journal directory",
+    )
+    .unwrap();
+    let err = super::checkout_txn::resolve_journal_key(&home, &mangled).unwrap_err();
+    assert!(
+        err.contains("not a directory"),
+        "non-directory must fail closed: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A pre-existing oversized legacy directory is discovered and migrated rather
 /// than silently replaced by a fresh hash journal (Unix can still read this path;
 /// Windows uses the bounded-new-write path because the legacy path is too long).
@@ -306,18 +383,7 @@ fn txn_long_journal_identity_unreadable_still_fails_closed() {
 #[test]
 fn txn_long_legacy_journal_migrates_before_recovery() {
     let home = tmp_home("txn-long-legacy");
-    let mut mangled = "agent-C_".to_string();
-    while super::checkout_txn::journal_path(&home, &mangled)
-        .to_string_lossy()
-        .len()
-        <= 240
-    {
-        mangled.push_str("source_");
-    }
-    assert!(
-        mangled.len() < 255,
-        "legacy directory component must fit: {mangled}"
-    );
+    let mangled = oversized_legacy_mangled(&home);
     let legacy_path = super::checkout_txn::journal_path(&home, &mangled);
     let mut journal = sample_journal();
     journal.advance(Phase::WorktreeAdded);

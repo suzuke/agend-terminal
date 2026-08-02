@@ -169,12 +169,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     } else {
         None
     };
-    // #2755 INNER provisioning lock — acquired BEFORE the idempotent-reuse check
-    // and any provision so reuse AND fresh provision are both serialized on the
-    // worktree PATH (a reuse must not bypass the lock or the recursive submodule
-    // init). Declared AFTER `_lease_lock` ⇒ drops (releases) INNER-first. Journal +
-    // lock live OUTSIDE the worktree so a rollback `remove --force` can't delete
-    // the recovery record.
+    // #2755: serialize reuse and fresh provision on the target path; journal + lock
+    // remain outside the worktree so rollback cannot delete recovery state.
     let worktree_path_str = worktree_dir.display().to_string();
     let mangled = worktree_dir
         .file_name()
@@ -194,8 +190,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             })
         }
     };
-    // Revalidate the held lock maps to the EXACT target path before any side effect
-    // (fail-closed; the authority is the guard's normalized path).
+    // Revalidate the held lock against the exact target path before side effects.
     if !path_lock.guards(&worktree_dir) {
         return json!({
             "error": "provisioning lock identity does not match the target worktree path",
@@ -203,16 +198,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             "branch": branch,
         });
     }
-    let journal_key = match super::checkout_txn::resolve_journal_key(home, &mangled) {
-        Ok(key) => key,
-        Err(e) => {
-            return json!({
-                "error": redact_paths(&e),
-                "code": "stale_txn_rollback",
-                "branch": branch,
-            })
-        }
-    };
+    let journal_key =
+        match super::checkout_txn::resolve_journal_key_response(home, &mangled, branch) {
+            Ok(key) => key,
+            Err(error) => return error,
+        };
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path (removes a
     // stale worktree so a fresh add — or the reuse check below — sees clean state).

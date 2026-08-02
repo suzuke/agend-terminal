@@ -88,10 +88,23 @@ pub(super) fn resolve_checkout_source_path(
 
 /// The system-directory policy, applied to every path this module hands back.
 fn is_system_dir(p: &Path) -> bool {
-    p.starts_with("/etc")
+    if p.starts_with("/etc")
         || p.starts_with("/usr")
         || p.starts_with("/sys")
         || p.starts_with("/proc")
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .and_then(|root| PathBuf::from(root).canonicalize().ok());
+        if let Some(root) = system_root {
+            return p.starts_with(root);
+        }
+    }
+    false
 }
 
 /// The contracted rejection — error string preserved byte-for-byte (any matcher/test).
@@ -191,6 +204,20 @@ mod tests {
             src_path, abs_str,
             "pre-canonical source string preserved for the caller"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_root_is_rejected() {
+        let root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok())
+            .expect("Windows system root");
+        assert!(is_system_dir(&root));
+        let err = resolve_checkout_source_path(&std::env::temp_dir(), &root.display().to_string())
+            .expect_err("Windows system root must be rejected");
+        assert_eq!(err["error"], "source path rejected: system directory");
     }
 
     /// #2454 first slice: agent-name source resolution no longer needs an MCP-to-API

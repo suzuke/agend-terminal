@@ -278,6 +278,9 @@ pub(crate) fn resolve_journal_key(home: &Path, mangled: &str) -> Result<String, 
     if key == mangled {
         return Ok(key);
     }
+    if journal_path_length(&journal_path(home, &key)) > LEGACY_JOURNAL_PATH_MAX {
+        return Err("bounded checkout journal path exceeds the safe path limit".into());
+    }
     let root = txn_root(home);
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -319,6 +322,20 @@ pub(crate) fn resolve_journal_key(home: &Path, mangled: &str) -> Result<String, 
     std::fs::rename(&legacy_dir, &bounded_dir)
         .map_err(|e| format!("legacy checkout journal could not be migrated: {e}"))?;
     Ok(key)
+}
+
+pub(crate) fn resolve_journal_key_response(
+    home: &Path,
+    mangled: &str,
+    branch: &str,
+) -> Result<String, serde_json::Value> {
+    resolve_journal_key(home, mangled).map_err(|e| {
+        serde_json::json!({
+            "error": super::checkout_helpers::redact_paths(&e),
+            "code": "stale_txn_rollback",
+            "branch": branch,
+        })
+    })
 }
 
 fn journal_path_length(path: &Path) -> usize {
