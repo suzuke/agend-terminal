@@ -1,6 +1,13 @@
 use super::*;
 
-fn seed_handoff_row(home: &Path, target: &str, correlation: &str, episode: &str, id: &str) {
+fn seed_handoff_row_with_class(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    id: &str,
+    class: crate::inbox::CiHandoffClass,
+) {
     let mut msg = crate::inbox::InboxMessage::new_system(
         "system:ci",
         "ci-ready-for-action",
@@ -9,8 +16,19 @@ fn seed_handoff_row(home: &Path, target: &str, correlation: &str, episode: &str,
     .with_correlation_id(correlation.to_string());
     msg.id = Some(id.to_string());
     msg.ci_handoff_episode = Some(episode.to_string());
-    msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Feature);
+    msg.ci_handoff_class = Some(class);
     crate::inbox::enqueue(home, target, msg).unwrap();
+}
+
+fn seed_handoff_row(home: &Path, target: &str, correlation: &str, episode: &str, id: &str) {
+    seed_handoff_row_with_class(
+        home,
+        target,
+        correlation,
+        episode,
+        id,
+        crate::inbox::CiHandoffClass::Feature,
+    );
 }
 
 fn ack_row(home: &Path, target: &str, episode: &str) -> crate::inbox::InboxMessage {
@@ -153,4 +171,145 @@ fn ack_handoff_missing_or_ambiguous_resolved_feature_row_fails_closed_3179() {
     assert!(ack_row(&ambiguous_home, "lead", episode).read_at.is_none());
     assert!(crate::daemon::ci_handoff_track::list(&ambiguous_home).is_empty());
     std::fs::remove_dir_all(&ambiguous_home).ok();
+}
+
+#[test]
+fn ack_handoff_resolved_feature_episode_mismatch_leaves_row_untouched_3179() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3179-ack-resolved-mismatch-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let corr = "o/r@feat/resolved-mismatch";
+    let row_episode = "ep-row";
+    seed_handoff_row(&home, "lead", corr, row_episode, "m-3179-resolved-mismatch");
+
+    let response = handle_ack_handoff_ci(
+        &home,
+        &json!({
+            "repository": "o/r",
+            "branch": "feat/resolved-mismatch",
+            "episode": "ep-request"
+        }),
+        "lead",
+    );
+    assert_eq!(response["code"], "track_not_found", "{response}");
+    assert!(ack_row(&home, "lead", row_episode).read_at.is_none());
+    assert_eq!(
+        crate::inbox::storage::handoff_row_state(
+            &home,
+            "lead",
+            corr,
+            row_episode,
+            crate::inbox::CiHandoffClass::Feature,
+        ),
+        crate::inbox::storage::ProtectedHandoffRowState::Pending
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ack_handoff_resolved_protected_row_is_not_feature_fallback_3179() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3179-ack-resolved-protected-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let corr = "o/r@main";
+    let episode = "ep-protected";
+    seed_handoff_row_with_class(
+        &home,
+        "lead",
+        corr,
+        episode,
+        "m-3179-resolved-protected",
+        crate::inbox::CiHandoffClass::Protected,
+    );
+
+    let response = handle_ack_handoff_ci(
+        &home,
+        &json!({"repository": "o/r", "branch": "main", "episode": episode}),
+        "lead",
+    );
+    assert_eq!(response["code"], "track_not_found", "{response}");
+    assert!(ack_row(&home, "lead", episode).read_at.is_none());
+    assert_eq!(
+        crate::inbox::storage::handoff_row_state(
+            &home,
+            "lead",
+            corr,
+            episode,
+            crate::inbox::CiHandoffClass::Protected,
+        ),
+        crate::inbox::storage::ProtectedHandoffRowState::Pending
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn settle_ci_handoff_row_exact_is_idempotent_3179() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3179-settle-idempotent-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let corr = "o/r@feat/settle-idempotent";
+    let episode = "ep-settle-idempotent";
+    seed_handoff_row(&home, "lead", corr, episode, "m-3179-settle-idempotent");
+
+    assert_eq!(
+        crate::inbox::storage::settle_ci_handoff_row_exact(
+            &home,
+            "lead",
+            corr,
+            episode,
+            crate::inbox::CiHandoffClass::Feature,
+        ),
+        crate::inbox::storage::HandoffRowSettleOutcome::Settled
+    );
+    assert_eq!(
+        crate::inbox::storage::settle_ci_handoff_row_exact(
+            &home,
+            "lead",
+            corr,
+            episode,
+            crate::inbox::CiHandoffClass::Feature,
+        ),
+        crate::inbox::storage::HandoffRowSettleOutcome::AlreadySettled
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ack_handoff_resolved_feature_lock_failure_is_reported_3179() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3179-ack-resolved-lock-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let corr = "o/r@feat/resolved-lock";
+    let episode = "ep-resolved-lock";
+    seed_handoff_row(&home, "lead", corr, episode, "m-3179-resolved-lock");
+
+    let inbox_path = crate::inbox::inbox_path_resolved(&home, "lead");
+    let lock_path = inbox_path.with_extension("jsonl.lock");
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+
+    let response = handle_ack_handoff_ci(
+        &home,
+        &json!({"repository": "o/r", "branch": "feat/resolved-lock", "episode": episode}),
+        "lead",
+    );
+    assert_eq!(response["code"], "row_lock_failed", "{response}");
+    assert!(ack_row(&home, "lead", episode).read_at.is_none());
+    std::fs::remove_dir_all(&home).ok();
 }
