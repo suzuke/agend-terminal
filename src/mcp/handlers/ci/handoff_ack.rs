@@ -66,6 +66,65 @@ pub(crate) fn handle_ack_handoff_ci(home: &Path, args: &Value, instance_name: &s
                 });
             }
         }
+        // Draft/REJECTED resolution may remove the sidecar before the exact
+        // recipient ACKs the feature handoff. The unique trusted feature row
+        // remains the only authority in that race; settle it without touching
+        // the watch or inferring a newer episode.
+        let feature_row_state = handoff_row_state(
+            home,
+            instance_name,
+            &correlation,
+            episode,
+            crate::inbox::CiHandoffClass::Feature,
+        );
+        if matches!(
+            feature_row_state,
+            ProtectedHandoffRowState::Pending
+                | ProtectedHandoffRowState::Processed
+                | ProtectedHandoffRowState::Ambiguous
+        ) {
+            let row_outcome = settle_ci_handoff_row_exact(
+                home,
+                instance_name,
+                &correlation,
+                episode,
+                crate::inbox::CiHandoffClass::Feature,
+            );
+            let already_acked = match row_outcome {
+                HandoffRowSettleOutcome::Settled => false,
+                HandoffRowSettleOutcome::AlreadySettled => true,
+                HandoffRowSettleOutcome::Missing => {
+                    return json!({"error": "matching inbox row not found", "code": "track_not_found"})
+                }
+                HandoffRowSettleOutcome::Ambiguous => {
+                    return json!({"error": "matching inbox row is ambiguous", "code": "row_ambiguous"})
+                }
+                HandoffRowSettleOutcome::WriteFailed => {
+                    return json!({"error": "failed to settle inbox row", "code": "row_write_failed"})
+                }
+                HandoffRowSettleOutcome::LockFailed => {
+                    return json!({"error": "failed to lock inbox row", "code": "row_lock_failed"})
+                }
+            };
+            crate::event_log::log(
+                home,
+                "ci_handoff_acknowledged",
+                instance_name,
+                &format!(
+                    "correlation={correlation} episode={episode} class=Feature track_already_resolved=true watch_preserved=true"
+                ),
+            );
+            return json!({
+                "ok": true,
+                "acked": true,
+                "already_acked": already_acked,
+                "settled_row": true,
+                "track_already_resolved": true,
+                "correlation": correlation,
+                "episode": episode,
+                "watch_preserved": true
+            });
+        }
         return json!({"error": "no matching handoff track", "code": "track_not_found"});
     }
     if exact.len() != 1 {
