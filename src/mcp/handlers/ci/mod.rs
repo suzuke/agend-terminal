@@ -195,3 +195,8 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
 #[path = "watch_status_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod watch_status_tests;
+
+#[cfg(test)]
+#[path = "ack_handoff_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ack_handoff_tests;
