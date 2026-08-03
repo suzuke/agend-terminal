@@ -36,6 +36,7 @@ struct MockChannel {
     kind: &'static str,
     caps: ChannelCapabilities,
     reply: ReplyOutcome,
+    sent: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl MockChannel {
@@ -44,7 +45,24 @@ impl MockChannel {
             kind,
             caps: ChannelCapabilities::default(),
             reply,
+            sent: None,
         })
+    }
+
+    fn counting_arc(
+        kind: &'static str,
+        reply: ReplyOutcome,
+    ) -> (Arc<dyn Channel>, Arc<std::sync::atomic::AtomicUsize>) {
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Arc::new(MockChannel {
+                kind,
+                caps: ChannelCapabilities::default(),
+                reply,
+                sent: Some(Arc::clone(&sent)),
+            }),
+            sent,
+        )
     }
 }
 
@@ -88,6 +106,9 @@ impl Channel for MockChannel {
         Err(ChannelError::NotSupported("notify".into()))
     }
     fn send_from_agent(&self, _: &str, _: AgentOutboundOp) -> Result<MsgRef, ChannelError> {
+        if let Some(sent) = &self.sent {
+            sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         match self.reply {
             ReplyOutcome::Ok => Ok(MsgRef {
                 binding: BindingRef::new(self.kind, None, ()),
@@ -98,6 +119,91 @@ impl Channel for MockChannel {
             }
         }
     }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn telegram_inline_reply_settles_late_inbox_row_s2_c() {
+    let home = tmp_home("telegram-inline-late-settlement");
+    let state = Arc::new(Mutex::new(
+        crate::channel::telegram::state::TelegramState::new_for_contract_test(
+            -1,
+            std::collections::HashMap::new(),
+            home.clone(),
+            std::collections::HashMap::new(),
+            Some(vec![1000]),
+        ),
+    ));
+    let msg = serde_json::from_value(serde_json::json!({
+        "message_id": 1,
+        "date": 1700000000,
+        "chat": { "id": -1, "type": "private", "first_name": "U" },
+        "from": { "id": 1000, "is_bot": false, "first_name": "U" },
+        "text": "late settlement question ".repeat(12),
+    }))
+    .expect("construct Telegram inbound fixture");
+
+    // Production path: Telegram inbound enqueues the row and performs its
+    // inline PTY notification before the agent's generic reply arrives.
+    crate::channel::telegram::inbound::handle_message_for_test(&state, &msg).await;
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let (channel, sends) = MockChannel::counting_arc("telegram", ReplyOutcome::Ok);
+    crate::channel::register_active_channel(channel);
+    let result = crate::mcp::handlers::handle_reply_for_test(
+        &home,
+        &serde_json::json!({"message": "answered before inbox drain"}),
+        "general",
+    );
+    assert_eq!(
+        result["message_id"], "mock-msg-1",
+        "generic reply must succeed: {result}"
+    );
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the generic reply must emit exactly one outbound send"
+    );
+
+    let drained = crate::inbox::drain(&home, "general");
+    assert!(
+        drained.is_empty(),
+        "the exact row was already settled by the successful generic reply"
+    );
+    assert_eq!(
+        crate::inbox::ack(&home, "general", None),
+        0,
+        "a late ack must not resurrect or re-settle the already-read row"
+    );
+
+    // A late drain/ack/sweep must not resurrect the already-settled logical
+    // turn or produce the channel-reply-missing escalation.
+    crate::daemon::heartbeat_pair::update_with("general", |p| {
+        if let Some(turn) = p.pending_user_turn.as_mut() {
+            turn.armed_at_ms = 0;
+        }
+    });
+    let action = crate::reply_ledger::sweep(&home, "general", &|_| None);
+    assert!(
+        matches!(action, crate::reply_ledger::SweepAction::None),
+        "late drain/ack/sweep must be quiet after the reply: {action:?}"
+    );
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for("general")
+            .pending_user_turn
+            .is_none(),
+        "late drain must not leave a pending reply obligation"
+    );
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "late drain/ack/sweep must not emit a second outbound send"
+    );
+    assert!(
+        !logs_contain("user message turn ended un-replied"),
+        "late drain/ack/sweep must not emit channel-reply-missing audit"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 // ── Fixtures ────────────────────────────────────────────────────────────

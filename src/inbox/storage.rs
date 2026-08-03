@@ -523,7 +523,7 @@ pub fn enqueue_returning_unread_count(
 /// [`enqueue_with_idle_hint`] so the latter can pre-stamp an id before
 /// the enqueue, then reference it in the PTY hint without consuming the
 /// message-by-value twice.
-pub(super) fn ensure_msg_id(msg: &mut InboxMessage) {
+pub(crate) fn ensure_msg_id(msg: &mut InboxMessage) {
     if msg.id.is_some() {
         return;
     }

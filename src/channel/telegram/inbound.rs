@@ -672,7 +672,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         let reply_target = msg
             .reply_to_message()
             .and_then(|r| resolve_reply_target(&home, &r.id.0.to_string(), &reply_chat_id));
-        let msg_obj = InboxMessage {
+        let mut msg_obj = InboxMessage {
             schema_version: 0,
             id: None,
             read_at: None,
@@ -717,11 +717,30 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             ci_handoff_class: None,
             ci_handoff_settlement: None,
         };
-        persist_or_log!(
-            inbox::enqueue(&home, &instance_name, msg_obj),
-            "telegram_dispatch",
-            instance_name
-        );
+        // Stamp the durable row identity before enqueueing so a generic reply
+        // can settle this exact row even when the inline notification is
+        // consumed before the inbox drain arms its ledger obligation.
+        crate::inbox::storage::ensure_msg_id(&mut msg_obj);
+        let inbound_msg_id = msg_obj.id.clone();
+        let inbound_from = format!("user:{username}");
+        match inbox::enqueue(&home, &instance_name, msg_obj) {
+            Ok(()) => crate::reply_ledger::arm_channel_turn(
+                &home,
+                &instance_name,
+                crate::channel::ChannelKind::Telegram,
+                inbound_msg_id,
+                Some(reply_chat_id),
+                None,
+                Some(&inbound_from),
+                Some(&text),
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                op = "telegram_dispatch",
+                target = %instance_name,
+                "op failed — result dropped (silent-loss #1630/#1647)"
+            ),
+        }
         inbox::notify_agent_with_attachments(
             &home,
             &instance_name,
@@ -745,6 +764,11 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             agent: instance_name,
         });
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn handle_message_for_test(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
+    handle_message(state, msg).await;
 }
 
 /// Read the current `agent_state` of `instance_name` from the in-process
