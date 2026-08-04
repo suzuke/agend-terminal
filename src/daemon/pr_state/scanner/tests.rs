@@ -714,6 +714,219 @@ fn open_resolved_pr_without_reviewer_assignment_requires_dispatch_3182() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+/// #3182 adversarial guard: a persisted MergeReady cache must be invalidated
+/// when the current exact-head review coverage is empty. This drives the live
+/// GhPoller -> scanner path rather than calling the classifier directly.
+#[test]
+fn cached_mergeready_without_current_review_coverage_self_heals_3182() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+
+    let mut state = merge_ready_state("owner/repo", "feat/review-dispatch-cache", head, 3182);
+    state.pr_author = "dev".into();
+    state.validated_review_receipts.clear();
+    state.last_gh_state = Some(open_pr_meta_oids(
+        3182,
+        "feat/review-dispatch-cache",
+        head,
+        base,
+    ));
+    state.merge_state = MergeState::MergeReady;
+    save(&home, &state).unwrap();
+
+    scan_and_emit_with(
+        &home,
+        &empty_registry(),
+        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182,
+            "feat/review-dispatch-cache",
+            head,
+            base,
+        )])]),
+    );
+
+    let messages = crate::inbox::drain(&home, "lead");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].kind.as_deref(),
+        Some("review-dispatch-required")
+    );
+    let reloaded = load(&home, "owner/repo", "feat/review-dispatch-cache").unwrap();
+    assert_eq!(reloaded.merge_state, MergeState::NotReady);
+    assert_eq!(
+        reloaded.review_dispatch_emitted_for_sha.as_deref(),
+        Some(head)
+    );
+    assert_eq!(reloaded.ready_emitted_for_sha, None);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// #3182 adversarial guard: an active typed assignment for the previous head
+/// cannot satisfy coverage for the current exact head.
+#[test]
+fn previous_head_assignment_does_not_satisfy_current_head_3182() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let previous_head = "1111111111111111111111111111111111111111";
+    let current_head = "2222222222222222222222222222222222222222";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch-head",
+        current_head,
+        super::super::CiConclusion::Green,
+        vec!["dev".into()],
+        ReviewClass::Single,
+    );
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "feat/review-dispatch-head",
+        "reviewer",
+        crate::types::InstanceId::new(),
+        3182,
+        previous_head,
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-3182-previous-head-assignment",
+        ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("dev".into()),
+        "review",
+        None,
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+
+    scan_and_emit_with(
+        &home,
+        &empty_registry(),
+        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182,
+            "feat/review-dispatch-head",
+            current_head,
+            base,
+        )])]),
+    );
+
+    let messages = crate::inbox::drain(&home, "lead");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].kind.as_deref(),
+        Some("review-dispatch-required")
+    );
+    assert_eq!(messages[0].reviewed_head.as_deref(), Some(current_head));
+    let reloaded = load(&home, "owner/repo", "feat/review-dispatch-head").unwrap();
+    assert_eq!(
+        reloaded.review_dispatch_emitted_for_sha.as_deref(),
+        Some(current_head)
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// #3182 adversarial guard: an old deferred enqueue failure must not clear a
+/// newer-head debounce latch after a real CI/GhPoller head advance.
+#[test]
+fn old_head_enqueue_failure_cannot_clear_new_head_debounce_3182() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let old_head = "3333333333333333333333333333333333333333";
+    let new_head = "4444444444444444444444444444444444444444";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+    let branch = "feat/review-dispatch-race";
+
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        branch,
+        old_head,
+        super::super::CiConclusion::Green,
+        vec!["dev".into()],
+        ReviewClass::Single,
+    );
+    scan_and_emit_with(
+        &home,
+        &empty_registry(),
+        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182, branch, old_head, base,
+        )])]),
+    );
+    let old_messages = crate::inbox::drain(&home, "lead");
+    assert_eq!(old_messages.len(), 1);
+    assert_eq!(
+        load(&home, "owner/repo", branch)
+            .unwrap()
+            .review_dispatch_emitted_for_sha
+            .as_deref(),
+        Some(old_head)
+    );
+
+    // Real CI ingestion advances the persisted subject and clears the old latch.
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        branch,
+        new_head,
+        super::super::CiConclusion::Green,
+        vec!["dev".into()],
+        ReviewClass::Single,
+    );
+    let mut advanced = load(&home, "owner/repo", branch).unwrap();
+    assert_eq!(advanced.head_sha, new_head);
+    assert_eq!(advanced.review_dispatch_emitted_for_sha, None);
+    // Force the next scanner tick through the GhPoller path even though the
+    // previous head was polled moments ago.
+    advanced.last_gh_poll_at = None;
+    save(&home, &advanced).unwrap();
+
+    // The live GhPoller/scanner path establishes the newer-head latch.
+    scan_and_emit_with(
+        &home,
+        &empty_registry(),
+        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182, branch, new_head, base,
+        )])]),
+    );
+    let new_messages = crate::inbox::drain(&home, "lead");
+    assert_eq!(new_messages.len(), 1);
+    assert_eq!(
+        load(&home, "owner/repo", branch)
+            .unwrap()
+            .review_dispatch_emitted_for_sha
+            .as_deref(),
+        Some(new_head)
+    );
+
+    // Simulate the older deferred item finally failing after the head advance.
+    super::deliver_review_dispatch_emits(
+        &home,
+        "owner/repo",
+        branch,
+        vec![super::PendingReviewDispatch {
+            recipient: "lead".into(),
+            message: crate::inbox::InboxMessage::new_system(
+                "system:pr-state",
+                "review-dispatch-required",
+                "old-head",
+            ),
+            head_sha: old_head.into(),
+            status: super::ReviewDispatchStatus::Required,
+        }],
+        |_home, _recipient, _message| Err(anyhow::anyhow!("forced old-head enqueue failure")),
+    );
+
+    let after_failure = load(&home, "owner/repo", branch).unwrap();
+    assert_eq!(
+        after_failure.review_dispatch_emitted_for_sha.as_deref(),
+        Some(new_head),
+        "old-head failure must not clear the newer-head debounce latch"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
 /// #3182: a corrupt assignment record is not treated as absence. The scanner
 /// must surface an actionable unavailable signal and keep the state closed.
 #[test]
