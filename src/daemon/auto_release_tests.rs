@@ -1083,7 +1083,7 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
         "owner/repo",
         branch,
         MergeState::Merged {
-            merge_commit: merge_sha,
+            merge_commit: merge_sha.clone(),
             merged_at: "2026-08-04T00:00:00Z".into(),
         },
         42,
@@ -1110,6 +1110,14 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
     assert_eq!(
         done["status"], "done",
         "task must reach terminal state: {done}"
+    );
+    assert!(
+        crate::merge_receipt::find_for_task_completion(&home, task_id, "dev").is_none(),
+        "successful terminalization must settle the task-completion proof"
+    );
+    assert!(
+        crate::merge_receipt::find(&home, "owner/repo", &merge_sha, task_id).is_some(),
+        "CI watch/unwatch must retain the underlying merge receipt"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

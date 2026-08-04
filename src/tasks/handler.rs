@@ -849,14 +849,19 @@ fn handle_done(
             )
         });
     }
-    if !force {
-        if let Err(reason) = super::assignee_completion_guard(home, &id, &caller, &record) {
-            return serde_json::json!({
-                "error": reason,
-                "code": "assignee_completion_blocked",
-            });
+    let completion_receipt = if force {
+        None
+    } else {
+        match super::assignee_completion_guard(home, &id, &caller, &record) {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                return serde_json::json!({
+                    "error": reason,
+                    "code": "assignee_completion_blocked",
+                })
+            }
         }
-    }
+    };
     // #1265: transition enforcement for done action.
     if !record
         .status
@@ -950,6 +955,15 @@ fn handle_done(
         }),
         Ok(inner) => match inner {
             Ok(Ok(_)) => {
+                // The task event is durable now, so the receipt may be settled
+                // for task completion. Keep the receipt itself until the CI
+                // watch lifecycle ends; watch/unwatch uses the same proof.
+                if let Some(receipt) = completion_receipt.as_ref() {
+                    if let Err(error) = crate::merge_receipt::settle_task_completion(home, receipt)
+                    {
+                        tracing::warn!(task_id = %id, %error, "task completion receipt settlement failed");
+                    }
+                }
                 // #789: task-completion is a workflow boundary —
                 // clean any empty `init` commits the backend has
                 // accumulated in the agent's bound worktree since

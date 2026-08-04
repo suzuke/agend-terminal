@@ -3578,6 +3578,21 @@ fn task_done_accepts_clean_squash_merged_branch_but_rejects_real_work() {
             head_oid: feature_head,
         },
     ));
+    let created_at = chrono::Utc::now();
+    crate::merge_receipt::persist(
+        &home,
+        &crate::merge_receipt::MergeReceipt {
+            repo: "example/repo".into(),
+            merge_sha: "b".repeat(40),
+            task_id: task_id.clone(),
+            task_assignee: "dev".into(),
+            merge_authority: "lead".into(),
+            pr_number: 42,
+            created_at: created_at.to_rfc3339(),
+            expires_at: (created_at + chrono::TimeDelta::hours(1)).to_rfc3339(),
+        },
+    )
+    .unwrap();
     std::fs::write(repo.join("dirty.txt"), "uncommitted\n").unwrap();
     let dirty = handle(
         &home,
@@ -3600,6 +3615,42 @@ fn task_done_accepts_clean_squash_merged_branch_but_rejects_real_work() {
         "a clean branch whose patch is on origin/main is safe to settle: {done}"
     );
 
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn branch_task_without_binding_or_merge_receipt_cannot_be_completed_by_assignee() {
+    let home = tmp_home("done-without-binding-or-receipt");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "must retain proof",
+            "assignee": "dev",
+            "branch": "feat/no-proof",
+        }),
+    );
+    let task_id = created["task"]["id"].as_str().unwrap();
+    let claimed = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    assert_eq!(claimed["task"]["status"], "claimed");
+
+    let done = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": task_id}),
+    );
+    assert_eq!(done["code"], "assignee_completion_blocked");
+    assert!(
+        done["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("unconsumed merge receipt")),
+        "missing both proofs must fail closed: {done}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 

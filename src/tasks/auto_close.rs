@@ -96,9 +96,10 @@ fn auto_close_on_report_with_mode(
     } else {
         super::assignee_completion_guard
     };
-    if completion_guard(home, correlation_id, reporter, record).is_err() {
-        return Ok(false);
-    }
+    let completion_receipt = match completion_guard(home, correlation_id, reporter, record) {
+        Ok(receipt) => receipt,
+        Err(_) => return Ok(false),
+    };
     let summary = if report_text.chars().count() > 200 {
         let truncated: String = report_text.chars().take(200).collect();
         format!("{truncated}…")
@@ -136,6 +137,15 @@ fn auto_close_on_report_with_mode(
         }
     };
     if closed {
+        if let Some(receipt) = completion_receipt.as_ref() {
+            if let Err(error) = crate::merge_receipt::settle_task_completion(home, receipt) {
+                tracing::warn!(
+                    task_id = correlation_id,
+                    %error,
+                    "auto-close completion receipt settlement failed"
+                );
+            }
+        }
         // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
         super::task_terminal_cleanup(home, correlation_id);
         // #t-…24962-7: a verdict-auto-closed task is a terminal task-done event
@@ -309,6 +319,73 @@ mod tests {
             Some(crate::task_events::TaskStatus::Done),
             "task status should be Done after auto-close"
         );
+    }
+
+    #[test]
+    fn terminal_report_uses_and_settles_merge_receipt_after_binding_release() {
+        let home = tmp_home("receipt_after_release");
+        let task_id = "t-receipt-auto-close";
+        let assignee = "dev-agent";
+        let emitter = InstanceName::from("test:seed");
+        crate::task_events::append_batch_at(
+            &home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: TaskId(task_id.into()),
+                    title: "merged task".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from(assignee)),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some("feat/merged".into()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: TaskId(task_id.into()),
+                    by: InstanceName::from(assignee),
+                },
+            ],
+        )
+        .unwrap();
+        let created_at = chrono::Utc::now();
+        let receipt = crate::merge_receipt::MergeReceipt {
+            repo: "owner/repo".into(),
+            merge_sha: "c".repeat(40),
+            task_id: task_id.into(),
+            task_assignee: assignee.into(),
+            merge_authority: "lead".into(),
+            pr_number: 42,
+            created_at: created_at.to_rfc3339(),
+            expires_at: (created_at + chrono::TimeDelta::hours(1)).to_rfc3339(),
+        };
+        crate::merge_receipt::persist(&home, &receipt).unwrap();
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            task_id,
+            assignee,
+            "Task completed successfully",
+            true,
+        )
+        .unwrap();
+        assert!(closed, "receipt-backed terminal report must auto-close");
+        assert!(
+            crate::merge_receipt::find_for_task_completion(&home, task_id, assignee).is_none(),
+            "auto-close must settle its completion proof"
+        );
+        assert!(
+            crate::merge_receipt::find(&home, &receipt.repo, &receipt.merge_sha, &receipt.task_id)
+                .is_some(),
+            "CI lifecycle must retain the underlying receipt"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// A completed child is not a reason to block a legitimate terminal report
