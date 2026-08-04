@@ -225,7 +225,7 @@ fn typed_buffer_replay_revalidates_active_assignment_2760() {
         },
     );
     assert!(
-        super::record_validated_receipt(&home, &receipt),
+        super::record_validated_receipt(&home, &receipt, None),
         "validated receipt is buffered when its exact PR state is momentarily absent"
     );
     crate::daemon::assignment_authority::revoke(
@@ -2880,7 +2880,7 @@ fn review_verdict_routes_same_branch_by_binding_repo_2920() {
     save(&home, &state).unwrap();
     let receipt = seed_route_assignment(&home, "owner/repo-b", branch, &head);
 
-    assert!(record_validated_receipt(&home, &receipt));
+    assert!(record_validated_receipt(&home, &receipt, None));
     assert_eq!(route_messages(&home, "repo-b-holder").len(), 1);
     assert!(
         route_messages(&home, "repo-a-holder").is_empty(),
@@ -2912,7 +2912,7 @@ fn review_verdict_no_matching_binding_falls_back_to_author_2920() {
     save(&home, &state).unwrap();
     let receipt = seed_route_assignment(&home, "owner/repo-c", branch, &head);
 
-    assert!(record_validated_receipt(&home, &receipt));
+    assert!(record_validated_receipt(&home, &receipt, None));
     assert_eq!(route_messages(&home, "resolved-author-2919").len(), 1);
     assert!(route_messages(&home, "repo-a-holder").is_empty());
     assert!(route_messages(&home, "repo-b-holder").is_empty());
@@ -2943,7 +2943,7 @@ fn review_verdict_routes_legacy_binding_without_source_repo_2920() {
     save(&home, &state).unwrap();
     let receipt = seed_route_assignment(&home, "owner/repo", branch, &head);
 
-    assert!(record_validated_receipt(&home, &receipt));
+    assert!(record_validated_receipt(&home, &receipt, None));
     assert_eq!(route_messages(&home, "legacy-holder").len(), 1);
     assert!(route_messages(&home, "legacy-author-fallback").is_empty());
     let _ = std::fs::remove_dir_all(&root);

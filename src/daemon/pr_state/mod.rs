@@ -1587,6 +1587,7 @@ fn apply_receipt_to_state(
 pub(crate) fn record_validated_receipt(
     home: &Path,
     receipt: &crate::review_receipt::ValidatedCodeReviewReceipt,
+    report_delivery: Option<(&str, &crate::inbox::InboxMessage)>,
 ) -> bool {
     let summary = receipt.summary();
     // Resolve binding identity before taking either the assignment or pr-state
@@ -1626,9 +1627,22 @@ pub(crate) fn record_validated_receipt(
             crate::review_receipt::ReviewVerdict::Rejected => "REJECTED",
             crate::review_receipt::ReviewVerdict::Unverified => "UNVERIFIED",
         };
-        if !is_merge_ready(state) {
-            let recipient =
-                resolve_notify_recipient_precomputed(state, binding_recipient.as_deref());
+        let recipient = resolve_notify_recipient_precomputed(state, binding_recipient.as_deref());
+        if let Some((report_recipient, report_message)) = report_delivery {
+            // #3177: `route_and_deliver` already wrote the complete report to
+            // `report_recipient`. A same-recipient verdict row is duplicate noise;
+            // a distinct branch author needs the SAME complete report, not the
+            // old status-only summary. Clear only per-inbox delivery identity so
+            // the fan-out row gets its own ack lifecycle while the validated
+            // receipt inside remains tied to the original authenticated send.
+            if recipient != report_recipient {
+                let mut msg = report_message.clone();
+                msg.id = None;
+                msg.read_at = None;
+                msg.delivering_at = None;
+                pending_notify = Some((recipient, msg));
+            }
+        } else if !is_merge_ready(state) {
             let body = format_verdict_body(state, &summary.reviewer_name, label);
             let msg =
                 crate::inbox::InboxMessage::new_system("system:pr-state", "review-verdict", body)

@@ -4304,6 +4304,7 @@ fn write_cross_team_review_fleet(
 fn seed_cross_team_review_subject(
     home: &std::path::Path,
     reviewer_id: crate::types::InstanceId,
+    review_class: crate::daemon::pr_state::ReviewClass,
 ) -> crate::daemon::assignment_authority::ActiveAssignment {
     use crate::daemon::pr_state;
     pr_state::record_ci_result(
@@ -4313,7 +4314,7 @@ fn seed_cross_team_review_subject(
         RECEIPT_HEAD_2957,
         pr_state::CiConclusion::Green,
         vec!["ct-lead".into()],
-        pr_state::ReviewClass::Single,
+        review_class,
     );
     pr_state::with_pr_state(home, "owner/repo", "fix/cross-team", |state| {
         state.pr_number = 2957;
@@ -4329,7 +4330,7 @@ fn seed_cross_team_review_subject(
         crate::review_receipt::ReviewSlot::Primary,
         "ct-lead",
         "t-cross-team-2957",
-        pr_state::ReviewClass::Single,
+        review_class,
         crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
         "cross-team review",
         None,
@@ -4372,7 +4373,11 @@ fn cross_team_code_review_report_with_valid_assignment_delivers_2957() {
     let reviewer_id = crate::types::InstanceId::new();
     let lead_id = crate::types::InstanceId::new();
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
-    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
 
     let result = handle_send(
         &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
@@ -4400,6 +4405,121 @@ fn cross_team_code_review_report_with_valid_assignment_delivers_2957() {
         !audit_log_contains(&home, "send_cross_team_blocked"),
         "valid assignment bypass must not emit contradictory blocked audit"
     );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3177 RED: one typed code-review send must not create two durable rows for
+/// the same recipient when the first verdict does not yet satisfy a dual-review
+/// gate. Today the report is delivered first, then `process_verdicts` emits a
+/// second status-only `[review-verdict]` row to the same dispatcher.
+#[test]
+fn code_review_single_send_delivers_at_most_one_row_per_recipient_3177() {
+    let home = tmp_home("3177-same-recipient-double-delivery");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Dual,
+    );
+
+    let result = handle_send(
+        &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(result["ok"], true, "review report must deliver: {result}");
+
+    let delivered = crate::inbox::drain(&home, "ct-lead");
+    assert_eq!(
+        delivered.len(),
+        1,
+        "#3177: one code_review send must create at most one row per recipient; got: {delivered:#?}"
+    );
+    assert!(
+        delivered[0].text.contains("### Evidence"),
+        "the retained notification must carry the full review report"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3177 RED: when the review-report target and branch author are distinct,
+/// each receives one notification and both notifications carry the full report.
+/// The pre-fix author copy is only a status-only `[review-verdict]` line.
+#[test]
+fn code_review_distinct_author_receives_full_report_3177() {
+    let home = tmp_home("3177-distinct-author-full-report");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Dual,
+    );
+    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/cross-team", |state| {
+        state.pr_author = "ct-imposter".into()
+    })
+    .unwrap();
+
+    let result = handle_send(
+        &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(result["ok"], true, "review report must deliver: {result}");
+
+    let dispatcher = crate::inbox::drain(&home, "ct-lead");
+    let implementer = crate::inbox::drain(&home, "ct-imposter");
+    assert_eq!(dispatcher.len(), 1, "dispatcher gets one notification");
+    assert_eq!(implementer.len(), 1, "implementer gets one notification");
+    assert!(dispatcher[0].text.contains("### Evidence"));
+    assert!(
+        implementer[0].text.contains("### Evidence"),
+        "implementer must receive the full report, got: {implementer:#?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3177: a first VERIFIED on a single-review subject immediately makes the PR
+/// merge-ready, but a distinct implementer still needs the full review report.
+/// The old status notifier was suppressed at this boundary, so the implementer
+/// received nothing at all.
+#[test]
+fn code_review_merge_ready_fans_full_report_to_distinct_author_3177() {
+    let home = tmp_home("3177-merge-ready-distinct-author");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    write_cross_team_review_fleet(&home, reviewer_id, lead_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
+    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/cross-team", |state| {
+        state.pr_author = "ct-imposter".into()
+    })
+    .unwrap();
+
+    let result = handle_send(
+        &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(result["ok"], true, "review report must deliver: {result}");
+
+    let dispatcher = crate::inbox::drain(&home, "ct-lead");
+    let implementer = crate::inbox::drain(&home, "ct-imposter");
+    assert_eq!(dispatcher.len(), 1, "dispatcher gets one notification");
+    assert_eq!(implementer.len(), 1, "implementer gets one notification");
+    assert!(implementer[0].text.contains("### Evidence"));
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4444,7 +4564,11 @@ fn cross_team_code_review_wrong_sender_blocked_2957() {
     let reviewer_id = crate::types::InstanceId::new();
     let lead_id = crate::types::InstanceId::new();
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
-    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
 
     let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
     params["from"] = json!("ct-imposter");
@@ -4478,7 +4602,11 @@ fn cross_team_code_review_wrong_recipient_blocked_2957() {
     let reviewer_id = crate::types::InstanceId::new();
     let lead_id = crate::types::InstanceId::new();
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
-    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
 
     let mut params = cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED");
     params["target"] = json!("ct-imposter");
@@ -4504,7 +4632,11 @@ fn cross_team_code_review_terminal_assignment_blocked_2957() {
     let reviewer_id = crate::types::InstanceId::new();
     let lead_id = crate::types::InstanceId::new();
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
-    let assignment = seed_cross_team_review_subject(&home, reviewer_id);
+    let assignment = seed_cross_team_review_subject(
+        &home,
+        reviewer_id,
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
 
     let _ = crate::daemon::assignment_authority::record_terminal(
         &home,

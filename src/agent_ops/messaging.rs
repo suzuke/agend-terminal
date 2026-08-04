@@ -193,7 +193,12 @@ pub(crate) fn execute_send(
     crate::inbox::settle_parent_after_successful_send(home, from, msg.parent_id.as_deref());
     inject_provenance(&request, from, target);
     let branch_checked_out = checkout_branch_if_requested(home, target, request.branch.as_deref());
-    let receipt_applied = process_verdicts(home, &msg);
+    let report_recipient = target_resolved
+        .as_ref()
+        .map(|(_, canonical_name)| canonical_name.as_str())
+        .unwrap_or(target);
+    let receipt_applied =
+        process_verdicts_with_report_recipient(home, &msg, Some(report_recipient));
     if receipt_applied || msg.validated_code_review.is_none() {
         track_dispatch(home, &request, from, target, &msg);
     } else {
@@ -603,12 +608,28 @@ fn checkout_branch_if_requested<'a>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn process_verdicts(home: &Path, msg: &crate::inbox::InboxMessage) -> bool {
+    process_verdicts_with_report_recipient(home, msg, None)
+}
+
+/// #3177: production send-time verdict ingestion knows where the full report
+/// row was already delivered. Thread that context into PR state so it can avoid
+/// a duplicate status-only row for the same recipient and fan the full report
+/// out when the bound author is distinct. The two-argument wrapper above keeps
+/// synthetic/test ingestion explicit: without a known prior delivery target it
+/// retains the legacy `[review-verdict]` notification.
+fn process_verdicts_with_report_recipient(
+    home: &Path,
+    msg: &crate::inbox::InboxMessage,
+    report_recipient: Option<&str>,
+) -> bool {
     let Some(receipt) = msg.validated_code_review.as_ref() else {
         return false;
     };
     let summary = receipt.summary();
-    if !crate::daemon::pr_state::record_validated_receipt(home, receipt) {
+    let report_delivery = report_recipient.map(|recipient| (recipient, msg));
+    if !crate::daemon::pr_state::record_validated_receipt(home, receipt, report_delivery) {
         return false;
     }
     if crate::daemon::auto_release::is_verdict_message(msg) {
