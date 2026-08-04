@@ -1047,6 +1047,74 @@ fn integration_merge_releases_via_real_scanner() {
 }
 
 #[test]
+fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
+    let home = tmp_home("merge-receipt-task-done");
+    let repo = itest_source_repo(&home, "owner/repo");
+    let branch = "feat/receipt-done";
+    let task_id = "t-receipt-done";
+    let merge_sha = "a".repeat(40);
+    itest_lease(&home, &repo, "dev", branch, task_id, false);
+    let claimed = crate::tasks::handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    assert!(claimed.get("error").is_none(), "claim failed: {claimed}");
+
+    let post_merge = crate::mcp::handlers::ci::post_merge_receipt_and_watch(
+        &home,
+        "owner/repo",
+        &merge_sha,
+        42,
+        branch,
+        "lead",
+    );
+    assert_eq!(
+        post_merge["receipt"], "persisted",
+        "real post-merge hook must persist completion provenance: {post_merge}"
+    );
+    assert!(
+        crate::merge_receipt::find(&home, "owner/repo", &merge_sha, task_id).is_some(),
+        "merge receipt must exist before auto-release"
+    );
+
+    write_pr_slug(
+        &home,
+        "owner/repo",
+        branch,
+        MergeState::Merged {
+            merge_commit: merge_sha,
+            merged_at: "2026-08-04T00:00:00Z".into(),
+        },
+        42,
+        true,
+    );
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let poller = crate::daemon::pr_state::gh_poll::tests::MockGhPoller::new(vec![Ok(vec![])]);
+    crate::daemon::pr_state::scan_and_emit_with(&home, &registry, &poller);
+    drain_queue(&home);
+    assert!(!bound(&home, "dev"), "merge must auto-release the worktree");
+
+    let done = crate::tasks::handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": task_id}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "merge receipt should replace the intentionally released live binding: {done}"
+    );
+    assert_eq!(
+        done["status"], "done",
+        "task must reach terminal state: {done}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn integration_open_pr_retains_via_real_handler() {
     let home = tmp_home("itest-open");
     write_fleet(&home, "dev");
