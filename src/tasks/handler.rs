@@ -955,15 +955,7 @@ fn handle_done(
         }),
         Ok(inner) => match inner {
             Ok(Ok(_)) => {
-                // The task event is durable now, so the receipt may be settled
-                // for task completion. Keep the receipt itself until the CI
-                // watch lifecycle ends; watch/unwatch uses the same proof.
-                if let Some(receipt) = completion_receipt.as_ref() {
-                    if let Err(error) = crate::merge_receipt::settle_task_completion(home, receipt)
-                    {
-                        tracing::warn!(task_id = %id, %error, "task completion receipt settlement failed");
-                    }
-                }
+                super::settle_completion_receipt(home, &id, completion_receipt.as_ref());
                 // #789: task-completion is a workflow boundary —
                 // clean any empty `init` commits the backend has
                 // accumulated in the agent's bound worktree since

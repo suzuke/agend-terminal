@@ -44,6 +44,18 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
 
+pub(crate) fn settle_completion_receipt(
+    home: &Path,
+    task_id: &str,
+    receipt: Option<&crate::merge_receipt::MergeReceipt>,
+) {
+    if let Some(receipt) = receipt {
+        if let Err(error) = crate::merge_receipt::settle_task_completion(home, receipt) {
+            tracing::warn!(%task_id, %error, "task completion receipt settlement failed");
+        }
+    }
+}
+
 /// Gate completion by the assignee's bound branch state. Non-assignees (the
 /// orchestrator/system paths) and branchless tasks retain their existing ACL.
 pub(crate) fn assignee_completion_guard(

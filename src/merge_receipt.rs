@@ -218,6 +218,21 @@ mod tests {
     }
 
     #[test]
+    fn multiple_unconsumed_receipts_for_the_same_task_fail_closed() {
+        let home = tmp_home("ambiguous");
+        let first = valid_receipt("t-ambiguous", "dev", 'c');
+        let second = valid_receipt("t-ambiguous", "dev", 'd');
+        persist(&home, &first).unwrap();
+        persist(&home, &second).unwrap();
+
+        assert!(
+            find_for_task_completion(&home, "t-ambiguous", "dev").is_none(),
+            "multiple candidate merges must not authorize task completion"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn expired_and_malformed_receipts_never_authorize_task_completion() {
         let home = tmp_home("invalid");
         let mut expired = valid_receipt("t-expired", "dev", 'b');

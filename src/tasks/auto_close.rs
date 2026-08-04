@@ -137,15 +137,7 @@ fn auto_close_on_report_with_mode(
         }
     };
     if closed {
-        if let Some(receipt) = completion_receipt.as_ref() {
-            if let Err(error) = crate::merge_receipt::settle_task_completion(home, receipt) {
-                tracing::warn!(
-                    task_id = correlation_id,
-                    %error,
-                    "auto-close completion receipt settlement failed"
-                );
-            }
-        }
+        super::settle_completion_receipt(home, correlation_id, completion_receipt.as_ref());
         // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
         super::task_terminal_cleanup(home, correlation_id);
         // #t-…24962-7: a verdict-auto-closed task is a terminal task-done event
