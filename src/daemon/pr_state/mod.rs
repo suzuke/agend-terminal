@@ -100,6 +100,15 @@ pub struct PrState {
     /// never interferes with the terminal-replay suppression that field drives.
     #[serde(default)]
     pub diagnostic_emitted_for_sha: Option<String>,
+    /// #3182 debounce key for the merge-authority-only diagnostic emitted when
+    /// an authoritative open PR has no exact typed reviewer assignment.
+    #[serde(default)]
+    pub review_dispatch_emitted_for_sha: Option<String>,
+    /// #3182 debounce key for the fail-closed assignment-authority-unavailable
+    /// diagnostic. Kept separate so a transient unreadable store does not mask
+    /// a later missing-assignment diagnostic at the same head.
+    #[serde(default)]
+    pub review_dispatch_unavailable_emitted_for_sha: Option<String>,
     /// #973 cross-audit Pushback C: tracks whether implementer armed
     /// `gh pr merge --auto` against the current head. Cleared on
     /// head_sha advance (force-push cancels GitHub's auto-merge).
@@ -432,6 +441,8 @@ pub fn apply(state: &mut PrState, event: Event<'_>) {
                 state.auto_armed_for_sha = None;
                 state.ready_emitted_for_sha = None;
                 state.diagnostic_emitted_for_sha = None;
+                state.review_dispatch_emitted_for_sha = None;
+                state.review_dispatch_unavailable_emitted_for_sha = None;
                 state
                     .validated_review_receipts
                     .retain(|r| r.reviewed_head == head_sha);
@@ -930,10 +941,15 @@ pub fn ensure_from_scm(
     // Phase 1: fast path — file already exists. Reconcile review_class
     // under flock (#3040: persisted Unresolved must adopt resolved class).
     let existing = with_pr_state(home, repo, branch, |state| {
+        let previous_class = state.review_class;
         let was_unresolved = matches!(state.review_class, ReviewClass::Unresolved);
         state.review_class = reconcile_review_class(state.review_class, review_class);
         if was_unresolved && !matches!(state.review_class, ReviewClass::Unresolved) {
             state.diagnostic_emitted_for_sha = None;
+        }
+        if state.review_class != previous_class {
+            state.review_dispatch_emitted_for_sha = None;
+            state.review_dispatch_unavailable_emitted_for_sha = None;
         }
         state.clone()
     })?;
@@ -1287,6 +1303,8 @@ pub fn new_for_branch(
         review_class,
         ready_emitted_for_sha: None,
         diagnostic_emitted_for_sha: None,
+        review_dispatch_emitted_for_sha: None,
+        review_dispatch_unavailable_emitted_for_sha: None,
         auto_armed: false,
         auto_armed_for_sha: None,
         auto_armed_at: None,
@@ -1435,10 +1453,15 @@ pub fn record_ci_result(
             // create-only before, stranding persisted Unresolved/legacy-Single. On a
             // transition OUT of Unresolved, clear the diagnostic debounce so the
             // pr-ready flow takes over at this head.
+            let previous_class = state.review_class;
             let was_unresolved = matches!(state.review_class, ReviewClass::Unresolved);
             state.review_class = reconcile_review_class(state.review_class, review_class);
             if was_unresolved && !matches!(state.review_class, ReviewClass::Unresolved) {
                 state.diagnostic_emitted_for_sha = None;
+            }
+            if state.review_class != previous_class {
+                state.review_dispatch_emitted_for_sha = None;
+                state.review_dispatch_unavailable_emitted_for_sha = None;
             }
             if !subscribers.is_empty() && state.subscribers.is_empty() {
                 state.subscribers = subscribers;

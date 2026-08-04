@@ -60,6 +60,8 @@ pub(super) fn new_state(head: &str, class: ReviewClass) -> PrState {
         review_class: class,
         ready_emitted_for_sha: None,
         diagnostic_emitted_for_sha: None,
+        review_dispatch_emitted_for_sha: None,
+        review_dispatch_unavailable_emitted_for_sha: None,
         auto_armed: false,
         auto_armed_for_sha: None,
         auto_armed_at: None,

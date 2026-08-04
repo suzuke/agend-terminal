@@ -574,6 +574,327 @@ fn behind_poller(pr: u64) -> MockGhPoller {
     MockGhPoller::new(vec![Ok(vec![open_pr_meta(pr, "feat/x")])])
 }
 
+/// #3182 RED: the production CI-ingestion → GhPoller → scanner path must
+/// surface a missing exact reviewer assignment to merge authority. This is
+/// intentionally written before the production diagnostic exists.
+#[test]
+fn open_resolved_pr_without_reviewer_assignment_requires_dispatch_3182() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+
+    // Real CI observation entry: this creates the persisted PR state and
+    // leaves it NotReady because no typed review receipt exists.
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch",
+        head,
+        super::super::CiConclusion::Green,
+        vec!["dev".into()],
+        ReviewClass::Dual,
+    );
+
+    // Real scanner entry: apply_gh_poll observes the authoritative open PR,
+    // including exact head/base OIDs, before the scanner evaluates diagnostics.
+    let poller = || {
+        MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182,
+            "feat/review-dispatch",
+            head,
+            base,
+        )])])
+    };
+    scan_and_emit_with(&home, &empty_registry(), &poller());
+
+    let messages = crate::inbox::drain(&home, "lead");
+    assert_eq!(messages.len(), 1, "missing assignment must be actionable");
+    assert_eq!(
+        messages[0].kind.as_deref(),
+        Some("review-dispatch-required"),
+        "diagnostic must target review dispatch, never pr-ready"
+    );
+    assert_eq!(messages[0].reviewed_head.as_deref(), Some(head));
+
+    let state = load(&home, "owner/repo", "feat/review-dispatch").unwrap();
+    assert_eq!(state.merge_state, MergeState::NotReady);
+
+    // Same-head scanner ticks are debounced.
+    scan_and_emit_with(&home, &empty_registry(), &poller());
+    assert!(crate::inbox::drain(&home, "lead").is_empty());
+
+    // One exact typed assignment is only 1/2 Dual coverage, so the existing
+    // same-head diagnostic remains latched as Required.
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "feat/review-dispatch",
+        "reviewer",
+        crate::types::InstanceId::new(),
+        3182,
+        head,
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-3182-review",
+        ReviewClass::Dual,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("dev".into()),
+        "review",
+        None,
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+    scan_and_emit_with(&home, &empty_registry(), &poller());
+    assert!(
+        crate::inbox::drain(&home, "lead").is_empty(),
+        "same-head diagnostic remains debounced while Dual coverage is 1/2"
+    );
+    let partial = load(&home, "owner/repo", "feat/review-dispatch").unwrap();
+    assert_eq!(
+        partial.review_dispatch_emitted_for_sha.as_deref(),
+        Some(head),
+        "Dual 1/2 coverage must remain Required"
+    );
+
+    let assignment_two = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "feat/review-dispatch",
+        "reviewer-two",
+        crate::types::InstanceId::new(),
+        3182,
+        head,
+        crate::review_receipt::ReviewSlot::Secondary,
+        "lead",
+        "t-3182-review-two",
+        ReviewClass::Dual,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("dev".into()),
+        "review",
+        None,
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment_two).unwrap();
+    scan_and_emit_with(&home, &empty_registry(), &poller());
+    assert!(
+        crate::inbox::drain(&home, "lead").is_empty(),
+        "two distinct exact typed assignments satisfy Dual coverage"
+    );
+    let satisfied = load(&home, "owner/repo", "feat/review-dispatch").unwrap();
+    assert!(satisfied.review_dispatch_emitted_for_sha.is_none());
+    assert_eq!(satisfied.merge_state, MergeState::NotReady);
+
+    // Revocation reopens the same-head obligation and re-arms one diagnostic.
+    crate::daemon::assignment_authority::retire_if_id_matches(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch",
+        "reviewer",
+        assignment.assignment_id,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .unwrap();
+    crate::daemon::assignment_authority::retire_if_id_matches(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch",
+        "reviewer-two",
+        assignment_two.assignment_id,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .unwrap();
+    scan_and_emit_with(&home, &empty_registry(), &poller());
+    let rearmed = crate::inbox::drain(&home, "lead");
+    assert_eq!(rearmed.len(), 1);
+    assert_eq!(rearmed[0].kind.as_deref(), Some("review-dispatch-required"));
+    assert!(
+        !rearmed[0].text.contains("pr-ready-for-merge"),
+        "review-dispatch diagnostic must never be a merge-ready signal"
+    );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// #3182: a corrupt assignment record is not treated as absence. The scanner
+/// must surface an actionable unavailable signal and keep the state closed.
+#[test]
+fn unreadable_reviewer_assignment_authority_fails_closed_3182() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let head = "fedcba9876543210fedcba9876543210fedcba98";
+    let base = "0123456789abcdef0123456789abcdef01234567";
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch-unavailable",
+        head,
+        super::super::CiConclusion::Green,
+        vec!["dev".into()],
+        ReviewClass::Single,
+    );
+
+    let corrupt = crate::daemon::assignment_authority::record_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch-unavailable",
+        "reviewer",
+    );
+    std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+    std::fs::write(&corrupt, b"{not-json").unwrap();
+
+    scan_and_emit_with(
+        &home,
+        &empty_registry(),
+        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182,
+            "feat/review-dispatch-unavailable",
+            head,
+            base,
+        )])]),
+    );
+
+    let messages = crate::inbox::drain(&home, "lead");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].kind.as_deref(),
+        Some("review-dispatch-unavailable")
+    );
+    assert!(messages[0].text.contains("unreadable"));
+    let state = load(&home, "owner/repo", "feat/review-dispatch-unavailable").unwrap();
+    assert!(state.authority_unknown);
+    assert_eq!(state.merge_state, MergeState::NotReady);
+
+    // The existing assignment reconciler clears the fail-closed latch once the
+    // corrupt authority is repaired, without requiring a new CI observation.
+    std::fs::remove_file(&corrupt).unwrap();
+    crate::daemon::assignment_authority::redrive_reserved(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch-unavailable",
+    );
+    let repaired = load(&home, "owner/repo", "feat/review-dispatch-unavailable").unwrap();
+    assert!(!repaired.authority_unknown);
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// #3182: deferred diagnostic delivery is retryable. A failed enqueue clears
+/// only the same-head latch; a concurrent head advance remains protected.
+#[test]
+fn review_dispatch_debounce_resets_after_enqueue_failure_3182() {
+    let home = tmp_home(line!());
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    let mut state = new_for_branch(
+        "owner/repo",
+        "feat/review-dispatch-retry",
+        head,
+        ReviewClass::Single,
+    );
+    state.review_dispatch_emitted_for_sha = Some(head.into());
+    save(&home, &state).unwrap();
+
+    super::deliver_review_dispatch_emits(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch-retry",
+        vec![super::PendingReviewDispatch {
+            recipient: "lead".into(),
+            message: crate::inbox::InboxMessage::new_system(
+                "system:pr-state",
+                "review-dispatch-required",
+                "retry",
+            ),
+            head_sha: head.into(),
+            status: super::ReviewDispatchStatus::Required,
+        }],
+        |_home, _recipient, _message| Err(anyhow::anyhow!("forced enqueue failure")),
+    );
+
+    let retryable = load(&home, "owner/repo", "feat/review-dispatch-retry").unwrap();
+    assert!(retryable.review_dispatch_emitted_for_sha.is_none());
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// #3182: Dual coverage is the distinct-identity union of exact active typed
+/// assignments and matching typed receipts; the same reviewer counts once.
+#[test]
+fn dual_review_dispatch_coverage_unions_assignment_and_receipt_3182() {
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    let mut state = new_for_branch(
+        "owner/repo",
+        "feat/review-dispatch-union",
+        head,
+        ReviewClass::Dual,
+    );
+    state.pr_number = 3182;
+    state.last_gh_state = Some(open_pr_meta_oids(
+        3182,
+        "feat/review-dispatch-union",
+        head,
+        "1234567890abcdef1234567890abcdef12345678",
+    ));
+    let first_id = crate::types::InstanceId::new();
+    let second_id = crate::types::InstanceId::new();
+    let first = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "feat/review-dispatch-union",
+        "reviewer-one",
+        first_id,
+        3182,
+        head,
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-3182-union-one",
+        ReviewClass::Dual,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("dev".into()),
+        "review",
+        None,
+        None,
+        "2026-08-04T00:00:00Z",
+    );
+    state
+        .validated_review_receipts
+        .push(crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:t-3182-union-two".into(),
+            source_id: "t-3182-union-two".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: second_id,
+            reviewer_name: "reviewer-two".into(),
+            repo: state.repo.clone(),
+            pr_number: state.pr_number,
+            branch: state.branch.clone(),
+            task_id: "t-3182-union-two".into(),
+            reviewed_head: head.into(),
+            review_class: ReviewClass::Dual,
+            slot: crate::review_receipt::ReviewSlot::Secondary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        });
+    assert_eq!(
+        super::review_dispatch_status(
+            &state,
+            crate::daemon::assignment_authority::BranchAuthority::Active,
+            &[first.clone()],
+        ),
+        super::ReviewDispatchStatus::Satisfied,
+        "one exact assignment + one distinct exact receipt satisfies Dual"
+    );
+
+    let same_reviewer_receipt = crate::review_receipt::ReviewReceiptSummary {
+        reviewer_instance_id: first_id,
+        ..state.validated_review_receipts[0].clone()
+    };
+    state.validated_review_receipts[0] = same_reviewer_receipt;
+    assert_eq!(
+        super::review_dispatch_status(
+            &state,
+            crate::daemon::assignment_authority::BranchAuthority::Active,
+            &[first],
+        ),
+        super::ReviewDispatchStatus::Required,
+        "the same reviewer in assignment + receipt counts once"
+    );
+}
+
 /// RED#1: behind ⇒ suppress pr-ready + exactly ONE durable [pr-needs-rebase]
 /// to each deduped {merge authority (lead), PR owner (dev)}.
 #[test]
