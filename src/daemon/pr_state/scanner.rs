@@ -118,12 +118,11 @@ fn deliver_review_dispatch_emits<F>(
                             state.review_dispatch_emitted_for_sha = None;
                         }
                     }
-                    ReviewDispatchStatus::AuthorityUnavailable => {
+                    ReviewDispatchStatus::AuthorityUnavailable
                         if state.review_dispatch_unavailable_emitted_for_sha.as_deref()
-                            == Some(head.as_str())
-                        {
-                            state.review_dispatch_unavailable_emitted_for_sha = None;
-                        }
+                            == Some(head.as_str()) =>
+                    {
+                        state.review_dispatch_unavailable_emitted_for_sha = None;
                     }
                     _ => {}
                 }

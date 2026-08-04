@@ -873,7 +873,7 @@ fn dual_review_dispatch_coverage_unions_assignment_and_receipt_3182() {
         super::review_dispatch_status(
             &state,
             crate::daemon::assignment_authority::BranchAuthority::Active,
-            &[first.clone()],
+            std::slice::from_ref(&first),
         ),
         super::ReviewDispatchStatus::Satisfied,
         "one exact assignment + one distinct exact receipt satisfies Dual"
