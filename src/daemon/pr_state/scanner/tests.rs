@@ -734,17 +734,13 @@ fn cached_mergeready_without_current_review_coverage_self_heals_3182() {
         base,
     ));
     state.merge_state = MergeState::MergeReady;
+    state.ready_emitted_for_sha = Some(head.into());
     save(&home, &state).unwrap();
 
     scan_and_emit_with(
         &home,
         &empty_registry(),
-        &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
-            3182,
-            "feat/review-dispatch-cache",
-            head,
-            base,
-        )])]),
+        &MockGhPoller::new(vec![Err(anyhow::anyhow!("forced observation failure"))]),
     );
 
     let messages = crate::inbox::drain(&home, "lead");
@@ -759,7 +755,7 @@ fn cached_mergeready_without_current_review_coverage_self_heals_3182() {
         reloaded.review_dispatch_emitted_for_sha.as_deref(),
         Some(head)
     );
-    assert_eq!(reloaded.ready_emitted_for_sha, None);
+    assert_eq!(reloaded.ready_emitted_for_sha.as_deref(), Some(head));
     let _ = std::fs::remove_dir_all(home);
 }
 
@@ -892,13 +888,16 @@ fn old_head_enqueue_failure_cannot_clear_new_head_debounce_3182() {
     );
     let new_messages = crate::inbox::drain(&home, "lead");
     assert_eq!(new_messages.len(), 1);
+    let mut current = load(&home, "owner/repo", branch).unwrap();
     assert_eq!(
-        load(&home, "owner/repo", branch)
-            .unwrap()
-            .review_dispatch_emitted_for_sha
-            .as_deref(),
+        current.review_dispatch_emitted_for_sha.as_deref(),
         Some(new_head)
     );
+    // Seed the persisted debounce with the stale item being delivered. The
+    // current state is still the newer head; the outer exact-head guard must
+    // preserve this latch while the old deferred item fails.
+    current.review_dispatch_emitted_for_sha = Some(old_head.into());
+    save(&home, &current).unwrap();
 
     // Simulate the older deferred item finally failing after the head advance.
     super::deliver_review_dispatch_emits(
@@ -921,8 +920,8 @@ fn old_head_enqueue_failure_cannot_clear_new_head_debounce_3182() {
     let after_failure = load(&home, "owner/repo", branch).unwrap();
     assert_eq!(
         after_failure.review_dispatch_emitted_for_sha.as_deref(),
-        Some(new_head),
-        "old-head failure must not clear the newer-head debounce latch"
+        Some(old_head),
+        "old-head failure must not clear the current state's debounce latch"
     );
     let _ = std::fs::remove_dir_all(home);
 }
