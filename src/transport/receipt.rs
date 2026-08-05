@@ -338,6 +338,7 @@ mod tests {
         ));
         let store = ReceiptStore::for_instance(&home, "agent/one").expect("store");
         let body_padding = "x".repeat(120_000);
+        let mut delivery_ids = Vec::new();
         for index in 0..40 {
             let envelope = DeliveryEnvelope::new(
                 "agent/one",
@@ -346,6 +347,7 @@ mod tests {
                 format!("body-{index}-{body_padding}"),
                 None,
             );
+            delivery_ids.push(envelope.delivery_id);
             store.record_queued(&envelope).expect("queued");
             store
                 .record(DeliveryReceipt::for_state(
@@ -375,9 +377,18 @@ mod tests {
             }
         }
         assert!(body_owners.values().all(|count| *count == 1));
-        assert!(std::str::from_utf8(&bytes)
-            .expect("utf8")
-            .contains("body-39-"));
+        let receipt_text = std::str::from_utf8(&bytes).expect("utf8");
+        for (index, body_marker) in [(33, "body-33-"), (39, "body-39-")] {
+            assert_eq!(
+                body_owners.get(&delivery_ids[index]),
+                Some(&1_u32),
+                "retained delivery {index} must have exactly one body owner"
+            );
+            assert!(
+                receipt_text.contains(body_marker),
+                "retained delivery {index} body must survive compaction"
+            );
+        }
 
         #[cfg(unix)]
         {

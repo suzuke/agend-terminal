@@ -538,6 +538,7 @@ mod tests {
 
     #[test]
     fn stale_transport_delivery_cannot_recreate_receipts_after_cleanup() {
+        let _ff = test_support::force_full_guard();
         let home = std::env::temp_dir().join(format!(
             "agend-transport-worker-teardown-{}",
             uuid::Uuid::new_v4()
@@ -585,6 +586,55 @@ mod tests {
         assert!(
             !delivery_path.parent().is_some_and(std::path::Path::exists),
             "teardown must leave no delivery directory after a stale worker delivery"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn delivery_enqueued_during_teardown_cannot_resurrect_receipts() {
+        let _ff = test_support::force_full_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-teardown-window-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent = "legacy-agent";
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  legacy-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+
+        let cleanup = begin_transport_cleanup(&home, agent);
+        assert!(enqueue_transport_delivery(&home, agent, "wake during teardown").is_ok());
+        crate::transport::remove_instance_delivery_state(&home, agent).expect("cleanup");
+        drop(cleanup);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while test_support::transport_dispatch_count(&home, agent) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, agent),
+            1,
+            "the delivery enqueued during teardown must be processed before inspecting state"
+        );
+
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        assert!(
+            !delivery_path.exists(),
+            "a delivery enqueued during teardown must not resurrect the receipt body"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "a delivery enqueued during teardown must not resurrect the receipt lock"
+        );
+        assert!(
+            !delivery_path.parent().is_some_and(std::path::Path::exists),
+            "a delivery enqueued during teardown must leave no delivery directory"
         );
 
         let _ = std::fs::remove_dir_all(home);
