@@ -241,6 +241,15 @@ pub(crate) fn full_delete_instance_with_runtime(
             let _ = std::fs::remove_file(inbox_id.with_extension("jsonl.lock"));
         }
     }
+
+    // Structured transport receipts are daemon-owned per-instance state. Stop
+    // queued/in-flight transport work before removing its JSONL and lock; the
+    // cleanup guard also invalidates jobs enqueued during this teardown so a
+    // late worker dequeue cannot recreate the deleted instance's receipts.
+    let _transport_cleanup = crate::daemon::delivery_worker::begin_transport_cleanup(home, name);
+    if let Err(e) = crate::transport::remove_instance_delivery_state(home, name) {
+        step_errors.push(format!("transport delivery cleanup: {e}"));
+    }
     crate::teams::remove_member_from_all(home, name);
 
     // #808: orphan tasks whose owner is the deleted instance so the
@@ -534,6 +543,10 @@ pub(crate) fn name_residual_anywhere(
     }
     if crate::daemon::pr_state::has_subscriber(home, name) {
         sources.push("pr-state");
+    }
+    let delivery_path = crate::transport::delivery_path_for_instance(home, name);
+    if delivery_path.exists() || delivery_path.with_extension("jsonl.lock").exists() {
+        sources.push("transport/deliveries");
     }
     // #1907: the daemon-created default workspace dir (`workspace/<name>`). Only a
     // residual when the entry had no explicit `working_directory` AND the cleanup

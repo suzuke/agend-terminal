@@ -11,7 +11,10 @@ mod receipt;
 mod registry;
 
 pub(crate) use envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
-pub(crate) use receipt::{DeliveryReceipt, DeliveryState, ReceiptStore};
+pub(crate) use receipt::{
+    delivery_path_for_instance, remove_instance_delivery_state, DeliveryReceipt, DeliveryState,
+    ReceiptStore,
+};
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;
 

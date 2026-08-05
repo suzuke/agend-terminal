@@ -6,9 +6,9 @@ use crate::backend::Backend;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Resolve the declared backend.  A missing or stale fleet entry is not a
-/// reason to guess NativeShared from a command basename, so the safe explicit
-/// mode is LegacyPty.
+/// Resolve the declared backend. A missing or stale fleet entry is not enough
+/// to guess NativeShared, but a persisted structured session artifact is an
+/// explicit mode anchor and must never silently downgrade to PTY.
 pub(crate) fn backend_for_instance(home: &Path, instance: &str) -> Option<Backend> {
     crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
@@ -34,10 +34,34 @@ pub(crate) fn mode_for_backend(backend: &Backend) -> TransportMode {
 }
 
 pub(crate) fn mode_for_instance(home: &Path, instance: &str) -> TransportMode {
+    if persisted_native_shared_hint(home, instance) {
+        return TransportMode::NativeShared;
+    }
     backend_for_instance(home, instance)
         .as_ref()
         .map(mode_for_backend)
         .unwrap_or(TransportMode::LegacyPty)
+}
+
+/// A session locator is written only after the structured adapter has selected
+/// the Codex session. Keep that mode even when fleet.yaml is temporarily
+/// missing, stale, or unreadable. If the artifact itself is malformed or has
+/// an unsafe type, choose NativeShared so locator resolution fails closed
+/// instead of falling back to a PTY write.
+fn persisted_native_shared_hint(home: &Path, instance: &str) -> bool {
+    let path = session_path(home, instance);
+    match std::fs::metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return true;
+            }
+            // Any regular session artifact is an explicit structured-mode
+            // anchor. The actual locator parse below remains fail-closed.
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 fn session_path(home: &Path, instance: &str) -> PathBuf {
@@ -222,6 +246,72 @@ mod tests {
             "instances:\n  codex-agent:\n    backend: codex\n",
         )
         .expect("fleet");
+        std::fs::write(session_path(&home, "codex-agent"), b"{not valid json")
+            .expect("corrupt locator");
+        let pty_calls = Arc::new(AtomicUsize::new(0));
+        let pty_calls_for_injector = Arc::clone(&pty_calls);
+        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+            pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(pty_calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn persisted_structured_mode_does_not_downgrade_when_fleet_is_unreadable() {
+        for (tag, fleet_contents) in [
+            ("missing", None),
+            ("corrupt", Some("instances: [")),
+            (
+                "stale",
+                Some("instances:\n  codex-agent:\n    backend: claude\n"),
+            ),
+        ] {
+            let home = std::env::temp_dir().join(format!(
+                "agend-transport-persisted-mode-{tag}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(home.join("transport/sessions")).expect("home");
+            if let Some(contents) = fleet_contents {
+                std::fs::write(crate::fleet::fleet_yaml_path(&home), contents).expect("fleet");
+            }
+            std::fs::write(
+                session_path(&home, "codex-agent"),
+                serde_json::to_vec(&SessionLocator::codex(
+                    PathBuf::from("/tmp/missing-codex.sock"),
+                    Some("thread".to_string()),
+                ))
+                .expect("locator"),
+            )
+            .expect("session locator");
+            let pty_calls = Arc::new(AtomicUsize::new(0));
+            let pty_calls_for_injector = Arc::clone(&pty_calls);
+            let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+                pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            assert!(
+                result.is_err(),
+                "structured resolution must fail closed: {tag}"
+            );
+            assert_eq!(
+                pty_calls.load(Ordering::SeqCst),
+                0,
+                "PTY fallback for {tag}"
+            );
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn malformed_persisted_locator_keeps_structured_mode_when_fleet_is_missing() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-malformed-mode-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join("transport/sessions")).expect("home");
         std::fs::write(session_path(&home, "codex-agent"), b"{not valid json")
             .expect("corrupt locator");
         let pty_calls = Arc::new(AtomicUsize::new(0));

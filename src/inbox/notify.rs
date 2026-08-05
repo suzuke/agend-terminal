@@ -1491,7 +1491,7 @@ mod should_defer_direct_inject_tests_1513pr2 {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod structured_transport_delivery_tests {
     use super::inject_notification_with_submit;
-    use crate::transport::{DeliveryState, ReceiptStore};
+    use crate::transport::{DeliveryState, ReceiptStore, SessionLocator};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1524,6 +1524,45 @@ mod structured_transport_delivery_tests {
             started.elapsed() < std::time::Duration::from_millis(500),
             "inject caller must not run Codex socket/RPC readiness inline"
         );
+    }
+
+    /// Mutation pin for the offload boundary: a connected Codex endpoint that
+    /// stalls before its handshake would block the old inline implementation,
+    /// but must not block the caller that only enqueues the transport job.
+    #[cfg(unix)]
+    #[test]
+    fn stalled_codex_handshake_does_not_block_inject_caller() {
+        use std::os::unix::net::UnixListener;
+
+        let home = tmp_home("stalled-handshake");
+        let socket =
+            std::path::PathBuf::from(format!("/tmp/agend-codex-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket).expect("bind stalled Codex socket");
+        std::fs::create_dir_all(home.join("transport/sessions")).expect("session dir");
+        std::fs::write(
+            home.join("transport/sessions/codex-agent.json"),
+            serde_json::to_vec(&SessionLocator::codex(
+                socket.clone(),
+                Some("thread".to_string()),
+            ))
+            .expect("locator"),
+        )
+        .expect("session locator");
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept stalled Codex client");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        let started = std::time::Instant::now();
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "inject caller must not wait for a stalled Codex handshake"
+        );
+        server.join().expect("stalled Codex worker");
+        std::fs::remove_file(socket).ok();
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
