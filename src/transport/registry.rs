@@ -78,15 +78,55 @@ pub(crate) fn save_session_locator(
     let path = session_path(home, instance);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let bytes = serde_json::to_vec_pretty(locator)?;
-    crate::store::atomic_write(&path, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    secure_atomic_write(&path, &bytes)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn secure_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use uuid::Uuid;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session locator has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("locator.json");
+    let temp = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&temp, path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        crate::store::fsync_parent_dir(path);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn secure_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    crate::store::atomic_write(path, bytes)
 }
 
 pub(crate) fn load_session_locator(home: &Path, instance: &str) -> anyhow::Result<SessionLocator> {
@@ -186,6 +226,8 @@ fn locator_for_instance(
         model: None,
         event_cursor: None,
         managed: false,
+        server_pid: None,
+        server_start_token: None,
     })
 }
 
@@ -234,8 +276,7 @@ pub(crate) fn prepare_opencode_tui_session(
     if locator.model.is_none() {
         locator.model = opencode_model_arg(args);
     }
-    let mut adapter = OpenCodeNativeShared::new(home, instance);
-    adapter.prepare_for_tui(locator, working_dir)
+    super::opencode_server::prepare_resident_tui(home, instance, locator, working_dir)
 }
 
 fn opencode_model_arg(args: &[String]) -> Option<String> {
@@ -315,10 +356,7 @@ where
                 let mut adapter = CodexNativeShared::new(home, instance);
                 adapter.deliver_blocking(envelope)
             }
-            "opencode" => {
-                let mut adapter = OpenCodeNativeShared::new(home, instance);
-                adapter.deliver_blocking(envelope)
-            }
+            "opencode" => super::opencode_server::deliver_resident(home, instance, envelope),
             backend => Err(anyhow::anyhow!(
                 "NativeShared backend {backend:?} has no registered adapter"
             )),
@@ -467,5 +505,41 @@ mod tests {
             opencode_model_arg(&["-m=openai/gpt-5".to_string()]),
             Some("openai/gpt-5".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_locator_and_parent_are_private_before_secret_is_persisted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-private-locator-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            Some("session".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        save_session_locator(&home, "agent", &locator).expect("save locator");
+        let path = session_path(&home, "agent");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("locator metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().expect("parent"))
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 }

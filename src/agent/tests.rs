@@ -3084,6 +3084,13 @@ fn opencode_data_dir_is_per_instance_1519() {
     );
 }
 
+#[test]
+fn opencode_data_dir_sanitizes_instance_component() {
+    let home = std::path::Path::new("/tmp/agend-home");
+    let path = opencode_data_dir(home, "../outside/instance");
+    assert_eq!(path, home.join("backend-data/opencode/.._outside_instance"));
+}
+
 /// The core #1519 regression: two opencode instances resolve to DISTINCT
 /// XDG_DATA_HOME values — the property that prevents the shared-session
 /// collision. Pre-fix there was no per-instance XDG at all (both inherited the

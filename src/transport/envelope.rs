@@ -36,6 +36,14 @@ pub(crate) struct SessionLocator {
     /// endpoints can opt out while still using the same adapter.
     #[serde(default)]
     pub managed: bool,
+    /// PID of the managed `opencode serve` process, when one was launched by
+    /// AgEnD.  The start token below makes this safe across PID reuse and
+    /// daemon restarts.
+    #[serde(default)]
+    pub server_pid: Option<u32>,
+    /// OS process-start identity paired with `server_pid`.
+    #[serde(default)]
+    pub server_start_token: Option<u64>,
 }
 
 impl SessionLocator {
@@ -51,6 +59,8 @@ impl SessionLocator {
             model: None,
             event_cursor: None,
             managed: false,
+            server_pid: None,
+            server_start_token: None,
         }
     }
 
@@ -71,6 +81,8 @@ impl SessionLocator {
             model: None,
             event_cursor: Some(0),
             managed: true,
+            server_pid: None,
+            server_start_token: None,
         }
     }
 

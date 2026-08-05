@@ -688,7 +688,9 @@ fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// Pure — testable without a real spawn. Lives under `$AGEND_HOME/backend-data`
 /// so the instance-delete teardown can GC it (see `full_delete_instance`).
 pub(crate) fn opencode_data_dir(home: &std::path::Path, instance: &str) -> PathBuf {
-    home.join("backend-data").join("opencode").join(instance)
+    home.join("backend-data")
+        .join("opencode")
+        .join(crate::transport::safe_component(instance))
 }
 
 /// #1519: the per-instance `XDG_DATA_HOME` to inject for an opencode spawn, or

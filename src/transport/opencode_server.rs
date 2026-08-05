@@ -12,12 +12,14 @@ use super::{
 use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::sync::OnceLock;
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -314,6 +316,7 @@ struct SseDecoder {
     raw: Vec<u8>,
     body: Vec<u8>,
     chunked: bool,
+    overflowed: bool,
 }
 
 impl SseDecoder {
@@ -322,15 +325,30 @@ impl SseDecoder {
             raw: initial,
             body: Vec::new(),
             chunked,
+            overflowed: false,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        if self.overflowed {
+            return Vec::new();
+        }
         self.raw.extend_from_slice(bytes);
+        if self.raw.len() > MAX_BODY {
+            self.raw.clear();
+            self.body.clear();
+            self.overflowed = true;
+            return Vec::new();
+        }
         if self.chunked {
             self.dechunk();
         } else {
             self.body.append(&mut self.raw);
+            if self.body.len() > MAX_BODY {
+                self.body.clear();
+                self.overflowed = true;
+                return Vec::new();
+            }
         }
         self.split_events()
     }
@@ -344,11 +362,13 @@ impl SseDecoder {
             let size_text = size_line.split(';').next().unwrap_or_default().trim();
             let Ok(size) = usize::from_str_radix(size_text, 16) else {
                 self.raw.clear();
+                self.overflowed = true;
                 return;
             };
             let data_start = size_end + 2;
             let Some(data_end) = data_start.checked_add(size) else {
                 self.raw.clear();
+                self.overflowed = true;
                 return;
             };
             if self.raw.len() < data_end + 2 {
@@ -363,6 +383,7 @@ impl SseDecoder {
             if self.body.len() > MAX_BODY {
                 self.body.clear();
                 self.raw.clear();
+                self.overflowed = true;
                 return;
             }
         }
@@ -371,10 +392,22 @@ impl SseDecoder {
     fn split_events(&mut self) -> Vec<String> {
         let mut events = Vec::new();
         loop {
-            let delimiter = self.body.windows(2).position(|window| window == b"\n\n");
-            let Some(position) = delimiter else { break };
+            let delimiter = self
+                .body
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| (position, 4))
+                .or_else(|| {
+                    self.body
+                        .windows(2)
+                        .position(|window| window == b"\n\n")
+                        .map(|position| (position, 2))
+                });
+            let Some((position, delimiter_len)) = delimiter else {
+                break;
+            };
             let frame = self.body[..position].to_vec();
-            self.body.drain(..position + 2);
+            self.body.drain(..position + delimiter_len);
             let mut data = Vec::new();
             for line in frame.split(|byte| *byte == b'\n') {
                 let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -404,30 +437,51 @@ struct SseStream {
 }
 
 impl SseStream {
-    fn next_json(&mut self) -> anyhow::Result<Value> {
+    fn next_json(&mut self) -> anyhow::Result<Option<Value>> {
         let mut bytes = [0_u8; 8192];
         loop {
             if let Some(value) = self.pending.pop_front() {
-                return Ok(value);
+                return Ok(Some(value));
             }
             let events = self.decoder.feed(&[]);
+            if self.decoder.overflowed {
+                return Err(anyhow::anyhow!("OpenCode SSE frame exceeds the size limit"));
+            }
             for event in events {
                 if let Ok(value) = serde_json::from_str::<Value>(&event) {
                     self.pending.push_back(value);
                 }
             }
             if let Some(value) = self.pending.pop_front() {
-                return Ok(value);
+                return Ok(Some(value));
             }
-            let read = self.stream.read(&mut bytes)?;
-            if read == 0 {
-                return Err(anyhow::anyhow!("OpenCode SSE stream closed"));
-            }
+            let read = match self.stream.read(&mut bytes) {
+                Ok(0) => return Err(anyhow::anyhow!("OpenCode SSE stream closed")),
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            // A quiet resident stream must yield the adapter lock regularly so
+            // delivery can submit a prompt while the event reader waits.
+            // `TcpStream` timeouts are normal polling, not stream failure.
             let events = self.decoder.feed(&bytes[..read]);
+            if self.decoder.overflowed {
+                return Err(anyhow::anyhow!("OpenCode SSE frame exceeds the size limit"));
+            }
             for event in events {
                 if let Ok(value) = serde_json::from_str::<Value>(&event) {
                     self.pending.push_back(value);
                 }
+            }
+            if self.pending.is_empty() {
+                return Ok(None);
             }
         }
     }
@@ -436,11 +490,29 @@ impl SseStream {
 #[derive(Debug)]
 struct ManagedServer {
     child: Child,
+    pid: u32,
+    start_token: Option<u64>,
+    ready: Arc<AtomicBool>,
+}
+
+struct ResidentWorker {
+    adapter: Arc<Mutex<OpenCodeNativeShared>>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
 }
 
 fn managed_servers() -> &'static Mutex<HashMap<String, ManagedServer>> {
     static SERVERS: OnceLock<Mutex<HashMap<String, ManagedServer>>> = OnceLock::new();
     SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resident_workers() -> &'static Mutex<HashMap<String, ResidentWorker>> {
+    static WORKERS: OnceLock<Mutex<HashMap<String, ResidentWorker>>> = OnceLock::new();
+    WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resident_key(home: &Path, instance: &str) -> String {
+    format!("{}\0{}", home.display(), instance)
 }
 
 fn server_key(home: &Path, instance: &str, locator: &SessionLocator) -> String {
@@ -453,6 +525,18 @@ fn server_key(home: &Path, instance: &str, locator: &SessionLocator) -> String {
 }
 
 pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
+    let workers = {
+        let mut all = resident_workers().lock();
+        all.remove(&resident_key(home, instance))
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    for mut worker in workers {
+        worker.stop.store(true, Ordering::Release);
+        if let Some(join) = worker.join.take() {
+            let _ = join.join();
+        }
+    }
     let prefix = format!("{}\0{}\0", home.display(), instance);
     managed_servers().lock().retain(|key, server| {
         if !key.starts_with(&prefix) {
@@ -462,6 +546,29 @@ pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
         let _ = server.child.wait();
         false
     });
+    // A daemon restart drops the in-memory Child handle, but the locator keeps
+    // the verified PID/start identity. Re-check that identity before signaling
+    // so instance deletion cannot orphan a managed server or kill a recycled
+    // unrelated PID.
+    if let Ok(locator) = super::registry::load_session_locator(home, instance) {
+        if locator.managed {
+            if let Some(pid) = locator
+                .server_pid
+                .filter(|_| persisted_server_owned(&locator))
+            {
+                crate::process::terminate(pid);
+                for _ in 0..5 {
+                    if crate::process::process_start_token(pid).is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if persisted_server_owned(&locator) {
+                    crate::process::kill_process_tree(pid);
+                }
+            }
+        }
+    }
 }
 
 fn canonical_auth() -> Option<PathBuf> {
@@ -476,6 +583,12 @@ fn canonical_auth() -> Option<PathBuf> {
 fn provision_data_dir(data_dir: &Path) -> anyhow::Result<()> {
     let opencode_dir = data_dir.join("opencode");
     std::fs::create_dir_all(&opencode_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&opencode_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     if let Some(source) = canonical_auth().filter(|path| path.exists()) {
         let target = opencode_dir.join("auth.json");
         std::fs::copy(source, &target)?;
@@ -491,7 +604,7 @@ fn provision_data_dir(data_dir: &Path) -> anyhow::Result<()> {
 fn launch_server(
     home: &Path,
     instance: &str,
-    locator: &SessionLocator,
+    locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
     let endpoint = Endpoint::parse(locator)?;
@@ -505,7 +618,7 @@ fn launch_server(
             servers.remove(&key);
         }
     }
-    let data_dir = home.join("backend-data").join("opencode").join(instance);
+    let data_dir = crate::agent::opencode_data_dir(home, instance);
     provision_data_dir(&data_dir)?;
     let binary = std::env::var("AGEND_OPENCODE_BINARY").unwrap_or_else(|_| "opencode".to_string());
     let mut command = std::process::Command::new(binary);
@@ -529,12 +642,96 @@ fn launch_server(
     }
     command.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
     command.env("OPENCODE_CONFIG_CONTENT", r#"{"autoupdate":false}"#);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     // fire-and-forget: the managed server is retained in `managed_servers` and
     // is reconciled/reaped on the next adapter attach.
-    let child = command.spawn()?;
-    managed_servers()
-        .lock()
-        .insert(key, ManagedServer { child });
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    let start_token = crate::process::process_start_token(pid);
+    let ready = Arc::new(AtomicBool::new(false));
+    if let Some(stdout) = child.stdout.take() {
+        let ready = Arc::clone(&ready);
+        // fire-and-forget: this reader only observes the child readiness line
+        // and exits when the managed server closes stdout.
+        std::thread::Builder::new()
+            .name("opencode-server-ready".to_string())
+            .spawn(move || observe_server_ready(stdout, ready))?;
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let ready = Arc::clone(&ready);
+        // fire-and-forget: this reader only observes the child readiness line
+        // and exits when the managed server closes stderr.
+        std::thread::Builder::new()
+            .name("opencode-server-ready-err".to_string())
+            .spawn(move || observe_server_ready(stderr, ready))?;
+    }
+    locator.server_pid = Some(pid);
+    locator.server_start_token = start_token;
+    super::registry::save_session_locator(home, instance, locator)?;
+    managed_servers().lock().insert(
+        key,
+        ManagedServer {
+            child,
+            pid,
+            start_token,
+            ready,
+        },
+    );
+    Ok(())
+}
+
+fn observe_server_ready<R: Read>(reader: R, ready: Arc<AtomicBool>) {
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(reader)
+        .lines()
+        .map_while(Result::ok)
+    {
+        if line.contains("server listening on http://127.0.0.1:") {
+            ready.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn in_memory_server_owned(home: &Path, instance: &str, locator: &SessionLocator) -> bool {
+    let key = server_key(home, instance, locator);
+    let mut servers = managed_servers().lock();
+    let Some(server) = servers.get_mut(&key) else {
+        return false;
+    };
+    if server.child.try_wait().ok().flatten().is_some() {
+        servers.remove(&key);
+        return false;
+    }
+    locator.server_pid == Some(server.pid)
+        && locator.server_start_token.is_some()
+        && locator.server_start_token == server.start_token
+}
+
+fn persisted_server_owned(locator: &SessionLocator) -> bool {
+    let (Some(pid), Some(start_token)) = (locator.server_pid, locator.server_start_token) else {
+        return false;
+    };
+    crate::process::process_start_token(pid) == Some(start_token)
+}
+
+fn server_ready(home: &Path, instance: &str, locator: &SessionLocator) -> bool {
+    if in_memory_server_owned(home, instance, locator) {
+        return managed_servers()
+            .lock()
+            .get(&server_key(home, instance, locator))
+            .is_some_and(|server| server.ready.load(Ordering::Acquire));
+    }
+    persisted_server_owned(locator)
+}
+
+fn rotate_managed_endpoint(locator: &mut SessionLocator) -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    locator.endpoint_url = Some(format!("http://127.0.0.1:{port}"));
+    locator.server_pid = None;
+    locator.server_start_token = None;
     Ok(())
 }
 
@@ -556,18 +753,48 @@ fn global_health(locator: &SessionLocator) -> anyhow::Result<(String, bool)> {
 fn wait_for_server(
     home: &Path,
     instance: &str,
-    locator: &SessionLocator,
+    locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<String> {
-    let deadline = Instant::now() + SERVER_START_TIMEOUT;
+    wait_for_server_until(home, instance, locator, cwd, SERVER_START_TIMEOUT)
+}
+
+fn wait_for_server_until(
+    home: &Path,
+    instance: &str,
+    locator: &mut SessionLocator,
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let deadline = Instant::now() + timeout;
     let mut last_error = None;
+    if locator.managed && !persisted_server_owned(locator) {
+        if locator.server_pid.is_some() || locator.server_start_token.is_some() {
+            rotate_managed_endpoint(locator)?;
+        }
+        launch_server(home, instance, locator, cwd)?;
+    }
     while Instant::now() < deadline {
+        if locator.managed && !server_ready(home, instance, locator) {
+            if !persisted_server_owned(locator) && !in_memory_server_owned(home, instance, locator)
+            {
+                rotate_managed_endpoint(locator)?;
+                launch_server(home, instance, locator, cwd)?;
+            }
+            last_error = Some("managed OpenCode child has not proved it owns the endpoint".into());
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         match global_health(locator) {
             Ok((version, true)) => return Ok(version),
             Ok((_, false)) => last_error = Some("OpenCode server reported unhealthy".to_string()),
             Err(error) => last_error = Some(error.to_string()),
         }
-        if locator.managed {
+        if locator.managed
+            && !persisted_server_owned(locator)
+            && !in_memory_server_owned(home, instance, locator)
+        {
+            rotate_managed_endpoint(locator)?;
             launch_server(home, instance, locator, cwd)?;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -628,6 +855,9 @@ pub(crate) struct OpenCodeNativeShared {
     backend_version: Option<String>,
     in_flight: Option<Uuid>,
     pending: HashMap<Uuid, DeliveryEnvelope>,
+    /// Delivery IDs that have been observed in a message-specific event or
+    /// session history. Session-level status is never enough by itself.
+    target_confirmed: HashSet<Uuid>,
     events: VecDeque<BackendEvent>,
     stream: Option<SseStream>,
 }
@@ -642,6 +872,7 @@ impl OpenCodeNativeShared {
             backend_version: None,
             in_flight: None,
             pending: HashMap::new(),
+            target_confirmed: HashSet::new(),
             events: VecDeque::new(),
             stream: None,
         }
@@ -677,20 +908,23 @@ impl OpenCodeNativeShared {
             store.record(failed)?;
             return Err(error);
         }
-        if self.in_flight.is_some() && !matches!(envelope.kind, DeliveryKind::Steer) {
-            let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
-            queued.detail = Some("one ordinary OpenCode turn is already in flight".to_string());
-            store.record(queued)?;
-            return Err(anyhow::anyhow!(
-                "OpenCode session already has an ordinary turn in flight"
-            ));
-        }
         if matches!(envelope.kind, DeliveryKind::Steer | DeliveryKind::Interrupt) {
             let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
             failed.detail = Some("OpenCode has no implicit steer/interrupt operation".to_string());
             store.record(failed)?;
             return Err(anyhow::anyhow!(
                 "OpenCode NativeShared requires an explicit prompt operation"
+            ));
+        }
+        if self.in_flight.is_some() {
+            let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
+            failed.detail = Some(
+                "OpenCode ordinary turn is already in flight; no durable queue accepted this delivery"
+                    .to_string(),
+            );
+            store.record(failed)?;
+            return Err(anyhow::anyhow!(
+                "OpenCode session already has an ordinary turn in flight"
             ));
         }
         let locator = self
@@ -743,17 +977,6 @@ impl OpenCodeNativeShared {
         Ok(receipt)
     }
 
-    pub(crate) fn prepare_for_tui(
-        &mut self,
-        locator: SessionLocator,
-        cwd: Option<&Path>,
-    ) -> anyhow::Result<SessionLocator> {
-        self.start_or_attach_blocking(locator, cwd)?;
-        self.locator
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("OpenCode TUI session was not prepared"))
-    }
-
     fn start_or_attach_blocking(
         &mut self,
         mut locator: SessionLocator,
@@ -765,11 +988,16 @@ impl OpenCodeNativeShared {
             ));
         }
         Endpoint::parse(&locator)?;
-        if self.ready && self.locator.as_ref() == Some(&locator) {
+        if self
+            .ready
+            .then_some(self.locator.as_ref())
+            .flatten()
+            .is_some_and(|current| Self::same_session(current, &locator))
+        {
             return Ok(self.capability());
         }
         self.ready = false;
-        let version = wait_for_server(&self.home, &self.instance, &locator, cwd)?;
+        let version = wait_for_server(&self.home, &self.instance, &mut locator, cwd)?;
         let session_id = match locator.session_id.clone() {
             Some(session_id) if !session_id.is_empty() => {
                 let response = request(&locator, "GET", &session_path(&session_id), Value::Null)?;
@@ -809,6 +1037,16 @@ impl OpenCodeNativeShared {
         Ok(self.capability())
     }
 
+    fn same_session(current: &SessionLocator, requested: &SessionLocator) -> bool {
+        current.backend == requested.backend
+            && current.endpoint_url == requested.endpoint_url
+            && current.session_id == requested.session_id
+            && current.username == requested.username
+            && current.password == requested.password
+            && current.model == requested.model
+            && current.managed == requested.managed
+    }
+
     fn restore_pending_state(&mut self) -> anyhow::Result<()> {
         let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
         let mut pending = store.pending_deliveries()?;
@@ -828,29 +1066,97 @@ impl OpenCodeNativeShared {
         self.in_flight = Some(delivery_id);
 
         // A previous adapter may have gone away after prompt_async accepted.
-        // If the server now reports idle, the durable message has completed;
-        // otherwise keep the ordinary-turn gate closed until an SSE event or
-        // explicit reconcile proves the outcome.
-        let Some(locator) = self.locator.as_ref() else {
-            return Ok(());
+        // Session-level idle is not target evidence: history must first prove
+        // this exact delivery exists, otherwise recovery is Ambiguous and the
+        // ordinary-turn gate is reopened for explicit reconciliation.
+        let Some(locator) = self.locator.clone() else {
+            return self.mark_ambiguous_and_clear(
+                delivery_id,
+                "OpenCode restored delivery has no locator",
+            );
         };
         let Some(session_id) = locator.session_id.as_deref() else {
-            return Ok(());
-        };
-        let Ok(response) = request(locator, "GET", "/session/status", Value::Null) else {
-            return Ok(());
-        };
-        let Ok(status) = response_json(response, "session status") else {
-            return Ok(());
-        };
-        if session_status_type(&status, session_id).as_deref() == Some("idle") {
-            self.update_state(
+            return self.mark_ambiguous_and_clear(
                 delivery_id,
-                DeliveryState::Completed,
-                "OpenCode reported the restored delivery completed",
-                Some("restore/session.status"),
-            )?;
-            self.pending.remove(&delivery_id);
+                "OpenCode restored delivery has no session identity",
+            );
+        };
+        let history = match request(
+            &locator,
+            "GET",
+            &format!("{}/message?limit=100", session_path(session_id)),
+            Value::Null,
+        )
+        .and_then(|response| response_json(response, "restored session history"))
+        {
+            Ok(history) => history,
+            Err(_) => {
+                return self.mark_ambiguous_and_clear(
+                    delivery_id,
+                    "OpenCode could not prove the restored delivery exists in session history",
+                )
+            }
+        };
+        if !contains_delivery_id(&history, delivery_id) {
+            return self.mark_ambiguous_and_clear(
+                delivery_id,
+                "OpenCode restored delivery is absent from session history",
+            );
+        }
+        self.target_confirmed.insert(delivery_id);
+        let status = match request(&locator, "GET", "/session/status", Value::Null)
+            .and_then(|response| response_json(response, "session status"))
+        {
+            Ok(status) => status,
+            Err(_) => {
+                return self.mark_ambiguous_and_clear(
+                    delivery_id,
+                    "OpenCode could not prove the restored delivery session status",
+                )
+            }
+        };
+        match session_status_type(&status, session_id).as_deref() {
+            Some("idle") => {
+                self.update_state(
+                    delivery_id,
+                    DeliveryState::Completed,
+                    "OpenCode reported the restored delivery completed after target history proof",
+                    Some("restore/session.status"),
+                )?;
+                self.pending.remove(&delivery_id);
+                self.target_confirmed.remove(&delivery_id);
+                self.in_flight = None;
+            }
+            Some("busy") | Some("retry") => {
+                self.update_state(
+                    delivery_id,
+                    DeliveryState::TurnStarted,
+                    "OpenCode restored a target-confirmed active delivery",
+                    Some("restore/session.status"),
+                )?;
+            }
+            _ => {
+                self.update_state(
+                    delivery_id,
+                    DeliveryState::ObservedInSession,
+                    "OpenCode restored a target-confirmed delivery with unknown status",
+                    Some("restore/session.status"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_ambiguous_and_clear(&mut self, delivery_id: Uuid, detail: &str) -> anyhow::Result<()> {
+        self.update_state(
+            delivery_id,
+            DeliveryState::Ambiguous,
+            detail,
+            Some("restore/insufficient-target-proof"),
+        )?;
+        self.pending.remove(&delivery_id);
+        self.target_confirmed.remove(&delivery_id);
+        if self.in_flight == Some(delivery_id) {
             self.in_flight = None;
         }
         Ok(())
@@ -887,6 +1193,7 @@ impl OpenCodeNativeShared {
         let chunked = headers
             .get("transfer-encoding")
             .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
         self.stream = Some(SseStream {
             stream,
             decoder: SseDecoder::new(chunked, initial),
@@ -914,9 +1221,16 @@ impl OpenCodeNativeShared {
         backend_event: Option<&str>,
     ) -> anyhow::Result<()> {
         let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        let previous = store.latest(delivery_id)?;
+        if previous.as_ref().is_some_and(|previous| {
+            previous.state.is_terminal()
+                || Self::state_rank(state) < Self::state_rank(previous.state)
+        }) {
+            return Ok(());
+        }
         if let Some(envelope) = self.pending.get(&delivery_id) {
             let mut receipt = DeliveryReceipt::for_state(envelope, state);
-            if let Some(previous) = store.latest(delivery_id)? {
+            if let Some(previous) = previous {
                 receipt.protocol_request_id = previous.protocol_request_id;
                 receipt.tui_visibility = previous.tui_visibility;
             }
@@ -931,6 +1245,16 @@ impl OpenCodeNativeShared {
             store.record(receipt)?;
         }
         Ok(())
+    }
+
+    fn state_rank(state: DeliveryState) -> u8 {
+        match state {
+            DeliveryState::Queued => 0,
+            DeliveryState::ProtocolAccepted => 1,
+            DeliveryState::ObservedInSession => 2,
+            DeliveryState::TurnStarted => 3,
+            DeliveryState::Completed | DeliveryState::Failed | DeliveryState::Ambiguous => 4,
+        }
     }
 
     fn session_id_from_event(value: &Value) -> Option<&str> {
@@ -957,10 +1281,25 @@ impl OpenCodeNativeShared {
             .and_then(Value::as_str)
             .or_else(|| {
                 value
+                    .pointer("/properties/info/messageID")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                value
                     .pointer("/properties/part/messageID")
                     .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                value
+                    .pointer("/properties/part/messageId")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                value
+                    .pointer("/properties/messageID")
+                    .and_then(Value::as_str)
             });
-        if id == Some(target_text.as_str()) || self.pending.contains_key(&target) {
+        if id == Some(target_text.as_str()) {
             Some(target)
         } else {
             None
@@ -996,6 +1335,7 @@ impl OpenCodeNativeShared {
             "server.connected" => Ok(BackendEvent::Ready),
             "message.updated" | "message.part.updated" => {
                 if let Some(id) = delivery_id {
+                    self.target_confirmed.insert(id);
                     self.update_state(
                         id,
                         DeliveryState::ObservedInSession,
@@ -1017,7 +1357,11 @@ impl OpenCodeNativeShared {
                     .pointer("/properties/status/type")
                     .and_then(Value::as_str)
                     .or_else(|| value.pointer("/properties/status").and_then(Value::as_str));
-                match (status, delivery_id) {
+                let confirmed_id = delivery_id.or_else(|| {
+                    self.in_flight
+                        .filter(|id| self.target_confirmed.contains(id))
+                });
+                match (status, confirmed_id) {
                     (Some("busy"), Some(id)) => {
                         self.update_state(
                             id,
@@ -1037,6 +1381,10 @@ impl OpenCodeNativeShared {
                 }
             }
             "session.idle" => delivery_id
+                .or_else(|| {
+                    self.in_flight
+                        .filter(|id| self.target_confirmed.contains(id))
+                })
                 .map(|id| self.complete(id, method))
                 .unwrap_or_else(|| {
                     Ok(BackendEvent::Unknown {
@@ -1044,7 +1392,11 @@ impl OpenCodeNativeShared {
                     })
                 }),
             "session.error" => {
-                if let Some(id) = delivery_id {
+                let confirmed_id = delivery_id.or_else(|| {
+                    self.in_flight
+                        .filter(|id| self.target_confirmed.contains(id))
+                });
+                if let Some(id) = confirmed_id {
                     self.update_state(
                         id,
                         DeliveryState::Failed,
@@ -1053,9 +1405,10 @@ impl OpenCodeNativeShared {
                     )?;
                     self.in_flight = None;
                     self.pending.remove(&id);
+                    self.target_confirmed.remove(&id);
                 }
                 Ok(BackendEvent::Failed {
-                    delivery_id,
+                    delivery_id: confirmed_id,
                     reason: "OpenCode emitted session.error".to_string(),
                 })
             }
@@ -1083,27 +1436,46 @@ impl OpenCodeNativeShared {
         )?;
         self.in_flight = None;
         self.pending.remove(&delivery_id);
+        self.target_confirmed.remove(&delivery_id);
         Ok(BackendEvent::Completed {
             delivery_id,
             event: method.to_string(),
         })
     }
 
-    fn next_event_blocking(&mut self) -> anyhow::Result<BackendEvent> {
+    fn poll_event_blocking(&mut self) -> anyhow::Result<Option<BackendEvent>> {
         if let Some(event) = self.events.pop_front() {
-            return Ok(event);
+            return Ok(Some(event));
         }
-        let value = self
+        let Some(value) = self
             .stream
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("OpenCode event stream is not attached"))?
-            .next_json()?;
+            .next_json()?
+        else {
+            return Ok(None);
+        };
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.decoder.overflowed)
+        {
+            return Err(anyhow::anyhow!("OpenCode SSE frame exceeds the size limit"));
+        }
         if let Some(locator) = self.locator.as_mut() {
             let cursor = locator.event_cursor.unwrap_or(0).saturating_add(1);
             locator.event_cursor = Some(cursor);
             super::registry::save_session_locator(&self.home, &self.instance, locator)?;
         }
-        self.normalize_event(value)
+        self.normalize_event(value).map(Some)
+    }
+
+    fn next_event_blocking(&mut self) -> anyhow::Result<BackendEvent> {
+        loop {
+            if let Some(event) = self.poll_event_blocking()? {
+                return Ok(event);
+            }
+        }
     }
 
     async fn reconcile_blocking(&mut self, delivery_id: Uuid) -> anyhow::Result<DeliveryState> {
@@ -1134,15 +1506,13 @@ impl OpenCodeNativeShared {
             Value::Null,
         )?;
         if !contains_delivery_id(&response_json(history, "session history")?, delivery_id) {
-            let mut ambiguous = previous;
-            ambiguous.state = DeliveryState::Ambiguous;
-            ambiguous.detail = Some(
-                "OpenCode receipt is not present in session history; retry requires operator reconciliation"
-                    .to_string(),
-            );
-            store.record(ambiguous)?;
+            self.mark_ambiguous_and_clear(
+                delivery_id,
+                "OpenCode receipt is not present in session history; retry requires operator reconciliation",
+            )?;
             return Ok(DeliveryState::Ambiguous);
         }
+        self.target_confirmed.insert(delivery_id);
         let status_response = request(locator, "GET", "/session/status", Value::Null)?;
         let status = response_json(status_response, "session status")?;
         let state = match session_status_type(&status, session_id).as_deref() {
@@ -1150,13 +1520,107 @@ impl OpenCodeNativeShared {
             Some("busy") | Some("retry") => DeliveryState::TurnStarted,
             _ => DeliveryState::ObservedInSession,
         };
-        let mut receipt = previous;
-        receipt.state = state;
-        receipt.backend_event = Some("reconcile".to_string());
-        receipt.detail = Some("OpenCode session history reconciled the delivery".to_string());
-        store.record(receipt)?;
+        self.update_state(
+            delivery_id,
+            state,
+            "OpenCode session history reconciled the target delivery",
+            Some("reconcile"),
+        )?;
+        if state == DeliveryState::Completed {
+            self.pending.remove(&delivery_id);
+            self.target_confirmed.remove(&delivery_id);
+            self.in_flight = None;
+        }
         Ok(state)
     }
+}
+
+/// Get the resident OpenCode adapter for an instance. The adapter and its SSE
+/// reader outlive an individual delivery, so event receipts are consumed on
+/// the production path instead of only by tests that call `next_event`.
+fn resident_adapter(
+    home: &Path,
+    instance: &str,
+    locator: SessionLocator,
+    cwd: Option<&Path>,
+) -> anyhow::Result<Arc<Mutex<OpenCodeNativeShared>>> {
+    let key = resident_key(home, instance);
+    let mut workers = resident_workers().lock();
+    if let Some(worker) = workers.get(&key) {
+        return Ok(Arc::clone(&worker.adapter));
+    }
+
+    let mut adapter = OpenCodeNativeShared::new(home, instance);
+    adapter.start_or_attach_blocking(locator, cwd)?;
+    let adapter = Arc::new(Mutex::new(adapter));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_adapter = Arc::clone(&adapter);
+    let worker_stop = Arc::clone(&stop);
+    let join = std::thread::Builder::new()
+        .name(format!("opencode-events-{instance}"))
+        // The JoinHandle is retained in `ResidentWorker`; cleanup stops and
+        // joins this reader before the managed server is killed.
+        .spawn(move || resident_event_loop(worker_adapter, worker_stop))?;
+    workers.insert(
+        key,
+        ResidentWorker {
+            adapter: Arc::clone(&adapter),
+            stop,
+            join: Some(join),
+        },
+    );
+    Ok(adapter)
+}
+
+fn resident_event_loop(adapter: Arc<Mutex<OpenCodeNativeShared>>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Acquire) {
+        let result = adapter.lock().poll_event_blocking();
+        match result {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(error = %error, "OpenCode resident event stream disconnected");
+                let reconnected = {
+                    let mut adapter = adapter.lock();
+                    adapter.ready = false;
+                    adapter.stream = None;
+                    adapter
+                        .locator
+                        .clone()
+                        .map(|locator| adapter.start_or_attach_blocking(locator, None).is_ok())
+                        .unwrap_or(false)
+                };
+                if !reconnected {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn deliver_resident(
+    home: &Path,
+    instance: &str,
+    envelope: DeliveryEnvelope,
+) -> anyhow::Result<DeliveryReceipt> {
+    let locator = envelope.session.clone();
+    let adapter = resident_adapter(home, instance, locator, None)?;
+    let result = adapter.lock().deliver_blocking(envelope);
+    result
+}
+
+pub(crate) fn prepare_resident_tui(
+    home: &Path,
+    instance: &str,
+    locator: SessionLocator,
+    cwd: Option<&Path>,
+) -> anyhow::Result<SessionLocator> {
+    let adapter = resident_adapter(home, instance, locator, cwd)?;
+    let result = adapter
+        .lock()
+        .locator
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("OpenCode TUI session was not prepared"));
+    result
 }
 
 #[async_trait::async_trait]
@@ -1213,6 +1677,89 @@ mod tests {
         assert!(Endpoint::parse(&locator).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_start_does_not_send_credentials_to_a_port_winner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock");
+        let home = std::env::temp_dir().join(format!("agend-opencode-owner-{}", Uuid::new_v4()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("address").port();
+        let fake = home.join("fake-opencode.sh");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 1\n").expect("fake binary");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))
+            .expect("fake executable");
+        let previous_binary = std::env::var_os("AGEND_OPENCODE_BINARY");
+        std::env::set_var("AGEND_OPENCODE_BINARY", &fake);
+        let mut locator = SessionLocator::opencode(
+            format!("http://127.0.0.1:{port}"),
+            None,
+            "opencode".to_string(),
+            "must-not-leak".to_string(),
+        );
+        let result = wait_for_server_until(
+            &home,
+            "agent",
+            &mut locator,
+            None,
+            Duration::from_millis(300),
+        );
+        assert!(result.is_err(), "fake child cannot prove server ownership");
+        let mut received = false;
+        for _ in 0..20 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    received = true;
+                    let mut bytes = [0_u8; 256];
+                    let _ = stream.read(&mut bytes);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("listener: {error}"),
+            }
+        }
+        assert!(
+            !received,
+            "managed startup must not probe an unowned listener"
+        );
+        stop_instance_server(&home, "agent");
+        match previous_binary {
+            Some(value) => std::env::set_var("AGEND_OPENCODE_BINARY", value),
+            None => std::env::remove_var("AGEND_OPENCODE_BINARY"),
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn persisted_server_identity_rejects_pid_reuse_or_missing_start_token() {
+        let pid = std::process::id();
+        let token = crate::process::process_start_token(pid).expect("current process token");
+        let mut locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            None,
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        locator.server_pid = Some(pid);
+        locator.server_start_token = Some(token);
+        assert!(persisted_server_owned(&locator));
+        locator.server_start_token = Some(token.wrapping_add(1));
+        assert!(!persisted_server_owned(&locator));
+        locator.server_start_token = None;
+        assert!(!persisted_server_owned(&locator));
+    }
+
     #[test]
     fn sse_decoder_handles_split_chunked_unicode_events() {
         let mut decoder = SseDecoder::new(true, Vec::new());
@@ -1227,6 +1774,19 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out[0].contains("session.status"));
         assert!(out[1].contains("session.idle"));
+    }
+
+    #[test]
+    fn sse_decoder_accepts_crlf_and_bounds_non_chunked_frames() {
+        let mut decoder = SseDecoder::new(false, Vec::new());
+        let out = decoder.feed(
+            b"data: {\"type\":\"server.connected\"}\r\n\r\ndata: {\"type\":\"session.idle\"}\r\n\r\n",
+        );
+        assert_eq!(out.len(), 2);
+
+        let mut decoder = SseDecoder::new(false, Vec::new());
+        assert!(decoder.feed(&vec![b'x'; MAX_BODY + 1]).is_empty());
+        assert!(decoder.overflowed);
     }
 
     #[test]
@@ -1266,6 +1826,35 @@ mod tests {
                 None,
             ),
         );
+        let idle_before_target = adapter
+            .normalize_event(json!({
+                "type": "session.idle",
+                "properties": {"sessionID": "session-1"}
+            }))
+            .expect("idle before target");
+        assert!(matches!(idle_before_target, BackendEvent::Unknown { .. }));
+        assert_eq!(adapter.in_flight, Some(delivery_id));
+
+        let other_message = Uuid::new_v4();
+        let unrelated = adapter
+            .normalize_event(json!({
+                "type": "message.updated",
+                "properties": {"sessionID": "session-1", "info": {"id": other_message.to_string()}}
+            }))
+            .expect("unrelated message");
+        assert!(matches!(unrelated, BackendEvent::Unknown { .. }));
+        assert_eq!(adapter.in_flight, Some(delivery_id));
+
+        let observed = adapter
+            .normalize_event(json!({
+                "type": "message.updated",
+                "properties": {"sessionID": "session-1", "info": {"id": delivery_id.to_string()}}
+            }))
+            .expect("target message");
+        assert!(
+            matches!(observed, BackendEvent::ObservedInSession { delivery_id: id, .. } if id == delivery_id)
+        );
+
         let busy = adapter
             .normalize_event(json!({
                 "type": "session.status",
@@ -1280,6 +1869,136 @@ mod tests {
             }))
             .expect("idle");
         assert!(matches!(idle, BackendEvent::Completed { .. }));
+    }
+
+    #[test]
+    fn session_only_events_do_not_regress_or_complete_a_delivery() {
+        let home = std::env::temp_dir().join(format!("agend-opencode-events-{}", Uuid::new_v4()));
+        let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+        let locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            Some("session-1".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        adapter.locator = Some(locator.clone());
+        let envelope = DeliveryEnvelope::new("agent", locator, DeliveryKind::Prompt, "hello", None);
+        let delivery_id = envelope.delivery_id;
+        adapter.pending.insert(delivery_id, envelope.clone());
+        adapter.in_flight = Some(delivery_id);
+        let _ = adapter
+            .normalize_event(json!({
+                "type": "session.status",
+                "properties": {"sessionID": "session-1", "status": {"type": "idle"}}
+            }))
+            .expect("idle");
+        assert_eq!(adapter.in_flight, Some(delivery_id));
+        assert!(!adapter.target_confirmed.contains(&delivery_id));
+
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        adapter
+            .update_state(
+                delivery_id,
+                DeliveryState::Completed,
+                "test completion",
+                Some("test"),
+            )
+            .expect("complete");
+        adapter
+            .update_state(
+                delivery_id,
+                DeliveryState::ObservedInSession,
+                "late event",
+                Some("test"),
+            )
+            .expect("monotonic");
+        assert_eq!(
+            store
+                .latest(delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::Completed
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn busy_collision_and_interrupt_are_terminal_failures_not_fake_queue_entries() {
+        let home =
+            std::env::temp_dir().join(format!("agend-opencode-collision-{}", Uuid::new_v4()));
+        let locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            Some("session-1".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+        adapter.locator = Some(locator.clone());
+        adapter.ready = true;
+        let in_flight = DeliveryEnvelope::new(
+            "agent",
+            locator.clone(),
+            DeliveryKind::Prompt,
+            "first",
+            None,
+        );
+        adapter.in_flight = Some(in_flight.delivery_id);
+        adapter.pending.insert(in_flight.delivery_id, in_flight);
+
+        for kind in [DeliveryKind::Prompt, DeliveryKind::Interrupt] {
+            let envelope = DeliveryEnvelope::new("agent", locator.clone(), kind, "next", None);
+            let delivery_id = envelope.delivery_id;
+            assert!(adapter.deliver_blocking(envelope).is_err());
+            let receipt = ReceiptStore::for_instance(&home, "agent")
+                .expect("store")
+                .latest(delivery_id)
+                .expect("latest")
+                .expect("receipt");
+            assert_eq!(receipt.state, DeliveryState::Failed);
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn restore_probe_failure_clears_gate_as_ambiguous() {
+        let home = std::env::temp_dir().join(format!("agend-opencode-restore-{}", Uuid::new_v4()));
+        let locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            None,
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        let envelope =
+            DeliveryEnvelope::new("agent", locator, DeliveryKind::Prompt, "restore me", None);
+        let delivery_id = envelope.delivery_id;
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        store.record_queued(&envelope).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::ProtocolAccepted,
+            ))
+            .expect("accepted");
+
+        let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+        adapter.pending.insert(delivery_id, envelope);
+        adapter.in_flight = Some(delivery_id);
+        adapter.restore_pending_state().expect("restore");
+        assert_eq!(adapter.in_flight, None);
+        assert_eq!(
+            store
+                .latest(delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::Ambiguous
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn read_http_request(mut stream: &TcpStream) -> (String, Vec<u8>) {
@@ -1332,6 +2051,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
         let port = listener.local_addr().expect("address").port();
         let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+        let delivery_id = Uuid::new_v4();
         let server = thread::spawn(move || {
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept");
@@ -1353,6 +2073,7 @@ mod tests {
                     .expect("event headers");
                     let events = [
                         json!({"type": "server.connected"}),
+                        json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": delivery_id.to_string()}}}),
                         json!({"type": "session.status", "properties": {"sessionID": "session-1", "status": {"type": "busy"}}}),
                         json!({"type": "session.idle", "properties": {"sessionID": "session-1"}}),
                     ];
@@ -1386,9 +2107,9 @@ mod tests {
         adapter
             .start_or_attach_blocking(locator.clone(), None)
             .expect("attach");
-        let envelope =
+        let mut envelope =
             DeliveryEnvelope::new("agent", locator, DeliveryKind::Prompt, "hello\n世界", None);
-        let delivery_id = envelope.delivery_id;
+        envelope.delivery_id = delivery_id;
         let receipt = adapter.deliver_blocking(envelope).expect("prompt");
         assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
         let (header, body) = prompt_rx
@@ -1406,6 +2127,10 @@ mod tests {
             adapter.next_event_blocking().expect("connected"),
             BackendEvent::Ready
         ));
+        assert!(matches!(
+            adapter.next_event_blocking().expect("observed"),
+            BackendEvent::ObservedInSession { delivery_id: id, .. } if id == delivery_id
+        ));
         assert!(
             matches!(adapter.next_event_blocking().expect("busy"), BackendEvent::TurnStarted { delivery_id: id, .. } if id == delivery_id)
         );
@@ -1413,6 +2138,158 @@ mod tests {
             matches!(adapter.next_event_blocking().expect("idle"), BackendEvent::Completed { delivery_id: id, .. } if id == delivery_id)
         );
         server.join().expect("server");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn resident_event_loop_consumes_target_receipt_without_manual_polling() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("address").port();
+        let prompt_seen = Arc::new(AtomicBool::new(false));
+        let event_sent = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::new(AtomicBool::new(false));
+        let server_prompt_seen = Arc::clone(&prompt_seen);
+        let server_event_sent = Arc::clone(&event_sent);
+        let server_stop_flag = Arc::clone(&server_stop);
+        let delivery_id = Uuid::new_v4();
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !server_stop_flag.load(Ordering::Acquire) {
+                let (stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                let prompt_seen = Arc::clone(&server_prompt_seen);
+                let event_sent = Arc::clone(&server_event_sent);
+                let stop = Arc::clone(&server_stop_flag);
+                handlers.push(thread::spawn(move || {
+                    let (header, body) = read_http_request(&stream);
+                    let request_line = header.lines().next().unwrap_or_default().to_string();
+                    if request_line.starts_with("GET /global/health ") {
+                        let mut stream = stream;
+                        json_response(
+                            &mut stream,
+                            "200 OK",
+                            json!({"healthy": true, "version": "1.17.5"}),
+                        );
+                    } else if request_line.starts_with("GET /session/session-1 ") {
+                        let mut stream = stream;
+                        json_response(&mut stream, "200 OK", json!({"id": "session-1"}));
+                    } else if request_line.starts_with("POST /session/session-1/prompt_async ") {
+                        assert!(!body.is_empty(), "prompt body must be present");
+                        prompt_seen.store(true, Ordering::Release);
+                        let mut stream = stream;
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .expect("prompt response");
+                        stream.flush().expect("prompt flush");
+                    } else if request_line.starts_with("GET /event ") {
+                        let mut stream = stream;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+                        )
+                        .expect("event headers");
+                        let connected = format!(
+                            "data: {}\n\n",
+                            json!({"type": "server.connected"})
+                        );
+                        write!(stream, "{:X}\r\n", connected.len()).expect("connected size");
+                        stream
+                            .write_all(connected.as_bytes())
+                            .expect("connected event");
+                        stream.write_all(b"\r\n").expect("connected trailer");
+                        stream.flush().expect("connected flush");
+                        while !stop.load(Ordering::Acquire) {
+                            if prompt_seen.load(Ordering::Acquire)
+                                && !event_sent.swap(true, Ordering::AcqRel)
+                            {
+                                let events = [
+                                    json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": delivery_id.to_string()}}}),
+                                    json!({"type": "session.status", "properties": {"sessionID": "session-1", "status": {"type": "busy"}}}),
+                                    json!({"type": "session.idle", "properties": {"sessionID": "session-1"}}),
+                                ];
+                                for event in events {
+                                    let payload = format!("data: {}\n\n", event);
+                                    write!(stream, "{:X}\r\n", payload.len())
+                                        .expect("event size");
+                                    stream
+                                        .write_all(payload.as_bytes())
+                                        .expect("event payload");
+                                    stream.write_all(b"\r\n").expect("event trailer");
+                                }
+                                stream.flush().expect("event flush");
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    } else {
+                        panic!("unexpected request: {request_line}");
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().expect("request handler");
+            }
+        });
+
+        let home = std::env::temp_dir().join(format!("agend-opencode-resident-{}", Uuid::new_v4()));
+        let locator = SessionLocator::opencode(
+            format!("http://127.0.0.1:{port}"),
+            Some("session-1".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        let mut locator = locator;
+        locator.managed = false;
+        let mut envelope = DeliveryEnvelope::new(
+            "agent",
+            locator.clone(),
+            DeliveryKind::Prompt,
+            "resident hello",
+            None,
+        );
+        envelope.delivery_id = delivery_id;
+
+        prepare_resident_tui(&home, "agent", locator, None).expect("resident attach");
+        let receipt = deliver_resident(&home, "agent", envelope).expect("resident prompt");
+        assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+
+        let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let completed = loop {
+            if store
+                .latest(delivery_id)
+                .expect("latest receipt")
+                .is_some_and(|receipt| receipt.state == DeliveryState::Completed)
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            completed,
+            "resident SSE worker must settle the target receipt"
+        );
+
+        server_stop.store(true, Ordering::Release);
+        stop_instance_server(&home, "agent");
+        server.join().expect("server");
+        assert!(event_sent.load(Ordering::Acquire));
         let _ = std::fs::remove_dir_all(home);
     }
 
