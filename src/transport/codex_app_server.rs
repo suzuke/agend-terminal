@@ -920,6 +920,13 @@ mod tests {
                             json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
                         );
                     }
+                    "thread/start" => {
+                        write_server_frame(
+                            &mut stream,
+                            json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
+                        );
+                        break;
+                    }
                     "turn/start" => {
                         write_server_frame(
                             &mut stream,
@@ -939,6 +946,42 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn managed_bootstrap_persists_thread_and_shared_receipt_identity() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-codex-managed-bootstrap-{}",
+            Uuid::new_v4()
+        ));
+        let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let server = run_fake_codex(&endpoint);
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+
+        let capability = adapter
+            .start_or_attach_blocking(locator)
+            .expect("missing thread must be created through app-server");
+        assert!(capability.ready);
+        let persisted = super::super::registry::load_session_locator(&home, "codex-agent")
+            .expect("managed bootstrap must persist a locator");
+        assert_eq!(persisted.thread_id.as_deref(), Some("thread-1"));
+
+        let envelope = DeliveryEnvelope::new(
+            "codex-agent",
+            persisted,
+            DeliveryKind::Prompt,
+            "hello",
+            Some("corr-managed".to_string()),
+        );
+        let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        receipt.tui_visibility = Some("shared_codex_thread".to_string());
+        assert_eq!(receipt.tui_visibility.as_deref(), Some("shared_codex_thread"));
+
+        server.join().expect("fake server");
+        let _ = std::fs::remove_file(endpoint);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
