@@ -71,6 +71,73 @@ impl ModelCapability {
         }
         hits
     }
+
+    /// Return the first explicit model value in flag territory.
+    pub fn value(&self, args: &[String]) -> Option<String> {
+        let mut iter = args.iter();
+        while let Some(tok) = iter.next() {
+            if tok == "--" {
+                break;
+            }
+            if tok == self.long_flag || self.short_flag.is_some_and(|short| tok == short) {
+                return iter.next().filter(|value| !value.is_empty()).cloned();
+            }
+            if let Some(value) = tok
+                .strip_prefix(self.long_flag)
+                .and_then(|rest| rest.strip_prefix('='))
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+            if let Some(value) = self
+                .short_flag
+                .and_then(|short| tok.strip_prefix(short))
+                .and_then(|rest| rest.strip_prefix('='))
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+        None
+    }
+
+    /// Remove model selection from flag territory while preserving payload.
+    pub fn without_model(&self, args: &[String]) -> Vec<String> {
+        let mut output = Vec::with_capacity(args.len());
+        let mut skip_value = false;
+        let mut in_payload = false;
+        for tok in args {
+            if in_payload {
+                output.push(tok.clone());
+                continue;
+            }
+            if tok == "--" {
+                in_payload = true;
+                output.push(tok.clone());
+                continue;
+            }
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if tok == self.long_flag || self.short_flag.is_some_and(|short| tok == short) {
+                skip_value = true;
+                continue;
+            }
+            let long_with_value = tok
+                .strip_prefix(self.long_flag)
+                .is_some_and(|rest| rest.starts_with('='));
+            let short_with_value = self
+                .short_flag
+                .and_then(|short| tok.strip_prefix(short))
+                .is_some_and(|rest| rest.starts_with('='));
+            if long_with_value || short_with_value {
+                continue;
+            }
+            output.push(tok.clone());
+        }
+        output
+    }
 }
 
 /// #2744 PR-A: the DECLARED backend's model-flag grammar. Keyed off the
@@ -150,6 +217,33 @@ mod tests {
         let cap = Backend::ClaudeCode.model_capability().unwrap();
         let args: Vec<String> = ["-m", "x", "-mz"].iter().map(|s| s.to_string()).collect();
         assert!(cap.scan(&args).is_empty());
+    }
+
+    #[test]
+    fn model_capability_extracts_and_removes_only_flag_territory() {
+        let cap = Backend::OpenCode.model_capability().unwrap();
+        let args: Vec<String> = [
+            "--verbose",
+            "--model=anthropic/opus",
+            "--",
+            "--model",
+            "payload",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(cap.value(&args).as_deref(), Some("anthropic/opus"));
+        assert_eq!(
+            cap.without_model(&args),
+            vec!["--verbose", "--", "--model", "payload"]
+        );
+
+        let short: Vec<String> = ["-m", "openai/gpt-5", "--verbose"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(cap.value(&short).as_deref(), Some("openai/gpt-5"));
+        assert_eq!(cap.without_model(&short), vec!["--verbose"]);
     }
 
     /// #2744 PR-A L2: every declared ModelCapability is pinned by a verbatim

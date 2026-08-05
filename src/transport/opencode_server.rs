@@ -392,17 +392,21 @@ impl SseDecoder {
     fn split_events(&mut self) -> Vec<String> {
         let mut events = Vec::new();
         loop {
-            let delimiter = self
+            let crlf = self
                 .body
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
-                .map(|position| (position, 4))
-                .or_else(|| {
-                    self.body
-                        .windows(2)
-                        .position(|window| window == b"\n\n")
-                        .map(|position| (position, 2))
-                });
+                .map(|position| (position, 4));
+            let lf = self
+                .body
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| (position, 2));
+            let delimiter = match (crlf, lf) {
+                (Some(crlf), Some(lf)) => Some(if crlf.0 < lf.0 { crlf } else { lf }),
+                (Some(delimiter), None) | (None, Some(delimiter)) => Some(delimiter),
+                (None, None) => None,
+            };
             let Some((position, delimiter_len)) = delimiter else {
                 break;
             };
@@ -448,8 +452,13 @@ impl SseStream {
                 return Err(anyhow::anyhow!("OpenCode SSE frame exceeds the size limit"));
             }
             for event in events {
-                if let Ok(value) = serde_json::from_str::<Value>(&event) {
-                    self.pending.push_back(value);
+                match serde_json::from_str::<Value>(&event) {
+                    Ok(value) => self.pending.push_back(value),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        event_bytes = event.len(),
+                        "ignoring unparseable OpenCode SSE event"
+                    ),
                 }
             }
             if let Some(value) = self.pending.pop_front() {
@@ -649,6 +658,7 @@ fn launch_server(
     let mut child = command.spawn()?;
     let pid = child.id();
     let start_token = crate::process::process_start_token(pid);
+    let expected_port = endpoint.port;
     let ready = Arc::new(AtomicBool::new(false));
     if let Some(stdout) = child.stdout.take() {
         let ready = Arc::clone(&ready);
@@ -656,7 +666,7 @@ fn launch_server(
         // and exits when the managed server closes stdout.
         std::thread::Builder::new()
             .name("opencode-server-ready".to_string())
-            .spawn(move || observe_server_ready(stdout, ready))?;
+            .spawn(move || observe_server_ready(stdout, expected_port, ready))?;
     }
     if let Some(stderr) = child.stderr.take() {
         let ready = Arc::clone(&ready);
@@ -664,7 +674,7 @@ fn launch_server(
         // and exits when the managed server closes stderr.
         std::thread::Builder::new()
             .name("opencode-server-ready-err".to_string())
-            .spawn(move || observe_server_ready(stderr, ready))?;
+            .spawn(move || observe_server_ready(stderr, expected_port, ready))?;
     }
     locator.server_pid = Some(pid);
     locator.server_start_token = start_token;
@@ -681,13 +691,17 @@ fn launch_server(
     Ok(())
 }
 
-fn observe_server_ready<R: Read>(reader: R, ready: Arc<AtomicBool>) {
+fn observe_server_ready<R: Read>(reader: R, expected_port: u16, ready: Arc<AtomicBool>) {
     use std::io::BufRead;
     for line in std::io::BufReader::new(reader)
         .lines()
         .map_while(Result::ok)
     {
-        if line.contains("server listening on http://127.0.0.1:") {
+        let observed_port = line
+            .split_once("server listening on http://127.0.0.1:")
+            .and_then(|(_, suffix)| suffix.split_whitespace().next())
+            .and_then(|port| port.parse::<u16>().ok());
+        if observed_port == Some(expected_port) {
             ready.store(true, Ordering::Release);
         }
     }
@@ -1057,6 +1071,11 @@ impl OpenCodeNativeShared {
                     | DeliveryState::ObservedInSession
                     | DeliveryState::TurnStarted
             )
+        });
+        pending.sort_by(|(left, _), (right, _)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
         });
         let Some((envelope, _receipt)) = pending.into_iter().next() else {
             return Ok(());
@@ -1790,6 +1809,35 @@ mod tests {
     }
 
     #[test]
+    fn sse_decoder_splits_mixed_delimiters_in_wire_order() {
+        let mut decoder = SseDecoder::new(false, Vec::new());
+        let out = decoder.feed(
+            b"data: {\"type\":\"session.status\"}\n\ndata: {\"type\":\"session.idle\"}\r\n\r\n",
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains("session.status"));
+        assert!(out[1].contains("session.idle"));
+    }
+
+    #[test]
+    fn readiness_observer_requires_the_configured_port() {
+        let ready = Arc::new(AtomicBool::new(false));
+        observe_server_ready(
+            std::io::Cursor::new("server listening on http://127.0.0.1:40960\n"),
+            4096,
+            Arc::clone(&ready),
+        );
+        assert!(!ready.load(Ordering::Acquire));
+
+        observe_server_ready(
+            std::io::Cursor::new("server listening on http://127.0.0.1:4096\n"),
+            4096,
+            Arc::clone(&ready),
+        );
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn attach_args_are_session_specific_and_do_not_include_password() {
         let locator = SessionLocator::opencode(
             "http://127.0.0.1:4096".to_string(),
@@ -1998,6 +2046,89 @@ mod tests {
                 .state,
             DeliveryState::Ambiguous
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn restore_idle_without_target_history_proof_is_ambiguous() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("address").port();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut responses = 0;
+            while responses < 2 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                let (header, _) = read_http_request(&stream);
+                let request_line = header.lines().next().unwrap_or_default();
+                if request_line.starts_with("GET /session/session-1/message?limit=100 ") {
+                    json_response(
+                        &mut stream,
+                        "200 OK",
+                        json!([{"id": Uuid::new_v4().to_string()}]),
+                    );
+                } else if request_line.starts_with("GET /session/status ") {
+                    json_response(
+                        &mut stream,
+                        "200 OK",
+                        json!({"session-1": {"type": "idle"}}),
+                    );
+                } else {
+                    panic!("unexpected request: {request_line}");
+                }
+                responses += 1;
+            }
+        });
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-opencode-restore-target-proof-{}",
+            Uuid::new_v4()
+        ));
+        let locator = SessionLocator::opencode(
+            format!("http://127.0.0.1:{port}"),
+            Some("session-1".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        let envelope = DeliveryEnvelope::new(
+            "agent",
+            locator.clone(),
+            DeliveryKind::Prompt,
+            "restore me",
+            None,
+        );
+        let delivery_id = envelope.delivery_id;
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        store.record_queued(&envelope).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::ProtocolAccepted,
+            ))
+            .expect("accepted");
+
+        let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+        adapter.locator = Some(locator);
+        adapter.restore_pending_state().expect("restore");
+        assert_eq!(adapter.in_flight, None);
+        assert_eq!(
+            store
+                .latest(delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::Ambiguous
+        );
+        server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);
     }
 

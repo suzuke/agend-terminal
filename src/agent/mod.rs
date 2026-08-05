@@ -709,23 +709,10 @@ fn per_instance_opencode_xdg(
 }
 
 fn opencode_attach_passthrough_args(args: &[String]) -> Vec<String> {
-    let mut output = Vec::with_capacity(args.len());
-    let mut skip_model_value = false;
-    for arg in args {
-        if skip_model_value {
-            skip_model_value = false;
-            continue;
-        }
-        if arg == "--model" || arg == "-m" {
-            skip_model_value = true;
-            continue;
-        }
-        if arg.starts_with("--model=") || arg.starts_with("-m=") {
-            continue;
-        }
-        output.push(arg.clone());
-    }
-    output
+    Backend::OpenCode.model_capability().map_or_else(
+        || args.to_vec(),
+        |capability| capability.without_model(args),
+    )
 }
 
 /// #1519: canonical opencode `auth.json` to seed each per-instance data dir

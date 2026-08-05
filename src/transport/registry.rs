@@ -280,25 +280,9 @@ pub(crate) fn prepare_opencode_tui_session(
 }
 
 fn opencode_model_arg(args: &[String]) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix("--model=") {
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        if let Some(value) = arg.strip_prefix("-m=") {
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        if arg == "--model" || arg == "-m" {
-            if let Some(value) = iter.next().filter(|value| !value.is_empty()) {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
+    Backend::OpenCode
+        .model_capability()
+        .and_then(|capability| capability.value(args))
 }
 
 pub(crate) fn envelope_for_instance(
