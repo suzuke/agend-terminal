@@ -12,15 +12,19 @@ use super::{
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(unix)]
 use std::io::Read;
 
+#[cfg(unix)]
 const CODEX_PROTOCOL: &str = "v2";
+#[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct CodexNativeShared {
@@ -439,6 +443,14 @@ impl CodexNativeShared {
         }
     }
 
+    #[cfg(not(unix))]
+    fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let _ = (method, params);
+        Err(anyhow::anyhow!(
+            "Codex NativeShared requires Unix sockets; refusing structured delivery without a PTY fallback"
+        ))
+    }
+
     #[cfg(unix)]
     fn write_frame(&mut self, frame: &Value) -> anyhow::Result<()> {
         let writer = self
@@ -615,6 +627,7 @@ impl CodexNativeShared {
     }
 }
 
+#[cfg(unix)]
 fn validate_initialize_response(response: &Value) -> anyhow::Result<String> {
     let version = response
         .get("userAgent")
@@ -837,6 +850,7 @@ mod tests {
 
     fn run_fake_codex(endpoint: &Path) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(endpoint).expect("bind fake Codex socket");
+        // fire-and-forget: the fake app-server owns the socket until the client drains events.
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept fake Codex client");
             let mut handshake = Vec::new();
