@@ -1491,7 +1491,9 @@ mod should_defer_direct_inject_tests_1513pr2 {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod structured_transport_delivery_tests {
     use super::inject_notification_with_submit;
-    use crate::transport::{DeliveryState, ReceiptStore, SessionLocator};
+    #[cfg(unix)]
+    use crate::transport::SessionLocator;
+    use crate::transport::{DeliveryState, ReceiptStore};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
