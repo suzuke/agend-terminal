@@ -3091,6 +3091,49 @@ fn opencode_data_dir_sanitizes_instance_component() {
     assert_eq!(path, home.join("backend-data/opencode/.._outside_instance"));
 }
 
+#[test]
+fn opencode_attach_command_uses_one_model_parse_result() {
+    let args = ["--verbose", "--model=anthropic/opus", "--", "payload"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    let parsed = crate::transport::parse_opencode_model_args(&args).expect("parse model args");
+    let mut locator = crate::transport::SessionLocator::opencode(
+        "http://127.0.0.1:4096".to_string(),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    locator.model = parsed.model.clone();
+
+    let argv = opencode_attach_command_args(&locator, &args).expect("attach argv");
+    assert_eq!(locator.model.as_deref(), Some("anthropic/opus"));
+    assert_eq!(
+        argv,
+        vec![
+            "attach",
+            "http://127.0.0.1:4096",
+            "--session",
+            "session-1",
+            "--verbose",
+            "--",
+            "payload",
+        ]
+    );
+    assert!(!argv.iter().any(|arg| arg.contains("model")));
+
+    assert!(opencode_attach_command_args(&locator, &["-mopus".to_string()]).is_err());
+    assert!(opencode_attach_command_args(
+        &locator,
+        &[
+            "--model".to_string(),
+            "--".to_string(),
+            "payload".to_string()
+        ],
+    )
+    .is_err());
+}
+
 /// The core #1519 regression: two opencode instances resolve to DISTINCT
 /// XDG_DATA_HOME values — the property that prevents the shared-session
 /// collision. Pre-fix there was no per-instance XDG at all (both inherited the

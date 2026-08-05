@@ -21,7 +21,8 @@ pub(crate) use registry::mode_for_backend;
 pub(crate) use registry::{deliver_notification, record_delivery_drop};
 
 pub(crate) use registry::{
-    opencode_attach_args, opencode_attach_locator, prepare_opencode_tui_session,
+    opencode_attach_args, opencode_attach_locator, parse_opencode_model_args,
+    prepare_opencode_tui_session,
 };
 
 pub(crate) fn remove_instance_delivery_state(

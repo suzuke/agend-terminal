@@ -36,6 +36,34 @@ pub enum ModelFlagHit {
     Ambiguous(String),
 }
 
+#[derive(Debug, PartialEq)]
+pub enum ModelArgError {
+    Ambiguous(String),
+    MissingValue(String),
+}
+
+impl std::fmt::Display for ModelArgError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous(token) => write!(
+                formatter,
+                "ambiguous model-flag token {token:?}; use a separate flag/value pair"
+            ),
+            Self::MissingValue(token) => {
+                write!(formatter, "model flag {token:?} requires a value")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModelArgError {}
+
+#[derive(Debug, PartialEq)]
+pub struct ParsedModelArgs {
+    pub model: Option<String>,
+    pub passthrough: Vec<String>,
+}
+
 impl ModelCapability {
     /// Scan flag territory — tokens BEFORE the first bare `--` delimiter —
     /// for existing spellings of this backend's model flag. Tokens after
@@ -72,71 +100,56 @@ impl ModelCapability {
         hits
     }
 
-    /// Return the first explicit model value in flag territory.
-    pub fn value(&self, args: &[String]) -> Option<String> {
-        let mut iter = args.iter();
-        while let Some(tok) = iter.next() {
+    /// Parse one consistent model selection and attach-safe passthrough argv.
+    pub fn parse(&self, args: &[String]) -> Result<ParsedModelArgs, ModelArgError> {
+        if let Some(ModelFlagHit::Ambiguous(token)) = self
+            .scan(args)
+            .into_iter()
+            .find(|hit| matches!(hit, ModelFlagHit::Ambiguous(_)))
+        {
+            return Err(ModelArgError::Ambiguous(token));
+        }
+        let mut model = None;
+        let mut output = Vec::with_capacity(args.len());
+        let mut index = 0;
+        while let Some(tok) = args.get(index) {
             if tok == "--" {
+                output.extend_from_slice(&args[index..]);
                 break;
             }
             if tok == self.long_flag || self.short_flag.is_some_and(|short| tok == short) {
-                return iter.next().filter(|value| !value.is_empty()).cloned();
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && *value != "--")
+                    .ok_or_else(|| ModelArgError::MissingValue(tok.clone()))?;
+                model.get_or_insert_with(|| value.clone());
+                index += 2;
+                continue;
             }
-            if let Some(value) = tok
+            let long_value = tok
                 .strip_prefix(self.long_flag)
-                .and_then(|rest| rest.strip_prefix('='))
-                .filter(|value| !value.is_empty())
-            {
-                return Some(value.to_string());
-            }
-            if let Some(value) = self
+                .and_then(|rest| rest.strip_prefix('='));
+            let short_value = self
                 .short_flag
                 .and_then(|short| tok.strip_prefix(short))
-                .and_then(|rest| rest.strip_prefix('='))
-                .filter(|value| !value.is_empty())
-            {
-                return Some(value.to_string());
-            }
-        }
-        None
-    }
-
-    /// Remove model selection from flag territory while preserving payload.
-    pub fn without_model(&self, args: &[String]) -> Vec<String> {
-        let mut output = Vec::with_capacity(args.len());
-        let mut skip_value = false;
-        let mut in_payload = false;
-        for tok in args {
-            if in_payload {
-                output.push(tok.clone());
-                continue;
-            }
-            if tok == "--" {
-                in_payload = true;
-                output.push(tok.clone());
-                continue;
-            }
-            if skip_value {
-                skip_value = false;
-                continue;
-            }
-            if tok == self.long_flag || self.short_flag.is_some_and(|short| tok == short) {
-                skip_value = true;
-                continue;
-            }
-            let long_with_value = tok
-                .strip_prefix(self.long_flag)
-                .is_some_and(|rest| rest.starts_with('='));
-            let short_with_value = self
-                .short_flag
-                .and_then(|short| tok.strip_prefix(short))
-                .is_some_and(|rest| rest.starts_with('='));
-            if long_with_value || short_with_value {
+                .and_then(|rest| rest.strip_prefix('='));
+            if let Some(value) = long_value.or(short_value) {
+                if value.is_empty() {
+                    return Err(ModelArgError::MissingValue(tok.clone()));
+                }
+                if model.is_none() {
+                    model = Some(value.to_string());
+                }
+                index += 1;
                 continue;
             }
             output.push(tok.clone());
+            index += 1;
         }
-        output
+        Ok(ParsedModelArgs {
+            model,
+            passthrough: output,
+        })
     }
 }
 
@@ -232,9 +245,12 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        assert_eq!(cap.value(&args).as_deref(), Some("anthropic/opus"));
         assert_eq!(
-            cap.without_model(&args),
+            cap.parse(&args).unwrap().model.as_deref(),
+            Some("anthropic/opus")
+        );
+        assert_eq!(
+            cap.parse(&args).unwrap().passthrough,
             vec!["--verbose", "--", "--model", "payload"]
         );
 
@@ -242,8 +258,37 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(cap.value(&short).as_deref(), Some("openai/gpt-5"));
-        assert_eq!(cap.without_model(&short), vec!["--verbose"]);
+        assert_eq!(
+            cap.parse(&short).unwrap().model.as_deref(),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(cap.parse(&short).unwrap().passthrough, vec!["--verbose"]);
+
+        let ambiguous = vec!["-mopenai/gpt-5".to_string()];
+        assert!(matches!(
+            cap.parse(&ambiguous),
+            Err(ModelArgError::Ambiguous(_))
+        ));
+        let missing = ["--model", "--", "payload"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            cap.parse(&missing),
+            Err(ModelArgError::MissingValue(_))
+        ));
+
+        let payload = ["--", "-mopenai/gpt-5"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cap.parse(&payload).unwrap(),
+            ParsedModelArgs {
+                model: None,
+                passthrough: payload,
+            }
+        );
     }
 
     /// #2744 PR-A L2: every declared ModelCapability is pinned by a verbatim

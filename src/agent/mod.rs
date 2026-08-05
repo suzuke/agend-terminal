@@ -708,11 +708,21 @@ fn per_instance_opencode_xdg(
     }
 }
 
-fn opencode_attach_passthrough_args(args: &[String]) -> Vec<String> {
-    Backend::OpenCode.model_capability().map_or_else(
-        || args.to_vec(),
-        |capability| capability.without_model(args),
-    )
+fn opencode_attach_command_args(
+    locator: &crate::transport::SessionLocator,
+    args: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let parsed = crate::transport::parse_opencode_model_args(args)?;
+    if let Some(model) = parsed.model.as_ref() {
+        anyhow::ensure!(
+            locator.model.as_ref() == Some(model),
+            "OpenCode session model does not match the parsed spawn argument"
+        );
+    }
+    Ok(crate::transport::opencode_attach_args(locator)?
+        .into_iter()
+        .chain(parsed.passthrough)
+        .collect())
 }
 
 /// #1519: canonical opencode `auth.json` to seed each per-instance data dir
@@ -791,11 +801,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
-        let passthrough = opencode_attach_passthrough_args(args);
-        crate::transport::opencode_attach_args(locator)?
-            .into_iter()
-            .chain(passthrough)
-            .collect()
+        opencode_attach_command_args(locator, args)?
     } else {
         let preset = detected_backend
             .as_ref()

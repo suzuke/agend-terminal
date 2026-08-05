@@ -273,16 +273,20 @@ pub(crate) fn prepare_opencode_tui_session(
         Some(&Backend::OpenCode),
         TransportMode::NativeShared,
     )?;
-    if locator.model.is_none() {
-        locator.model = opencode_model_arg(args);
+    if let Some(model) = parse_opencode_model_args(args)?.model {
+        locator.model = Some(model);
     }
     super::opencode_server::prepare_resident_tui(home, instance, locator, working_dir)
 }
 
-fn opencode_model_arg(args: &[String]) -> Option<String> {
+pub(crate) fn parse_opencode_model_args(
+    args: &[String],
+) -> anyhow::Result<crate::backend_model::ParsedModelArgs> {
     Backend::OpenCode
         .model_capability()
-        .and_then(|capability| capability.value(args))
+        .ok_or_else(|| anyhow::anyhow!("OpenCode model capability is unavailable"))?
+        .parse(args)
+        .map_err(|error| anyhow::anyhow!("invalid OpenCode model argument: {error}"))
 }
 
 pub(crate) fn envelope_for_instance(
@@ -476,19 +480,27 @@ mod tests {
     }
 
     #[test]
-    fn opencode_model_arg_accepts_long_and_short_forms() {
+    fn opencode_model_arg_contract_matches_declared_backend_policy() {
         assert_eq!(
-            opencode_model_arg(&["--model=anthropic/opus".to_string()]),
+            parse_opencode_model_args(&["--model=anthropic/opus".to_string()])
+                .expect("long model")
+                .model,
             Some("anthropic/opus".to_string())
         );
         assert_eq!(
-            opencode_model_arg(&["-m".to_string(), "openai/gpt-5".to_string()]),
+            parse_opencode_model_args(&["-m".to_string(), "openai/gpt-5".to_string()])
+                .expect("short model")
+                .model,
             Some("openai/gpt-5".to_string())
         );
-        assert_eq!(
-            opencode_model_arg(&["-m=openai/gpt-5".to_string()]),
-            Some("openai/gpt-5".to_string())
-        );
+        assert!(parse_opencode_model_args(&["-m=openai/gpt-5".to_string()]).is_err());
+        assert!(parse_opencode_model_args(&["-mopenai/gpt-5".to_string()]).is_err());
+        assert!(parse_opencode_model_args(&[
+            "--model".to_string(),
+            "--".to_string(),
+            "payload".to_string(),
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]
