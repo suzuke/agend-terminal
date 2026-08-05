@@ -103,9 +103,12 @@ mod tests {
             mode_for_backend(&Backend::Codex),
             TransportMode::NativeShared
         );
+        assert_eq!(
+            mode_for_backend(&Backend::OpenCode),
+            TransportMode::NativeShared
+        );
         for backend in [
             Backend::ClaudeCode,
-            Backend::OpenCode,
             Backend::Grok,
             Backend::KiroCli,
             Backend::Agy,
