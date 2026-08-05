@@ -82,6 +82,75 @@ fn default_codex_locator(home: &Path, instance: &str) -> SessionLocator {
     SessionLocator::codex(endpoint, thread_id)
 }
 
+fn locator_for_instance(
+    home: &Path,
+    instance: &str,
+    backend: Option<&Backend>,
+    mode: TransportMode,
+) -> anyhow::Result<SessionLocator> {
+    if mode == TransportMode::NativeShared {
+        let path = session_path(home, instance);
+        return match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => load_session_locator(home, instance),
+            Ok(_) => Err(anyhow::anyhow!(
+                "NativeShared session locator is not a regular file: {}",
+                path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(default_codex_locator(home, instance))
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "NativeShared session locator cannot be inspected at {}: {error}",
+                path.display()
+            )),
+        };
+    }
+    Ok(SessionLocator {
+        backend: backend
+            .map(Backend::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        endpoint: None,
+        thread_id: None,
+        session_id: None,
+    })
+}
+
+pub(crate) fn envelope_for_instance(
+    home: &Path,
+    instance: &str,
+    body: &str,
+) -> anyhow::Result<DeliveryEnvelope> {
+    let backend = backend_for_instance(home, instance);
+    let mode = mode_for_instance(home, instance);
+    let locator = locator_for_instance(home, instance, backend.as_ref(), mode)?;
+    Ok(DeliveryEnvelope::new(
+        instance,
+        locator,
+        DeliveryKind::Notification,
+        body,
+        None,
+    ))
+}
+
+/// Persist a local queue drop as a terminal failure. This is used when the
+/// caller-facing bounded worker queue is full, before any backend request was
+/// attempted; structured failures never become an invisible PTY fallback.
+pub(crate) fn record_delivery_drop(
+    home: &Path,
+    instance: &str,
+    body: &str,
+    detail: &str,
+) -> anyhow::Result<DeliveryReceipt> {
+    let envelope = envelope_for_instance(home, instance, body)?;
+    let store = super::ReceiptStore::for_instance(home, instance)?;
+    store.record_queued(&envelope)?;
+    let mut receipt = DeliveryReceipt::for_state(&envelope, super::DeliveryState::Failed);
+    receipt.detail = Some(detail.to_string());
+    store.record(receipt.clone())?;
+    Ok(receipt)
+}
+
 /// Deliver one already-composed notification. The selected mode is persisted
 /// before the physical/structured attempt; a Codex failure is returned as a
 /// hard error and never invokes the LegacyPty closure.
@@ -94,34 +163,8 @@ pub(crate) fn deliver_notification<F>(
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
-    let backend = backend_for_instance(home, instance);
     let mode = mode_for_instance(home, instance);
-    let locator = match mode {
-        TransportMode::NativeShared => match load_session_locator(home, instance) {
-            Ok(locator) => locator,
-            Err(_) => default_codex_locator(home, instance),
-        },
-        TransportMode::LegacyPty
-        | TransportMode::ChannelBridge
-        | TransportMode::ManagedHeadless
-        | TransportMode::ManualRequired => SessionLocator {
-            backend: backend
-                .as_ref()
-                .map(Backend::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            endpoint: None,
-            thread_id: None,
-            session_id: None,
-        },
-    };
-    let envelope = DeliveryEnvelope::new(
-        instance,
-        locator.clone(),
-        DeliveryKind::Notification,
-        body,
-        None,
-    );
+    let envelope = envelope_for_instance(home, instance, body)?;
     match mode {
         TransportMode::NativeShared => {
             let mut adapter = CodexNativeShared::new(home, instance);
@@ -155,6 +198,31 @@ mod tests {
             "instances:\n  codex-agent:\n    backend: codex\n",
         )
         .expect("fleet");
+        let pty_calls = Arc::new(AtomicUsize::new(0));
+        let pty_calls_for_injector = Arc::clone(&pty_calls);
+        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+            pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(pty_calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn corrupt_codex_locator_fails_closed_without_env_fallback() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-corrupt-locator-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join("transport/sessions")).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  codex-agent:\n    backend: codex\n",
+        )
+        .expect("fleet");
+        std::fs::write(session_path(&home, "codex-agent"), b"{not valid json")
+            .expect("corrupt locator");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
         let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {

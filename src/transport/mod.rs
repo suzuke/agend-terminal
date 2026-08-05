@@ -15,7 +15,7 @@ pub(crate) use receipt::{DeliveryReceipt, DeliveryState, ReceiptStore};
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;
 
-pub(crate) use registry::deliver_notification;
+pub(crate) use registry::{deliver_notification, record_delivery_drop};
 
 /// Explicit transport selected for a backend instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

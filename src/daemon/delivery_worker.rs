@@ -1,19 +1,20 @@
 //! AUDIT2-006: bounded delivery worker.
 //!
 //! The daemon's main tick / `run_core` loop emits events and, via the event bus
-//! subscribers, delivers notifications by injecting into agent PTYs and sending
-//! Telegram messages. Both are BLOCKING I/O: a Telegram network black-hole (no
-//! local request timeout) or a slow PTY readback would otherwise park the tick
-//! thread — stalling the hang-detection, recovery-dispatcher and crash handling
-//! that share that one thread.
+//! subscribers, delivers notifications by injecting into agent PTYs, using a
+//! structured backend protocol, and sending Telegram messages. All are
+//! BLOCKING I/O: a Telegram network black-hole (no local request timeout), a
+//! slow PTY readback, or a backend handshake/RPC wait would otherwise park the
+//! tick thread — stalling the hang-detection, recovery-dispatcher and crash
+//! handling that share that one thread.
 //!
-//! This module offloads ONLY the blocking *wake* effect (the physical PTY poke
-//! and the Telegram send) onto a single bounded background worker. Durable
-//! source-of-truth writes (inbox JSONL, `notification_queue`, schedule
-//! `run_history`) stay SYNCHRONOUS on the caller — a notification is a wakeup,
-//! not a commit barrier. `event_bus::emit`'s handled-count is unaffected: it is
-//! decided by the synchronous kind-match inside each subscriber, BEFORE any
-//! delivery is enqueued (see `event_bus.rs`).
+//! This module offloads the blocking delivery effect (physical PTY poke,
+//! structured backend delivery, and Telegram send) onto a single bounded
+//! background worker. Durable source-of-truth writes (inbox JSONL,
+//! `notification_queue`, schedule `run_history`) stay SYNCHRONOUS on the caller
+//! — a notification is a wakeup, not a commit barrier. `event_bus::emit`'s
+//! handled-count is unaffected: it is decided by the synchronous kind-match
+//! inside each subscriber, BEFORE any delivery is enqueued (see `event_bus.rs`).
 //!
 //! Backpressure: a bounded `sync_channel(QUEUE_CAP)`; [`enqueue_pty_wake`] /
 //! [`enqueue_telegram_send`] use `try_send` and NEVER block. On a full queue the
@@ -45,6 +46,13 @@ enum DeliveryJob {
     /// primitive (an `api::call(INJECT)` loopback). The worker calls the `_direct`
     /// primitive, NEVER the offload wrapper, so there is no recursive re-enqueue.
     PtyWake {
+        home: std::path::PathBuf,
+        agent: String,
+        notification: String,
+    },
+    /// A selected transport delivery. LegacyPty may enqueue a second `PtyWake`
+    /// from the worker, while structured adapters perform protocol work here.
+    TransportDelivery {
         home: std::path::PathBuf,
         agent: String,
         notification: String,
@@ -138,6 +146,28 @@ fn dispatch(job: DeliveryJob) {
                 tracing::debug!(agent = %agent, error = %e, "delivery_worker: PTY wake inject failed");
             }
         }
+        DeliveryJob::TransportDelivery {
+            home,
+            agent,
+            notification,
+        } => {
+            let result = crate::transport::deliver_notification(
+                &home,
+                &agent,
+                &notification,
+                |home, agent, text| {
+                    enqueue_pty_wake(home, agent, text)
+                        .map_err(|()| anyhow::anyhow!("delivery queue full — PTY wake dropped"))
+                },
+            );
+            if let Err(error) = result {
+                tracing::debug!(
+                    agent = %agent,
+                    error = %error,
+                    "delivery_worker: structured transport delivery failed"
+                );
+            }
+        }
         DeliveryJob::TelegramSend(job) => {
             crate::channel::telegram::notify::send_telegram_job(job);
         }
@@ -202,6 +232,21 @@ pub(crate) fn enqueue_pty_wake(
     notification: &str,
 ) -> Result<(), ()> {
     try_enqueue(DeliveryJob::PtyWake {
+        home: home.to_path_buf(),
+        agent: agent.to_string(),
+        notification: notification.to_string(),
+    })
+}
+
+/// Enqueue a complete backend transport delivery. The bounded queue is the
+/// caller-facing non-blocking boundary; structured handshakes and protocol
+/// waits happen only in [`dispatch`] on the worker thread.
+pub(crate) fn enqueue_transport_delivery(
+    home: &std::path::Path,
+    agent: &str,
+    notification: &str,
+) -> Result<(), ()> {
+    try_enqueue(DeliveryJob::TransportDelivery {
         home: home.to_path_buf(),
         agent: agent.to_string(),
         notification: notification.to_string(),
@@ -357,5 +402,29 @@ mod tests {
             "a full delivery queue must drop the page (Err), never block the monitor"
         );
         test_support::set_force_full(false);
+    }
+
+    /// A missing Codex endpoint must not make the caller wait for the
+    /// structured adapter's readiness timeout; only the worker may perform it.
+    #[test]
+    fn transport_delivery_enqueue_is_nonblocking_for_unavailable_codex() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-codex-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  codex-agent:\n    backend: codex\n",
+        )
+        .expect("fleet");
+        let started = std::time::Instant::now();
+        assert!(enqueue_transport_delivery(&home, "codex-agent", "ping").is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "transport enqueue must not run Codex readiness on the caller thread"
+        );
+        // The daemon-lifetime worker may still be consuming this job; keep the
+        // unique home available until its best-effort read has finished.
     }
 }

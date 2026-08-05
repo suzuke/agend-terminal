@@ -758,21 +758,29 @@ where
     Ok(())
 }
 
-/// AUDIT2-006: LegacyPty physical wakes are offloaded to the bounded delivery
-/// worker so the tick / main-loop thread never blocks on PTY readback. For a
-/// backend with an explicit structured mode, this same seam performs the
-/// protocol delivery and never invokes the PTY closure. Every upstream durable
-/// decision — the #911 dedup gate, the #1513 defer→`enqueue_classified`, the
-/// #2044 verification arm — has already run synchronously on the caller.
+/// AUDIT2-006: the selected transport delivery is offloaded to the bounded
+/// worker so the tick / main-loop thread never blocks on PTY readback or a
+/// structured backend handshake/RPC. LegacyPty performs its physical wake from
+/// that worker; structured modes never invoke the PTY closure. Every upstream
+/// durable decision — the #911 dedup gate, the #1513 defer→`enqueue_classified`,
+/// the #2044 verification arm — has already run synchronously on the caller.
 ///
 /// Returns `Ok(())` once the wake is accepted by the bounded queue; `Err` only
 /// when the queue is full (the wake is dropped — the worker module logs a WARN).
 fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
-    crate::transport::deliver_notification(home, agent_name, message, |home, agent, text| {
-        crate::daemon::delivery_worker::enqueue_pty_wake(home, agent, text)
-            .map_err(|()| anyhow::anyhow!("delivery queue full — PTY wake dropped"))
-    })
-    .map(|_| ())
+    if crate::daemon::delivery_worker::enqueue_transport_delivery(home, agent_name, message).is_ok()
+    {
+        return Ok(());
+    }
+    let reason = "bounded transport delivery queue full; delivery was not attempted";
+    if let Err(error) = crate::transport::record_delivery_drop(home, agent_name, message, reason) {
+        return Err(anyhow::anyhow!(
+            "delivery queue full and durable failure receipt failed: {error}"
+        ));
+    }
+    Err(anyhow::anyhow!(
+        "delivery queue full — transport delivery dropped"
+    ))
 }
 
 /// The physical submit-aware inject primitive: a self-IPC `api::call(INJECT)`
@@ -1476,5 +1484,60 @@ mod should_defer_direct_inject_tests_1513pr2 {
             !should_defer_direct_inject(&tmp_home("nosnap"), "a"),
             "no snapshot → inject"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod structured_transport_delivery_tests {
+    use super::inject_notification_with_submit;
+    use crate::transport::{DeliveryState, ReceiptStore};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CTR: AtomicU32 = AtomicU32::new(0);
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-structured-delivery-{}-{}-{}",
+            tag,
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  codex-agent:\n    backend: codex\n",
+        )
+        .expect("fleet");
+        home
+    }
+
+    #[test]
+    fn unavailable_codex_does_not_block_inject_caller() {
+        let home = tmp_home("nonblocking");
+        let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        let started = std::time::Instant::now();
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "inject caller must not run Codex socket/RPC readiness inline"
+        );
+    }
+
+    #[test]
+    fn full_transport_queue_persists_failed_receipt() {
+        let home = tmp_home("queue-full");
+        let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(true);
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+
+        assert!(result.is_err(), "full queue must report a durable drop");
+        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("receipt store");
+        let body = std::fs::read_to_string(store.path()).expect("receipt log");
+        assert!(body.contains(&format!("\"state\":\"{:?}\"", DeliveryState::Failed)));
+        assert!(body.contains("bounded transport delivery queue full"));
     }
 }

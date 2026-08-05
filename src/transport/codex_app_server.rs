@@ -165,9 +165,24 @@ impl CodexNativeShared {
                     endpoint.display()
                 ));
             }
-            if let Some(parent) = endpoint.parent() {
-                std::fs::create_dir_all(parent)?;
+            let parent = endpoint
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Codex socket must have a dedicated parent directory")
+                })?;
+            let temp_root = std::env::temp_dir();
+            if parent == Path::new("/") || parent == temp_root.as_path() {
+                return Err(anyhow::anyhow!(
+                    "refusing to make the shared socket parent private: {}",
+                    parent.display()
+                ));
             }
+            std::fs::create_dir_all(parent)?;
+            let mut parent_permissions = std::fs::metadata(parent)?.permissions();
+            use std::os::unix::fs::PermissionsExt;
+            parent_permissions.set_mode(0o700);
+            std::fs::set_permissions(parent, parent_permissions)?;
             let mut child = std::process::Command::new(codex)
                 .args(["app-server", "--listen", &locator.remote_attach_arg()])
                 .current_dir(cwd)
@@ -180,7 +195,6 @@ impl CodexNativeShared {
                 ));
             }
             let mut permissions = std::fs::metadata(endpoint)?.permissions();
-            use std::os::unix::fs::PermissionsExt;
             permissions.set_mode(0o600);
             std::fs::set_permissions(endpoint, permissions)?;
             Ok(child)
