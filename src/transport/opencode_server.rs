@@ -1575,10 +1575,10 @@ fn resident_adapter(
     let stop = Arc::new(AtomicBool::new(false));
     let worker_adapter = Arc::clone(&adapter);
     let worker_stop = Arc::clone(&stop);
+    // fire-and-forget: ownership transfers to `ResidentWorker`; cleanup sets
+    // the stop flag and joins the retained handle before server teardown.
     let join = std::thread::Builder::new()
         .name(format!("opencode-events-{instance}"))
-        // The JoinHandle is retained in `ResidentWorker`; cleanup stops and
-        // joins this reader before the managed server is killed.
         .spawn(move || resident_event_loop(worker_adapter, worker_stop))?;
     workers.insert(
         key,
