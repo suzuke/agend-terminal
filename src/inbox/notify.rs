@@ -758,19 +758,21 @@ where
     Ok(())
 }
 
-/// AUDIT2-006: offload the physical PTY wake (the blocking `api::call(INJECT)`
-/// loopback) to the bounded delivery worker so the tick / main-loop thread never
-/// blocks on the inject readback. Every upstream durable decision — the #911
-/// dedup gate, the #1513 defer→`enqueue_classified`, the #2044 verification arm —
-/// has already run synchronously on the caller; only the physical wake moves off-
-/// thread. The worker calls [`inject_with_submit_direct`] (NOT this wrapper), so
-/// there is no recursive re-enqueue.
+/// AUDIT2-006: LegacyPty physical wakes are offloaded to the bounded delivery
+/// worker so the tick / main-loop thread never blocks on PTY readback. For a
+/// backend with an explicit structured mode, this same seam performs the
+/// protocol delivery and never invokes the PTY closure. Every upstream durable
+/// decision — the #911 dedup gate, the #1513 defer→`enqueue_classified`, the
+/// #2044 verification arm — has already run synchronously on the caller.
 ///
 /// Returns `Ok(())` once the wake is accepted by the bounded queue; `Err` only
 /// when the queue is full (the wake is dropped — the worker module logs a WARN).
 fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
-    crate::daemon::delivery_worker::enqueue_pty_wake(home, agent_name, message)
-        .map_err(|()| anyhow::anyhow!("delivery queue full — PTY wake dropped"))
+    crate::transport::deliver_notification(home, agent_name, message, |home, agent, text| {
+        crate::daemon::delivery_worker::enqueue_pty_wake(home, agent, text)
+            .map_err(|()| anyhow::anyhow!("delivery queue full — PTY wake dropped"))
+    })
+    .map(|_| ())
 }
 
 /// The physical submit-aware inject primitive: a self-IPC `api::call(INJECT)`

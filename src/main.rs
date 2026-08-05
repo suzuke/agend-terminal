@@ -95,6 +95,7 @@ mod team_ops;
 mod teams;
 mod thread_census;
 mod token_cost;
+mod transport;
 #[cfg(feature = "tray")]
 mod tray;
 mod tui;
