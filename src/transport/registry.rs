@@ -46,6 +46,7 @@ fn session_path(home: &Path, instance: &str) -> PathBuf {
         .join(format!("{}.json", super::receipt::safe_component(instance)))
 }
 
+#[cfg(unix)]
 pub(crate) fn save_session_locator(
     home: &Path,
     instance: &str,

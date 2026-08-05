@@ -11,7 +11,9 @@ use super::{
     DeliveryState, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,7 @@ pub(crate) struct CodexNativeShared {
     in_flight: Option<Uuid>,
     active_turn_id: Option<String>,
     pending: HashMap<Uuid, DeliveryEnvelope>,
+    #[cfg(unix)]
     events: VecDeque<BackendEvent>,
     #[cfg(unix)]
     writer: Option<std::os::unix::net::UnixStream>,
@@ -56,6 +59,7 @@ impl CodexNativeShared {
             in_flight: None,
             active_turn_id: None,
             pending: HashMap::new(),
+            #[cfg(unix)]
             events: VecDeque::new(),
             #[cfg(unix)]
             writer: None,
@@ -309,6 +313,7 @@ impl CodexNativeShared {
         }
     }
 
+    #[cfg(unix)]
     fn update_pending_state(
         &self,
         delivery_id: Uuid,
