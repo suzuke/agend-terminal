@@ -12,6 +12,30 @@ pub(crate) struct SessionLocator {
     pub endpoint: Option<PathBuf>,
     pub thread_id: Option<String>,
     pub session_id: Option<String>,
+    /// HTTP endpoint used by OpenCode NativeShared.  This is separate from
+    /// `endpoint` because the latter is a filesystem Unix-socket path for
+    /// Codex and must remain backwards-compatible in durable locators.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    /// OpenCode's HTTP Basic-auth username.  Never included in normal logs.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// OpenCode's loopback server password.  The locator is stored in the
+    /// private transport state directory and is never logged.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Optional provider/model selected for the shared OpenCode session.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Monotonic local SSE position used to prove how far the daemon has
+    /// consumed an event stream after reconnect. OpenCode does not provide a
+    /// durable event cursor in the HTTP API.
+    #[serde(default)]
+    pub event_cursor: Option<u64>,
+    /// Whether AgEnD owns the OpenCode server lifecycle. Explicit external
+    /// endpoints can opt out while still using the same adapter.
+    #[serde(default)]
+    pub managed: bool,
 }
 
 impl SessionLocator {
@@ -21,6 +45,32 @@ impl SessionLocator {
             endpoint: Some(endpoint),
             thread_id,
             session_id: None,
+            endpoint_url: None,
+            username: None,
+            password: None,
+            model: None,
+            event_cursor: None,
+            managed: false,
+        }
+    }
+
+    pub(crate) fn opencode(
+        endpoint_url: String,
+        session_id: Option<String>,
+        username: String,
+        password: String,
+    ) -> Self {
+        Self {
+            backend: "opencode".to_string(),
+            endpoint: None,
+            thread_id: None,
+            session_id,
+            endpoint_url: Some(endpoint_url),
+            username: Some(username),
+            password: Some(password),
+            model: None,
+            event_cursor: Some(0),
+            managed: true,
         }
     }
 

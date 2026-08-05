@@ -129,6 +129,44 @@ impl ReceiptStore {
         Ok(latest)
     }
 
+    /// Return durable envelopes whose latest receipt is not terminal.  A
+    /// structured adapter is intentionally short-lived per worker job, so a
+    /// fresh adapter must restore the in-flight turn before deciding whether a
+    /// second prompt may be sent.
+    pub(crate) fn pending_deliveries(
+        &self,
+    ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        restrict_permissions(&self.path, 0o600)?;
+        let file = File::open(&self.path)?;
+        let mut histories: HashMap<Uuid, (Option<DeliveryEnvelope>, Option<DeliveryReceipt>)> =
+            HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let record: DurableRecord = serde_json::from_str(&line?)?;
+            let entry = histories
+                .entry(record.receipt.delivery_id)
+                .or_insert_with(|| (None, None));
+            if let Some(envelope) = record.envelope {
+                entry.0 = Some(envelope);
+            }
+            entry.1 = Some(record.receipt);
+        }
+        Ok(histories
+            .into_values()
+            .filter_map(|(envelope, receipt)| {
+                let receipt = receipt?;
+                if receipt.state.is_terminal() {
+                    return None;
+                }
+                Some((envelope?, receipt))
+            })
+            .collect())
+    }
+
     fn append(&self, record: DurableRecord) -> anyhow::Result<()> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
