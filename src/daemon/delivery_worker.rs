@@ -184,6 +184,8 @@ fn dispatch(job: DeliveryJob) {
             if crate::agent::deleting::is_deleting(&home, &agent)
                 || transport_epoch(&home, &agent) != epoch
             {
+                #[cfg(test)]
+                test_support::note_transport_dispatch_complete(&home, &agent);
                 tracing::debug!(
                     agent = %agent,
                     "delivery_worker: discarded stale transport delivery during teardown"
@@ -207,6 +209,8 @@ fn dispatch(job: DeliveryJob) {
                     "delivery_worker: structured transport delivery failed"
                 );
             }
+            #[cfg(test)]
+            test_support::note_transport_dispatch_complete(&home, &agent);
         }
         DeliveryJob::TelegramSend(job) => {
             crate::channel::telegram::notify::send_telegram_job(job);
@@ -368,6 +372,16 @@ pub(crate) mod test_support {
     static LEGACY_WAKE_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     static FF_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static TRANSPORT_COMPLETIONS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), usize>>,
+    > = std::sync::OnceLock::new();
+
+    fn transport_completions(
+    ) -> &'static parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), usize>>
+    {
+        TRANSPORT_COMPLETIONS
+            .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
 
     /// Force every `try_enqueue` to behave as if the bounded queue were full,
     /// WITHOUT actually filling 256 slots — lets callers unit-test the drop /
@@ -396,6 +410,21 @@ pub(crate) mod test_support {
 
     pub(crate) fn legacy_wake_count() -> usize {
         LEGACY_WAKE_COUNT.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn note_transport_dispatch_complete(home: &std::path::Path, agent: &str) {
+        let key = (home.to_path_buf(), agent.to_string());
+        let mut completions = transport_completions().lock();
+        *completions.entry(key).or_default() += 1;
+    }
+
+    pub(crate) fn transport_dispatch_count(home: &std::path::Path, agent: &str) -> usize {
+        let key = (home.to_path_buf(), agent.to_string());
+        transport_completions()
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(super) fn force_full() -> bool {
@@ -504,6 +533,60 @@ mod tests {
             "LegacyPty must make one physical wake on the existing worker lane"
         );
         test_support::set_force_full(false);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stale_transport_delivery_cannot_recreate_receipts_after_cleanup() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-teardown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent = "legacy-agent";
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  legacy-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+
+        let stale_epoch = transport_epoch(&home, agent);
+        let cleanup = begin_transport_cleanup(&home, agent);
+        assert!(try_enqueue(DeliveryJob::TransportDelivery {
+            home: home.clone(),
+            agent: agent.to_string(),
+            notification: "stale teardown wake".to_string(),
+            epoch: stale_epoch,
+        })
+        .is_ok());
+        drop(cleanup);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while test_support::transport_dispatch_count(&home, agent) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, agent),
+            1,
+            "the queued stale delivery must be processed by the worker before inspecting state"
+        );
+
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        assert!(
+            !delivery_path.exists(),
+            "teardown must prevent stale worker delivery from recreating the receipt body"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "teardown must prevent stale worker delivery from recreating the receipt lock"
+        );
+        assert!(
+            !delivery_path.parent().is_some_and(std::path::Path::exists),
+            "teardown must leave no delivery directory after a stale worker delivery"
+        );
+
         let _ = std::fs::remove_dir_all(home);
     }
 }
