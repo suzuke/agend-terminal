@@ -309,6 +309,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn kill_process_tree_refuses_shared_process_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let caller_pgid = unsafe { libc::getpgrp() };
+        let mut child = unsafe {
+            Command::new("sh")
+                .args(["-c", "trap '' TERM; while :; do :; done"])
+                .pre_exec(move || {
+                    if libc::setpgid(0, caller_pgid) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("shared-group child")
+        };
+        let child_pid = child.id();
+        assert_ne!(process_group_id(child_pid), Some(child_pid));
+        assert!(is_pid_alive(child_pid));
+
+        kill_process_tree(child_pid);
+
+        assert!(is_pid_alive(child_pid), "shared child must survive refusal");
+        assert!(
+            is_pid_alive(std::process::id()),
+            "caller must survive refusal"
+        );
+        child.kill().expect("cleanup shared-group child");
+        let _ = child.wait();
+    }
+
+    #[test]
     fn kill_process_tree_with_pid_zero_is_noop() {
         // Should not panic or kill anything
         kill_process_tree(0);
