@@ -150,20 +150,13 @@ pub fn terminate(pid: u32) {
 }
 
 /// Return the process group ID when the platform exposes one.
+#[cfg(unix)]
 pub fn process_group_id(pid: u32) -> Option<u32> {
     if pid == 0 {
         return None;
     }
-    #[cfg(unix)]
-    {
-        let pgid = unsafe { libc::getpgid(pid as i32) };
-        (pgid > 0).then_some(pgid as u32)
-    }
-    #[cfg(windows)]
-    {
-        let _ = pid;
-        None
-    }
+    let pgid = unsafe { libc::getpgid(pid as i32) };
+    (pgid > 0).then_some(pgid as u32)
 }
 
 /// Kill an entire process group when `pid` is its process-group leader. On Unix,
@@ -205,30 +198,14 @@ pub fn kill_process_tree(pid: u32) {
 
 /// Force-kill only one process. Callers that track a process must revalidate
 /// its identity immediately before calling this function.
+#[cfg(unix)]
 pub fn kill_process(pid: u32) {
     if pid == 0 {
         tracing::warn!("kill_process called with pid=0, skipping");
         return;
     }
-    #[cfg(unix)]
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        let handle = unsafe {
-            windows_sys::Win32::System::Threading::OpenProcess(
-                windows_sys::Win32::System::Threading::PROCESS_TERMINATE,
-                0,
-                pid,
-            )
-        };
-        if !handle.is_null() {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
-                windows_sys::Win32::Foundation::CloseHandle(handle);
-            }
-        }
     }
 }
 
