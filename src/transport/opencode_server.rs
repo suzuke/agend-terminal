@@ -27,6 +27,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
+const MAX_ERROR_DETAIL: usize = 2048;
+const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg-";
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -296,15 +298,87 @@ fn request(
 
 fn response_json(response: HttpResponse, operation: &str) -> anyhow::Result<Value> {
     if !(200..300).contains(&response.status) {
-        return Err(anyhow::anyhow!(
-            "OpenCode {operation} returned HTTP {}",
-            response.status
-        ));
+        return Err(anyhow::anyhow!(response_error_detail(&response, operation)));
     }
     if response.body.is_empty() {
         return Ok(Value::Null);
     }
     Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn response_error_detail(response: &HttpResponse, operation: &str) -> String {
+    let body = response_body_detail(&response.body);
+    if body.is_empty() {
+        format!("OpenCode {operation} returned HTTP {}", response.status)
+    } else {
+        format!(
+            "OpenCode {operation} returned HTTP {}: {body}",
+            response.status
+        )
+    }
+}
+
+fn response_body_detail(body: &[u8]) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => redact_response_value(value),
+        Err(_) => return truncate_error_detail(&String::from_utf8_lossy(body)),
+    };
+    truncate_error_detail(&value.to_string())
+}
+
+fn redact_response_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_response_key(&key) {
+                        Value::String("[REDACTED]".to_string())
+                    } else {
+                        redact_response_value(value)
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_response_value).collect())
+        }
+        value => value,
+    }
+}
+
+fn is_sensitive_response_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "authorization"
+            | "accesstoken"
+            | "credential"
+            | "password"
+            | "privatekey"
+            | "secret"
+            | "token"
+    )
+}
+
+fn truncate_error_detail(value: &str) -> String {
+    let value = value.trim();
+    if value.len() <= MAX_ERROR_DETAIL {
+        return value.to_string();
+    }
+    let mut end = MAX_ERROR_DETAIL;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 fn not_found(response: &HttpResponse) -> bool {
@@ -851,12 +925,30 @@ fn session_status_type(value: &Value, session_id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn opencode_message_id(delivery_id: Uuid) -> String {
+    format!("{OPENCODE_MESSAGE_ID_PREFIX}{delivery_id}")
+}
+
+fn delivery_id_from_opencode_message_id(value: &str) -> Option<Uuid> {
+    value
+        .strip_prefix(OPENCODE_MESSAGE_ID_PREFIX)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn is_delivery_message_id(value: &str, delivery_id: Uuid) -> bool {
+    value == opencode_message_id(delivery_id)
+        // Keep exact matching for receipts accepted by pre-contract builds;
+        // all newly submitted requests use the msg-prefixed identity above.
+        || value == delivery_id.to_string()
+}
+
 fn contains_delivery_id(value: &Value, delivery_id: Uuid) -> bool {
-    let target = delivery_id.to_string();
     match value {
         Value::Object(map) => map.iter().any(|(key, child)| {
             (matches!(key.as_str(), "id" | "messageID" | "clientUserMessageId")
-                && child.as_str() == Some(target.as_str()))
+                && child
+                    .as_str()
+                    .is_some_and(|value| is_delivery_message_id(value, delivery_id)))
                 || contains_delivery_id(child, delivery_id)
         }),
         Value::Array(values) => values
@@ -955,9 +1047,10 @@ impl OpenCodeNativeShared {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("OpenCode session id is missing"))?;
         let path = format!("{}/prompt_async", session_path(session_id));
+        let wire_message_id = opencode_message_id(envelope.delivery_id);
         let response = request(locator, "POST", &path, {
             let mut body = json!({
-                "messageID": envelope.delivery_id.to_string(),
+                "messageID": wire_message_id,
                 "parts": [{"type": "text", "text": envelope.body}],
             });
             if let Some(model) = locator.model.as_deref() {
@@ -968,10 +1061,10 @@ impl OpenCodeNativeShared {
         let response = match response {
             Ok(response) if (200..300).contains(&response.status) => response,
             Ok(response) => {
-                let error =
-                    anyhow::anyhow!("OpenCode prompt_async returned HTTP {}", response.status);
+                let detail = response_error_detail(&response, "prompt_async");
+                let error = anyhow::anyhow!(detail.clone());
                 let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
-                failed.detail = Some("OpenCode rejected prompt_async".to_string());
+                failed.detail = Some(detail);
                 store.record(failed)?;
                 return Err(error);
             }
@@ -989,7 +1082,7 @@ impl OpenCodeNativeShared {
         self.pending.insert(envelope.delivery_id, envelope.clone());
         self.in_flight = Some(envelope.delivery_id);
         let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-        receipt.protocol_request_id = Some(envelope.delivery_id.to_string());
+        receipt.protocol_request_id = Some(wire_message_id);
         receipt.tui_visibility = Some("shared_opencode_session".to_string());
         receipt.detail = Some("OpenCode prompt_async accepted".to_string());
         store.record(receipt.clone())?;
@@ -1323,7 +1416,9 @@ impl OpenCodeNativeShared {
                     .pointer("/properties/messageID")
                     .and_then(Value::as_str)
             });
-        if id == Some(target_text.as_str()) {
+        if id.and_then(delivery_id_from_opencode_message_id) == Some(target)
+            || id == Some(target_text.as_str())
+        {
             Some(target)
         } else {
             None
@@ -1901,7 +1996,7 @@ mod tests {
         let observed = adapter
             .normalize_event(json!({
                 "type": "message.updated",
-                "properties": {"sessionID": "session-1", "info": {"id": delivery_id.to_string()}}
+                "properties": {"sessionID": "session-1", "info": {"id": opencode_message_id(delivery_id)}}
             }))
             .expect("target message");
         assert!(
@@ -1922,6 +2017,30 @@ mod tests {
             }))
             .expect("idle");
         assert!(matches!(idle, BackendEvent::Completed { .. }));
+    }
+
+    #[test]
+    fn opencode_message_id_roundtrips_only_the_prefixed_wire_identity() {
+        let delivery_id =
+            Uuid::parse_str("5af6d2a0-f5ca-4bef-8171-bb29202e25d2").expect("fixture UUID");
+        let wire_id = opencode_message_id(delivery_id);
+        assert_eq!(wire_id, "msg-5af6d2a0-f5ca-4bef-8171-bb29202e25d2");
+        assert_eq!(
+            delivery_id_from_opencode_message_id(&wire_id),
+            Some(delivery_id)
+        );
+        assert_eq!(
+            delivery_id_from_opencode_message_id(&delivery_id.to_string()),
+            None
+        );
+        assert!(contains_delivery_id(
+            &json!({"info": {"id": wire_id}}),
+            delivery_id
+        ));
+        assert!(!contains_delivery_id(
+            &json!({"info": {"id": opencode_message_id(Uuid::new_v4())}}),
+            delivery_id
+        ));
     }
 
     #[test]
@@ -1967,7 +2086,7 @@ mod tests {
         let store = ReceiptStore::for_instance(&home, "agent").expect("store");
         store.record_queued(&envelope).expect("queued");
         let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-        accepted.protocol_request_id = Some(delivery_id.to_string());
+        accepted.protocol_request_id = Some(opencode_message_id(delivery_id));
         store.record(accepted).expect("accepted");
         adapter
             .update_state(
@@ -2067,6 +2186,71 @@ mod tests {
                 .state,
             DeliveryState::Ambiguous
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn restore_reconciles_msg_prefixed_history_target() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let port = listener.local_addr().expect("address").port();
+        let delivery_id = Uuid::new_v4();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let (header, _) = read_http_request(&stream);
+                let request_line = header.lines().next().unwrap_or_default();
+                if request_line.starts_with("GET /session/session-1/message?limit=100 ") {
+                    json_response(
+                        &mut stream,
+                        "200 OK",
+                        json!([{"info": {"id": opencode_message_id(delivery_id)}}]),
+                    );
+                } else if request_line.starts_with("GET /session/status ") {
+                    json_response(
+                        &mut stream,
+                        "200 OK",
+                        json!({"session-1": {"type": "idle"}}),
+                    );
+                } else {
+                    panic!("unexpected request: {request_line}");
+                }
+            }
+        });
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-opencode-restore-msg-target-{}",
+            Uuid::new_v4()
+        ));
+        let locator = SessionLocator::opencode(
+            format!("http://127.0.0.1:{port}"),
+            Some("session-1".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        let mut envelope = DeliveryEnvelope::new(
+            "agent",
+            locator.clone(),
+            DeliveryKind::Prompt,
+            "restore me",
+            None,
+        );
+        envelope.delivery_id = delivery_id;
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(opencode_message_id(delivery_id));
+        store.record(accepted).expect("accepted");
+
+        let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+        adapter.locator = Some(locator);
+        adapter.pending.insert(delivery_id, envelope);
+        adapter.in_flight = Some(delivery_id);
+        adapter.restore_pending_state().expect("restore");
+        assert_eq!(adapter.in_flight, None);
+        let receipt = store.latest(delivery_id).expect("latest").expect("receipt");
+        assert_eq!(receipt.delivery_id, delivery_id);
+        assert_eq!(receipt.state, DeliveryState::Completed);
+        server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -2330,6 +2514,7 @@ mod tests {
         let server_event_sent = Arc::clone(&event_sent);
         let server_stop_flag = Arc::clone(&server_stop);
         let delivery_id = Uuid::new_v4();
+        let wire_message_id = opencode_message_id(delivery_id);
         let server = thread::spawn(move || {
             let mut handlers = Vec::new();
             while !server_stop_flag.load(Ordering::Acquire) {
@@ -2344,6 +2529,7 @@ mod tests {
                 let prompt_seen = Arc::clone(&server_prompt_seen);
                 let event_sent = Arc::clone(&server_event_sent);
                 let stop = Arc::clone(&server_stop_flag);
+                let wire_message_id = wire_message_id.clone();
                 handlers.push(thread::spawn(move || {
                     let (header, body) = read_http_request(&stream);
                     let request_line = header.lines().next().unwrap_or_default().to_string();
@@ -2389,7 +2575,7 @@ mod tests {
                                 && !event_sent.swap(true, Ordering::AcqRel)
                             {
                                 let events = [
-                                    json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": delivery_id.to_string()}}}),
+                                    json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": wire_message_id}}}),
                                     json!({"type": "session.status", "properties": {"sessionID": "session-1", "status": {"type": "busy"}}}),
                                     json!({"type": "session.idle", "properties": {"sessionID": "session-1"}}),
                                 ];
