@@ -1453,6 +1453,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stop_owned_process_rejects_identity_mismatch_without_signaling() {
+        let home = std::env::temp_dir().join(format!("agend-codex-identity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let marker = home.join("term-marker");
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap 'printf term > \"$AGEND_TERM_MARKER\"; exit 0' TERM; while :; do :; done",
+            ])
+            .env("AGEND_TERM_MARKER", &marker)
+            .spawn()
+            .expect("identity fixture");
+        let pid = child.id();
+        let token = crate::process::process_start_token(pid).expect("start token");
+
+        let result = stop_owned_process(pid, token.wrapping_add(1), Some(&mut child));
+
+        assert!(result.is_err(), "identity mismatch must fail closed");
+        assert!(
+            crate::process::process_start_token(pid).is_some(),
+            "mismatched identity must not stop the live child"
+        );
+        assert!(!marker.exists(), "mismatched identity must not signal TERM");
+        child.kill().expect("cleanup identity fixture");
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn missing_socket_reaps_owned_server_before_relaunch() {
         let home =
             std::env::temp_dir().join(format!("agend-codex-owned-relaunch-{}", Uuid::new_v4()));
