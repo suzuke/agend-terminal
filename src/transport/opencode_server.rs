@@ -1677,6 +1677,10 @@ impl AgentDeliveryTransport for OpenCodeNativeShared {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "opencode_server_teardown_tests.rs"]
+mod teardown_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1703,14 +1707,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn managed_start_does_not_send_credentials_to_a_port_winner() {
         use std::os::unix::fs::PermissionsExt;
 
-        static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("env lock");
         let home = std::env::temp_dir().join(format!("agend-opencode-owner-{}", Uuid::new_v4()));
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
         listener
@@ -1758,53 +1758,6 @@ mod tests {
             "managed startup must not probe an unowned listener"
         );
         stop_instance_server(&home, "agent");
-        match previous_binary {
-            Some(value) => std::env::set_var("AGEND_OPENCODE_BINARY", value),
-            None => std::env::remove_var("AGEND_OPENCODE_BINARY"),
-        }
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_teardown_kills_isolated_term_ignoring_server() {
-        use std::os::unix::fs::PermissionsExt;
-
-        static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("env lock");
-        let home = std::env::temp_dir().join(format!("agend-opencode-teardown-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&home).expect("home");
-        let fake = home.join("fake-opencode.sh");
-        std::fs::write(&fake, "#!/bin/sh\ntrap '' TERM\nwhile :; do :; done\n")
-            .expect("fake binary");
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))
-            .expect("fake executable");
-        let previous_binary = std::env::var_os("AGEND_OPENCODE_BINARY");
-        std::env::set_var("AGEND_OPENCODE_BINARY", &fake);
-        let mut locator = SessionLocator::opencode(
-            "http://127.0.0.1:4096".to_string(),
-            None,
-            "opencode".to_string(),
-            "secret".to_string(),
-        );
-        locator.managed = true;
-        launch_server(&home, "agent", &mut locator, None).expect("launch fake server");
-        let pid = locator.server_pid.expect("server pid");
-        let key = server_key(&home, "agent", &locator);
-        managed_servers()
-            .lock()
-            .remove(&key)
-            .expect("managed server");
-        assert!(crate::process::process_start_token(pid).is_some());
-
-        stop_instance_server(&home, "agent");
-        assert!(
-            crate::process::process_start_token(pid).is_none(),
-            "isolated term-ignoring server must be killed during teardown"
-        );
         match previous_binary {
             Some(value) => std::env::set_var("AGEND_OPENCODE_BINARY", value),
             None => std::env::remove_var("AGEND_OPENCODE_BINARY"),
