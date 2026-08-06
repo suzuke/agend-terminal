@@ -1535,6 +1535,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_endpoint_for_long_instance_fits_macos_sun_len() {
+        let home = Path::new("/Users/suzuke/.agend-terminal");
+        let instance = "archfix-codex-native-smoke-072903";
+        let mut locator = SessionLocator::codex(PathBuf::new(), None);
+
+        rotate_managed_endpoint(home, instance, &mut locator);
+
+        let endpoint = locator.endpoint.expect("managed endpoint");
+        assert!(
+            endpoint.as_os_str().as_encoded_bytes().len() < 104,
+            "managed Codex socket must fit macOS sockaddr_un.sun_path: {} ({} bytes)",
+            endpoint.display(),
+            endpoint.as_os_str().as_encoded_bytes().len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn teardown_removes_owned_socket_but_not_other_socket() {
         let suffix = Uuid::new_v4().to_string();
         let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
