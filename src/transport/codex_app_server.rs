@@ -894,36 +894,169 @@ fn launch_managed_server(
 }
 
 #[cfg(unix)]
-pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
+fn remove_managed_endpoint(
+    home: &Path,
+    instance: &str,
+    locator: &SessionLocator,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Some(endpoint) = locator.endpoint.as_ref() else {
+        return Ok(());
+    };
+    let expected_parent = home.join("transport").join("codex");
+    let safe_instance = super::receipt::safe_component(instance);
+    let valid_name = endpoint.parent().is_some_and(|parent| parent == expected_parent)
+        && endpoint
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.strip_prefix(&format!("{safe_instance}-"))
+                    .and_then(|uuid| uuid.strip_suffix(".sock"))
+                    .and_then(|uuid| Uuid::parse_str(uuid).ok())
+                    .is_some_and(|uuid| format!("{safe_instance}-{uuid}.sock") == name)
+            });
+    if !valid_name {
+        return Err(anyhow::anyhow!(
+            "refusing to remove Codex endpoint outside managed namespace: {}",
+            endpoint.display()
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(endpoint) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot inspect Codex managed socket {}: {error}",
+                endpoint.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow::anyhow!(
+            "refusing to remove symlink at Codex managed socket {}",
+            endpoint.display()
+        ));
+    }
+    if !metadata.file_type().is_socket() {
+        return Err(anyhow::anyhow!(
+            "refusing to remove non-socket Codex managed endpoint {}",
+            endpoint.display()
+        ));
+    }
+    std::fs::remove_file(endpoint).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot remove Codex managed socket {}: {error}",
+            endpoint.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn stop_owned_process(pid: u32, start_token: u64) -> anyhow::Result<()> {
+    match crate::process::process_start_token(pid) {
+        None => return Ok(()),
+        Some(observed) if observed != start_token => {
+            return Err(anyhow::anyhow!(
+                "Codex managed server PID {pid} changed identity before teardown"
+            ));
+        }
+        Some(_) => {}
+    }
+    crate::process::terminate(pid);
+    for _ in 0..5 {
+        if crate::process::process_start_token(pid).is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if crate::process::process_start_token(pid) == Some(start_token) {
+        crate::process::kill_process_tree(pid);
+        for _ in 0..5 {
+            if crate::process::process_start_token(pid).is_none() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if let Some(observed) = crate::process::process_start_token(pid) {
+        return Err(anyhow::anyhow!(
+            "Codex managed server PID {pid} remained alive with identity {observed}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn stop_instance_server(home: &Path, instance: &str) -> anyhow::Result<()> {
     let key = server_key(home, instance);
+    let locator = super::registry::load_session_locator(home, instance).ok();
+    let persisted_owned = locator
+        .as_ref()
+        .is_some_and(|locator| locator.managed && persisted_server_owned(locator));
+    let mut in_memory_owned = false;
+    let mut in_memory_identity = None;
     if let Some(mut server) = managed_servers()
         .lock()
         .expect("Codex server registry lock")
         .remove(&key)
     {
-        let _ = server.child.kill();
-        let _ = server.child.wait();
-    }
-    if let Ok(locator) = super::registry::load_session_locator(home, instance) {
-        if locator.managed && persisted_server_owned(&locator) {
-            if let Some(pid) = locator.server_pid {
-                crate::process::terminate(pid);
-                for _ in 0..5 {
-                    if crate::process::process_start_token(pid).is_none() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                if persisted_server_owned(&locator) {
-                    crate::process::kill_process_tree(pid);
-                }
-            }
+        in_memory_owned = locator.as_ref().is_some_and(|locator| {
+            locator.managed
+                && locator.server_pid == Some(server.pid)
+                && locator.server_start_token == server.start_token
+        });
+        in_memory_identity = server
+            .start_token
+            .map(|start_token| (server.pid, start_token));
+        if let Some(start_token) = server.start_token {
+            stop_owned_process(server.pid, start_token)?;
+            let _ = server.child.wait()?;
+        } else if server.child.try_wait()?.is_none() {
+            server.child.kill()?;
+            let _ = server.child.wait()?;
         }
+    }
+    if persisted_owned {
+        let locator = locator
+            .as_ref()
+            .expect("persisted ownership requires a locator");
+        let pid = locator
+            .server_pid
+            .expect("persisted ownership requires a server PID");
+        let start_token = locator
+            .server_start_token
+            .expect("persisted ownership requires a start token");
+        if in_memory_identity != Some((pid, start_token)) {
+            stop_owned_process(pid, start_token)?;
+        }
+    }
+    if persisted_owned || in_memory_owned {
+        if let Some(locator) = locator.as_ref() {
+            remove_managed_endpoint(home, instance, locator)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn stop_instance_server(_home: &Path, _instance: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_instance_server_best_effort(home: &Path, instance: &str) {
+    if let Err(error) = stop_instance_server(home, instance) {
+        tracing::warn!(
+            instance,
+            error = %error,
+            "Codex managed server cleanup failed"
+        );
     }
 }
 
 #[cfg(not(unix))]
-pub(crate) fn stop_instance_server(_home: &Path, _instance: &str) {}
+fn stop_instance_server_best_effort(_home: &Path, _instance: &str) {}
 
 #[cfg(unix)]
 pub(crate) fn prepare_managed_tui(
@@ -945,7 +1078,7 @@ pub(crate) fn prepare_managed_tui(
         || in_memory_server_owned(home, instance, &locator);
     if !server_owned || !endpoint_exists {
         if server_owned {
-            stop_instance_server(home, instance);
+            stop_instance_server(home, instance)?;
         }
         rotate_managed_endpoint(home, instance, &mut locator);
         launch_managed_server(home, instance, codex, &mut locator, cwd)?;
@@ -953,7 +1086,7 @@ pub(crate) fn prepare_managed_tui(
 
     let mut adapter = CodexNativeShared::new(home, instance);
     if let Err(error) = adapter.start_or_attach_blocking_with_cwd(locator, cwd) {
-        stop_instance_server(home, instance);
+        stop_instance_server_best_effort(home, instance);
         return Err(error);
     }
     adapter
@@ -1286,7 +1419,10 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("agend-codex-owned-relaunch-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("home");
-        let endpoint = home.join("transport/codex/owned.sock");
+        let instance = "a";
+        let endpoint = home
+            .join("transport/codex")
+            .join(format!("a-{}.sock", Uuid::new_v4()));
         let child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -1297,13 +1433,13 @@ mod tests {
         locator.managed = true;
         locator.server_pid = Some(pid);
         locator.server_start_token = Some(start_token);
-        super::super::registry::save_session_locator(&home, "codex-agent", &locator)
+        super::super::registry::save_session_locator(&home, instance, &locator)
             .expect("persist locator");
         managed_servers()
             .lock()
             .expect("server registry lock")
             .insert(
-                server_key(&home, "codex-agent"),
+                server_key(&home, instance),
                 ManagedServer {
                     child,
                     pid,
@@ -1311,12 +1447,111 @@ mod tests {
                 },
             );
 
-        let result = prepare_managed_tui(&home, "codex-agent", "/bin/false", locator, None);
+        let result = prepare_managed_tui(&home, instance, "/bin/false", locator, None);
         assert!(result.is_err(), "false must not create a Codex socket");
         assert!(
             crate::process::process_start_token(pid).is_none(),
             "owned child must be reaped before a replacement launch"
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn teardown_removes_owned_socket_but_not_other_socket() {
+        let suffix = Uuid::new_v4().to_string();
+        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
+        let instance = "a";
+        let socket_dir = home.join("transport/codex");
+        std::fs::create_dir_all(&socket_dir).expect("socket dir");
+        let endpoint = socket_dir.join(format!("a-{}.sock", Uuid::new_v4()));
+        let other_endpoint = socket_dir.join("other.sock");
+        let listener = UnixListener::bind(&endpoint).expect("owned socket");
+        let other_listener = UnixListener::bind(&other_endpoint).expect("other socket");
+        drop(listener);
+
+        let term_marker = home.join("term-grace");
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap 'printf done > \"$AGEND_TERM_MARKER\"; exit 0' TERM; while :; do :; done",
+            ])
+            .env("AGEND_TERM_MARKER", &term_marker)
+            .spawn()
+            .expect("owned server fixture");
+        let pid = child.id();
+        let start_token = crate::process::process_start_token(pid).expect("start token");
+        let mut locator = SessionLocator::codex(endpoint.clone(), None);
+        locator.managed = true;
+        locator.server_pid = Some(pid);
+        locator.server_start_token = Some(start_token);
+        super::super::registry::save_session_locator(&home, instance, &locator)
+            .expect("persist locator");
+        managed_servers()
+            .lock()
+            .expect("server registry lock")
+            .insert(
+                server_key(&home, instance),
+                ManagedServer {
+                    child,
+                    pid,
+                    start_token: Some(start_token),
+                },
+            );
+
+        stop_instance_server(&home, instance).expect("owned teardown");
+        assert!(term_marker.exists(), "owned child must receive TERM grace");
+        assert!(!endpoint.exists(), "owned stale socket must be removed");
+        assert!(other_endpoint.exists(), "unowned socket must remain");
+        drop(other_listener);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_endpoint_cleanup_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = Uuid::new_v4().to_string();
+        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
+        let instance = "a";
+        let socket_dir = home.join("transport/codex");
+        std::fs::create_dir_all(&socket_dir).expect("socket dir");
+        let target = home.join("target");
+        let endpoint = socket_dir.join(format!("a-{}.sock", Uuid::new_v4()));
+        std::fs::write(&target, "must survive").expect("target");
+        symlink(&target, &endpoint).expect("endpoint symlink");
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+
+        assert!(remove_managed_endpoint(&home, instance, &locator).is_err());
+        assert!(
+            std::fs::symlink_metadata(&endpoint)
+                .expect("endpoint metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target contents"),
+            "must survive"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_endpoint_cleanup_rejects_real_socket_outside_namespace() {
+        let suffix = Uuid::new_v4().to_string();
+        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
+        let instance = "a";
+        std::fs::create_dir_all(home.join("transport/codex")).expect("socket dir");
+        let endpoint = home.join("outside.sock");
+        let listener = UnixListener::bind(&endpoint).expect("outside socket");
+        drop(listener);
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+
+        assert!(remove_managed_endpoint(&home, instance, &locator).is_err());
+        assert!(endpoint.exists(), "outside socket must survive cleanup");
+        let _ = std::fs::remove_file(endpoint);
         let _ = std::fs::remove_dir_all(home);
     }
 

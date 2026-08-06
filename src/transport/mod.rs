@@ -29,7 +29,7 @@ pub(crate) fn remove_instance_delivery_state(
     home: &std::path::Path,
     instance: &str,
 ) -> anyhow::Result<()> {
-    codex_app_server::stop_instance_server(home, instance);
+    codex_app_server::stop_instance_server(home, instance)?;
     opencode_server::stop_instance_server(home, instance);
     receipt::remove_instance_delivery_state(home, instance)
 }
