@@ -1539,15 +1539,25 @@ mod tests {
         drop(listener);
 
         let term_marker = home.join("term-grace");
+        let trap_ready = home.join("trap-ready");
         let child = std::process::Command::new("sh")
             .args([
                 "-c",
-                "trap 'printf done > \"$AGEND_TERM_MARKER\"; exit 0' TERM; while :; do :; done",
+                "trap 'printf done > \"$AGEND_TERM_MARKER\"; exit 0' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
             ])
             .env("AGEND_TERM_MARKER", &term_marker)
+            .env("AGEND_TRAP_READY", &trap_ready)
             .spawn()
             .expect("owned server fixture");
         let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !trap_ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned server fixture did not install TERM trap"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
         let start_token = crate::process::process_start_token(pid).expect("start token");
         let mut locator = SessionLocator::codex(endpoint.clone(), None);
         locator.managed = true;
@@ -1588,15 +1598,17 @@ mod tests {
         drop(listener);
 
         let term_marker = home.join("term-grace");
+        let trap_ready = home.join("trap-ready");
         let caller_pgid = unsafe { libc::getpgrp() };
         let child = unsafe {
             use std::os::unix::process::CommandExt;
             std::process::Command::new("sh")
                 .args([
                     "-c",
-                    "trap 'printf term > \"$AGEND_TERM_MARKER\"' TERM; while :; do :; done",
+                    "trap 'printf term > \"$AGEND_TERM_MARKER\"' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
                 ])
                 .env("AGEND_TERM_MARKER", &term_marker)
+                .env("AGEND_TRAP_READY", &trap_ready)
                 .pre_exec(move || {
                     if libc::setpgid(0, caller_pgid) == -1 {
                         return Err(std::io::Error::last_os_error());
@@ -1607,6 +1619,14 @@ mod tests {
                 .expect("shared-group fixture")
         };
         let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !trap_ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shared-group fixture did not install TERM trap"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_ne!(
             crate::process::process_group_id(pid),
             Some(pid),
