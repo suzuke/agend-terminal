@@ -21,14 +21,15 @@ pub(crate) use registry::mode_for_backend;
 pub(crate) use registry::{deliver_notification, record_delivery_drop};
 
 pub(crate) use registry::{
-    opencode_attach_args, opencode_attach_locator, parse_opencode_model_args,
-    prepare_opencode_tui_session,
+    codex_attach_args, codex_attach_locator, opencode_attach_args, opencode_attach_locator,
+    parse_opencode_model_args, prepare_codex_tui_session, prepare_opencode_tui_session,
 };
 
 pub(crate) fn remove_instance_delivery_state(
     home: &std::path::Path,
     instance: &str,
 ) -> anyhow::Result<()> {
+    codex_app_server::stop_instance_server(home, instance);
     opencode_server::stop_instance_server(home, instance);
     receipt::remove_instance_delivery_state(home, instance)
 }

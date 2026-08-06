@@ -257,8 +257,59 @@ pub(crate) fn opencode_attach_locator(
     }
 }
 
+pub(crate) fn codex_attach_locator(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<SessionLocator>> {
+    let path = session_path(home, instance);
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            let locator = load_session_locator(home, instance)?;
+            if locator.backend == "codex" {
+                Ok(Some(locator))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "Codex session locator is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "Codex session locator cannot be inspected at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn prepare_codex_tui_session(
+    home: &Path,
+    instance: &str,
+    codex: &str,
+    working_dir: Option<&Path>,
+) -> anyhow::Result<SessionLocator> {
+    let locator = locator_for_instance(
+        home,
+        instance,
+        Some(&Backend::Codex),
+        TransportMode::NativeShared,
+    )?;
+    super::codex_app_server::prepare_managed_tui(home, instance, codex, locator, working_dir)
+}
+
 pub(crate) fn opencode_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<String>> {
     OpenCodeNativeShared::attach_args(locator)
+}
+
+pub(crate) fn codex_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<String>> {
+    if locator.backend != "codex" {
+        return Err(anyhow::anyhow!("Codex attach locator backend is not codex"));
+    }
+    if locator.endpoint.is_none() {
+        return Err(anyhow::anyhow!("Codex NativeShared endpoint is missing"));
+    }
+    Ok(CodexNativeShared::remote_attach_args(locator))
 }
 
 pub(crate) fn prepare_opencode_tui_session(

@@ -18,6 +18,8 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
+#[cfg(unix)]
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -45,6 +47,50 @@ pub(crate) struct CodexNativeShared {
     writer: Option<std::os::unix::net::UnixStream>,
     #[cfg(unix)]
     reader: Option<std::os::unix::net::UnixStream>,
+}
+
+#[cfg(unix)]
+struct ManagedServer {
+    child: std::process::Child,
+    pid: u32,
+    start_token: Option<u64>,
+}
+
+#[cfg(unix)]
+fn managed_servers() -> &'static Mutex<HashMap<String, ManagedServer>> {
+    static SERVERS: OnceLock<Mutex<HashMap<String, ManagedServer>>> = OnceLock::new();
+    SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+fn server_key(home: &Path, instance: &str) -> String {
+    format!("{}\0{}", home.display(), instance)
+}
+
+#[cfg(unix)]
+fn persisted_server_owned(locator: &SessionLocator) -> bool {
+    let (Some(pid), Some(start_token)) = (locator.server_pid, locator.server_start_token) else {
+        return false;
+    };
+    crate::process::process_start_token(pid) == Some(start_token)
+}
+
+#[cfg(unix)]
+fn in_memory_server_owned(home: &Path, instance: &str, locator: &SessionLocator) -> bool {
+    let key = server_key(home, instance);
+    let mut servers = managed_servers()
+        .lock()
+        .expect("Codex server registry lock");
+    let Some(server) = servers.get_mut(&key) else {
+        return false;
+    };
+    if server.child.try_wait().ok().flatten().is_some() {
+        servers.remove(&key);
+        return false;
+    }
+    locator.server_pid == Some(server.pid)
+        && locator.server_start_token.is_some()
+        && locator.server_start_token == server.start_token
 }
 
 impl CodexNativeShared {
@@ -138,6 +184,7 @@ impl CodexNativeShared {
         self.in_flight = Some(envelope.delivery_id);
         let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
         receipt.protocol_request_id = Some(backend_request_id.unwrap_or(request_id));
+        receipt.tui_visibility = Some("shared_codex_thread".to_string());
         receipt.detail = Some("Codex app-server accepted turn request".to_string());
         store.record(receipt.clone())?;
         Ok(receipt)
@@ -254,14 +301,19 @@ impl CodexNativeShared {
         &mut self,
         locator: SessionLocator,
     ) -> anyhow::Result<TransportCapability> {
+        self.start_or_attach_blocking_with_cwd(locator, None)
+    }
+
+    fn start_or_attach_blocking_with_cwd(
+        &mut self,
+        mut locator: SessionLocator,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<TransportCapability> {
         if locator.backend != "codex" {
             return Err(anyhow::anyhow!("NativeShared locator backend is not codex"));
         }
-        if locator.endpoint.is_none() || locator.thread_id.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(anyhow::anyhow!(
-                "Codex NativeShared requires both endpoint and thread_id"
-            ));
+        if locator.endpoint.is_none() {
+            return Err(anyhow::anyhow!("Codex NativeShared requires an endpoint"));
         }
         if self.ready && self.locator.as_ref() == Some(&locator) {
             return Ok(TransportCapability {
@@ -292,10 +344,32 @@ impl CodexNativeShared {
             )?;
             let version = validate_initialize_response(&initialize)?;
             self.send_notification("initialized", json!({}))?;
-            self.send_request(
-                "thread/resume",
-                json!({"threadId": locator.thread_id.as_deref()}),
-            )?;
+            if let Some(thread_id) = locator
+                .thread_id
+                .as_deref()
+                .filter(|thread_id| !thread_id.is_empty())
+            {
+                self.send_request("thread/resume", json!({"threadId": thread_id}))?;
+            } else {
+                let mut params = json!({});
+                if let Some(cwd) = cwd {
+                    params["cwd"] = Value::String(cwd.display().to_string());
+                }
+                if let Some(model) = locator.model.as_deref() {
+                    params["model"] = Value::String(model.to_string());
+                }
+                let response = self.send_request("thread/start", params)?;
+                let thread_id = response
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|thread_id| !thread_id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Codex thread/start response omitted thread id")
+                    })?;
+                locator.thread_id = Some(thread_id.to_string());
+            }
+            self.locator = Some(locator.clone());
             self.backend_version = Some(version.clone());
             self.ready = true;
             super::registry::save_session_locator(&self.home, &self.instance, &locator)?;
@@ -772,6 +846,124 @@ fn wait_for_socket(endpoint: &Path, child: &mut std::process::Child) -> anyhow::
     Ok(false)
 }
 
+#[cfg(unix)]
+fn rotate_managed_endpoint(home: &Path, instance: &str, locator: &mut SessionLocator) {
+    let parent = home.join("transport").join("codex");
+    locator.endpoint = Some(parent.join(format!(
+        "{}-{}.sock",
+        super::receipt::safe_component(instance),
+        Uuid::new_v4()
+    )));
+    locator.server_pid = None;
+    locator.server_start_token = None;
+}
+
+#[cfg(unix)]
+fn launch_managed_server(
+    home: &Path,
+    instance: &str,
+    codex: &str,
+    locator: &mut SessionLocator,
+    cwd: Option<&Path>,
+) -> anyhow::Result<()> {
+    let child = CodexNativeShared::launch(codex, locator, cwd.unwrap_or_else(|| Path::new(".")))?;
+    let pid = child.id();
+    let start_token = crate::process::process_start_token(pid);
+    locator.managed = true;
+    locator.server_pid = Some(pid);
+    locator.server_start_token = start_token;
+    if let Err(error) = super::registry::save_session_locator(home, instance, locator) {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    managed_servers()
+        .lock()
+        .expect("Codex server registry lock")
+        .insert(
+            server_key(home, instance),
+            ManagedServer {
+                child,
+                pid,
+                start_token,
+            },
+        );
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
+    let key = server_key(home, instance);
+    if let Some(mut server) = managed_servers()
+        .lock()
+        .expect("Codex server registry lock")
+        .remove(&key)
+    {
+        let _ = server.child.kill();
+        let _ = server.child.wait();
+    }
+    if let Ok(locator) = super::registry::load_session_locator(home, instance) {
+        if locator.managed && persisted_server_owned(&locator) {
+            if let Some(pid) = locator.server_pid {
+                crate::process::terminate(pid);
+                if persisted_server_owned(&locator) {
+                    crate::process::kill_process_tree(pid);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn stop_instance_server(_home: &Path, _instance: &str) {}
+
+#[cfg(unix)]
+pub(crate) fn prepare_managed_tui(
+    home: &Path,
+    instance: &str,
+    codex: &str,
+    mut locator: SessionLocator,
+    cwd: Option<&Path>,
+) -> anyhow::Result<SessionLocator> {
+    locator.managed = true;
+    let endpoint_exists = locator
+        .endpoint
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.exists());
+    let server_owned = locator
+        .endpoint
+        .as_ref()
+        .is_some_and(|_| persisted_server_owned(&locator))
+        || in_memory_server_owned(home, instance, &locator);
+    if !server_owned || !endpoint_exists {
+        if endpoint_exists {
+            rotate_managed_endpoint(home, instance, &mut locator);
+        }
+        launch_managed_server(home, instance, codex, &mut locator, cwd)?;
+    }
+
+    let mut adapter = CodexNativeShared::new(home, instance);
+    if let Err(error) = adapter.start_or_attach_blocking_with_cwd(locator, cwd) {
+        stop_instance_server(home, instance);
+        return Err(error);
+    }
+    adapter
+        .locator
+        .ok_or_else(|| anyhow::anyhow!("Codex managed TUI session was not prepared"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn prepare_managed_tui(
+    _home: &Path,
+    _instance: &str,
+    _codex: &str,
+    _locator: SessionLocator,
+    _cwd: Option<&Path>,
+) -> anyhow::Result<SessionLocator> {
+    Err(anyhow::anyhow!("Codex NativeShared requires Unix sockets"))
+}
+
 #[async_trait::async_trait]
 impl AgentDeliveryTransport for CodexNativeShared {
     fn mode(&self) -> TransportMode {
@@ -925,7 +1117,6 @@ mod tests {
                             &mut stream,
                             json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
                         );
-                        break;
                     }
                     "turn/start" => {
                         write_server_frame(
@@ -950,10 +1141,8 @@ mod tests {
 
     #[test]
     fn managed_bootstrap_persists_thread_and_shared_receipt_identity() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-codex-managed-bootstrap-{}",
-            Uuid::new_v4()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("agend-codex-managed-bootstrap-{}", Uuid::new_v4()));
         let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("home");
         let server = run_fake_codex(&endpoint);
@@ -975,9 +1164,14 @@ mod tests {
             "hello",
             Some("corr-managed".to_string()),
         );
-        let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-        receipt.tui_visibility = Some("shared_codex_thread".to_string());
-        assert_eq!(receipt.tui_visibility.as_deref(), Some("shared_codex_thread"));
+        let accepted = adapter
+            .deliver_blocking(envelope)
+            .expect("managed thread must accept a structured turn");
+        assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
+        assert_eq!(
+            accepted.tui_visibility.as_deref(),
+            Some("shared_codex_thread")
+        );
 
         server.join().expect("fake server");
         let _ = std::fs::remove_file(endpoint);
@@ -1026,6 +1220,56 @@ mod tests {
         server.join().expect("fake server");
         let _ = std::fs::remove_file(endpoint);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn readiness_failure_records_a_failed_closed_receipt() {
+        let home =
+            std::env::temp_dir().join(format!("agend-codex-failed-readiness-{}", Uuid::new_v4()));
+        let envelope = DeliveryEnvelope::new(
+            "codex-agent",
+            SessionLocator::codex(
+                std::env::temp_dir().join(format!("missing-{}.sock", Uuid::new_v4())),
+                Some("thread-1".to_string()),
+            ),
+            DeliveryKind::Prompt,
+            "hello",
+            Some("corr-failed".to_string()),
+        );
+        let delivery_id = envelope.delivery_id;
+        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+        assert!(adapter.deliver_blocking(envelope).is_err());
+
+        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("store");
+        let receipt = store
+            .latest(delivery_id)
+            .expect("latest receipt")
+            .expect("failed readiness receipt");
+        assert_eq!(receipt.state, DeliveryState::Failed);
+        assert_eq!(
+            receipt.detail.as_deref(),
+            Some("NativeShared readiness failed closed")
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_server_identity_rejects_pid_reuse_or_missing_start_token() {
+        let pid = std::process::id();
+        let token = crate::process::process_start_token(pid).expect("current process token");
+        let mut locator = SessionLocator::codex(
+            std::env::temp_dir().join("codex-managed.sock"),
+            Some("thread-1".to_string()),
+        );
+        locator.managed = true;
+        locator.server_pid = Some(pid);
+        locator.server_start_token = Some(token);
+        assert!(persisted_server_owned(&locator));
+        locator.server_start_token = Some(token.wrapping_add(1));
+        assert!(!persisted_server_owned(&locator));
+        locator.server_start_token = None;
+        assert!(!persisted_server_owned(&locator));
     }
 
     #[test]
