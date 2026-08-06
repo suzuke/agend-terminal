@@ -888,13 +888,46 @@ fn wait_for_socket(endpoint: &Path, child: &mut std::process::Child) -> anyhow::
 #[cfg(unix)]
 fn rotate_managed_endpoint(home: &Path, instance: &str, locator: &mut SessionLocator) {
     let parent = home.join("transport").join("codex");
-    locator.endpoint = Some(parent.join(format!(
-        "{}-{}.sock",
-        super::receipt::safe_component(instance),
-        Uuid::new_v4()
-    )));
+    locator.endpoint = Some(parent.join(managed_endpoint_name(instance, Uuid::new_v4())));
     locator.server_pid = None;
     locator.server_start_token = None;
+}
+
+#[cfg(unix)]
+fn managed_endpoint_name(instance: &str, uuid: Uuid) -> String {
+    format!(
+        "{}{}.sock",
+        managed_endpoint_prefix(instance),
+        uuid.simple()
+    )
+}
+
+#[cfg(unix)]
+fn managed_endpoint_prefix(instance: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(instance.as_bytes());
+    format!("c{}-", hex::encode(&digest[..6]))
+}
+
+#[cfg(unix)]
+fn valid_managed_endpoint_name(instance: &str, name: &str) -> bool {
+    let compact = name
+        .strip_prefix(&managed_endpoint_prefix(instance))
+        .and_then(|uuid| uuid.strip_suffix(".sock"))
+        .and_then(|uuid| Uuid::parse_str(uuid).ok())
+        .is_some_and(|uuid| managed_endpoint_name(instance, uuid) == name);
+    if compact {
+        return true;
+    }
+
+    // Accept the pre-bounded form so a new daemon can clean up a locator
+    // persisted by the previous binary after an unclean shutdown.
+    let safe_instance = super::receipt::safe_component(instance);
+    name.strip_prefix(&format!("{safe_instance}-"))
+        .and_then(|uuid| uuid.strip_suffix(".sock"))
+        .and_then(|uuid| Uuid::parse_str(uuid).ok())
+        .is_some_and(|uuid| format!("{safe_instance}-{uuid}.sock") == name)
 }
 
 #[cfg(unix)]
@@ -943,19 +976,13 @@ fn remove_managed_endpoint(
         return Ok(());
     };
     let expected_parent = home.join("transport").join("codex");
-    let safe_instance = super::receipt::safe_component(instance);
     let valid_name = endpoint
         .parent()
         .is_some_and(|parent| parent == expected_parent)
         && endpoint
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.strip_prefix(&format!("{safe_instance}-"))
-                    .and_then(|uuid| uuid.strip_suffix(".sock"))
-                    .and_then(|uuid| Uuid::parse_str(uuid).ok())
-                    .is_some_and(|uuid| format!("{safe_instance}-{uuid}.sock") == name)
-            });
+            .is_some_and(|name| valid_managed_endpoint_name(instance, name));
     if !valid_name {
         return Err(anyhow::anyhow!(
             "refusing to remove Codex endpoint outside managed namespace: {}",
@@ -1543,12 +1570,21 @@ mod tests {
         rotate_managed_endpoint(home, instance, &mut locator);
 
         let endpoint = locator.endpoint.expect("managed endpoint");
+        let endpoint_name = endpoint
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 endpoint name");
         assert!(
             endpoint.as_os_str().as_encoded_bytes().len() < 104,
             "managed Codex socket must fit macOS sockaddr_un.sun_path: {} ({} bytes)",
             endpoint.display(),
             endpoint.as_os_str().as_encoded_bytes().len()
         );
+        assert!(valid_managed_endpoint_name(instance, endpoint_name));
+        assert!(!valid_managed_endpoint_name(
+            "another-instance",
+            endpoint_name
+        ));
     }
 
     #[cfg(unix)]
@@ -1559,7 +1595,7 @@ mod tests {
         let instance = "a";
         let socket_dir = home.join("transport/codex");
         std::fs::create_dir_all(&socket_dir).expect("socket dir");
-        let endpoint = socket_dir.join(format!("a-{}.sock", Uuid::new_v4()));
+        let endpoint = socket_dir.join(managed_endpoint_name(instance, Uuid::new_v4()));
         let other_endpoint = socket_dir.join("other.sock");
         let listener = UnixListener::bind(&endpoint).expect("owned socket");
         let other_listener = UnixListener::bind(&other_endpoint).expect("other socket");
