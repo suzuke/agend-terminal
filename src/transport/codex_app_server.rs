@@ -906,7 +906,9 @@ fn remove_managed_endpoint(
     };
     let expected_parent = home.join("transport").join("codex");
     let safe_instance = super::receipt::safe_component(instance);
-    let valid_name = endpoint.parent().is_some_and(|parent| parent == expected_parent)
+    let valid_name = endpoint
+        .parent()
+        .is_some_and(|parent| parent == expected_parent)
         && endpoint
             .file_name()
             .and_then(|name| name.to_str())
@@ -1524,12 +1526,10 @@ mod tests {
         let locator = SessionLocator::codex(endpoint.clone(), None);
 
         assert!(remove_managed_endpoint(&home, instance, &locator).is_err());
-        assert!(
-            std::fs::symlink_metadata(&endpoint)
-                .expect("endpoint metadata")
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(&endpoint)
+            .expect("endpoint metadata")
+            .file_type()
+            .is_symlink());
         assert_eq!(
             std::fs::read_to_string(target).expect("target contents"),
             "must survive"
