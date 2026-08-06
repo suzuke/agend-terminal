@@ -1156,7 +1156,6 @@ pub(crate) fn prepare_managed_tui(
     cwd: Option<&Path>,
 ) -> anyhow::Result<SessionLocator> {
     locator.managed = true;
-    locator.thread_id = None;
     let server_owned = locator
         .endpoint
         .as_ref()

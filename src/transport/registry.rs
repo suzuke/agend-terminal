@@ -288,14 +288,30 @@ pub(crate) fn prepare_codex_tui_session(
     instance: &str,
     codex: &str,
     working_dir: Option<&Path>,
+    spawn_mode: crate::backend::SpawnMode,
 ) -> anyhow::Result<SessionLocator> {
-    let locator = locator_for_instance(
+    let mut locator = locator_for_instance(
         home,
         instance,
         Some(&Backend::Codex),
         TransportMode::NativeShared,
     )?;
+    locator.thread_id = codex_thread_for_spawn(&locator, spawn_mode);
     super::codex_app_server::prepare_managed_tui(home, instance, codex, locator, working_dir)
+}
+
+pub(crate) fn codex_thread_for_spawn(
+    locator: &SessionLocator,
+    spawn_mode: crate::backend::SpawnMode,
+) -> Option<String> {
+    match spawn_mode {
+        crate::backend::SpawnMode::Resume => locator
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(str::to_string),
+        crate::backend::SpawnMode::Fresh => None,
+    }
 }
 
 pub(crate) fn opencode_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<String>> {
