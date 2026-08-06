@@ -735,7 +735,9 @@ fn codex_remote_command_args(
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),
     ]);
-    if let Some(thread_id) = crate::transport::codex_thread_for_spawn(locator, spawn_mode) {
+    if spawn_mode == crate::backend::SpawnMode::Resume {
+        let thread_id = crate::transport::codex_thread_for_spawn(locator, spawn_mode)
+            .unwrap_or_else(|| "--last".to_string());
         enriched.extend(["resume".to_string(), thread_id]);
     }
     enriched.push("--dangerously-bypass-approvals-and-sandbox".to_string());
