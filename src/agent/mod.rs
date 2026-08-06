@@ -1299,20 +1299,14 @@ pub(crate) fn spawn_agent_with_capture_home(
     // A declared OpenCode identity may intentionally use a wrapper command
     // (the capability/model tests do this); only a real OpenCode command may
     // be replaced by the attach subcommand and managed server lifecycle.
-    let declared_backend = config
-        .backend
-        .cloned()
-        .or_else(|| Backend::from_command(backend_command));
-    let is_opencode = declared_backend
-        .as_ref()
+    let is_opencode = Backend::from_command(backend_command)
         .is_some_and(|backend| matches!(backend, Backend::OpenCode));
     if is_opencode {
         if let Some(home_path) = *home {
             crate::transport::prepare_opencode_tui_session(home_path, name, *working_dir, args)?;
         }
     }
-    let is_codex = declared_backend
-        .as_ref()
+    let is_codex = Backend::from_command(backend_command)
         .is_some_and(|backend| matches!(backend, Backend::Codex));
     if is_codex {
         if let Some(home_path) = *home {

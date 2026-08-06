@@ -306,8 +306,8 @@ impl CodexNativeShared {
 
     fn start_or_attach_blocking_with_cwd(
         &mut self,
-        mut locator: SessionLocator,
-        cwd: Option<&Path>,
+        locator: SessionLocator,
+        _cwd: Option<&Path>,
     ) -> anyhow::Result<TransportCapability> {
         if locator.backend != "codex" {
             return Err(anyhow::anyhow!("NativeShared locator backend is not codex"));
@@ -328,6 +328,7 @@ impl CodexNativeShared {
         self.locator = Some(locator.clone());
         #[cfg(unix)]
         {
+            let mut locator = locator;
             self.connect(&locator)?;
             let initialize = self.send_request(
                 "initialize",
@@ -352,7 +353,7 @@ impl CodexNativeShared {
                 self.send_request("thread/resume", json!({"threadId": thread_id}))?;
             } else {
                 let mut params = json!({});
-                if let Some(cwd) = cwd {
+                if let Some(cwd) = _cwd {
                     params["cwd"] = Value::String(cwd.display().to_string());
                 }
                 if let Some(model) = locator.model.as_deref() {
@@ -907,6 +908,12 @@ pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
         if locator.managed && persisted_server_owned(&locator) {
             if let Some(pid) = locator.server_pid {
                 crate::process::terminate(pid);
+                for _ in 0..5 {
+                    if crate::process::process_start_token(pid).is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 if persisted_server_owned(&locator) {
                     crate::process::kill_process_tree(pid);
                 }
@@ -937,9 +944,10 @@ pub(crate) fn prepare_managed_tui(
         .is_some_and(|_| persisted_server_owned(&locator))
         || in_memory_server_owned(home, instance, &locator);
     if !server_owned || !endpoint_exists {
-        if endpoint_exists {
-            rotate_managed_endpoint(home, instance, &mut locator);
+        if server_owned {
+            stop_instance_server(home, instance);
         }
+        rotate_managed_endpoint(home, instance, &mut locator);
         launch_managed_server(home, instance, codex, &mut locator, cwd)?;
     }
 
@@ -1270,6 +1278,46 @@ mod tests {
         assert!(!persisted_server_owned(&locator));
         locator.server_start_token = None;
         assert!(!persisted_server_owned(&locator));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_socket_reaps_owned_server_before_relaunch() {
+        let home =
+            std::env::temp_dir().join(format!("agend-codex-owned-relaunch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let endpoint = home.join("transport/codex/owned.sock");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("owned server fixture");
+        let pid = child.id();
+        let start_token = crate::process::process_start_token(pid).expect("start token");
+        let mut locator = SessionLocator::codex(endpoint, None);
+        locator.managed = true;
+        locator.server_pid = Some(pid);
+        locator.server_start_token = Some(start_token);
+        super::super::registry::save_session_locator(&home, "codex-agent", &locator)
+            .expect("persist locator");
+        managed_servers()
+            .lock()
+            .expect("server registry lock")
+            .insert(
+                server_key(&home, "codex-agent"),
+                ManagedServer {
+                    child,
+                    pid,
+                    start_token: Some(start_token),
+                },
+            );
+
+        let result = prepare_managed_tui(&home, "codex-agent", "/bin/false", locator, None);
+        assert!(result.is_err(), "false must not create a Codex socket");
+        assert!(
+            crate::process::process_start_token(pid).is_none(),
+            "owned child must be reaped before a replacement launch"
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
