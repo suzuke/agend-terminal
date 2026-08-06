@@ -638,6 +638,11 @@ fn launch_server(
         "--port",
         &endpoint.port.to_string(),
     ]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -1672,6 +1677,10 @@ impl AgentDeliveryTransport for OpenCodeNativeShared {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "opencode_server_teardown_tests.rs"]
+mod teardown_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,14 +1707,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn managed_start_does_not_send_credentials_to_a_port_winner() {
         use std::os::unix::fs::PermissionsExt;
 
-        static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("env lock");
         let home = std::env::temp_dir().join(format!("agend-opencode-owner-{}", Uuid::new_v4()));
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
         listener

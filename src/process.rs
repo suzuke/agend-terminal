@@ -149,9 +149,21 @@ pub fn terminate(pid: u32) {
     }
 }
 
-/// Kill an entire process group. On Unix, sends SIGTERM to -pgid (all processes
-/// in the group), then waits briefly and escalates to SIGKILL if still alive.
-/// On Windows, falls back to TerminateProcess on the leader.
+/// Return the process group ID when the platform exposes one.
+#[cfg(unix)]
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    let pgid = unsafe { libc::getpgid(pid as i32) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
+/// Kill an entire process group when `pid` is its process-group leader. On Unix,
+/// sends SIGTERM to -pgid (all processes in the isolated group), then waits
+/// briefly and escalates to SIGKILL if still alive. If the process belongs to a
+/// shared or otherwise unexpected group, this fails closed without signalling
+/// it. On Windows, falls back to TerminateProcess on the leader.
 pub fn kill_process_tree(pid: u32) {
     if pid == 0 {
         tracing::warn!("kill_process_tree called with pid=0, skipping (would kill daemon)");
@@ -161,22 +173,39 @@ pub fn kill_process_tree(pid: u32) {
     {
         // M2: query actual PGID instead of assuming PID==PGID
         let pgid = unsafe { libc::getpgid(pid as i32) };
-        let kill_pgid = if pgid > 0 { -pgid } else { -(pid as i32) };
-        // SIGTERM the entire process group
+        if pgid != pid as i32 {
+            tracing::warn!(pid, pgid, "refusing to signal a shared process group");
+            return;
+        }
+        let kill_target = -pgid;
+        // SIGTERM the isolated process group.
         unsafe {
-            libc::kill(kill_pgid, libc::SIGTERM);
+            libc::kill(kill_target, libc::SIGTERM);
         }
         // Grace period, then unconditional SIGKILL (handles grandchildren
         // that ignore SIGTERM even if leader already exited).
         std::thread::sleep(std::time::Duration::from_millis(500));
         unsafe {
-            libc::kill(kill_pgid, libc::SIGKILL);
+            libc::kill(kill_target, libc::SIGKILL);
         }
         // ESRCH (no such process) is fine — group already dead.
     }
     #[cfg(windows)]
     {
         terminate(pid);
+    }
+}
+
+/// Force-kill only one process. Callers that track a process must revalidate
+/// its identity immediately before calling this function.
+#[cfg(unix)]
+pub fn kill_process(pid: u32) {
+    if pid == 0 {
+        tracing::warn!("kill_process called with pid=0, skipping");
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
     }
 }
 
@@ -277,6 +306,40 @@ mod tests {
              (group kill semantics; 10s covers init / launchd reap latency)"
         );
         let _ = std::fs::remove_file(&pid_file);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_process_tree_refuses_shared_process_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let caller_pgid = unsafe { libc::getpgrp() };
+        let mut child = unsafe {
+            Command::new("sh")
+                .args(["-c", "trap '' TERM; while :; do :; done"])
+                .pre_exec(move || {
+                    if libc::setpgid(0, caller_pgid) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("shared-group child")
+        };
+        let child_pid = child.id();
+        assert_ne!(process_group_id(child_pid), Some(child_pid));
+        assert!(is_pid_alive(child_pid));
+
+        kill_process_tree(child_pid);
+
+        assert!(is_pid_alive(child_pid), "shared child must survive refusal");
+        assert!(
+            is_pid_alive(std::process::id()),
+            "caller must survive refusal"
+        );
+        child.kill().expect("cleanup shared-group child");
+        let _ = child.wait();
     }
 
     #[test]

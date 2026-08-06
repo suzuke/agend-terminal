@@ -725,6 +725,26 @@ fn opencode_attach_command_args(
         .collect())
 }
 
+fn codex_remote_command_args(
+    locator: &crate::transport::SessionLocator,
+    args: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut enriched = crate::transport::codex_attach_args(locator)?;
+    let thread_id = locator
+        .thread_id
+        .as_deref()
+        .filter(|thread_id| !thread_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Codex NativeShared thread id is missing"))?;
+    enriched.extend(["resume".to_string(), thread_id.to_string()]);
+    enriched.extend([
+        "-c".to_string(),
+        "check_for_update_on_startup=false".to_string(),
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
+    ]);
+    enriched.extend(args.iter().cloned());
+    Ok(enriched)
+}
+
 /// #1519: canonical opencode `auth.json` to seed each per-instance data dir
 /// from. opencode uses XDG semantics on every platform (`~/.local/share`, NOT
 /// macOS's `~/Library/Application Support`), so resolve it the XDG way from the
@@ -798,10 +818,17 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         _ => None,
     };
 
+    let codex_locator = match (detected_backend.as_ref(), *home) {
+        (Some(Backend::Codex), Some(home)) => crate::transport::codex_attach_locator(home, name)?,
+        _ => None,
+    };
+
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
         opencode_attach_command_args(locator, args)?
+    } else if let Some(locator) = codex_locator.as_ref() {
+        codex_remote_command_args(locator, args)?
     } else {
         let preset = detected_backend
             .as_ref()
@@ -1277,6 +1304,18 @@ pub(crate) fn spawn_agent_with_capture_home(
     if is_opencode {
         if let Some(home_path) = *home {
             crate::transport::prepare_opencode_tui_session(home_path, name, *working_dir, args)?;
+        }
+    }
+    let is_codex = Backend::from_command(backend_command)
+        .is_some_and(|backend| matches!(backend, Backend::Codex));
+    if is_codex {
+        if let Some(home_path) = *home {
+            crate::transport::prepare_codex_tui_session(
+                home_path,
+                name,
+                backend_command,
+                *working_dir,
+            )?;
         }
     }
 

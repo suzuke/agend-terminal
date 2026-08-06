@@ -3134,6 +3134,39 @@ fn opencode_attach_command_uses_one_model_parse_result() {
     .is_err());
 }
 
+#[test]
+fn codex_managed_tui_resumes_the_prepared_native_thread() {
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-managed.sock"),
+        Some("thread-1".to_string()),
+    );
+    let args = codex_remote_command_args(&locator, &["--model=gpt-5".to_string()])
+        .expect("managed Codex attach argv");
+    assert_eq!(
+        args,
+        vec![
+            "--remote",
+            "unix:///tmp/codex-managed.sock",
+            "resume",
+            "thread-1",
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model=gpt-5",
+        ]
+    );
+    assert!(!args.iter().any(|arg| arg == "--last"));
+}
+
+#[test]
+fn codex_managed_tui_requires_a_prepared_thread() {
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-managed.sock"),
+        None,
+    );
+    assert!(codex_remote_command_args(&locator, &[]).is_err());
+}
+
 /// The core #1519 regression: two opencode instances resolve to DISTINCT
 /// XDG_DATA_HOME values — the property that prevents the shared-session
 /// collision. Pre-fix there was no per-instance XDG at all (both inherited the
