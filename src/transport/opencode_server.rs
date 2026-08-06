@@ -28,7 +28,7 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_ERROR_DETAIL: usize = 2048;
-const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg-";
+const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -322,51 +322,14 @@ fn response_body_detail(body: &[u8]) -> String {
     if body.is_empty() {
         return String::new();
     }
-    let value = match serde_json::from_slice::<Value>(body) {
-        Ok(value) => redact_response_value(value),
-        Err(_) => return truncate_error_detail(&String::from_utf8_lossy(body)),
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return String::new();
     };
-    truncate_error_detail(&value.to_string())
-}
-
-fn redact_response_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| {
-                    let value = if is_sensitive_response_key(&key) {
-                        Value::String("[REDACTED]".to_string())
-                    } else {
-                        redact_response_value(value)
-                    };
-                    (key, value)
-                })
-                .collect(),
-        ),
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(redact_response_value).collect())
-        }
-        value => value,
-    }
-}
-
-fn is_sensitive_response_key(key: &str) -> bool {
-    let normalized = key
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    matches!(
-        normalized.as_str(),
-        "apikey"
-            | "authorization"
-            | "accesstoken"
-            | "credential"
-            | "password"
-            | "privatekey"
-            | "secret"
-            | "token"
-    )
+    let message = value
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str));
+    message.map(truncate_error_detail).unwrap_or_default()
 }
 
 fn truncate_error_detail(value: &str) -> String {
@@ -926,7 +889,7 @@ fn session_status_type(value: &Value, session_id: &str) -> Option<String> {
 }
 
 fn opencode_message_id(delivery_id: Uuid) -> String {
-    format!("{OPENCODE_MESSAGE_ID_PREFIX}{delivery_id}")
+    format!("{OPENCODE_MESSAGE_ID_PREFIX}{}", delivery_id.simple())
 }
 
 fn delivery_id_from_opencode_message_id(value: &str) -> Option<Uuid> {
@@ -938,7 +901,7 @@ fn delivery_id_from_opencode_message_id(value: &str) -> Option<Uuid> {
 fn is_delivery_message_id(value: &str, delivery_id: Uuid) -> bool {
     value == opencode_message_id(delivery_id)
         // Keep exact matching for receipts accepted by pre-contract builds;
-        // all newly submitted requests use the msg-prefixed identity above.
+        // all newly submitted requests use the canonical msg_ identity above.
         || value == delivery_id.to_string()
 }
 
@@ -2024,7 +1987,7 @@ mod tests {
         let delivery_id =
             Uuid::parse_str("5af6d2a0-f5ca-4bef-8171-bb29202e25d2").expect("fixture UUID");
         let wire_id = opencode_message_id(delivery_id);
-        assert_eq!(wire_id, "msg-5af6d2a0-f5ca-4bef-8171-bb29202e25d2");
+        assert_eq!(wire_id, "msg_5af6d2a0f5ca4bef8171bb29202e25d2");
         assert_eq!(
             delivery_id_from_opencode_message_id(&wire_id),
             Some(delivery_id)
@@ -2048,7 +2011,7 @@ mod tests {
         let error = response_json(
             HttpResponse {
                 status: 400,
-                body: br#"{"error":"Expected a string starting with msg","token":"do-not-log"}"#
+                body: br#"{"data":{"message":"Expected a string starting with msg"},"token":"do-not-log"}"#
                     .to_vec(),
             },
             "prompt_async",
@@ -2388,7 +2351,7 @@ mod tests {
         let port = listener.local_addr().expect("address").port();
         let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
         let delivery_id = Uuid::new_v4();
-        let wire_message_id = format!("msg-{delivery_id}");
+        let wire_message_id = opencode_message_id(delivery_id);
         let expected_wire_message_id = wire_message_id.clone();
         let server = thread::spawn(move || {
             for _ in 0..4 {
@@ -2428,11 +2391,11 @@ mod tests {
                         .get("messageID")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if !message_id.starts_with("msg-") {
+                    if !message_id.starts_with("msg_") {
                         json_response(
                             &mut stream,
                             "400 Bad Request",
-                            json!({"error": "Expected a string starting with \\\"msg\\\", got bare delivery UUID"}),
+                            json!({"data": {"message": "Expected a string starting with msg_, got bare delivery UUID"}, "token": "do-not-log"}),
                         );
                     } else {
                         prompt_tx.send((header, body)).expect("prompt capture");
