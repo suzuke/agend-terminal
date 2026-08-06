@@ -3162,6 +3162,27 @@ fn codex_managed_tui_resume_targets_the_persisted_thread() {
 }
 
 #[test]
+fn codex_managed_tui_resume_falls_back_to_last_thread_in_cwd() {
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-managed.sock"),
+        None,
+    );
+    assert_eq!(
+        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume)
+            .expect("managed Codex resume fallback argv"),
+        vec![
+            "--remote",
+            "unix:///tmp/codex-managed.sock",
+            "-c",
+            "check_for_update_on_startup=false",
+            "resume",
+            "--last",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
+}
+
+#[test]
 fn codex_managed_tui_does_not_require_a_precreated_thread() {
     let locator = crate::transport::SessionLocator::codex(
         std::path::PathBuf::from("/tmp/codex-managed.sock"),
