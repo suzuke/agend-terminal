@@ -1291,11 +1291,14 @@ mod tests {
                             json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
                         );
                     }
-                    "thread/start" => {
+                    "thread/loaded/list" => {
                         write_server_frame(
                             &mut stream,
-                            json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
+                            json!({"id": id, "result": {"data": [{"id": "thread-1"}]}}),
                         );
+                    }
+                    "thread/start" => {
+                        panic!("daemon must not pre-create the visible TUI thread");
                     }
                     "turn/start" => {
                         write_server_frame(
@@ -1319,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_bootstrap_persists_thread_and_shared_receipt_identity() {
+    fn first_delivery_discovers_the_tui_created_thread_without_precreating_one() {
         let home =
             std::env::temp_dir().join(format!("agend-codex-managed-bootstrap-{}", Uuid::new_v4()));
         let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
@@ -1328,17 +1331,9 @@ mod tests {
         let locator = SessionLocator::codex(endpoint.clone(), None);
         let mut adapter = CodexNativeShared::new(&home, "codex-agent");
 
-        let capability = adapter
-            .start_or_attach_blocking(locator)
-            .expect("missing thread must be created through app-server");
-        assert!(capability.ready);
-        let persisted = super::super::registry::load_session_locator(&home, "codex-agent")
-            .expect("managed bootstrap must persist a locator");
-        assert_eq!(persisted.thread_id.as_deref(), Some("thread-1"));
-
         let envelope = DeliveryEnvelope::new(
             "codex-agent",
-            persisted,
+            locator,
             DeliveryKind::Prompt,
             "hello",
             Some("corr-managed".to_string()),
@@ -1351,6 +1346,9 @@ mod tests {
             accepted.tui_visibility.as_deref(),
             Some("shared_codex_thread")
         );
+        let persisted = super::super::registry::load_session_locator(&home, "codex-agent")
+            .expect("first delivery must persist the discovered TUI thread");
+        assert_eq!(persisted.thread_id.as_deref(), Some("thread-1"));
 
         server.join().expect("fake server");
         let _ = std::fs::remove_file(endpoint);

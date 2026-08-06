@@ -3135,7 +3135,7 @@ fn opencode_attach_command_uses_one_model_parse_result() {
 }
 
 #[test]
-fn codex_managed_tui_resumes_the_prepared_native_thread() {
+fn codex_managed_tui_lets_remote_create_the_visible_thread() {
     let locator = crate::transport::SessionLocator::codex(
         std::path::PathBuf::from("/tmp/codex-managed.sock"),
         Some("thread-1".to_string()),
@@ -3147,8 +3147,6 @@ fn codex_managed_tui_resumes_the_prepared_native_thread() {
         vec![
             "--remote",
             "unix:///tmp/codex-managed.sock",
-            "resume",
-            "thread-1",
             "-c",
             "check_for_update_on_startup=false",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -3159,12 +3157,21 @@ fn codex_managed_tui_resumes_the_prepared_native_thread() {
 }
 
 #[test]
-fn codex_managed_tui_requires_a_prepared_thread() {
+fn codex_managed_tui_does_not_require_a_precreated_thread() {
     let locator = crate::transport::SessionLocator::codex(
         std::path::PathBuf::from("/tmp/codex-managed.sock"),
         None,
     );
-    assert!(codex_remote_command_args(&locator, &[]).is_err());
+    assert_eq!(
+        codex_remote_command_args(&locator, &[]).expect("TUI-first remote argv"),
+        vec![
+            "--remote",
+            "unix:///tmp/codex-managed.sock",
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
 }
 
 /// The core #1519 regression: two opencode instances resolve to DISTINCT
