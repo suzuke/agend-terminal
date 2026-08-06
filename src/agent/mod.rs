@@ -730,12 +730,6 @@ fn codex_remote_command_args(
     args: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut enriched = crate::transport::codex_attach_args(locator)?;
-    let thread_id = locator
-        .thread_id
-        .as_deref()
-        .filter(|thread_id| !thread_id.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Codex NativeShared thread id is missing"))?;
-    enriched.extend(["resume".to_string(), thread_id.to_string()]);
     enriched.extend([
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),

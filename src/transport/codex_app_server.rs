@@ -116,7 +116,7 @@ impl CodexNativeShared {
 
     pub(crate) fn deliver_blocking(
         &mut self,
-        envelope: DeliveryEnvelope,
+        mut envelope: DeliveryEnvelope,
     ) -> anyhow::Result<DeliveryReceipt> {
         let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
         store.record_queued(&envelope)?;
@@ -128,6 +128,9 @@ impl CodexNativeShared {
             failed.detail = Some("NativeShared readiness failed closed".to_string());
             store.record(failed)?;
             return Err(error);
+        }
+        if let Some(locator) = self.locator.clone() {
+            envelope.session = locator;
         }
         if self.in_flight.is_some() && !matches!(envelope.kind, DeliveryKind::Steer) {
             let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
@@ -348,30 +351,15 @@ impl CodexNativeShared {
             )?;
             let version = validate_initialize_response(&initialize)?;
             self.send_notification("initialized", json!({}))?;
-            if let Some(thread_id) = locator
+            let had_thread_id = locator
                 .thread_id
                 .as_deref()
                 .filter(|thread_id| !thread_id.is_empty())
-            {
+                .map(str::to_string);
+            if let Some(thread_id) = had_thread_id.as_deref() {
                 self.send_request("thread/resume", json!({"threadId": thread_id}))?;
             } else {
-                let mut params = json!({});
-                if let Some(cwd) = _cwd {
-                    params["cwd"] = Value::String(cwd.display().to_string());
-                }
-                if let Some(model) = locator.model.as_deref() {
-                    params["model"] = Value::String(model.to_string());
-                }
-                let response = self.send_request("thread/start", params)?;
-                let thread_id = response
-                    .get("thread")
-                    .and_then(|thread| thread.get("id"))
-                    .and_then(Value::as_str)
-                    .filter(|thread_id| !thread_id.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Codex thread/start response omitted thread id")
-                    })?;
-                locator.thread_id = Some(thread_id.to_string());
+                locator.thread_id = Some(self.discover_loaded_tui_thread()?);
             }
             self.locator = Some(locator.clone());
             self.backend_version = Some(version.clone());
@@ -388,6 +376,32 @@ impl CodexNativeShared {
         #[cfg(not(unix))]
         {
             Err(anyhow::anyhow!("Codex NativeShared requires Unix sockets"))
+        }
+    }
+
+    #[cfg(unix)]
+    fn discover_loaded_tui_thread(&mut self) -> anyhow::Result<String> {
+        let deadline = std::time::Instant::now() + IO_TIMEOUT;
+        loop {
+            let response = self.send_request("thread/loaded/list", json!({}))?;
+            let thread_ids = loaded_thread_ids(&response);
+            match thread_ids.as_slice() {
+                [thread_id] => return Ok(thread_id.clone()),
+                [] if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                [] => {
+                    return Err(anyhow::anyhow!(
+                        "Codex TUI did not publish a loaded thread before the delivery deadline"
+                    ));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Codex app-server has {} loaded threads; refusing ambiguous TUI delivery",
+                        thread_ids.len()
+                    ));
+                }
+            }
         }
     }
 
@@ -755,6 +769,27 @@ fn validate_initialize_response(response: &Value) -> anyhow::Result<String> {
 }
 
 #[cfg(unix)]
+fn loaded_thread_ids(response: &Value) -> Vec<String> {
+    let mut thread_ids = Vec::new();
+    for item in response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let thread_id = item
+            .as_str()
+            .or_else(|| item.get("id").and_then(Value::as_str));
+        if let Some(thread_id) = thread_id.filter(|thread_id| !thread_id.is_empty()) {
+            if !thread_ids.iter().any(|loaded| loaded == thread_id) {
+                thread_ids.push(thread_id.to_string());
+            }
+        }
+    }
+    thread_ids
+}
+
+#[cfg(unix)]
 fn append_masked_payload(output: &mut Vec<u8>, body: &[u8]) -> anyhow::Result<()> {
     let length = body.len();
     if length > 16 * 1024 * 1024 {
@@ -1086,17 +1121,6 @@ pub(crate) fn stop_instance_server(_home: &Path, _instance: &str) -> anyhow::Res
 }
 
 #[cfg(unix)]
-fn stop_instance_server_best_effort(home: &Path, instance: &str) {
-    if let Err(error) = stop_instance_server(home, instance) {
-        tracing::warn!(
-            instance,
-            error = %error,
-            "Codex managed server cleanup failed"
-        );
-    }
-}
-
-#[cfg(unix)]
 pub(crate) fn prepare_managed_tui(
     home: &Path,
     instance: &str,
@@ -1105,31 +1129,18 @@ pub(crate) fn prepare_managed_tui(
     cwd: Option<&Path>,
 ) -> anyhow::Result<SessionLocator> {
     locator.managed = true;
-    let endpoint_exists = locator
-        .endpoint
-        .as_ref()
-        .is_some_and(|endpoint| endpoint.exists());
+    locator.thread_id = None;
     let server_owned = locator
         .endpoint
         .as_ref()
         .is_some_and(|_| persisted_server_owned(&locator))
         || in_memory_server_owned(home, instance, &locator);
-    if !server_owned || !endpoint_exists {
-        if server_owned {
-            stop_instance_server(home, instance)?;
-        }
-        rotate_managed_endpoint(home, instance, &mut locator);
-        launch_managed_server(home, instance, codex, &mut locator, cwd)?;
+    if server_owned {
+        stop_instance_server(home, instance)?;
     }
-
-    let mut adapter = CodexNativeShared::new(home, instance);
-    if let Err(error) = adapter.start_or_attach_blocking_with_cwd(locator, cwd) {
-        stop_instance_server_best_effort(home, instance);
-        return Err(error);
-    }
-    adapter
-        .locator
-        .ok_or_else(|| anyhow::anyhow!("Codex managed TUI session was not prepared"))
+    rotate_managed_endpoint(home, instance, &mut locator);
+    launch_managed_server(home, instance, codex, &mut locator, cwd)?;
+    Ok(locator)
 }
 
 #[cfg(not(unix))]
