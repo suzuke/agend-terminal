@@ -1925,6 +1925,22 @@ mod tests {
     }
 
     #[test]
+    fn non_2xx_response_diagnostics_are_bounded_and_redacted() {
+        let error = response_json(
+            HttpResponse {
+                status: 400,
+                body: br#"{"error":"Expected a string starting with msg","token":"do-not-log"}"#
+                    .to_vec(),
+            },
+            "prompt_async",
+        )
+        .expect_err("non-2xx response");
+        let detail = error.to_string();
+        assert!(detail.contains("Expected a string starting with msg"));
+        assert!(!detail.contains("do-not-log"));
+    }
+
+    #[test]
     fn session_only_events_do_not_regress_or_complete_a_delivery() {
         let home = std::env::temp_dir().join(format!("agend-opencode-events-{}", Uuid::new_v4()));
         let mut adapter = OpenCodeNativeShared::new(&home, "agent");
@@ -2188,6 +2204,8 @@ mod tests {
         let port = listener.local_addr().expect("address").port();
         let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
         let delivery_id = Uuid::new_v4();
+        let wire_message_id = format!("msg-{delivery_id}");
+        let expected_wire_message_id = wire_message_id.clone();
         let server = thread::spawn(move || {
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept");
@@ -2209,7 +2227,7 @@ mod tests {
                     .expect("event headers");
                     let events = [
                         json!({"type": "server.connected"}),
-                        json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": delivery_id.to_string()}}}),
+                        json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": wire_message_id}}}),
                         json!({"type": "session.status", "properties": {"sessionID": "session-1", "status": {"type": "busy"}}}),
                         json!({"type": "session.idle", "properties": {"sessionID": "session-1"}}),
                     ];
@@ -2221,10 +2239,23 @@ mod tests {
                     }
                     stream.flush().expect("event flush");
                 } else if request_line.starts_with("POST /session/session-1/prompt_async ") {
-                    prompt_tx.send((header, body)).expect("prompt capture");
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .expect("prompt response");
+                    let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
+                    let message_id = prompt
+                        .get("messageID")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !message_id.starts_with("msg-") {
+                        json_response(
+                            &mut stream,
+                            "400 Bad Request",
+                            json!({"error": "Expected a string starting with \\\"msg\\\", got bare delivery UUID"}),
+                        );
+                    } else {
+                        prompt_tx.send((header, body)).expect("prompt capture");
+                        stream
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .expect("prompt response");
+                    }
                     stream.flush().expect("prompt flush");
                 }
             }
@@ -2248,6 +2279,11 @@ mod tests {
         envelope.delivery_id = delivery_id;
         let receipt = adapter.deliver_blocking(envelope).expect("prompt");
         assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+        assert_eq!(receipt.delivery_id, delivery_id);
+        assert_eq!(
+            receipt.protocol_request_id.as_deref(),
+            Some(expected_wire_message_id.as_str())
+        );
         let (header, body) = prompt_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("prompt request");
@@ -2255,7 +2291,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&body).expect("prompt json"),
             json!({
-                "messageID": delivery_id.to_string(),
+                "messageID": expected_wire_message_id,
                 "parts": [{"type": "text", "text": "hello\n世界"}],
             })
         );
