@@ -3135,13 +3135,17 @@ fn opencode_attach_command_uses_one_model_parse_result() {
 }
 
 #[test]
-fn codex_managed_tui_lets_remote_create_the_visible_thread() {
+fn codex_managed_tui_resume_targets_the_persisted_thread() {
     let locator = crate::transport::SessionLocator::codex(
         std::path::PathBuf::from("/tmp/codex-managed.sock"),
         Some("thread-1".to_string()),
     );
-    let args = codex_remote_command_args(&locator, &["--model=gpt-5".to_string()])
-        .expect("managed Codex attach argv");
+    let args = codex_remote_command_args(
+        &locator,
+        &["--model=gpt-5".to_string()],
+        crate::backend::SpawnMode::Resume,
+    )
+    .expect("managed Codex resume argv");
     assert_eq!(
         args,
         vec![
@@ -3149,11 +3153,12 @@ fn codex_managed_tui_lets_remote_create_the_visible_thread() {
             "unix:///tmp/codex-managed.sock",
             "-c",
             "check_for_update_on_startup=false",
+            "resume",
+            "thread-1",
             "--dangerously-bypass-approvals-and-sandbox",
             "--model=gpt-5",
         ]
     );
-    assert!(!args.iter().any(|arg| arg == "--last"));
 }
 
 #[test]
@@ -3163,7 +3168,8 @@ fn codex_managed_tui_does_not_require_a_precreated_thread() {
         None,
     );
     assert_eq!(
-        codex_remote_command_args(&locator, &[]).expect("TUI-first remote argv"),
+        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Fresh)
+            .expect("TUI-first remote argv"),
         vec![
             "--remote",
             "unix:///tmp/codex-managed.sock",

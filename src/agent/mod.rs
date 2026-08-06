@@ -728,6 +728,7 @@ fn opencode_attach_command_args(
 fn codex_remote_command_args(
     locator: &crate::transport::SessionLocator,
     args: &[String],
+    _spawn_mode: crate::backend::SpawnMode,
 ) -> anyhow::Result<Vec<String>> {
     let mut enriched = crate::transport::codex_attach_args(locator)?;
     enriched.extend([
@@ -822,7 +823,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
         opencode_attach_command_args(locator, args)?
     } else if let Some(locator) = codex_locator.as_ref() {
-        codex_remote_command_args(locator, args)?
+        codex_remote_command_args(locator, args, *spawn_mode)?
     } else {
         let preset = detected_backend
             .as_ref()
