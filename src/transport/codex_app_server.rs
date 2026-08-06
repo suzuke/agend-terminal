@@ -234,10 +234,13 @@ impl CodexNativeShared {
             use std::os::unix::fs::PermissionsExt;
             parent_permissions.set_mode(0o700);
             std::fs::set_permissions(parent, parent_permissions)?;
-            let mut child = std::process::Command::new(codex)
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(codex);
+            command
                 .args(["app-server", "--listen", &locator.remote_attach_arg()])
                 .current_dir(cwd)
-                .spawn()?;
+                .process_group(0);
+            let mut child = command.spawn()?;
             let started = wait_for_socket(endpoint, &mut child)?;
             if !started {
                 let _ = child.kill();
@@ -955,7 +958,17 @@ fn remove_managed_endpoint(
 }
 
 #[cfg(unix)]
-fn stop_owned_process(pid: u32, start_token: u64) -> anyhow::Result<()> {
+fn stop_owned_process(
+    pid: u32,
+    start_token: u64,
+    child: Option<&mut std::process::Child>,
+) -> anyhow::Result<()> {
+    let mut child = child;
+    if let Some(child) = child.as_deref_mut() {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+    }
     match crate::process::process_start_token(pid) {
         None => return Ok(()),
         Some(observed) if observed != start_token => {
@@ -967,18 +980,44 @@ fn stop_owned_process(pid: u32, start_token: u64) -> anyhow::Result<()> {
     }
     crate::process::terminate(pid);
     for _ in 0..5 {
+        if let Some(child) = child.as_deref_mut() {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+        }
         if crate::process::process_start_token(pid).is_none() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    if let Some(child) = child.as_deref_mut() {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+    }
     if crate::process::process_start_token(pid) == Some(start_token) {
-        crate::process::kill_process_tree(pid);
+        if crate::process::process_group_id(pid) == Some(pid) {
+            if crate::process::process_start_token(pid) == Some(start_token) {
+                crate::process::kill_process_tree(pid);
+            }
+        } else if crate::process::process_start_token(pid) == Some(start_token) {
+            crate::process::kill_process(pid);
+        }
         for _ in 0..5 {
+            if let Some(child) = child.as_deref_mut() {
+                if child.try_wait()?.is_some() {
+                    return Ok(());
+                }
+            }
             if crate::process::process_start_token(pid).is_none() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if let Some(child) = child {
+        if child.try_wait()?.is_some() {
+            return Ok(());
         }
     }
     if let Some(observed) = crate::process::process_start_token(pid) {
@@ -1012,7 +1051,7 @@ pub(crate) fn stop_instance_server(home: &Path, instance: &str) -> anyhow::Resul
             .start_token
             .map(|start_token| (server.pid, start_token));
         if let Some(start_token) = server.start_token {
-            stop_owned_process(server.pid, start_token)?;
+            stop_owned_process(server.pid, start_token, Some(&mut server.child))?;
             let _ = server.child.wait()?;
         } else if server.child.try_wait()?.is_none() {
             server.child.kill()?;
@@ -1030,7 +1069,7 @@ pub(crate) fn stop_instance_server(home: &Path, instance: &str) -> anyhow::Resul
             .server_start_token
             .expect("persisted ownership requires a start token");
         if in_memory_identity != Some((pid, start_token)) {
-            stop_owned_process(pid, start_token)?;
+            stop_owned_process(pid, start_token, None)?;
         }
     }
     if persisted_owned || in_memory_owned {
@@ -1056,9 +1095,6 @@ fn stop_instance_server_best_effort(home: &Path, instance: &str) {
         );
     }
 }
-
-#[cfg(not(unix))]
-fn stop_instance_server_best_effort(_home: &Path, _instance: &str) {}
 
 #[cfg(unix)]
 pub(crate) fn prepare_managed_tui(
@@ -1506,6 +1542,73 @@ mod tests {
         assert!(!endpoint.exists(), "owned stale socket must be removed");
         assert!(other_endpoint.exists(), "unowned socket must remain");
         drop(other_listener);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_process_group_stop_does_not_kill_caller() {
+        let suffix = Uuid::new_v4().to_string();
+        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
+        let instance = "a";
+        let socket_dir = home.join("transport/codex");
+        std::fs::create_dir_all(&socket_dir).expect("socket dir");
+        let endpoint = socket_dir.join(format!("a-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&endpoint).expect("owned socket");
+        drop(listener);
+
+        let term_marker = home.join("term-grace");
+        let caller_pgid = unsafe { libc::getpgrp() };
+        let child = unsafe {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "trap 'printf term > \"$AGEND_TERM_MARKER\"' TERM; while :; do :; done",
+                ])
+                .env("AGEND_TERM_MARKER", &term_marker)
+                .pre_exec(move || {
+                    if libc::setpgid(0, caller_pgid) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("shared-group fixture")
+        };
+        let pid = child.id();
+        assert_ne!(
+            crate::process::process_group_id(pid),
+            Some(pid),
+            "fixture must share the caller process group"
+        );
+        let start_token = crate::process::process_start_token(pid).expect("start token");
+        let mut locator = SessionLocator::codex(endpoint.clone(), None);
+        locator.managed = true;
+        locator.server_pid = Some(pid);
+        locator.server_start_token = Some(start_token);
+        super::super::registry::save_session_locator(&home, instance, &locator)
+            .expect("persist locator");
+        managed_servers()
+            .lock()
+            .expect("Codex server registry lock")
+            .insert(
+                server_key(&home, instance),
+                ManagedServer {
+                    child,
+                    pid,
+                    start_token: Some(start_token),
+                },
+            );
+
+        stop_instance_server(&home, instance).expect("shared-group teardown");
+        assert!(term_marker.exists(), "shared-group child must receive TERM");
+        assert!(
+            crate::process::process_start_token(pid).is_none(),
+            "shared-group child must be reaped"
+        );
+        assert!(!endpoint.exists(), "owned socket must be removed");
+        assert!(crate::process::is_pid_alive(std::process::id()));
         let _ = std::fs::remove_dir_all(home);
     }
 

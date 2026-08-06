@@ -149,9 +149,28 @@ pub fn terminate(pid: u32) {
     }
 }
 
-/// Kill an entire process group. On Unix, sends SIGTERM to -pgid (all processes
-/// in the group), then waits briefly and escalates to SIGKILL if still alive.
-/// On Windows, falls back to TerminateProcess on the leader.
+/// Return the process group ID when the platform exposes one.
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        (pgid > 0).then_some(pgid as u32)
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Kill an entire process group when `pid` is its process-group leader. On Unix,
+/// sends SIGTERM to -pgid (all processes in the isolated group), then waits
+/// briefly and escalates to SIGKILL if still alive. If the process belongs to a
+/// shared or otherwise unexpected group, this fails closed without signalling
+/// it. On Windows, falls back to TerminateProcess on the leader.
 pub fn kill_process_tree(pid: u32) {
     if pid == 0 {
         tracing::warn!("kill_process_tree called with pid=0, skipping (would kill daemon)");
@@ -161,22 +180,55 @@ pub fn kill_process_tree(pid: u32) {
     {
         // M2: query actual PGID instead of assuming PID==PGID
         let pgid = unsafe { libc::getpgid(pid as i32) };
-        let kill_pgid = if pgid > 0 { -pgid } else { -(pid as i32) };
-        // SIGTERM the entire process group
+        if pgid != pid as i32 {
+            tracing::warn!(pid, pgid, "refusing to signal a shared process group");
+            return;
+        }
+        let kill_target = -pgid;
+        // SIGTERM the isolated process group.
         unsafe {
-            libc::kill(kill_pgid, libc::SIGTERM);
+            libc::kill(kill_target, libc::SIGTERM);
         }
         // Grace period, then unconditional SIGKILL (handles grandchildren
         // that ignore SIGTERM even if leader already exited).
         std::thread::sleep(std::time::Duration::from_millis(500));
         unsafe {
-            libc::kill(kill_pgid, libc::SIGKILL);
+            libc::kill(kill_target, libc::SIGKILL);
         }
         // ESRCH (no such process) is fine — group already dead.
     }
     #[cfg(windows)]
     {
         terminate(pid);
+    }
+}
+
+/// Force-kill only one process. Callers that track a process must revalidate
+/// its identity immediately before calling this function.
+pub fn kill_process(pid: u32) {
+    if pid == 0 {
+        tracing::warn!("kill_process called with pid=0, skipping");
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let handle = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                windows_sys::Win32::System::Threading::PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        if !handle.is_null() {
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
     }
 }
 
