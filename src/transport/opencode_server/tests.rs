@@ -412,6 +412,8 @@ fn restore_reconciles_msg_prefixed_history_target() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     let port = listener.local_addr().expect("address").port();
     let delivery_id = Uuid::new_v4();
+    let wire_message_id = "msg_1700000000000000000".to_string();
+    let expected_wire_message_id = wire_message_id.clone();
     let server = thread::spawn(move || {
         for _ in 0..2 {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -421,7 +423,7 @@ fn restore_reconciles_msg_prefixed_history_target() {
                 json_response(
                     &mut stream,
                     "200 OK",
-                    json!([{"info": {"id": opencode_message_id(delivery_id)}}]),
+                    json!([{"info": {"id": wire_message_id}}]),
                 );
             } else if request_line.starts_with("GET /session/status ") {
                 json_response(
@@ -456,7 +458,7 @@ fn restore_reconciles_msg_prefixed_history_target() {
     let store = ReceiptStore::for_instance(&home, "agent").expect("store");
     store.record_queued(&envelope).expect("queued");
     let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-    accepted.protocol_request_id = Some(opencode_message_id(delivery_id));
+    accepted.protocol_request_id = Some(expected_wire_message_id);
     store.record(accepted).expect("accepted");
 
     let mut adapter = OpenCodeNativeShared::new(&home, "agent");
@@ -605,7 +607,7 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     let port = listener.local_addr().expect("address").port();
     let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
-    let delivery_id = Uuid::new_v4();
+    let delivery_id = Uuid::nil();
     let wire_message_id = opencode_message_id(delivery_id);
     let expected_wire_message_id = wire_message_id.clone();
     let server = thread::spawn(move || {
@@ -646,11 +648,11 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
                     .get("messageID")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if !message_id.starts_with("msg_") {
+                if !message_id.starts_with("msg_") || message_id <= "msg_fdb5a96c3001auuSsUN6in29xP" {
                     json_response(
                         &mut stream,
                         "400 Bad Request",
-                        json!({"data": {"message": "Expected a string starting with msg_, got bare delivery UUID"}, "token": "do-not-log"}),
+                        json!({"data": {"message": "Expected a lexicographically newer msg_ ID"}, "token": "do-not-log"}),
                     );
                 } else {
                     prompt_tx.send((header, body)).expect("prompt capture");
