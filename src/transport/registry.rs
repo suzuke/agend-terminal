@@ -33,14 +33,16 @@ pub(crate) fn mode_for_backend(backend: &Backend) -> TransportMode {
 }
 
 pub(crate) fn mode_for_instance(home: &Path, instance: &str) -> TransportMode {
+    let backend = backend_for_instance(home, instance);
+    if backend.as_ref() == Some(&Backend::ClaudeCode) {
+        return if claude_channel::legacy_pty_opt_in(home, instance) {
+            TransportMode::LegacyPty
+        } else {
+            TransportMode::ChannelBridge
+        };
+    }
     if persisted_native_shared_hint(home, instance) {
         return TransportMode::NativeShared;
-    }
-    let backend = backend_for_instance(home, instance);
-    if backend.as_ref() == Some(&Backend::ClaudeCode)
-        && claude_channel::legacy_pty_opt_in(home, instance)
-    {
-        return TransportMode::LegacyPty;
     }
     backend
         .as_ref()
@@ -73,6 +75,44 @@ fn session_path(home: &Path, instance: &str) -> PathBuf {
     home.join("transport")
         .join("sessions")
         .join(format!("{}.json", super::receipt::safe_component(instance)))
+}
+
+pub(crate) fn claude_attach_locator(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<SessionLocator>> {
+    let path = session_path(home, instance);
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            let locator = load_session_locator(home, instance)?;
+            if locator.backend == "claude" {
+                Ok(Some(locator))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Claude session locator belongs to backend {}",
+                    locator.backend
+                ))
+            }
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "Claude session locator is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "Claude session locator cannot be inspected at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn remove_session_locator(home: &Path, instance: &str) -> anyhow::Result<()> {
+    let path = session_path(home, instance);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn save_session_locator(
@@ -368,7 +408,11 @@ pub(crate) fn envelope_for_instance(
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let mode = mode_for_instance(home, instance);
-    let locator = locator_for_instance(home, instance, backend.as_ref(), mode)?;
+    let locator = if mode == TransportMode::ChannelBridge {
+        super::claude_channel::prepare_claude_channel(home, instance)?
+    } else {
+        locator_for_instance(home, instance, backend.as_ref(), mode)?
+    };
     Ok(DeliveryEnvelope::new(
         instance,
         locator,

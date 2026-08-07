@@ -896,6 +896,23 @@ impl Backend {
             if mcp.exists() {
                 out.push("--mcp-config".to_string());
                 out.push(mcp.display().to_string());
+                if std::fs::read_to_string(&mcp)
+                    .ok()
+                    .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                    .and_then(|config| config.get("mcpServers").cloned())
+                    .and_then(|servers| servers.get("agend-claude-channel").cloned())
+                    .is_some()
+                {
+                    // Claude Channels are a research-preview capability. The
+                    // development-channel flag is deliberately emitted only
+                    // when this workspace explicitly contains our bridge.
+                    out.extend([
+                        "--channels".to_string(),
+                        "server:agend-claude-channel".to_string(),
+                        "--dangerously-load-development-channels".to_string(),
+                        "server:agend-claude-channel".to_string(),
+                    ]);
+                }
             }
         }
         out
@@ -2304,6 +2321,27 @@ mod tests {
         assert!(flags
             .windows(2)
             .any(|w| w[0] == "--mcp-config" && w[1].ends_with("mcp-config.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_flags_claude_enable_channels_only_for_bridge_server() {
+        let dir = tmp_dir("spawn_flags_claude_channel");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/agend.md"), "x").unwrap();
+        std::fs::write(
+            dir.join("mcp-config.json"),
+            r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-terminal"}}}"#,
+        )
+        .unwrap();
+        let flags = Backend::ClaudeCode.spawn_flags(&dir);
+        assert!(flags.windows(2).any(|window| {
+            window[0] == "--channels" && window[1] == "server:agend-claude-channel"
+        }));
+        assert!(flags.windows(2).any(|window| {
+            window[0] == "--dangerously-load-development-channels"
+                && window[1] == "server:agend-claude-channel"
+        }));
         std::fs::remove_dir_all(&dir).ok();
     }
 

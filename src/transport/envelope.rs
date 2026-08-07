@@ -86,6 +86,23 @@ impl SessionLocator {
         }
     }
 
+    pub(crate) fn claude(endpoint_url: String, session_id: String, token: String) -> Self {
+        Self {
+            backend: "claude".to_string(),
+            endpoint: None,
+            thread_id: None,
+            session_id: Some(session_id),
+            endpoint_url: Some(endpoint_url),
+            username: Some("bearer".to_string()),
+            password: Some(token),
+            model: None,
+            event_cursor: Some(0),
+            managed: false,
+            server_pid: None,
+            server_start_token: None,
+        }
+    }
+
     pub(crate) fn remote_attach_arg(&self) -> String {
         self.endpoint
             .as_ref()

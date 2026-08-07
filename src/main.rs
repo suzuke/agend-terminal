@@ -341,6 +341,13 @@ enum Commands {
         #[arg(long)]
         event: Option<String>,
     },
+    /// Hidden MCP subprocess used by Claude Code's research-preview channel.
+    #[command(hide = true, name = "channel-bridge")]
+    ChannelBridge {
+        /// Fleet instance whose durable channel locator and receipt log are used.
+        #[arg(long)]
+        instance: String,
+    },
     /// Send input to an agent
     Inject {
         /// Agent name
@@ -1022,6 +1029,9 @@ fn main() -> anyhow::Result<()> {
             // above. Best-effort, observe-only.
             emit_shadow_frame(&v);
             return Ok(());
+        }
+        Some(Commands::ChannelBridge { instance }) => {
+            transport::claude_channel::run_channel_server(&home, &instance)?;
         }
         Some(Commands::Inject { name, text }) => {
             let text = text.join(" ");

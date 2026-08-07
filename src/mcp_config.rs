@@ -118,6 +118,12 @@ fn config_lock_path(path: &Path) -> PathBuf {
 /// directly with no lock, so two concurrent `create_instance` calls
 /// targeting the same working_directory could drop one of their edits.
 fn upsert_mcp_servers(path: &Path, instance_name: Option<&str>) -> Result<()> {
+    upsert_mcp_server(path, "agend-terminal", mcp_server_entry(instance_name))
+}
+
+/// Upsert one named MCP server while preserving every unrelated server and
+/// serialising concurrent workspace provisions under the same path lock.
+fn upsert_mcp_server(path: &Path, server_name: &str, server: serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -166,7 +172,7 @@ fn upsert_mcp_servers(path: &Path, instance_name: Option<&str>) -> Result<()> {
     if config.get("mcpServers").is_none() {
         config["mcpServers"] = json!({});
     }
-    config["mcpServers"]["agend-terminal"] = mcp_server_entry(instance_name);
+    config["mcpServers"][server_name] = server;
 
     let body = serde_json::to_string_pretty(&config)?;
     crate::store::atomic_write(path, body.as_bytes())?;
@@ -210,7 +216,36 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     // Write standalone mcp-config.json for --mcp-config flag
     let standalone = working_dir.join("mcp-config.json");
     upsert_mcp_servers(&standalone, instance_name)?;
+    if let Some(instance_name) = instance_name {
+        let home = PathBuf::from(home_path());
+        if crate::transport::claude_channel::legacy_pty_opt_in(&home, instance_name) {
+            // An explicit LegacyPty instance must not advertise a structured
+            // channel to Claude; this keeps the fallback visible and opt-in.
+            remove_mcp_server(&standalone, "agend-claude-channel")?;
+        } else {
+            let channel =
+                crate::transport::claude_channel::channel_server_entry(&home, instance_name)?;
+            upsert_mcp_server(&standalone, "agend-claude-channel", channel)?;
+        }
+    }
 
+    Ok(())
+}
+
+fn remove_mcp_server(path: &Path, server_name: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
+    let mut config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    if let Some(servers) = config
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        servers.remove(server_name);
+    }
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1394,6 +1429,24 @@ mod tests {
         configure_claude(&dir, None).expect("configure");
         assert!(dir.join("mcp-config.json").exists());
         assert!(dir.join(".claude/settings.local.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_instance_configures_authenticated_channel_server() {
+        let dir = tmp_dir("claude_channel");
+        configure_claude(&dir, Some("agent-channel")).expect("configure");
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("mcp-config.json")).unwrap())
+                .unwrap();
+        let server = &config["mcpServers"]["agend-claude-channel"];
+        assert!(server["command"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert_eq!(server["args"][0], "channel-bridge");
+        assert_eq!(server["args"][1], "--instance");
+        assert_eq!(server["args"][2], "agent-channel");
+        assert_eq!(server["env"]["AGEND_INSTANCE_NAME"], json!("agent-channel"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
