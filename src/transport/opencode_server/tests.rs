@@ -284,6 +284,84 @@ fn opencode_message_ids_are_monotonic_when_clock_does_not_advance() {
 }
 
 #[test]
+fn opencode_message_ids_fail_closed_at_vendor_timestamp_wrap() {
+    let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
+    let before_wrap = next_opencode_message_id_at(None, before_wrap_ms).expect("pre-wrap ID");
+    let before_field = opencode_message_id_timestamp(&before_wrap).expect("pre-wrap field");
+    assert!(
+        next_opencode_message_id_at(Some(&before_wrap), before_wrap_ms + 1)
+            .expect_err("natural wrap must fail closed")
+            .to_string()
+            .contains("timestamp wrapped")
+    );
+    let exhausted = format!(
+        "{OPENCODE_MESSAGE_ID_PREFIX}{OPENCODE_MESSAGE_ID_TIMESTAMP_MASK:012x}00000000000000"
+    );
+    assert!(
+        next_opencode_message_id_at(Some(&exhausted), before_wrap_ms)
+            .expect_err("exhausted prefix must fail closed")
+            .to_string()
+            .contains("prefix is exhausted")
+    );
+    assert!(before_field > 1);
+}
+
+#[test]
+fn prompt_async_fails_closed_before_vendor_timestamp_wrap() {
+    let home = std::env::temp_dir().join(format!("agend-opencode-wrap-fail-{}", Uuid::new_v4()));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    let locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
+    let pre_wrap_user_id =
+        next_opencode_message_id_at(None, before_wrap_ms).expect("pre-wrap user ID");
+    let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+    let pre_wrap_delivery = DeliveryEnvelope::new(
+        "agent",
+        locator.clone(),
+        DeliveryKind::Prompt,
+        "pre-wrap terminal user",
+        None,
+    );
+    store
+        .record_queued(&pre_wrap_delivery)
+        .expect("pre-wrap queued");
+    let mut pre_wrap_receipt =
+        DeliveryReceipt::for_state(&pre_wrap_delivery, DeliveryState::Completed);
+    pre_wrap_receipt.protocol_request_id = Some(pre_wrap_user_id);
+    store.record(pre_wrap_receipt).expect("pre-wrap completed");
+
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.ready = true;
+    adapter.locator = Some(locator.clone());
+    adapter.message_id_timestamp_ms = Some(before_wrap_ms + 1);
+    let envelope = DeliveryEnvelope::new(
+        "agent",
+        locator,
+        DeliveryKind::Prompt,
+        "post-wrap delivery",
+        None,
+    );
+    let error = adapter
+        .deliver_blocking(envelope.clone())
+        .expect_err("post-wrap delivery must fail closed");
+    assert!(error.to_string().contains("timestamp wrapped"));
+    let receipt = store
+        .latest(envelope.delivery_id)
+        .expect("latest receipt")
+        .expect("failed receipt");
+    assert_eq!(receipt.state, DeliveryState::Failed);
+    assert!(receipt.protocol_request_id.is_none());
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn non_2xx_response_diagnostics_are_bounded_and_redacted() {
     let error = response_json(
             HttpResponse {
@@ -630,6 +708,13 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
     let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
     let delivery_id = Uuid::nil();
     let event_message_id = opencode_message_id(delivery_id);
+    let persisted_seed_ms = current_opencode_timestamp().saturating_add(60_000);
+    let persisted_low =
+        next_opencode_message_id_at(None, persisted_seed_ms).expect("persisted low ID");
+    let persisted_high =
+        next_opencode_message_id_at(None, persisted_seed_ms + 1_000).expect("persisted high ID");
+    let persisted_wire_message_id = persisted_high.clone();
+    let server_persisted_wire_message_id = persisted_wire_message_id.clone();
     let server = thread::spawn(move || {
         for _ in 0..4 {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -668,12 +753,13 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
                     .get("messageID")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if !message_id.starts_with("msg_") || message_id <= "msg_fdb5a96c3001auuSsUN6in29xP"
+                if !message_id.starts_with("msg_")
+                    || message_id <= server_persisted_wire_message_id.as_str()
                 {
                     json_response(
                         &mut stream,
                         "400 Bad Request",
-                        json!({"data": {"message": "Expected a lexicographically newer msg_ ID"}, "token": "do-not-log"}),
+                        json!({"data": {"message": "Expected an ID newer than the persisted request"}, "token": "do-not-log"}),
                     );
                 } else {
                     prompt_tx.send((header, body)).expect("prompt capture");
@@ -695,6 +781,20 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
     );
     let mut locator = locator;
     locator.managed = false;
+    let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+    for (index, protocol_request_id) in [&persisted_low, &persisted_high].into_iter().enumerate() {
+        let seed = DeliveryEnvelope::new(
+            "agent",
+            locator.clone(),
+            DeliveryKind::Prompt,
+            format!("persisted-seed-{index}"),
+            None,
+        );
+        store.record_queued(&seed).expect("seed queued");
+        let mut receipt = DeliveryReceipt::for_state(&seed, DeliveryState::Completed);
+        receipt.protocol_request_id = Some(protocol_request_id.clone());
+        store.record(receipt).expect("seed completed");
+    }
     let mut adapter = OpenCodeNativeShared::new(&home, "agent");
     adapter
         .start_or_attach_blocking(locator.clone(), None)
@@ -716,7 +816,7 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
         .expect("wire message id");
     assert!(message_id.starts_with("msg_"));
     assert_eq!(message_id.len(), 4 + 12 + 14);
-    assert!(message_id > "msg_fdb5a96c3001auuSsUN6in29xP");
+    assert!(message_id > persisted_wire_message_id.as_str());
     assert_eq!(receipt.protocol_request_id.as_deref(), Some(message_id));
     assert_eq!(
         prompt.get("parts"),

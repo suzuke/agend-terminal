@@ -32,6 +32,7 @@ const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
 const OPENCODE_MESSAGE_ID_HEX_LEN: usize = 12;
 const OPENCODE_MESSAGE_ID_RANDOM_LEN: usize = 14;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_MASK: u64 = (1_u64 << 48) - 1;
+const OPENCODE_MESSAGE_ID_TIMESTAMP_HALF_RANGE: u64 = 1_u64 << 47;
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -918,15 +919,33 @@ fn next_opencode_message_id_at(
     previous: Option<&str>,
     current_timestamp_ms: u64,
 ) -> anyhow::Result<String> {
-    let mut timestamp =
-        current_timestamp_ms.saturating_mul(0x1000) & OPENCODE_MESSAGE_ID_TIMESTAMP_MASK;
-    if let Some(previous) = previous.and_then(opencode_message_id_timestamp) {
-        timestamp = timestamp.max(
+    let now = current_timestamp_ms.wrapping_mul(0x1000).wrapping_add(1)
+        & OPENCODE_MESSAGE_ID_TIMESTAMP_MASK;
+    let timestamp = match previous.and_then(opencode_message_id_timestamp) {
+        None => now,
+        Some(previous) if previous == OPENCODE_MESSAGE_ID_TIMESTAMP_MASK => {
+            anyhow::bail!(
+                "OpenCode message ID timestamp prefix is exhausted; start a fresh session before sending"
+            );
+        }
+        Some(previous) if now >= previous => now.max(
             previous
                 .saturating_add(1)
                 .min(OPENCODE_MESSAGE_ID_TIMESTAMP_MASK),
-        );
-    }
+        ),
+        Some(previous) if previous - now > OPENCODE_MESSAGE_ID_TIMESTAMP_HALF_RANGE => {
+            anyhow::bail!(
+                "OpenCode message ID timestamp wrapped; start a fresh session before sending"
+            );
+        }
+        Some(previous) => {
+            // A small clock lag must still advance beyond the persisted
+            // request so a restart cannot reuse its wire identity.
+            previous
+                .saturating_add(1)
+                .min(OPENCODE_MESSAGE_ID_TIMESTAMP_MASK)
+        }
+    };
 
     const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut random = [0_u8; OPENCODE_MESSAGE_ID_RANDOM_LEN];
@@ -986,6 +1005,8 @@ pub(crate) struct OpenCodeNativeShared {
     target_confirmed: HashSet<Uuid>,
     events: VecDeque<BackendEvent>,
     stream: Option<SseStream>,
+    #[cfg(test)]
+    message_id_timestamp_ms: Option<u64>,
 }
 
 impl OpenCodeNativeShared {
@@ -1001,6 +1022,8 @@ impl OpenCodeNativeShared {
             target_confirmed: HashSet::new(),
             events: VecDeque::new(),
             stream: None,
+            #[cfg(test)]
+            message_id_timestamp_ms: None,
         }
     }
 
@@ -1020,6 +1043,14 @@ impl OpenCodeNativeShared {
             "--session".to_string(),
             session_id.to_string(),
         ])
+    }
+
+    fn next_message_id(&self, previous: Option<&str>) -> anyhow::Result<String> {
+        #[cfg(test)]
+        if let Some(timestamp_ms) = self.message_id_timestamp_ms {
+            return next_opencode_message_id_at(previous, timestamp_ms);
+        }
+        next_opencode_message_id(previous)
     }
 
     pub(crate) fn deliver_blocking(
@@ -1064,7 +1095,15 @@ impl OpenCodeNativeShared {
         let path = format!("{}/prompt_async", session_path(session_id));
         let previous_wire_message_id =
             store.latest_protocol_request_id_with_prefix(OPENCODE_MESSAGE_ID_PREFIX)?;
-        let wire_message_id = next_opencode_message_id(previous_wire_message_id.as_deref())?;
+        let wire_message_id = match self.next_message_id(previous_wire_message_id.as_deref()) {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
+                failed.detail = Some(error.to_string());
+                store.record(failed)?;
+                return Err(error);
+            }
+        };
         let response = request(locator, "POST", &path, {
             let mut body = json!({
                 "messageID": wire_message_id,
