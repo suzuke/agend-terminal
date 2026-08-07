@@ -362,6 +362,128 @@ fn prompt_async_fails_closed_before_vendor_timestamp_wrap() {
 }
 
 #[test]
+fn prompt_async_scopes_wrap_failure_to_the_current_session() {
+    let home =
+        std::env::temp_dir().join(format!("agend-opencode-session-scope-{}", Uuid::new_v4()));
+    let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
+    let session_a_port = TcpListener::bind(("127.0.0.1", 0))
+        .expect("session A listener")
+        .local_addr()
+        .expect("session A address")
+        .port();
+    let session_a = SessionLocator::opencode(
+        format!("http://127.0.0.1:{session_a_port}"),
+        Some("session-a".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let pre_wrap_user_id =
+        next_opencode_message_id_at(None, before_wrap_ms).expect("pre-wrap user ID");
+    let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+    let pre_wrap_delivery = DeliveryEnvelope::new(
+        "agent",
+        session_a.clone(),
+        DeliveryKind::Prompt,
+        "session A pre-wrap terminal user",
+        None,
+    );
+    store
+        .record_queued(&pre_wrap_delivery)
+        .expect("pre-wrap queued");
+    let mut pre_wrap_receipt =
+        DeliveryReceipt::for_state(&pre_wrap_delivery, DeliveryState::Completed);
+    pre_wrap_receipt.protocol_request_id = Some(pre_wrap_user_id);
+    store.record(pre_wrap_receipt).expect("pre-wrap completed");
+
+    let mut adapter_a = OpenCodeNativeShared::new(&home, "agent");
+    adapter_a.ready = true;
+    adapter_a.locator = Some(session_a.clone());
+    adapter_a.message_id_timestamp_ms = Some(before_wrap_ms + 1);
+    let session_a_delivery = DeliveryEnvelope::new(
+        "agent",
+        session_a,
+        DeliveryKind::Prompt,
+        "session A post-wrap delivery",
+        None,
+    );
+    let error = adapter_a
+        .deliver_blocking(session_a_delivery.clone())
+        .expect_err("session A must fail closed");
+    assert!(error.to_string().contains("timestamp wrapped"));
+    assert_eq!(
+        store
+            .latest(session_a_delivery.delivery_id)
+            .expect("session A receipt")
+            .expect("session A failed receipt")
+            .state,
+        DeliveryState::Failed
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("session B listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let session_b_port = listener.local_addr().expect("session B address").port();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let (_, body) = read_http_request(&stream);
+                    let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
+                    let message_id = prompt
+                        .get("messageID")
+                        .and_then(Value::as_str)
+                        .expect("message ID")
+                        .to_string();
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .expect("prompt response");
+                    return Some(message_id);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("session B listener: {error}"),
+            }
+        }
+    });
+    let session_b = SessionLocator::opencode(
+        format!("http://127.0.0.1:{session_b_port}"),
+        Some("session-b".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let mut adapter_b = OpenCodeNativeShared::new(&home, "agent");
+    adapter_b.ready = true;
+    adapter_b.locator = Some(session_b.clone());
+    adapter_b.message_id_timestamp_ms = Some(before_wrap_ms + 1);
+    let session_b_delivery = DeliveryEnvelope::new(
+        "agent",
+        session_b,
+        DeliveryKind::Prompt,
+        "session B fresh delivery",
+        None,
+    );
+    let receipt = adapter_b
+        .deliver_blocking(session_b_delivery)
+        .expect("fresh session B must deliver");
+    let message_id = server
+        .join()
+        .expect("session B server")
+        .expect("session B prompt");
+    assert_eq!(
+        receipt.protocol_request_id.as_deref(),
+        Some(message_id.as_str())
+    );
+    assert_eq!(opencode_message_id_timestamp(&message_id), Some(1));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn non_2xx_response_diagnostics_are_bounded_and_redacted() {
     let error = response_json(
             HttpResponse {

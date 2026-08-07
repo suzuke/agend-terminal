@@ -1094,7 +1094,7 @@ impl OpenCodeNativeShared {
             .ok_or_else(|| anyhow::anyhow!("OpenCode session id is missing"))?;
         let path = format!("{}/prompt_async", session_path(session_id));
         let previous_wire_message_id =
-            store.latest_protocol_request_id_with_prefix(OPENCODE_MESSAGE_ID_PREFIX)?;
+            store.latest_opencode_protocol_request_id_for_session(session_id)?;
         let wire_message_id = match self.next_message_id(previous_wire_message_id.as_deref()) {
             Ok(message_id) => message_id,
             Err(error) => {
