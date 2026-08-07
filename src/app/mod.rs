@@ -1467,14 +1467,14 @@ fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
                 continue;
             };
             let agent_name = pane.agent_name.clone();
-            flush_notifications_for_pane(home, pane, |text| {
+            flush_notifications_for_pane(home, pane, |notification| {
                 // #982 RC: queue contents come from compose_aware_*
                 // which would have submit-injected on the immediate-
                 // idle path. The flush must preserve that contract or
                 // queued hints (e.g. `[AGEND-MSG-PENDING]`) land in
                 // the prompt buffer without the backend submit_key —
                 // codex one-shots silently drop the wake.
-                crate::inbox::inject_notification_with_submit(home, &agent_name, text)
+                crate::inbox::inject_notification_with_submit(home, &agent_name, notification)
             });
         }
     }
@@ -1494,7 +1494,7 @@ const DRAFT_INPUT_TAIL_ROWS: usize = 8;
 /// raw draft state), plus the badge refresh.
 fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, injector: F)
 where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&crate::notification_queue::QueuedNotification) -> anyhow::Result<()>,
 {
     if pane.pending_notification_count == 0 {
         return;
@@ -2389,8 +2389,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert_eq!(
@@ -2411,8 +2411,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert!(
@@ -2435,8 +2435,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert!(
@@ -2461,8 +2461,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert_eq!(
@@ -2483,8 +2483,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert!(
@@ -2508,8 +2508,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert_eq!(
@@ -2532,8 +2532,8 @@ mod tests {
         p.pending_notification_count = notification_queue::pending_count(&home, "lead");
 
         let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
+        flush_notifications_for_pane(&home, &mut p, |notification| {
+            injected.push(notification.text.clone());
             Ok(())
         });
         assert!(
@@ -2608,8 +2608,8 @@ mod tests {
         notification_queue::enqueue(&home, "agent1", "queued").expect("queue notification");
         pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
         let mut flushed = Vec::new();
-        flush_notifications_for_pane(&home, &mut pane, |text| {
-            flushed.push(text.to_string());
+        flush_notifications_for_pane(&home, &mut pane, |notification| {
+            flushed.push(notification.text.clone());
             Ok(())
         });
         assert_eq!(flushed, vec!["queued".to_string()]);
@@ -2627,8 +2627,8 @@ mod tests {
         pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
 
         let mut flushed = Vec::new();
-        flush_notifications_for_pane(&home, &mut pane, |text| {
-            flushed.push(text.to_string());
+        flush_notifications_for_pane(&home, &mut pane, |notification| {
+            flushed.push(notification.text.clone());
             Ok(())
         });
 

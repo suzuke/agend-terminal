@@ -2012,6 +2012,108 @@ fn typed_inject_never_submits_or_succeeds_without_readback_s1() {
 }
 
 #[test]
+fn typed_inject_abort_returns_unconfirmed_error_variant_3175() {
+    // The readback-abort error must be the RECOVERABLE `PtyWriteUnconfirmed`
+    // variant (payload written but not confirmed rendered) — the delivery
+    // worker keys its requeue-resume on that identity. A plain `PtyWrite`
+    // TimedOut would be indistinguishable from a genuine write failure.
+    let payload = b"AGEND_UNCONFIRMED_VARIANT";
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&bytes),
+    })));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    let err = inject_with_target(&target, payload)
+        .expect_err("a persistently unrendered payload must abort with an error");
+    assert!(
+        matches!(err, crate::error::AgendError::PtyWriteUnconfirmed(_)),
+        "abort must surface the recoverable Unconfirmed variant, got: {err:?}"
+    );
+    assert_eq!(
+        bytes.lock().iter().filter(|&&byte| byte == b'\r').count(),
+        0,
+        "an unconfirmed payload must never be submitted"
+    );
+}
+
+#[test]
+fn resume_typed_inject_completes_already_rendered_draft_3175() {
+    // A prior abort left the payload rendered as a draft in the input area
+    // (the pane settled after the abort). Resume must complete it with the
+    // submit key ONLY — never re-type the payload (would append a duplicate
+    // to the input box and double-deliver the wake).
+    let payload = "AGEND_RESUME_RENDERED_TAIL";
+    let core = readback_test_core(format!("\u{203a} {payload}").as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&bytes),
+    })));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: "\r".to_string(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    resume_typed_inject(&target, payload.as_bytes())
+        .expect("a rendered draft must resume-submit cleanly");
+
+    let written = bytes.lock();
+    let text = String::from_utf8_lossy(&written);
+    assert_eq!(
+        written.iter().filter(|&&byte| byte == b'\r').count(),
+        1,
+        "resume writes the submit key exactly once — got: {text:?}"
+    );
+    assert!(
+        !text.contains(payload),
+        "resume must NOT re-type the payload — got: {text:?}"
+    );
+}
+
+#[test]
+fn resume_typed_inject_writes_nothing_when_still_unrendered_3175() {
+    // Pane still busy — the draft has not rendered yet. Resume must write
+    // NOTHING (no payload rewrite, no blind submit of whatever is in the box)
+    // and report the unconfirmed condition so the caller retries later. This
+    // is what makes the retry loop safe for arbitrarily long generations.
+    let payload = "AGEND_RESUME_NOT_YET_RENDERED";
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&bytes),
+    })));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: "\r".to_string(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    assert!(
+        resume_typed_inject(&target, payload.as_bytes()).is_err(),
+        "an unrendered resume must report unconfirmed for a later retry"
+    );
+    assert!(
+        bytes.lock().is_empty(),
+        "an unrendered resume must write NOTHING — no payload rewrite, no blind submit"
+    );
+}
+
+#[test]
 fn observe_post_submit_detects_screen_change_1912() {
     let core = readback_test_core("\u{203a} before".as_bytes());
     let target = readback_test_target(Arc::clone(&core));

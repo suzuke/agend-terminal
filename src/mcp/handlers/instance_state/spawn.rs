@@ -39,7 +39,7 @@ pub(in crate::mcp::handlers) fn inject_with_routing(
     rt_arcs: Option<&(crate::agent::AgentRegistry, crate::agent::ExternalRegistry)>,
 ) -> Result<(), String> {
     if let Some((reg, ext)) = rt_arcs {
-        crate::agent_ops::inject_input(reg, ext, home, target, data, false)
+        crate::agent_ops::inject_input(reg, ext, home, target, data, false, false)
             .map(|_| ())
             .map_err(|e| e.to_string())
     } else {

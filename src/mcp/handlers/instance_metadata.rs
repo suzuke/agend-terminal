@@ -67,6 +67,7 @@ pub(super) fn handle_interrupt(
         target,
         b"\x1b",
         true,
+        false,
     ) {
         Ok(_) => {
             if let Some(reason) = args["reason"].as_str() {

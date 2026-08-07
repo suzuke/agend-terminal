@@ -11,6 +11,9 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
     let name = params["name"].as_str().unwrap_or("");
     let data = params["data"].as_str().unwrap_or("");
     let raw = params["raw"].as_bool().unwrap_or(false);
+    // #3175: resume=true = complete a previously-aborted typed inject with the
+    // submit key only (payload already buffered; see agent::resume_typed_inject).
+    let resume = params["resume"].as_bool().unwrap_or(false);
     match crate::agent_ops::inject_input(
         ctx.registry,
         ctx.externals,
@@ -18,8 +21,15 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
         name,
         data.as_bytes(),
         raw,
+        resume,
     ) {
         Ok(bytes) => json!({"ok": true, "result": {"bytes": bytes}}),
+        // #3175: the unconfirmed-abort carries a structured `code` so the
+        // delivery worker can distinguish "recoverable — requeue as resume"
+        // from a genuine write failure WITHOUT string-matching the message.
+        Err(crate::agent_ops::InjectError::UnconfirmedWrite(msg)) => {
+            json!({"ok": false, "error": msg, "code": "inject_unconfirmed"})
+        }
         Err(e) => json!({"ok": false, "error": format!("{e}")}),
     }
 }

@@ -2144,6 +2144,12 @@ fn cleanup_agent(
     remove_and_unregister(registry, id);
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
+        // #3176: this agent's pane is being torn down (shell fallback respawn /
+        // shutdown / signal-kill removal) — any unproven stranded typed-inject
+        // draft is destroyed with it. Lift a delivery-worker quarantine so held
+        // wakes stop being blocked; they are re-enqueued fresh and land on the
+        // (re)spawned pane. Harmless when no quarantine is set.
+        crate::daemon::delivery_worker::lift_quarantine(home, name);
     }
 }
 
@@ -2722,10 +2728,14 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
             );
             write_payload()?;
             if !readback_confirm_typed(target, &stripped) {
-                return Err(crate::error::AgendError::PtyWrite(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "typed inject was not rendered after one retry; payload not submitted",
-                )));
+                // #3175: surface the abort as the RECOVERABLE Unconfirmed variant
+                // (payload written, submit withheld) — the delivery worker requeues
+                // it as a resume item instead of dropping the wake. A plain
+                // `PtyWrite` would be indistinguishable from a genuine write failure.
+                return Err(crate::error::AgendError::PtyWriteUnconfirmed(
+                    "typed inject was not rendered after one retry; payload not submitted"
+                        .to_string(),
+                ));
             }
         }
     } else {
@@ -2748,6 +2758,47 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     }
     Ok(())
 }
+
+/// #3175: resume a previously-aborted typed inject (`PtyWriteUnconfirmed`).
+///
+/// A prior attempt already wrote the payload into the PTY input buffer — the
+/// bytes render as an unsent draft once the pane settles. This function NEVER
+/// re-writes the payload (that would append a duplicate to the input box) and
+/// NEVER blind-submits (the box might now hold the operator's own text). It
+/// only waits for the draft to RENDER, then completes it with the submit key.
+///
+/// - Draft rendered → write the submit key once, observe the post-submit screen
+///   change (log-only, #1912), return `Ok`.
+/// - Still unrendered (pane busy / text lost) → `Err(PtyWriteUnconfirmed)` so
+///   the caller can retry later, bounded by its own attempt budget.
+/// - `deleted` → `Ok` no-op (agent gone; nothing to complete).
+///
+/// Short readback window on purpose: this is a "settled yet?" probe — if the
+/// draft hasn't rendered within the window it won't within the full 2s either,
+/// and the caller (delivery worker) retries on its own pacing.
+pub(crate) fn resume_typed_inject(target: &InjectTarget, text: &[u8]) -> crate::error::Result<()> {
+    if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    let stripped = strip_ansi(&String::from_utf8_lossy(text));
+    if !readback_confirm_typed_with(target, &stripped, RESUME_READBACK_TIMEOUT, READBACK_POLL) {
+        return Err(crate::error::AgendError::PtyWriteUnconfirmed(
+            "resume: payload still not rendered; submit withheld".to_string(),
+        ));
+    }
+    tracing::info!(
+        tag = "#3175-resume-confirmed",
+        "resumed typed inject: draft rendered, completing with submit key only"
+    );
+    write_with_timeout(&target.pty_writer, target.submit_key.as_bytes())?;
+    let _submitted = observe_post_submit(target);
+    Ok(())
+}
+
+/// #3175: resume readback window — shorter than the full inject
+/// [`READBACK_TIMEOUT`] because a resume is a "settled yet?" probe, not a
+/// delivery wait; the caller retries on its own pacing when unconfirmed.
+const RESUME_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// #1912: tail-sentinel of a (possibly multi-line) injected payload — the last
 /// run of up to `MAX` chars on the final non-empty line, the line the submit `\r`

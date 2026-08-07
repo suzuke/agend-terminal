@@ -50,18 +50,18 @@ impl PerTickHandler for NotificationFlushHandler {
 /// queued hints must land WITH the backend submit key or one-shot backends
 /// silently drop the wake).
 pub(crate) fn flush_all(home: &Path) {
-    flush_all_with(home, |agent, text| {
-        crate::inbox::notify::inject_notification_with_submit(home, agent, text)
+    flush_all_with(home, |agent, notification| {
+        crate::inbox::notify::inject_notification_with_submit(home, agent, notification)
     });
 }
 
-/// Test-seam variant: `injector` receives `(agent_name, notification_text)`.
+/// Test-seam variant: `injector` receives `(agent_name, notification)`.
 /// The busy/typing/draft GATING lives in the shared core
 /// (`inbox::notify::flush_agent_queue`), so a test driving this entry asserts
 /// exactly what the daemon tick delivers.
 pub(crate) fn flush_all_with<F>(home: &Path, mut injector: F)
 where
-    F: FnMut(&str, &str) -> anyhow::Result<()>,
+    F: FnMut(&str, &crate::notification_queue::QueuedNotification) -> anyhow::Result<()>,
 {
     let Ok(fleet) = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home))
     else {
@@ -79,7 +79,9 @@ where
         }
         // Shared core applies the SAME draft/busy/typing gating + MAX_DEFER
         // caps as the TUI flush; failed injects are requeued for next tick.
-        crate::inbox::notify::flush_agent_queue(home, agent, |text| injector(agent, text));
+        crate::inbox::notify::flush_agent_queue(home, agent, |notification| {
+            injector(agent, notification)
+        });
     }
 }
 
@@ -141,8 +143,9 @@ mod tests {
 
         let delivered: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let d = delivered.clone();
-        flush_all_with(&home, |agent, text| {
-            d.lock().push((agent.to_string(), text.to_string()));
+        flush_all_with(&home, |agent, notification| {
+            d.lock()
+                .push((agent.to_string(), notification.text.clone()));
             Ok(())
         });
 
@@ -271,8 +274,8 @@ mod tests {
 
         let delivered: Arc<Mutex<Vec<String>>> = Arc::default();
         let d = delivered.clone();
-        flush_all_with(&home, |_, text| {
-            d.lock().push(text.to_string());
+        flush_all_with(&home, |_, notification| {
+            d.lock().push(notification.text.clone());
             Ok(())
         });
 

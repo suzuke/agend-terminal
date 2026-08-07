@@ -998,6 +998,7 @@ pub(crate) fn inject_input(
     target: &str,
     data: &[u8],
     raw: bool,
+    resume: bool,
 ) -> Result<usize, InjectError> {
     if let Err(e) = agent::validate_name(target) {
         return Err(InjectError::Validation(e));
@@ -1027,11 +1028,21 @@ pub(crate) fn inject_input(
             }
             let result = if raw {
                 agent::write_to_pty(&tgt.pty_writer, data)
+            } else if resume {
+                // #3175: resume path — the payload was ALREADY written by a
+                // prior attempt (rendering as a draft once the pane settles).
+                // Complete it with the submit key only; NEVER rewrite. Skips
+                // `inject_with_target_gated` entirely (no marker, no #1513 gate,
+                // no payload write).
+                agent::resume_typed_inject(&tgt, data)
             } else {
                 agent::inject_with_target_gated(&tgt, target, data, true, None)
             };
             match result {
                 Ok(()) => Ok(data.len()),
+                Err(crate::error::AgendError::PtyWriteUnconfirmed(msg)) => {
+                    Err(InjectError::UnconfirmedWrite(msg))
+                }
                 Err(e) => Err(InjectError::Write(format!("{e}"))),
             }
         }
@@ -1055,6 +1066,10 @@ pub(crate) enum InjectError {
     External(String),
     NotFound(String),
     Write(String),
+    /// #3175: typed-inject readback-abort — payload written, rendering
+    /// unconfirmed, submit withheld. Recoverable: the delivery worker requeues
+    /// as a resume item. Wire-mapped to the `inject_unconfirmed` response code.
+    UnconfirmedWrite(String),
 }
 
 impl std::fmt::Display for InjectError {
@@ -1064,7 +1079,8 @@ impl std::fmt::Display for InjectError {
             | Self::Unavailable(e)
             | Self::External(e)
             | Self::NotFound(e)
-            | Self::Write(e) => f.write_str(e),
+            | Self::Write(e)
+            | Self::UnconfirmedWrite(e) => f.write_str(e),
         }
     }
 }

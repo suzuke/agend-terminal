@@ -345,7 +345,11 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     // the PTY regardless of an operator DRAFT — only the busy/typing gate above
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
-        let _ = inject_with_submit(home, agent_name, notification);
+        let _ = inject_with_submit(
+            home,
+            agent_name,
+            crate::notification_queue::QueuedNotification::fresh(notification.to_string(), true),
+        );
         // #2044: arm delivery-verification — if this actionable wake is
         // swallowed by an open operator dialog (no UserPromptSubmit follows),
         // the per-tick watchdog re-delivers it once. No-op for non-hook
@@ -354,7 +358,14 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
         return;
     }
     let _ = route_notification(home, agent_name, notification, |msg| {
-        inject_with_submit(home, agent_name, msg)
+        inject_with_submit(
+            home,
+            agent_name,
+            crate::notification_queue::QueuedNotification::fresh(
+                msg.to_string(),
+                notification_is_actionable_wake(msg),
+            ),
+        )
     });
 }
 
@@ -537,7 +548,12 @@ pub(crate) fn renudge_actionable_unread(
 ) {
     let now_field = operator_now_field();
     let pointer = build_renudge_pointer("renudge", kind, "system:ci", pending_count, &now_field);
-    if let Err(e) = inject_with_submit(home, target, &pointer) {
+    let actionable = notification_is_actionable_wake(&pointer);
+    if let Err(e) = inject_with_submit(
+        home,
+        target,
+        crate::notification_queue::QueuedNotification::fresh(pointer, actionable),
+    ) {
         tracing::debug!(%target, error = %e, "renudge_actionable_unread: inject failed");
     }
 }
@@ -560,7 +576,12 @@ pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
         inbox_count,
         &now_field,
     );
-    if let Err(e) = inject_with_submit(home, target, &pointer) {
+    let actionable = notification_is_actionable_wake(&pointer);
+    if let Err(e) = inject_with_submit(
+        home,
+        target,
+        crate::notification_queue::QueuedNotification::fresh(pointer, actionable),
+    ) {
         tracing::debug!(%target, error = %e, "wake_review_assignment: best-effort inject failed");
     }
 }
@@ -677,8 +698,13 @@ pub fn wake_persisted_pointer(
     if wake_capture_push(&pointer) {
         return Ok(());
     }
-    inject_with_submit(home, target, &pointer)
-        .map_err(|e| anyhow::anyhow!("pointer wake dropped: {e}"))
+    let actionable = notification_is_actionable_wake(&pointer);
+    inject_with_submit(
+        home,
+        target,
+        crate::notification_queue::QueuedNotification::fresh(pointer, actionable),
+    )
+    .map_err(|e| anyhow::anyhow!("pointer wake dropped: {e}"))
 }
 
 #[cfg(test)]
@@ -767,13 +793,19 @@ where
 ///
 /// Returns `Ok(())` once the wake is accepted by the bounded queue; `Err` only
 /// when the queue is full (the wake is dropped — the worker module logs a WARN).
-fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
-    if crate::daemon::delivery_worker::enqueue_transport_delivery(home, agent_name, message).is_ok()
+fn inject_with_submit(
+    home: &Path,
+    agent_name: &str,
+    notification: crate::notification_queue::QueuedNotification,
+) -> anyhow::Result<()> {
+    let text = notification.text.clone();
+    if crate::daemon::delivery_worker::enqueue_transport_delivery(home, agent_name, notification)
+        .is_ok()
     {
         return Ok(());
     }
     let reason = "bounded transport delivery queue full; delivery was not attempted";
-    if let Err(error) = crate::transport::record_delivery_drop(home, agent_name, message, reason) {
+    if let Err(error) = crate::transport::record_delivery_drop(home, agent_name, &text, reason) {
         return Err(anyhow::anyhow!(
             "delivery queue full and durable failure receipt failed: {error}"
         ));
@@ -783,31 +815,56 @@ fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::R
     ))
 }
 
+/// #3175: outcome of one physical inject attempt, classified for the delivery
+/// worker's recovery decision.
+#[derive(Debug)]
+pub(crate) enum InjectDeliveryFailure {
+    /// Typed-inject readback-abort: the payload WAS written to the PTY (it
+    /// renders as a draft once the pane settles) but the submit key was
+    /// withheld. RECOVERABLE — requeue as a resume item; never re-type.
+    Unconfirmed(String),
+    /// Any other failure (agent gone, queue full, genuine write error) — the
+    /// wake is dropped, matching pre-#3175 behavior.
+    Other(String),
+}
+
 /// The physical submit-aware inject primitive: a self-IPC `api::call(INJECT)`
 /// loopback that drives the actual PTY write. Runs on the delivery worker thread
 /// (see [`inject_with_submit`]); callers on the tick / main-loop thread MUST go
 /// through the offload wrapper instead of calling this directly.
+///
+/// #3175: carries the whole `QueuedNotification` (resume flag + attempt budget)
+/// and returns a STRUCTURED failure classification keyed on the wire `code` —
+/// never string-matching the error message.
 pub(crate) fn inject_with_submit_direct(
     home: &Path,
     agent_name: &str,
-    message: &str,
-) -> anyhow::Result<()> {
+    notification: &crate::notification_queue::QueuedNotification,
+) -> Result<(), InjectDeliveryFailure> {
     let resp = crate::api::call(
         home,
         &serde_json::json!({
             "method": crate::api::method::INJECT,
-            "params": {"name": agent_name, "data": message}
+            "params": {
+                "name": agent_name,
+                "data": notification.text,
+                "resume": notification.resume,
+            }
         }),
-    )?;
+    )
+    .map_err(|e| InjectDeliveryFailure::Other(format!("inject self-IPC failed: {e}")))?;
     if resp["ok"].as_bool() == Some(true) {
         Ok(())
     } else {
-        anyhow::bail!(
-            "{}",
-            resp["error"]
-                .as_str()
-                .unwrap_or("inject with submit failed")
-        );
+        let message = resp["error"]
+            .as_str()
+            .unwrap_or("inject with submit failed")
+            .to_string();
+        if resp["code"].as_str() == Some("inject_unconfirmed") {
+            Err(InjectDeliveryFailure::Unconfirmed(message))
+        } else {
+            Err(InjectDeliveryFailure::Other(message))
+        }
     }
 }
 
@@ -816,9 +873,9 @@ pub(crate) fn inject_with_submit_direct(
 pub fn inject_notification_with_submit(
     home: &Path,
     agent_name: &str,
-    notification: &str,
+    notification: &crate::notification_queue::QueuedNotification,
 ) -> anyhow::Result<()> {
-    inject_with_submit(home, agent_name, notification)
+    inject_with_submit(home, agent_name, notification.clone())
 }
 
 /// #1513: MAX_DEFER anti-starvation caps — once an item has been deferred this
@@ -868,7 +925,7 @@ pub(crate) fn flush_release(
 /// is mid-keystroke, bounded by the MAX_DEFER anti-starvation caps.
 pub(crate) fn flush_agent_queue<F>(home: &Path, agent_name: &str, injector: F)
 where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&crate::notification_queue::QueuedNotification) -> anyhow::Result<()>,
 {
     // Raw draft state only: the #1944/#1948 input-box probe needs the rendered
     // pane (TUI-owned vterm), so the headless caller conservatively honors the
@@ -890,14 +947,14 @@ pub(crate) fn flush_agent_queue_with_state<F>(
     draft_state: crate::notification_queue::DraftState,
     mut injector: F,
 ) where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&crate::notification_queue::QueuedNotification) -> anyhow::Result<()>,
 {
     use crate::notification_queue::{self, DraftState};
     match draft_state {
         DraftState::Drafting => {}
         DraftState::Abandoned => {
             if let Some(notification) = notification_queue::drain_one(home, agent_name) {
-                if injector(&notification.text).is_err() {
+                if injector(&notification).is_err() {
                     notification_queue::requeue_all(home, agent_name, &[notification]);
                 }
             }
@@ -931,7 +988,7 @@ pub(crate) fn flush_agent_queue_with_state<F>(
                 if inject_failed || !flush_release(&notification, agent_busy, typing_recent, now_ms)
                 {
                     keep.push(notification);
-                } else if injector(&notification.text).is_err() {
+                } else if injector(&notification).is_err() {
                     inject_failed = true;
                     keep.push(notification);
                 }
@@ -975,6 +1032,8 @@ mod flush_release_tests_1513 {
             timestamp: String::new(),
             actionable,
             deferred_since_ms,
+            resume: false,
+            attempts: 0,
         }
     }
 
@@ -1520,7 +1579,11 @@ mod structured_transport_delivery_tests {
         let home = tmp_home("nonblocking");
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         let started = std::time::Instant::now();
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(
+            &home,
+            "codex-agent",
+            &crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false),
+        );
         assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -1556,7 +1619,11 @@ mod structured_transport_delivery_tests {
         });
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         let started = std::time::Instant::now();
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(
+            &home,
+            "codex-agent",
+            &crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false),
+        );
         assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -1572,7 +1639,11 @@ mod structured_transport_delivery_tests {
         let home = tmp_home("queue-full");
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(true);
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(
+            &home,
+            "codex-agent",
+            &crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false),
+        );
         crate::daemon::delivery_worker::test_support::set_force_full(false);
 
         assert!(result.is_err(), "full queue must report a durable drop");

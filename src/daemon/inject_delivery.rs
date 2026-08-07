@@ -115,7 +115,11 @@ pub(crate) fn verify_pass(home: &Path) {
         );
         // Re-inject via the plain submit path — NOT compose_aware_inject — so the
         // re-delivery does not re-arm verification (the latch lives in `Pending`).
-        let _ = crate::inbox::notify::inject_notification_with_submit(home, &agent, &text);
+        let _ = crate::inbox::notify::inject_notification_with_submit(
+            home,
+            &agent,
+            &crate::notification_queue::QueuedNotification::fresh(text, true),
+        );
     }
     for agent in gave_up {
         tracing::warn!(

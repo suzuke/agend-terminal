@@ -10,6 +10,13 @@ pub enum AgendError {
     SpawnFailed(String),
     /// Write to PTY failed.
     PtyWrite(std::io::Error),
+    /// #3175: typed-inject readback-abort — the payload bytes WERE written to
+    /// the PTY (they will render as an unsent draft once the pane settles) but
+    /// rendering was never confirmed, so the submit key was withheld. Distinct
+    /// from [`Self::PtyWrite`]: this is RECOVERABLE by resubmitting the submit
+    /// key later (never by re-typing the payload). The delivery worker keys its
+    /// requeue-resume on this variant.
+    PtyWriteUnconfirmed(String),
     /// Socket connection failed.
     SocketConnect(std::io::Error),
     /// Agent not found in registry.
@@ -27,6 +34,7 @@ impl fmt::Display for AgendError {
         match self {
             Self::SpawnFailed(msg) => write!(f, "spawn failed: {msg}"),
             Self::PtyWrite(e) => write!(f, "PTY write: {e}"),
+            Self::PtyWriteUnconfirmed(msg) => write!(f, "PTY write unconfirmed: {msg}"),
             Self::SocketConnect(e) => write!(f, "socket connect: {e}"),
             Self::AgentNotFound(name) => write!(f, "agent '{name}' not found"),
             Self::ApiError(msg) => write!(f, "API: {msg}"),
