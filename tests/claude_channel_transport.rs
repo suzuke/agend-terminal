@@ -215,6 +215,10 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
     assert_eq!(notification["params"]["content"], "hello from the channel");
     assert_eq!(notification["params"]["meta"]["chat_id"], "chat-42");
     assert_eq!(
+        notification["params"]["meta"]["sender_id"],
+        "telegram:user-7"
+    );
+    assert_eq!(
         notification["params"]["meta"]["delivery_id"],
         delivery_id.to_string()
     );

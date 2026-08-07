@@ -329,7 +329,13 @@ impl ChannelRuntime {
         (receiver, replay)
     }
 
-    fn send_channel_notification(&self, delivery_id: Uuid, chat_id: &str, content: &str) -> bool {
+    fn send_channel_notification(
+        &self,
+        delivery_id: Uuid,
+        chat_id: &str,
+        sender_id: Option<&str>,
+        content: &str,
+    ) -> bool {
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "notifications/claude/channel",
@@ -338,7 +344,7 @@ impl ChannelRuntime {
                 "meta": {
                     "delivery_id": delivery_id.to_string(),
                     "chat_id": chat_id,
-                    "sender_id": "agend-terminal"
+                    "sender_id": sender_id.unwrap_or("agend-terminal")
                 }
             }
         });
@@ -791,7 +797,7 @@ fn handle_http(mut stream: TcpStream, runtime: Arc<ChannelRuntime>) -> anyhow::R
         };
         let sender_id = payload.get("sender_id").and_then(Value::as_str);
         runtime.remember_inbound(delivery_id, chat_id, sender_id, content)?;
-        if !runtime.send_channel_notification(delivery_id, chat_id, content) {
+        if !runtime.send_channel_notification(delivery_id, chat_id, sender_id, content) {
             write_http_response(
                 &mut stream,
                 503,
@@ -848,10 +854,12 @@ pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<
     runtime.set_sender(sender.clone());
     let http_stop = Arc::clone(&stop);
     let http_runtime = Arc::clone(&runtime);
+    // fire-and-forget: retained JoinHandle joins the HTTP listener during bridge shutdown.
     let http_join = thread::Builder::new()
         .name("claude-channel-http".to_string())
         .spawn(move || run_http_listener(listener, http_runtime, http_stop))?;
 
+    // fire-and-forget: retained JoinHandle joins the MCP writer during bridge shutdown.
     let writer_join = thread::Builder::new()
         .name("claude-channel-mcp-writer".to_string())
         .spawn(move || {

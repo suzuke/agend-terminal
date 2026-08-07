@@ -518,7 +518,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  legacy-agent:\n    backend: claude\n",
+            "instances:\n  legacy-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
         )
         .expect("fleet");
         dispatch(DeliveryJob::TransportDelivery {
@@ -547,7 +547,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  legacy-agent:\n    backend: claude\n",
+            "instances:\n  legacy-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
         )
         .expect("fleet");
 
@@ -602,7 +602,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  legacy-agent:\n    backend: claude\n",
+            "instances:\n  legacy-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
         )
         .expect("fleet");
 
