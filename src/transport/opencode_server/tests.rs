@@ -252,13 +252,15 @@ fn opencode_message_id_roundtrips_only_the_prefixed_wire_identity() {
         delivery_id_from_opencode_message_id(&delivery_id.to_string()),
         None
     );
-    assert!(contains_delivery_id(
+    assert!(contains_delivery_target(
         &json!({"info": {"id": wire_id}}),
-        delivery_id
+        delivery_id,
+        None
     ));
-    assert!(!contains_delivery_id(
+    assert!(!contains_delivery_target(
         &json!({"info": {"id": opencode_message_id(Uuid::new_v4())}}),
-        delivery_id
+        delivery_id,
+        None
     ));
 }
 
@@ -608,8 +610,7 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
     let port = listener.local_addr().expect("address").port();
     let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
     let delivery_id = Uuid::nil();
-    let wire_message_id = opencode_message_id(delivery_id);
-    let expected_wire_message_id = wire_message_id.clone();
+    let event_message_id = opencode_message_id(delivery_id);
     let server = thread::spawn(move || {
         for _ in 0..4 {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -631,7 +632,7 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
                     .expect("event headers");
                 let events = [
                     json!({"type": "server.connected"}),
-                    json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": wire_message_id}}}),
+                    json!({"type": "message.updated", "properties": {"sessionID": "session-1", "info": {"id": event_message_id}}}),
                     json!({"type": "session.status", "properties": {"sessionID": "session-1", "status": {"type": "busy"}}}),
                     json!({"type": "session.idle", "properties": {"sessionID": "session-1"}}),
                 ];
@@ -648,7 +649,8 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
                     .get("messageID")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if !message_id.starts_with("msg_") || message_id <= "msg_fdb5a96c3001auuSsUN6in29xP" {
+                if !message_id.starts_with("msg_") || message_id <= "msg_fdb5a96c3001auuSsUN6in29xP"
+                {
                     json_response(
                         &mut stream,
                         "400 Bad Request",
@@ -684,20 +686,22 @@ fn prompt_async_wire_and_sse_stream_share_one_session() {
     let receipt = adapter.deliver_blocking(envelope).expect("prompt");
     assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
     assert_eq!(receipt.delivery_id, delivery_id);
-    assert_eq!(
-        receipt.protocol_request_id.as_deref(),
-        Some(expected_wire_message_id.as_str())
-    );
     let (header, body) = prompt_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("prompt request");
     assert!(header.contains("Authorization: Basic "));
+    let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
+    let message_id = prompt
+        .get("messageID")
+        .and_then(Value::as_str)
+        .expect("wire message id");
+    assert!(message_id.starts_with("msg_"));
+    assert_eq!(message_id.len(), 4 + 12 + 14);
+    assert!(message_id > "msg_fdb5a96c3001auuSsUN6in29xP");
+    assert_eq!(receipt.protocol_request_id.as_deref(), Some(message_id));
     assert_eq!(
-        serde_json::from_slice::<Value>(&body).expect("prompt json"),
-        json!({
-            "messageID": expected_wire_message_id,
-            "parts": [{"type": "text", "text": "hello\n世界"}],
-        })
+        prompt.get("parts"),
+        Some(&json!([{"type": "text", "text": "hello\n世界"}]))
     );
     assert!(matches!(
         adapter.next_event_blocking().expect("connected"),

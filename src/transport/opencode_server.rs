@@ -20,7 +20,7 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +29,9 @@ const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_ERROR_DETAIL: usize = 2048;
 const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
+const OPENCODE_MESSAGE_ID_HEX_LEN: usize = 12;
+const OPENCODE_MESSAGE_ID_RANDOM_LEN: usize = 14;
+const OPENCODE_MESSAGE_ID_TIMESTAMP_MASK: u64 = (1_u64 << 48) - 1;
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -892,6 +895,44 @@ fn opencode_message_id(delivery_id: Uuid) -> String {
     format!("{OPENCODE_MESSAGE_ID_PREFIX}{}", delivery_id.simple())
 }
 
+fn current_opencode_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn opencode_message_id_timestamp(value: &str) -> Option<u64> {
+    let value = value.strip_prefix(OPENCODE_MESSAGE_ID_PREFIX)?;
+    if value.len() < OPENCODE_MESSAGE_ID_HEX_LEN {
+        return None;
+    }
+    u64::from_str_radix(value.get(..OPENCODE_MESSAGE_ID_HEX_LEN)?, 16).ok()
+}
+
+fn next_opencode_message_id(previous: Option<&str>) -> anyhow::Result<String> {
+    let mut timestamp =
+        current_opencode_timestamp().saturating_mul(0x1000) & OPENCODE_MESSAGE_ID_TIMESTAMP_MASK;
+    if let Some(previous) = previous.and_then(opencode_message_id_timestamp) {
+        timestamp = timestamp.max(
+            previous
+                .saturating_add(1)
+                .min(OPENCODE_MESSAGE_ID_TIMESTAMP_MASK),
+        );
+    }
+
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut random = [0_u8; OPENCODE_MESSAGE_ID_RANDOM_LEN];
+    getrandom::fill(&mut random)?;
+    let random = random
+        .into_iter()
+        .map(|byte| BASE62[(byte as usize) % BASE62.len()] as char)
+        .collect::<String>();
+    Ok(format!(
+        "{OPENCODE_MESSAGE_ID_PREFIX}{timestamp:012x}{random}"
+    ))
+}
+
 fn delivery_id_from_opencode_message_id(value: &str) -> Option<Uuid> {
     value
         .strip_prefix(OPENCODE_MESSAGE_ID_PREFIX)
@@ -905,18 +946,22 @@ fn is_delivery_message_id(value: &str, delivery_id: Uuid) -> bool {
         || value == delivery_id.to_string()
 }
 
-fn contains_delivery_id(value: &Value, delivery_id: Uuid) -> bool {
+fn contains_delivery_target(
+    value: &Value,
+    delivery_id: Uuid,
+    protocol_request_id: Option<&str>,
+) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, child)| {
             (matches!(key.as_str(), "id" | "messageID" | "clientUserMessageId")
-                && child
-                    .as_str()
-                    .is_some_and(|value| is_delivery_message_id(value, delivery_id)))
-                || contains_delivery_id(child, delivery_id)
+                && child.as_str().is_some_and(|value| {
+                    protocol_request_id == Some(value) || is_delivery_message_id(value, delivery_id)
+                }))
+                || contains_delivery_target(child, delivery_id, protocol_request_id)
         }),
         Value::Array(values) => values
             .iter()
-            .any(|child| contains_delivery_id(child, delivery_id)),
+            .any(|child| contains_delivery_target(child, delivery_id, protocol_request_id)),
         _ => false,
     }
 }
@@ -1010,7 +1055,9 @@ impl OpenCodeNativeShared {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("OpenCode session id is missing"))?;
         let path = format!("{}/prompt_async", session_path(session_id));
-        let wire_message_id = opencode_message_id(envelope.delivery_id);
+        let previous_wire_message_id =
+            store.latest_protocol_request_id_with_prefix(OPENCODE_MESSAGE_ID_PREFIX)?;
+        let wire_message_id = next_opencode_message_id(previous_wire_message_id.as_deref())?;
         let response = request(locator, "POST", &path, {
             let mut body = json!({
                 "messageID": wire_message_id,
@@ -1138,10 +1185,11 @@ impl OpenCodeNativeShared {
                 .cmp(&right.created_at)
                 .then_with(|| left.delivery_id.cmp(&right.delivery_id))
         });
-        let Some((envelope, _receipt)) = pending.into_iter().next() else {
+        let Some((envelope, receipt)) = pending.into_iter().next() else {
             return Ok(());
         };
         let delivery_id = envelope.delivery_id;
+        let protocol_request_id = receipt.protocol_request_id.clone();
         self.pending.insert(delivery_id, envelope);
         self.in_flight = Some(delivery_id);
 
@@ -1177,7 +1225,7 @@ impl OpenCodeNativeShared {
                 )
             }
         };
-        if !contains_delivery_id(&history, delivery_id) {
+        if !contains_delivery_target(&history, delivery_id, protocol_request_id.as_deref()) {
             return self.mark_ambiguous_and_clear(
                 delivery_id,
                 "OpenCode restored delivery is absent from session history",
@@ -1356,6 +1404,10 @@ impl OpenCodeNativeShared {
     fn event_delivery_id(&self, value: &Value) -> Option<Uuid> {
         let target = self.in_flight?;
         let target_text = target.to_string();
+        let protocol_request_id = ReceiptStore::for_instance(&self.home, &self.instance)
+            .ok()
+            .and_then(|store| store.latest(target).ok().flatten())
+            .and_then(|receipt| receipt.protocol_request_id);
         let id = value
             .pointer("/properties/info/id")
             .and_then(Value::as_str)
@@ -1379,7 +1431,8 @@ impl OpenCodeNativeShared {
                     .pointer("/properties/messageID")
                     .and_then(Value::as_str)
             });
-        if id.and_then(delivery_id_from_opencode_message_id) == Some(target)
+        if id.is_some() && protocol_request_id.as_deref() == id
+            || id.and_then(delivery_id_from_opencode_message_id) == Some(target)
             || id == Some(target_text.as_str())
         {
             Some(target)
@@ -1587,7 +1640,11 @@ impl OpenCodeNativeShared {
             &format!("{}/message?limit=100", session_path(session_id)),
             Value::Null,
         )?;
-        if !contains_delivery_id(&response_json(history, "session history")?, delivery_id) {
+        if !contains_delivery_target(
+            &response_json(history, "session history")?,
+            delivery_id,
+            previous.protocol_request_id.as_deref(),
+        ) {
             self.mark_ambiguous_and_clear(
                 delivery_id,
                 "OpenCode receipt is not present in session history; retry requires operator reconciliation",

@@ -167,6 +167,36 @@ impl ReceiptStore {
             .collect())
     }
 
+    pub(crate) fn latest_protocol_request_id_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        restrict_permissions(&self.path, 0o600)?;
+        let file = File::open(&self.path)?;
+        let mut latest = None;
+        for line in BufReader::new(file).lines() {
+            let record: DurableRecord = serde_json::from_str(&line?)?;
+            let Some(request_id) = record.receipt.protocol_request_id.as_deref() else {
+                continue;
+            };
+            if !request_id.starts_with(prefix) {
+                continue;
+            }
+            if latest
+                .as_deref()
+                .is_none_or(|current: &str| request_id > current)
+            {
+                latest = Some(request_id.to_string());
+            }
+        }
+        Ok(latest)
+    }
+
     fn append(&self, record: DurableRecord) -> anyhow::Result<()> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
