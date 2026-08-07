@@ -14,7 +14,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,6 +32,7 @@ const BRIDGE_VERSION: &str = "0.1.0";
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PATH: &str = "/webhook";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,9 +323,25 @@ impl ChannelRuntime {
         self.replies.lock().get(&delivery_id).cloned()
     }
 
-    fn subscribe(&self) -> (Receiver<ReplyEvent>, Vec<ReplyEvent>) {
+    fn subscribe(&self, after_reply_id: Option<&str>) -> (Receiver<ReplyEvent>, Vec<ReplyEvent>) {
         let (sender, receiver) = mpsc::channel();
-        let replay = self.replies.lock().values().cloned().collect();
+        let replies = self.replies.lock();
+        let mut replay: Vec<_> = replies.values().cloned().collect();
+        replay.sort_by(|left, right| {
+            left.recorded_at
+                .cmp(&right.recorded_at)
+                .then_with(|| left.reply_id.cmp(&right.reply_id))
+        });
+        if let Some(after_reply_id) = after_reply_id {
+            if let Some(position) = replay
+                .iter()
+                .position(|event| event.reply_id == after_reply_id)
+            {
+                replay.drain(..=position);
+            }
+        }
+        // Keep the reply and subscriber locks in the same order as
+        // remember_reply so a reply cannot land between replay and subscribe.
         self.subscribers.lock().push(sender);
         (receiver, replay)
     }
@@ -408,7 +425,7 @@ fn mcp_initialize(message: &Value, runtime: &ChannelRuntime) -> Value {
                 "tools": {}
             },
             "serverInfo": {"name": CHANNEL_SERVER_NAME, "version": BRIDGE_VERSION},
-            "instructions": "Messages arrive as <channel source=\"agend-terminal\" chat_id=\"...\" delivery_id=\"...\">. Reply with the reply tool using the same chat_id and delivery_id."
+            "instructions": "Messages arrive as <channel source=\"agend-terminal\" chat_id=\"...\" delivery_id=\"...\">. Each delivery has a unique chat_id; reply with the reply tool using the same chat_id and delivery_id."
         }
     })
 }
@@ -675,28 +692,20 @@ fn handle_http(mut stream: TcpStream, runtime: Arc<ChannelRuntime>) -> anyhow::R
         return Ok(());
     }
     if request.method == "GET" && request.path == "/events" {
-        let (receiver, replay) = runtime.subscribe();
+        let cursor = request.headers.get("last-event-id").map(String::as_str);
+        let (receiver, replay) = runtime.subscribe(cursor);
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n: connected\n\n"
         )?;
         for event in replay {
-            write!(
-                stream,
-                "event: reply\ndata: {}\n\n",
-                serde_json::to_string(&event)?
-            )?;
+            write_sse_event(&mut stream, &event)?;
         }
         stream.flush()?;
         loop {
             match receiver.recv_timeout(Duration::from_secs(15)) {
                 Ok(event) => {
-                    write!(
-                        stream,
-                        "event: reply\ndata: {}\n\n",
-                        serde_json::to_string(&event)?
-                    )?;
-                    stream.flush()?;
+                    write_sse_event(&mut stream, &event)?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     stream.write_all(b": keepalive\n\n")?;
@@ -820,6 +829,17 @@ fn handle_http(mut stream: TcpStream, runtime: Arc<ChannelRuntime>) -> anyhow::R
         "application/json",
         br#"{"error":"not_found"}"#,
     )?;
+    Ok(())
+}
+
+fn write_sse_event(stream: &mut TcpStream, event: &ReplyEvent) -> anyhow::Result<()> {
+    write!(
+        stream,
+        "id: {}\nevent: reply\ndata: {}\n\n",
+        event.reply_id,
+        serde_json::to_string(event)?
+    )?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -1092,15 +1112,18 @@ struct SseStream {
 }
 
 impl SseStream {
-    fn connect(locator: &SessionLocator) -> anyhow::Result<Self> {
+    fn connect(locator: &SessionLocator, last_event_id: Option<&str>) -> anyhow::Result<Self> {
         let address = endpoint_address(locator)?;
         let mut stream = TcpStream::connect_timeout(&address.parse()?, HTTP_TIMEOUT)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(SSE_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
         let token = token(locator)?;
+        let cursor = last_event_id
+            .map(|value| format!("Last-Event-ID: {value}\r\n"))
+            .unwrap_or_default();
         write!(
             stream,
-            "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+            "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n{cursor}\r\n"
         )?;
         stream.flush()?;
         let mut reader = BufReader::new(stream);
@@ -1164,19 +1187,34 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
     let home = home.to_path_buf();
     let instance = instance.to_string();
     let locator = locator.clone();
+    let mut last_event_id = None::<String>;
+    let mut seen_reply_ids = HashSet::new();
     // fire-and-forget: this resident listener owns reconnect/reconciliation for the daemon lifetime; cleanup stops and joins it.
     let join = thread::Builder::new()
         .name("claude-channel-events".to_string())
         .spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
-                match SseStream::connect(&locator) {
+                match SseStream::connect(&locator, last_event_id.as_deref()) {
                     Ok(mut stream) => loop {
                         if thread_stop.load(Ordering::Acquire) {
                             return;
                         }
                         match stream.next() {
                             Ok(Some(event)) => {
-                                let _ = complete_receipt(&home, &instance, &event);
+                                if seen_reply_ids.contains(&event.reply_id) {
+                                    // This event was reconciled successfully on an
+                                    // earlier connection; it is safe to advance
+                                    // past the duplicate replay.
+                                    last_event_id = Some(event.reply_id);
+                                } else if complete_receipt(&home, &instance, &event).is_ok() {
+                                    // Advance the cursor only after receipt
+                                    // persistence succeeds. A failed write must
+                                    // be replayed after reconnect.
+                                    seen_reply_ids.insert(event.reply_id.clone());
+                                    last_event_id = Some(event.reply_id);
+                                } else {
+                                    break;
+                                }
                             }
                             Ok(None) | Err(_) => break,
                         }
@@ -1235,10 +1273,7 @@ pub(crate) fn deliver_resident(
         store.record(receipt)?;
         anyhow::bail!("Claude ChannelBridge capability probe failed closed");
     }
-    let chat_id = envelope
-        .correlation_id
-        .clone()
-        .unwrap_or_else(|| format!("agend:{}", envelope.instance));
+    let chat_id = chat_id_for_delivery(&envelope.instance, envelope.delivery_id);
     let payload = json!({
         "delivery_id": envelope.delivery_id,
         "chat_id": chat_id,
@@ -1291,6 +1326,10 @@ pub(crate) fn deliver_resident(
     Ok(receipt)
 }
 
+fn chat_id_for_delivery(instance: &str, delivery_id: Uuid) -> String {
+    format!("agend:{instance}:{delivery_id}")
+}
+
 #[async_trait::async_trait]
 impl AgentDeliveryTransport for ClaudeChannelBridge {
     fn mode(&self) -> TransportMode {
@@ -1311,7 +1350,7 @@ impl AgentDeliveryTransport for ClaudeChannelBridge {
 
     async fn next_event(&mut self) -> anyhow::Result<BackendEvent> {
         let locator = self.locator()?;
-        let mut stream = SseStream::connect(&locator)?;
+        let mut stream = SseStream::connect(&locator, None)?;
         match stream.next()? {
             Some(event) => Ok(BackendEvent::Completed {
                 delivery_id: event.delivery_id,
@@ -1618,6 +1657,27 @@ mod tests {
         )
         .expect("tool response");
         assert_eq!(response["error"]["code"], -32602);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn concurrent_deliveries_keep_distinct_chat_correlations() {
+        let home = home("two-in-flight");
+        let locator = prepare_claude_channel(&home, "claude-agent").expect("locator");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let first_chat = chat_id_for_delivery("claude-agent", first);
+        let second_chat = chat_id_for_delivery("claude-agent", second);
+        assert_ne!(first_chat, second_chat);
+        runtime
+            .remember_inbound(first, &first_chat, None, "first")
+            .expect("first inbound");
+        runtime
+            .remember_inbound(second, &second_chat, None, "second")
+            .expect("second inbound");
+        assert_eq!(runtime.delivery_for_chat(&first_chat), Some(first));
+        assert_eq!(runtime.delivery_for_chat(&second_chat), Some(second));
         let _ = fs::remove_dir_all(home);
     }
 }

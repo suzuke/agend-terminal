@@ -449,6 +449,10 @@ impl Backend {
                 // default-cursor for that prompt not yet captured.
                 dismiss_patterns: &[
                     DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels",
+                        sequence: b"\r",
+                    },
+                    DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
                         sequence: b"\r",
                     },
@@ -903,12 +907,7 @@ impl Backend {
                     .and_then(|servers| servers.get("agend-claude-channel").cloned())
                     .is_some()
                 {
-                    // Claude Channels are a research-preview capability. The
-                    // development-channel flag is deliberately emitted only
-                    // when this workspace explicitly contains our bridge.
                     out.extend([
-                        "--channels".to_string(),
-                        "server:agend-claude-channel".to_string(),
                         "--dangerously-load-development-channels".to_string(),
                         "server:agend-claude-channel".to_string(),
                     ]);
@@ -2335,9 +2334,7 @@ mod tests {
         )
         .unwrap();
         let flags = Backend::ClaudeCode.spawn_flags(&dir);
-        assert!(flags.windows(2).any(|window| {
-            window[0] == "--channels" && window[1] == "server:agend-claude-channel"
-        }));
+        assert!(!flags.iter().any(|flag| flag == "--channels"));
         assert!(flags.windows(2).any(|window| {
             window[0] == "--dangerously-load-development-channels"
                 && window[1] == "server:agend-claude-channel"

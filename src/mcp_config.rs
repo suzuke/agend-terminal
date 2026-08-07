@@ -180,7 +180,7 @@ fn upsert_mcp_server(path: &Path, server_name: &str, server: serde_json::Value) 
     Ok(())
 }
 
-/// Claude Code: .claude/settings.local.json + mcp-config.json
+/// Claude Code: .claude/settings.local.json + project `.mcp.json` + mcp-config.json
 fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
     let git_dir = working_dir.join(".git");
@@ -215,6 +215,7 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
 
     // Write standalone mcp-config.json for --mcp-config flag
     let standalone = working_dir.join("mcp-config.json");
+    let project_mcp = working_dir.join(".mcp.json");
     upsert_mcp_servers(&standalone, instance_name)?;
     if let Some(instance_name) = instance_name {
         let home = PathBuf::from(home_path());
@@ -222,10 +223,12 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
             // An explicit LegacyPty instance must not advertise a structured
             // channel to Claude; this keeps the fallback visible and opt-in.
             remove_mcp_server(&standalone, "agend-claude-channel")?;
+            remove_mcp_server(&project_mcp, "agend-claude-channel")?;
         } else {
             let channel =
                 crate::transport::claude_channel::channel_server_entry(&home, instance_name)?;
-            upsert_mcp_server(&standalone, "agend-claude-channel", channel)?;
+            upsert_mcp_server(&standalone, "agend-claude-channel", channel.clone())?;
+            upsert_mcp_server(&project_mcp, "agend-claude-channel", channel)?;
         }
     }
 
@@ -1447,6 +1450,12 @@ mod tests {
         assert_eq!(server["args"][1], "--instance");
         assert_eq!(server["args"][2], "agent-channel");
         assert_eq!(server["env"]["AGEND_INSTANCE_NAME"], json!("agent-channel"));
+        let project: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(
+            project["mcpServers"]["agend-claude-channel"]["args"][2],
+            "agent-channel"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

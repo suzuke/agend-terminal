@@ -340,6 +340,70 @@ mod tests {
         Arc::new(Mutex::new(Box::new(Vec::<u8>::new())))
     }
 
+    #[derive(Clone)]
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn claude_development_channel_modal_matches_and_sends_one_enter() {
+        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|pattern| (pattern.label.to_string(), pattern.sequence.to_vec()))
+            .collect();
+        // Exact text captured from Claude Code v2.1.224 after starting with
+        // --dangerously-load-development-channels server:agend-claude-channel.
+        let screen = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels:   server:agend-claude-channel
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+";
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+            bytes: Arc::clone(&written),
+        })));
+
+        assert!(try_dismiss_dialog(
+            "claude-development-channel-modal",
+            screen,
+            &writer,
+            &patterns
+        ));
+
+        for _ in 0..20 {
+            if written.lock().as_slice() == b"\r" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(written.lock().as_slice(), b"\r");
+    }
+
     /// A PTY writer whose `write` BLOCKS — simulates a backend that stopped
     /// draining its input (the exact #2160/H13 wedge). Bounded at 60s (>> the 5s
     /// `PTY_WRITE_TIMEOUT`) so the timeout fires first while the helper thread +
@@ -512,7 +576,7 @@ No, cancel                   n";
     /// Production dismiss regex for Claude's workspace-trust prompt (#996
     /// Phase 1). Modern Claude (v2.1.145+) defaults cursor to "Yes, I trust",
     /// so the keystroke shipped is single Enter `\r` — see
-    /// `Backend::ClaudeCode.preset().dismiss_patterns[0]`.
+    /// `Backend::ClaudeCode.preset().dismiss_patterns`.
     const CLAUDE_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust";
 
     /// `(regex, keystrokes)` pair for `try_dismiss_dialog` — `Down` then

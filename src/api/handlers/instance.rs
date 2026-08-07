@@ -326,9 +326,21 @@ mod tests {
     }
 
     fn cleanup_agent(ctx: &HandlerCtx, name: &str) {
-        let reg = agent::lock_registry(ctx.registry);
-        if let Some(h) = reg.values().find(|h| h.name.as_str() == name) {
-            let _ = h.child.lock().kill();
+        // The test fleet UUID can differ from the UUID stamped on the live
+        // handle; remove by the authoritative in-memory name so later tests
+        // cannot observe a stale registry entry on slower Windows teardown.
+        let id = {
+            let reg = agent::lock_registry(ctx.registry);
+            reg.iter()
+                .find(|(_, h)| h.name.as_str() == name)
+                .map(|(id, _)| *id)
+        };
+        if let Some(id) = id {
+            let mut reg = agent::lock_registry(ctx.registry);
+            if let Some(h) = reg.get(&id) {
+                let _ = h.child.lock().kill();
+            }
+            reg.remove(&id);
         }
     }
 

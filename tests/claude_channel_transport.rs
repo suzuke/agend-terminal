@@ -12,9 +12,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+const BRIDGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agend-terminal"))
@@ -30,7 +33,14 @@ fn temporary_home() -> PathBuf {
     home
 }
 
-fn spawn_bridge(home: &Path) -> (Child, ChildStdin, BufReader<std::process::ChildStdout>) {
+fn spawn_bridge(
+    home: &Path,
+) -> (
+    Child,
+    ChildStdin,
+    BufReader<std::process::ChildStdout>,
+    Arc<Mutex<Vec<u8>>>,
+) {
     let mut child = Command::new(binary())
         .arg("channel-bridge")
         .arg("--instance")
@@ -38,12 +48,23 @@ fn spawn_bridge(home: &Path) -> (Child, ChildStdin, BufReader<std::process::Chil
         .env("AGEND_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn Claude ChannelBridge");
     let stdin = child.stdin.take().unwrap();
     let stdout = BufReader::new(child.stdout.take().unwrap());
-    (child, stdin, stdout)
+    let stderr = child.stderr.take().unwrap();
+    let stderr_capture = Arc::new(Mutex::new(Vec::new()));
+    let stderr_capture_thread = Arc::clone(&stderr_capture);
+    // Test-only diagnostics reader; the child is stopped and joined by the
+    // fixture, so this short-lived reader has no production lifecycle.
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut captured = Vec::new();
+        let _ = reader.read_to_end(&mut captured);
+        *stderr_capture_thread.lock().unwrap() = captured;
+    });
+    (child, stdin, stdout, stderr_capture)
 }
 
 fn read_locator(home: &Path) -> Option<(String, String)> {
@@ -58,16 +79,28 @@ fn read_locator(home: &Path) -> Option<(String, String)> {
     ))
 }
 
-fn wait_for_locator(home: &Path) -> (String, String) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn wait_for_locator(
+    home: &Path,
+    child: &mut Child,
+    stderr_capture: &Arc<Mutex<Vec<u8>>>,
+) -> (String, String) {
+    // The fixture can start while the CI nextest profile is compiling or
+    // running many binaries; allow process startup headroom while retaining a
+    // bounded failure with child status and stderr below.
+    let deadline = Instant::now() + BRIDGE_STARTUP_TIMEOUT;
     loop {
         if let Some(locator) = read_locator(home) {
             return locator;
         }
-        assert!(
-            Instant::now() < deadline,
-            "Claude locator was not persisted"
-        );
+        if Instant::now() >= deadline {
+            let status = child
+                .try_wait()
+                .map(|status| format!("{status:?}"))
+                .unwrap_or_else(|error| format!("try_wait error: {error}"));
+            let stderr_bytes = stderr_capture.lock().unwrap().clone();
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            panic!("Claude locator was not persisted; child status={status}; stderr={stderr:?}");
+        }
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -129,7 +162,7 @@ fn http_request(
 }
 
 fn wait_for_health(endpoint: &str, token: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + BRIDGE_STARTUP_TIMEOUT;
     loop {
         if let Ok(mut stream) = TcpStream::connect(endpoint.strip_prefix("http://").unwrap()) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
@@ -155,6 +188,53 @@ fn wait_for_health(endpoint: &str, token: &str) -> Value {
     }
 }
 
+fn open_sse(endpoint: &str, token: &str, last_event_id: Option<&str>) -> BufReader<TcpStream> {
+    let address = endpoint.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let cursor = last_event_id
+        .map(|value| format!("Last-Event-ID: {value}\r\n"))
+        .unwrap_or_default();
+    write!(
+        stream,
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n{cursor}\r\n"
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    assert!(status.contains(" 200 "), "SSE must return 200: {status:?}");
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).unwrap();
+        if header == "\r\n" || header == "\n" {
+            break;
+        }
+    }
+    reader
+}
+
+fn read_sse_event(reader: &mut BufReader<TcpStream>) -> Value {
+    let mut data = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "SSE stream closed before an event");
+        if line == "\n" || line == "\r\n" {
+            if !data.is_empty() {
+                return serde_json::from_str(data.trim()).unwrap();
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push_str(value.trim_start());
+        }
+    }
+}
+
 fn stop(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -163,8 +243,8 @@ fn stop(mut child: Child) {
 #[test]
 fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() {
     let home = temporary_home();
-    let (child, mut stdin, mut stdout) = spawn_bridge(&home);
-    let (endpoint, token) = wait_for_locator(&home);
+    let (mut child, mut stdin, mut stdout, stderr_capture) = spawn_bridge(&home);
+    let (endpoint, token) = wait_for_locator(&home, &mut child, &stderr_capture);
 
     write_mcp(
         &mut stdin,
@@ -223,6 +303,8 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
         delivery_id.to_string()
     );
 
+    let mut events = open_sse(&endpoint, &token, None);
+
     write_mcp(
         &mut stdin,
         &json!({
@@ -245,6 +327,56 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
         reply["result"]["structuredContent"]["delivery_id"],
         delivery_id.to_string()
     );
+    let first_event = read_sse_event(&mut events);
+    assert_eq!(first_event["delivery_id"], delivery_id.to_string());
+    let first_reply_id = first_event["reply_id"].as_str().unwrap().to_string();
+    drop(events);
+
+    let second_delivery_id = Uuid::new_v4();
+    let (status, accepted) = http_request(
+        &endpoint,
+        &token,
+        "POST",
+        "/webhook",
+        &serde_json::to_vec(&json!({
+            "delivery_id": second_delivery_id,
+            "chat_id": "chat-43",
+            "sender_id": "telegram:user-8",
+            "text": "second channel delivery"
+        }))
+        .unwrap(),
+    );
+    assert_eq!(status, 202, "second webhook must be accepted: {accepted}");
+    let second_notification = read_mcp(&mut stdout);
+    assert_eq!(
+        second_notification["params"]["meta"]["delivery_id"],
+        second_delivery_id.to_string()
+    );
+
+    let mut resumed_events = open_sse(&endpoint, &token, Some(&first_reply_id));
+    write_mcp(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params": {
+                "name":"reply",
+                "arguments": {
+                    "chat_id":"chat-43",
+                    "delivery_id":second_delivery_id,
+                    "text":"second reply from Claude"
+                }
+            }
+        }),
+    );
+    let second_reply = read_mcp(&mut stdout);
+    assert_eq!(second_reply["result"]["content"][0]["text"], "sent");
+    let second_event = read_sse_event(&mut resumed_events);
+    assert_eq!(second_event["delivery_id"], second_delivery_id.to_string());
+    assert_ne!(second_event["delivery_id"], first_event["delivery_id"]);
+    drop(resumed_events);
+
     let (status, receipt) = http_request(
         &endpoint,
         &token,
@@ -259,8 +391,8 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
     drop(stdin);
     let persisted_locator = read_locator(&home).unwrap();
 
-    let (child, mut stdin, mut stdout) = spawn_bridge(&home);
-    let restarted_locator = wait_for_locator(&home);
+    let (mut child, mut stdin, mut stdout, stderr_capture) = spawn_bridge(&home);
+    let restarted_locator = wait_for_locator(&home, &mut child, &stderr_capture);
     assert_eq!(restarted_locator, persisted_locator);
     write_mcp(
         &mut stdin,
