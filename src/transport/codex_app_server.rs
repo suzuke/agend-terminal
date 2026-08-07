@@ -896,10 +896,20 @@ fn read_websocket_frame(
 
 #[cfg(unix)]
 fn drain_server_output<R: Read>(reader: R, stream: &'static str) {
-    for line in std::io::BufReader::new(reader)
-        .lines()
-        .map_while(Result::ok)
-    {
+    let mut reader = std::io::BufReader::new(reader);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(stream, %error, "Codex app-server output drain failed");
+                break;
+            }
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end_matches(['\r', '\n']);
         if stream == "stderr" {
             tracing::warn!(stream, %line, "Codex app-server output");
         } else {
