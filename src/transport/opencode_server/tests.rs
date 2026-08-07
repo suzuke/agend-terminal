@@ -265,6 +265,25 @@ fn opencode_message_id_roundtrips_only_the_prefixed_wire_identity() {
 }
 
 #[test]
+fn opencode_message_ids_are_monotonic_when_clock_does_not_advance() {
+    let now_ms = 1_786_091_572_000;
+    let first = next_opencode_message_id_at(None, now_ms).expect("first message id");
+    let second = next_opencode_message_id_at(Some(&first), now_ms).expect("second message id");
+
+    for value in [&first, &second] {
+        assert!(value.starts_with("msg_"));
+        assert_eq!(value.len(), 4 + 12 + 14);
+        assert!(value[4..16].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(value[16..].bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
+    assert!(
+        second[4..16] > first[4..16],
+        "timestamp prefix must advance"
+    );
+    assert!(second > first, "same-clock IDs must be strictly ordered");
+}
+
+#[test]
 fn non_2xx_response_diagnostics_are_bounded_and_redacted() {
     let error = response_json(
             HttpResponse {

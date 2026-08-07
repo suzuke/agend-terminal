@@ -488,4 +488,75 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(home);
     }
+
+    #[test]
+    fn protocol_request_id_survives_terminal_compaction_and_reload() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-protocol-id-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        let body_padding = "x".repeat(120_000);
+        for index in 0..40 {
+            let envelope = DeliveryEnvelope::new(
+                "agent",
+                SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+                DeliveryKind::Prompt,
+                format!("filler-{index}-{body_padding}"),
+                None,
+            );
+            store.record_queued(&envelope).expect("filler queued");
+            store
+                .record(DeliveryReceipt::for_state(
+                    &envelope,
+                    DeliveryState::Completed,
+                ))
+                .expect("filler completed");
+        }
+
+        let target = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            format!("target-{body_padding}"),
+            None,
+        );
+        let protocol_request_id = "msg_fdb5a96c3001auuSsUN6in29xP".to_string();
+        store.record_queued(&target).expect("target queued");
+        let mut accepted = DeliveryReceipt::for_state(&target, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(protocol_request_id.clone());
+        store.record(accepted).expect("target accepted");
+        let mut completed = DeliveryReceipt::for_state(&target, DeliveryState::Completed);
+        completed.protocol_request_id = Some(protocol_request_id.clone());
+        store.record(completed).expect("target completed");
+
+        let tail = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            format!("tail-{body_padding}"),
+            None,
+        );
+        store.record_queued(&tail).expect("tail queued");
+        store
+            .record(DeliveryReceipt::for_state(&tail, DeliveryState::Completed))
+            .expect("tail completed");
+
+        let reloaded = ReceiptStore::for_instance(&home, "agent").expect("reload store");
+        assert_eq!(
+            reloaded
+                .latest(target.delivery_id)
+                .expect("latest target")
+                .expect("target receipt")
+                .state,
+            DeliveryState::Completed
+        );
+        assert_eq!(
+            reloaded
+                .latest_protocol_request_id_with_prefix("msg_")
+                .expect("latest protocol request id"),
+            Some(protocol_request_id)
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
 }

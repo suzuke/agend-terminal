@@ -911,8 +911,15 @@ fn opencode_message_id_timestamp(value: &str) -> Option<u64> {
 }
 
 fn next_opencode_message_id(previous: Option<&str>) -> anyhow::Result<String> {
+    next_opencode_message_id_at(previous, current_opencode_timestamp())
+}
+
+fn next_opencode_message_id_at(
+    previous: Option<&str>,
+    current_timestamp_ms: u64,
+) -> anyhow::Result<String> {
     let mut timestamp =
-        current_opencode_timestamp().saturating_mul(0x1000) & OPENCODE_MESSAGE_ID_TIMESTAMP_MASK;
+        current_timestamp_ms.saturating_mul(0x1000) & OPENCODE_MESSAGE_ID_TIMESTAMP_MASK;
     if let Some(previous) = previous.and_then(opencode_message_id_timestamp) {
         timestamp = timestamp.max(
             previous
