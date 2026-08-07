@@ -1614,8 +1614,13 @@ mod tests {
         let port = listener.local_addr().expect("health address").port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("health request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("health request read");
+                assert!(read > 0, "health request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
             let body = json!({
                 "ready": true,
                 "session_id": "wrong-session",
@@ -1639,10 +1644,11 @@ mod tests {
         locator.managed = true;
         locator.server_pid = Some(std::process::id());
         locator.server_start_token = crate::process::process_start_token(std::process::id());
-        assert!(health_probe(&locator)
-            .expect_err("mismatched session must fail closed")
-            .to_string()
-            .contains("session identity mismatch"));
+        let error = health_probe(&locator).expect_err("mismatched session must fail closed");
+        assert!(
+            error.to_string().contains("session identity mismatch"),
+            "unexpected health probe error: {error:#}"
+        );
         server.join().expect("health server");
     }
 
