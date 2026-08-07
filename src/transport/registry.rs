@@ -1,3 +1,4 @@
+use super::claude_channel;
 use super::codex_app_server::CodexNativeShared;
 use super::envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 use super::legacy_pty::{LegacyPty, PtyInjector};
@@ -24,12 +25,10 @@ pub(crate) fn backend_for_instance(home: &Path, instance: &str) -> Option<Backen
 pub(crate) fn mode_for_backend(backend: &Backend) -> TransportMode {
     match backend {
         Backend::Codex | Backend::OpenCode => TransportMode::NativeShared,
-        Backend::ClaudeCode
-        | Backend::Grok
-        | Backend::KiroCli
-        | Backend::Agy
-        | Backend::Shell
-        | Backend::Raw(_) => TransportMode::LegacyPty,
+        Backend::ClaudeCode => TransportMode::ChannelBridge,
+        Backend::Grok | Backend::KiroCli | Backend::Agy | Backend::Shell | Backend::Raw(_) => {
+            TransportMode::LegacyPty
+        }
     }
 }
 
@@ -37,7 +36,13 @@ pub(crate) fn mode_for_instance(home: &Path, instance: &str) -> TransportMode {
     if persisted_native_shared_hint(home, instance) {
         return TransportMode::NativeShared;
     }
-    backend_for_instance(home, instance)
+    let backend = backend_for_instance(home, instance);
+    if backend.as_ref() == Some(&Backend::ClaudeCode)
+        && claude_channel::legacy_pty_opt_in(home, instance)
+    {
+        return TransportMode::LegacyPty;
+    }
+    backend
         .as_ref()
         .map(mode_for_backend)
         .unwrap_or(TransportMode::LegacyPty)
@@ -421,9 +426,17 @@ where
             let mut adapter = LegacyPty::new(home, instance, injector);
             adapter.deliver_blocking(envelope)
         }
-        TransportMode::ChannelBridge
-        | TransportMode::ManagedHeadless
-        | TransportMode::ManualRequired => Err(anyhow::anyhow!(
+        TransportMode::ChannelBridge => {
+            if envelope.session.backend == "claude" {
+                super::claude_channel::deliver_resident(home, instance, envelope)
+            } else {
+                Err(anyhow::anyhow!(
+                    "ChannelBridge backend {:?} has no registered adapter",
+                    envelope.session.backend
+                ))
+            }
+        }
+        TransportMode::ManagedHeadless | TransportMode::ManualRequired => Err(anyhow::anyhow!(
             "transport mode {mode:?} has no adapter in this implementation"
         )),
     }

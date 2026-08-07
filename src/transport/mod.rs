@@ -4,6 +4,7 @@
 //! is selected before delivery and failures in a structured adapter are
 //! terminal for that adapter; they never silently become a PTY write.
 
+mod claude_channel;
 mod codex_app_server;
 mod envelope;
 mod legacy_pty;
@@ -16,7 +17,7 @@ pub(crate) use receipt::{
     delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, ReceiptStore,
 };
 #[cfg(test)]
-pub(crate) use registry::mode_for_backend;
+pub(crate) use registry::{mode_for_backend, mode_for_instance};
 
 pub(crate) use registry::{deliver_notification, record_delivery_drop};
 
