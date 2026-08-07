@@ -24,7 +24,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::io::Read;
+use std::io::{BufRead, Read};
 
 #[cfg(unix)]
 const CODEX_PROTOCOL: &str = "v2";
@@ -242,8 +242,34 @@ impl CodexNativeShared {
             command
                 .args(["app-server", "--listen", &locator.remote_attach_arg()])
                 .current_dir(cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .process_group(0);
             let mut child = command.spawn()?;
+            if let Some(stdout) = child.stdout.take() {
+                // fire-and-forget: drain the managed server stream so it cannot
+                // block or write through the TUI owner's terminal; exits at EOF.
+                if let Err(error) = std::thread::Builder::new()
+                    .name("codex-app-server-out".to_string())
+                    .spawn(move || drain_server_output(stdout, "stdout"))
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
+            }
+            if let Some(stderr) = child.stderr.take() {
+                // fire-and-forget: drain the managed server stream into tracing;
+                // TUI mode routes tracing to app.log rather than the terminal.
+                if let Err(error) = std::thread::Builder::new()
+                    .name("codex-app-server-err".to_string())
+                    .spawn(move || drain_server_output(stderr, "stderr"))
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
+            }
             let started = wait_for_socket(endpoint, &mut child)?;
             if !started {
                 let _ = child.kill();
@@ -866,6 +892,20 @@ fn read_websocket_frame(
         }
     }
     Ok((opcode, payload))
+}
+
+#[cfg(unix)]
+fn drain_server_output<R: Read>(reader: R, stream: &'static str) {
+    for line in std::io::BufReader::new(reader)
+        .lines()
+        .map_while(Result::ok)
+    {
+        if stream == "stderr" {
+            tracing::warn!(stream, %line, "Codex app-server output");
+        } else {
+            tracing::debug!(stream, %line, "Codex app-server output");
+        }
+    }
 }
 
 #[cfg(unix)]
