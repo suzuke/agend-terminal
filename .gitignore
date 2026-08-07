@@ -25,6 +25,7 @@ claude-settings.json
 statusline.json
 statusline.sh
 mcp-config.json
+.mcp.json
 *.json.lock
 .agend-managed
 

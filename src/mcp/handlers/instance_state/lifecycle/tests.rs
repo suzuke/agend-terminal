@@ -798,6 +798,46 @@ fn full_delete_fleet_load_ambiguity_preserves_workspace_2764_slice10a() {
     std::fs::remove_dir_all(home).ok();
 }
 
+#[test]
+fn full_delete_claude_removes_only_managed_project_mcp_server() {
+    let home = tmp_home("claude_project_mcp_delete");
+    let working_dir = tmp_home("claude_project_mcp_workspace");
+    std::fs::write(
+        working_dir.join(".mcp.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "custom": "preserved",
+            "mcpServers": {
+                "operator-server": {"command": "operator-tool"},
+                "agend-claude-channel": {"command": "stale-bridge"}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n",
+            working_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(result.is_ok(), "Claude delete should complete: {result:?}");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(working_dir.join(".mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(value["custom"], "preserved");
+    assert_eq!(
+        value["mcpServers"]["operator-server"]["command"],
+        "operator-tool"
+    );
+    assert!(value["mcpServers"].get("agend-claude-channel").is_none());
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(working_dir).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn full_delete_candidate_canonicalization_ambiguity_preserves_and_errors_2764_slice10a() {

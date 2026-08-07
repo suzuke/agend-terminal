@@ -252,6 +252,20 @@ fn remove_mcp_server(path: &Path, server_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove only AgEnD's Claude ChannelBridge entry from project-local config.
+/// User-owned MCP servers and top-level settings remain untouched on instance
+/// deletion, including when the workspace itself is operator-owned.
+pub(crate) fn remove_claude_channel_config(working_dir: &Path) -> Result<()> {
+    remove_mcp_server(
+        &working_dir.join("mcp-config.json"),
+        crate::transport::claude_channel::CHANNEL_SERVER_NAME,
+    )?;
+    remove_mcp_server(
+        &working_dir.join(".mcp.json"),
+        crate::transport::claude_channel::CHANNEL_SERVER_NAME,
+    )
+}
+
 /// #hook-state-poc: upsert observe-only lifecycle-hook reporters into the
 /// per-workspace Claude settings. Merge-preserving at three levels: other
 /// top-level keys, other hook EVENTS, and other (user/project) hook entries
@@ -1456,6 +1470,34 @@ mod tests {
             project["mcpServers"]["agend-claude-channel"]["args"][2],
             "agent-channel"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_claude_channel_preserves_unrelated_project_servers() {
+        let dir = tmp_dir("claude_channel_delete");
+        let project = dir.join(".mcp.json");
+        std::fs::write(
+            &project,
+            serde_json::to_vec_pretty(&json!({
+                "custom": "preserved",
+                "mcpServers": {
+                    "operator-server": {"command": "operator-tool"},
+                    "agend-claude-channel": {"command": "stale-bridge"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        remove_claude_channel_config(&dir).expect("remove managed channel");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(project).unwrap()).unwrap();
+        assert_eq!(value["custom"], "preserved");
+        assert_eq!(
+            value["mcpServers"]["operator-server"]["command"],
+            "operator-tool"
+        );
+        assert!(value["mcpServers"].get("agend-claude-channel").is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

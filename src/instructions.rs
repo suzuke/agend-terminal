@@ -55,6 +55,7 @@ pub fn resolve_extra_for(
 const AGEND_GITIGNORE: &str = "\
 # agend-managed runtime artifacts
 mcp-config.json
+.mcp.json
 .claude/settings.local.json
 ";
 
@@ -1059,6 +1060,7 @@ mod tests {
         assert!(dir.join(".git").exists(), "missing .git after init");
         let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(ignore.contains("mcp-config.json"));
+        assert!(ignore.contains(".mcp.json"));
         assert!(ignore.contains(".claude/settings.local.json"));
         std::fs::remove_dir_all(&dir).ok();
     }

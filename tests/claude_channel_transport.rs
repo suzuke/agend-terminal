@@ -19,6 +19,13 @@ use uuid::Uuid;
 
 const BRIDGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TestLocator {
+    endpoint: String,
+    token: String,
+    session_id: String,
+}
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agend-terminal"))
 }
@@ -67,30 +74,34 @@ fn spawn_bridge(
     (child, stdin, stdout, stderr_capture)
 }
 
-fn read_locator(home: &Path) -> Option<(String, String)> {
+fn read_locator(home: &Path) -> Option<TestLocator> {
     let path = home
         .join("transport")
         .join("sessions")
         .join("claude-agent.json");
     let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    Some((
-        value["endpoint_url"].as_str()?.to_string(),
-        value["password"].as_str()?.to_string(),
-    ))
+    Some(TestLocator {
+        endpoint: value["endpoint_url"].as_str()?.to_string(),
+        token: value["password"].as_str()?.to_string(),
+        session_id: value["session_id"].as_str()?.to_string(),
+    })
 }
 
 fn wait_for_locator(
     home: &Path,
+    previous: Option<&TestLocator>,
     child: &mut Child,
     stderr_capture: &Arc<Mutex<Vec<u8>>>,
-) -> (String, String) {
+) -> TestLocator {
     // The fixture can start while the CI nextest profile is compiling or
     // running many binaries; allow process startup headroom while retaining a
     // bounded failure with child status and stderr below.
     let deadline = Instant::now() + BRIDGE_STARTUP_TIMEOUT;
     loop {
         if let Some(locator) = read_locator(home) {
-            return locator;
+            if previous != Some(&locator) {
+                return locator;
+            }
         }
         if Instant::now() >= deadline {
             let status = child
@@ -244,7 +255,9 @@ fn stop(mut child: Child) {
 fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() {
     let home = temporary_home();
     let (mut child, mut stdin, mut stdout, stderr_capture) = spawn_bridge(&home);
-    let (endpoint, token) = wait_for_locator(&home, &mut child, &stderr_capture);
+    let locator = wait_for_locator(&home, None, &mut child, &stderr_capture);
+    let endpoint = locator.endpoint.as_str();
+    let token = locator.token.as_str();
 
     write_mcp(
         &mut stdin,
@@ -269,14 +282,14 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
         &mut stdin,
         &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
     );
-    let health = wait_for_health(&endpoint, &token);
+    let health = wait_for_health(endpoint, token);
     assert_eq!(health["ready"], true);
     assert_eq!(health["capabilities"]["claude/channel"], true);
 
     let delivery_id = Uuid::new_v4();
     let (status, accepted) = http_request(
-        &endpoint,
-        &token,
+        endpoint,
+        token,
         "POST",
         "/webhook",
         &serde_json::to_vec(&json!({
@@ -303,7 +316,7 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
         delivery_id.to_string()
     );
 
-    let mut events = open_sse(&endpoint, &token, None);
+    let mut events = open_sse(endpoint, token, None);
 
     write_mcp(
         &mut stdin,
@@ -334,8 +347,8 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
 
     let second_delivery_id = Uuid::new_v4();
     let (status, accepted) = http_request(
-        &endpoint,
-        &token,
+        endpoint,
+        token,
         "POST",
         "/webhook",
         &serde_json::to_vec(&json!({
@@ -353,7 +366,7 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
         second_delivery_id.to_string()
     );
 
-    let mut resumed_events = open_sse(&endpoint, &token, Some(&first_reply_id));
+    let mut resumed_events = open_sse(endpoint, token, Some(&first_reply_id));
     write_mcp(
         &mut stdin,
         &json!({
@@ -378,8 +391,8 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
     drop(resumed_events);
 
     let (status, receipt) = http_request(
-        &endpoint,
-        &token,
+        endpoint,
+        token,
         "GET",
         &format!("/receipts/{delivery_id}"),
         &[],
@@ -392,8 +405,11 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
     let persisted_locator = read_locator(&home).unwrap();
 
     let (mut child, mut stdin, mut stdout, stderr_capture) = spawn_bridge(&home);
-    let restarted_locator = wait_for_locator(&home, &mut child, &stderr_capture);
-    assert_eq!(restarted_locator, persisted_locator);
+    let restarted_locator =
+        wait_for_locator(&home, Some(&persisted_locator), &mut child, &stderr_capture);
+    assert_ne!(restarted_locator, persisted_locator);
+    assert_ne!(restarted_locator.token, persisted_locator.token);
+    assert_ne!(restarted_locator.session_id, persisted_locator.session_id);
     write_mcp(
         &mut stdin,
         &json!({
@@ -405,8 +421,8 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
     );
     let _ = read_mcp(&mut stdout);
     let (status, receipt) = http_request(
-        &restarted_locator.0,
-        &restarted_locator.1,
+        &restarted_locator.endpoint,
+        &restarted_locator.token,
         "GET",
         &format!("/receipts/{delivery_id}"),
         &[],

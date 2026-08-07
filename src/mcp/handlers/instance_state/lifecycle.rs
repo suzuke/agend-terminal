@@ -124,6 +124,10 @@ pub(crate) fn full_delete_instance_with_runtime(
     // leaked mark would make it un-spawnable for the daemon's lifetime.
     let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
+    let is_claude = fleet
+        .as_ref()
+        .and_then(|config| config.resolve_instance(name))
+        .is_some_and(|resolved| resolved.backend == crate::backend::Backend::ClaudeCode);
     let topic_id = fleet
         .as_ref()
         .and_then(|c| c.resolve_instance(name).and_then(|r| r.topic_id));
@@ -201,6 +205,11 @@ pub(crate) fn full_delete_instance_with_runtime(
     // corrupt/unreadable identity, or a lock-acquire failure) preserves the
     // foreign tree; surface it as a step error so the delete reports failure
     // instead of a false success while B's directory is (correctly) left intact.
+    if is_claude {
+        if let Err(error) = crate::mcp_config::remove_claude_channel_config(&working_dir) {
+            step_errors.push(format!("Claude ChannelBridge config cleanup: {error}"));
+        }
+    }
     if let Some(reason) = cleanup_working_dir_admitted(home, name, &working_dir, &cleanup_admission)
     {
         step_errors.push(format!("working_dir cleanup refused: {reason}"));

@@ -859,15 +859,19 @@ fn run_http_listener(listener: TcpListener, runtime: Arc<ChannelRuntime>, stop: 
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => break,
+            Err(error) => {
+                tracing::error!(%error, "Claude ChannelBridge listener failed; terminating owner");
+                // The PID/start-token is the credential gate. If the listener
+                // cannot accept, terminate the owner so that gate cannot
+                // bless a live process with no owned endpoint.
+                std::process::exit(1);
+            }
         }
     }
 }
 
 pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<()> {
-    let locator = prepare_claude_channel(home, instance)?;
-    let address = endpoint_address(&locator)?;
-    let listener = TcpListener::bind(&address)?;
+    let (locator, listener) = bind_and_publish_channel(home, instance)?;
     let runtime = Arc::new(ChannelRuntime::new(home, instance, &locator)?);
     let stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel::<Value>(64);
@@ -927,19 +931,57 @@ pub(crate) fn prepare_claude_channel(
     home: &Path,
     instance: &str,
 ) -> anyhow::Result<SessionLocator> {
-    if let Some(locator) = super::registry::claude_attach_locator(home, instance)? {
-        return Ok(locator);
+    let locator = super::registry::claude_attach_locator(home, instance)?.ok_or_else(|| {
+        anyhow::anyhow!("Claude ChannelBridge locator has not been published by a live bridge")
+    })?;
+    ensure_claude_bridge_owned(&locator)?;
+    Ok(locator)
+}
+
+fn ensure_claude_bridge_owned(locator: &SessionLocator) -> anyhow::Result<()> {
+    if locator.backend != "claude" {
+        anyhow::bail!(
+            "Claude ChannelBridge locator belongs to backend {}",
+            locator.backend
+        );
     }
+    let (Some(pid), Some(start_token)) = (locator.server_pid, locator.server_start_token) else {
+        anyhow::bail!("Claude ChannelBridge locator has no live bridge identity");
+    };
+    if crate::process::process_start_token(pid) != Some(start_token) {
+        anyhow::bail!("Claude ChannelBridge locator is not owned by a live bridge");
+    }
+    Ok(())
+}
+
+fn bind_and_publish_channel(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<(SessionLocator, TcpListener)> {
+    // Inspect the old artifact only to reject a foreign backend. The new
+    // listener is always the source of truth; a rotated token/session makes
+    // reusing a now-free numeric port safe, and avoids allocator-dependent
+    // retry loops.
+    let _ = super::registry::claude_attach_locator(home, instance)?;
+    let pid = std::process::id();
+    let start_token = crate::process::process_start_token(pid)
+        .ok_or_else(|| anyhow::anyhow!("Claude ChannelBridge process identity is unavailable"))?;
+
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
-    drop(listener);
-    let locator = SessionLocator::claude(
+    let mut locator = SessionLocator::claude(
         format!("http://127.0.0.1:{port}"),
         format!("claude-{}", Uuid::new_v4()),
         random_token()?,
     );
+    locator.managed = true;
+    locator.server_pid = Some(pid);
+    locator.server_start_token = Some(start_token);
+    // The listener remains open while secure_atomic_write atomically
+    // publishes this exact endpoint, so a port squatter cannot win the
+    // bind/persist gap that existed in the old probe-then-drop flow.
     super::registry::save_session_locator(home, instance, &locator)?;
-    Ok(locator)
+    Ok((locator, listener))
 }
 
 pub(crate) fn channel_server_entry(home: &Path, instance: &str) -> anyhow::Result<Value> {
@@ -969,6 +1011,7 @@ fn client_request(
     body: &[u8],
     accept: &str,
 ) -> anyhow::Result<HttpResponse> {
+    ensure_claude_bridge_owned(locator)?;
     let address = endpoint_address(locator)?;
     let mut stream = TcpStream::connect_timeout(&address.parse()?, HTTP_TIMEOUT)?;
     stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
@@ -1041,6 +1084,14 @@ fn health_probe(locator: &SessionLocator) -> anyhow::Result<TransportCapability>
         );
     }
     let value: Value = serde_json::from_slice(&response.body)?;
+    let expected_session = locator
+        .session_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Claude ChannelBridge session identity is missing"))?;
+    let observed_session = value.get("session_id").and_then(Value::as_str);
+    if observed_session != Some(expected_session) {
+        anyhow::bail!("Claude ChannelBridge session identity mismatch");
+    }
     let version = value
         .get("backend_version")
         .and_then(Value::as_str)
@@ -1113,6 +1164,7 @@ struct SseStream {
 
 impl SseStream {
     fn connect(locator: &SessionLocator, last_event_id: Option<&str>) -> anyhow::Result<Self> {
+        ensure_claude_bridge_owned(locator)?;
         let address = endpoint_address(locator)?;
         let mut stream = TcpStream::connect_timeout(&address.parse()?, HTTP_TIMEOUT)?;
         stream.set_read_timeout(Some(SSE_READ_TIMEOUT))?;
@@ -1165,6 +1217,7 @@ impl SseStream {
 struct EventWorker {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    locator: SessionLocator,
 }
 
 fn event_workers() -> &'static Mutex<HashMap<String, EventWorker>> {
@@ -1179,14 +1232,23 @@ fn worker_key(home: &Path, instance: &str) -> String {
 fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
     let key = worker_key(home, instance);
     let mut workers = event_workers().lock();
-    if workers.contains_key(&key) {
-        return;
+    if let Some(existing) = workers.get(&key) {
+        if existing.locator == *locator {
+            return;
+        }
+    }
+    if let Some(mut existing) = workers.remove(&key) {
+        existing.stop.store(true, Ordering::Release);
+        if let Some(join) = existing.join.take() {
+            let _ = join.join();
+        }
     }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let home = home.to_path_buf();
     let instance = instance.to_string();
     let locator = locator.clone();
+    let worker_locator = locator.clone();
     let mut last_event_id = None::<String>;
     let mut seen_reply_ids = HashSet::new();
     // fire-and-forget: this resident listener owns reconnect/reconciliation for the daemon lifetime; cleanup stops and joins it.
@@ -1194,7 +1256,7 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
         .name("claude-channel-events".to_string())
         .spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
-                match SseStream::connect(&locator, last_event_id.as_deref()) {
+                match SseStream::connect(&worker_locator, last_event_id.as_deref()) {
                     Ok(mut stream) => loop {
                         if thread_stop.load(Ordering::Acquire) {
                             return;
@@ -1229,6 +1291,7 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
         EventWorker {
             stop,
             join: Some(join),
+            locator: locator.clone(),
         },
     );
 }
@@ -1431,6 +1494,20 @@ mod tests {
         home
     }
 
+    fn test_published_locator(home: &Path, instance: &str) -> SessionLocator {
+        let mut locator = SessionLocator::claude(
+            "http://127.0.0.1:43123".to_string(),
+            "claude-test-session".to_string(),
+            "test-token".to_string(),
+        );
+        locator.managed = true;
+        locator.server_pid = Some(std::process::id());
+        locator.server_start_token = crate::process::process_start_token(std::process::id());
+        super::super::registry::save_session_locator(home, instance, &locator)
+            .expect("published test locator");
+        locator
+    }
+
     #[test]
     fn claude_uses_channel_bridge_by_default() {
         assert_eq!(
@@ -1457,12 +1534,28 @@ mod tests {
     #[test]
     fn channel_locator_persists_across_daemon_restart() {
         let home = home("locator");
-        let first = prepare_claude_channel(&home, "claude-agent").expect("initial locator");
-        let second = prepare_claude_channel(&home, "claude-agent").expect("restart locator");
-        assert_eq!(
-            first, second,
-            "restart must reuse endpoint, token, and session"
+        let (first, first_listener) =
+            bind_and_publish_channel(&home, "claude-agent").expect("initial bridge");
+        assert!(first.managed);
+        assert!(
+            TcpListener::bind(endpoint_address(&first).expect("first endpoint")).is_err(),
+            "the published endpoint must remain owned by the bridge"
         );
+        assert_eq!(
+            prepare_claude_channel(&home, "claude-agent").expect("first published locator"),
+            first
+        );
+        drop(first_listener);
+        let (second, second_listener) =
+            bind_and_publish_channel(&home, "claude-agent").expect("restart bridge");
+        assert!(second.managed);
+        assert_ne!(second.password, first.password);
+        assert_ne!(second.session_id, first.session_id);
+        assert_eq!(
+            prepare_claude_channel(&home, "claude-agent").expect("second published locator"),
+            second
+        );
+        drop(second_listener);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -1490,9 +1583,73 @@ mod tests {
     }
 
     #[test]
+    fn stale_locator_rejects_port_squatter_without_sending_bearer() {
+        let home = home("port-squatter");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("squatter listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking squatter listener");
+        let port = listener.local_addr().expect("squatter address").port();
+        let mut stale = SessionLocator::claude(
+            format!("http://127.0.0.1:{port}"),
+            "stale-session".to_string(),
+            "SUPER-SECRET-BEARER".to_string(),
+        );
+        stale.server_pid = Some(0);
+        stale.server_start_token = Some(1);
+        super::super::registry::save_session_locator(&home, "claude-agent", &stale)
+            .expect("stale locator");
+
+        assert!(prepare_claude_channel(&home, "claude-agent").is_err());
+        assert!(client_request(&stale, "GET", "/health", &[], "application/json").is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn health_probe_rejects_mismatched_session_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("health listener");
+        let port = listener.local_addr().expect("health address").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = json!({
+                "ready": true,
+                "session_id": "wrong-session",
+                "backend_version": "2.1.89",
+                "capabilities": {"claude/channel": true, "tools": true}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("health response");
+        });
+        let mut locator = SessionLocator::claude(
+            format!("http://127.0.0.1:{port}"),
+            "expected-session".to_string(),
+            "health-token".to_string(),
+        );
+        locator.managed = true;
+        locator.server_pid = Some(std::process::id());
+        locator.server_start_token = crate::process::process_start_token(std::process::id());
+        assert!(health_probe(&locator)
+            .expect_err("mismatched session must fail closed")
+            .to_string()
+            .contains("session identity mismatch"));
+        server.join().expect("health server");
+    }
+
+    #[test]
     fn persisted_claude_locator_keeps_channel_mode() {
         let home = home("mode");
-        let locator = prepare_claude_channel(&home, "claude-agent").expect("locator");
+        let locator = test_published_locator(&home, "claude-agent");
         fs::write(
             crate::fleet::fleet_yaml_path(&home),
             "instances:\n  claude-agent:\n    backend: claude\n",
@@ -1529,6 +1686,7 @@ mod tests {
                                 "200 OK",
                                 json!({
                                     "ready": true,
+                                    "session_id": "claude-registry-session",
                                     "backend_version": "2.1.89",
                                     "capabilities": {"claude/channel": true, "tools": true}
                                 })
@@ -1552,11 +1710,14 @@ mod tests {
                 }
             }
         });
-        let locator = SessionLocator::claude(
+        let mut locator = SessionLocator::claude(
             format!("http://127.0.0.1:{port}"),
             "claude-registry-session".to_string(),
             "registry-token".to_string(),
         );
+        locator.managed = true;
+        locator.server_pid = Some(std::process::id());
+        locator.server_start_token = crate::process::process_start_token(std::process::id());
         super::super::registry::save_session_locator(&home, "claude-agent", &locator)
             .expect("locator");
         fs::write(
@@ -1622,7 +1783,7 @@ mod tests {
     #[test]
     fn channel_initialize_rejects_old_or_missing_client_version() {
         let home = home("version");
-        let locator = prepare_claude_channel(&home, "claude-agent").expect("locator");
+        let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
         let missing = mcp_initialize(&json!({"jsonrpc":"2.0","id":1,"params":{}}), &runtime);
         assert_eq!(missing["error"]["code"], -32001);
@@ -1637,7 +1798,7 @@ mod tests {
     #[test]
     fn reply_requires_delivery_and_chat_correlation() {
         let home = home("correlation");
-        let locator = prepare_claude_channel(&home, "claude-agent").expect("locator");
+        let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
         let response = mcp_message(
             json!({
@@ -1663,7 +1824,7 @@ mod tests {
     #[test]
     fn concurrent_deliveries_keep_distinct_chat_correlations() {
         let home = home("two-in-flight");
-        let locator = prepare_claude_channel(&home, "claude-agent").expect("locator");
+        let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -1678,6 +1839,30 @@ mod tests {
             .expect("second inbound");
         assert_eq!(runtime.delivery_for_chat(&first_chat), Some(first));
         assert_eq!(runtime.delivery_for_chat(&second_chat), Some(second));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn event_worker_switches_to_a_restarted_bridge_locator() {
+        let home = home("event-worker-restart");
+        let first = test_published_locator(&home, "claude-agent");
+        let mut second = first.clone();
+        second.endpoint_url = Some("http://127.0.0.1:43124".to_string());
+        second.session_id = Some("claude-restarted-session".to_string());
+        second.password = Some("restarted-token".to_string());
+
+        ensure_event_worker(&home, "claude-agent", &first);
+        ensure_event_worker(&home, "claude-agent", &second);
+        let key = worker_key(&home, "claude-agent");
+        assert_eq!(
+            event_workers()
+                .lock()
+                .get(&key)
+                .expect("restarted event worker")
+                .locator,
+            second
+        );
+        stop_instance_state(&home, "claude-agent");
         let _ = fs::remove_dir_all(home);
     }
 }

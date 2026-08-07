@@ -33,9 +33,22 @@
 | 進程環境 | `AGEND_HOME`, `AGEND_POINTER_ONLY_INJECT`, `AGEND_CAPTURE_FIXTURES` | 操作員 / 啟動器 | 啟動時讀取 |
 | Fleet 主設定 | `$AGEND_HOME/fleet.yaml` | 操作員 + daemon | 啟動 / 重新載入時 |
 | 執行期設定 | `$AGEND_HOME/runtime-config.json` | operator CLI／部分 TUI toggles | 每個 daemon tick |
-| MCP 派生設定 | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json` | daemon / 生成器 | backend 啟動前 |
+| MCP 派生設定 | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json`, `.mcp.json` | daemon / 生成器 | backend 啟動前 |
 | 服務管理器 artifact | plist / unit / task xml | `service install` | OS 登入時 |
 | 診斷輸出 | `bugreport-*.txt`, `captures/*` | operator / capture 工具 | 需要時 |
+
+### Claude ChannelBridge 的 project scope
+
+Claude Code 的 development channel resolver 會讀取 project scope 的
+`.mcp.json`，因此 ChannelBridge 除了寫入獨立的 `mcp-config.json`，也會
+刻意寫入這個檔案。AgEnD 只擁有 `mcpServers.agend-claude-channel`，會保留
+其他 server；刪除 instance 時也只移除這個受管理的 entry。為了讓生成的
+生成的 ChannelBridge launcher/runtime 設定不會弄髒 managed worktree，`.mcp.json` 會被加入
+ignore。但這個 blanket ignore 的代價是：同一個 repository 中由 operator
+擁有的 `.mcp.json` 也不會被 Git 追蹤。這是把生成的 workspace state 排除在
+source control 之外的明確取捨。同一個 workspace 裡 operator 自己啟動的
+Claude session 也會看見實驗性的 ChannelBridge server；這個 project scope
+是刻意的，而且會向這些 session 顯示。
 
 ## `AGEND_HOME`
 

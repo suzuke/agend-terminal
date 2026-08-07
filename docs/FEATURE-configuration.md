@@ -32,9 +32,23 @@ In practice that means:
 | Process environment | `AGEND_HOME`, `AGEND_POINTER_ONLY_INJECT`, `AGEND_CAPTURE_FIXTURES` | operator / launcher | startup |
 | Fleet source | `$AGEND_HOME/fleet.yaml` | operator + daemon | startup / reload |
 | Runtime config | `$AGEND_HOME/runtime-config.json` | operator CLI / selected TUI toggles | each daemon tick |
-| Derived MCP config | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json` | daemon / generator | before backend launch |
+| Derived MCP config | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json`, `.mcp.json` | daemon / generator | before backend launch |
 | Service artifact | plist / unit / task XML | `service install` | OS login |
 | Diagnostic output | `bugreport-*.txt`, `captures/*` | operator / capture tools | on demand |
+
+### Claude ChannelBridge project scope
+
+Claude Code's development-channel resolver reads the project-scope `.mcp.json`,
+so the ChannelBridge entry is intentionally written there as well as to the
+standalone `mcp-config.json`. AgEnD owns only
+`mcpServers.agend-claude-channel` and preserves unrelated servers; deleting an
+instance removes only that managed entry. `.mcp.json` is ignored in managed
+worktrees so generated ChannelBridge launcher/runtime config does not dirty them. This
+blanket ignore also means an operator-owned `.mcp.json` in such a repository is
+not tracked by Git, which is the tradeoff for keeping generated workspace state
+out of source control. Operator-owned Claude sessions in the same workspace
+will see the experimental ChannelBridge server; this project scope is
+intentional and visible to those sessions.
 
 ## `AGEND_HOME`
 
