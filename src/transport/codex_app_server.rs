@@ -1253,8 +1253,75 @@ impl AgentDeliveryTransport for CodexNativeShared {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::thread;
+
+    const STDIO_PROBE_MARKER: &str = "AGEND_CODEX_STDIO_LEAK_MARKER";
+
+    #[test]
+    fn codex_launch_stdio_probe_helper() {
+        if std::env::var_os("AGEND_CODEX_STDIO_PROBE_CHILD").is_none() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("agend-codex-stdio-{}", Uuid::new_v4()));
+        let endpoint = root.join("transport/codex/probe.sock");
+        let executable = root.join("fake-codex");
+        std::fs::create_dir_all(&root).expect("probe root");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nendpoint=${{3#unix://}}\nprintf '{STDIO_PROBE_MARKER} stdout\\n'\nprintf '{STDIO_PROBE_MARKER} stderr\\n' >&2\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"
+            ),
+        )
+        .expect("probe executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("probe metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("probe permissions");
+
+        let locator = SessionLocator::codex(endpoint, None);
+        let mut child = CodexNativeShared::launch(
+            executable.to_str().expect("UTF-8 executable"),
+            &locator,
+            &root,
+        )
+        .expect("launch fake Codex app-server");
+        std::thread::sleep(Duration::from_millis(50));
+        child.kill().expect("stop probe child");
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_server_output_does_not_escape_to_parent_terminal() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "transport::codex_app_server::tests::codex_launch_stdio_probe_helper",
+                "--nocapture",
+            ])
+            .env("AGEND_CODEX_STDIO_PROBE_CHILD", "1")
+            .output()
+            .expect("run isolated stdio probe");
+
+        assert!(
+            output.status.success(),
+            "stdio probe helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !combined.contains(STDIO_PROBE_MARKER),
+            "Codex app-server output escaped to the parent terminal: {combined}"
+        );
+    }
 
     fn write_server_frame(stream: &mut std::os::unix::net::UnixStream, value: Value) {
         let body = serde_json::to_vec(&value).expect("serialize frame");
