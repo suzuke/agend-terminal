@@ -744,6 +744,9 @@ fn resident_event_loop_consumes_target_receipt_without_manual_polling() {
                 }
                 Err(error) => panic!("accept: {error}"),
             };
+            stream
+                .set_nonblocking(false)
+                .expect("accepted request stream must be blocking");
             let prompt_seen = Arc::clone(&server_prompt_seen);
             let event_sent = Arc::clone(&server_event_sent);
             let stop = Arc::clone(&server_stop_flag);

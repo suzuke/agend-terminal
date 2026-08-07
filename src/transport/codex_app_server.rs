@@ -1304,6 +1304,9 @@ mod tests {
         if std::env::var_os("AGEND_CODEX_STDIO_PROBE_CHILD").is_none() {
             return;
         }
+        let helper_ran =
+            std::env::var_os("AGEND_CODEX_STDIO_PROBE_RAN").expect("probe helper sentinel path");
+        std::fs::write(helper_ran, b"ran").expect("record probe helper execution");
 
         let root = std::env::temp_dir().join(format!("agend-codex-stdio-{}", Uuid::new_v4()));
         let endpoint = root.join("transport/codex/probe.sock");
@@ -1337,6 +1340,8 @@ mod tests {
 
     #[test]
     fn codex_app_server_output_does_not_escape_to_parent_terminal() {
+        let helper_ran =
+            std::env::temp_dir().join(format!("agend-codex-stdio-helper-ran-{}", Uuid::new_v4()));
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -1344,9 +1349,12 @@ mod tests {
                 "--nocapture",
             ])
             .env("AGEND_CODEX_STDIO_PROBE_CHILD", "1")
+            .env("AGEND_CODEX_STDIO_PROBE_RAN", &helper_ran)
             .output()
             .expect("run isolated stdio probe");
 
+        assert!(helper_ran.exists(), "stdio probe helper did not run");
+        let _ = std::fs::remove_file(helper_ran);
         assert!(
             output.status.success(),
             "stdio probe helper failed: {}",
@@ -1360,6 +1368,40 @@ mod tests {
         assert!(
             !combined.contains(STDIO_PROBE_MARKER),
             "Codex app-server output escaped to the parent terminal: {combined}"
+        );
+    }
+
+    #[test]
+    fn drain_server_output_continues_past_invalid_utf8_to_eof() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct EofTrackingReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            reached_eof: Arc<AtomicBool>,
+        }
+
+        impl std::io::Read for EofTrackingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buffer)?;
+                if read == 0 {
+                    self.reached_eof.store(true, Ordering::Release);
+                }
+                Ok(read)
+            }
+        }
+
+        let reached_eof = Arc::new(AtomicBool::new(false));
+        let reader = EofTrackingReader {
+            inner: std::io::Cursor::new(b"first\n\xff\xfe\x80\nlast\n".to_vec()),
+            reached_eof: Arc::clone(&reached_eof),
+        };
+
+        drain_server_output(reader, "stderr");
+
+        assert!(
+            reached_eof.load(Ordering::Acquire),
+            "invalid UTF-8 must not stop the drain before EOF"
         );
     }
 
