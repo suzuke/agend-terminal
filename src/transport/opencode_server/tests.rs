@@ -780,6 +780,9 @@ fn restore_idle_without_target_history_proof_is_ambiguous() {
 
 fn read_http_request(mut stream: &TcpStream) -> (String, Vec<u8>) {
     stream
+        .set_nonblocking(false)
+        .expect("blocking accepted stream");
+    stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout");
     let mut bytes = Vec::new();
