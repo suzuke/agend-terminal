@@ -2699,6 +2699,7 @@ fn wait_for_idle_inject_target_tolerates_preregistration_without_wall_clock() {
         &registry,
         id,
         Duration::from_secs(1),
+        BootstrapRegistrationState::MayRegisterLater,
         None,
         &mut now,
         &mut sleep,
@@ -2732,6 +2733,7 @@ fn wait_for_idle_inject_target_reports_never_registered_timeout_without_wall_clo
         &registry,
         id,
         Duration::from_millis(400),
+        BootstrapRegistrationState::MayRegisterLater,
         None,
         &mut now,
         &mut sleep,
@@ -2767,6 +2769,7 @@ fn wait_for_idle_inject_target_aborts_after_seen_handle_disappears_without_wall_
         &registry,
         id,
         Duration::from_secs(10),
+        BootstrapRegistrationState::MayRegisterLater,
         None,
         &mut now,
         &mut sleep,
@@ -2779,6 +2782,39 @@ fn wait_for_idle_inject_target_aborts_after_seen_handle_disappears_without_wall_
     for handle in registry.lock().values() {
         let _ = handle.child.lock().kill();
     }
+}
+
+/// RED for call sites that know registration completed before arming: an
+/// initially absent handle must abort immediately with a truthful
+/// disappeared-after-seen reason, without advancing logical time.
+#[test]
+fn wait_for_idle_inject_target_already_registered_absence_aborts_without_wall_clock() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    let logical_now = Cell::new(Duration::ZERO);
+    let mut now = || logical_now.get();
+    let mut sleep = |_interval: Duration| {
+        panic!("already-registered absence must abort before polling");
+    };
+
+    let result = wait_for_idle_inject_target_with_clock(
+        &registry,
+        id,
+        Duration::from_secs(10),
+        BootstrapRegistrationState::AlreadyRegistered,
+        None,
+        &mut now,
+        &mut sleep,
+    );
+    assert!(result.target.is_none());
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::DisappearedAfterSeen)
+    );
+    assert_eq!(logical_now.get(), Duration::ZERO);
 }
 
 /// (1) Invariant: after a managed spawn, `registry key == handle.id ==
