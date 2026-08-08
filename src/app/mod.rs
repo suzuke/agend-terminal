@@ -487,7 +487,7 @@ fn run_app(
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
     let mut restart_target =
-        restart_resume::resolve_target(&home, attached_mode, restart_requester_id);
+        restart_resume::resolve_target(&fleet_path, attached_mode, restart_requester_id);
     restart_resume::arm_target_once(&mut restart_target, |instance_id, name, timeout| {
         crate::agent::spawn_self_kick_bootstrap(
             Arc::clone(&registry),

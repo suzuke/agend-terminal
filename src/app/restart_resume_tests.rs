@@ -291,23 +291,33 @@ fn restore_arm_behavior_is_owned_exact_uuid_and_once() {
         std::process::id()
     ));
     std::fs::create_dir_all(&home).expect("create test home");
+    let default_fleet = home.join("fleet.yaml");
+    let override_fleet = home.join("override-fleet.yaml");
     let id = InstanceId::new();
     let other_id = InstanceId::new();
 
     assert!(
-        resolve_target(&home, false, None).is_none(),
+        resolve_target(&override_fleet, false, None).is_none(),
         "cold boot must not arm"
     );
     assert!(
-        resolve_target(&home, true, Some(id)).is_none(),
+        resolve_target(&override_fleet, true, Some(id)).is_none(),
         "attached mode must not arm"
     );
     assert!(
-        resolve_target(&home, false, Some(id)).is_none(),
+        resolve_target(&override_fleet, false, Some(id)).is_none(),
         "missing UUID must not arm"
     );
     std::fs::write(
-        home.join("fleet.yaml"),
+        &default_fleet,
+        format!(
+            "instances:\n  lead:\n    id: {}\n    backend: codex\n",
+            other_id.full()
+        ),
+    )
+    .expect("write conflicting default fleet");
+    std::fs::write(
+        &override_fleet,
         format!(
             "instances:\n  lead:\n    id: {}\n    backend: codex\n",
             id.full()
@@ -315,11 +325,11 @@ fn restore_arm_behavior_is_owned_exact_uuid_and_once() {
     )
     .expect("write fleet");
     assert!(
-        resolve_target(&home, false, Some(other_id)).is_none(),
+        resolve_target(&override_fleet, false, Some(other_id)).is_none(),
         "UUID mismatch must not redirect by name"
     );
 
-    let mut target = resolve_target(&home, false, Some(id));
+    let mut target = resolve_target(&override_fleet, false, Some(id));
     assert!(target.is_some(), "matching UUID must resolve one target");
     let mut armed = 0;
     assert!(arm_target_once(&mut target, |_id, name, _timeout| {

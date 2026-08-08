@@ -11,8 +11,17 @@ use std::time::Duration;
 
 pub(crate) type RestartSelfKickTarget = (crate::types::InstanceId, String, Duration);
 
+fn resolve_name_by_uuid(fleet_path: &Path, uuid: &str) -> Option<String> {
+    let fleet = crate::fleet::FleetConfig::load(fleet_path).ok()?;
+    fleet
+        .instances
+        .iter()
+        .find(|(_, instance)| instance.id.as_deref() == Some(uuid))
+        .map(|(name, _)| name.clone())
+}
+
 pub(crate) fn resolve_target(
-    home: &Path,
+    fleet_path: &Path,
     attached_mode: bool,
     requester_id: Option<crate::types::InstanceId>,
 ) -> Option<RestartSelfKickTarget> {
@@ -20,8 +29,8 @@ pub(crate) fn resolve_target(
         return None;
     }
     let requester_id = requester_id?;
-    let name = crate::fleet::resolve_name_by_uuid(home, &requester_id.full())?;
-    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
+    let name = resolve_name_by_uuid(fleet_path, &requester_id.full())?;
+    let fleet = crate::fleet::FleetConfig::load(fleet_path).ok()?;
     let resolved = fleet.resolve_instance(&name)?;
     let timeout = Duration::from_secs(
         resolved
