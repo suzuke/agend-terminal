@@ -2698,10 +2698,8 @@ fn wait_for_idle_inject_target_tolerates_preregistration_without_wall_clock() {
     let result = wait_for_idle_inject_target_with_clock(
         &registry,
         id,
-        "boot",
         Duration::from_secs(1),
         None,
-        "self-kick",
         &mut now,
         &mut sleep,
     );
@@ -2733,14 +2731,12 @@ fn wait_for_idle_inject_target_reports_never_registered_timeout_without_wall_clo
     let result = wait_for_idle_inject_target_with_clock(
         &registry,
         id,
-        "never-registered",
         Duration::from_millis(400),
         None,
-        "self-kick",
         &mut now,
         &mut sleep,
     );
-    assert_eq!(result.target, None);
+    assert!(result.target.is_none());
     assert_eq!(
         result.terminal,
         Some(IdleInjectWaitTerminal::NeverRegisteredTimeout)
@@ -2770,14 +2766,12 @@ fn wait_for_idle_inject_target_aborts_after_seen_handle_disappears_without_wall_
     let result = wait_for_idle_inject_target_with_clock(
         &registry,
         id,
-        "boot",
         Duration::from_secs(10),
         None,
-        "self-kick",
         &mut now,
         &mut sleep,
     );
-    assert_eq!(result.target, None);
+    assert!(result.target.is_none());
     assert_eq!(
         result.terminal,
         Some(IdleInjectWaitTerminal::DisappearedAfterSeen)

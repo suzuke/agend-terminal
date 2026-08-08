@@ -1660,6 +1660,46 @@ fn bootstrap_core_is_idle(core: &std::sync::Arc<CoreMutex<AgentCore>>) -> bool {
     core.lock().state.get_state() == crate::state::AgentState::Idle
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleInjectWaitTerminal {
+    Shutdown,
+    NeverRegisteredTimeout,
+    NotIdleTimeout,
+    DisappearedAfterSeen,
+}
+
+impl IdleInjectWaitTerminal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutdown",
+            Self::NeverRegisteredTimeout => "never-registered-timeout",
+            Self::NotIdleTimeout => "not-idle-timeout",
+            Self::DisappearedAfterSeen => "disappeared-after-seen",
+        }
+    }
+}
+
+struct IdleInjectWaitResult {
+    target: Option<InjectTarget>,
+    terminal: Option<IdleInjectWaitTerminal>,
+}
+
+impl IdleInjectWaitResult {
+    fn ready(target: InjectTarget) -> Self {
+        Self {
+            target: Some(target),
+            terminal: None,
+        }
+    }
+
+    fn terminal(reason: IdleInjectWaitTerminal) -> Self {
+        Self {
+            target: None,
+            terminal: Some(reason),
+        }
+    }
+}
+
 /// Poll until the agent reaches Idle, then inject the pre-read instructions
 /// content as a first user message. Used by backends (Kiro) whose CLI does
 /// not auto-load the steering file.
@@ -1674,11 +1714,75 @@ fn bootstrap_core_is_idle(core: &std::sync::Arc<CoreMutex<AgentCore>>) -> bool {
 /// the prompt, then type one first turn" (injecting while the backend is still
 /// `Starting` would be swallowed).
 ///
+/// A restore can publish the exact UUID after this waiter starts. Absence is
+/// therefore tolerated until the deadline before first observation; once the
+/// handle has been observed, disappearance is an immediate terminal outcome.
+///
 /// #CR-2026-06-14 (concurrency): snapshot the core Arc under the tier-1 registry
 /// lock, DROP the registry guard, THEN lock the core (in `bootstrap_core_is_idle`)
 /// — never nest the per-agent core lock inside the registry lock. The old
 /// registry→core nesting established an acquisition order a core→registry path
 /// could deadlock against, every 200ms at startup.
+fn wait_for_idle_inject_target_with_clock<Now, Sleep>(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    timeout: std::time::Duration,
+    shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    now: &mut Now,
+    sleep: &mut Sleep,
+) -> IdleInjectWaitResult
+where
+    Now: FnMut() -> std::time::Duration,
+    Sleep: FnMut(std::time::Duration),
+{
+    let poll_interval = std::time::Duration::from_millis(200);
+    let settle_delay = std::time::Duration::from_millis(500);
+    let mut seen_handle = false;
+
+    loop {
+        if let Some(s) = shutdown {
+            if s.load(std::sync::atomic::Ordering::Relaxed) {
+                return IdleInjectWaitResult::terminal(IdleInjectWaitTerminal::Shutdown);
+            }
+        }
+        if now() >= timeout {
+            return IdleInjectWaitResult::terminal(if seen_handle {
+                IdleInjectWaitTerminal::NotIdleTimeout
+            } else {
+                IdleInjectWaitTerminal::NeverRegisteredTimeout
+            });
+        }
+        let core = {
+            let reg = lock_registry(registry);
+            match reg.get(&instance_id) {
+                Some(h) => {
+                    seen_handle = true;
+                    Some(std::sync::Arc::clone(&h.core))
+                }
+                None if seen_handle => {
+                    return IdleInjectWaitResult::terminal(
+                        IdleInjectWaitTerminal::DisappearedAfterSeen,
+                    );
+                }
+                None => None,
+            }
+        };
+        if core.as_ref().is_some_and(bootstrap_core_is_idle) {
+            break;
+        }
+        sleep(poll_interval);
+    }
+    // Small settle delay so the prompt is fully painted before we type.
+    sleep(settle_delay);
+    // #1530/F1: snapshot the inject target under the registry lock, release it,
+    // THEN inject (caller side) — never hold the registry across the blocking write.
+    let reg = lock_registry(registry);
+    match reg.get(&instance_id) {
+        Some(handle) => IdleInjectWaitResult::ready(InjectTarget::from_handle(handle)),
+        None => IdleInjectWaitResult::terminal(IdleInjectWaitTerminal::DisappearedAfterSeen),
+    }
+}
+
 fn wait_for_idle_inject_target(
     registry: &AgentRegistry,
     instance_id: crate::types::InstanceId,
@@ -1687,35 +1791,26 @@ fn wait_for_idle_inject_target(
     shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
     what: &str,
 ) -> Option<InjectTarget> {
-    let deadline = std::time::Instant::now() + timeout;
-    let poll_interval = std::time::Duration::from_millis(200);
-    loop {
-        if let Some(s) = shutdown {
-            if s.load(std::sync::atomic::Ordering::Relaxed) {
-                return None;
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(agent = %name, what, "bootstrap timed out waiting for Idle");
-            return None;
-        }
-        let core = {
-            let reg = lock_registry(registry);
-            // agent gone → abort bootstrap wait
-            let h = reg.get(&instance_id)?;
-            std::sync::Arc::clone(&h.core)
-        };
-        if bootstrap_core_is_idle(&core) {
-            break;
-        }
-        std::thread::sleep(poll_interval);
+    let started = std::time::Instant::now();
+    let mut now = || started.elapsed();
+    let mut sleep = std::thread::sleep;
+    let result = wait_for_idle_inject_target_with_clock(
+        registry,
+        instance_id,
+        timeout,
+        shutdown,
+        &mut now,
+        &mut sleep,
+    );
+    if let Some(reason) = result.terminal {
+        tracing::warn!(
+            agent = %name,
+            what,
+            reason = reason.label(),
+            "bootstrap wait ended"
+        );
     }
-    // Small settle delay so the prompt is fully painted before we type.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    // #1530/F1: snapshot the inject target under the registry lock, release it,
-    // THEN inject (caller side) — never hold the registry across the blocking write.
-    let reg = lock_registry(registry);
-    reg.get(&instance_id).map(InjectTarget::from_handle)
+    result.target
 }
 
 fn spawn_instructions_bootstrap(
