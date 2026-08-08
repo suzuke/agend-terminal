@@ -177,6 +177,7 @@ pub(crate) fn handle_reply_for_test(
     channel::handle_reply(home, args, instance_name)
 }
 
+#[cfg(test)]
 pub(crate) fn handle_tool_with_runtime(
     tool: &str,
     args: &Value,

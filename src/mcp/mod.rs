@@ -16,6 +16,7 @@ mod per_tool_arg_invariant;
 
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) fn execute_tool_with_runtime(
     tool_name: &str,
     args: &Value,

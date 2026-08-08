@@ -280,8 +280,8 @@ pub(super) fn handle_report_health(
     };
     // #2454: write IN-PROCESS via the forwarded live registry — no api::call
     // loopback. `runtime` is absent only on the test-only `handle_tool` entry
-    // (production is always mcp_proxy → execute_tool_with_runtime(Some)); return
-    // an explicit error, never fall back to api::call.
+    // (production is always mcp_proxy → execute_tool_with_runtime_and_requester);
+    // return an explicit error, never fall back to api::call.
     let Some(runtime) = runtime else {
         return json!({"error": "runtime unavailable: health write requires the in-process daemon runtime"});
     };
