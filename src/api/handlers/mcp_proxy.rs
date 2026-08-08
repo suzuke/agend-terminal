@@ -150,6 +150,22 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
             ),
         });
     }
+    let requester_id = if tool == "restart_daemon"
+        && ctx.capability == crate::api::RestartCapability::App
+        && !instance.is_empty()
+    {
+        match crate::agent::resolve_instance(ctx.home, &instance) {
+            Ok((id, _)) => Some(id),
+            Err(_) => {
+                return json!({
+                    "ok": false,
+                    "error": "restart_daemon requires the managed caller's stable InstanceId; fleet intact — no restart"
+                });
+            }
+        }
+    } else {
+        None
+    };
     let timeout = tool_timeout(tool);
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
         registry: ctx.registry.clone(),
@@ -170,7 +186,13 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         timeout,
         action,
         move |tool, args, instance| {
-            crate::mcp::execute_tool_with_runtime(tool, args, instance, runtime)
+            crate::mcp::execute_tool_with_runtime_and_requester(
+                tool,
+                args,
+                instance,
+                runtime,
+                requester_id,
+            )
         },
     )
 }

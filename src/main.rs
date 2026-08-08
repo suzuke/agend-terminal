@@ -388,6 +388,10 @@ enum Commands {
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml)
         #[arg(long)]
         fleet: Option<String>,
+        /// #restart-resume (hidden): exact fleet UUID carried only by a
+        /// committed Unix app re-exec. Invalid values are treated as cold boot.
+        #[arg(long = "app-restart-requester", hide = true)]
+        app_restart_requester: Option<String>,
     },
     /// Stop the daemon
     Stop,
@@ -804,8 +808,16 @@ fn main() -> anyhow::Result<()> {
             Cli::command().print_help()?;
             println!();
         }
-        Some(Commands::App { fleet }) => {
-            app::run(fleet.as_deref())?;
+        Some(Commands::App {
+            fleet,
+            app_restart_requester,
+        }) => {
+            app::run(
+                fleet.as_deref(),
+                app_restart_requester
+                    .as_deref()
+                    .and_then(crate::types::InstanceId::parse),
+            )?;
         }
         // #2453 R2: read-only restart preflight — never returns (exits 0/non-zero).
         Some(Commands::RestartProbe) => app::run_restart_probe(),
@@ -1638,6 +1650,34 @@ mod tests {
             s.contains(".agend") || s.contains("agend"),
             "home_dir should contain 'agend': {s}"
         );
+    }
+
+    #[test]
+    fn app_restart_requester_cli_arg_is_optional_and_exact() {
+        let id = crate::types::InstanceId::new();
+        let cold = Cli::try_parse_from(["agend-terminal", "app"]).expect("cold app parse");
+        assert!(matches!(
+            cold.command,
+            Some(Commands::App {
+                app_restart_requester: None,
+                ..
+            })
+        ));
+
+        let resumed = Cli::try_parse_from([
+            "agend-terminal",
+            "app",
+            "--app-restart-requester",
+            id.full().as_str(),
+        ])
+        .expect("resumed app parse");
+        assert!(matches!(
+            resumed.command,
+            Some(Commands::App {
+                app_restart_requester: Some(ref raw),
+                ..
+            }) if raw == &id.full()
+        ));
     }
 
     #[test]

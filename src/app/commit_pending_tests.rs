@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 fn cp(rx: crossbeam_channel::Receiver<()>, deadline: Instant) -> CommitPending {
     CommitPending {
         flush_ack: rx,
+        requester_id: None,
         deadline,
     }
 }

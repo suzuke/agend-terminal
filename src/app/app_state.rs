@@ -355,7 +355,7 @@ impl AppState {
         if self.restart.restart_probe.is_some() {
             use crate::api::app_restart::AppRestartVerdict;
             match poll_restart_probe(&mut self.restart.restart_probe, app_restart_gate) {
-                ProbePoll::Prepared(reply, flush_ack) => {
+                ProbePoll::Prepared(reply, flush_ack, requester_id) => {
                     // Probe passed; the gate is still Probing. Reply PREPARED, then park
                     // the transport ack (do NOT block): the handler returns the
                     // `prepared` reply, handle_session writes+flushes it, and its
@@ -366,6 +366,7 @@ impl AppState {
                     if reply.send(AppRestartVerdict::Prepared).is_ok() {
                         self.restart.restart_commit_pending = Some(CommitPending {
                             flush_ack,
+                            requester_id,
                             deadline: std::time::Instant::now() + RESTART_COMMIT_WATCHDOG,
                         });
                     } else {
@@ -394,9 +395,14 @@ impl AppState {
             );
             match poll {
                 CommitPoll::Commit => {
+                    let requester_id = self
+                        .restart
+                        .restart_commit_pending
+                        .as_ref()
+                        .and_then(|pending| pending.requester_id);
                     self.restart.restart_commit_pending = None;
                     if app_restart_gate.to_committing() {
-                        self.restart.restart_outcome = RunOutcome::RestartRequested;
+                        self.restart.restart_outcome = RunOutcome::RestartRequested(requester_id);
                         return LoopFlow::Break;
                     }
                     // Could not advance Probing→Committing (should not happen for the
@@ -665,6 +671,7 @@ impl AppState {
                             child,
                             reply: req.reply,
                             flush_ack: req.flush_ack,
+                            requester_id: req.requester_id,
                             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
                         });
                     }

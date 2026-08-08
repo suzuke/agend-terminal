@@ -19,7 +19,7 @@ pub(super) fn handle_restart_daemon(
     app_restart: Option<crate::api::app_restart::AppRestart>,
     post_flush: Option<crate::api::app_restart::PostFlushSlot>,
 ) -> Value {
-    handle_restart_daemon_with_shutdown(home, capability, app_restart, post_flush, None)
+    handle_restart_daemon_with_shutdown(home, capability, app_restart, post_flush, None, None)
 }
 
 /// #2454 Slice 9: carries the API-owned shutdown authority through the daemon
@@ -31,11 +31,12 @@ pub(super) fn handle_restart_daemon_with_shutdown(
     app_restart: Option<crate::api::app_restart::AppRestart>,
     post_flush: Option<crate::api::app_restart::PostFlushSlot>,
     shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    requester_id: Option<crate::types::InstanceId>,
 ) -> Value {
     use crate::api::RestartCapability;
     match capability {
         Some(RestartCapability::Daemon) => daemon_restart_strategy(home, shutdown),
-        Some(RestartCapability::App) => app_restart_strategy(app_restart, post_flush),
+        Some(RestartCapability::App) => app_restart_strategy(app_restart, post_flush, requester_id),
         Some(RestartCapability::Unsupported) | None => unsupported_fail_closed(),
     }
 }
@@ -58,6 +59,7 @@ pub(super) fn handle_restart_daemon_with_shutdown(
 fn app_restart_strategy(
     app_restart: Option<crate::api::app_restart::AppRestart>,
     post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+    requester_id: Option<crate::types::InstanceId>,
 ) -> Value {
     use crate::api::app_restart::{AppRestartRequest, AppRestartVerdict};
     let Some(ar) = app_restart else {
@@ -103,6 +105,7 @@ fn app_restart_strategy(
         .try_send(AppRestartRequest {
             reply: reply_tx,
             flush_ack: ack_rx,
+            requester_id,
         })
         .is_err()
     {
@@ -176,6 +179,7 @@ fn app_restart_strategy(
 fn app_restart_strategy(
     _app_restart: Option<crate::api::app_restart::AppRestart>,
     _post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+    _requester_id: Option<crate::types::InstanceId>,
 ) -> Value {
     tracing::warn!(
         target: "handoff",

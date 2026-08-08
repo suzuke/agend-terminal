@@ -183,6 +183,16 @@ pub(crate) fn handle_tool_with_runtime(
     instance_name: &str,
     runtime: Option<dispatch::RuntimeContext>,
 ) -> Value {
+    handle_tool_with_runtime_and_requester(tool, args, instance_name, runtime, None)
+}
+
+pub(crate) fn handle_tool_with_runtime_and_requester(
+    tool: &str,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<dispatch::RuntimeContext>,
+    requester_id: Option<crate::types::InstanceId>,
+) -> Value {
     let home = crate::home_dir();
     // arch F5 (t-…47102): a read-only tool (pure query, no state change) skips the
     // two per-call DISK side-effects below — the usage append and the heartbeat RMW
@@ -247,6 +257,12 @@ pub(crate) fn handle_tool_with_runtime(
         sender: &sender,
         runtime: runtime.as_ref(),
     };
+    if tool == "restart_daemon" {
+        return match requester_id {
+            Some(id) => dispatch::dispatch_restart_daemon_with_requester(&dispatch_ctx, Some(id)),
+            None => dispatch::dispatch_restart_daemon(&dispatch_ctx),
+        };
+    }
     if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
         return value;
     }
