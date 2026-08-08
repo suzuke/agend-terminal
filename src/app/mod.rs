@@ -494,6 +494,7 @@ fn run_app(
             instance_id,
             name,
             timeout,
+            crate::agent::BootstrapRegistrationState::MayRegisterLater,
             None,
         );
     });

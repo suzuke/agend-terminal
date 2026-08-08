@@ -3625,6 +3625,7 @@ fn bootstrap_readiness_no_registry_core_deadlock_real_path() {
                     id,
                     "boot",
                     Duration::from_millis(500),
+                    BootstrapRegistrationState::AlreadyRegistered,
                     None,
                     "deadlock-test",
                 );

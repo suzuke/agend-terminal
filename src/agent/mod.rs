@@ -1668,6 +1668,12 @@ enum IdleInjectWaitTerminal {
     DisappearedAfterSeen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootstrapRegistrationState {
+    MayRegisterLater,
+    AlreadyRegistered,
+}
+
 impl IdleInjectWaitTerminal {
     fn label(self) -> &'static str {
         match self {
@@ -1727,6 +1733,7 @@ fn wait_for_idle_inject_target_with_clock<Now, Sleep>(
     registry: &AgentRegistry,
     instance_id: crate::types::InstanceId,
     timeout: std::time::Duration,
+    registration_state: BootstrapRegistrationState,
     shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
     now: &mut Now,
     sleep: &mut Sleep,
@@ -1737,7 +1744,10 @@ where
 {
     let poll_interval = std::time::Duration::from_millis(200);
     let settle_delay = std::time::Duration::from_millis(500);
-    let mut seen_handle = false;
+    let mut seen_handle = matches!(
+        registration_state,
+        BootstrapRegistrationState::AlreadyRegistered
+    );
 
     loop {
         if let Some(s) = shutdown {
@@ -1788,6 +1798,7 @@ fn wait_for_idle_inject_target(
     instance_id: crate::types::InstanceId,
     name: &str,
     timeout: std::time::Duration,
+    registration_state: BootstrapRegistrationState,
     shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
     what: &str,
 ) -> Option<InjectTarget> {
@@ -1798,6 +1809,7 @@ fn wait_for_idle_inject_target(
         registry,
         instance_id,
         timeout,
+        registration_state,
         shutdown,
         &mut now,
         &mut sleep,
@@ -1833,6 +1845,7 @@ fn spawn_instructions_bootstrap(
             instance_id,
             &name,
             timeout,
+            BootstrapRegistrationState::AlreadyRegistered,
             shutdown.as_ref(),
             "instructions",
         ) {
@@ -1869,6 +1882,7 @@ pub(crate) fn spawn_self_kick_bootstrap(
     instance_id: crate::types::InstanceId,
     name: String,
     timeout: std::time::Duration,
+    registration_state: BootstrapRegistrationState,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let thread_name = format!("{name}_selfkick");
@@ -1881,6 +1895,7 @@ pub(crate) fn spawn_self_kick_bootstrap(
             instance_id,
             &name,
             timeout,
+            registration_state,
             shutdown.as_ref(),
             "self-kick",
         ) {

@@ -190,6 +190,7 @@ pub fn spawn_instance(
                 id,
                 request.name.clone(),
                 std::time::Duration::from_secs(ready_timeout),
+                agent::BootstrapRegistrationState::AlreadyRegistered,
                 None,
             );
         } else {
