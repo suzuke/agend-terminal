@@ -216,6 +216,104 @@ fn unresolved_managed_caller_fails_at_mcp_ingress_before_worker() {
     std::fs::remove_dir_all(home).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn live_mcp_ingress_uses_registry_identity_not_default_fleet() {
+    use crate::api::app_restart::{AppRestart, AppRestartGate, AppRestartRequest};
+    use crate::api::handlers::{mcp_proxy, HandlerCtx};
+    use crate::types::InstanceId;
+    use serde_json::json;
+    use std::time::Duration;
+
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!(
+        "agend-app-restart-ingress-override-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).expect("create test home");
+    let requester_id = InstanceId::new();
+    let conflicting_id = InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  lead:\n    id: {}\n    backend: codex\n",
+            conflicting_id.full()
+        ),
+    )
+    .expect("write conflicting default fleet");
+    std::fs::write(
+        home.join("override-fleet.yaml"),
+        format!(
+            "instances:\n  lead:\n    id: {}\n    backend: codex\n",
+            requester_id.full()
+        ),
+    )
+    .expect("write override fleet");
+
+    let registry: crate::agent::AgentRegistry = Default::default();
+    registry.lock().insert(
+        requester_id,
+        crate::agent::mk_test_handle("lead", requester_id),
+    );
+    let configs: crate::api::ConfigRegistry = Default::default();
+    let externals: crate::agent::ExternalRegistry = Default::default();
+    let gate = AppRestartGate::new();
+    let (tx, rx) = crossbeam_channel::bounded::<AppRestartRequest>(1);
+    let app_restart = AppRestart { tx, gate };
+    let ctx = HandlerCtx {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+        home: &home,
+        capability: crate::api::RestartCapability::App,
+        app_restart: Some(&app_restart),
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        shutdown: None,
+    };
+
+    let previous_home = std::env::var_os("AGEND_HOME");
+    std::env::set_var("AGEND_HOME", &home);
+    // fire-and-forget: test observer is retained and joined below.
+    let observer = std::thread::spawn(move || {
+        let request = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("restart request enqueued");
+        let debug = format!("{request:?}");
+        request
+            .reply
+            .send(crate::api::app_restart::AppRestartVerdict::Prepared)
+            .expect("prepared verdict delivered");
+        debug
+    });
+    let response = mcp_proxy::handle_mcp_tool(
+        &json!({
+            "tool": "restart_daemon",
+            "instance": "lead",
+            "arguments": {}
+        }),
+        &ctx,
+    );
+    let debug = observer.join().expect("request observer joined");
+
+    match previous_home {
+        Some(value) => std::env::set_var("AGEND_HOME", value),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+    registry.lock().remove(&requester_id);
+    std::fs::remove_dir_all(home).ok();
+
+    assert_eq!(
+        response["ok"], true,
+        "live requester must proceed: {response}"
+    );
+    assert_eq!(response["result"]["restart"], "prepared");
+    assert!(
+        debug.contains(&requester_id.full()) && !debug.contains(&conflicting_id.full()),
+        "request must carry the live override-fleet UUID only: {debug}"
+    );
+}
+
 #[test]
 fn successor_argv_contract_is_hidden_and_commit_only() {
     let app = include_str!("mod.rs");
