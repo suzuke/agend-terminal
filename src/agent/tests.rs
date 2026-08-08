@@ -2664,6 +2664,129 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
     }
 }
 
+/// Starting-state fixture for the disappearance-after-observation wait test.
+fn mk_starting_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
+    let handle = mk_handle_1441(name, id);
+    handle.core.lock().state.current = crate::state::AgentState::Starting;
+    handle
+}
+
+/// RED for the pre-registration race: the exact UUID may be absent briefly
+/// while restore publishes the handle. The production wait path must continue
+/// through the bounded poll window, then return one target once registration
+/// appears; this test advances a logical clock and never sleeps.
+#[test]
+fn wait_for_idle_inject_target_tolerates_preregistration_without_wall_clock() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    let logical_now = Cell::new(Duration::ZERO);
+    let inserted = Cell::new(false);
+    let registry_for_sleep = Arc::clone(&registry);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+        if !inserted.replace(true) {
+            registry_for_sleep
+                .lock()
+                .insert(id, mk_handle_1441("boot", id));
+        }
+    };
+
+    let result = wait_for_idle_inject_target_with_clock(
+        &registry,
+        id,
+        "boot",
+        Duration::from_secs(1),
+        None,
+        "self-kick",
+        &mut now,
+        &mut sleep,
+    );
+    assert!(
+        result.target.is_some(),
+        "initial absence followed by registration must produce one inject target"
+    );
+    assert_eq!(result.terminal, None);
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
+}
+
+/// RED for the bounded terminal path: a never-registered UUID must not return
+/// immediately and must expose a distinguishable terminal reason.
+#[test]
+fn wait_for_idle_inject_target_reports_never_registered_timeout_without_wall_clock() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    let logical_now = Cell::new(Duration::ZERO);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+    };
+
+    let result = wait_for_idle_inject_target_with_clock(
+        &registry,
+        id,
+        "never-registered",
+        Duration::from_millis(400),
+        None,
+        "self-kick",
+        &mut now,
+        &mut sleep,
+    );
+    assert_eq!(result.target, None);
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::NeverRegisteredTimeout)
+    );
+}
+
+/// RED for the post-observation safety path: once the exact UUID was seen,
+/// removal must abort immediately instead of waiting through the deadline.
+#[test]
+fn wait_for_idle_inject_target_aborts_after_seen_handle_disappears_without_wall_clock() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry
+        .lock()
+        .insert(id, mk_starting_handle_1441("boot", id));
+    let logical_now = Cell::new(Duration::ZERO);
+    let registry_for_sleep = Arc::clone(&registry);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+        registry_for_sleep.lock().remove(&id);
+    };
+
+    let result = wait_for_idle_inject_target_with_clock(
+        &registry,
+        id,
+        "boot",
+        Duration::from_secs(10),
+        None,
+        "self-kick",
+        &mut now,
+        &mut sleep,
+    );
+    assert_eq!(result.target, None);
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::DisappearedAfterSeen)
+    );
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
+}
+
 /// (1) Invariant: after a managed spawn, `registry key == handle.id ==
 /// resolve_uuid(name)` — the three identities share one fleet.yaml source.
 #[test]
