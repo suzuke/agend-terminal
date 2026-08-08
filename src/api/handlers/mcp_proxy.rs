@@ -69,6 +69,26 @@ fn is_side_effect_tool(tool: &str, action: Option<&str>) -> bool {
     crate::mcp::registry::side_effect_on_timeout_for(tool, action)
 }
 
+/// Resolve an App restart requester from the live managed registry. The app may
+/// have been launched with a fleet override that is not `$AGEND_HOME/fleet.yaml`;
+/// disk resolution here would therefore consult the wrong fleet. A restart is
+/// allowed only for an exact live handle name (or its exact UUID key).
+fn live_requester_id(
+    registry: &crate::agent::AgentRegistry,
+    instance: &str,
+) -> Option<crate::types::InstanceId> {
+    let registry = crate::agent::lock_registry(registry);
+    if let Some(id) = crate::types::InstanceId::parse(instance) {
+        return registry.get(&id).map(|_| id);
+    }
+    let mut matches = registry
+        .iter()
+        .filter(|(_, handle)| handle.name.as_str() == instance)
+        .map(|(id, _)| *id);
+    let id = matches.next()?;
+    matches.next().is_none().then_some(id)
+}
+
 /// Stable hash of `(tool, args)` for the timeout instrument. NOT used for any
 /// dedup decision — purely so a post-restart log grep can tell whether the SAME
 /// logical call reappears in the timeout probe (⇒ the agent retried despite
@@ -154,13 +174,13 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         && ctx.capability == crate::api::RestartCapability::App
         && !instance.is_empty()
     {
-        match crate::agent::resolve_instance(ctx.home, &instance) {
-            Ok((id, _)) => Some(id),
-            Err(_) => {
+        match live_requester_id(ctx.registry, &instance) {
+            Some(id) => Some(id),
+            None => {
                 return json!({
                     "ok": false,
-                    "error": "restart_daemon requires the managed caller's stable InstanceId; fleet intact — no restart"
-                });
+                    "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
+                })
             }
         }
     } else {
@@ -387,6 +407,40 @@ mod tests {
         assert_eq!(tool_timeout("send"), Duration::from_secs(30));
         assert_eq!(tool_timeout("task"), Duration::from_secs(30));
         assert_eq!(tool_timeout("unknown_tool"), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn live_requester_id_is_uuid_precedence_and_ambiguous_name_fail_closed() {
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let exact_id = crate::types::InstanceId::new();
+        let shadow_id = crate::types::InstanceId::new();
+        registry.lock().insert(
+            shadow_id,
+            crate::agent::mk_test_handle(&exact_id.full(), shadow_id),
+        );
+        registry
+            .lock()
+            .insert(exact_id, crate::agent::mk_test_handle("lead", exact_id));
+        assert_eq!(
+            live_requester_id(&registry, &exact_id.full()),
+            Some(exact_id),
+            "full UUID must use the exact registry key, not a UUID-shaped handle name"
+        );
+
+        let first = crate::types::InstanceId::new();
+        let second = crate::types::InstanceId::new();
+        registry
+            .lock()
+            .insert(first, crate::agent::mk_test_handle("duplicate", first));
+        registry
+            .lock()
+            .insert(second, crate::agent::mk_test_handle("duplicate", second));
+        assert_eq!(
+            live_requester_id(&registry, "duplicate"),
+            None,
+            "duplicate live names must not resolve by HashMap iteration order"
+        );
+        registry.lock().clear();
     }
 
     /// #2050 W1.3① / P1 single-source follow-up: timeout classification is now

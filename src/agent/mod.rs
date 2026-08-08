@@ -1764,10 +1764,11 @@ fn spawn_instructions_bootstrap(
 /// the freshly-spawned session to Idle (so the inject isn't swallowed while the
 /// backend is still `Starting`) and injects a single `[AGEND-RESUME]`
 /// self-bootstrap first turn, armed for ≤1 re-delivery via the inject-delivery
-/// verifier. Fired ONLY from the SPAWN handler when `restart_spawn_params` set the
-/// independent `self_kick_on_ready` flag (fresh restart) — the flag is NEVER
-/// derived from `SpawnMode::Fresh` (initial fleet spawns are Fresh too, and must
-/// not self-kick).
+/// verifier. Authorized paths are the SPAWN handler when `restart_spawn_params`
+/// sets the independent `self_kick_on_ready` flag (fresh restart), and the
+/// Owned app successor for an exact committed app-reexec requester — the flag
+/// is NEVER derived from `SpawnMode::Fresh` (initial fleet spawns are Fresh too,
+/// and must not self-kick).
 pub(crate) fn spawn_self_kick_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,
