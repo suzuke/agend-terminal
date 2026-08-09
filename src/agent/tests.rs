@@ -206,10 +206,12 @@ fn fresh_restart_self_kick_prompt_shape() {
     assert!(p.contains("NOT authority to dispatch"));
 }
 
-/// RED: the fresh-restart bootstrap must route a structured backend through
-/// exactly one adapter request, without touching the captured PTY or arming the
-/// legacy hook verifier. This drives the production self-kick entry point; the
-/// test hook only replaces the external adapter I/O.
+/// RED: a structured fresh-restart bootstrap must not inherit LegacyPty's raw
+/// screen-idle prerequisite. The structured adapter owns readiness and turn
+/// admission, so a stale `Active` screen classification must still reach exactly
+/// one adapter request without touching the PTY or arming the legacy verifier.
+/// This drives the production self-kick entry point; the test hook only replaces
+/// the external adapter I/O.
 #[test]
 fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
     let _test_guard = SelfKickTestGuard::acquire();
@@ -221,6 +223,11 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
     let id = crate::types::InstanceId::new();
     let home = std::env::temp_dir().join(format!("agend-selfkick-red-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).expect("test home");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  {name}:\n    backend: codex\n"),
+    )
+    .expect("write structured fleet entry");
     let written = Arc::new(Mutex::new(Vec::new()));
     let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
         bytes: Arc::clone(&written),
@@ -246,7 +253,7 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
         api_activity: crate::agent::ApiActivity::default(),
         observed_status: None,
     }));
-    core.lock().state.current = crate::state::AgentState::Idle;
+    core.lock().state.current = crate::state::AgentState::Active;
     let handle = AgentHandle {
         id,
         name: name.clone().into(),
