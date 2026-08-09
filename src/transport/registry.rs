@@ -406,10 +406,24 @@ pub(crate) fn envelope_for_instance(
     instance: &str,
     body: &str,
 ) -> anyhow::Result<DeliveryEnvelope> {
-    let backend = backend_for_instance(home, instance);
     let mode = mode_for_instance(home, instance);
+    envelope_for_mode(home, instance, body, mode, false)
+}
+
+fn envelope_for_mode(
+    home: &Path,
+    instance: &str,
+    body: &str,
+    mode: TransportMode,
+    wait_for_channel_readiness: bool,
+) -> anyhow::Result<DeliveryEnvelope> {
+    let backend = backend_for_instance(home, instance);
     let locator = if mode == TransportMode::ChannelBridge {
-        super::claude_channel::prepare_claude_channel(home, instance)?
+        if wait_for_channel_readiness {
+            super::claude_channel::wait_for_ready_claude_channel(home, instance)?
+        } else {
+            super::claude_channel::prepare_claude_channel(home, instance)?
+        }
     } else {
         locator_for_instance(home, instance, backend.as_ref(), mode)?
     };
@@ -457,7 +471,7 @@ where
         return result;
     }
     let mode = mode_for_instance(home, instance);
-    let envelope = envelope_for_instance(home, instance, body)?;
+    let envelope = envelope_for_mode(home, instance, body, mode, true)?;
     match mode {
         TransportMode::NativeShared => match envelope.session.backend.as_str() {
             "codex" => {

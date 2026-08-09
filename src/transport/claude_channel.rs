@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub(crate) const CHANNEL_SERVER_NAME: &str = "agend-claude-channel";
@@ -32,6 +32,8 @@ const BRIDGE_VERSION: &str = "0.1.0";
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+const CHANNEL_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const CHANNEL_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PATH: &str = "/webhook";
 
@@ -938,6 +940,46 @@ pub(crate) fn prepare_claude_channel(
     Ok(locator)
 }
 
+pub(crate) fn wait_for_ready_claude_channel(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<SessionLocator> {
+    wait_for_ready_claude_channel_until(home, instance, CHANNEL_READY_TIMEOUT)
+}
+
+fn wait_for_ready_claude_channel_until(
+    home: &Path,
+    instance: &str,
+    timeout: Duration,
+) -> anyhow::Result<SessionLocator> {
+    let started = Instant::now();
+    loop {
+        let last_error = match prepare_claude_channel(home, instance).and_then(|locator| {
+            let capability = health_probe(&locator)?;
+            if capability.ready {
+                Ok(locator)
+            } else {
+                Err(anyhow::anyhow!(
+                    "{}",
+                    capability.degraded_reason.unwrap_or_else(|| {
+                        "Claude ChannelBridge capability probe failed closed".to_string()
+                    })
+                ))
+            }
+        }) {
+            Ok(locator) => return Ok(locator),
+            Err(error) => error,
+        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "Claude ChannelBridge did not become ready within {timeout:?}: {last_error}"
+            );
+        }
+        thread::sleep(std::cmp::min(CHANNEL_READY_POLL_INTERVAL, remaining));
+    }
+}
+
 fn ensure_claude_bridge_owned(locator: &SessionLocator) -> anyhow::Result<()> {
     if locator.backend != "claude" {
         anyhow::bail!(
@@ -1604,6 +1646,24 @@ mod tests {
         assert!(client_request(&stale, "GET", "/health", &[], "application/json").is_err());
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn channel_ready_wait_is_bounded_when_locator_never_publishes() {
+        let home = home("bounded-ready-wait");
+        let started = Instant::now();
+        let error =
+            wait_for_ready_claude_channel_until(&home, "claude-agent", Duration::from_millis(50))
+                .expect_err("missing locator must time out");
+        assert!(
+            error.to_string().contains("did not become ready within"),
+            "unexpected readiness error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded readiness wait must not hang"
         );
         let _ = fs::remove_dir_all(home);
     }
