@@ -1698,6 +1698,15 @@ pub(crate) enum BootstrapRegistrationState {
     AlreadyRegistered,
 }
 
+/// First-turn readiness authority plus the registration contract. Legacy PTY
+/// waits for raw prompt classification because a starting TUI can swallow bytes;
+/// structured adapters own their handshake, session discovery, and turn admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapWaitPolicy {
+    RawPromptIdle(BootstrapRegistrationState),
+    StructuredTransport(BootstrapRegistrationState),
+}
+
 impl IdleInjectWaitTerminal {
     fn label(self) -> &'static str {
         match self {
@@ -1730,34 +1739,26 @@ impl IdleInjectWaitResult {
     }
 }
 
-/// Poll until the agent reaches Idle, then inject the pre-read instructions
-/// content as a first user message. Used by backends (Kiro) whose CLI does
-/// not auto-load the steering file.
-///
-/// The `content` is captured at spawn time (see call site) rather than
-/// re-read after Ready: this closes the mutation window where an external
-/// process could swap the instructions file between write and inject.
-/// Poll until the agent reaches Idle (or timeout / shutdown / agent-gone), then
-/// settle and snapshot its [`InjectTarget`] with the registry lock released.
-/// `None` => do not inject. Shared by the Kiro instructions bootstrap and the
-/// fresh-restart self-kick — both "wait for the freshly-spawned session to reach
-/// the prompt, then type one first turn" (injecting while the backend is still
-/// `Starting` would be swallowed).
+/// Wait for the caller-selected first-turn readiness authority, then settle and
+/// snapshot its [`InjectTarget`] with the registry lock released. `RawPromptIdle`
+/// is used by Kiro instructions and LegacyPty self-kick delivery, whose bytes
+/// would be swallowed while the TUI is still starting. `StructuredTransport`
+/// waits only for the exact handle to register, then delegates handshake/thread
+/// discovery/turn admission to the adapter. `None` => do not inject.
 ///
 /// A restore can publish the exact UUID after this waiter starts. Absence is
 /// therefore tolerated until the deadline before first observation; once the
 /// handle has been observed, disappearance is an immediate terminal outcome.
 ///
-/// #CR-2026-06-14 (concurrency): snapshot the core Arc under the tier-1 registry
-/// lock, DROP the registry guard, THEN lock the core (in `bootstrap_core_is_idle`)
-/// — never nest the per-agent core lock inside the registry lock. The old
-/// registry→core nesting established an acquisition order a core→registry path
-/// could deadlock against, every 200ms at startup.
-fn wait_for_idle_inject_target_with_clock<Now, Sleep>(
+/// #CR-2026-06-14 (concurrency): for raw-prompt readiness, snapshot the core Arc
+/// under the tier-1 registry lock, DROP the registry guard, THEN lock the core
+/// (in `bootstrap_core_is_idle`) — never registry→core nested. Structured
+/// readiness needs no core lock.
+fn wait_for_bootstrap_inject_target_with_clock<Now, Sleep>(
     registry: &AgentRegistry,
     instance_id: crate::types::InstanceId,
     timeout: std::time::Duration,
-    registration_state: BootstrapRegistrationState,
+    policy: BootstrapWaitPolicy,
     shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
     now: &mut Now,
     sleep: &mut Sleep,
@@ -1768,10 +1769,11 @@ where
 {
     let poll_interval = std::time::Duration::from_millis(200);
     let settle_delay = std::time::Duration::from_millis(500);
-    let mut seen_handle = matches!(
-        registration_state,
-        BootstrapRegistrationState::AlreadyRegistered
-    );
+    let registration = match policy {
+        BootstrapWaitPolicy::RawPromptIdle(state)
+        | BootstrapWaitPolicy::StructuredTransport(state) => state,
+    };
+    let mut seen_handle = matches!(registration, BootstrapRegistrationState::AlreadyRegistered);
 
     loop {
         if let Some(s) = shutdown {
@@ -1801,12 +1803,18 @@ where
                 None => None,
             }
         };
-        if core.as_ref().is_some_and(bootstrap_core_is_idle) {
+        let ready = match policy {
+            BootstrapWaitPolicy::RawPromptIdle(_) => {
+                core.as_ref().is_some_and(bootstrap_core_is_idle)
+            }
+            BootstrapWaitPolicy::StructuredTransport(_) => core.is_some(),
+        };
+        if ready {
             break;
         }
         sleep(poll_interval);
     }
-    // Small settle delay so the prompt is fully painted before we type.
+    // Small settle delay for prompt paint or structured-session publication.
     sleep(settle_delay);
     // #1530/F1: snapshot the inject target under the registry lock, release it,
     // THEN inject (caller side) — never hold the registry across the blocking write.
@@ -1817,23 +1825,23 @@ where
     }
 }
 
-fn wait_for_idle_inject_target(
+fn wait_for_bootstrap_inject_target(
     registry: &AgentRegistry,
     instance_id: crate::types::InstanceId,
     name: &str,
     timeout: std::time::Duration,
-    registration_state: BootstrapRegistrationState,
+    policy: BootstrapWaitPolicy,
     shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
     what: &str,
 ) -> Option<InjectTarget> {
     let started = std::time::Instant::now();
     let mut now = || started.elapsed();
     let mut sleep = std::thread::sleep;
-    let result = wait_for_idle_inject_target_with_clock(
+    let result = wait_for_bootstrap_inject_target_with_clock(
         registry,
         instance_id,
         timeout,
-        registration_state,
+        policy,
         shutdown,
         &mut now,
         &mut sleep,
@@ -1864,12 +1872,12 @@ fn spawn_instructions_bootstrap(
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("instr_boot"); // M3: was "pty_reader"
         // force=true bootstrap → use the (non-gated) target inject directly.
-        if let Some(tgt) = wait_for_idle_inject_target(
+        if let Some(tgt) = wait_for_bootstrap_inject_target(
             &registry,
             instance_id,
             &name,
             timeout,
-            BootstrapRegistrationState::AlreadyRegistered,
+            BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::AlreadyRegistered),
             shutdown.as_ref(),
             "instructions",
         ) {
@@ -1892,12 +1900,12 @@ fn spawn_instructions_bootstrap(
 /// fresh-restart SELF-KICK. After a `restart_instance mode=fresh` respawn the new
 /// session sits idle with no first turn — nothing drives the agent to recover its
 /// in-flight state, so an operator-absent overnight restart silently strands the
-/// fleet (the recurring "lead restarted and just sat there" failure). This polls
-/// the freshly-spawned session to Idle (so the inject isn't swallowed while the
-/// backend is still `Starting`) and injects a single `[AGEND-RESUME]`
-/// self-bootstrap first turn. Only the LegacyPty route arms the inject-delivery
-/// verifier for ≤1 re-delivery; structured routes are never armed. Authorized
-/// paths are the SPAWN handler when `restart_spawn_params`
+/// fleet (the recurring "lead restarted and just sat there" failure). LegacyPty
+/// waits for raw prompt Idle; structured routes wait for exact registration and
+/// let their adapter own readiness/turn admission. It then delivers a single
+/// `[AGEND-RESUME]` self-bootstrap first turn. Only the LegacyPty route arms the
+/// inject-delivery verifier for ≤1 re-delivery; structured routes are never
+/// armed. Authorized paths are the SPAWN handler when `restart_spawn_params`
 /// sets the independent `self_kick_on_ready` flag (fresh restart), and the
 /// Owned app successor for an exact committed app-reexec requester — the flag
 /// is NEVER derived from `SpawnMode::Fresh` (initial fleet spawns are Fresh too,
@@ -1916,16 +1924,24 @@ pub(crate) fn spawn_self_kick_bootstrap(
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("self_kick");
         let prompt = fresh_restart_self_kick_prompt();
-        if let Some(tgt) = wait_for_idle_inject_target(
+        let wait_policy = if crate::transport::mode_for_instance(&home, &name)
+            == crate::transport::TransportMode::LegacyPty
+        {
+            BootstrapWaitPolicy::RawPromptIdle(registration_state)
+        } else {
+            BootstrapWaitPolicy::StructuredTransport(registration_state)
+        };
+        if let Some(tgt) = wait_for_bootstrap_inject_target(
             &registry,
             instance_id,
             &name,
             timeout,
-            registration_state,
+            wait_policy,
             shutdown.as_ref(),
             "self-kick",
         ) {
-            match deliver_self_kick(&registry, &home, &tgt, &prompt) {
+            let legacy_pty_ready = matches!(wait_policy, BootstrapWaitPolicy::RawPromptIdle(_));
+            match deliver_self_kick(&registry, &home, &tgt, &prompt, legacy_pty_ready) {
                 Ok(SelfKickDelivery::LegacyPty) => {
                     // LegacyPty arms its verification while the self-kick
                     // transport lane is still held; structured adapters remain

@@ -17,11 +17,11 @@ pub(crate) use receipt::{
     delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, ReceiptStore,
 };
 #[cfg(test)]
-pub(crate) use registry::test_support;
+pub(crate) use registry::mode_for_backend;
 #[cfg(test)]
-pub(crate) use registry::{mode_for_backend, mode_for_instance};
+pub(crate) use registry::test_support;
 
-pub(crate) use registry::{deliver_notification, record_delivery_drop};
+pub(crate) use registry::{deliver_notification, mode_for_instance, record_delivery_drop};
 
 pub(crate) use registry::{
     codex_attach_args, codex_attach_locator, codex_thread_for_spawn, opencode_attach_args,

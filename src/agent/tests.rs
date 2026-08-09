@@ -464,6 +464,7 @@ fn self_kick_direct_helper_ignores_full_delivery_queue() {
         &fixture.home,
         &fixture.target,
         "queue-full direct self-kick",
+        false,
     );
     crate::daemon::delivery_worker::test_support::set_force_full(false);
     assert!(matches!(result, Ok(SelfKickDelivery::ProtocolAccepted)));
@@ -497,12 +498,37 @@ fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
             &fixture.home,
             &fixture.target,
             "structured failure self-kick",
+            false,
         );
         assert!(result.is_err(), "{state:?} must not be treated as success");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no transport retry");
         assert!(fixture.written.lock().is_empty(), "no PTY fallback");
         clear_self_kick_fixture(&fixture);
     }
+}
+
+#[test]
+fn self_kick_structured_readiness_cannot_downgrade_to_legacy_pty() {
+    let _test_guard = SelfKickTestGuard::acquire();
+    let fixture = self_kick_fixture("structured-to-legacy");
+
+    // The fixture has no structured fleet/session anchor, so delivery resolves
+    // to LegacyPty. A caller that reached readiness via the structured path must
+    // fail closed instead of converting that weaker proof into a terminal write.
+    let result = deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "mode changed after structured readiness",
+        false,
+    );
+
+    assert!(result.is_err());
+    assert!(
+        fixture.written.lock().is_empty(),
+        "structured readiness must never authorize a later LegacyPty write"
+    );
+    clear_self_kick_fixture(&fixture);
 }
 
 #[test]
@@ -536,7 +562,8 @@ fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
         &fixture.registry,
         &fixture.home,
         &fixture.target,
-        "stale generation"
+        "stale generation",
+        false,
     )
     .is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -555,7 +582,8 @@ fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
         &fixture.registry,
         &fixture.home,
         &fixture.target,
-        "stale uuid"
+        "stale uuid",
+        false,
     )
     .is_err());
     clear_self_kick_fixture(&fixture);
@@ -572,9 +600,14 @@ fn self_kick_deleted_or_deleting_target_fails_closed() {
         .expect("fixture handle")
         .deleted
         .store(true, std::sync::atomic::Ordering::Release);
-    assert!(
-        deliver_self_kick(&fixture.registry, &fixture.home, &fixture.target, "deleted").is_err()
-    );
+    assert!(deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "deleted",
+        false,
+    )
+    .is_err());
     clear_self_kick_fixture(&fixture);
 
     let fixture = self_kick_fixture("deleting");
@@ -583,7 +616,8 @@ fn self_kick_deleted_or_deleting_target_fails_closed() {
         &fixture.registry,
         &fixture.home,
         &fixture.target,
-        "deleting"
+        "deleting",
+        false,
     )
     .is_err());
     clear_self_kick_fixture(&fixture);
@@ -774,6 +808,7 @@ fn self_kick_legacy_uses_captured_writer_after_registry_swap() {
         &fixture.home,
         &fixture.target,
         "captured writer self-kick",
+        true,
     );
     assert!(matches!(result, Ok(SelfKickDelivery::LegacyPty)));
     assert!(fixture.written.lock().ends_with(b"\r"));
@@ -3341,11 +3376,11 @@ fn wait_for_idle_inject_target_tolerates_preregistration_without_wall_clock() {
         }
     };
 
-    let result = wait_for_idle_inject_target_with_clock(
+    let result = wait_for_bootstrap_inject_target_with_clock(
         &registry,
         id,
         Duration::from_secs(1),
-        BootstrapRegistrationState::MayRegisterLater,
+        BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::MayRegisterLater),
         None,
         &mut now,
         &mut sleep,
@@ -3375,11 +3410,11 @@ fn wait_for_idle_inject_target_reports_never_registered_timeout_without_wall_clo
         logical_now.set(logical_now.get() + interval);
     };
 
-    let result = wait_for_idle_inject_target_with_clock(
+    let result = wait_for_bootstrap_inject_target_with_clock(
         &registry,
         id,
         Duration::from_millis(400),
-        BootstrapRegistrationState::MayRegisterLater,
+        BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::MayRegisterLater),
         None,
         &mut now,
         &mut sleep,
@@ -3389,6 +3424,80 @@ fn wait_for_idle_inject_target_reports_never_registered_timeout_without_wall_clo
         result.terminal,
         Some(IdleInjectWaitTerminal::NeverRegisteredTimeout)
     );
+}
+
+#[test]
+fn structured_bootstrap_readiness_accepts_registered_raw_active_without_wall_clock() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry
+        .lock()
+        .insert(id, mk_starting_handle_1441("structured-boot", id));
+    let logical_now = Cell::new(Duration::ZERO);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+    };
+
+    let result = wait_for_bootstrap_inject_target_with_clock(
+        &registry,
+        id,
+        Duration::from_secs(1),
+        BootstrapWaitPolicy::StructuredTransport(BootstrapRegistrationState::AlreadyRegistered),
+        None,
+        &mut now,
+        &mut sleep,
+    );
+
+    assert!(result.target.is_some());
+    assert_eq!(result.terminal, None);
+    assert_eq!(
+        logical_now.get(),
+        Duration::from_millis(500),
+        "structured readiness should only pay the common settle delay"
+    );
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
+}
+
+#[test]
+fn legacy_bootstrap_readiness_still_rejects_raw_active_without_wall_clock() {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry
+        .lock()
+        .insert(id, mk_starting_handle_1441("legacy-boot", id));
+    let logical_now = Cell::new(Duration::ZERO);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+    };
+
+    let result = wait_for_bootstrap_inject_target_with_clock(
+        &registry,
+        id,
+        Duration::from_millis(400),
+        BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::AlreadyRegistered),
+        None,
+        &mut now,
+        &mut sleep,
+    );
+
+    assert!(result.target.is_none());
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::NotIdleTimeout)
+    );
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
 }
 
 /// RED for the post-observation safety path: once the exact UUID was seen,
@@ -3411,11 +3520,11 @@ fn wait_for_idle_inject_target_aborts_after_seen_handle_disappears_without_wall_
         registry_for_sleep.lock().remove(&id);
     };
 
-    let result = wait_for_idle_inject_target_with_clock(
+    let result = wait_for_bootstrap_inject_target_with_clock(
         &registry,
         id,
         Duration::from_secs(10),
-        BootstrapRegistrationState::MayRegisterLater,
+        BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::MayRegisterLater),
         None,
         &mut now,
         &mut sleep,
@@ -3446,11 +3555,11 @@ fn wait_for_idle_inject_target_already_registered_absence_aborts_without_wall_cl
         panic!("already-registered absence must abort before polling");
     };
 
-    let result = wait_for_idle_inject_target_with_clock(
+    let result = wait_for_bootstrap_inject_target_with_clock(
         &registry,
         id,
         Duration::from_secs(10),
-        BootstrapRegistrationState::AlreadyRegistered,
+        BootstrapWaitPolicy::RawPromptIdle(BootstrapRegistrationState::AlreadyRegistered),
         None,
         &mut now,
         &mut sleep,
@@ -4201,7 +4310,7 @@ fn signal_kill_escalates_only_for_self_orch_1744_h5() {
 /// Replaces the fragile source-scanning invariant in
 /// `tests/review_bootstrap_lock_nesting_agent_binding.rs` (a grep over
 /// `spawn_instructions_bootstrap`'s body) with a REAL concurrent deadlock test
-/// that drives the production `wait_for_idle_inject_target` readiness loop
+/// that drives the production `wait_for_bootstrap_inject_target` readiness loop
 /// against a competing core→registry path.
 ///
 /// Finding: the readiness poll must snapshot `Arc::clone(&h.core)` UNDER the
@@ -4225,7 +4334,7 @@ fn signal_kill_escalates_only_for_self_orch_1744_h5() {
 /// neutered deadlock leaks only local locks — no cross-test contamination and
 /// no nextest serialize group is required.
 ///
-/// neuter-RED: in `wait_for_idle_inject_target`, lock the core WHILE holding the
+/// neuter-RED: in `wait_for_bootstrap_inject_target`, lock the core WHILE holding the
 /// registry guard — e.g. call `bootstrap_core_is_idle(&h.core)` inside the
 /// `let reg = registry.lock(); match reg.get(..) { Some(h) => ... }` block
 /// instead of cloning the `Arc` out and dropping `reg` first. This test then
@@ -4266,12 +4375,14 @@ fn bootstrap_readiness_no_registry_core_deadlock_real_path() {
             let bar_a = Arc::clone(&barrier);
             let a = std::thread::spawn(move || {
                 bar_a.wait();
-                let _ = wait_for_idle_inject_target(
+                let _ = wait_for_bootstrap_inject_target(
                     &reg_a,
                     id,
                     "boot",
                     Duration::from_millis(500),
-                    BootstrapRegistrationState::AlreadyRegistered,
+                    BootstrapWaitPolicy::RawPromptIdle(
+                        BootstrapRegistrationState::AlreadyRegistered,
+                    ),
                     None,
                     "deadlock-test",
                 );

@@ -8,13 +8,16 @@ pub(super) enum SelfKickDelivery {
 }
 
 /// Deliver the fresh-restart prompt exactly once on the transport lane. The
-/// target identity is captured after the Idle wait and checked against the
+/// target identity is captured after the readiness wait and checked against the
 /// current registry generation before the registry lock is released for I/O.
+/// `legacy_pty_ready` is the raw-prompt proof carried across that wait; a
+/// structured-ready caller cannot later fall through to a PTY write.
 pub(super) fn deliver_self_kick(
     registry: &AgentRegistry,
     home: &std::path::Path,
     target: &InjectTarget,
     prompt: &str,
+    legacy_pty_ready: bool,
 ) -> anyhow::Result<SelfKickDelivery> {
     crate::daemon::delivery_worker::with_transport_serial(home, &target.name, || {
         if deleting::is_deleting(home, target.name.as_str()) {
@@ -50,6 +53,15 @@ pub(super) fn deliver_self_kick(
             target.name.as_str(),
             &prompt,
             move |_home, _agent, text| {
+                // The readiness mode was selected before the bounded wait. If
+                // transport configuration changes from structured to LegacyPty
+                // meanwhile, fail closed instead of converting registration-only
+                // readiness into an unchecked terminal write.
+                if !legacy_pty_ready {
+                    return Err(anyhow::anyhow!(
+                        "LegacyPty self-kick lacks raw-prompt-idle readiness"
+                    ));
+                }
                 if legacy_called_by_closure.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     return Err(anyhow::anyhow!("LegacyPty closure invoked more than once"));
                 }
