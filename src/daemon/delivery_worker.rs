@@ -1074,6 +1074,44 @@ mod tests {
         // unique home available until its best-effort read has finished.
     }
 
+    /// Ordinary queued notifications must not consume a fixed transport worker
+    /// for the fresh-spawn ChannelBridge readiness window. The one-shot
+    /// fresh-restart self-kick owns that wait; background notifications fail
+    /// fast and leave capacity for unrelated keys.
+    #[test]
+    fn unavailable_channel_bridge_notification_releases_worker_without_readiness_wait() {
+        let _ff = test_support::force_full_guard();
+        test_support::set_force_full(false);
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-channel-unready-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  claude-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+        assert_eq!(
+            crate::transport::mode_for_instance(&home, "claude-agent"),
+            crate::transport::TransportMode::ChannelBridge
+        );
+        assert!(enqueue_transport_delivery(&home, "claude-agent", "ordinary wake").is_ok());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while test_support::transport_dispatch_count(&home, "claude-agent") == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, "claude-agent"),
+            1,
+            "ordinary ChannelBridge notification must fail fast instead of occupying a worker"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn legacy_transport_delivery_executes_one_physical_wake_on_worker() {
         let _ff = test_support::force_full_guard();
