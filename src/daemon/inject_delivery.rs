@@ -37,6 +37,10 @@ struct Pending {
     text: String,
     /// True once the single re-delivery has fired (the latch).
     redelivered: bool,
+    /// Transport generation that admitted the original actionable wake.
+    /// Re-delivery must be admitted against this exact generation so a
+    /// delete/redeploy cannot route the stale wake to a successor.
+    transport_epoch: u64,
 }
 
 fn store() -> &'static Mutex<HashMap<String, Pending>> {
@@ -53,7 +57,7 @@ fn now_ms() -> u64 {
 /// can be verified — never falsely re-inject a non-hook backend). A second arm
 /// for the same agent replaces the first (we verify the latest wake; a newer
 /// dispatch landing implies the pane is responsive anyway).
-pub(crate) fn arm(agent: &str, text: &str) {
+pub(crate) fn arm_with_transport_epoch(agent: &str, text: &str, transport_epoch: u64) {
     if crate::daemon::hook_shadow::snapshot_for(agent).is_none() {
         return;
     }
@@ -63,8 +67,22 @@ pub(crate) fn arm(agent: &str, text: &str) {
             injected_at_ms: now_ms(),
             text: text.to_string(),
             redelivered: false,
+            transport_epoch,
         },
     );
+    #[cfg(test)]
+    test_support::run_arm_hook(agent);
+}
+
+#[cfg(test)]
+pub(crate) fn arm(agent: &str, text: &str) {
+    arm_with_transport_epoch(agent, text, 0);
+}
+
+/// Forget any pending verification for a deleted agent so a same-name
+/// redeploy cannot inherit a stale actionable wake.
+pub(crate) fn forget(agent: &str) {
+    store().lock().remove(agent);
 }
 
 #[cfg(test)]
@@ -74,7 +92,90 @@ pub(crate) fn is_armed_for_test(agent: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn clear_for_test(agent: &str) {
-    store().lock().remove(agent);
+    forget(agent);
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    pub(crate) type ArmHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+    pub(crate) type VerifyBeforeRedeliveryHook =
+        std::sync::Arc<dyn Fn(&Path, &str, u64) + Send + Sync>;
+
+    static ARM_HOOK: OnceLock<parking_lot::Mutex<Option<ArmHook>>> = OnceLock::new();
+    static VERIFY_BEFORE_REDELIVERY_HOOK: OnceLock<
+        parking_lot::Mutex<Option<VerifyBeforeRedeliveryHook>>,
+    > = OnceLock::new();
+    static ARM_HOOK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static VERIFY_BEFORE_REDELIVERY_HOOK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    pub(crate) struct ArmHookGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn arm_hook_guard() -> ArmHookGuard {
+        let lock = ARM_HOOK_LOCK.lock();
+        set_arm_hook(None);
+        ArmHookGuard { _lock: lock }
+    }
+
+    pub(crate) fn set_arm_hook(hook: Option<ArmHook>) {
+        *ARM_HOOK
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock() = hook;
+    }
+
+    impl Drop for ArmHookGuard {
+        fn drop(&mut self) {
+            set_arm_hook(None);
+        }
+    }
+
+    pub(crate) struct VerifyBeforeRedeliveryHookGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn verify_before_redelivery_hook_guard() -> VerifyBeforeRedeliveryHookGuard {
+        let lock = VERIFY_BEFORE_REDELIVERY_HOOK_LOCK.lock();
+        set_verify_before_redelivery_hook(None);
+        VerifyBeforeRedeliveryHookGuard { _lock: lock }
+    }
+
+    pub(crate) fn set_verify_before_redelivery_hook(hook: Option<VerifyBeforeRedeliveryHook>) {
+        *VERIFY_BEFORE_REDELIVERY_HOOK
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock() = hook;
+    }
+
+    impl Drop for VerifyBeforeRedeliveryHookGuard {
+        fn drop(&mut self) {
+            set_verify_before_redelivery_hook(None);
+        }
+    }
+
+    pub(super) fn run_arm_hook(agent: &str) {
+        let hook = ARM_HOOK
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock()
+            .as_ref()
+            .cloned();
+        if let Some(hook) = hook {
+            hook(agent);
+        }
+    }
+
+    pub(super) fn run_verify_before_redelivery_hook(home: &Path, agent: &str, epoch: u64) {
+        let hook = VERIFY_BEFORE_REDELIVERY_HOOK
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock()
+            .as_ref()
+            .cloned();
+        if let Some(hook) = hook {
+            hook(home, agent, epoch);
+        }
+    }
 }
 
 /// Per-tick verification pass. For each armed agent:
@@ -86,7 +187,7 @@ pub(crate) fn verify_pass(home: &Path) {
     let now = now_ms();
     // Decide under the lock, act (re-inject) after dropping it — the inject is a
     // self-IPC vector (#1492) and must not run while holding our mutex.
-    let mut to_redeliver: Vec<(String, String)> = Vec::new();
+    let mut to_redeliver: Vec<(String, String, u64)> = Vec::new();
     let mut gave_up: Vec<String> = Vec::new();
     {
         let mut guard = store().lock();
@@ -99,7 +200,7 @@ pub(crate) fn verify_pass(home: &Path) {
                 return true; // still inside the window — keep waiting
             }
             if !p.redelivered {
-                to_redeliver.push((agent.clone(), p.text.clone()));
+                to_redeliver.push((agent.clone(), p.text.clone(), p.transport_epoch));
                 p.redelivered = true;
                 p.injected_at_ms = now; // fresh window for the re-delivery
                 true
@@ -109,23 +210,52 @@ pub(crate) fn verify_pass(home: &Path) {
             }
         });
     }
-    for (agent, text) in to_redeliver {
-        tracing::warn!(
-            agent = %agent,
-            tag = "#2044-inject-redeliver",
-            "actionable inject unconfirmed after {}s (no UserPromptSubmit) — re-delivering once \
-             (likely swallowed by an open interactive dialog)",
-            VERIFY_WINDOW_MS / 1000
-        );
-        crate::event_log::log(
-            home,
-            "inject_redelivered",
-            &agent,
-            "actionable inject unconfirmed (no UserPromptSubmit) — re-delivered once",
-        );
+    for (agent, text, transport_epoch) in to_redeliver {
         // Re-inject via the plain submit path — NOT compose_aware_inject — so the
         // re-delivery does not re-arm verification (the latch lives in `Pending`).
-        let _ = crate::inbox::notify::inject_notification_with_submit(home, &agent, &text);
+        #[cfg(test)]
+        test_support::run_verify_before_redelivery_hook(home, &agent, transport_epoch);
+        let result = crate::inbox::notify::inject_notification_with_submit_at_epoch(
+            home,
+            &agent,
+            &text,
+            transport_epoch,
+        );
+        match result {
+            Ok(()) => {
+                tracing::warn!(
+                    agent = %agent,
+                    tag = "#2044-inject-redeliver",
+                    "actionable inject unconfirmed after {}s (no UserPromptSubmit) — re-delivering once \
+                     (likely swallowed by an open interactive dialog)",
+                    VERIFY_WINDOW_MS / 1000
+                );
+                crate::event_log::log(
+                    home,
+                    "inject_redelivered",
+                    &agent,
+                    "actionable inject unconfirmed (no UserPromptSubmit) — re-delivered once",
+                );
+            }
+            Err(error) => {
+                let fenced = error.to_string().contains("fenced");
+                let (tag, kind, detail) = if fenced {
+                    (
+                        "#2044-inject-redeliver-suppressed",
+                        "inject_redelivery_suppressed",
+                        "redelivery admission fenced by a newer transport generation",
+                    )
+                } else {
+                    (
+                        "#2044-inject-redeliver-failed",
+                        "inject_redelivery_failed",
+                        "redelivery admission failed before adapter delivery",
+                    )
+                };
+                tracing::warn!(agent = %agent, error = %error, tag, "{detail}");
+                crate::event_log::log(home, kind, &agent, detail);
+            }
+        }
     }
     for agent in gave_up {
         tracing::warn!(
@@ -172,12 +302,17 @@ mod tests {
     /// UserPromptSubmit ordering are deterministic (no clock-collision races).
     /// Bypasses the hook-history gate — the gate is covered separately.
     fn arm_at(agent: &str, text: &str, injected_at_ms: u64) {
+        arm_at_with_epoch(agent, text, injected_at_ms, 0);
+    }
+
+    fn arm_at_with_epoch(agent: &str, text: &str, injected_at_ms: u64, transport_epoch: u64) {
         store().lock().insert(
             agent.to_string(),
             Pending {
                 injected_at_ms,
                 text: text.to_string(),
                 redelivered: false,
+                transport_epoch,
             },
         );
     }
@@ -280,6 +415,83 @@ mod tests {
             Some(true),
             "the pre-inject UserPromptSubmit must not confirm the new inject"
         );
+        forget(agent);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The verifier decides to redeliver outside its store lock. If destructive
+    /// teardown wins in that gap, the original epoch must fence the later
+    /// enqueue even after cleanup has made the name admissible again. This
+    /// proves the stale verifier cannot call an adapter, create a receipt, or
+    /// leave an arm behind for a same-name successor.
+    #[test]
+    fn stale_redelivery_after_delete_is_fenced_before_adapter_or_receipt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _g = test_guard();
+        let home = tmp_home("stale-redelivery-delete");
+        let agent = "stale-redelivery-delete-2044";
+        let _delivery_hook_guard = crate::transport::test_support::delivery_hook_guard();
+        let _verify_hook_guard = test_support::verify_before_redelivery_hook_guard();
+        forget(agent);
+        let original_epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, agent);
+        let now = now_ms();
+        arm_at_with_epoch(
+            agent,
+            "stale verifier wake",
+            now - VERIFY_WINDOW_MS - 1,
+            original_epoch,
+        );
+
+        let adapter_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let adapter_calls_hook = std::sync::Arc::clone(&adapter_calls);
+        let expected_home = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(std::sync::Arc::new(
+            move |called_home, called_agent, _body| {
+                if called_home == expected_home.as_path() && called_agent == agent {
+                    adapter_calls_hook.fetch_add(1, Ordering::SeqCst);
+                    Some(Err(anyhow::anyhow!("stale verifier reached the adapter")))
+                } else {
+                    None
+                }
+            },
+        )));
+
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_ran_hook = std::sync::Arc::clone(&hook_ran);
+        let delete_completed_hook = std::sync::Arc::clone(&delete_completed);
+        let fence_home = home.clone();
+        test_support::set_verify_before_redelivery_hook(Some(std::sync::Arc::new(
+            move |hook_home, hook_agent, _epoch| {
+                assert_eq!(hook_home, fence_home.as_path());
+                assert_eq!(hook_agent, agent);
+                hook_ran_hook.store(true, Ordering::SeqCst);
+                let fence = crate::daemon::lifecycle::DeleteFence::new(hook_home, hook_agent, true);
+                drop(fence);
+                delete_completed_hook.store(true, Ordering::SeqCst);
+            },
+        )));
+
+        verify_pass(&home);
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert!(delete_completed.load(Ordering::SeqCst));
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+        assert!(!is_armed_for_test(agent));
+        assert!(
+            !crate::transport::delivery_path_for_instance(&home, agent).exists(),
+            "fenced verifier redelivery must not create a receipt"
+        );
+        assert!(
+            !crate::transport::delivery_path_for_instance(&home, agent)
+                .with_extension("jsonl.lock")
+                .exists(),
+            "fenced verifier redelivery must not create a receipt lock"
+        );
+        let event_log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(!event_log.contains("\"kind\":\"inject_redelivered\""));
+        assert!(event_log.contains("inject_redelivery_suppressed"));
         forget(agent);
         std::fs::remove_dir_all(&home).ok();
     }

@@ -46,7 +46,7 @@ pub(crate) fn delete_with_runtime_or_legacy(
     skip_exit_wait: bool,
 ) {
     if let Some(context) = delete_context {
-        crate::agent_ops::delete_instance(home, name, context, skip_exit_wait);
+        crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait);
     } else {
         let mut params = json!({"name": name});
         if skip_exit_wait {
@@ -122,7 +122,14 @@ pub(crate) fn full_delete_instance_with_runtime(
     // chokepoints. `DeletingGuard::drop` un-marks on EVERY path (normal return,
     // early `Err`, panic), so the name is always re-creatable afterwards — a
     // leaked mark would make it un-spawnable for the daemon's lifetime.
-    let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
+    let mut delete_fence =
+        crate::daemon::lifecycle::DeleteFence::new(home, name, delete_context.is_some());
+    // Fence transport delivery before any teardown side effect. The keyed
+    // guard invalidates queued epochs and excludes same-agent I/O for the full
+    // delete transaction, including removal of the receipt files below.
+    // The no-runtime legacy fallback enters the API handler below, whose
+    // shared managed-delete boundary owns the transport guard itself; holding
+    // this guard across self-IPC would deadlock on the keyed lane.
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     let is_claude = fleet
         .as_ref()
@@ -251,11 +258,13 @@ pub(crate) fn full_delete_instance_with_runtime(
         }
     }
 
-    // Structured transport receipts are daemon-owned per-instance state. Stop
-    // queued/in-flight transport work before removing its JSONL and lock; the
-    // cleanup guard also invalidates jobs enqueued during this teardown so a
-    // late worker dequeue cannot recreate the deleted instance's receipts.
-    let _transport_cleanup = crate::daemon::delivery_worker::begin_transport_cleanup(home, name);
+    // Structured transport receipts are daemon-owned per-instance state. Runtime
+    // deletes hold the keyed guard from entry; the legacy self-IPC fallback
+    // acquires it here after the API transaction returns, before the final
+    // receipt removal and residual audit.
+    if delete_context.is_none() {
+        delete_fence.attach_transport_cleanup(home, name);
+    }
     if let Err(e) = crate::transport::remove_instance_delivery_state(home, name) {
         step_errors.push(format!("transport delivery cleanup: {e}"));
     }
@@ -283,6 +292,9 @@ pub(crate) fn full_delete_instance_with_runtime(
     // accumulate in the tracking list and inflate alert text.
     crate::daemon::idle_watchdog::remove_agent_activity(home, name);
 
+    // #2044: forget any pending actionable inject verification before a
+    // same-name redeploy can inherit a stale re-delivery.
+    crate::daemon::inject_delivery::forget(name);
     // CR-2026-06-14: drop the in-memory hook-shadow store entry — same
     // per-agent-residual / stale-state-on-redeploy class as the sidecars above,
     // but this global `HashMap<name, HookShadow>` had no eviction path (it only

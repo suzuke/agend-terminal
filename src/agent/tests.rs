@@ -4,7 +4,17 @@ use crate::transport::{
 };
 
 static R8_DISMISS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static SELF_KICK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+struct SelfKickTestGuard {
+    _hook: crate::transport::test_support::DeliveryHookGuard,
+}
+
+impl SelfKickTestGuard {
+    fn acquire() -> Self {
+        Self {
+            _hook: crate::transport::test_support::delivery_hook_guard(),
+        }
+    }
+}
 
 /// #945 Phase 1: pending-registry slot publishes the agent registry
 /// to the background `telegram_init` thread. The slot is a
@@ -202,9 +212,7 @@ fn fresh_restart_self_kick_prompt_shape() {
 /// test hook only replaces the external adapter I/O.
 #[test]
 fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
-    let _test_guard = SELF_KICK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _test_guard = SelfKickTestGuard::acquire();
     use crate::transport::{DeliveryEnvelope, DeliveryKind, SessionLocator};
     use crate::transport::{DeliveryReceipt, DeliveryState};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -425,9 +433,8 @@ fn clear_self_kick_fixture(fixture: &SelfKickFixture) {
 fn self_kick_direct_helper_ignores_full_delivery_queue() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let _test_guard = SELF_KICK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+    let _test_guard = SelfKickTestGuard::acquire();
     let fixture = self_kick_fixture("queue-full");
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_hook = Arc::clone(&calls);
@@ -444,7 +451,6 @@ fn self_kick_direct_helper_ignores_full_delivery_queue() {
             DeliveryState::ProtocolAccepted,
         )))
     })));
-    let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
     crate::daemon::delivery_worker::test_support::set_force_full(true);
     let result = deliver_self_kick(
         &fixture.registry,
@@ -463,9 +469,7 @@ fn self_kick_direct_helper_ignores_full_delivery_queue() {
 fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let _test_guard = SELF_KICK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _test_guard = SelfKickTestGuard::acquire();
     for state in [DeliveryState::Ambiguous, DeliveryState::Failed] {
         let fixture = self_kick_fixture("structured-fail");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -498,9 +502,7 @@ fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
 fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let _test_guard = SELF_KICK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _test_guard = SelfKickTestGuard::acquire();
     let fixture = self_kick_fixture("generation");
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_hook = Arc::clone(&calls);
@@ -554,9 +556,7 @@ fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
 
 #[test]
 fn self_kick_deleted_or_deleting_target_fails_closed() {
-    let _test_guard = SELF_KICK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _test_guard = SelfKickTestGuard::acquire();
     let fixture = self_kick_fixture("deleted");
     fixture
         .registry
@@ -584,9 +584,7 @@ fn self_kick_deleted_or_deleting_target_fails_closed() {
 
 #[test]
 fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
-    let _test_guard = SELF_KICK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _test_guard = SelfKickTestGuard::acquire();
     let fixture = self_kick_fixture("legacy");
     assert_eq!(fixture.target.submit_key, "\r");
     assert!(!fixture
@@ -613,7 +611,10 @@ fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
         None,
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while !fixture.written.lock().ends_with(b"\r") && std::time::Instant::now() < deadline {
+    while (!fixture.written.lock().ends_with(b"\r")
+        || !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name))
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let written = fixture.written.lock().clone();
@@ -628,6 +629,150 @@ fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
     assert!(
         crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
         "only LegacyPty delivery arms the hook verifier"
+    );
+    clear_self_kick_fixture(&fixture);
+}
+
+#[test]
+fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _test_guard = SelfKickTestGuard::acquire();
+    let _arm_guard = crate::daemon::inject_delivery::test_support::arm_hook_guard();
+    let mut fixture = self_kick_fixture("arm-delete-order");
+    crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
+    let writer_entered = Arc::new(AtomicBool::new(false));
+    let writer_release = Arc::new(AtomicBool::new(false));
+    let blocking_writer: PtyWriter = Arc::new(Mutex::new(Box::new(BlockingWriter {
+        bytes: Arc::clone(&fixture.written),
+        entered: Arc::clone(&writer_entered),
+        release: Arc::clone(&writer_release),
+    })));
+    fixture.target.pty_writer = Arc::clone(&blocking_writer);
+    fixture
+        .registry
+        .lock()
+        .get_mut(&fixture.id)
+        .expect("fixture handle")
+        .pty_writer = blocking_writer;
+    fixture
+        .registry
+        .lock()
+        .get_mut(&fixture.id)
+        .expect("fixture handle")
+        .core
+        .lock()
+        .state
+        .current = crate::state::AgentState::Idle;
+    let (arm_tx, arm_rx) = std::sync::mpsc::channel();
+    let delete_finished = Arc::new(AtomicBool::new(false));
+    let delete_finished_for_arm = Arc::clone(&delete_finished);
+    let expected_agent = fixture.name.clone();
+    crate::daemon::inject_delivery::test_support::set_arm_hook(Some(Arc::new(move |agent| {
+        if agent == expected_agent {
+            arm_tx
+                .send(delete_finished_for_arm.load(Ordering::SeqCst))
+                .expect("arm observer");
+        }
+    })));
+
+    let bootstrap_registry = Arc::clone(&fixture.registry);
+    let bootstrap_id = fixture.id;
+    let bootstrap_name = fixture.name.clone();
+    let bootstrap_home = fixture.home.clone();
+    spawn_self_kick_bootstrap(
+        bootstrap_registry,
+        bootstrap_id,
+        bootstrap_name,
+        bootstrap_home,
+        std::time::Duration::from_secs(2),
+        BootstrapRegistrationState::AlreadyRegistered,
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !writer_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        writer_entered.load(Ordering::SeqCst),
+        "Legacy self-kick must reach its captured writer before delete starts"
+    );
+
+    let (delete_started_tx, delete_started_rx) = std::sync::mpsc::channel();
+    let (delete_done_tx, delete_done_rx) = std::sync::mpsc::channel();
+    let delete_home = fixture.home.clone();
+    let delete_agent = fixture.name.clone();
+    let delete_finished_for_thread = Arc::clone(&delete_finished);
+    let delete = std::thread::spawn(move || {
+        delete_started_tx.send(()).expect("delete start observer");
+        let fence = crate::daemon::lifecycle::DeleteFence::new(&delete_home, &delete_agent, true);
+        drop(fence);
+        delete_finished_for_thread.store(true, Ordering::SeqCst);
+        delete_done_tx.send(()).expect("delete done observer");
+    });
+    delete_started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("delete thread must start");
+    let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !crate::agent::deleting::is_deleting(&fixture.home, &fixture.name)
+        && std::time::Instant::now() < marker_deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(crate::agent::deleting::is_deleting(
+        &fixture.home,
+        &fixture.name
+    ));
+    assert!(
+        delete_done_rx.try_recv().is_err(),
+        "delete must wait for the self-kick lane while the writer is blocked"
+    );
+
+    writer_release.store(true, Ordering::SeqCst);
+    let arm_after_delete = arm_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("Legacy arm observer");
+    delete_done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("delete must complete after self-kick releases the lane");
+    delete.join().expect("delete thread");
+    assert!(
+        !arm_after_delete,
+        "Legacy arm must occur before delete completes, while the lane is held"
+    );
+    assert!(
+        !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
+        "delete's post-acquisition forget must clear the Legacy verification arm"
+    );
+    clear_self_kick_fixture(&fixture);
+}
+
+#[test]
+fn self_kick_legacy_uses_captured_writer_after_registry_swap() {
+    let _test_guard = SelfKickTestGuard::acquire();
+    let fixture = self_kick_fixture("captured-writer");
+    let replacement_written = Arc::new(Mutex::new(Vec::new()));
+    let replacement_writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&replacement_written),
+    })));
+    fixture
+        .registry
+        .lock()
+        .get_mut(&fixture.id)
+        .expect("fixture handle")
+        .pty_writer = replacement_writer;
+
+    let result = deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "captured writer self-kick",
+    );
+    assert!(matches!(result, Ok(SelfKickDelivery::LegacyPty)));
+    assert!(fixture.written.lock().ends_with(b"\r"));
+    assert!(
+        replacement_written.lock().is_empty(),
+        "a registry writer swapped after capture must not receive the self-kick"
     );
     clear_self_kick_fixture(&fixture);
 }
@@ -2880,6 +3025,42 @@ struct RecordingWriter {
 impl std::io::Write for RecordingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.bytes.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BlockingWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::io::Write for BlockingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().extend_from_slice(buf);
+        if !self.entered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !self.release.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            if !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                // A failed ordering assertion must not leave the detached
+                // bootstrap thread spinning forever; return a visible I/O
+                // failure after the bounded self-release deadline.
+                self.release
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "BlockingWriter release deadline exceeded",
+                ));
+            }
+        }
         Ok(buf.len())
     }
 

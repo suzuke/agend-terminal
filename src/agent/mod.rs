@@ -175,6 +175,9 @@ pub(crate) use inject_offload::{
     inject_target_physical, inject_with_target_gated_offload, InjectDispatch,
 };
 
+mod self_kick;
+use self_kick::{deliver_self_kick, SelfKickDelivery};
+
 /// Returns true if the env-var name is on the spawn-time deny-list.
 pub fn is_sensitive_env_key(key: &str) -> bool {
     SENSITIVE_ENV_KEYS
@@ -1300,6 +1303,18 @@ pub(crate) fn spawn_agent_with_capture_home(
     let transport_generation_guard = (*home).map(|home_path| {
         crate::daemon::delivery_worker::begin_transport_generation_transition(home_path, name)
     });
+    // The delete mark may have been acquired after the precheck but before the
+    // keyed transport lane. Re-check after the lane admission so preparation
+    // cannot proceed concurrently with a teardown that is now serialized on
+    // the same generation key.
+    if let Some(home_path) = *home {
+        if deleting::is_deleting(home_path, name) {
+            drop(transport_generation_guard);
+            anyhow::bail!(
+                "#1915: refusing to spawn '{name}' — instance entered deletion after lane admission"
+            );
+        }
+    }
 
     // OpenCode NativeShared owns the server/session handshake before the PTY
     // exists. The resulting attach locator is then consumed by `build_command`,
@@ -1834,78 +1849,6 @@ fn wait_for_idle_inject_target(
     result.target
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelfKickDelivery {
-    ProtocolAccepted,
-    LegacyPty,
-}
-
-/// Deliver the fresh-restart prompt exactly once on the transport lane. The
-/// target identity is captured after the Idle wait and checked against the
-/// current registry generation before the registry lock is released for I/O.
-fn deliver_self_kick(
-    registry: &AgentRegistry,
-    home: &std::path::Path,
-    target: &InjectTarget,
-    prompt: &str,
-) -> anyhow::Result<SelfKickDelivery> {
-    crate::daemon::delivery_worker::with_transport_serial(|| {
-        if deleting::is_deleting(home, target.name.as_str()) {
-            return Err(anyhow::anyhow!(
-                "self-kick target is being deleted: {}",
-                target.name
-            ));
-        }
-
-        let target_is_current = {
-            let reg = lock_registry(registry);
-            reg.get(&target.instance_id).is_some_and(|handle| {
-                handle.id == target.instance_id
-                    && handle.name.as_str() == target.name.as_str()
-                    && handle.generation == target.generation
-                    && !handle.deleted.load(std::sync::atomic::Ordering::Acquire)
-            })
-        };
-        if !target_is_current || target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(anyhow::anyhow!(
-                "self-kick target is stale: {} ({})",
-                target.name,
-                target.instance_id
-            ));
-        }
-
-        let legacy_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let legacy_called_by_closure = Arc::clone(&legacy_called);
-        let target_for_legacy = target.clone();
-        let prompt = prompt.to_string();
-        let receipt = crate::transport::deliver_notification(
-            home,
-            target.name.as_str(),
-            &prompt,
-            move |_home, _agent, text| {
-                if legacy_called_by_closure.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    return Err(anyhow::anyhow!("LegacyPty closure invoked more than once"));
-                }
-                inject_with_target(&target_for_legacy, text.as_bytes())
-                    .map_err(|error| anyhow::anyhow!("LegacyPty self-kick failed: {error}"))
-            },
-        )?;
-
-        if receipt.state == crate::transport::DeliveryState::ProtocolAccepted {
-            return Ok(SelfKickDelivery::ProtocolAccepted);
-        }
-        if receipt.state == crate::transport::DeliveryState::Ambiguous
-            && legacy_called.load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(SelfKickDelivery::LegacyPty);
-        }
-        Err(anyhow::anyhow!(
-            "self-kick transport did not accept delivery: {:?}",
-            receipt.state
-        ))
-    })
-}
-
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,
@@ -1952,8 +1895,9 @@ fn spawn_instructions_bootstrap(
 /// fleet (the recurring "lead restarted and just sat there" failure). This polls
 /// the freshly-spawned session to Idle (so the inject isn't swallowed while the
 /// backend is still `Starting`) and injects a single `[AGEND-RESUME]`
-/// self-bootstrap first turn, armed for ≤1 re-delivery via the inject-delivery
-/// verifier. Authorized paths are the SPAWN handler when `restart_spawn_params`
+/// self-bootstrap first turn. Only the LegacyPty route arms the inject-delivery
+/// verifier for ≤1 re-delivery; structured routes are never armed. Authorized
+/// paths are the SPAWN handler when `restart_spawn_params`
 /// sets the independent `self_kick_on_ready` flag (fresh restart), and the
 /// Owned app successor for an exact committed app-reexec requester — the flag
 /// is NEVER derived from `SpawnMode::Fresh` (initial fleet spawns are Fresh too,
@@ -1983,9 +1927,9 @@ pub(crate) fn spawn_self_kick_bootstrap(
         ) {
             match deliver_self_kick(&registry, &home, &tgt, &prompt) {
                 Ok(SelfKickDelivery::LegacyPty) => {
-                    // Only LegacyPty has a physical write without a protocol
-                    // receipt; structured adapters must never arm this hook.
-                    crate::daemon::inject_delivery::arm(&name, &prompt);
+                    // LegacyPty arms its verification while the self-kick
+                    // transport lane is still held; structured adapters remain
+                    // never-armed.
                     tracing::info!(agent = %name, "fresh-restart self-kick injected");
                 }
                 Ok(SelfKickDelivery::ProtocolAccepted) => {

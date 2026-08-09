@@ -118,7 +118,7 @@ ratatui = "0.30"
 
 # Concurrency
 crossbeam-channel = "0.5"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 # Lock-free single-writer/multi-reader snapshot publish for off-thread parse
 # (Option X, AGEND_OFFTHREAD_PARSE): render loads an immutable GridSnapshot
 # without blocking the per-pane parser thread.

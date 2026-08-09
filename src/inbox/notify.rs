@@ -345,12 +345,36 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     // the PTY regardless of an operator DRAFT — only the busy/typing gate above
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
-        let _ = inject_with_submit(home, agent_name, notification);
-        // #2044: arm delivery-verification — if this actionable wake is
-        // swallowed by an open operator dialog (no UserPromptSubmit follows),
-        // the per-tick watchdog re-delivers it once. No-op for non-hook
-        // backends (arm self-gates on hook history).
-        crate::daemon::inject_delivery::arm(agent_name, notification);
+        match inject_with_submit_admitted(home, agent_name, notification) {
+            Ok(epoch) => {
+                // #2044: arm delivery-verification only after admission succeeds,
+                // and linearize it against delete/transition on the captured
+                // per-key epoch. A delayed accepted enqueue cannot leave a stale
+                // 30s re-delivery behind teardown.
+                #[cfg(test)]
+                crate::daemon::delivery_worker::test_support::run_transport_accepted_before_arm_hook(
+                    home, agent_name, epoch,
+                );
+                if !crate::daemon::delivery_worker::arm_transport_verification_if_current(
+                    home,
+                    agent_name,
+                    epoch,
+                    notification,
+                ) {
+                    tracing::debug!(
+                        agent = %agent_name,
+                        "accepted actionable inject became stale before verification arm"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    agent = %agent_name,
+                    error = %error,
+                    "actionable notification inject was not admitted"
+                );
+            }
+        }
         return;
     }
     let _ = route_notification(home, agent_name, notification, |msg| {
@@ -759,32 +783,94 @@ where
 }
 
 /// AUDIT2-006: the selected transport delivery is offloaded to the bounded
-/// worker so the tick / main-loop thread never blocks on PTY readback or a
+/// scheduler so the tick / main-loop thread never blocks on PTY readback or a
 /// structured backend handshake/RPC. LegacyPty performs its physical wake from
 /// that worker; structured modes never invoke the PTY closure. Every upstream
-/// durable decision — the #911 dedup gate, the #1513 defer→`enqueue_classified`,
-/// the #2044 verification arm — has already run synchronously on the caller.
+/// durable decision — the #911 dedup gate and the #1513 defer→`enqueue_classified`
+/// decision — has already run synchronously on the caller. The #2044
+/// verification arm is performed by `compose_aware_inject` only after this
+/// helper reports accepted admission and the epoch remains current.
 ///
-/// Returns `Ok(())` once the wake is accepted by the bounded queue; `Err` only
-/// when the queue is full (the wake is dropped — the worker module logs a WARN).
+/// Returns `Ok(())` once the wake is accepted by the bounded queue. Queue-full
+/// admission records a durable drop; teardown/generation fencing is returned
+/// without writing a receipt because cleanup owns that lifecycle boundary.
+fn inject_with_submit_admitted(
+    home: &Path,
+    agent_name: &str,
+    message: &str,
+) -> anyhow::Result<u64> {
+    finish_transport_admission(
+        home,
+        agent_name,
+        message,
+        crate::daemon::delivery_worker::enqueue_transport_delivery_with_epoch(
+            home, agent_name, message,
+        ),
+    )
+}
+
+/// Re-deliveries from #2044 carry the epoch that admitted the original wake.
+/// The store lock is intentionally released by `verify_pass` before this call;
+/// the transport epoch is the cross-lock fence that prevents a stale verifier
+/// decision from reaching a same-name successor.
+pub(crate) fn inject_notification_with_submit_at_epoch(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    expected_epoch: u64,
+) -> anyhow::Result<()> {
+    finish_transport_admission(
+        home,
+        agent_name,
+        notification,
+        crate::daemon::delivery_worker::enqueue_transport_delivery_at_epoch(
+            home,
+            agent_name,
+            notification,
+            expected_epoch,
+        ),
+    )
+    .map(|_| ())
+}
+
+fn finish_transport_admission(
+    home: &Path,
+    agent_name: &str,
+    message: &str,
+    admission: Result<u64, crate::daemon::delivery_worker::TransportEnqueueError>,
+) -> anyhow::Result<u64> {
+    match admission {
+        Ok(epoch) => Ok(epoch),
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { epoch }) => {
+            let reason = "bounded transport delivery queue full; delivery was not attempted";
+            #[cfg(test)]
+            crate::daemon::delivery_worker::test_support::run_queue_full_before_record_hook(
+                home, agent_name, epoch,
+            );
+            let recorded = crate::daemon::delivery_worker::record_queue_full_drop_if_current(
+                home, agent_name, message, epoch, reason,
+            )?;
+            if !recorded {
+                return Err(anyhow::anyhow!(
+                    "transport delivery queue-full result became stale during teardown or generation transition"
+                ));
+            }
+            Err(anyhow::anyhow!(
+                "delivery queue full — transport delivery dropped"
+            ))
+        }
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => Err(anyhow::anyhow!(
+            "transport delivery fenced during teardown or generation transition"
+        )),
+    }
+}
+
 fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
-    if crate::daemon::delivery_worker::enqueue_transport_delivery(home, agent_name, message).is_ok()
-    {
-        return Ok(());
-    }
-    let reason = "bounded transport delivery queue full; delivery was not attempted";
-    if let Err(error) = crate::transport::record_delivery_drop(home, agent_name, message, reason) {
-        return Err(anyhow::anyhow!(
-            "delivery queue full and durable failure receipt failed: {error}"
-        ));
-    }
-    Err(anyhow::anyhow!(
-        "delivery queue full — transport delivery dropped"
-    ))
+    inject_with_submit_admitted(home, agent_name, message).map(|_| ())
 }
 
 /// The physical submit-aware inject primitive: a self-IPC `api::call(INJECT)`
-/// loopback that drives the actual PTY write. Runs on the delivery worker thread
+/// loopback that drives the actual PTY write. Runs on a transport scheduler worker
 /// (see [`inject_with_submit`]); callers on the tick / main-loop thread MUST go
 /// through the offload wrapper instead of calling this directly.
 pub(crate) fn inject_with_submit_direct(
@@ -1490,7 +1576,7 @@ mod should_defer_direct_inject_tests_1513pr2 {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod structured_transport_delivery_tests {
-    use super::inject_notification_with_submit;
+    use super::{compose_aware_inject, inject_notification_with_submit};
     #[cfg(unix)]
     use crate::transport::SessionLocator;
     use crate::transport::{DeliveryState, ReceiptStore};
@@ -1580,5 +1666,104 @@ mod structured_transport_delivery_tests {
         let body = std::fs::read_to_string(store.path()).expect("receipt log");
         assert!(body.contains(&format!("\"state\":\"{:?}\"", DeliveryState::Failed)));
         assert!(body.contains("bounded transport delivery queue full"));
+    }
+
+    #[test]
+    fn accepted_actionable_inject_does_not_arm_after_delete() {
+        let home = tmp_home("accepted-stale-arm");
+        let agent = "codex-agent";
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _delivery_hook = crate::transport::test_support::delivery_hook_guard();
+        let _accepted_hook_guard =
+            crate::daemon::delivery_worker::test_support::transport_accepted_before_arm_hook_guard(
+            );
+        crate::transport::test_support::set_delivery_hook(Some(std::sync::Arc::new(|_, _, _| {
+            Some(Err(anyhow::anyhow!("accepted stale-arm probe")))
+        })));
+        crate::daemon::inject_delivery::forget(agent);
+        crate::daemon::hook_shadow::record_event(agent, "UserPromptSubmit", None);
+        let expected_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_transport_accepted_before_arm_hook(Some(
+            std::sync::Arc::new(move |hook_home, hook_agent, _epoch| {
+                if hook_home != expected_home.as_path() || hook_agent != agent {
+                    return;
+                }
+                let cleanup_home = hook_home.to_path_buf();
+                let cleanup_agent = hook_agent.to_string();
+                std::thread::spawn(move || {
+                    let fence = crate::daemon::lifecycle::DeleteFence::new(
+                        &cleanup_home,
+                        &cleanup_agent,
+                        true,
+                    );
+                    drop(fence);
+                })
+                .join()
+                .expect("delete cleanup thread");
+            }),
+        ));
+
+        compose_aware_inject(
+            &home,
+            agent,
+            "\x1b[43;30m[AGEND-MSG-PENDING]\x1b[0m id=m-accepted kind=task from=lead ",
+        );
+        crate::transport::test_support::set_delivery_hook(None);
+        assert!(
+            !crate::daemon::inject_delivery::is_armed_for_test(agent),
+            "accepted work invalidated by delete must not arm verification"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn fenced_actionable_inject_does_not_arm_verification() {
+        let home = tmp_home("fenced-no-arm");
+        let agent = "codex-agent";
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _tail_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_release_tail_hook_guard();
+        crate::daemon::inject_delivery::forget(agent);
+        crate::daemon::hook_shadow::record_event(agent, "UserPromptSubmit", None);
+        let expected_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_release_tail_hook(Some(
+            std::sync::Arc::new(move |hook_home, hook_agent| {
+                if hook_home == expected_home.as_path() && hook_agent == agent {
+                    compose_aware_inject(
+                        hook_home,
+                        hook_agent,
+                        "\x1b[43;30m[AGEND-MSG-PENDING]\x1b[0m id=m-fenced kind=task from=lead ",
+                    );
+                }
+            }),
+        ));
+
+        let fence = crate::daemon::lifecycle::DeleteFence::new(&home, agent, true);
+        drop(fence);
+        assert!(
+            !crate::daemon::inject_delivery::is_armed_for_test(agent),
+            "fenced actionable admission must not arm stale verification"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn delete_forgets_existing_inject_verification() {
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        let home = tmp_home("forget-inject-verification");
+        let agent = "codex-agent";
+        crate::daemon::hook_shadow::record_event(agent, "UserPromptSubmit", None);
+        crate::daemon::inject_delivery::arm(agent, "stale actionable wake");
+        assert!(crate::daemon::inject_delivery::is_armed_for_test(agent));
+
+        let fence = crate::daemon::lifecycle::DeleteFence::new(&home, agent, true);
+        drop(fence);
+        assert!(
+            !crate::daemon::inject_delivery::is_armed_for_test(agent),
+            "destructive delete must clear an already-armed verification"
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 }

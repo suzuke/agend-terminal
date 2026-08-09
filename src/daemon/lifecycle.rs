@@ -34,6 +34,49 @@ const CHILD_EXIT_POLL: Duration = Duration::from_millis(50);
 
 type ChildArc = Arc<Mutex<Box<dyn portable_pty::Child + Send>>>;
 
+/// Owns the two deletion fences whose teardown order is load-bearing. The
+/// deleting marker is cleared first while the keyed transport state/lane is
+/// still active; the transport guard then performs its final epoch bump and
+/// releases the lane. This prevents an enqueue from observing a fresh epoch
+/// after the marker disappears but before transport invalidation completes.
+pub(crate) struct DeleteFence {
+    deleting: Option<crate::agent::deleting::DeletingGuard>,
+    transport: Option<crate::daemon::delivery_worker::TransportGenerationGuard>,
+}
+
+impl DeleteFence {
+    pub(crate) fn new(home: &Path, name: &str, hold_transport: bool) -> Self {
+        let deleting = Some(crate::agent::deleting::mark_deleting(home, name));
+        let transport = hold_transport
+            .then(|| crate::daemon::delivery_worker::begin_transport_cleanup(home, name));
+        // The final forget must follow keyed transport ownership. Otherwise a
+        // self-kick that already owns the lane could arm after this early
+        // forget and before cleanup acquires the lane.
+        if transport.is_some() {
+            crate::daemon::inject_delivery::forget(name);
+        }
+        Self {
+            deleting,
+            transport,
+        }
+    }
+
+    pub(crate) fn attach_transport_cleanup(&mut self, home: &Path, name: &str) {
+        debug_assert!(self.transport.is_none());
+        self.transport = Some(crate::daemon::delivery_worker::begin_transport_cleanup(
+            home, name,
+        ));
+        crate::daemon::inject_delivery::forget(name);
+    }
+}
+
+impl Drop for DeleteFence {
+    fn drop(&mut self) {
+        drop(self.deleting.take());
+        drop(self.transport.take());
+    }
+}
+
 /// Wait up to [`CHILD_EXIT_TIMEOUT`] for the child to transition to exited.
 /// Returns `true` if the child exited within the budget; `false` if the
 /// timeout fired (caller should force-remove the registry entry anyway and log
@@ -80,6 +123,27 @@ fn drop_active_binding(name: &str) {
 /// if [`CHILD_EXIT_TIMEOUT`] fired and we force-removed anyway. When
 /// `skip_exit_wait` is `true`, always returns `true` (optimistic).
 pub fn delete_transaction(
+    home: &Path,
+    name: &str,
+    registry: &AgentRegistry,
+    configs: Option<&Arc<Mutex<HashMap<String, super::AgentConfig>>>>,
+    skip_exit_wait: bool,
+) -> bool {
+    let _delete_fence = DeleteFence::new(home, name, true);
+    if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+        tracing::warn!(
+            agent = %name,
+            error = %error,
+            "delete: transport delivery cleanup failed"
+        );
+    }
+    delete_transaction_under_guard(home, name, registry, configs, skip_exit_wait)
+}
+
+/// Shared delete transaction body. Callers must already hold the deleting mark
+/// and keyed transport cleanup guard; this is used by full-delete, whose larger
+/// residual teardown owns those guards across all of its side effects.
+pub(crate) fn delete_transaction_under_guard(
     home: &Path,
     name: &str,
     registry: &AgentRegistry,
@@ -270,6 +334,420 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn transport_aware_rollback_cleans_receipts_after_active_delivery() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _hook_guard = crate::transport::test_support::delivery_hook_guard();
+        let home = tmp_home("transport-rollback");
+        let agent = "rollback-agent";
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        let expected_home = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |called_home, name, body| {
+                if called_home != expected_home.as_path() {
+                    return None;
+                }
+                let envelope = crate::transport::DeliveryEnvelope::new(
+                    name,
+                    crate::transport::SessionLocator::codex(
+                        std::path::PathBuf::from("/tmp/rollback-test.sock"),
+                        Some("rollback-test-thread".to_string()),
+                    ),
+                    crate::transport::DeliveryKind::Notification,
+                    body,
+                    None,
+                );
+                let store = crate::transport::ReceiptStore::for_instance(called_home, name)
+                    .expect("receipt store");
+                store.record_queued(&envelope).expect("queued receipt");
+                let receipt = crate::transport::DeliveryReceipt::for_state(
+                    &envelope,
+                    crate::transport::DeliveryState::ProtocolAccepted,
+                );
+                store.record(receipt.clone()).expect("terminal receipt");
+                entered_hook.store(true, Ordering::SeqCst);
+                while !release_hook.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Some(Ok(receipt))
+            },
+        )));
+        assert!(crate::daemon::delivery_worker::enqueue_transport_delivery(
+            &home,
+            agent,
+            "rollback wake",
+        )
+        .is_ok());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(entered.load(Ordering::SeqCst));
+
+        let registry = empty_registry();
+        let rollback_home = home.clone();
+        let rollback_registry = Arc::clone(&registry);
+        let rollback_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rollback_finished_thread = Arc::clone(&rollback_finished);
+        let rollback = std::thread::spawn(move || {
+            let result = delete_transaction(&rollback_home, agent, &rollback_registry, None, true);
+            rollback_finished_thread.store(true, Ordering::SeqCst);
+            result
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !rollback_finished.load(Ordering::SeqCst),
+            "rollback must remain blocked behind the active transport lane"
+        );
+        assert!(
+            crate::transport::delivery_path_for_instance(&home, agent).exists(),
+            "active delivery must create a receipt before rollback can clean it"
+        );
+        assert!(crate::daemon::delivery_worker::enqueue_transport_delivery(
+            &home,
+            agent,
+            "queued during rollback",
+        )
+        .is_ok());
+        release.store(true, Ordering::SeqCst);
+        assert!(rollback.join().expect("rollback thread"));
+        assert!(rollback_finished.load(Ordering::SeqCst));
+        crate::transport::test_support::set_delivery_hook(None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::daemon::delivery_worker::test_support::transport_dispatch_count(&home, agent)
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let dispatch_count =
+            crate::daemon::delivery_worker::test_support::transport_dispatch_count(&home, agent);
+        assert_eq!(
+            dispatch_count, 2,
+            "active old job and queued stale job must both be observed exactly once"
+        );
+        assert!(
+            !crate::transport::delivery_path_for_instance(&home, agent).exists(),
+            "outer rollback must remove receipts and reject queued stale work"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn delete_fence_clears_marker_before_transport_finalization() {
+        let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _hook_guard = crate::transport::test_support::delivery_hook_guard();
+        let _tail_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_release_tail_hook_guard();
+        let home = tmp_home("delete-fence-order");
+        let agent = "fence-agent";
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  fence-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
+        )
+        .expect("fleet");
+        let (tail_tx, tail_rx) = std::sync::mpsc::channel();
+        let tail_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_release_tail_hook(Some(
+            Arc::new(move |hook_home, hook_agent| {
+                if hook_home != tail_home.as_path() || hook_agent != agent {
+                    return;
+                }
+                tail_tx
+                    .send((
+                        crate::agent::deleting::is_deleting(hook_home, hook_agent),
+                        crate::daemon::delivery_worker::enqueue_transport_delivery(
+                            hook_home,
+                            hook_agent,
+                            "late fence wake",
+                        ),
+                    ))
+                    .expect("tail result receiver");
+            }),
+        ));
+        let (adapter_tx, adapter_rx) = std::sync::mpsc::channel();
+        let adapter_home = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |called_home, _name, _body| {
+                if called_home != adapter_home.as_path() {
+                    return None;
+                }
+                adapter_tx.send(()).expect("adapter result receiver");
+                Some(Err(anyhow::anyhow!("post-fence probe")))
+            },
+        )));
+
+        {
+            let fence = DeleteFence::new(&home, agent, true);
+            drop(fence);
+        }
+        let (was_deleting, late_result) = tail_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup tail hook must run");
+        assert!(
+            !was_deleting,
+            "marker must clear before transport finalization"
+        );
+        assert_eq!(
+            late_result,
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced),
+            "same-key enqueue must remain stale while transport finalization is active"
+        );
+
+        assert!(crate::daemon::delivery_worker::enqueue_transport_delivery(
+            &home,
+            agent,
+            "fresh fence wake",
+        )
+        .is_ok());
+        adapter_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("post-fence same-key delivery must reach the adapter");
+        crate::transport::test_support::set_delivery_hook(None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn delete_fence_blocks_direct_serial_until_transport_finalization() {
+        let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _tail_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_release_tail_hook_guard();
+        let _admission_guard =
+            crate::daemon::delivery_worker::test_support::direct_transport_admission_hook_guard();
+        let home = tmp_home("direct-serial-finalization");
+        let agent = "direct-serial-agent";
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  direct-serial-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
+        )
+        .expect("fleet");
+
+        let (admission_tx, admission_rx) = std::sync::mpsc::channel();
+        let admission_rx = Arc::new(parking_lot::Mutex::new(admission_rx));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let entered_rx = Arc::new(parking_lot::Mutex::new(entered_rx));
+        let direct_thread = Arc::new(parking_lot::Mutex::new(None));
+        let direct_thread_for_tail = Arc::clone(&direct_thread);
+        let admission_rx_for_tail = Arc::clone(&admission_rx);
+        let expected_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_direct_transport_admission_hook(Some(
+            Arc::new(move |hook_home, hook_agent| {
+                if hook_home == expected_home.as_path() && hook_agent == agent {
+                    admission_tx.send(()).expect("direct admission receiver");
+                }
+            }),
+        ));
+
+        let tail_home = home.clone();
+        let entered_rx_for_tail = Arc::clone(&entered_rx);
+        crate::daemon::delivery_worker::test_support::set_cleanup_release_tail_hook(Some(
+            Arc::new(move |hook_home, hook_agent| {
+                if hook_home != tail_home.as_path() || hook_agent != agent {
+                    return;
+                }
+                let direct_home = hook_home.to_path_buf();
+                let direct_agent = hook_agent.to_string();
+                let entered_tx = entered_tx.clone();
+                let handle = std::thread::spawn(move || {
+                    crate::daemon::delivery_worker::with_transport_serial(
+                        &direct_home,
+                        &direct_agent,
+                        || {
+                            entered_tx.send(()).expect("direct serial entry receiver");
+                        },
+                    );
+                });
+                admission_rx_for_tail
+                    .lock()
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("direct serial must reach lane-to-state admission");
+                assert!(
+                    entered_rx_for_tail.lock().try_recv().is_err(),
+                    "direct serial must not enter while finalization still owns epoch state"
+                );
+                *direct_thread_for_tail.lock() = Some(handle);
+            }),
+        ));
+
+        let fence = DeleteFence::new(&home, agent, true);
+        drop(fence);
+        let handle = direct_thread
+            .lock()
+            .take()
+            .expect("tail must retain direct serial thread");
+        handle.join().expect("direct serial thread");
+        entered_rx
+            .lock()
+            .recv_timeout(Duration::from_secs(1))
+            .expect("direct serial enters after transport finalization");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn fenced_inject_with_submit_does_not_recreate_receipts() {
+        let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _tail_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_release_tail_hook_guard();
+        let home = tmp_home("fenced-inject-no-receipt");
+        let agent = "fenced-inject-agent";
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  fenced-inject-agent:\n    backend: codex\n",
+        )
+        .expect("fleet");
+        let envelope = crate::transport::DeliveryEnvelope::new(
+            agent,
+            crate::transport::SessionLocator::codex(
+                std::path::PathBuf::from("/tmp/fenced-inject.sock"),
+                Some("fenced-inject-thread".to_string()),
+            ),
+            crate::transport::DeliveryKind::Notification,
+            "existing receipt",
+            None,
+        );
+        let store =
+            crate::transport::ReceiptStore::for_instance(&home, agent).expect("receipt store");
+        store.record_queued(&envelope).expect("queued receipt");
+        store
+            .record(crate::transport::DeliveryReceipt::for_state(
+                &envelope,
+                crate::transport::DeliveryState::ProtocolAccepted,
+            ))
+            .expect("terminal receipt");
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        assert!(delivery_path.exists(), "fixture receipt must exist");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let expected_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_release_tail_hook(Some(
+            Arc::new(move |hook_home, hook_agent| {
+                if hook_home != expected_home.as_path() || hook_agent != agent {
+                    return;
+                }
+                result_tx
+                    .send(crate::inbox::notify::inject_notification_with_submit(
+                        hook_home,
+                        hook_agent,
+                        "late fenced actionable wake",
+                    ))
+                    .expect("fenced inject result receiver");
+            }),
+        ));
+
+        let fence = DeleteFence::new(&home, agent, true);
+        crate::transport::remove_instance_delivery_state(&home, agent).expect("receipt cleanup");
+        drop(fence);
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup tail inject must run");
+        assert!(result.is_err(), "fenced inject must be rejected");
+        assert!(result
+            .expect_err("fenced inject unexpectedly succeeded")
+            .to_string()
+            .contains("fenced"));
+        assert!(
+            !delivery_path.exists(),
+            "fenced inject must not recreate receipt body"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "fenced inject must not recreate receipt lock"
+        );
+        assert!(
+            !delivery_path.parent().is_some_and(std::path::Path::exists),
+            "fenced inject must not recreate receipt directory"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stale_queue_full_drop_is_suppressed_after_delete() {
+        let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
+        let _queue_full_hook_guard =
+            crate::daemon::delivery_worker::test_support::queue_full_before_record_hook_guard();
+        let home = tmp_home("stale-queue-full-drop");
+        let agent = "stale-queue-full-agent";
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  stale-queue-full-agent:\n    backend: codex\n",
+        )
+        .expect("fleet");
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        let expected_home = home.clone();
+        crate::daemon::delivery_worker::test_support::set_queue_full_before_record_hook(Some(
+            Arc::new(move |hook_home, hook_agent, _epoch| {
+                if hook_home != expected_home.as_path() || hook_agent != agent {
+                    return;
+                }
+                let cleanup_home = hook_home.to_path_buf();
+                let cleanup_agent = hook_agent.to_string();
+                std::thread::spawn(move || {
+                    let fence = DeleteFence::new(&cleanup_home, &cleanup_agent, true);
+                    crate::transport::remove_instance_delivery_state(&cleanup_home, &cleanup_agent)
+                        .expect("receipt cleanup");
+                    drop(fence);
+                })
+                .join()
+                .expect("cleanup thread");
+            }),
+        ));
+        crate::daemon::delivery_worker::test_support::set_force_full(true);
+        let result = crate::inbox::notify::inject_notification_with_submit(
+            &home,
+            agent,
+            "queue-full result invalidated by delete",
+        );
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        assert!(
+            result.is_err(),
+            "stale queue-full admission must not report successful persistence"
+        );
+        assert!(
+            !delivery_path.exists(),
+            "stale queue-full result must not recreate receipt body"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "stale queue-full result must not recreate receipt lock"
+        );
+        assert!(
+            !delivery_path.parent().is_some_and(std::path::Path::exists),
+            "stale queue-full result must not recreate receipt directory"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn guarded_delete_boundary_call_sites_remain_explicit() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agent_ops = std::fs::read_to_string(root.join("src/agent_ops.rs")).expect("agent_ops");
+        let full_delete =
+            std::fs::read_to_string(root.join("src/mcp/handlers/instance_state/lifecycle.rs"))
+                .expect("full-delete lifecycle");
+        assert_eq!(
+            agent_ops.matches("delete_transaction_under_guard(").count(),
+            1,
+            "only the guarded agent-ops path may call the low-level delete body"
+        );
+        assert!(
+            full_delete.contains("delete_instance_under_guard"),
+            "full-delete must use the explicit caller-held-guard boundary"
+        );
+        assert!(
+            !full_delete.contains("delete_transaction_under_guard("),
+            "full-delete must not bypass the agent-ops guard boundary"
+        );
     }
 
     #[test]

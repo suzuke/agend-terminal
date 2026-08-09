@@ -500,6 +500,19 @@ pub(crate) mod test_support {
         Arc<dyn Fn(&Path, &str, &str) -> Option<anyhow::Result<DeliveryReceipt>> + Send + Sync>;
 
     static DELIVERY_HOOK: OnceLock<parking_lot::Mutex<Option<DeliveryHook>>> = OnceLock::new();
+    static DELIVERY_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct DeliveryHookGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn delivery_hook_guard() -> DeliveryHookGuard {
+        let lock = DELIVERY_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        set_delivery_hook(None);
+        DeliveryHookGuard { _lock: lock }
+    }
 
     fn hook() -> &'static parking_lot::Mutex<Option<DeliveryHook>> {
         DELIVERY_HOOK.get_or_init(|| parking_lot::Mutex::new(None))
@@ -509,16 +522,19 @@ pub(crate) mod test_support {
         *hook().lock() = next;
     }
 
+    impl Drop for DeliveryHookGuard {
+        fn drop(&mut self) {
+            set_delivery_hook(None);
+        }
+    }
+
     pub(crate) fn run_delivery_hook(
         home: &Path,
         instance: &str,
         body: &str,
     ) -> Option<anyhow::Result<DeliveryReceipt>> {
-        hook()
-            .lock()
-            .as_ref()
-            .cloned()
-            .and_then(|hook| hook(home, instance, body))
+        let delivery_hook = hook().lock().as_ref().cloned();
+        delivery_hook.and_then(|hook| hook(home, instance, body))
     }
 }
 

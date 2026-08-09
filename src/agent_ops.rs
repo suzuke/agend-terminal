@@ -308,6 +308,40 @@ pub fn delete_instance(
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
 ) -> DeleteOutcome {
+    // The public runtime entry owns the complete deletion fence even for an
+    // external agent. External-first resolution must not bypass transport
+    // invalidation: a queued job for the same name can otherwise outlive the
+    // early return and recreate delivery state or reach an adapter.
+    let _delete_fence = crate::daemon::lifecycle::DeleteFence::new(home, name, true);
+    if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+        tracing::warn!(
+            agent = %name,
+            error = %error,
+            "delete: transport delivery cleanup failed"
+        );
+    }
+    delete_instance_impl(home, name, context, skip_exit_wait)
+}
+
+/// Delete through the shared transaction body when the caller already owns the
+/// deleting mark and keyed transport cleanup guard (the full-delete path).
+pub(crate) fn delete_instance_under_guard(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+) -> DeleteOutcome {
+    // The full-delete caller already owns DeleteFence; do not nest a second
+    // lifecycle or transport guard around this body.
+    delete_instance_impl(home, name, context, skip_exit_wait)
+}
+
+fn delete_instance_impl(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+) -> DeleteOutcome {
     // Match the API adapter's external-first behavior.  External agents have
     // no managed registry/config entry and therefore need no notifier event.
     if agent::lock_external(context.externals)
@@ -318,7 +352,7 @@ pub fn delete_instance(
         return DeleteOutcome::External;
     }
 
-    crate::daemon::lifecycle::delete_transaction(
+    crate::daemon::lifecycle::delete_transaction_under_guard(
         home,
         name,
         context.registry,
@@ -1226,6 +1260,155 @@ mod tests {
             move_pane(&home, Some("agent-a"), None, None),
             Err("missing target_tab".into())
         );
+    }
+
+    /// The public runtime DELETE must fence an external early-return path just
+    /// like a managed delete. A queued old-generation job held behind the
+    /// keyed lane must be discarded after the external record is removed,
+    /// without reaching an adapter or recreating receipt state.
+    #[test]
+    fn external_delete_fences_queued_transport_before_early_return() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let home = tmp_home("external-delete-transport-fence");
+        let agent = format!("external-delete-race-{}", std::process::id());
+        let _full_guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _delivery_hook = crate::transport::test_support::delivery_hook_guard();
+        let adapter_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let adapter_calls_hook = std::sync::Arc::clone(&adapter_calls);
+        let expected_home = home.clone();
+        let expected_agent = agent.clone();
+        crate::transport::test_support::set_delivery_hook(Some(std::sync::Arc::new(
+            move |called_home, called_agent, _body| {
+                if called_home == expected_home.as_path() && called_agent == expected_agent {
+                    adapter_calls_hook.fetch_add(1, Ordering::SeqCst);
+                    Some(Err(anyhow::anyhow!(
+                        "external-delete stale job reached adapter"
+                    )))
+                } else {
+                    None
+                }
+            },
+        )));
+
+        let (lane_entered_tx, lane_entered_rx) = std::sync::mpsc::channel();
+        let (lane_release_tx, lane_release_rx) = std::sync::mpsc::channel();
+        let lane_home = home.clone();
+        let lane_agent = agent.clone();
+        let lane_holder = std::thread::spawn(move || {
+            crate::daemon::delivery_worker::with_transport_serial(&lane_home, &lane_agent, || {
+                lane_entered_tx.send(()).expect("lane-entered observer");
+                lane_release_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("lane release");
+            });
+        });
+        lane_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("lane holder must enter");
+
+        assert!(crate::daemon::delivery_worker::enqueue_transport_delivery(
+            &home,
+            &agent,
+            "queued before external delete",
+        )
+        .is_ok());
+
+        let externals: agent::ExternalRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        externals.lock().insert(
+            agent.clone(),
+            agent::ExternalAgentHandle {
+                backend_command: "remote".to_string(),
+                pid: 4321,
+            },
+        );
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs: crate::api::ConfigRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let delete_home = home.clone();
+        let delete_agent = agent.clone();
+        let delete_externals = std::sync::Arc::clone(&externals);
+        let delete_registry = std::sync::Arc::clone(&registry);
+        let delete_configs = std::sync::Arc::clone(&configs);
+        let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let delete_thread = std::thread::spawn(move || {
+            let context = DeleteContext {
+                registry: &delete_registry,
+                configs: &delete_configs,
+                externals: &delete_externals,
+                notifier: None,
+            };
+            delete_tx
+                .send(delete_instance(
+                    &delete_home,
+                    &delete_agent,
+                    &context,
+                    false,
+                ))
+                .expect("delete outcome observer");
+        });
+
+        let marker_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !crate::agent::deleting::is_deleting(&home, &agent)
+            && std::time::Instant::now() < marker_deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            crate::agent::deleting::is_deleting(&home, &agent),
+            "external delete must mark the name before waiting for its transport lane"
+        );
+        assert!(
+            delete_rx.try_recv().is_err(),
+            "external delete must remain behind the held transport lane"
+        );
+
+        lane_release_tx.send(()).expect("release lane");
+        lane_holder.join().expect("lane holder");
+        assert_eq!(
+            delete_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("external delete outcome"),
+            DeleteOutcome::External
+        );
+        delete_thread.join().expect("delete thread");
+
+        let dispatch_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::daemon::delivery_worker::test_support::transport_dispatch_count(&home, &agent)
+            < 1
+            && std::time::Instant::now() < dispatch_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let dispatch_count =
+            crate::daemon::delivery_worker::test_support::transport_dispatch_count(&home, &agent);
+        assert_eq!(
+            dispatch_count, 1,
+            "the queued old-generation job must be observed and discarded exactly once"
+        );
+        assert_eq!(
+            adapter_calls.load(Ordering::SeqCst),
+            0,
+            "the stale queued external-delete job must not reach an adapter"
+        );
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, &agent);
+        assert!(
+            !delivery_path.exists(),
+            "stale external job must not create a receipt"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "stale external job must not create a receipt lock"
+        );
+        assert!(
+            !agent::lock_external(&externals).contains_key(&agent),
+            "external delete must remove the external registry entry"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
