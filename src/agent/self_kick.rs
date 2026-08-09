@@ -8,8 +8,8 @@ pub(super) enum SelfKickDelivery {
 }
 
 /// Deliver the fresh-restart prompt exactly once on the transport lane. The
-/// target identity is captured after the readiness wait and checked against the
-/// current registry generation before the registry lock is released for I/O.
+/// target identity is captured after the bootstrap registration wait, checked
+/// before adapter readiness, then checked again on the keyed transport lane.
 /// `legacy_pty_ready` is the raw-prompt proof carried across that wait; a
 /// structured-ready caller cannot later fall through to a PTY write.
 pub(super) fn deliver_self_kick(
@@ -18,7 +18,25 @@ pub(super) fn deliver_self_kick(
     target: &InjectTarget,
     prompt: &str,
     legacy_pty_ready: bool,
+    readiness_timeout: std::time::Duration,
 ) -> anyhow::Result<SelfKickDelivery> {
+    if deleting::is_deleting(home, target.name.as_str())
+        || !self_kick_target_is_current(registry, target)
+    {
+        return Err(anyhow::anyhow!(
+            "self-kick target is stale or being deleted: {} ({})",
+            target.name,
+            target.instance_id
+        ));
+    }
+    // ChannelBridge registration precedes publication of its live locator.
+    // Spend the caller's remaining bootstrap budget here, before taking the
+    // keyed lane, so a same-agent delete is never stalled by this poll.
+    crate::transport::wait_for_notification_readiness(
+        home,
+        target.name.as_str(),
+        readiness_timeout,
+    )?;
     crate::daemon::delivery_worker::with_transport_serial(home, &target.name, || {
         if deleting::is_deleting(home, target.name.as_str()) {
             return Err(anyhow::anyhow!(
@@ -27,16 +45,7 @@ pub(super) fn deliver_self_kick(
             ));
         }
 
-        let target_is_current = {
-            let reg = lock_registry(registry);
-            reg.get(&target.instance_id).is_some_and(|handle| {
-                handle.id == target.instance_id
-                    && handle.name.as_str() == target.name.as_str()
-                    && handle.generation == target.generation
-                    && !handle.deleted.load(std::sync::atomic::Ordering::Acquire)
-            })
-        };
-        if !target_is_current || target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+        if !self_kick_target_is_current(registry, target) {
             return Err(anyhow::anyhow!(
                 "self-kick target is stale: {} ({})",
                 target.name,
@@ -94,5 +103,18 @@ pub(super) fn deliver_self_kick(
             "self-kick transport did not accept delivery: {:?}",
             receipt.state
         ))
+    })
+}
+
+fn self_kick_target_is_current(registry: &AgentRegistry, target: &InjectTarget) -> bool {
+    if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let reg = lock_registry(registry);
+    reg.get(&target.instance_id).is_some_and(|handle| {
+        handle.id == target.instance_id
+            && handle.name.as_str() == target.name.as_str()
+            && handle.generation == target.generation
+            && !handle.deleted.load(std::sync::atomic::Ordering::Acquire)
     })
 }

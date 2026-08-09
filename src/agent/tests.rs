@@ -432,6 +432,7 @@ fn self_kick_test_receipt(name: &str, body: &str, state: DeliveryState) -> Deliv
 
 fn clear_self_kick_fixture(fixture: &SelfKickFixture) {
     crate::transport::test_support::set_delivery_hook(None);
+    crate::transport::test_support::set_readiness_hook(None);
     crate::daemon::inject_delivery::clear_for_test(&fixture.name);
     let _ = std::fs::remove_dir_all(&fixture.home);
 }
@@ -465,11 +466,87 @@ fn self_kick_direct_helper_ignores_full_delivery_queue() {
         &fixture.target,
         "queue-full direct self-kick",
         false,
+        std::time::Duration::from_secs(1),
     );
     crate::daemon::delivery_worker::test_support::set_force_full(false);
     assert!(matches!(result, Ok(SelfKickDelivery::ProtocolAccepted)));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(fixture.written.lock().is_empty());
+    clear_self_kick_fixture(&fixture);
+}
+
+#[test]
+fn structured_self_kick_readiness_wait_does_not_hold_transport_lane() {
+    let _test_guard = SelfKickTestGuard::acquire();
+    let fixture = self_kick_fixture("readiness-before-lane");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&fixture.home),
+        format!("instances:\n  {}:\n    backend: claude\n", fixture.name),
+    )
+    .expect("ChannelBridge fleet entry");
+
+    let (readiness_entered_tx, readiness_entered_rx) = std::sync::mpsc::channel();
+    let (readiness_release_tx, readiness_release_rx) = std::sync::mpsc::channel();
+    let readiness_release_rx = Arc::new(Mutex::new(readiness_release_rx));
+    let expected_home = fixture.home.clone();
+    let expected_name = fixture.name.clone();
+    crate::transport::test_support::set_readiness_hook(Some(Arc::new(
+        move |home, name, _timeout| {
+            if home != expected_home || name != expected_name {
+                return None;
+            }
+            readiness_entered_tx
+                .send(())
+                .expect("readiness-entered observer");
+            readiness_release_rx
+                .lock()
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("readiness release");
+            Some(Ok(()))
+        },
+    )));
+    let delivery_home = fixture.home.clone();
+    let delivery_name = fixture.name.clone();
+    crate::transport::test_support::set_delivery_hook(Some(Arc::new(move |home, name, body| {
+        if home != delivery_home || name != delivery_name {
+            return None;
+        }
+        Some(Ok(self_kick_test_receipt(
+            name,
+            body,
+            DeliveryState::ProtocolAccepted,
+        )))
+    })));
+
+    let registry = Arc::clone(&fixture.registry);
+    let home = fixture.home.clone();
+    let target = fixture.target.clone();
+    let delivery = std::thread::spawn(move || {
+        deliver_self_kick(
+            &registry,
+            &home,
+            &target,
+            "readiness before keyed lane",
+            false,
+            std::time::Duration::from_secs(1),
+        )
+    });
+    readiness_entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("self-kick must enter readiness wait");
+
+    let started = std::time::Instant::now();
+    crate::daemon::delivery_worker::with_transport_serial(&fixture.home, &fixture.name, || {});
+    let lane_elapsed = started.elapsed();
+    let _ = readiness_release_tx.send(());
+    assert!(
+        lane_elapsed < std::time::Duration::from_millis(250),
+        "readiness wait must not block same-agent teardown lane: {lane_elapsed:?}"
+    );
+    assert!(matches!(
+        delivery.join().expect("self-kick thread"),
+        Ok(SelfKickDelivery::ProtocolAccepted)
+    ));
     clear_self_kick_fixture(&fixture);
 }
 
@@ -499,6 +576,7 @@ fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
             &fixture.target,
             "structured failure self-kick",
             false,
+            std::time::Duration::from_secs(1),
         );
         assert!(result.is_err(), "{state:?} must not be treated as success");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no transport retry");
@@ -521,6 +599,7 @@ fn self_kick_structured_readiness_cannot_downgrade_to_legacy_pty() {
         &fixture.target,
         "mode changed after structured readiness",
         false,
+        std::time::Duration::from_secs(1),
     );
 
     assert!(result.is_err());
@@ -564,6 +643,7 @@ fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
         &fixture.target,
         "stale generation",
         false,
+        std::time::Duration::from_secs(1),
     )
     .is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -584,6 +664,7 @@ fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
         &fixture.target,
         "stale uuid",
         false,
+        std::time::Duration::from_secs(1),
     )
     .is_err());
     clear_self_kick_fixture(&fixture);
@@ -606,6 +687,7 @@ fn self_kick_deleted_or_deleting_target_fails_closed() {
         &fixture.target,
         "deleted",
         false,
+        std::time::Duration::from_secs(1),
     )
     .is_err());
     clear_self_kick_fixture(&fixture);
@@ -618,6 +700,7 @@ fn self_kick_deleted_or_deleting_target_fails_closed() {
         &fixture.target,
         "deleting",
         false,
+        std::time::Duration::from_secs(1),
     )
     .is_err());
     clear_self_kick_fixture(&fixture);
@@ -809,6 +892,7 @@ fn self_kick_legacy_uses_captured_writer_after_registry_swap() {
         &fixture.target,
         "captured writer self-kick",
         true,
+        std::time::Duration::from_secs(1),
     );
     assert!(matches!(result, Ok(SelfKickDelivery::LegacyPty)));
     assert!(fixture.written.lock().ends_with(b"\r"));

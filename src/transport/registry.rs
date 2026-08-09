@@ -407,7 +407,7 @@ pub(crate) fn envelope_for_instance(
     body: &str,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let mode = mode_for_instance(home, instance);
-    envelope_for_mode(home, instance, body, mode, false)
+    envelope_for_mode(home, instance, body, mode)
 }
 
 fn envelope_for_mode(
@@ -415,15 +415,10 @@ fn envelope_for_mode(
     instance: &str,
     body: &str,
     mode: TransportMode,
-    wait_for_channel_readiness: bool,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let locator = if mode == TransportMode::ChannelBridge {
-        if wait_for_channel_readiness {
-            super::claude_channel::wait_for_ready_claude_channel(home, instance)?
-        } else {
-            super::claude_channel::prepare_claude_channel(home, instance)?
-        }
+        super::claude_channel::prepare_claude_channel(home, instance)?
     } else {
         locator_for_instance(home, instance, backend.as_ref(), mode)?
     };
@@ -434,6 +429,25 @@ fn envelope_for_mode(
         body,
         None,
     ))
+}
+
+/// Wait only for the fresh-spawn ChannelBridge publication/health window.
+/// Callers must do this before acquiring the keyed transport lane: ordinary
+/// queued notifications stay fail-fast, and same-agent teardown is never
+/// parked behind a cold bridge readiness poll.
+pub(crate) fn wait_for_notification_readiness(
+    home: &Path,
+    instance: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    if mode_for_instance(home, instance) != TransportMode::ChannelBridge {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if let Some(result) = test_support::run_readiness_hook(home, instance, timeout) {
+        return result;
+    }
+    super::claude_channel::wait_for_ready_claude_channel(home, instance, timeout).map(|_| ())
 }
 
 /// Persist a local queue drop as a terminal failure. This is used when the
@@ -471,7 +485,7 @@ where
         return result;
     }
     let mode = mode_for_instance(home, instance);
-    let envelope = envelope_for_mode(home, instance, body, mode, true)?;
+    let envelope = envelope_for_mode(home, instance, body, mode)?;
     match mode {
         TransportMode::NativeShared => match envelope.session.backend.as_str() {
             "codex" => {
@@ -512,8 +526,11 @@ pub(crate) mod test_support {
 
     pub(crate) type DeliveryHook =
         Arc<dyn Fn(&Path, &str, &str) -> Option<anyhow::Result<DeliveryReceipt>> + Send + Sync>;
+    pub(crate) type ReadinessHook =
+        Arc<dyn Fn(&Path, &str, std::time::Duration) -> Option<anyhow::Result<()>> + Send + Sync>;
 
     static DELIVERY_HOOK: OnceLock<parking_lot::Mutex<Option<DeliveryHook>>> = OnceLock::new();
+    static READINESS_HOOK: OnceLock<parking_lot::Mutex<Option<ReadinessHook>>> = OnceLock::new();
     static DELIVERY_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) struct DeliveryHookGuard {
@@ -525,6 +542,7 @@ pub(crate) mod test_support {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         set_delivery_hook(None);
+        set_readiness_hook(None);
         DeliveryHookGuard { _lock: lock }
     }
 
@@ -536,9 +554,18 @@ pub(crate) mod test_support {
         *hook().lock() = next;
     }
 
+    fn readiness_hook() -> &'static parking_lot::Mutex<Option<ReadinessHook>> {
+        READINESS_HOOK.get_or_init(|| parking_lot::Mutex::new(None))
+    }
+
+    pub(crate) fn set_readiness_hook(next: Option<ReadinessHook>) {
+        *readiness_hook().lock() = next;
+    }
+
     impl Drop for DeliveryHookGuard {
         fn drop(&mut self) {
             set_delivery_hook(None);
+            set_readiness_hook(None);
         }
     }
 
@@ -549,6 +576,15 @@ pub(crate) mod test_support {
     ) -> Option<anyhow::Result<DeliveryReceipt>> {
         let delivery_hook = hook().lock().as_ref().cloned();
         delivery_hook.and_then(|hook| hook(home, instance, body))
+    }
+
+    pub(crate) fn run_readiness_hook(
+        home: &Path,
+        instance: &str,
+        timeout: std::time::Duration,
+    ) -> Option<anyhow::Result<()>> {
+        let readiness_hook = readiness_hook().lock().as_ref().cloned();
+        readiness_hook.and_then(|hook| hook(home, instance, timeout))
     }
 }
 

@@ -1923,6 +1923,7 @@ pub(crate) fn spawn_self_kick_bootstrap(
     // fire-and-forget: mirrors spawn_instructions_bootstrap's lifetime/discipline.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("self_kick");
+        let readiness_deadline = std::time::Instant::now() + timeout;
         let prompt = fresh_restart_self_kick_prompt();
         let wait_policy = if crate::transport::mode_for_instance(&home, &name)
             == crate::transport::TransportMode::LegacyPty
@@ -1941,7 +1942,16 @@ pub(crate) fn spawn_self_kick_bootstrap(
             "self-kick",
         ) {
             let legacy_pty_ready = matches!(wait_policy, BootstrapWaitPolicy::RawPromptIdle(_));
-            match deliver_self_kick(&registry, &home, &tgt, &prompt, legacy_pty_ready) {
+            let remaining =
+                readiness_deadline.saturating_duration_since(std::time::Instant::now());
+            match deliver_self_kick(
+                &registry,
+                &home,
+                &tgt,
+                &prompt,
+                legacy_pty_ready,
+                remaining,
+            ) {
                 Ok(SelfKickDelivery::LegacyPty) => {
                     // LegacyPty arms its verification while the self-kick
                     // transport lane is still held; structured adapters remain

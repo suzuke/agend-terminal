@@ -32,7 +32,6 @@ const BRIDGE_VERSION: &str = "0.1.0";
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
-const CHANNEL_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CHANNEL_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PATH: &str = "/webhook";
@@ -943,8 +942,9 @@ pub(crate) fn prepare_claude_channel(
 pub(crate) fn wait_for_ready_claude_channel(
     home: &Path,
     instance: &str,
+    timeout: Duration,
 ) -> anyhow::Result<SessionLocator> {
-    wait_for_ready_claude_channel_until(home, instance, CHANNEL_READY_TIMEOUT)
+    wait_for_ready_claude_channel_until(home, instance, timeout)
 }
 
 fn wait_for_ready_claude_channel_until(
@@ -1731,6 +1731,7 @@ mod tests {
 
     #[test]
     fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
+        let _delivery_hook_guard = super::super::registry::test_support::delivery_hook_guard();
         let home = home("registry-delivery");
         let listener = TcpListener::bind("127.0.0.1:0").expect("fake channel listener");
         listener
@@ -1810,15 +1811,22 @@ mod tests {
         });
         let legacy_called = Arc::new(AtomicBool::new(false));
         let legacy_called_by_closure = Arc::clone(&legacy_called);
-        let result = super::super::registry::deliver_notification(
+        let result = super::super::registry::wait_for_notification_readiness(
             &home,
             "claude-agent",
-            "registry delivery",
-            move |_, _, _| {
-                legacy_called_by_closure.store(true, Ordering::Release);
-                Ok(())
-            },
-        );
+            Duration::from_secs(1),
+        )
+        .and_then(|()| {
+            super::super::registry::deliver_notification(
+                &home,
+                "claude-agent",
+                "registry delivery",
+                move |_, _, _| {
+                    legacy_called_by_closure.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+        });
         publisher.join().expect("delayed publisher");
         if let Ok(receipt) = &result {
             assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
