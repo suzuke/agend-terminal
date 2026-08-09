@@ -67,6 +67,16 @@ pub(crate) fn arm(agent: &str, text: &str) {
     );
 }
 
+#[cfg(test)]
+pub(crate) fn is_armed_for_test(agent: &str) -> bool {
+    store().lock().contains_key(agent)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_for_test(agent: &str) {
+    store().lock().remove(agent);
+}
+
 /// Per-tick verification pass. For each armed agent:
 /// - a `UserPromptSubmit` recorded AFTER the inject ⇒ delivered, clear silently.
 /// - else past [`VERIFY_WINDOW_MS`] and not yet re-delivered ⇒ re-inject once,

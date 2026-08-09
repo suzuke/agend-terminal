@@ -17,6 +17,8 @@ pub(crate) use receipt::{
     delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, ReceiptStore,
 };
 #[cfg(test)]
+pub(crate) use registry::test_support;
+#[cfg(test)]
 pub(crate) use registry::{mode_for_backend, mode_for_instance};
 
 pub(crate) use registry::{deliver_notification, record_delivery_drop};

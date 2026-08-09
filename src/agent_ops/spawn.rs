@@ -189,6 +189,7 @@ pub fn spawn_instance(
                 std::sync::Arc::clone(context.registry),
                 id,
                 request.name.clone(),
+                context.home.to_path_buf(),
                 std::time::Duration::from_secs(ready_timeout),
                 agent::BootstrapRegistrationState::AlreadyRegistered,
                 None,

@@ -493,6 +493,7 @@ fn run_app(
             Arc::clone(&registry),
             instance_id,
             name,
+            home.clone(),
             timeout,
             crate::agent::BootstrapRegistrationState::MayRegisterLater,
             None,

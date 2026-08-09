@@ -192,6 +192,134 @@ fn fresh_restart_self_kick_prompt_shape() {
     assert!(p.contains("NOT authority to dispatch"));
 }
 
+/// RED: the fresh-restart bootstrap must route a structured backend through
+/// exactly one adapter request, without touching the captured PTY or arming the
+/// legacy hook verifier. This drives the production self-kick entry point; the
+/// test hook only replaces the external adapter I/O.
+#[test]
+fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
+    use crate::transport::{DeliveryEnvelope, DeliveryKind, SessionLocator};
+    use crate::transport::{DeliveryReceipt, DeliveryState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let name = format!("selfkick-red-{}", uuid::Uuid::new_v4());
+    let id = crate::types::InstanceId::new();
+    let home = std::env::temp_dir().join(format!("agend-selfkick-red-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("test home");
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&written),
+    })));
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = portable_pty::CommandBuilder::new("true");
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn child");
+    drop(pair.slave);
+    let pty_master = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(Some(&Backend::Codex)),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    core.lock().state.current = crate::state::AgentState::Idle;
+    let handle = AgentHandle {
+        id,
+        name: name.clone().into(),
+        declared_backend: Some(Backend::Codex),
+        backend_command: "codex".to_string(),
+        pty_writer,
+        pty_master,
+        published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
+        core,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let registry: AgentRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    registry.lock().insert(id, handle);
+
+    let adapter_requests = Arc::new(AtomicUsize::new(0));
+    let adapter_requests_for_hook = Arc::clone(&adapter_requests);
+    let expected_home = home.clone();
+    let expected_name = name.clone();
+    crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+        move |called_home, called_name, body| {
+            if called_home != expected_home || called_name != expected_name {
+                return None;
+            }
+            adapter_requests_for_hook.fetch_add(1, Ordering::SeqCst);
+            let envelope = DeliveryEnvelope::new(
+                called_name,
+                SessionLocator::codex(
+                    std::path::PathBuf::from("/tmp/selfkick-red.sock"),
+                    Some("selfkick-red-thread".to_string()),
+                ),
+                DeliveryKind::Notification,
+                body,
+                None,
+            );
+            let mut receipt =
+                DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+            receipt.protocol_request_id = Some("selfkick-red-request".to_string());
+            receipt.tui_visibility = Some("shared_codex_thread".to_string());
+            Some(Ok(receipt))
+        },
+    )));
+    crate::daemon::hook_shadow::record_event(&name, "UserPromptSubmit", None);
+
+    spawn_self_kick_bootstrap(
+        Arc::clone(&registry),
+        id,
+        name.clone(),
+        home.clone(),
+        std::time::Duration::from_secs(2),
+        BootstrapRegistrationState::AlreadyRegistered,
+        None,
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while adapter_requests.load(Ordering::SeqCst) == 0
+        && written.lock().is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    crate::transport::test_support::set_delivery_hook(None);
+
+    assert_eq!(
+        adapter_requests.load(Ordering::SeqCst),
+        1,
+        "structured self-kick must make exactly one adapter request"
+    );
+    assert!(
+        written.lock().is_empty(),
+        "structured self-kick must not write to the PTY"
+    );
+    assert!(
+        !crate::daemon::inject_delivery::is_armed_for_test(&name),
+        "structured self-kick must not arm LegacyPty delivery verification"
+    );
+    crate::daemon::inject_delivery::clear_for_test(&name);
+    let _ = std::fs::remove_dir_all(home);
+}
+
 #[test]
 fn strip_ansi_cursor_move_no_space() {
     // CSI C (cursor forward) and D (cursor back) must not insert spaces

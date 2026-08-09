@@ -1881,6 +1881,7 @@ pub(crate) fn spawn_self_kick_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,
     name: String,
+    home: std::path::PathBuf,
     timeout: std::time::Duration,
     registration_state: BootstrapRegistrationState,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1899,6 +1900,7 @@ pub(crate) fn spawn_self_kick_bootstrap(
             shutdown.as_ref(),
             "self-kick",
         ) {
+            let _ = &home;
             // force=true: we already waited for Idle; the submit key drives the turn.
             match inject_with_target(&tgt, prompt.as_bytes()) {
                 Ok(()) => {

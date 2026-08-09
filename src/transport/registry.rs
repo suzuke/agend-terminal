@@ -452,6 +452,10 @@ pub(crate) fn deliver_notification<F>(
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
+    #[cfg(test)]
+    if let Some(result) = test_support::run_delivery_hook(home, instance, body) {
+        return result;
+    }
     let mode = mode_for_instance(home, instance);
     let envelope = envelope_for_instance(home, instance, body)?;
     match mode {
@@ -483,6 +487,38 @@ where
         TransportMode::ManagedHeadless | TransportMode::ManualRequired => Err(anyhow::anyhow!(
             "transport mode {mode:?} has no adapter in this implementation"
         )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::DeliveryReceipt;
+    use std::path::Path;
+    use std::sync::{Arc, OnceLock};
+
+    pub(crate) type DeliveryHook =
+        Arc<dyn Fn(&Path, &str, &str) -> Option<anyhow::Result<DeliveryReceipt>> + Send + Sync>;
+
+    static DELIVERY_HOOK: OnceLock<parking_lot::Mutex<Option<DeliveryHook>>> = OnceLock::new();
+
+    fn hook() -> &'static parking_lot::Mutex<Option<DeliveryHook>> {
+        DELIVERY_HOOK.get_or_init(|| parking_lot::Mutex::new(None))
+    }
+
+    pub(crate) fn set_delivery_hook(next: Option<DeliveryHook>) {
+        *hook().lock() = next;
+    }
+
+    pub(crate) fn run_delivery_hook(
+        home: &Path,
+        instance: &str,
+        body: &str,
+    ) -> Option<anyhow::Result<DeliveryReceipt>> {
+        hook()
+            .lock()
+            .as_ref()
+            .cloned()
+            .and_then(|hook| hook(home, instance, body))
     }
 }
 
