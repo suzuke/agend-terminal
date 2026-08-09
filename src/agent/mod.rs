@@ -1293,6 +1293,14 @@ pub(crate) fn spawn_agent_with_capture_home(
         }
     }
 
+    // Fence normal queued deliveries across the whole generation transition.
+    // The lane is acquired after the delete precheck and before any structured
+    // session preparation, then released only after SpawnRollback commits (or
+    // during rollback on every error return).
+    let transport_generation_guard = (*home).map(|home_path| {
+        crate::daemon::delivery_worker::begin_transport_generation_transition(home_path, name)
+    });
+
     // OpenCode NativeShared owns the server/session handshake before the PTY
     // exists. The resulting attach locator is then consumed by `build_command`,
     // so the visible TUI and daemon prompt_async deliveries share one session.
@@ -1596,6 +1604,7 @@ pub(crate) fn spawn_agent_with_capture_home(
 
     // Disarm the rollback guard — all ordered mutations succeeded.
     rollback.commit();
+    drop(transport_generation_guard);
 
     tracing::info!(agent = name, backend = backend_command, args = %config.args.join(" "), "spawned");
     Ok(instance_id)
@@ -1825,6 +1834,78 @@ fn wait_for_idle_inject_target(
     result.target
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfKickDelivery {
+    ProtocolAccepted,
+    LegacyPty,
+}
+
+/// Deliver the fresh-restart prompt exactly once on the transport lane. The
+/// target identity is captured after the Idle wait and checked against the
+/// current registry generation before the registry lock is released for I/O.
+fn deliver_self_kick(
+    registry: &AgentRegistry,
+    home: &std::path::Path,
+    target: &InjectTarget,
+    prompt: &str,
+) -> anyhow::Result<SelfKickDelivery> {
+    crate::daemon::delivery_worker::with_transport_serial(|| {
+        if deleting::is_deleting(home, target.name.as_str()) {
+            return Err(anyhow::anyhow!(
+                "self-kick target is being deleted: {}",
+                target.name
+            ));
+        }
+
+        let target_is_current = {
+            let reg = lock_registry(registry);
+            reg.get(&target.instance_id).is_some_and(|handle| {
+                handle.id == target.instance_id
+                    && handle.name.as_str() == target.name.as_str()
+                    && handle.generation == target.generation
+                    && !handle.deleted.load(std::sync::atomic::Ordering::Acquire)
+            })
+        };
+        if !target_is_current || target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow::anyhow!(
+                "self-kick target is stale: {} ({})",
+                target.name,
+                target.instance_id
+            ));
+        }
+
+        let legacy_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let legacy_called_by_closure = Arc::clone(&legacy_called);
+        let target_for_legacy = target.clone();
+        let prompt = prompt.to_string();
+        let receipt = crate::transport::deliver_notification(
+            home,
+            target.name.as_str(),
+            &prompt,
+            move |_home, _agent, text| {
+                if legacy_called_by_closure.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    return Err(anyhow::anyhow!("LegacyPty closure invoked more than once"));
+                }
+                inject_with_target(&target_for_legacy, text.as_bytes())
+                    .map_err(|error| anyhow::anyhow!("LegacyPty self-kick failed: {error}"))
+            },
+        )?;
+
+        if receipt.state == crate::transport::DeliveryState::ProtocolAccepted {
+            return Ok(SelfKickDelivery::ProtocolAccepted);
+        }
+        if receipt.state == crate::transport::DeliveryState::Ambiguous
+            && legacy_called.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(SelfKickDelivery::LegacyPty);
+        }
+        Err(anyhow::anyhow!(
+            "self-kick transport did not accept delivery: {:?}",
+            receipt.state
+        ))
+    })
+}
+
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,
@@ -1900,18 +1981,18 @@ pub(crate) fn spawn_self_kick_bootstrap(
             shutdown.as_ref(),
             "self-kick",
         ) {
-            let _ = &home;
-            // force=true: we already waited for Idle; the submit key drives the turn.
-            match inject_with_target(&tgt, prompt.as_bytes()) {
-                Ok(()) => {
-                    // Re-delivery verification (≤1 redeliver, operator-visible if
-                    // undelivered) so a swallowed first turn can't silently strand
-                    // the restart. arm is a no-op for non-hook backends.
+            match deliver_self_kick(&registry, &home, &tgt, &prompt) {
+                Ok(SelfKickDelivery::LegacyPty) => {
+                    // Only LegacyPty has a physical write without a protocol
+                    // receipt; structured adapters must never arm this hook.
                     crate::daemon::inject_delivery::arm(&name, &prompt);
                     tracing::info!(agent = %name, "fresh-restart self-kick injected");
                 }
-                Err(e) => {
-                    tracing::warn!(agent = %name, error = %e, "fresh-restart self-kick inject failed");
+                Ok(SelfKickDelivery::ProtocolAccepted) => {
+                    tracing::info!(agent = %name, "fresh-restart self-kick accepted");
+                }
+                Err(error) => {
+                    tracing::warn!(agent = %name, error = %error, "fresh-restart self-kick delivery failed");
                 }
             }
         }
@@ -2981,6 +3062,9 @@ fn observe_post_submit_with(
 /// blocks every other registry operation for the entire duration.
 #[derive(Clone)]
 pub(crate) struct InjectTarget {
+    pub instance_id: crate::types::InstanceId,
+    pub name: String,
+    pub generation: crash_disposition::SpawnGeneration,
     pub pty_writer: PtyWriter,
     pub inject_prefix: String,
     pub submit_key: String,
@@ -2997,6 +3081,9 @@ pub(crate) struct InjectTarget {
 impl InjectTarget {
     pub fn from_handle(h: &AgentHandle) -> Self {
         Self {
+            instance_id: h.id,
+            name: h.name.to_string(),
+            generation: h.generation,
             pty_writer: Arc::clone(&h.pty_writer),
             inject_prefix: h.inject_prefix.clone(),
             submit_key: h.submit_key.clone(),

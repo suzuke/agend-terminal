@@ -1,6 +1,10 @@
 use super::*;
+use crate::transport::{
+    DeliveryEnvelope, DeliveryKind, DeliveryReceipt, DeliveryState, SessionLocator,
+};
 
 static R8_DISMISS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SELF_KICK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// #945 Phase 1: pending-registry slot publishes the agent registry
 /// to the background `telegram_init` thread. The slot is a
@@ -198,6 +202,9 @@ fn fresh_restart_self_kick_prompt_shape() {
 /// test hook only replaces the external adapter I/O.
 #[test]
 fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
+    let _test_guard = SELF_KICK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     use crate::transport::{DeliveryEnvelope, DeliveryKind, SessionLocator};
     use crate::transport::{DeliveryReceipt, DeliveryState};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -318,6 +325,311 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
     );
     crate::daemon::inject_delivery::clear_for_test(&name);
     let _ = std::fs::remove_dir_all(home);
+}
+
+struct SelfKickFixture {
+    home: std::path::PathBuf,
+    name: String,
+    id: crate::types::InstanceId,
+    registry: AgentRegistry,
+    target: InjectTarget,
+    written: Arc<Mutex<Vec<u8>>>,
+}
+
+fn self_kick_fixture(tag: &str) -> SelfKickFixture {
+    let name = format!("selfkick-{tag}-{}", uuid::Uuid::new_v4());
+    let id = crate::types::InstanceId::new();
+    let home = std::env::temp_dir().join(format!("agend-selfkick-{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("test home");
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&written),
+    })));
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = portable_pty::CommandBuilder::new("true");
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn child");
+    drop(pair.slave);
+    let pty_master = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(Some(&Backend::Codex)),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let handle = AgentHandle {
+        id,
+        name: name.clone().into(),
+        declared_backend: Some(Backend::Codex),
+        backend_command: "codex".to_string(),
+        pty_writer,
+        pty_master,
+        published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
+        core,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let registry: AgentRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    registry.lock().insert(id, handle);
+    let target = InjectTarget::from_handle(registry.lock().get(&id).expect("fixture handle"));
+    SelfKickFixture {
+        home,
+        name,
+        id,
+        registry,
+        target,
+        written,
+    }
+}
+
+fn self_kick_test_receipt(name: &str, body: &str, state: DeliveryState) -> DeliveryReceipt {
+    let envelope = DeliveryEnvelope::new(
+        name,
+        SessionLocator::codex(
+            std::path::PathBuf::from("/tmp/selfkick-test.sock"),
+            Some("selfkick-test-thread".to_string()),
+        ),
+        DeliveryKind::Notification,
+        body,
+        None,
+    );
+    let mut receipt = DeliveryReceipt::for_state(&envelope, state);
+    receipt.protocol_request_id = Some("selfkick-test-request".to_string());
+    receipt
+}
+
+fn clear_self_kick_fixture(fixture: &SelfKickFixture) {
+    crate::transport::test_support::set_delivery_hook(None);
+    crate::daemon::inject_delivery::clear_for_test(&fixture.name);
+    let _ = std::fs::remove_dir_all(&fixture.home);
+}
+
+#[test]
+fn self_kick_direct_helper_ignores_full_delivery_queue() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _test_guard = SELF_KICK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fixture = self_kick_fixture("queue-full");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let expected_home = fixture.home.clone();
+    let expected_name = fixture.name.clone();
+    crate::transport::test_support::set_delivery_hook(Some(Arc::new(move |home, name, body| {
+        if home != expected_home || name != expected_name {
+            return None;
+        }
+        calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(self_kick_test_receipt(
+            name,
+            body,
+            DeliveryState::ProtocolAccepted,
+        )))
+    })));
+    let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+    crate::daemon::delivery_worker::test_support::set_force_full(true);
+    let result = deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "queue-full direct self-kick",
+    );
+    crate::daemon::delivery_worker::test_support::set_force_full(false);
+    assert!(matches!(result, Ok(SelfKickDelivery::ProtocolAccepted)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(fixture.written.lock().is_empty());
+    clear_self_kick_fixture(&fixture);
+}
+
+#[test]
+fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _test_guard = SELF_KICK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for state in [DeliveryState::Ambiguous, DeliveryState::Failed] {
+        let fixture = self_kick_fixture("structured-fail");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = Arc::clone(&calls);
+        let expected_home = fixture.home.clone();
+        let expected_name = fixture.name.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |home, name, body| {
+                if home != expected_home || name != expected_name {
+                    return None;
+                }
+                calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                Some(Ok(self_kick_test_receipt(name, body, state)))
+            },
+        )));
+        let result = deliver_self_kick(
+            &fixture.registry,
+            &fixture.home,
+            &fixture.target,
+            "structured failure self-kick",
+        );
+        assert!(result.is_err(), "{state:?} must not be treated as success");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no transport retry");
+        assert!(fixture.written.lock().is_empty(), "no PTY fallback");
+        clear_self_kick_fixture(&fixture);
+    }
+}
+
+#[test]
+fn self_kick_target_generation_and_uuid_mismatches_fail_closed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _test_guard = SELF_KICK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fixture = self_kick_fixture("generation");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let expected_home = fixture.home.clone();
+    let expected_name = fixture.name.clone();
+    crate::transport::test_support::set_delivery_hook(Some(Arc::new(move |home, name, body| {
+        if home != expected_home || name != expected_name {
+            return None;
+        }
+        calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(self_kick_test_receipt(
+            name,
+            body,
+            DeliveryState::ProtocolAccepted,
+        )))
+    })));
+    fixture
+        .registry
+        .lock()
+        .get_mut(&fixture.id)
+        .expect("fixture handle")
+        .generation = crate::agent::crash_disposition::SpawnGeneration::new(99);
+    assert!(deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "stale generation"
+    )
+    .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.written.lock().is_empty());
+    clear_self_kick_fixture(&fixture);
+
+    let fixture = self_kick_fixture("uuid");
+    let old_id = fixture.id;
+    let new_id = crate::types::InstanceId::new();
+    let replacement = mk_handle_1441(&fixture.name, new_id);
+    let mut registry = fixture.registry.lock();
+    registry.remove(&old_id);
+    registry.insert(new_id, replacement);
+    drop(registry);
+    assert!(deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "stale uuid"
+    )
+    .is_err());
+    clear_self_kick_fixture(&fixture);
+}
+
+#[test]
+fn self_kick_deleted_or_deleting_target_fails_closed() {
+    let _test_guard = SELF_KICK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fixture = self_kick_fixture("deleted");
+    fixture
+        .registry
+        .lock()
+        .get(&fixture.id)
+        .expect("fixture handle")
+        .deleted
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        deliver_self_kick(&fixture.registry, &fixture.home, &fixture.target, "deleted").is_err()
+    );
+    clear_self_kick_fixture(&fixture);
+
+    let fixture = self_kick_fixture("deleting");
+    let _deleting = crate::agent::deleting::mark_deleting(&fixture.home, &fixture.name);
+    assert!(deliver_self_kick(
+        &fixture.registry,
+        &fixture.home,
+        &fixture.target,
+        "deleting"
+    )
+    .is_err());
+    clear_self_kick_fixture(&fixture);
+}
+
+#[test]
+fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
+    let _test_guard = SELF_KICK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fixture = self_kick_fixture("legacy");
+    assert_eq!(fixture.target.submit_key, "\r");
+    assert!(!fixture
+        .target
+        .deleted
+        .load(std::sync::atomic::Ordering::Acquire));
+    fixture
+        .registry
+        .lock()
+        .get(&fixture.id)
+        .expect("fixture handle")
+        .core
+        .lock()
+        .state
+        .current = crate::state::AgentState::Idle;
+    crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
+    spawn_self_kick_bootstrap(
+        Arc::clone(&fixture.registry),
+        fixture.id,
+        fixture.name.clone(),
+        fixture.home.clone(),
+        std::time::Duration::from_secs(2),
+        BootstrapRegistrationState::AlreadyRegistered,
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !fixture.written.lock().ends_with(b"\r") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let written = fixture.written.lock().clone();
+    assert!(
+        !written.is_empty(),
+        "LegacyPty must write through the captured target"
+    );
+    assert!(
+        written.ends_with(b"\r"),
+        "LegacyPty must submit the self-kick turn"
+    );
+    assert!(
+        crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
+        "only LegacyPty delivery arms the hook verifier"
+    );
+    clear_self_kick_fixture(&fixture);
 }
 
 #[test]
@@ -1833,6 +2145,9 @@ fn inject_with_target_skips_deleted_agent_1146() {
     ));
     let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "inject-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         pty_writer: writer,
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
@@ -1862,6 +2177,9 @@ fn inject_offload_queues_then_drops_on_full() {
         Box::new(std::io::sink()) as Box<dyn Write + Send>
     ));
     let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "inject-offload-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         pty_writer: writer,
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
@@ -1912,6 +2230,9 @@ fn inject_offload_defers_without_touching_delivery_worker() {
         Box::new(std::io::sink()) as Box<dyn Write + Send>
     ));
     let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "inject-defer-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         pty_writer: writer,
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
@@ -1963,6 +2284,9 @@ fn readback_test_target(core: Arc<CoreMutex<AgentCore>>) -> InjectTarget {
         Box::new(std::io::sink()) as Box<dyn Write + Send>
     ));
     InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "readback-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         pty_writer: writer,
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
@@ -2089,6 +2413,9 @@ fn typed_inject_retries_unrendered_payload_then_submits_once_s1() {
         core: Arc::clone(&core),
     })));
     let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-retry-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         pty_writer: writer,
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
@@ -2120,6 +2447,9 @@ fn typed_inject_never_submits_or_succeeds_without_readback_s1() {
         bytes: Arc::clone(&bytes),
     })));
     let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-no-readback-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
         pty_writer: writer,
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
@@ -3885,6 +4215,9 @@ fn concurrent_inject_to_different_agents_never_interleaves_2620() {
             .expect("spawn reader thread");
 
         let target = InjectTarget {
+            instance_id: crate::types::InstanceId::default(),
+            name: tag.to_string(),
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
             pty_writer: writer,
             inject_prefix: String::new(),
             submit_key: "\r".to_string(),

@@ -124,22 +124,37 @@ fn bump_transport_epoch(home: &Path, agent: &str) {
     *epoch = epoch.saturating_add(1);
 }
 
-pub(crate) struct TransportCleanupGuard {
+pub(crate) struct TransportGenerationGuard {
     _serial: parking_lot::MutexGuard<'static, ()>,
     key: (PathBuf, String),
+}
+
+/// Execute synchronous transport delivery on the same serialized lane as the
+/// background worker. Callers may perform registry validation before the
+/// delivery, but must not hold the registry lock across the closure/I/O.
+pub(crate) fn with_transport_serial<T>(f: impl FnOnce() -> T) -> T {
+    let _serial = transport_coordinator().serial.lock();
+    f()
 }
 
 /// Invalidate queued transport work and hold the transport lane through
 /// teardown. The epoch bump at drop also invalidates jobs enqueued while the
 /// deletion guard was held, so a late worker dequeue cannot recreate receipts.
-pub(crate) fn begin_transport_cleanup(home: &Path, agent: &str) -> TransportCleanupGuard {
+pub(crate) fn begin_transport_generation_transition(
+    home: &Path,
+    agent: &str,
+) -> TransportGenerationGuard {
     let coordinator = transport_coordinator();
     let serial = coordinator.serial.lock();
     bump_transport_epoch(home, agent);
-    TransportCleanupGuard {
+    TransportGenerationGuard {
         _serial: serial,
         key: (home.to_path_buf(), agent.to_string()),
     }
+}
+
+pub(crate) fn begin_transport_cleanup(home: &Path, agent: &str) -> TransportGenerationGuard {
+    begin_transport_generation_transition(home, agent)
 }
 
 fn global() -> &'static DeliveryWorker {
@@ -283,7 +298,7 @@ pub(crate) fn enqueue_transport_delivery(
     })
 }
 
-impl Drop for TransportCleanupGuard {
+impl Drop for TransportGenerationGuard {
     fn drop(&mut self) {
         bump_transport_epoch(&self.key.0, &self.key.1);
     }
@@ -638,5 +653,78 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn generation_transition_invalidates_queued_epochs_before_and_during_spawn() {
+        let _ff = test_support::force_full_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-generation-transition-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent = "legacy-agent";
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  legacy-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
+        )
+        .expect("fleet");
+
+        let before_epoch = transport_epoch(&home, agent);
+        let transition = begin_transport_generation_transition(&home, agent);
+        let during_epoch = transport_epoch(&home, agent);
+        drop(transition);
+        let after_epoch = transport_epoch(&home, agent);
+        assert_ne!(before_epoch, during_epoch);
+        assert_ne!(during_epoch, after_epoch);
+
+        dispatch(DeliveryJob::TransportDelivery {
+            home: home.clone(),
+            agent: agent.to_string(),
+            notification: "queued before spawn transition".to_string(),
+            epoch: before_epoch,
+        });
+        dispatch(DeliveryJob::TransportDelivery {
+            home: home.clone(),
+            agent: agent.to_string(),
+            notification: "queued during spawn transition".to_string(),
+            epoch: during_epoch,
+        });
+
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, agent),
+            2,
+            "both stale queued deliveries must be observed and discarded"
+        );
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        assert!(
+            !delivery_path.exists(),
+            "stale epochs must not recreate receipts"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn generation_transition_lane_rejects_reentrant_transport_entry() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-generation-reentry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let transition = begin_transport_generation_transition(&home, "agent");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            with_transport_serial(|| tx.send(()).expect("reentry probe receiver"));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "spawn preparation must not re-enter the held transport lane"
+        );
+        drop(transition);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
+            "the lane must become available after generation transition"
+        );
+        worker.join().expect("reentry probe thread");
     }
 }
