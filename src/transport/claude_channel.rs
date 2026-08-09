@@ -1670,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_delivery_uses_channel_bridge_without_pty_fallback() {
+    fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
         let home = home("registry-delivery");
         let listener = TcpListener::bind("127.0.0.1:0").expect("fake channel listener");
         listener
@@ -1678,7 +1678,9 @@ mod tests {
             .expect("nonblocking listener");
         let port = listener.local_addr().expect("listener address").port();
         let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_ready = Arc::clone(&ready);
         let server = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -1691,10 +1693,13 @@ mod tests {
                             (
                                 "200 OK",
                                 json!({
-                                    "ready": true,
+                                    "ready": thread_ready.load(Ordering::Acquire),
                                     "session_id": "claude-registry-session",
                                     "backend_version": "2.1.89",
-                                    "capabilities": {"claude/channel": true, "tools": true}
+                                    "capabilities": {
+                                        "claude/channel": thread_ready.load(Ordering::Acquire),
+                                        "tools": thread_ready.load(Ordering::Acquire)
+                                    }
                                 })
                                 .to_string(),
                             )
@@ -1724,16 +1729,28 @@ mod tests {
         locator.managed = true;
         locator.server_pid = Some(std::process::id());
         locator.server_start_token = crate::process::process_start_token(std::process::id());
-        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
-            .expect("locator");
         fs::write(
             crate::fleet::fleet_yaml_path(&home),
             "instances:\n  claude-agent:\n    backend: claude\n",
         )
         .expect("fleet");
+        let publisher_home = home.clone();
+        let publisher_locator = locator.clone();
+        let publisher_ready = Arc::clone(&ready);
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            super::super::registry::save_session_locator(
+                &publisher_home,
+                "claude-agent",
+                &publisher_locator,
+            )
+            .expect("delayed locator publication");
+            thread::sleep(Duration::from_millis(200));
+            publisher_ready.store(true, Ordering::Release);
+        });
         let legacy_called = Arc::new(AtomicBool::new(false));
         let legacy_called_by_closure = Arc::clone(&legacy_called);
-        let receipt = super::super::registry::deliver_notification(
+        let result = super::super::registry::deliver_notification(
             &home,
             "claude-agent",
             "registry delivery",
@@ -1741,20 +1758,23 @@ mod tests {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
             },
-        )
-        .expect("ChannelBridge delivery");
-        assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
-        assert!(!legacy_called.load(Ordering::Acquire));
-        let stored = ReceiptStore::for_instance(&home, "claude-agent")
-            .expect("receipt store")
-            .latest(receipt.delivery_id)
-            .expect("receipt lookup")
-            .expect("stored receipt");
-        assert_eq!(stored.state, DeliveryState::ProtocolAccepted);
+        );
+        publisher.join().expect("delayed publisher");
+        if let Ok(receipt) = &result {
+            assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+            assert!(!legacy_called.load(Ordering::Acquire));
+            let stored = ReceiptStore::for_instance(&home, "claude-agent")
+                .expect("receipt store")
+                .latest(receipt.delivery_id)
+                .expect("receipt lookup")
+                .expect("stored receipt");
+            assert_eq!(stored.state, DeliveryState::ProtocolAccepted);
+        }
         stop_instance_state(&home, "claude-agent");
         stop.store(true, Ordering::Release);
         let _ = server.join();
         let _ = fs::remove_dir_all(home);
+        result.expect("ChannelBridge delivery must wait for delayed readiness");
     }
 
     #[test]
