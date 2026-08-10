@@ -241,10 +241,11 @@ fn deliver_cron_fire(
 
     // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
     let target_id = crate::fleet::resolve_uuid(home, target);
-    // Snapshot only live identity under the registry lock, then RELEASE it
-    // before transport admission or the offline inbox fallback. The transport
-    // scheduler captures its own generation epoch, so a same-name replacement
-    // cannot receive this stale fire.
+    // Snapshot only the live logical name under the registry lock, then RELEASE
+    // it before transport admission or the offline inbox fallback. Scheduled
+    // delivery is intentionally name-scoped like inbox notification delivery: a
+    // replacement completed before admission may receive the fire. The transport
+    // epoch fences lifecycle transitions that race after admission.
     let live_name = {
         let reg = agent::lock_registry(registry);
         target_id
