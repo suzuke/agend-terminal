@@ -1205,6 +1205,11 @@ impl OpenCodeNativeShared {
             }
         }
         if let Err(error) = self.start_or_attach_blocking(envelope.session.clone(), None) {
+            if let Some(existing) = store.latest(envelope.delivery_id)? {
+                if existing.state != DeliveryState::Queued {
+                    return Self::replayed_receipt(existing);
+                }
+            }
             if load_rollover_journal(&self.home, &self.instance)?.is_some() {
                 return Err(error);
             }

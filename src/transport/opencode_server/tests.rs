@@ -650,8 +650,15 @@ fn rollover_reconcile_server(
                     "200 OK",
                     json!({"healthy": true, "version": "1.17.5"}),
                 );
-            } else if request_line.starts_with(&format!("GET /session/{ROLLOVER_SESSION_ID} ")) {
-                json_response(&mut stream, "200 OK", json!({"id": ROLLOVER_SESSION_ID}));
+            } else if request_line.starts_with("GET /session/session-1 ")
+                || request_line.starts_with(&format!("GET /session/{ROLLOVER_SESSION_ID} "))
+            {
+                let session_id = if request_line.starts_with("GET /session/session-1 ") {
+                    "session-1"
+                } else {
+                    ROLLOVER_SESSION_ID
+                };
+                json_response(&mut stream, "200 OK", json!({"id": session_id}));
             } else if request_line.starts_with("GET /event ") {
                 stream
                     .write_all(
@@ -796,6 +803,34 @@ fn reconstruction_marks_an_absent_submit_attempt_ambiguous_without_retry() {
             .expect("journal lookup")
             .is_none(),
         "an explicit ambiguous receipt replaces the journal"
+    );
+    let requests = server.join().expect("server");
+    assert!(requests.iter().all(|line| !line.contains("prompt_async")));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn same_envelope_retry_preserves_an_ambiguous_submit_reconciliation() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-opencode-rollover-reconcile-retry-{}",
+        Uuid::new_v4()
+    ));
+    let wire_message_id = "msg_00000000000a00000000000000".to_string();
+    let (port, server) = rollover_reconcile_server(false, wire_message_id.clone());
+    let (_, envelope, store) = seed_submit_attempted_rollover(&home, port, &wire_message_id);
+
+    let mut reconstructed = OpenCodeNativeShared::new(&home, "agent");
+    reconstructed
+        .deliver_blocking(envelope.clone())
+        .expect_err("absence cannot be retried as a fresh prompt");
+    assert_eq!(
+        store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("ambiguous receipt")
+            .state,
+        DeliveryState::Ambiguous,
+        "the delivery wrapper must not overwrite Ambiguous with Failed"
     );
     let requests = server.join().expect("server");
     assert!(requests.iter().all(|line| !line.contains("prompt_async")));
