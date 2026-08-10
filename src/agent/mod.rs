@@ -2881,16 +2881,13 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
         write_payload()?;
         if !readback_confirm_typed(target, &stripped) {
             tracing::warn!(
-                tag = "#1912-readback-retry",
-                "typed inject was not rendered; retrying payload once before submit"
+                tag = "#3175-readback-fail-closed",
+                "typed inject was not cursor-confirmed; leaving draft unsubmitted"
             );
-            write_payload()?;
-            if !readback_confirm_typed(target, &stripped) {
-                return Err(crate::error::AgendError::PtyWrite(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "typed inject was not rendered after one retry; payload not submitted",
-                )));
-            }
+            return Err(crate::error::AgendError::PtyWrite(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "typed inject was not cursor-confirmed; draft left unsubmitted",
+            )));
         }
     } else {
         let mut combined = Vec::with_capacity(prefix.len() + text_bytes.len());
@@ -2932,7 +2929,10 @@ fn inject_sentinel(stripped: &str) -> String {
         .last()
         .map(|(i, _)| i)
         .unwrap_or(0);
-    last_line[take_from..].to_string()
+    last_line[take_from..]
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .collect()
 }
 
 const READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2941,12 +2941,13 @@ const POSTSUBMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 /// Bottom rows scanned for the input area — the prompt + a few wrapped input rows.
 const READBACK_TAIL_ROWS: usize = 8;
 
-/// #1912: poll the rendered input area until the typed line's tail-sentinel
-/// renders, then return `true`. Returns `false` and warns if unconfirmed within
-/// the timeout; the caller retries once and never submits an unconfirmed payload.
-/// Acquires the core lock only
-/// briefly per poll (read `tail_lines`, drop) so the `pty_read_loop` renders the
-/// backend's echo of the typed chars between polls.
+/// #1912/#3175: poll until the typed line's tail sentinel is a suffix of the
+/// visible text ending exactly at the cursor. The VTerm matcher walks backwards
+/// only over proven `WRAPLINE` boundaries, so an older row, scrollback, or text
+/// after the cursor cannot authorize submit. Returns `false` on timeout; the
+/// caller leaves the first write untouched and never retries or submits it.
+/// Acquires the core lock only briefly per poll so `pty_read_loop` can render the
+/// backend's echo between polls.
 fn readback_confirm_typed(target: &InjectTarget, stripped: &str) -> bool {
     readback_confirm_typed_with(target, stripped, READBACK_TIMEOUT, READBACK_POLL)
 }
@@ -2959,16 +2960,21 @@ fn readback_confirm_typed_with(
 ) -> bool {
     let sentinel = inject_sentinel(stripped);
     if sentinel.is_empty() {
-        return true; // nothing to confirm (empty/whitespace payload)
+        return false;
     }
+    let max_rows = unicode_width::UnicodeWidthStr::width(sentinel.as_str()).max(1);
     let start = std::time::Instant::now();
     let mut polls = 0u32;
     loop {
         if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        let visible = target.core.lock().vterm.tail_lines(READBACK_TAIL_ROWS);
-        if visible.contains(&sentinel) {
+        let confirmed = target
+            .core
+            .lock()
+            .vterm
+            .cursor_anchored_suffix_matches(&sentinel, max_rows);
+        if confirmed {
             tracing::debug!(
                 tag = "#1912-readback-confirmed",
                 polls,

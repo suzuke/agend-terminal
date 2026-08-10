@@ -2624,6 +2624,19 @@ fn readback_confirm_rejects_sentinel_on_previous_hard_row_3175() {
 }
 
 #[test]
+fn readback_confirm_never_joins_same_text_across_hard_rows_3175() {
+    let payload = "1234567890tail";
+    let core = readback_test_core_with_size(10, 4, b"1234567890\r\ntail");
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
 fn readback_confirm_rejects_sentinel_after_cursor_3175() {
     let payload = "unique-after-cursor";
     let core = readback_test_core(format!("\u{203a} {payload}\r\x1b[2C").as_bytes());
@@ -2652,7 +2665,7 @@ fn readback_confirm_compares_tab_at_its_composer_display_width_3175() {
 #[test]
 fn readback_confirm_preserves_wide_graphemes_3175() {
     let payload = "wake-日本語-尾";
-    let core = readback_test_core(format!("\u{203a} {payload}").as_bytes());
+    let core = readback_test_core_with_size(10, 4, format!("\u{203a} {payload}").as_bytes());
     let target = readback_test_target(core);
     assert!(readback_confirm_typed_with(
         &target,
