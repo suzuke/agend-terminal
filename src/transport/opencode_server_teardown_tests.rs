@@ -8,12 +8,14 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const FIXTURE_CPU_LIMIT_SECS: u64 = 30;
+const FIXTURE_CPU_PROBE_LIMIT_SECS: u64 = 1;
+const FIXTURE_CPU_PROBE_WALL_BUDGET_SECS: u64 = 60;
 
 fn write_term_ignoring_fixture(fake: &Path, trap_ready: &Path, cpu_limit_secs: u64) {
     std::fs::write(
         fake,
         format!(
-            "#!/bin/sh\nulimit -t {cpu_limit_secs}\ntrap ':' TERM\ntouch '{}'\nwhile :; do :; done\n",
+            "#!/bin/sh\n# This CPU-time backstop requires the fixture to remain CPU-bound.\nulimit -t {cpu_limit_secs}\ntrap ':' TERM\n: > '{}'\nwhile :; do :; done\n",
             trap_ready.display()
         ),
     )
@@ -45,23 +47,25 @@ fn term_ignoring_fixture_has_a_bounded_lifetime() {
     std::fs::create_dir_all(&home).expect("home");
     let fake = home.join("fake-opencode.sh");
     let trap_ready = home.join("trap-ready");
-    write_term_ignoring_fixture(&fake, &trap_ready, 1);
+    write_term_ignoring_fixture(&fake, &trap_ready, FIXTURE_CPU_PROBE_LIMIT_SECS);
 
     let mut child = Command::new(&fake).spawn().expect("bounded fixture");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(FIXTURE_CPU_PROBE_WALL_BUDGET_SECS);
     let mut status = child.try_wait().expect("probe bounded fixture");
     while status.is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
         status = child.try_wait().expect("reap bounded fixture");
     }
-    if status.is_none() {
+    let status = status.unwrap_or_else(|| {
         let _ = child.kill();
         let _ = child.wait();
-    }
+        let _ = std::fs::remove_dir_all(&home);
+        panic!("TERM-ignoring fixture exceeded its CPU-limit wall-clock budget");
+    });
     let _ = std::fs::remove_dir_all(home);
     assert!(
-        status.is_some(),
-        "TERM-ignoring fixture must self-reap when its harness disappears"
+        !status.success(),
+        "TERM-ignoring fixture must be terminated by its CPU limit"
     );
 }
 
