@@ -2853,6 +2853,7 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
             .typed_inject_contaminated
             .load(std::sync::atomic::Ordering::Acquire)
     {
+        latch_typed_inject_contamination(target);
         return Err(crate::error::AgendError::PtyWrite(std::io::Error::other(
             "typed inject blocked after a prior unconfirmed draft",
         )));
@@ -2906,15 +2907,11 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
         };
 
         if let Err(error) = write_payload() {
-            target
-                .typed_inject_contaminated
-                .store(true, std::sync::atomic::Ordering::Release);
+            latch_typed_inject_contamination(target);
             return Err(error);
         }
         if !readback_confirm_typed(target, stripped) {
-            target
-                .typed_inject_contaminated
-                .store(true, std::sync::atomic::Ordering::Release);
+            latch_typed_inject_contamination(target);
             tracing::warn!(
                 tag = "#3175-readback-fail-closed",
                 "typed inject was not cursor-confirmed; leaving draft unsubmitted"
@@ -2938,9 +2935,7 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     }
     if let Err(error) = write_with_timeout(&target.pty_writer, submit) {
         if target.typed_inject {
-            target
-                .typed_inject_contaminated
-                .store(true, std::sync::atomic::Ordering::Release);
+            latch_typed_inject_contamination(target);
         }
         return Err(error.into());
     }
@@ -2950,6 +2945,19 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
         let _submitted = observe_post_submit(target);
     }
     Ok(())
+}
+
+fn latch_typed_inject_contamination(target: &InjectTarget) {
+    target
+        .typed_inject_contaminated
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut core = target.core.lock();
+    core.health
+        .set_blocked_reason(crate::health::BlockedReason::TypedInjectContaminated);
+    core.health.set_blocked_note(Some(
+        "Typed injection is fenced after an unconfirmed draft; restart this agent process to clear the composer and fence."
+            .to_string(),
+    ));
 }
 
 /// #1146: lightweight clone of the fields `inject_to_agent` reads from

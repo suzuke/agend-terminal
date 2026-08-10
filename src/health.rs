@@ -206,6 +206,11 @@ pub enum BlockedReason {
     /// `AgentState::ModelUnsupported`. Manual-clear-only and hang-suppressing —
     /// see `auto_clears_on` / `suppresses_hang_check`.
     ModelUnsupported,
+    /// #3175: a LegacyPty typed injection left a draft whose delivery or submit
+    /// could not be confirmed. The per-process injection fence remains closed
+    /// until the agent handle is replaced; surface that fail-closed state instead
+    /// of silently dropping every later nudge behind the same fence.
+    TypedInjectContaminated,
 }
 
 /// #1638: which recovery signal a [`BlockedReason`] is being tested against.
@@ -234,6 +239,7 @@ impl BlockedReason {
             "hang" => Some(Self::Hang),
             "crash" => Some(Self::Crash),
             "model_unsupported" => Some(Self::ModelUnsupported),
+            "typed_inject_contaminated" => Some(Self::TypedInjectContaminated),
             _ => None,
         }
     }
@@ -247,6 +253,7 @@ impl BlockedReason {
             Self::PermissionPrompt => "permission_prompt",
             Self::Crash => "crash",
             Self::ModelUnsupported => "model_unsupported",
+            Self::TypedInjectContaminated => "typed_inject_contaminated",
         }
     }
 
@@ -281,7 +288,11 @@ impl BlockedReason {
             // the operator must change the configured model, then the agent
             // restarts and `HealthTracker::reset()` clears it on respawn. So it
             // joins the manual-clear-only class with PermissionPrompt/Hang/Crash.
-            Self::PermissionPrompt | Self::Hang | Self::Crash | Self::ModelUnsupported => false,
+            Self::PermissionPrompt
+            | Self::Hang
+            | Self::Crash
+            | Self::ModelUnsupported
+            | Self::TypedInjectContaminated => false,
         }
     }
 
@@ -303,7 +314,8 @@ impl BlockedReason {
             Self::RateLimit { .. }
             | Self::QuotaExceeded
             | Self::AwaitingOperator
-            | Self::ModelUnsupported => true,
+            | Self::ModelUnsupported
+            | Self::TypedInjectContaminated => true,
             Self::PermissionPrompt | Self::Hang | Self::Crash => false,
         }
     }
@@ -1814,6 +1826,7 @@ mod tests {
             BlockedReason::PermissionPrompt,
             BlockedReason::Crash,
             BlockedReason::ModelUnsupported,
+            BlockedReason::TypedInjectContaminated,
         ];
         for reason in cases {
             let json = serde_json::to_string(&reason).expect("serialize");
@@ -2293,6 +2306,7 @@ mod tests {
             // (true) combination — manual-clear-only like Crash, but suppresses
             // hang-check like RateLimit (stuck-but-not-hung).
             (ModelUnsupported, false, false, true),
+            (TypedInjectContaminated, false, false, true),
         ];
         for (reason, on_rl, on_op, suppress) in table {
             assert_eq!(
