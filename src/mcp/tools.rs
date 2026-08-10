@@ -315,7 +315,9 @@ pub(crate) fn def_schedule() -> Value {
             "enabled": {"type": "boolean"},
             "full_history": {"type": "boolean", "description": "#2037: `list` trims run_history to the newest 3 per schedule (row carries runs_total); pass true for the full stored history (up to 50)."},
             "fire_strategy": {"type": "string", "enum": ["always", "until_success"], "description": "Default always (fire every cron match). until_success: skip remaining same-day fires once linked_task_id completes (done); resumes next calendar day. Requires linked_task_id when until_success. See #1521."},
-            "linked_task_id": {"type": "string", "description": "Task ID whose done status (today) suppresses further fires under until_success. Missing task disables the schedule with target_task_missing. See #1521."}
+            "linked_task_id": {"type": "string", "description": "Task ID whose done status (today) suppresses further fires under until_success. Missing task disables the schedule with target_task_missing. See #1521."},
+            "replacement_key": {"type": "string", "description": "Create-only logical singleton scope. Creating a newer schedule for the same target+key atomically disables and audits older enabled rows. If omitted for [AGEND-AUTO kind=X], defaults to agend-auto:X."},
+            "subject_ref": {"type": "string", "description": "Create-only immutable subject identity for audit, such as git:<full-sha>. Does not itself control replacement."}
         }, "required": ["action"]}})
 }
 
@@ -1210,6 +1212,8 @@ mod tests {
             ("schedule", "enabled", "schedules.rs update"),
             ("schedule", "fire_strategy", "schedules.rs create/update (#1521)"),
             ("schedule", "linked_task_id", "schedules.rs until_success gate (#1521)"),
+            ("schedule", "replacement_key", "schedules.rs create atomic supersession scope"),
+            ("schedule", "subject_ref", "schedules.rs create immutable subject metadata"),
             // ── deployment ──
             ("deployment", "action", "deployments.rs routing"),
             ("deployment", "template", "deployments.rs validate_deploy_args"),

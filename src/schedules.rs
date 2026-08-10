@@ -103,6 +103,15 @@ pub struct Schedule {
     /// observed `done` — suppresses re-fires for the rest of that day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_date: Option<String>,
+    /// Logical singleton scope. Creating a newer schedule for the same target
+    /// and key atomically disables older enabled rows while retaining them for
+    /// audit. AGEND-AUTO messages derive this from their `kind` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_key: Option<String>,
+    /// Immutable revision/subject being monitored (for example `git:<sha>`).
+    /// Informational identity; replacement is governed by `replacement_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_ref: Option<String>,
 }
 
 /// On-wire representation that accepts both v1 (top-level `cron`) and v2
@@ -141,6 +150,10 @@ struct ScheduleRaw {
     linked_task_id: Option<String>,
     #[serde(default)]
     last_success_date: Option<String>,
+    #[serde(default)]
+    replacement_key: Option<String>,
+    #[serde(default)]
+    subject_ref: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -167,8 +180,62 @@ impl From<ScheduleRaw> for Schedule {
             fire_strategy: r.fire_strategy,
             linked_task_id: r.linked_task_id,
             last_success_date: r.last_success_date,
+            replacement_key: r.replacement_key,
+            subject_ref: r.subject_ref,
         }
     }
+}
+
+const MAX_REPLACEMENT_KEY_BYTES: usize = 128;
+const MAX_SUBJECT_REF_BYTES: usize = 512;
+
+fn optional_identity_arg(
+    args: &Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(format!("'{field}' must be a string"));
+    };
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        return Err(format!("'{field}' must not be empty"));
+    }
+    if normalized.len() > max_bytes {
+        return Err(format!("'{field}' exceeds the {max_bytes}-byte limit"));
+    }
+    if normalized.chars().any(char::is_control) {
+        return Err(format!("'{field}' must not contain control characters"));
+    }
+    Ok(Some(normalized.to_string()))
+}
+
+/// The daemon-auto marker already defines keep-latest identity for queued
+/// nudges. Reuse that `kind` as the default schedule replacement scope so a
+/// recurring automatic monitor cannot survive creation of its successor.
+fn auto_replacement_key(message: &str) -> Option<String> {
+    let rest = message.strip_prefix(crate::agent::DAEMON_AUTO_INJECT_MARKER)?;
+    let rest = rest.strip_prefix(" kind=")?;
+    let end = rest.find(']')?;
+    let kind = &rest[..end];
+    if kind.is_empty()
+        || !kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(format!("agend-auto:{kind}"))
+}
+
+fn effective_replacement_key(schedule: &Schedule) -> Option<String> {
+    schedule
+        .replacement_key
+        .clone()
+        .or_else(|| auto_replacement_key(&schedule.message))
 }
 
 /// #1521: a `linked_task_id` is required for `UntilSuccess` and the task must
@@ -474,6 +541,16 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
     if let Err(e) = validate_fire_strategy(home, fire_strategy, linked_task_id.as_deref()) {
         return serde_json::json!({"error": e});
     }
+    let replacement_key =
+        match optional_identity_arg(args, "replacement_key", MAX_REPLACEMENT_KEY_BYTES) {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => auto_replacement_key(message),
+            Err(error) => return serde_json::json!({"error": error}),
+        };
+    let subject_ref = match optional_identity_arg(args, "subject_ref", MAX_SUBJECT_REF_BYTES) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({"error": error}),
+    };
     let now = chrono::Utc::now();
     let now_str = now.to_rfc3339();
     // H3: microsecond precision + counter to prevent same-second collision
@@ -498,12 +575,47 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         fire_strategy,
         linked_task_id,
         last_success_date: None,
+        replacement_key,
+        subject_ref,
     };
+    let supersession_target = schedule.target.clone();
+    let supersession_key = schedule.replacement_key.clone();
+    let supersession_id = schedule.id.clone();
+    let supersession_at = schedule.updated_at.clone();
+    let mut superseded_ids = Vec::new();
     match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+        if let Some(key) = supersession_key.as_deref() {
+            for existing in &mut store.schedules {
+                if !existing.enabled || existing.target != supersession_target {
+                    continue;
+                }
+                if effective_replacement_key(existing).as_deref() != Some(key) {
+                    continue;
+                }
+                existing.enabled = false;
+                existing.updated_at.clone_from(&supersession_at);
+                if existing.replacement_key.is_none() {
+                    existing.replacement_key = Some(key.to_string());
+                }
+                existing.run_history.push(ScheduleRun {
+                    triggered_at: supersession_at.clone(),
+                    status: format!("superseded_by:{supersession_id}"),
+                });
+                if existing.run_history.len() > 50 {
+                    let excess = existing.run_history.len() - 50;
+                    existing.run_history.drain(..excess);
+                }
+                superseded_ids.push(existing.id.clone());
+            }
+        }
         store.schedules.push(schedule);
         Ok(())
     }) {
-        Ok(()) => serde_json::json!({"id": id, "status": "created"}),
+        Ok(()) => serde_json::json!({
+            "id": id,
+            "status": "created",
+            "superseded_ids": superseded_ids
+        }),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
@@ -594,6 +706,11 @@ pub fn update(home: &Path, args: &Value) -> Value {
         Some(i) => i.to_string(),
         None => return serde_json::json!({"error": "missing 'id'"}),
     };
+    if args.get("replacement_key").is_some() || args.get("subject_ref").is_some() {
+        return serde_json::json!({
+            "error": "'replacement_key' and 'subject_ref' are create-only identity fields; create a replacement schedule instead"
+        });
+    }
 
     // Pre-validate trigger change (if any) outside the store lock so
     // errors return without touching the file.
@@ -633,6 +750,20 @@ pub fn update(home: &Path, args: &Value) -> Value {
         .find(|s| s.id == id)
     {
         Some(schedule) => {
+            // Materialize the effective key before applying message edits so a
+            // migrated AGEND-AUTO row cannot silently change replacement scope.
+            if schedule.replacement_key.is_none() {
+                schedule.replacement_key = auto_replacement_key(&schedule.message);
+            }
+            if new_target
+                .as_deref()
+                .is_some_and(|target| target != schedule.target)
+                && schedule.replacement_key.is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "a keyed schedule's target is immutable; create a replacement schedule instead"
+                ));
+            }
             if let Some(ref m) = new_message {
                 schedule.message.clone_from(m);
             }
@@ -805,6 +936,22 @@ mod tests {
         );
         let old_id = old["id"].as_str().expect("old id").to_string();
 
+        // Simulate a row written before replacement identity was persisted.
+        // Its AGEND-AUTO marker must still participate in supersession.
+        let path = store_path(&home);
+        let mut legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read schedule store"))
+                .expect("parse schedule store");
+        legacy["schedules"][0]
+            .as_object_mut()
+            .expect("legacy schedule row")
+            .remove("replacement_key");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy store"),
+        )
+        .expect("seed legacy schedule store");
+
         let other_target = create(
             &home,
             "lead",
@@ -947,6 +1094,49 @@ mod tests {
             CREATORS - 1,
             "every losing row must carry a durable supersession audit"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn replacement_identity_is_bounded_and_create_only() {
+        let home = tmp_home("replacement-identity-validation");
+        let empty = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 * * * *",
+                "message": "monitor",
+                "replacement_key": "   "
+            }),
+        );
+        assert!(empty["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("must not be empty")));
+
+        let created = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 * * * *",
+                "instance": "lead",
+                "message": "monitor",
+                "replacement_key": "runtime-acceptance",
+                "subject_ref": "git:sha"
+            }),
+        );
+        let id = created["id"].as_str().expect("created id");
+        let identity_update = update(
+            &home,
+            &serde_json::json!({"id": id, "subject_ref": "git:other"}),
+        );
+        assert!(identity_update["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("create-only")));
+        let target_update = update(&home, &serde_json::json!({"id": id, "instance": "other"}));
+        assert!(target_update["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("target is immutable")));
 
         std::fs::remove_dir_all(&home).ok();
     }
