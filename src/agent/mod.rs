@@ -29,6 +29,11 @@ pub mod deleting;
 #[cfg(unix)]
 mod write_actor;
 
+mod typed_inject;
+#[cfg(test)]
+use typed_inject::{inject_sentinel, observe_post_submit_with, readback_confirm_typed_with};
+use typed_inject::{observe_post_submit, readback_confirm_typed};
+
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Core state for one agent — protected by a single Mutex for atomic operations.
@@ -97,6 +102,10 @@ pub struct AgentHandle {
     pub(crate) submit_key: String,
     pub(crate) inject_prefix: String,
     pub(crate) typed_inject: bool,
+    /// Sticky per-process fence set after an unconfirmed typed write. A later
+    /// payload must not append to and submit the stranded draft; replacing the
+    /// agent handle creates a fresh fence.
+    pub(crate) typed_inject_contaminated: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) spawned_at: std::time::Instant,
     pub(crate) spawned_at_epoch_ms: u64,
     /// The `SpawnMode` this handle's process was spawned with (#t-777-3). Stamped
@@ -1479,6 +1488,7 @@ pub(crate) fn spawn_agent_with_capture_home(
                     .as_ref()
                     .map(|b| b.preset().typed_inject)
                     .unwrap_or(false),
+                typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 spawned_at: std::time::Instant::now(),
                 spawned_at_epoch_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2838,12 +2848,29 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
+    if target.typed_inject
+        && target
+            .typed_inject_contaminated
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(crate::error::AgendError::PtyWrite(std::io::Error::other(
+            "typed inject blocked after a prior unconfirmed draft",
+        )));
+    }
     let prefix = target.inject_prefix.as_bytes();
     let submit = target.submit_key.as_bytes();
 
     // S54 fix: strip ANSI sequences before injection to avoid ESC conflict in typed_inject.
     let text_str = String::from_utf8_lossy(text);
-    let stripped = strip_ansi(&text_str);
+    let stripped_owned = strip_ansi(&text_str);
+    // #3175: the cursor anchor must observe exactly the same logical tail that was
+    // written. Trailing whitespace has no notification semantics, but retaining it
+    // would put the cursor after bytes that inject_sentinel intentionally trims.
+    let stripped = if target.typed_inject {
+        stripped_owned.trim_end()
+    } else {
+        stripped_owned.as_str()
+    };
     let text_bytes = stripped.as_bytes();
 
     if target.typed_inject {
@@ -2878,8 +2905,16 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
             Ok(())
         };
 
-        write_payload()?;
-        if !readback_confirm_typed(target, &stripped) {
+        if let Err(error) = write_payload() {
+            target
+                .typed_inject_contaminated
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
+        if !readback_confirm_typed(target, stripped) {
+            target
+                .typed_inject_contaminated
+                .store(true, std::sync::atomic::Ordering::Release);
             tracing::warn!(
                 tag = "#3175-readback-fail-closed",
                 "typed inject was not cursor-confirmed; leaving draft unsubmitted"
@@ -2910,127 +2945,6 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     Ok(())
 }
 
-/// #1912: tail-sentinel of a (possibly multi-line) injected payload — the last
-/// run of up to `MAX` chars on the final non-empty line, the line the submit `\r`
-/// commits. Short + drawn from the bottom line so it stays robust to input-box
-/// wrapping. Empty when the payload has no non-blank line (nothing to confirm).
-fn inject_sentinel(stripped: &str) -> String {
-    const MAX: usize = 24;
-    let last_line = stripped
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let take_from = last_line
-        .char_indices()
-        .rev()
-        .take(MAX)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    last_line[take_from..]
-        .chars()
-        .map(|c| if c == '\t' { ' ' } else { c })
-        .collect()
-}
-
-const READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(15);
-const POSTSUBMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
-/// Bottom rows scanned for the input area — the prompt + a few wrapped input rows.
-const READBACK_TAIL_ROWS: usize = 8;
-
-/// #1912/#3175: poll until the typed line's tail sentinel is a suffix of the
-/// visible text ending exactly at the cursor. The VTerm matcher walks backwards
-/// only over proven `WRAPLINE` boundaries, so an older row, scrollback, or text
-/// after the cursor cannot authorize submit. Returns `false` on timeout; the
-/// caller leaves the first write untouched and never retries or submits it.
-/// Acquires the core lock only briefly per poll so `pty_read_loop` can render the
-/// backend's echo between polls.
-fn readback_confirm_typed(target: &InjectTarget, stripped: &str) -> bool {
-    readback_confirm_typed_with(target, stripped, READBACK_TIMEOUT, READBACK_POLL)
-}
-
-fn readback_confirm_typed_with(
-    target: &InjectTarget,
-    stripped: &str,
-    timeout: std::time::Duration,
-    poll: std::time::Duration,
-) -> bool {
-    let sentinel = inject_sentinel(stripped);
-    if sentinel.is_empty() {
-        return false;
-    }
-    let max_rows = unicode_width::UnicodeWidthStr::width(sentinel.as_str()).max(1);
-    let start = std::time::Instant::now();
-    let mut polls = 0u32;
-    loop {
-        if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        let confirmed = target
-            .core
-            .lock()
-            .vterm
-            .cursor_anchored_suffix_matches(&sentinel, max_rows);
-        if confirmed {
-            tracing::debug!(
-                tag = "#1912-readback-confirmed",
-                polls,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "typed inject line rendered in input area before submit"
-            );
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            tracing::warn!(
-                tag = "#1912-readback-timeout",
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                sentinel_len = sentinel.len(),
-                "typed inject line not confirmed in input area within timeout"
-            );
-            return false;
-        }
-        std::thread::sleep(poll);
-        polls += 1;
-    }
-}
-
-/// #1912: post-submit observability (no retry). A successful submit clears the
-/// input line / grows the transcript, so the rendered tail CHANGES; returns `true`
-/// the moment it does. If it stays byte-identical for `POSTSUBMIT_WINDOW`, the
-/// submit likely didn't take — warn (log/metric only) and return `false`. NEVER
-/// retries the submit: a second `\r` would risk double-submit.
-fn observe_post_submit(target: &InjectTarget) -> bool {
-    observe_post_submit_with(target, POSTSUBMIT_WINDOW, READBACK_POLL)
-}
-
-fn observe_post_submit_with(
-    target: &InjectTarget,
-    window: std::time::Duration,
-    poll: std::time::Duration,
-) -> bool {
-    let before = target.core.lock().vterm.tail_lines(READBACK_TAIL_ROWS);
-    let start = std::time::Instant::now();
-    loop {
-        if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        std::thread::sleep(poll);
-        if target.core.lock().vterm.tail_lines(READBACK_TAIL_ROWS) != before {
-            return true;
-        }
-        if start.elapsed() >= window {
-            tracing::warn!(
-                tag = "#1912-postsubmit-nochange",
-                "input area unchanged after submit — a readback-confirmed line may not have submitted"
-            );
-            return false;
-        }
-    }
-}
-
 /// #1146: lightweight clone of the fields `inject_to_agent` reads from
 /// `AgentHandle`. Lets callers snapshot under lock then inject after
 /// releasing the registry mutex — typed_inject agents sleep 2ms per
@@ -3045,6 +2959,7 @@ pub(crate) struct InjectTarget {
     pub inject_prefix: String,
     pub submit_key: String,
     pub typed_inject: bool,
+    pub typed_inject_contaminated: Arc<std::sync::atomic::AtomicBool>,
     pub deleted: Arc<std::sync::atomic::AtomicBool>,
     /// #1912: the agent's core, so the typed-inject readback-confirm can poll the
     /// RENDERED input line (`core.vterm.tail_lines`) before sending the submit key —
@@ -3064,6 +2979,7 @@ impl InjectTarget {
             inject_prefix: h.inject_prefix.clone(),
             submit_key: h.submit_key.clone(),
             typed_inject: h.typed_inject,
+            typed_inject_contaminated: Arc::clone(&h.typed_inject_contaminated),
             deleted: Arc::clone(&h.deleted),
             core: Arc::clone(&h.core),
         }
@@ -3192,6 +3108,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,

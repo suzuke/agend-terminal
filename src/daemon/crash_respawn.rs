@@ -710,6 +710,9 @@ mod deleted_gate_tests_1913 {
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
+            typed_inject_contaminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
             spawn_mode: crate::backend::SpawnMode::Fresh,

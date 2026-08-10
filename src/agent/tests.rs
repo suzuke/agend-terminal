@@ -268,6 +268,7 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -395,6 +396,7 @@ fn self_kick_fixture(tag: &str) -> SelfKickFixture {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1129,6 +1131,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1750,6 +1753,7 @@ fn write_to_agent_typed_uses_timeout() {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -2423,6 +2427,7 @@ fn inject_with_target_skips_deleted_agent_1146() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::clone(&deleted),
         core: readback_test_core(b""), // #1912: bulk path never reads it
     };
@@ -2455,6 +2460,7 @@ fn inject_offload_queues_then_drops_on_full() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core: readback_test_core(b""),
     };
@@ -2508,6 +2514,7 @@ fn inject_offload_defers_without_touching_delivery_worker() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core: readback_test_core(b""),
     };
@@ -2566,6 +2573,7 @@ fn readback_test_target(core: Arc<CoreMutex<AgentCore>>) -> InjectTarget {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     }
@@ -2806,6 +2814,7 @@ fn typed_inject_readback_miss_never_rewrites_or_submits_3175() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     };
@@ -2847,6 +2856,7 @@ fn typed_inject_normalizes_trailing_whitespace_before_write_3175() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     };
@@ -2878,6 +2888,7 @@ fn typed_inject_miss_latches_before_later_payload_can_append_3175() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     };
@@ -2911,6 +2922,7 @@ fn typed_inject_never_submits_or_succeeds_without_readback_s1() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     };
@@ -3023,6 +3035,7 @@ fn pty_read_error_triggers_cleanup() {
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
+            typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -3146,6 +3159,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -3607,6 +3621,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -4791,6 +4806,7 @@ fn concurrent_inject_to_different_agents_never_interleaves_2620() {
             inject_prefix: String::new(),
             submit_key: "\r".to_string(),
             typed_inject: true,
+            typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             core,
         };
