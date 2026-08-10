@@ -16,7 +16,7 @@
 //! handled-count is unaffected: it is decided by the synchronous kind-match
 //! inside each subscriber, BEFORE any delivery is enqueued (see `event_bus.rs`).
 //!
-//! Backpressure: Telegram and the other `DeliveryJob` kinds use a bounded
+//! Backpressure: Telegram and tick-stall `DeliveryJob` kinds use a bounded
 //! `sync_channel(QUEUE_CAP)` and `try_send`, while transport uses a separate
 //! bounded fixed-worker scheduler with per-key FIFO queues. Neither enqueue
 //! path blocks. On a full queue the job is dropped and the caller is told so it
@@ -52,16 +52,6 @@ enum DeliveryJob {
     /// thread (see `channel::telegram::notify`). On terminal send failure the
     /// worker evicts that claim.
     TelegramSend(TelegramSendJob),
-    /// AUDIT2-006 C: a cron physical PTY inject. The prepare/gate phase (marker +
-    /// #1513 defer) already ran synchronously on the tick thread; the worker does
-    /// ONLY the physical write via the CAPTURED `InjectTarget`. It NEVER re-resolves
-    /// `agent` (a same-name redeploy must not receive a stale fire — `agent` is for
-    /// logging only).
-    CronInject {
-        target: crate::agent::InjectTarget,
-        agent: String,
-        text: Vec<u8>,
-    },
     /// PR4: an out-of-band tick-stall page. The stall monitor thread `try_send`s
     /// this (never blocking the tick host it watches); the worker — off that
     /// thread — owns the escalation fan-out + `event_log` write. `host` / `phase`
@@ -432,15 +422,6 @@ fn dispatch(job: DeliveryJob) {
         DeliveryJob::TelegramSend(job) => {
             crate::channel::telegram::notify::send_telegram_job(job);
         }
-        DeliveryJob::CronInject {
-            target,
-            agent,
-            text,
-        } => {
-            if let Err(e) = crate::agent::inject_target_physical(&target, &text) {
-                tracing::debug!(agent = %agent, error = %e, "delivery_worker: cron inject failed");
-            }
-        }
         DeliveryJob::TickStallAlert {
             home,
             host,
@@ -528,7 +509,6 @@ fn dispatch_transport(
 /// Enqueue a complete backend transport delivery. The bounded queue is the
 /// caller-facing non-blocking boundary; structured handshakes and protocol
 /// waits happen only in [`dispatch_transport`] on a keyed transport scheduler worker.
-#[allow(dead_code)]
 pub(crate) fn enqueue_transport_delivery(
     home: &Path,
     agent: &str,
@@ -655,22 +635,6 @@ impl Drop for TransportGenerationGuard {
 /// dedup claim so a later identical emit isn't suppressed for the whole TTL.
 pub(crate) fn enqueue_telegram_send(job: TelegramSendJob) -> Result<(), ()> {
     try_enqueue(DeliveryJob::TelegramSend(job))
-}
-
-/// AUDIT2-006 C: offload a cron physical PTY inject. The caller (cron) has already
-/// run the prepare/gate phase synchronously; `target` is the CAPTURED inject
-/// snapshot — the worker never re-resolves `agent` (logging only). Returns `Err(())`
-/// when the bounded queue is full, so the caller records `drop_queue_full`.
-pub(crate) fn enqueue_cron_inject(
-    target: crate::agent::InjectTarget,
-    agent: &str,
-    text: Vec<u8>,
-) -> Result<(), ()> {
-    try_enqueue(DeliveryJob::CronInject {
-        target,
-        agent: agent.to_string(),
-        text,
-    })
 }
 
 /// PR4: offload an out-of-band tick-stall page. The stall monitor calls this; it

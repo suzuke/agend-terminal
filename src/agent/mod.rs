@@ -175,14 +175,10 @@ pub fn lock_external(
 mod sensitive_env;
 use sensitive_env::SENSITIVE_ENV_KEYS;
 
-// AUDIT2-006 C: cron PTY-inject offload — prepare/gate split + bounded-worker
-// offload sibling. Kept out of this (grandfathered) file to respect its LOC
-// ceiling; the child module reaches the private `inject_with_target` /
-// `daemon_auto_prefix` via `super::`.
-mod inject_offload;
-pub(crate) use inject_offload::{
-    inject_target_physical, inject_with_target_gated_offload, InjectDispatch,
-};
+// Shared marker + direct-PTY defer gate. Kept out of this (grandfathered) file
+// to respect its LOC ceiling; the child reaches `daemon_auto_prefix` via
+// `super::`.
+mod inject_gate;
 
 mod self_kick;
 use self_kick::{deliver_self_kick, SelfKickDelivery};
@@ -2831,13 +2827,13 @@ pub(crate) fn inject_with_target_gated(
     force: bool,
     auto_kind: Option<&str>,
 ) -> crate::error::Result<()> {
-    // AUDIT2-006 C: prepare/gate (marker + #1513 defer) is the shared synchronous
-    // phase (sole impl in `inject_offload`); this inline variant then does the
-    // physical write directly, byte-equivalent to before. Cron uses
-    // `inject_with_target_gated_offload` to offload that physical write instead.
-    match inject_offload::prepare_inject(name, text, force, auto_kind) {
-        inject_offload::InjectPrep::Deferred(result) => result,
-        inject_offload::InjectPrep::Proceed(marked) => inject_with_target(target, &marked),
+    // The marker + #1513 defer gate has one implementation in `inject_gate`;
+    // direct PTY callers then perform the physical write byte-equivalently.
+    // Backend-aware notification sources, including cron, bypass this path and
+    // use the transport scheduler.
+    match inject_gate::prepare_inject(name, text, force, auto_kind) {
+        inject_gate::InjectPrep::Deferred(result) => result,
+        inject_gate::InjectPrep::Proceed(marked) => inject_with_target(target, &marked),
     }
 }
 

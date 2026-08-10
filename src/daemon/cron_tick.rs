@@ -200,22 +200,24 @@ fn note_unhandled_cron_fire(home: &Path, sched_id: &str, target: &str, handled: 
 }
 
 /// #event-bus pattern (cron_tick): the per-fire EFFECT, shared by the legacy
-/// inline path and the bus subscriber. Resolves the target, injects to a
-/// running agent or enqueues to its inbox (or records missed / skips an
+/// inline path and the bus subscriber. Resolves the target, queues backend
+/// transport delivery for a running agent, or enqueues to its inbox (or records missed / skips an
 /// orphaned target), then records the run and auto-disables one-shots.
 /// `message`/`label` are the static schedule strings (frozen by the producer —
 /// non-time-sensitive, so no rebuild-drift concern).
-/// AUDIT2-006 C: map an offloaded-inject outcome to a `record_run` status. Pure so
-/// it is unit-tested without seeding a live registry. `ok_queued` means "accepted
-/// by the bounded delivery queue", NOT physically delivered (see `InjectDispatch`);
-/// the deferred-gate path keeps today's `ok`/`inject_failed` mapping because its
-/// durable enqueue already completed synchronously.
-fn cron_inject_status(dispatch: &agent::InjectDispatch) -> &'static str {
-    match dispatch {
-        agent::InjectDispatch::Deferred(Ok(())) => "ok",
-        agent::InjectDispatch::Deferred(Err(_)) => "inject_failed",
-        agent::InjectDispatch::Queued => "ok_queued",
-        agent::InjectDispatch::QueueFull => "drop_queue_full",
+/// Map transport admission to the schedule's durable run status. `ok_queued`
+/// means the keyed backend-transport queue accepted the delivery, not that the
+/// backend has completed it. Teardown fencing is distinct from capacity loss so
+/// operators can tell why no delivery was attempted.
+fn cron_transport_status(
+    admission: &Result<(), crate::daemon::delivery_worker::TransportEnqueueError>,
+) -> &'static str {
+    match admission {
+        Ok(()) => "ok_queued",
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
+            "drop_queue_full"
+        }
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => "drop_fenced",
     }
 }
 
@@ -239,17 +241,15 @@ fn deliver_cron_fire(
 
     // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
     let target_id = crate::fleet::resolve_uuid(home, target);
-    // #1530/F1: snapshot the inject target under the registry lock, then
-    // RELEASE the lock before the (up to 5s + payload-scaled) blocking PTY
-    // write — the registry must not be held across inject. The inbox
-    // fallback below also does self-IPC (`enqueue_with_idle_hint` →
-    // `api::call` loopback), which the API handler can't service while we
-    // hold the registry — so it too runs only after the lock is released.
-    let inject_snap = {
+    // Snapshot only live identity under the registry lock, then RELEASE it
+    // before transport admission or the offline inbox fallback. The transport
+    // scheduler captures its own generation epoch, so a same-name replacement
+    // cannot receive this stale fire.
+    let live_name = {
         let reg = agent::lock_registry(registry);
         target_id
             .and_then(|id| reg.get(&id))
-            .map(|h| (agent::InjectTarget::from_handle(h), h.name.to_string()))
+            .map(|h| h.name.to_string())
     };
     let mut deferred_inbox = false;
     let status = if missed {
@@ -258,18 +258,23 @@ fn deliver_cron_fire(
         // three days ago). Just mark it missed so the user can see it
         // in run_history, and let the auto-disable below retire it.
         "missed"
-    } else if let Some((tgt, name)) = inject_snap.as_ref() {
-        // #1769: cron is an operator-scheduled action, not a daemon auto-nudge → no
-        // marker. AUDIT2-006 C: offload the physical PTY write to the bounded
-        // delivery worker so this tick never blocks on the typed-inject readback.
-        // The prepare/gate phase still runs synchronously inside `_offload`.
-        let dispatch = agent::inject_with_target_gated_offload(tgt, name, message.as_bytes());
-        if let agent::InjectDispatch::Deferred(Err(e)) = &dispatch {
-            tracing::warn!(error = %e, "schedule inject failed");
-        } else if matches!(dispatch, agent::InjectDispatch::QueueFull) {
-            tracing::warn!(target = %name, "schedule inject dropped: delivery queue full");
+    } else if let Some(name) = live_name.as_ref() {
+        // Route every live schedule through the same backend selector as inbox
+        // notifications. Codex/OpenCode use NativeShared, Claude uses its
+        // ChannelBridge, and only explicitly legacy backends may touch a PTY.
+        // Structured failures never downgrade to composer injection.
+        let admission =
+            crate::daemon::delivery_worker::enqueue_transport_delivery(home, name, message);
+        match &admission {
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
+                tracing::warn!(target = %name, "schedule delivery dropped: transport queue full");
+            }
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => {
+                tracing::warn!(target = %name, "schedule delivery fenced by lifecycle transition");
+            }
+            Ok(()) => {}
         }
-        cron_inject_status(&dispatch)
+        cron_transport_status(&admission)
     } else if crate::fleet::instance_is_known(home, target) {
         // Known fleet instance that simply isn't running right now. Defer
         // the self-IPC enqueue past the lock (see the `deferred_inbox`
@@ -801,30 +806,18 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// AUDIT2-006 C: the offloaded-inject → run-status mapping. `ok_queued` =
-    /// accepted by the bounded delivery queue (not physically delivered);
-    /// `drop_queue_full` = dropped; the deferred-gate path keeps today's
-    /// `ok`/`inject_failed` because its durable enqueue already completed.
+    /// Backend transport admission → durable schedule run status.
     #[test]
-    fn cron_inject_status_maps_dispatch() {
-        use crate::agent::InjectDispatch;
+    fn cron_transport_status_maps_admission() {
+        use crate::daemon::delivery_worker::TransportEnqueueError;
+        assert_eq!(super::cron_transport_status(&Ok(())), "ok_queued");
         assert_eq!(
-            super::cron_inject_status(&InjectDispatch::Deferred(Ok(()))),
-            "ok"
-        );
-        assert_eq!(
-            super::cron_inject_status(&InjectDispatch::Deferred(Err(
-                crate::error::AgendError::ApiError("boom".into())
-            ))),
-            "inject_failed"
-        );
-        assert_eq!(
-            super::cron_inject_status(&InjectDispatch::Queued),
-            "ok_queued"
-        );
-        assert_eq!(
-            super::cron_inject_status(&InjectDispatch::QueueFull),
+            super::cron_transport_status(&Err(TransportEnqueueError::QueueFull { epoch: 7 })),
             "drop_queue_full"
+        );
+        assert_eq!(
+            super::cron_transport_status(&Err(TransportEnqueueError::Fenced)),
+            "drop_fenced"
         );
     }
 
@@ -873,6 +866,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
+        const FIRES: usize = 64;
+
         let _queue_guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(false);
         let _delivery_hook_guard = crate::transport::test_support::delivery_hook_guard();
@@ -911,35 +906,39 @@ mod tests {
         let hook_home_expected = home.clone();
         crate::transport::test_support::set_delivery_hook(Some(Arc::new(
             move |hook_home, hook_target, body| {
-                assert_eq!(hook_home, hook_home_expected.as_path());
-                assert_eq!(hook_target, target);
+                if hook_home != hook_home_expected.as_path() || hook_target != target {
+                    return None;
+                }
                 assert_eq!(body, "ping");
                 calls.fetch_add(1, Ordering::SeqCst);
                 Some(Err(anyhow::anyhow!("stop after proving transport route")))
             },
         )));
 
-        deliver_cron_fire(
-            &home,
-            &registry,
-            "s-1488",
-            target,
-            "ping",
-            "transport route",
-            &FireDecision {
-                one_shot: false,
-                missed: false,
-            },
-        );
+        for _ in 0..FIRES {
+            deliver_cron_fire(
+                &home,
+                &registry,
+                "s-1488",
+                target,
+                "ping",
+                "transport route",
+                &FireDecision {
+                    one_shot: false,
+                    missed: false,
+                },
+            );
+        }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while transport_calls.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        while transport_calls.load(Ordering::SeqCst) < FIRES && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(
             transport_calls.load(Ordering::SeqCst),
-            1,
-            "a live Codex cron fire must be handed to NativeShared transport"
+            FIRES,
+            "every live Codex cron fire must be handed to the keyed NativeShared transport lane"
         );
         assert!(
             !composer_contaminated.load(Ordering::SeqCst),
