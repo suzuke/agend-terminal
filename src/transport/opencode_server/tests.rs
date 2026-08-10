@@ -306,22 +306,96 @@ fn opencode_message_ids_fail_closed_at_vendor_timestamp_wrap() {
     assert!(before_field > 1);
 }
 
-#[test]
-fn prompt_async_fails_closed_before_vendor_timestamp_wrap() {
-    let home = std::env::temp_dir().join(format!("agend-opencode-wrap-fail-{}", Uuid::new_v4()));
+const ROLLOVER_SESSION_ID: &str = "ses_rollover";
+const ROLLOVER_LATEST_MESSAGE_ID: &str = "msg_00000000000900000000000000";
+
+fn rollover_server(fail_first_select: bool) -> (u16, thread::JoinHandle<Vec<(String, Value)>>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     let port = listener.local_addr().expect("address").port();
-    drop(listener);
-    let locator = SessionLocator::opencode(
-        format!("http://127.0.0.1:{port}"),
-        Some("session-1".to_string()),
-        "opencode".to_string(),
-        "secret".to_string(),
-    );
-    let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requests = Vec::new();
+        let mut select_count = 0;
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "rollover server timed out");
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("rollover listener: {error}"),
+            };
+            let (header, body) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default().to_string();
+            let body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            requests.push((request_line.clone(), body.clone()));
+            if request_line.starts_with("GET /global/health ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!({"healthy": true, "version": "1.17.5"}),
+                );
+            } else if request_line.starts_with("GET /session/session-1 ") {
+                json_response(&mut stream, "200 OK", json!({"id": "session-1"}));
+            } else if request_line.starts_with("POST /session/session-1/fork ") {
+                json_response(&mut stream, "200 OK", json!({"id": ROLLOVER_SESSION_ID}));
+            } else if request_line.starts_with(&format!(
+                "GET /session/{ROLLOVER_SESSION_ID}/message?limit=1 "
+            )) {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!([{"info": {"id": ROLLOVER_LATEST_MESSAGE_ID}, "parts": []}]),
+                );
+            } else if request_line.starts_with("POST /tui/select-session ") {
+                assert_eq!(body, json!({"sessionID": ROLLOVER_SESSION_ID}));
+                select_count += 1;
+                if fail_first_select && select_count == 1 {
+                    json_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        json!({"data": {"message": "select unavailable"}}),
+                    );
+                } else {
+                    json_response(&mut stream, "200 OK", json!(true));
+                }
+            } else if request_line.starts_with(&format!(
+                "POST /session/{ROLLOVER_SESSION_ID}/prompt_async "
+            )) {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("prompt response");
+                stream.flush().expect("prompt flush");
+                return requests;
+            } else if request_line.starts_with("GET /event ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("event response");
+                stream.flush().expect("event flush");
+            } else {
+                panic!("unexpected rollover request: {request_line}");
+            }
+        }
+    });
+    (port, server)
+}
+
+fn seed_pre_wrap_delivery(
+    home: &Path,
+    locator: &SessionLocator,
+    before_wrap_ms: u64,
+) -> ReceiptStore {
     let pre_wrap_user_id =
         next_opencode_message_id_at(None, before_wrap_ms).expect("pre-wrap user ID");
-    let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
+    let store = ReceiptStore::for_instance(home, "agent").expect("receipt store");
     let pre_wrap_delivery = DeliveryEnvelope::new(
         "agent",
         locator.clone(),
@@ -336,6 +410,22 @@ fn prompt_async_fails_closed_before_vendor_timestamp_wrap() {
         DeliveryReceipt::for_state(&pre_wrap_delivery, DeliveryState::Completed);
     pre_wrap_receipt.protocol_request_id = Some(pre_wrap_user_id);
     store.record(pre_wrap_receipt).expect("pre-wrap completed");
+    store
+}
+
+#[test]
+fn prompt_async_rolls_over_before_vendor_timestamp_wrap() {
+    let home =
+        std::env::temp_dir().join(format!("agend-opencode-wrap-rollover-{}", Uuid::new_v4()));
+    let (port, server) = rollover_server(false);
+    let locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
+    let store = seed_pre_wrap_delivery(&home, &locator, before_wrap_ms);
 
     let mut adapter = OpenCodeNativeShared::new(&home, "agent");
     adapter.ready = true;
@@ -348,138 +438,135 @@ fn prompt_async_fails_closed_before_vendor_timestamp_wrap() {
         "post-wrap delivery",
         None,
     );
-    let error = adapter
+    let receipt = adapter
         .deliver_blocking(envelope.clone())
-        .expect_err("post-wrap delivery must fail closed");
-    assert!(error.to_string().contains("timestamp wrapped"));
-    let receipt = store
-        .latest(envelope.delivery_id)
-        .expect("latest receipt")
-        .expect("failed receipt");
-    assert_eq!(receipt.state, DeliveryState::Failed);
-    assert!(receipt.protocol_request_id.is_none());
+        .expect("post-wrap delivery must roll over");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    let wire_message_id = receipt
+        .protocol_request_id
+        .as_deref()
+        .expect("rollover wire message ID");
+    assert!(wire_message_id > ROLLOVER_LATEST_MESSAGE_ID);
+    assert_eq!(opencode_message_id_timestamp(wire_message_id), Some(10));
+    let saved =
+        super::super::registry::load_session_locator(&home, "agent").expect("rollover locator");
+    assert_eq!(saved.session_id.as_deref(), Some(ROLLOVER_SESSION_ID));
+    assert_eq!(
+        store
+            .latest_opencode_protocol_request_id_for_session(ROLLOVER_SESSION_ID)
+            .expect("new-session seed")
+            .as_deref(),
+        Some(wire_message_id)
+    );
+    let requests = server.join().expect("rollover server");
+    let request_lines = requests
+        .iter()
+        .map(|(line, _)| line.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        request_lines,
+        [
+            "POST /session/session-1/fork HTTP/1.1",
+            "GET /session/ses_rollover/message?limit=1 HTTP/1.1",
+            "POST /tui/select-session HTTP/1.1",
+            "POST /session/ses_rollover/prompt_async HTTP/1.1",
+        ]
+    );
+    let prompts = requests
+        .iter()
+        .filter(|(line, _)| line.contains("/prompt_async "))
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        prompts[0].1.get("parts"),
+        Some(&json!([{"type": "text", "text": "post-wrap delivery"}]))
+    );
     let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]
-fn prompt_async_scopes_wrap_failure_to_the_current_session() {
+fn prompt_async_replays_pre_submit_rollover_after_reconstruction() {
     let home =
-        std::env::temp_dir().join(format!("agend-opencode-session-scope-{}", Uuid::new_v4()));
+        std::env::temp_dir().join(format!("agend-opencode-rollover-replay-{}", Uuid::new_v4()));
     let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
-    let session_a_port = TcpListener::bind(("127.0.0.1", 0))
-        .expect("session A listener")
-        .local_addr()
-        .expect("session A address")
-        .port();
-    let session_a = SessionLocator::opencode(
-        format!("http://127.0.0.1:{session_a_port}"),
-        Some("session-a".to_string()),
+    let (port, server) = rollover_server(true);
+    let mut locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
         "opencode".to_string(),
         "secret".to_string(),
     );
-    let pre_wrap_user_id =
-        next_opencode_message_id_at(None, before_wrap_ms).expect("pre-wrap user ID");
-    let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
-    let pre_wrap_delivery = DeliveryEnvelope::new(
-        "agent",
-        session_a.clone(),
-        DeliveryKind::Prompt,
-        "session A pre-wrap terminal user",
-        None,
-    );
-    store
-        .record_queued(&pre_wrap_delivery)
-        .expect("pre-wrap queued");
-    let mut pre_wrap_receipt =
-        DeliveryReceipt::for_state(&pre_wrap_delivery, DeliveryState::Completed);
-    pre_wrap_receipt.protocol_request_id = Some(pre_wrap_user_id);
-    store.record(pre_wrap_receipt).expect("pre-wrap completed");
+    locator.managed = false;
+    let store = seed_pre_wrap_delivery(&home, &locator, before_wrap_ms);
 
-    let mut adapter_a = OpenCodeNativeShared::new(&home, "agent");
-    adapter_a.ready = true;
-    adapter_a.locator = Some(session_a.clone());
-    adapter_a.message_id_timestamp_ms = Some(before_wrap_ms + 1);
-    let session_a_delivery = DeliveryEnvelope::new(
+    let mut first_adapter = OpenCodeNativeShared::new(&home, "agent");
+    first_adapter.ready = true;
+    first_adapter.locator = Some(locator.clone());
+    first_adapter.message_id_timestamp_ms = Some(before_wrap_ms + 1);
+    let envelope = DeliveryEnvelope::new(
         "agent",
-        session_a,
+        locator.clone(),
         DeliveryKind::Prompt,
-        "session A post-wrap delivery",
+        "replay exact boundary prompt",
         None,
     );
-    let error = adapter_a
-        .deliver_blocking(session_a_delivery.clone())
-        .expect_err("session A must fail closed");
-    assert!(error.to_string().contains("timestamp wrapped"));
+    first_adapter
+        .deliver_blocking(envelope.clone())
+        .expect_err("first select-session attempt must fail before prompt submission");
     assert_eq!(
         store
-            .latest(session_a_delivery.delivery_id)
-            .expect("session A receipt")
-            .expect("session A failed receipt")
+            .latest(envelope.delivery_id)
+            .expect("queued replay receipt")
+            .expect("replay receipt")
             .state,
-        DeliveryState::Failed
+        DeliveryState::Queued,
+        "a pre-submit rollover failure must remain replayable"
     );
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("session B listener");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let session_b_port = listener.local_addr().expect("session B address").port();
-    let server = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let (_, body) = read_http_request(&stream);
-                    let prompt = serde_json::from_slice::<Value>(&body).expect("prompt json");
-                    let message_id = prompt
-                        .get("messageID")
-                        .and_then(Value::as_str)
-                        .expect("message ID")
-                        .to_string();
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .expect("prompt response");
-                    return Some(message_id);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return None;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("session B listener: {error}"),
-            }
-        }
-    });
-    let session_b = SessionLocator::opencode(
-        format!("http://127.0.0.1:{session_b_port}"),
-        Some("session-b".to_string()),
-        "opencode".to_string(),
-        "secret".to_string(),
-    );
-    let mut adapter_b = OpenCodeNativeShared::new(&home, "agent");
-    adapter_b.ready = true;
-    adapter_b.locator = Some(session_b.clone());
-    adapter_b.message_id_timestamp_ms = Some(before_wrap_ms + 1);
-    let session_b_delivery = DeliveryEnvelope::new(
-        "agent",
-        session_b,
-        DeliveryKind::Prompt,
-        "session B fresh delivery",
-        None,
-    );
-    let receipt = adapter_b
-        .deliver_blocking(session_b_delivery)
-        .expect("fresh session B must deliver");
-    let message_id = server
-        .join()
-        .expect("session B server")
-        .expect("session B prompt");
+    let mut reconstructed = OpenCodeNativeShared::new(&home, "agent");
+    reconstructed.message_id_timestamp_ms = Some(before_wrap_ms + 1);
+    reconstructed
+        .start_or_attach_blocking(locator, None)
+        .expect("fresh adapter must replay the durable pre-submit rollover");
+    let receipt = store
+        .latest(envelope.delivery_id)
+        .expect("accepted replay receipt")
+        .expect("replayed receipt");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    let message_id = receipt
+        .protocol_request_id
+        .as_deref()
+        .expect("replayed wire message ID");
     assert_eq!(
-        receipt.protocol_request_id.as_deref(),
-        Some(message_id.as_str())
+        opencode_message_id_timestamp(message_id),
+        Some(10),
+        "replay must retain the fork-scoped wire seed"
     );
-    assert_eq!(opencode_message_id_timestamp(&message_id), Some(1));
+    let requests = server.join().expect("replay server");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(line, _)| line == "POST /session/session-1/fork HTTP/1.1")
+            .count(),
+        1,
+        "reconstruction must resume the durable fork instead of forking again"
+    );
+    let prompts = requests
+        .iter()
+        .filter(|(line, _)| line.contains("/prompt_async "))
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        prompts[0].1.get("parts"),
+        Some(&json!([{"type": "text", "text": "replay exact boundary prompt"}]))
+    );
+    assert_eq!(
+        super::super::registry::load_session_locator(&home, "agent")
+            .expect("replayed locator")
+            .session_id
+            .as_deref(),
+        Some(ROLLOVER_SESSION_ID)
+    );
     let _ = std::fs::remove_dir_all(home);
 }
 
