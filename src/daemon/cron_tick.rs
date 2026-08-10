@@ -865,6 +865,92 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// A live Codex schedule must enter the backend transport lane. In
+    /// particular, cron must not bypass `NativeShared` by writing the payload to
+    /// the TUI composer through its captured PTY handle.
+    #[test]
+    fn live_codex_schedule_uses_transport_without_touching_composer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _queue_guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _delivery_hook_guard = crate::transport::test_support::delivery_hook_guard();
+
+        let home = cron_tmp_home("live-codex-transport");
+        let target = "codex-agent";
+        let id = crate::types::InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  {target}:\n    backend: codex\n    id: {}\n",
+                id.full()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::transport::mode_for_instance(&home, target),
+            crate::transport::TransportMode::NativeShared,
+            "the fleet-declared Codex target must select NativeShared"
+        );
+        seed_oneshot(&home, target);
+
+        let (mut handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context(target);
+        handle.id = id;
+        handle.declared_backend = Some(crate::backend::Backend::Codex);
+        handle.backend_command = "codex".to_string();
+        handle.typed_inject = true;
+        let composer_contaminated = Arc::clone(&handle.typed_inject_contaminated);
+        let registry: crate::agent::AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+                (id, handle),
+            ])));
+
+        let transport_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&transport_calls);
+        let hook_home_expected = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |hook_home, hook_target, body| {
+                assert_eq!(hook_home, hook_home_expected.as_path());
+                assert_eq!(hook_target, target);
+                assert_eq!(body, "ping");
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(Err(anyhow::anyhow!("stop after proving transport route")))
+            },
+        )));
+
+        deliver_cron_fire(
+            &home,
+            &registry,
+            "s-1488",
+            target,
+            "ping",
+            "transport route",
+            &FireDecision {
+                one_shot: false,
+                missed: false,
+            },
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while transport_calls.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            transport_calls.load(Ordering::SeqCst),
+            1,
+            "a live Codex cron fire must be handed to NativeShared transport"
+        );
+        assert!(
+            !composer_contaminated.load(Ordering::SeqCst),
+            "structured cron delivery must never write or fence the TUI composer"
+        );
+        assert_eq!(last_status(&home), "ok_queued");
+
+        crate::transport::test_support::set_delivery_hook(None);
+        std::fs::remove_dir_all(home).ok();
+    }
+
     /// app-mode wiring (functional half of the #1720 root fix): the cron
     /// subscriber MUST be reachable on the PROCESS-GLOBAL bus — the live
     /// `agend-terminal app` tick emits there (app/mod.rs), and owned mode now
