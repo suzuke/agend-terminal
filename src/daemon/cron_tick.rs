@@ -950,6 +950,99 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// A live LegacyPty schedule still needs the #1513 busy/typing gate before
+    /// entering transport. Structured backends have no composer to collide
+    /// with, but a legacy schedule must be durably deferred while the operator
+    /// is typing instead of reaching the forced API INJECT leg.
+    #[test]
+    fn live_legacy_schedule_defers_while_operator_is_typing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _queue_guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _delivery_hook_guard = crate::transport::test_support::delivery_hook_guard();
+
+        let home = cron_tmp_home("live-legacy-defer");
+        let target = "legacy-agent";
+        let id = crate::types::InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  {target}:\n    backend: kiro-cli\n    id: {}\n",
+                id.full()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::transport::mode_for_instance(&home, target),
+            crate::transport::TransportMode::LegacyPty
+        );
+        seed_oneshot(&home, target);
+
+        let (mut handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context(target);
+        handle.id = id;
+        handle.declared_backend = Some(crate::backend::Backend::KiroCli);
+        handle.backend_command = "kiro-cli".to_string();
+        handle.typed_inject = true;
+        let registry: crate::agent::AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+                (id, handle),
+            ])));
+
+        crate::notification_queue::record_input_activity(&home, target);
+        crate::notification_queue::flush_pending_input_activity(&home);
+        assert!(crate::inbox::notify::should_defer_direct_inject(
+            &home, target
+        ));
+
+        let transport_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&transport_calls);
+        let hook_home_expected = home.clone();
+        crate::transport::test_support::set_delivery_hook(Some(Arc::new(
+            move |hook_home, hook_target, _body| {
+                if hook_home != hook_home_expected.as_path() || hook_target != target {
+                    return None;
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(Err(anyhow::anyhow!(
+                    "legacy transport must not run while operator typing is recent"
+                )))
+            },
+        )));
+
+        deliver_cron_fire(
+            &home,
+            &registry,
+            "s-1488",
+            target,
+            "ping",
+            "legacy defer",
+            &FireDecision {
+                one_shot: false,
+                missed: false,
+            },
+        );
+
+        assert_eq!(
+            last_status(&home),
+            "ok",
+            "a busy LegacyPty target must preserve the durable #1513 defer status"
+        );
+        assert_eq!(
+            transport_calls.load(Ordering::SeqCst),
+            0,
+            "the forced LegacyPty transport leg must not run while typing is recent"
+        );
+        let queued = crate::notification_queue::drain_one(&home, target)
+            .expect("legacy cron payload must be durably deferred");
+        assert_eq!(queued.text, "ping");
+        assert!(!queued.actionable);
+
+        crate::transport::test_support::set_delivery_hook(None);
+        std::fs::remove_dir_all(home).ok();
+    }
+
     /// app-mode wiring (functional half of the #1720 root fix): the cron
     /// subscriber MUST be reachable on the PROCESS-GLOBAL bus — the live
     /// `agend-terminal app` tick emits there (app/mod.rs), and owned mode now
