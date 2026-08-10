@@ -787,6 +787,170 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// A newer automatic monitor for the same target and daemon-auto kind must
+    /// retire the old recurring row atomically. This is the public create/list
+    /// path that previously left exact-main monitors firing forever.
+    #[test]
+    fn create_auto_supersedes_same_target_kind_and_preserves_scope() {
+        let home = tmp_home("auto-supersede");
+        let old = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 * * * *",
+                "instance": "lead",
+                "message": "[AGEND-AUTO kind=exact-main-quiescence-monitor] old sha",
+                "subject_ref": "git:old-sha"
+            }),
+        );
+        let old_id = old["id"].as_str().expect("old id").to_string();
+
+        let other_target = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 * * * *",
+                "instance": "peer",
+                "message": "[AGEND-AUTO kind=exact-main-quiescence-monitor] peer sha"
+            }),
+        );
+        let other_target_id = other_target["id"]
+            .as_str()
+            .expect("other target id")
+            .to_string();
+        let other_kind = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 * * * *",
+                "instance": "lead",
+                "message": "[AGEND-AUTO kind=another-monitor] keep me"
+            }),
+        );
+        let other_kind_id = other_kind["id"]
+            .as_str()
+            .expect("other kind id")
+            .to_string();
+
+        let replacement = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 * * * *",
+                "instance": "lead",
+                "message": "[AGEND-AUTO kind=exact-main-quiescence-monitor] new sha",
+                "subject_ref": "git:new-sha"
+            }),
+        );
+        let replacement_id = replacement["id"]
+            .as_str()
+            .expect("replacement id")
+            .to_string();
+        assert_eq!(
+            replacement["superseded_ids"],
+            serde_json::json!([old_id]),
+            "create must report the exact rows it retired"
+        );
+
+        let listed = list(&home, &serde_json::json!({"full_history": true}));
+        let rows = listed["schedules"].as_array().expect("schedule rows");
+        let row = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"] == id)
+                .unwrap_or_else(|| panic!("missing schedule {id}"))
+        };
+
+        let old_row = row(&old_id);
+        assert_eq!(old_row["enabled"], false);
+        assert_eq!(
+            old_row["run_history"][0]["status"],
+            format!("superseded_by:{replacement_id}")
+        );
+        assert_eq!(
+            old_row["replacement_key"],
+            "agend-auto:exact-main-quiescence-monitor"
+        );
+        assert_eq!(old_row["subject_ref"], "git:old-sha");
+
+        let replacement_row = row(&replacement_id);
+        assert_eq!(replacement_row["enabled"], true);
+        assert_eq!(
+            replacement_row["replacement_key"],
+            "agend-auto:exact-main-quiescence-monitor"
+        );
+        assert_eq!(replacement_row["subject_ref"], "git:new-sha");
+        assert_eq!(row(&other_target_id)["enabled"], true);
+        assert_eq!(row(&other_kind_id)["enabled"], true);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Concurrent replacement creates are linearizable: the store keeps every
+    /// audit row, but exactly the last committed row remains enabled.
+    #[test]
+    fn concurrent_replacement_creates_leave_one_enabled_winner() {
+        const CREATORS: usize = 16;
+
+        let home = tmp_home("concurrent-supersede");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CREATORS));
+        let mut threads = Vec::new();
+        for index in 0..CREATORS {
+            let home = home.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                create(
+                    &home,
+                    "lead",
+                    &serde_json::json!({
+                        "cron": "0 * * * *",
+                        "instance": "lead",
+                        "message": format!("monitor revision {index}"),
+                        "replacement_key": "runtime-acceptance",
+                        "subject_ref": format!("git:sha-{index}")
+                    }),
+                )
+            }));
+        }
+        let responses: Vec<Value> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("creator thread"))
+            .collect();
+        assert!(responses
+            .iter()
+            .all(|response| response["status"] == "created"));
+
+        let listed = list(&home, &serde_json::json!({"full_history": true}));
+        let rows = listed["schedules"].as_array().expect("schedule rows");
+        assert_eq!(rows.len(), CREATORS, "no audit row may be lost");
+        assert!(rows
+            .iter()
+            .all(|row| row["replacement_key"] == "runtime-acceptance"));
+        assert_eq!(
+            rows.iter().filter(|row| row["enabled"] == true).count(),
+            1,
+            "last committed replacement must be the sole enabled row"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["enabled"] == false)
+                .filter(|row| {
+                    row["run_history"].as_array().is_some_and(|history| {
+                        history.iter().any(|run| {
+                            run["status"]
+                                .as_str()
+                                .is_some_and(|status| status.starts_with("superseded_by:"))
+                        })
+                    })
+                })
+                .count(),
+            CREATORS - 1,
+            "every losing row must carry a durable supersession audit"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #1720 ③: `schedule list` carries a computed `next_scheduled_fire_at` —
     /// non-null + parseable for an enabled cron schedule, and null once disabled
     /// (so an operator can see when each schedule is next due).
