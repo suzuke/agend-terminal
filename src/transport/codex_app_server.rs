@@ -1654,7 +1654,7 @@ mod tests {
         let mut child = std::process::Command::new("sh")
             .args([
                 "-c",
-                "trap 'printf term > \"$AGEND_TERM_MARKER\"; exit 0' TERM; while :; do :; done",
+                "ulimit -t 30; trap 'printf term > \"$AGEND_TERM_MARKER\"; exit 0' TERM; while :; do :; done",
             ])
             .env("AGEND_TERM_MARKER", &marker)
             .spawn()
@@ -1764,7 +1764,7 @@ mod tests {
         let child = std::process::Command::new("sh")
             .args([
                 "-c",
-                "trap 'printf done > \"$AGEND_TERM_MARKER\"; exit 0' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
+                "ulimit -t 30; trap 'printf done > \"$AGEND_TERM_MARKER\"; exit 0' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
             ])
             .env("AGEND_TERM_MARKER", &term_marker)
             .env("AGEND_TRAP_READY", &trap_ready)
@@ -1826,7 +1826,7 @@ mod tests {
             std::process::Command::new("sh")
                 .args([
                     "-c",
-                    "trap 'printf term > \"$AGEND_TERM_MARKER\"' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
+                    "ulimit -t 30; trap 'printf term > \"$AGEND_TERM_MARKER\"' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
                 ])
                 .env("AGEND_TERM_MARKER", &term_marker)
                 .env("AGEND_TRAP_READY", &trap_ready)

@@ -317,7 +317,7 @@ mod tests {
         let caller_pgid = unsafe { libc::getpgrp() };
         let mut child = unsafe {
             Command::new("sh")
-                .args(["-c", "trap '' TERM; while :; do :; done"])
+                .args(["-c", "ulimit -t 30; trap '' TERM; while :; do :; done"])
                 .pre_exec(move || {
                     if libc::setpgid(0, caller_pgid) == -1 {
                         return Err(std::io::Error::last_os_error());
