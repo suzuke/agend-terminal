@@ -262,19 +262,40 @@ fn deliver_cron_fire(
         // Route every live schedule through the same backend selector as inbox
         // notifications. Codex/OpenCode use NativeShared, Claude uses its
         // ChannelBridge, and only explicitly legacy backends may touch a PTY.
-        // Structured failures never downgrade to composer injection.
-        let admission =
-            crate::daemon::delivery_worker::enqueue_transport_delivery(home, name, message);
-        match &admission {
-            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
-                tracing::warn!(target = %name, "schedule delivery dropped: transport queue full");
+        // Structured failures never downgrade to composer injection. A
+        // selector-confirmed LegacyPty target retains the #1513 busy/typing
+        // gate before its transport leg reaches forced API INJECT.
+        let deferred = if crate::transport::mode_for_instance(home, name)
+            == crate::transport::TransportMode::LegacyPty
+        {
+            agent::defer_direct_inject_if_needed(home, name, message.as_bytes(), None)
+        } else {
+            None
+        };
+        if let Some(result) = deferred {
+            match result {
+                Ok(()) => "ok",
+                Err(error) => {
+                    tracing::warn!(target = %name, error = %error, "schedule legacy defer failed");
+                    "inject_failed"
+                }
             }
-            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => {
-                tracing::warn!(target = %name, "schedule delivery fenced by lifecycle transition");
+        } else {
+            let admission =
+                crate::daemon::delivery_worker::enqueue_transport_delivery(home, name, message);
+            match &admission {
+                Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull {
+                    ..
+                }) => {
+                    tracing::warn!(target = %name, "schedule delivery dropped: transport queue full");
+                }
+                Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => {
+                    tracing::warn!(target = %name, "schedule delivery fenced by lifecycle transition");
+                }
+                Ok(()) => {}
             }
-            Ok(()) => {}
+            cron_transport_status(&admission)
         }
-        cron_transport_status(&admission)
     } else if crate::fleet::instance_is_known(home, target) {
         // Known fleet instance that simply isn't running right now. Defer
         // the self-IPC enqueue past the lock (see the `deferred_inbox`

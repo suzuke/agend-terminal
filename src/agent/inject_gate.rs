@@ -16,6 +16,33 @@ pub(crate) enum InjectPrep {
     Proceed(Vec<u8>),
 }
 
+/// Durably defer a direct PTY payload when the #1513 busy/typing gate is
+/// active. `None` means delivery may proceed now; `Some` carries the durable
+/// enqueue result. Cron calls this only for a selector-confirmed LegacyPty
+/// target, while [`prepare_inject`] shares it with the other direct PTY paths.
+pub(crate) fn defer_direct_inject_if_needed(
+    home: &std::path::Path,
+    name: &str,
+    text: &[u8],
+    auto_kind: Option<&str>,
+) -> Option<crate::error::Result<()>> {
+    if !crate::inbox::notify::should_defer_direct_inject(home, name) {
+        return None;
+    }
+
+    let text_str = String::from_utf8_lossy(text);
+    let enqueued = if auto_kind.is_some() {
+        crate::notification_queue::enqueue_coalesced_auto(home, name, &text_str)
+    } else {
+        crate::notification_queue::enqueue_classified(home, name, &text_str, false)
+    };
+    Some(
+        enqueued.map_err(|error| {
+            crate::error::AgendError::ApiError(format!("deferred enqueue: {error}"))
+        }),
+    )
+}
+
 /// The synchronous prepare/gate phase: #1769 marker prepend + #1513 env-conditional
 /// defer gate. SOLE implementation of both — callers must not duplicate either.
 /// `force` skips the gate (operator relay / api INJECT / recovery); `auto_kind`
@@ -40,22 +67,8 @@ pub(crate) fn prepare_inject(
     if !force {
         if let Ok(home) = std::env::var("AGEND_HOME") {
             let home = std::path::Path::new(&home);
-            if crate::inbox::notify::should_defer_direct_inject(home, name) {
-                // Gated direct injects (replay/recovery) are UTF-8 text wakes;
-                // enqueue ambient-class for the per-tick flush to drain once the
-                // pane settles (the flush re-injects through api INJECT with
-                // force=true). #1630: this enqueue IS the deferred-delivery path,
-                // so its error is propagated. #t-3558 P2: an AGEND-AUTO nudge
-                // routes through the coalescing keep-latest queue.
-                let text_str = String::from_utf8_lossy(&marked);
-                let enq = if auto_kind.is_some() {
-                    crate::notification_queue::enqueue_coalesced_auto(home, name, &text_str)
-                } else {
-                    crate::notification_queue::enqueue_classified(home, name, &text_str, false)
-                };
-                return InjectPrep::Deferred(enq.map_err(|e| {
-                    crate::error::AgendError::ApiError(format!("deferred enqueue: {e}"))
-                }));
+            if let Some(enqueued) = defer_direct_inject_if_needed(home, name, &marked, auto_kind) {
+                return InjectPrep::Deferred(enqueued);
             }
         }
     }

@@ -179,6 +179,7 @@ use sensitive_env::SENSITIVE_ENV_KEYS;
 // to respect its LOC ceiling; the child reaches `daemon_auto_prefix` via
 // `super::`.
 mod inject_gate;
+pub(crate) use inject_gate::defer_direct_inject_if_needed;
 
 mod self_kick;
 use self_kick::{deliver_self_kick, SelfKickDelivery};
@@ -2829,8 +2830,8 @@ pub(crate) fn inject_with_target_gated(
 ) -> crate::error::Result<()> {
     // The marker + #1513 defer gate has one implementation in `inject_gate`;
     // direct PTY callers then perform the physical write byte-equivalently.
-    // Backend-aware notification sources, including cron, bypass this path and
-    // use the transport scheduler.
+    // Backend-aware notification sources use the transport scheduler. Cron
+    // calls the shared defer helper separately only for LegacyPty targets.
     match inject_gate::prepare_inject(name, text, force, auto_kind) {
         inject_gate::InjectPrep::Deferred(result) => result,
         inject_gate::InjectPrep::Proceed(marked) => inject_with_target(target, &marked),
