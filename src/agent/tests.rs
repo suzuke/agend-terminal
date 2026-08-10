@@ -2538,7 +2538,11 @@ fn inject_offload_defers_without_touching_delivery_worker() {
 /// the backend's echo of typed chars). Lets the readback helpers be tested without
 /// a live backend process.
 fn readback_test_core(feed: &[u8]) -> Arc<CoreMutex<AgentCore>> {
-    let mut vterm = VTerm::new(80, 24);
+    readback_test_core_with_size(80, 24, feed)
+}
+
+fn readback_test_core_with_size(cols: u16, rows: u16, feed: &[u8]) -> Arc<CoreMutex<AgentCore>> {
+    let mut vterm = VTerm::new(cols, rows);
     vterm.process(feed);
     Arc::new(CoreMutex::new(AgentCore {
         vterm,
@@ -2589,6 +2593,83 @@ fn readback_confirm_returns_true_when_line_rendered_1912() {
         &target,
         payload,
         std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_matches_only_cursor_anchored_soft_wrap_3175() {
+    let payload = "ABCDEFGHIJKLMNO123456789";
+    let core = readback_test_core_with_size(20, 6, format!("\u{203a} {payload}").as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_rejects_sentinel_on_previous_hard_row_3175() {
+    let payload = "unique-previous-row-suffix";
+    let core = readback_test_core(format!("{payload}\r\n\u{203a} different draft").as_bytes());
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_rejects_sentinel_after_cursor_3175() {
+    let payload = "unique-after-cursor";
+    let core = readback_test_core(format!("\u{203a} {payload}\r\x1b[2C").as_bytes());
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_compares_tab_at_its_composer_display_width_3175() {
+    let payload = "tab\tcase";
+    let core = readback_test_core("\u{203a} tab case".as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_preserves_wide_graphemes_3175() {
+    let payload = "wake-日本語-尾";
+    let core = readback_test_core(format!("\u{203a} {payload}").as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_rejects_empty_or_whitespace_payload_3175() {
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        " \n\t ",
+        std::time::Duration::from_millis(40),
         std::time::Duration::from_millis(5),
     ));
 }
@@ -2672,7 +2753,7 @@ impl std::io::Write for RetryEchoWriter {
 }
 
 #[test]
-fn typed_inject_retries_unrendered_payload_then_submits_once_s1() {
+fn typed_inject_readback_miss_never_rewrites_or_submits_3175() {
     let payload = b"S1_AGY_DIALOG_RETRY";
     let core = readback_test_core("\u{203a} ".as_bytes());
     let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -2695,17 +2776,20 @@ fn typed_inject_retries_unrendered_payload_then_submits_once_s1() {
         core,
     };
 
-    inject_with_target(&target, payload).expect("second rendered attempt should submit");
+    assert!(
+        inject_with_target(&target, payload).is_err(),
+        "an unconfirmed first write must fail closed without a rewrite"
+    );
 
     assert_eq!(
         payload_writes.load(std::sync::atomic::Ordering::Relaxed),
-        2,
-        "a transient startup dialog should cause one bounded retry"
+        1,
+        "readback miss must never duplicate the payload in the composer"
     );
     assert_eq!(
         bytes.lock().iter().filter(|&&byte| byte == b'\r').count(),
-        1,
-        "the recovered payload must be submitted exactly once"
+        0,
+        "an unconfirmed payload must never be submitted"
     );
 }
 
