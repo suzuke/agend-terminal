@@ -320,7 +320,7 @@ fn send_same_team_allowed() {
 }
 
 #[test]
-fn send_cross_team_blocked() {
+fn send_cross_team_blocked_has_role_agnostic_remediation_3200() {
     let home = tmp_home("cross-team");
     setup_team_env(
         &home,
@@ -336,12 +336,18 @@ fn send_cross_team_blocked() {
         result["ok"], false,
         "cross-team send must be blocked: {result}"
     );
+    let error = result["error"].as_str().unwrap_or("");
     assert!(
-        result["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("cross-team"),
+        error.contains("cross-team"),
         "error must mention cross-team: {result}"
+    );
+    assert!(
+        !error.contains("general"),
+        "remediation must not name a fleet member: {result}"
+    );
+    assert!(
+        error.contains("accept_from") && error.contains("create_instance(team=...)"),
+        "remediation must retain role-agnostic ACL and co-location guidance: {result}"
     );
     assert!(audit_log_contains(&home, "send_cross_team_blocked"));
     std::fs::remove_dir_all(&home).ok();
