@@ -964,9 +964,21 @@ fn clear_rollover_journal(home: &Path, instance: &str) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     let dir = rollover_journal_dir(home);
-    if dir.exists() && std::fs::read_dir(&dir)?.next().is_none() {
-        std::fs::remove_dir(&dir)?;
-        crate::store::fsync_parent_dir(&dir);
+    let dir_is_empty = match std::fs::read_dir(&dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if dir_is_empty {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => crate::store::fsync_parent_dir(&dir),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
