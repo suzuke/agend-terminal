@@ -2794,6 +2794,33 @@ impl std::io::Write for ExactEchoWriter {
     }
 }
 
+struct SubmitFailEchoWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    expected: Vec<u8>,
+    rendered: String,
+    core: Arc<CoreMutex<AgentCore>>,
+}
+
+impl std::io::Write for SubmitFailEchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf == b"\r" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "submit write failed",
+            ));
+        }
+        self.bytes.lock().extend_from_slice(buf);
+        if buf == self.expected {
+            self.core.lock().vterm.process(self.rendered.as_bytes());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn typed_inject_readback_miss_never_rewrites_or_submits_3175() {
     let payload = b"S1_AGY_DIALOG_RETRY";
@@ -2903,6 +2930,45 @@ fn typed_inject_miss_latches_before_later_payload_can_append_3175() {
         *bytes.lock(),
         after_first_miss,
         "the contamination latch must reject before writing any later byte"
+    );
+}
+
+#[test]
+fn typed_inject_submit_error_latches_before_later_payload_3175() {
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(SubmitFailEchoWriter {
+        bytes: Arc::clone(&bytes),
+        expected: b"A".to_vec(),
+        rendered: "\r\x1b[2K\u{203a} A".to_string(),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-submit-error-latch-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    assert!(
+        inject_with_target(&target, b"A").is_err(),
+        "the confirmed draft must remain unsubmitted when the submit write fails"
+    );
+    let after_submit_error = bytes.lock().clone();
+    assert!(
+        inject_with_target(&target, b"B").is_err(),
+        "a later payload must not append to a draft whose submit write failed"
+    );
+    assert_eq!(
+        *bytes.lock(),
+        after_submit_error,
+        "the submit-error latch must reject before writing any later byte"
     );
 }
 
