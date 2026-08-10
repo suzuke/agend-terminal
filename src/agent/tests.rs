@@ -2765,6 +2765,27 @@ impl std::io::Write for RetryEchoWriter {
     }
 }
 
+struct ExactEchoWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    expected: Vec<u8>,
+    rendered: String,
+    core: Arc<CoreMutex<AgentCore>>,
+}
+
+impl std::io::Write for ExactEchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().extend_from_slice(buf);
+        if buf == self.expected {
+            self.core.lock().vterm.process(self.rendered.as_bytes());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn typed_inject_readback_miss_never_rewrites_or_submits_3175() {
     let payload = b"S1_AGY_DIALOG_RETRY";
@@ -2803,6 +2824,74 @@ fn typed_inject_readback_miss_never_rewrites_or_submits_3175() {
         bytes.lock().iter().filter(|&&byte| byte == b'\r').count(),
         0,
         "an unconfirmed payload must never be submitted"
+    );
+}
+
+#[test]
+fn typed_inject_normalizes_trailing_whitespace_before_write_3175() {
+    let payload = b"TRAILING_BOTH   \n";
+    let expected = b"TRAILING_BOTH";
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(ExactEchoWriter {
+        bytes: Arc::clone(&bytes),
+        expected: expected.to_vec(),
+        rendered: "\r\x1b[2K\u{203a} TRAILING_BOTH".to_string(),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-trailing-whitespace-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    inject_with_target(&target, payload)
+        .expect("typed payload and sentinel must share one trailing-whitespace normalization");
+    assert_eq!(
+        bytes.lock().as_slice(),
+        [expected.as_slice(), b"\r"].concat(),
+        "only the normalized payload may be written before one submit"
+    );
+}
+
+#[test]
+fn typed_inject_miss_latches_before_later_payload_can_append_3175() {
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(ExactEchoWriter {
+        bytes: Arc::clone(&bytes),
+        expected: b"B".to_vec(),
+        rendered: "\r\x1b[2K\u{203a} AB".to_string(),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-contamination-latch-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    assert!(inject_with_target(&target, b"A").is_err());
+    let after_first_miss = bytes.lock().clone();
+    assert!(
+        inject_with_target(&target, b"B").is_err(),
+        "a later payload must not append to or submit an unconfirmed draft"
+    );
+    assert_eq!(
+        *bytes.lock(),
+        after_first_miss,
+        "the contamination latch must reject before writing any later byte"
     );
 }
 
