@@ -2936,7 +2936,14 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    write_with_timeout(&target.pty_writer, submit)?;
+    if let Err(error) = write_with_timeout(&target.pty_writer, submit) {
+        if target.typed_inject {
+            target
+                .typed_inject_contaminated
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        return Err(error.into());
+    }
     // #1912: post-submit observability (log/metric-only, NEVER retries — a second
     // `\r` would risk double-submit). Typed-inject only; bulk's fast path stays lean.
     if target.typed_inject {
