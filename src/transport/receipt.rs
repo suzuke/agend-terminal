@@ -38,6 +38,11 @@ pub(crate) struct DeliveryReceipt {
     pub state: DeliveryState,
     pub payload_digest: String,
     pub protocol_request_id: Option<String>,
+    /// The backend session that actually accepted the request. This normally
+    /// matches the queued envelope, but an OpenCode wrap rollover moves the
+    /// same durable delivery to a freshly forked session.
+    #[serde(default)]
+    pub backend_session_id: Option<String>,
     pub backend_event: Option<String>,
     pub tui_visibility: Option<String>,
     pub detail: Option<String>,
@@ -55,6 +60,7 @@ impl DeliveryReceipt {
             state,
             payload_digest: envelope.payload_digest.clone(),
             protocol_request_id: None,
+            backend_session_id: None,
             backend_event: None,
             tui_visibility: None,
             detail: None,
@@ -146,6 +152,32 @@ impl ReceiptStore {
         Ok(latest)
     }
 
+    pub(crate) fn delivery(
+        &self,
+        delivery_id: Uuid,
+    ) -> anyhow::Result<Option<(DeliveryEnvelope, DeliveryReceipt)>> {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        restrict_permissions(&self.path, 0o600)?;
+        let file = File::open(&self.path)?;
+        let mut envelope = None;
+        let mut latest = None;
+        for line in BufReader::new(file).lines() {
+            let record: DurableRecord = serde_json::from_str(&line?)?;
+            if record.receipt.delivery_id != delivery_id {
+                continue;
+            }
+            if let Some(record_envelope) = record.envelope {
+                envelope = Some(record_envelope);
+            }
+            latest = Some(record.receipt);
+        }
+        Ok(envelope.zip(latest))
+    }
+
     /// Return durable envelopes whose latest receipt is not terminal.  A
     /// structured adapter is intentionally short-lived per worker job, so a
     /// fresh adapter must restore the in-flight turn before deciding whether a
@@ -199,7 +231,7 @@ impl ReceiptStore {
             .lines()
             .map(|line| -> anyhow::Result<DurableRecord> { Ok(serde_json::from_str(&line?)?) })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let sessions = records
+        let envelope_sessions = records
             .iter()
             .filter_map(|record| {
                 record.envelope.as_ref().and_then(|envelope| {
@@ -216,10 +248,12 @@ impl ReceiptStore {
             let Some(request_id) = record.receipt.protocol_request_id.as_deref() else {
                 continue;
             };
-            if sessions
-                .get(&record.receipt.delivery_id)
-                .map(String::as_str)
-                != Some(session_id)
+            let actual_session = record.receipt.backend_session_id.as_deref().or_else(|| {
+                envelope_sessions
+                    .get(&record.receipt.delivery_id)
+                    .map(String::as_str)
+            });
+            if actual_session != Some(session_id)
                 || !is_native_opencode_protocol_request_id(request_id)
             {
                 continue;
@@ -695,5 +729,71 @@ mod tests {
             Some(session_b_high.to_string())
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_seed_lookup_prefers_the_receipts_actual_backend_session() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-opencode-rollover-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        let envelope = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::opencode(
+                "http://127.0.0.1:4096".to_string(),
+                Some("source-session".to_string()),
+                "opencode".to_string(),
+                "secret".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            "rollover prompt",
+            None,
+        );
+        store.record_queued(&envelope).expect("queued");
+        let request_id = "msg_00000000000a00000000000000";
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(request_id.to_string());
+        accepted.backend_session_id = Some("target-session".to_string());
+        store.record(accepted).expect("accepted");
+
+        assert_eq!(
+            store
+                .latest_opencode_protocol_request_id_for_session("target-session")
+                .expect("target seed")
+                .as_deref(),
+            Some(request_id)
+        );
+        assert_eq!(
+            store
+                .latest_opencode_protocol_request_id_for_session("source-session")
+                .expect("source seed"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn legacy_receipts_without_backend_session_id_still_deserialize() {
+        let envelope = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::opencode(
+                "http://127.0.0.1:4096".to_string(),
+                Some("session".to_string()),
+                "opencode".to_string(),
+                "secret".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            "legacy receipt",
+            None,
+        );
+        let receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
+        let mut value = serde_json::to_value(receipt).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("backend_session_id");
+        let decoded: DeliveryReceipt = serde_json::from_value(value).expect("legacy receipt");
+        assert!(decoded.backend_session_id.is_none());
     }
 }

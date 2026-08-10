@@ -571,6 +571,238 @@ fn prompt_async_replays_pre_submit_rollover_after_reconstruction() {
 }
 
 #[test]
+fn prompt_async_retries_the_same_durable_envelope_without_regressing_its_receipt() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-opencode-rollover-same-envelope-{}",
+        Uuid::new_v4()
+    ));
+    let before_wrap_ms = OPENCODE_MESSAGE_ID_TIMESTAMP_MASK / 0x1000;
+    let (port, server) = rollover_server(true);
+    let mut locator = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    locator.managed = false;
+    let store = seed_pre_wrap_delivery(&home, &locator, before_wrap_ms);
+    let mut adapter = OpenCodeNativeShared::new(&home, "agent");
+    adapter.ready = true;
+    adapter.locator = Some(locator.clone());
+    adapter.message_id_timestamp_ms = Some(before_wrap_ms + 1);
+    let envelope = DeliveryEnvelope::new(
+        "agent",
+        locator,
+        DeliveryKind::Prompt,
+        "retry exact durable envelope",
+        None,
+    );
+
+    adapter
+        .deliver_blocking(envelope.clone())
+        .expect_err("first select must fail");
+    let receipt = adapter
+        .deliver_blocking(envelope.clone())
+        .expect("same envelope retry must resume the journal");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    assert_eq!(
+        store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("accepted")
+            .state,
+        DeliveryState::ProtocolAccepted
+    );
+    let requests = server.join().expect("server");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(line, _)| line.contains("/fork "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(line, _)| line.contains("/prompt_async "))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
+
+fn rollover_reconcile_server(
+    message_found: bool,
+    wire_message_id: String,
+) -> (u16, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (header, body) = read_http_request(&stream);
+            let request_line = header.lines().next().unwrap_or_default().to_string();
+            requests.push(request_line.clone());
+            if request_line.starts_with("GET /global/health ") {
+                json_response(
+                    &mut stream,
+                    "200 OK",
+                    json!({"healthy": true, "version": "1.17.5"}),
+                );
+            } else if request_line.starts_with(&format!("GET /session/{ROLLOVER_SESSION_ID} ")) {
+                json_response(&mut stream, "200 OK", json!({"id": ROLLOVER_SESSION_ID}));
+            } else if request_line.starts_with("GET /event ") {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("event response");
+                stream.flush().expect("event flush");
+            } else if request_line.starts_with("POST /tui/select-session ") {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).expect("select body"),
+                    json!({"sessionID": ROLLOVER_SESSION_ID})
+                );
+                json_response(&mut stream, "200 OK", json!(true));
+            } else if request_line.starts_with(&format!(
+                "GET /session/{ROLLOVER_SESSION_ID}/message/{wire_message_id} "
+            )) {
+                if message_found {
+                    json_response(
+                        &mut stream,
+                        "200 OK",
+                        json!({"info": {"id": wire_message_id}, "parts": []}),
+                    );
+                } else {
+                    json_response(
+                        &mut stream,
+                        "404 Not Found",
+                        json!({"data": {"message": "message not found"}}),
+                    );
+                }
+            } else {
+                panic!("unexpected reconciliation request: {request_line}");
+            }
+        }
+        requests
+    });
+    (port, server)
+}
+
+fn seed_submit_attempted_rollover(
+    home: &Path,
+    port: u16,
+    wire_message_id: &str,
+) -> (SessionLocator, DeliveryEnvelope, ReceiptStore) {
+    let mut source = SessionLocator::opencode(
+        format!("http://127.0.0.1:{port}"),
+        Some("session-1".to_string()),
+        "opencode".to_string(),
+        "secret".to_string(),
+    );
+    source.managed = false;
+    let envelope = DeliveryEnvelope::new(
+        "agent",
+        source.clone(),
+        DeliveryKind::Prompt,
+        "never blindly retry this prompt",
+        None,
+    );
+    let store = ReceiptStore::for_instance(home, "agent").expect("receipt store");
+    store.record_queued(&envelope).expect("queued");
+    save_rollover_journal(
+        home,
+        "agent",
+        &RolloverJournal {
+            version: ROLLOVER_JOURNAL_VERSION,
+            delivery_id: envelope.delivery_id,
+            phase: RolloverPhase::SubmitAttempted {
+                source_session_id: "session-1".to_string(),
+                target_session_id: ROLLOVER_SESSION_ID.to_string(),
+                wire_message_id: wire_message_id.to_string(),
+            },
+        },
+    )
+    .expect("submit-attempted journal");
+    let mut target = source;
+    target.session_id = Some(ROLLOVER_SESSION_ID.to_string());
+    (target, envelope, store)
+}
+
+#[test]
+fn reconstruction_accepts_a_proven_submit_attempt_without_retrying_prompt() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-opencode-rollover-reconcile-present-{}",
+        Uuid::new_v4()
+    ));
+    let wire_message_id = "msg_00000000000a00000000000000".to_string();
+    let (port, server) = rollover_reconcile_server(true, wire_message_id.clone());
+    let (locator, envelope, store) = seed_submit_attempted_rollover(&home, port, &wire_message_id);
+
+    let mut reconstructed = OpenCodeNativeShared::new(&home, "agent");
+    reconstructed
+        .start_or_attach_blocking(locator, None)
+        .expect("stable message proof must recover acceptance");
+    let receipt = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted receipt");
+    assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+    assert_eq!(
+        receipt.backend_session_id.as_deref(),
+        Some(ROLLOVER_SESSION_ID)
+    );
+    assert_eq!(
+        receipt.protocol_request_id.as_deref(),
+        Some(&*wire_message_id)
+    );
+    assert!(
+        load_rollover_journal(&home, "agent")
+            .expect("journal lookup")
+            .is_none(),
+        "a reconciled attempt must clear the journal"
+    );
+    let requests = server.join().expect("server");
+    assert!(requests.iter().all(|line| !line.contains("prompt_async")));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn reconstruction_marks_an_absent_submit_attempt_ambiguous_without_retry() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-opencode-rollover-reconcile-absent-{}",
+        Uuid::new_v4()
+    ));
+    let wire_message_id = "msg_00000000000a00000000000000".to_string();
+    let (port, server) = rollover_reconcile_server(false, wire_message_id.clone());
+    let (locator, envelope, store) = seed_submit_attempted_rollover(&home, port, &wire_message_id);
+
+    let mut reconstructed = OpenCodeNativeShared::new(&home, "agent");
+    reconstructed
+        .start_or_attach_blocking(locator, None)
+        .expect_err("absence cannot prove that retry is safe");
+    let receipt = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("ambiguous receipt");
+    assert_eq!(receipt.state, DeliveryState::Ambiguous);
+    assert_eq!(
+        receipt.backend_session_id.as_deref(),
+        Some(ROLLOVER_SESSION_ID)
+    );
+    assert!(
+        load_rollover_journal(&home, "agent")
+            .expect("journal lookup")
+            .is_none(),
+        "an explicit ambiguous receipt replaces the journal"
+    );
+    let requests = server.join().expect("server");
+    assert!(requests.iter().all(|line| !line.contains("prompt_async")));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn non_2xx_response_diagnostics_are_bounded_and_redacted() {
     let error = response_json(
             HttpResponse {

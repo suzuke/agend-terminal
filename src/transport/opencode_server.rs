@@ -11,6 +11,7 @@ use super::{
 };
 use base64::Engine as _;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -33,6 +34,32 @@ const OPENCODE_MESSAGE_ID_HEX_LEN: usize = 12;
 const OPENCODE_MESSAGE_ID_RANDOM_LEN: usize = 14;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_MASK: u64 = (1_u64 << 48) - 1;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_HALF_RANGE: u64 = 1_u64 << 47;
+const ROLLOVER_JOURNAL_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RolloverJournal {
+    version: u8,
+    delivery_id: Uuid,
+    phase: RolloverPhase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum RolloverPhase {
+    NeedFork {
+        source_session_id: String,
+    },
+    Prepared {
+        source_session_id: String,
+        target_session_id: String,
+        wire_message_id: String,
+    },
+    SubmitAttempted {
+        source_session_id: String,
+        target_session_id: String,
+        wire_message_id: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -881,6 +908,73 @@ fn session_path(session_id: &str) -> String {
     format!("/session/{}", path_segment(session_id))
 }
 
+fn rollover_journal_dir(home: &Path) -> PathBuf {
+    home.join("transport").join("opencode-rollovers")
+}
+
+fn rollover_journal_path(home: &Path, instance: &str) -> PathBuf {
+    rollover_journal_dir(home).join(format!("{}.json", super::safe_component(instance)))
+}
+
+fn save_rollover_journal(
+    home: &Path,
+    instance: &str,
+    journal: &RolloverJournal,
+) -> anyhow::Result<()> {
+    let dir = rollover_journal_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = rollover_journal_path(home, instance);
+    crate::store::atomic_write(&path, &serde_json::to_vec(journal)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::File::open(&path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn load_rollover_journal(home: &Path, instance: &str) -> anyhow::Result<Option<RolloverJournal>> {
+    let path = rollover_journal_path(home, instance);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let journal: RolloverJournal = serde_json::from_slice(&bytes)?;
+    if journal.version != ROLLOVER_JOURNAL_VERSION {
+        anyhow::bail!(
+            "unsupported OpenCode rollover journal version {}",
+            journal.version
+        );
+    }
+    Ok(Some(journal))
+}
+
+fn clear_rollover_journal(home: &Path, instance: &str) -> anyhow::Result<()> {
+    let path = rollover_journal_path(home, instance);
+    match std::fs::remove_file(&path) {
+        Ok(()) => crate::store::fsync_parent_dir(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let dir = rollover_journal_dir(home);
+    if dir.exists() && std::fs::read_dir(&dir)?.next().is_none() {
+        std::fs::remove_dir(&dir)?;
+        crate::store::fsync_parent_dir(&dir);
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_instance_rollover_state(home: &Path, instance: &str) -> anyhow::Result<()> {
+    clear_rollover_journal(home, instance)
+}
+
 fn session_status_type(value: &Value, session_id: &str) -> Option<String> {
     let status = value
         .get(session_id)
@@ -911,8 +1005,16 @@ fn opencode_message_id_timestamp(value: &str) -> Option<u64> {
     u64::from_str_radix(value.get(..OPENCODE_MESSAGE_ID_HEX_LEN)?, 16).ok()
 }
 
-fn next_opencode_message_id(previous: Option<&str>) -> anyhow::Result<String> {
-    next_opencode_message_id_at(previous, current_opencode_timestamp())
+fn opencode_message_id_needs_rollover(previous: Option<&str>, current_timestamp_ms: u64) -> bool {
+    let Some(previous) = previous.and_then(opencode_message_id_timestamp) else {
+        return false;
+    };
+    if previous == OPENCODE_MESSAGE_ID_TIMESTAMP_MASK {
+        return true;
+    }
+    let now = current_timestamp_ms.wrapping_mul(0x1000).wrapping_add(1)
+        & OPENCODE_MESSAGE_ID_TIMESTAMP_MASK;
+    now < previous && previous - now > OPENCODE_MESSAGE_ID_TIMESTAMP_HALF_RANGE
 }
 
 fn next_opencode_message_id_at(
@@ -957,6 +1059,22 @@ fn next_opencode_message_id_at(
     Ok(format!(
         "{OPENCODE_MESSAGE_ID_PREFIX}{timestamp:012x}{random}"
     ))
+}
+
+fn newest_message_id(value: &Value) -> anyhow::Result<Option<String>> {
+    let messages = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("OpenCode fork history is not an array"))?;
+    let newest = messages
+        .iter()
+        .filter_map(|message| message.pointer("/info/id").and_then(Value::as_str))
+        .filter(|message_id| opencode_message_id_timestamp(message_id).is_some())
+        .max()
+        .map(str::to_string);
+    if !messages.is_empty() && newest.is_none() {
+        anyhow::bail!("OpenCode fork history omitted a native message id");
+    }
+    Ok(newest)
 }
 
 fn delivery_id_from_opencode_message_id(value: &str) -> Option<Uuid> {
@@ -1045,12 +1163,16 @@ impl OpenCodeNativeShared {
         ])
     }
 
-    fn next_message_id(&self, previous: Option<&str>) -> anyhow::Result<String> {
+    fn message_id_timestamp(&self) -> u64 {
         #[cfg(test)]
         if let Some(timestamp_ms) = self.message_id_timestamp_ms {
-            return next_opencode_message_id_at(previous, timestamp_ms);
+            return timestamp_ms;
         }
-        next_opencode_message_id(previous)
+        current_opencode_timestamp()
+    }
+
+    fn next_message_id(&self, previous: Option<&str>) -> anyhow::Result<String> {
+        next_opencode_message_id_at(previous, self.message_id_timestamp())
     }
 
     pub(crate) fn deliver_blocking(
@@ -1058,12 +1180,31 @@ impl OpenCodeNativeShared {
         envelope: DeliveryEnvelope,
     ) -> anyhow::Result<DeliveryReceipt> {
         let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
-        store.record_queued(&envelope)?;
+        match store.latest(envelope.delivery_id)? {
+            Some(existing) if existing.payload_digest != envelope.payload_digest => {
+                anyhow::bail!("OpenCode delivery id was reused with a different payload")
+            }
+            Some(existing) if existing.state.is_terminal() => {
+                return Self::replayed_receipt(existing)
+            }
+            Some(_) => {}
+            None => {
+                store.record_queued(&envelope)?;
+            }
+        }
         if let Err(error) = self.start_or_attach_blocking(envelope.session.clone(), None) {
+            if load_rollover_journal(&self.home, &self.instance)?.is_some() {
+                return Err(error);
+            }
             let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
             failed.detail = Some("OpenCode NativeShared readiness failed closed".to_string());
             store.record(failed)?;
             return Err(error);
+        }
+        if let Some(existing) = store.latest(envelope.delivery_id)? {
+            if existing.state != DeliveryState::Queued {
+                return Self::replayed_receipt(existing);
+            }
         }
         if matches!(envelope.kind, DeliveryKind::Steer | DeliveryKind::Interrupt) {
             let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
@@ -1086,15 +1227,20 @@ impl OpenCodeNativeShared {
         }
         let locator = self
             .locator
-            .as_ref()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("OpenCode locator was not attached"))?;
         let session_id = locator
             .session_id
-            .as_deref()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("OpenCode session id is missing"))?;
-        let path = format!("{}/prompt_async", session_path(session_id));
         let previous_wire_message_id =
-            store.latest_opencode_protocol_request_id_for_session(session_id)?;
+            store.latest_opencode_protocol_request_id_for_session(&session_id)?;
+        if opencode_message_id_needs_rollover(
+            previous_wire_message_id.as_deref(),
+            self.message_id_timestamp(),
+        ) {
+            return self.begin_rollover(&store, &envelope, &session_id);
+        }
         let wire_message_id = match self.next_message_id(previous_wire_message_id.as_deref()) {
             Ok(message_id) => message_id,
             Err(error) => {
@@ -1104,16 +1250,13 @@ impl OpenCodeNativeShared {
                 return Err(error);
             }
         };
-        let response = request(locator, "POST", &path, {
-            let mut body = json!({
-                "messageID": wire_message_id,
-                "parts": [{"type": "text", "text": envelope.body}],
-            });
-            if let Some(model) = locator.model.as_deref() {
-                body["model"] = Value::String(model.to_string());
-            }
-            body
-        });
+        let path = format!("{}/prompt_async", session_path(&session_id));
+        let response = request(
+            &locator,
+            "POST",
+            &path,
+            Self::prompt_body(&locator, &envelope, &wire_message_id),
+        );
         let response = match response {
             Ok(response) if (200..300).contains(&response.status) => response,
             Ok(response) => {
@@ -1135,14 +1278,315 @@ impl OpenCodeNativeShared {
             }
         };
         let _ = response;
+        self.record_accepted(
+            &store,
+            &envelope,
+            wire_message_id,
+            session_id,
+            "OpenCode prompt_async accepted",
+        )
+    }
+
+    fn replayed_receipt(receipt: DeliveryReceipt) -> anyhow::Result<DeliveryReceipt> {
+        match receipt.state {
+            DeliveryState::Failed | DeliveryState::Ambiguous => Err(anyhow::anyhow!(
+                "OpenCode durable delivery is {:?}: {}",
+                receipt.state,
+                receipt.detail.as_deref().unwrap_or("no detail")
+            )),
+            _ => Ok(receipt),
+        }
+    }
+
+    fn prompt_body(
+        locator: &SessionLocator,
+        envelope: &DeliveryEnvelope,
+        wire_message_id: &str,
+    ) -> Value {
+        let mut body = json!({
+            "messageID": wire_message_id,
+            "parts": [{"type": "text", "text": envelope.body}],
+        });
+        if let Some(model) = locator.model.as_deref() {
+            body["model"] = Value::String(model.to_string());
+        }
+        body
+    }
+
+    fn record_accepted(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+        wire_message_id: String,
+        backend_session_id: String,
+        detail: &str,
+    ) -> anyhow::Result<DeliveryReceipt> {
+        let mut receipt = DeliveryReceipt::for_state(envelope, DeliveryState::ProtocolAccepted);
+        receipt.protocol_request_id = Some(wire_message_id);
+        receipt.backend_session_id = Some(backend_session_id);
+        receipt.tui_visibility = Some("shared_opencode_session".to_string());
+        receipt.detail = Some(detail.to_string());
+        store.record(receipt.clone())?;
         self.pending.insert(envelope.delivery_id, envelope.clone());
         self.in_flight = Some(envelope.delivery_id);
-        let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-        receipt.protocol_request_id = Some(wire_message_id);
-        receipt.tui_visibility = Some("shared_opencode_session".to_string());
-        receipt.detail = Some("OpenCode prompt_async accepted".to_string());
-        store.record(receipt.clone())?;
         Ok(receipt)
+    }
+
+    fn begin_rollover(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+        source_session_id: &str,
+    ) -> anyhow::Result<DeliveryReceipt> {
+        let journal = RolloverJournal {
+            version: ROLLOVER_JOURNAL_VERSION,
+            delivery_id: envelope.delivery_id,
+            phase: RolloverPhase::NeedFork {
+                source_session_id: source_session_id.to_string(),
+            },
+        };
+        save_rollover_journal(&self.home, &self.instance, &journal)?;
+        self.advance_rollover(store, envelope, journal)
+    }
+
+    fn restore_rollover(&mut self) -> anyhow::Result<bool> {
+        let Some(journal) = load_rollover_journal(&self.home, &self.instance)? else {
+            return Ok(false);
+        };
+        let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        let Some((envelope, receipt)) = store.delivery(journal.delivery_id)? else {
+            anyhow::bail!(
+                "OpenCode rollover journal references a missing durable delivery {}",
+                journal.delivery_id
+            );
+        };
+        if receipt.state != DeliveryState::Queued {
+            clear_rollover_journal(&self.home, &self.instance)?;
+            return Ok(false);
+        }
+        self.advance_rollover(&store, &envelope, journal)?;
+        Ok(true)
+    }
+
+    fn advance_rollover(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+        mut journal: RolloverJournal,
+    ) -> anyhow::Result<DeliveryReceipt> {
+        let source_session_id = match &journal.phase {
+            RolloverPhase::NeedFork { source_session_id }
+            | RolloverPhase::Prepared {
+                source_session_id, ..
+            }
+            | RolloverPhase::SubmitAttempted {
+                source_session_id, ..
+            } => source_session_id,
+        };
+        if envelope.instance != self.instance
+            || envelope.session.session_id.as_deref() != Some(source_session_id)
+            || !self
+                .locator
+                .as_ref()
+                .is_some_and(|locator| Self::same_server(locator, &envelope.session))
+        {
+            anyhow::bail!("OpenCode rollover journal does not match the durable delivery session");
+        }
+        loop {
+            match journal.phase.clone() {
+                RolloverPhase::NeedFork { source_session_id } => {
+                    let locator = self
+                        .locator
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("OpenCode rollover has no locator"))?;
+                    let fork = request(
+                        locator,
+                        "POST",
+                        &format!("{}/fork", session_path(&source_session_id)),
+                        json!({}),
+                    )?;
+                    let fork = response_json(fork, "session fork")?;
+                    let target_session_id = fork
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("OpenCode session fork omitted id"))?
+                        .to_string();
+                    if target_session_id == source_session_id {
+                        anyhow::bail!("OpenCode session fork reused the source session id");
+                    }
+                    let history = request(
+                        locator,
+                        "GET",
+                        &format!("{}/message?limit=1", session_path(&target_session_id)),
+                        Value::Null,
+                    )?;
+                    let history = response_json(history, "fork session history")?;
+                    let newest = newest_message_id(&history)?;
+                    let wire_message_id = self.next_message_id(newest.as_deref())?;
+                    journal.phase = RolloverPhase::Prepared {
+                        source_session_id,
+                        target_session_id,
+                        wire_message_id,
+                    };
+                    save_rollover_journal(&self.home, &self.instance, &journal)?;
+                }
+                RolloverPhase::Prepared {
+                    source_session_id,
+                    target_session_id,
+                    wire_message_id,
+                } => {
+                    let locator = self.select_rollover_session(&target_session_id)?;
+                    journal.phase = RolloverPhase::SubmitAttempted {
+                        source_session_id,
+                        target_session_id: target_session_id.clone(),
+                        wire_message_id: wire_message_id.clone(),
+                    };
+                    save_rollover_journal(&self.home, &self.instance, &journal)?;
+                    return self.submit_rollover_prompt(
+                        store,
+                        envelope,
+                        &locator,
+                        target_session_id,
+                        wire_message_id,
+                    );
+                }
+                RolloverPhase::SubmitAttempted {
+                    source_session_id: _,
+                    target_session_id,
+                    wire_message_id,
+                } => {
+                    let locator = self.select_rollover_session(&target_session_id)?;
+                    return self.reconcile_rollover_prompt(
+                        store,
+                        envelope,
+                        &locator,
+                        target_session_id,
+                        wire_message_id,
+                    );
+                }
+            }
+        }
+    }
+
+    fn select_rollover_session(
+        &mut self,
+        target_session_id: &str,
+    ) -> anyhow::Result<SessionLocator> {
+        let current = self
+            .locator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenCode rollover has no locator"))?;
+        let response = request(
+            current,
+            "POST",
+            "/tui/select-session",
+            json!({"sessionID": target_session_id}),
+        )?;
+        let _ = response_json(response, "TUI session selection")?;
+        let mut target = current.clone();
+        target.session_id = Some(target_session_id.to_string());
+        super::registry::save_session_locator(&self.home, &self.instance, &target)?;
+        self.locator = Some(target.clone());
+        Ok(target)
+    }
+
+    fn submit_rollover_prompt(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+        locator: &SessionLocator,
+        target_session_id: String,
+        wire_message_id: String,
+    ) -> anyhow::Result<DeliveryReceipt> {
+        let response = request(
+            locator,
+            "POST",
+            &format!("{}/prompt_async", session_path(&target_session_id)),
+            Self::prompt_body(locator, envelope, &wire_message_id),
+        );
+        match response {
+            Ok(response) if (200..300).contains(&response.status) => {
+                let receipt = self.record_accepted(
+                    store,
+                    envelope,
+                    wire_message_id,
+                    target_session_id,
+                    "OpenCode rollover prompt_async accepted",
+                )?;
+                clear_rollover_journal(&self.home, &self.instance)?;
+                Ok(receipt)
+            }
+            Ok(response) => {
+                let detail = response_error_detail(&response, "rollover prompt_async");
+                let mut failed = DeliveryReceipt::for_state(envelope, DeliveryState::Failed);
+                failed.protocol_request_id = Some(wire_message_id);
+                failed.backend_session_id = Some(target_session_id);
+                failed.detail = Some(detail.clone());
+                store.record(failed)?;
+                clear_rollover_journal(&self.home, &self.instance)?;
+                Err(anyhow::anyhow!(detail))
+            }
+            Err(submit_error) => self
+                .reconcile_rollover_prompt(
+                    store,
+                    envelope,
+                    locator,
+                    target_session_id,
+                    wire_message_id,
+                )
+                .map_err(|reconcile_error| {
+                    anyhow::anyhow!(
+                        "OpenCode rollover prompt outcome is unresolved: submit: {submit_error}; reconcile: {reconcile_error}"
+                    )
+                }),
+        }
+    }
+
+    fn reconcile_rollover_prompt(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+        locator: &SessionLocator,
+        target_session_id: String,
+        wire_message_id: String,
+    ) -> anyhow::Result<DeliveryReceipt> {
+        let response = request(
+            locator,
+            "GET",
+            &format!(
+                "{}/message/{}",
+                session_path(&target_session_id),
+                path_segment(&wire_message_id)
+            ),
+            Value::Null,
+        )?;
+        if (200..300).contains(&response.status) {
+            let _ = response_json(response, "rollover message reconciliation")?;
+            let receipt = self.record_accepted(
+                store,
+                envelope,
+                wire_message_id,
+                target_session_id,
+                "OpenCode rollover prompt reconciled by stable message id",
+            )?;
+            clear_rollover_journal(&self.home, &self.instance)?;
+            return Ok(receipt);
+        }
+        if not_found(&response) {
+            let detail = "OpenCode rollover prompt is absent after an indeterminate submission; retry requires operator reconciliation";
+            let mut ambiguous = DeliveryReceipt::for_state(envelope, DeliveryState::Ambiguous);
+            ambiguous.protocol_request_id = Some(wire_message_id);
+            ambiguous.backend_session_id = Some(target_session_id);
+            ambiguous.detail = Some(detail.to_string());
+            store.record(ambiguous)?;
+            clear_rollover_journal(&self.home, &self.instance)?;
+            return Err(anyhow::anyhow!(detail));
+        }
+        Err(anyhow::anyhow!(response_error_detail(
+            &response,
+            "rollover message reconciliation"
+        )))
     }
 
     fn start_or_attach_blocking(
@@ -1162,6 +1606,7 @@ impl OpenCodeNativeShared {
             .flatten()
             .is_some_and(|current| Self::same_session(current, &locator))
         {
+            self.restore_rollover()?;
             return Ok(self.capability());
         }
         self.ready = false;
@@ -1201,7 +1646,9 @@ impl OpenCodeNativeShared {
         self.locator = Some(locator);
         self.backend_version = Some(version.clone());
         self.ready = true;
-        self.restore_pending_state()?;
+        if !self.restore_rollover()? {
+            self.restore_pending_state()?;
+        }
         Ok(self.capability())
     }
 
@@ -1209,6 +1656,15 @@ impl OpenCodeNativeShared {
         current.backend == requested.backend
             && current.endpoint_url == requested.endpoint_url
             && current.session_id == requested.session_id
+            && current.username == requested.username
+            && current.password == requested.password
+            && current.model == requested.model
+            && current.managed == requested.managed
+    }
+
+    fn same_server(current: &SessionLocator, requested: &SessionLocator) -> bool {
+        current.backend == requested.backend
+            && current.endpoint_url == requested.endpoint_url
             && current.username == requested.username
             && current.password == requested.password
             && current.model == requested.model
@@ -1406,6 +1862,7 @@ impl OpenCodeNativeShared {
             let mut receipt = DeliveryReceipt::for_state(envelope, state);
             if let Some(previous) = previous {
                 receipt.protocol_request_id = previous.protocol_request_id;
+                receipt.backend_session_id = previous.backend_session_id;
                 receipt.tui_visibility = previous.tui_visibility;
             }
             receipt.backend_event = backend_event.map(str::to_string);

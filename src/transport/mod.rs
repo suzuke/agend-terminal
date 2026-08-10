@@ -37,6 +37,7 @@ pub(crate) fn remove_instance_delivery_state(
 ) -> anyhow::Result<()> {
     codex_app_server::stop_instance_server(home, instance)?;
     opencode_server::stop_instance_server(home, instance);
+    opencode_server::remove_instance_rollover_state(home, instance)?;
     claude_channel::stop_instance_state(home, instance);
     receipt::remove_instance_delivery_state(home, instance)
 }
