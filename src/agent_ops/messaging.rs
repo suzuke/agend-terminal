@@ -263,7 +263,7 @@ fn check_team_isolation(home: &Path, from: &str, target: &str) -> Result<(), Sen
             return Err(SendOutcome::Error {
                 error: format!(
                     "cross-team send blocked: '{from}' (team={:?}) → '{target}' (team={:?}). \
-                     Route via general, add sender to team's accept_from, or use create_instance(team=...) to grow your team.",
+                     Add the sender to the target team's accept_from and route to its orchestrator, or use create_instance(team=...) to place both instances in the same team.",
                     from_team.as_ref().map(|t| &t.name),
                     target_team.as_ref().map(|t| &t.name),
                 ),
