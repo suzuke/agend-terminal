@@ -2921,6 +2921,21 @@ fn typed_inject_miss_latches_before_later_payload_can_append_3175() {
     };
 
     assert!(inject_with_target(&target, b"A").is_err());
+    {
+        let core = target.core.lock();
+        assert_eq!(
+            core.health.current_reason.as_ref().map(ToString::to_string),
+            Some("typed_inject_contaminated".to_string()),
+            "a persistent typed-inject fence must be visible as a blocked reason"
+        );
+        assert!(
+            core.health
+                .current_note
+                .as_deref()
+                .is_some_and(|note| note.contains("restart")),
+            "the blocked reason must tell the operator how the process-scoped fence clears"
+        );
+    }
     let after_first_miss = bytes.lock().clone();
     assert!(
         inject_with_target(&target, b"B").is_err(),
