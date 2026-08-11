@@ -689,6 +689,31 @@ fn release_inprogress_orphans_preserves_exact_signed_binding() {
     assert_eq!(post_rec.status, TaskStatus::InProgress);
     assert_eq!(post_rec.owner.as_ref(), Some(&worker));
 
+    // A future-schema binding is explicitly Opaque, not Absent. Even when the
+    // current daemon cannot interpret it, that uncertainty is not authority to
+    // destroy the durable lease and re-dispatch the task.
+    let binding_path = crate::paths::binding_path(&home, worker.0.as_str());
+    let mut future_binding: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&binding_path).expect("read exact binding fixture"))
+            .expect("parse exact binding fixture");
+    future_binding["version"] = serde_json::json!(u64::MAX);
+    let future_body = serde_json::to_vec_pretty(&future_binding).expect("serialize future binding");
+    let future_sig = agentic_git_core::integrity_core::sign_binding(&home, &future_body)
+        .expect("sign future binding fixture");
+    std::fs::write(&binding_path, &future_body).expect("write future binding fixture");
+    std::fs::write(binding_path.with_file_name("binding.json.sig"), future_sig)
+        .expect("write future binding signature");
+    assert!(matches!(
+        crate::binding::guarded_binding_disk_fresh(&home, worker.0.as_str()),
+        crate::binding::GuardedBinding::Opaque(_)
+    ));
+
+    let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
+    assert!(
+        released.is_empty(),
+        "an opaque binding is not proof that the durable lease is absent"
+    );
+
     std::fs::remove_dir_all(&home).ok();
 }
 
