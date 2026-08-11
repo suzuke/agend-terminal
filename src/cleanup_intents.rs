@@ -1296,6 +1296,7 @@ mod tests {
         .expect("seed open task");
     }
 
+    #[cfg(unix)]
     fn seed_cancelled_task(home: &Path, task_id: &str) {
         use crate::task_events::{InstanceName, TaskEvent, TaskId};
         let tid = TaskId(task_id.to_string());
