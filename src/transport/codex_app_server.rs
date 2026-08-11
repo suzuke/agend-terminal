@@ -1482,6 +1482,11 @@ mod tests {
                     ),
                     "initialized" => {}
                     "thread/resume" => {
+                        assert_eq!(
+                            request.pointer("/params/excludeTurns"),
+                            Some(&Value::Bool(true)),
+                            "readiness must rejoin the live thread without downloading turn history"
+                        );
                         write_server_frame(
                             &mut stream,
                             json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
@@ -1619,10 +1624,16 @@ mod tests {
             .expect("latest receipt")
             .expect("failed readiness receipt");
         assert_eq!(receipt.state, DeliveryState::Failed);
-        assert_eq!(
-            receipt.detail.as_deref(),
-            Some("NativeShared readiness failed closed")
+        let detail = receipt.detail.expect("failed readiness detail");
+        assert!(
+            detail.starts_with("NativeShared readiness failed closed: "),
+            "receipt must preserve the readiness failure class: {detail}"
         );
+        assert!(
+            detail.contains("No such file or directory"),
+            "receipt must preserve the exact readiness cause: {detail}"
+        );
+        assert!(detail.len() <= 1024, "receipt detail must remain bounded");
         let _ = std::fs::remove_dir_all(home);
     }
 
