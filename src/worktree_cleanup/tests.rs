@@ -888,26 +888,51 @@ fn make_squash_orphan(repo: &Path, branch: &str, tip_date: &str) {
 
 /// PR-D·D3 equivalence pin: `branch_reap_delete` — the `branch_disposition`
 /// delegation — must reproduce BOTH pre-D3 branch-reap gates byte-for-byte:
-///   phase-2 `prune_orphaned_branches`: delete iff `merged || squash || scaffold`
+///   phase-2 `prune_orphaned_branches`: delete iff merged, squash, or a
+///   recovery-ref-backed TTL has expired
 ///   phase-1 `branch_safe_to_delete`:   delete iff `merged || squash` (scaffold=false)
-/// Both reduce to `provably_in_default || scaffold_ttl`. The CR-2026-06-14
+/// Both reduce to `provably_in_default || recoverable_ttl`. The CR-2026-06-14
 /// invariant — remote-gone ALONE is never a delete trigger — is pinned by
 /// asserting `remote_gone` NEVER changes the result across the full domain.
 #[test]
 fn branch_reap_delete_equals_pre_d3_gate() {
     for provably_in_default in [true, false] {
         for remote_gone in [true, false] {
-            for scaffold_ttl in [true, false] {
+            for recoverable_ttl in [true, false] {
                 assert_eq!(
-                    branch_reap_delete(provably_in_default, remote_gone, scaffold_ttl),
-                    provably_in_default || scaffold_ttl,
+                    branch_reap_delete(provably_in_default, remote_gone, recoverable_ttl),
+                    provably_in_default || recoverable_ttl,
                     "branch reap DRIFT: provably={provably_in_default} \
-                         remote_gone={remote_gone} scaffold={scaffold_ttl} \
+                         remote_gone={remote_gone} ttl={recoverable_ttl} \
                          (remote-gone must NEVER flip the result — CR-2026-06-14)"
                 );
             }
         }
     }
+}
+
+#[test]
+fn recovery_backed_delete_uses_expected_tip_cas() {
+    let repo = setup_test_repo("stale-idle-cas");
+    let branch = "feat/cas-protected";
+    make_unmerged_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    let old_tip = branch_tip_info(&repo, branch).expect("old tip").0;
+    git_in(&repo, &["checkout", branch]);
+    std::fs::write(repo.join("new.txt"), "new work").expect("write");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-m", "advance branch"]);
+    git_in(&repo, &["checkout", "main"]);
+    let new_tip = branch_tip_info(&repo, branch).expect("new tip").0;
+    assert_ne!(old_tip, new_tip);
+
+    let result = delete_branch_ref_cas(&repo, branch, &old_tip);
+
+    assert!(result.is_err(), "stale expected tip must fail closed");
+    assert_eq!(
+        branch_tip_info(&repo, branch).expect("branch survives").0,
+        new_tip
+    );
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
@@ -966,14 +991,15 @@ fn prune_skips_squash_merged_too_new_1750_b3() {
 }
 
 #[test]
-fn prune_skips_unmerged_branch_1750_b3() {
+fn prune_skips_young_unmerged_branch_1750_b3() {
     let _lock = ENV_LOCK.lock();
     let repo = setup_test_repo("b3-unmerged");
-    // A genuinely unmerged branch (old tip) — squash detection must NOT fire.
+    // A genuinely unmerged branch with a fresh tip — neither squash nor TTL
+    // eligibility may fire.
     git_in(&repo, &["checkout", "-b", "feat/wip"]);
     std::fs::write(repo.join("feat.txt"), "wip").ok();
     git_in(&repo, &["add", "."]);
-    git_commit_dated(&repo, "wip", "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["commit", "-m", "wip"]);
     git_in(&repo, &["checkout", "main"]);
 
     assert!(
@@ -983,7 +1009,7 @@ fn prune_skips_unmerged_branch_1750_b3() {
     let pruned = prune_orphaned_branches(&repo, false);
     assert!(
         !pruned.iter().any(|(b, _)| b == "feat/wip"),
-        "#1750-B3: a real unmerged branch must NOT be GC'd"
+        "#1750-B3: a fresh unmerged branch must NOT be GC'd"
     );
     std::fs::remove_dir_all(&repo).ok();
 }
@@ -1121,26 +1147,96 @@ fn prune_keeps_young_review_scaffold_p1() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// RED4 (guard, 不動): `spike/*` (intentional design record) and an aged but
-/// UNMERGED `feat/*` (real WIP) must never be touched by the scaffolding path
-/// — neither matches the reviewer-checkout regex / is disposable.
+/// Generic unmerged refs eventually leave the ordinary branch namespace once
+/// the 90d stale-idle TTL expires, but only after their exact tips are protected
+/// by durable recovery refs.
 #[test]
-fn prune_keeps_spike_and_unmerged_feat_p1() {
+fn prune_recovers_and_deletes_stale_idle_generic_branches() {
     let _lock = ENV_LOCK.lock();
     let repo = setup_test_repo("p1-spike-feat");
     make_unmerged_dated_branch(&repo, "spike/2342-inbound", "2024-01-01T00:00:00 +0000");
     make_unmerged_dated_branch(&repo, "feat/real-wip", "2024-01-01T00:00:00 +0000");
 
+    let spike_tip = branch_tip_info(&repo, "spike/2342-inbound")
+        .expect("spike tip")
+        .0;
+    let feat_tip = branch_tip_info(&repo, "feat/real-wip").expect("feat tip").0;
+
     let pruned = prune_orphaned_branches(&repo, false);
     assert!(
-        !pruned.iter().any(|(b, _)| b == "spike/2342-inbound"),
-        "PR-A P1: spike/* is a retained design record and must NOT be pruned: {pruned:?}"
+        pruned
+            .iter()
+            .any(|(b, r)| b == "spike/2342-inbound" && *r == "stale-idle-ttl"),
+        "stale spike ref must retire through the recovery-backed TTL: {pruned:?}"
     );
     assert!(
-        !pruned.iter().any(|(b, _)| b == "feat/real-wip"),
-        "PR-A P1: an unmerged feat/* carrying real work must NOT be pruned: {pruned:?}"
+        pruned
+            .iter()
+            .any(|(b, r)| b == "feat/real-wip" && *r == "stale-idle-ttl"),
+        "stale feature ref must retire through the recovery-backed TTL: {pruned:?}"
+    );
+    let recovery_tips = crate::git_helpers::git_cmd(
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/agend/recovery/branch/",
+        ],
+    )
+    .expect("list recovery refs");
+    assert!(recovery_tips.lines().any(|tip| tip == spike_tip));
+    assert!(recovery_tips.lines().any(|tip| tip == feat_tip));
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn prune_keeps_stale_idle_branch_with_active_task() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("stale-idle-active-task");
+    let home = tmp_home("stale-idle-active-task");
+    let branch = "feat/stale-but-active";
+    make_unmerged_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    let board = crate::task_events::board_root(&home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).ok();
+    crate::task_events::append(
+        &board,
+        &InstanceName::from("test"),
+        TaskEvent::Created {
+            task_id: TaskId("t-stale-active".into()),
+            title: "live work".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            tags: Vec::new(),
+            owner: None,
+            depends_on: Vec::new(),
+            parent_id: None,
+            branch: Some(branch.into()),
+            due_at: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    )
+    .expect("seed active task");
+
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert!(
+        !pruned.iter().any(|(name, _)| name == branch),
+        "active task must keep even a TTL-old branch: {pruned:?}"
+    );
+    assert!(branch_exists(&repo, branch));
+    let tasks = hygiene_tasks(&home);
+    let key = format!("residue-lifecycle-blocked:{}:{branch}", repo.display());
+    assert!(
+        tasks.iter().any(|(task_key, evidence)| {
+            task_key == &key && evidence["task_active"] == serde_json::Value::Bool(true)
+        }),
+        "a TTL-old branch blocked by a live task must be observable: {tasks:?}"
     );
     std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
 }
 
 // ── #P1-2607: squash-eligibility tip-SHA cache ──
@@ -1338,6 +1434,57 @@ fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
         .unwrap_or_default()
 }
 
+#[test]
+fn aged_preserved_review_intent_upserts_hygiene_task() {
+    let _lock = ENV_LOCK.lock();
+    std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+    let home = tmp_home("aged-review-intent-hygiene");
+    let repo = setup_test_repo("aged-review-intent-hygiene");
+    let branch = "review/aged-blocked";
+    make_unmerged_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    let tip = branch_tip_info(&repo, branch).expect("tip").0;
+    crate::cleanup_intents::persist_intent(
+        &home,
+        &repo.display().to_string(),
+        branch,
+        &tip,
+        "t-aged-blocked",
+        None,
+        None,
+    )
+    .expect("persist intent");
+    let intent_path = std::fs::read_dir(home.join("cleanup-intents"))
+        .expect("intent dir")
+        .flatten()
+        .next()
+        .expect("intent file")
+        .path();
+    let mut intent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&intent_path).expect("read intent"))
+            .expect("parse intent");
+    intent["created_at"] =
+        serde_json::Value::String((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
+    std::fs::write(
+        &intent_path,
+        serde_json::to_vec_pretty(&intent).expect("serialize intent"),
+    )
+    .expect("backdate intent");
+
+    let _ = sweep_from_registry(&home, &HashMap::new(), &[]);
+
+    let tasks = hygiene_tasks(&home);
+    let (_, evidence) = tasks
+        .iter()
+        .find(|(key, _)| key.starts_with("cleanup-intent-preserved:"))
+        .unwrap_or_else(|| panic!("aged preserved intent must be actionable: {tasks:?}"));
+    assert_eq!(evidence["branch"], branch);
+    assert_eq!(evidence["task_id"], "t-aged-blocked");
+    assert_eq!(evidence["reason"], "preserved:task_not_terminal");
+    std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// V1 RED: an ELIGIBLE (merged) worktree whose removal FAILS must produce a
 /// durable hygiene task with the exact repo/branch/reason — the sweep may
 /// not silently skip a proven-eligible-but-undeletable candidate.
@@ -1523,7 +1670,7 @@ fn nonterminal_candidates_skip_task_and_binding_probes_3011() {
         git_in(&repo, &["checkout", "-b", name]);
         std::fs::write(repo.join("wip.txt"), name).ok();
         git_in(&repo, &["add", "."]);
-        git_commit_dated(&repo, "wip", "2024-01-01T00:00:00 +0000");
+        git_in(&repo, &["commit", "-m", "wip"]);
         git_in(&repo, &["checkout", "main"]);
     }
 

@@ -1208,6 +1208,66 @@ mod tests {
         );
     }
 
+    fn seed_open_task(home: &Path, task_id: &str, branch: &str) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        std::fs::create_dir_all(&board).ok();
+        crate::task_events::append(
+            &board,
+            &InstanceName::from("test"),
+            TaskEvent::Created {
+                task_id: TaskId(task_id.to_string()),
+                title: "merged subject".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                tags: Vec::new(),
+                owner: None,
+                depends_on: Vec::new(),
+                parent_id: None,
+                branch: Some(branch.to_string()),
+                due_at: None,
+                routed_to: None,
+                bind: None,
+                eta_secs: None,
+            },
+        )
+        .expect("seed open task");
+    }
+
+    fn seed_cancelled_task(home: &Path, task_id: &str) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let tid = TaskId(task_id.to_string());
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        std::fs::create_dir_all(&board).ok();
+        let emitter = InstanceName::from("test");
+        let _ = crate::task_events::append_batch_at(
+            &board,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "test".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    tags: Vec::new(),
+                    owner: None,
+                    depends_on: Vec::new(),
+                    parent_id: None,
+                    branch: None,
+                    due_at: None,
+                    routed_to: None,
+                    bind: None,
+                    eta_secs: None,
+                },
+                TaskEvent::Cancelled {
+                    task_id: tid,
+                    by: emitter.clone(),
+                    reason: "review invalidated".into(),
+                },
+            ],
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn reconcile_terminal_review_intent_deletes_branch() {
@@ -1255,6 +1315,38 @@ mod tests {
             refs_out.lines().any(|l| l.trim() == tip),
             "recovery ref must point to deleted tip"
         );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reconcile_cancelled_review_intent_deletes_branch() {
+        let home = tmp_dir("reconcile-cancelled");
+        let repo = tmp_repo("reconcile-cancelled-repo");
+        let branch = "review/pr-cancelled";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(
+            &home,
+            &rs,
+            branch,
+            &tip,
+            "t-reconcile-cancelled",
+            None,
+            None,
+        )
+        .expect("persist");
+        seed_cancelled_task(&home, "t-reconcile-cancelled");
+
+        let result = reconcile_terminal_review_intents(&home, false);
+
+        assert_eq!(
+            result.settled, 1,
+            "cancelled review task is terminal and must settle: {result:?}"
+        );
+        assert!(!branch_exists(&repo, branch));
+        assert!(!has_intent(&home, &rs, branch));
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
@@ -1565,12 +1657,63 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_merged_subject_tasks_replays_missed_auto_close() {
+        let home = tmp_dir("replay-merged-subject");
+        let repo = tmp_repo("replay-merged-subject-repo");
+        git_in(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        let subject_branch = "fix/merged-subject";
+        let subject_tip = make_branch(&repo, subject_branch);
+        let review_branch = "review/pr-999-replay";
+        let review_tip = make_branch(&repo, review_branch);
+        let task_id = "t-replay-merged-subject";
+        seed_open_task(&home, task_id, subject_branch);
+        persist_intent(
+            &home,
+            &repo.display().to_string(),
+            review_branch,
+            &review_tip,
+            task_id,
+            Some("example/repo"),
+            Some(999),
+        )
+        .expect("persist review intent");
+        let provider =
+            crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::MergedHead {
+                base: "main".into(),
+                head_oid: subject_tip,
+            });
+        let _provider_guard = crate::scm::set_test_scm_provider(provider);
+
+        reconcile_merged_subject_tasks(&home);
+
+        let task = crate::tasks::list_all(&home)
+            .into_iter()
+            .find(|task| task.id.as_str() == task_id)
+            .expect("task present");
+        assert_eq!(task.status, crate::task_events::TaskStatus::Done);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
     fn reconcile_production_entry_wired() {
         let source = include_str!("worktree_cleanup.rs");
         assert!(
             source.contains("reconcile_terminal_review_intents"),
             "worktree_cleanup.rs must call reconcile_terminal_review_intents \
              — if this fails, the reconciler was unwired from the periodic sweep"
+        );
+        assert!(
+            source.contains("reconcile_merged_subject_tasks"),
+            "worktree_cleanup.rs must replay missed merged-task auto-close"
         );
     }
 }

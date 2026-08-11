@@ -409,6 +409,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn auto_close_closes_all_tasks_with_same_structured_branch() {
+        use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId};
+        let dir = std::env::temp_dir().join(format!(
+            "agend-autoclose-shared-branch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let branch = "fix/shared-implementation-and-review";
+        let task_ids = ["t-shared-impl", "t-shared-review"];
+
+        for task_id in task_ids {
+            append_batch(
+                &dir,
+                &InstanceName::from("test:seed"),
+                vec![TaskEvent::Created {
+                    task_id: TaskId(task_id.into()),
+                    title: task_id.into(),
+                    description: "work".into(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                }],
+            )
+            .expect("seed task");
+            crate::tasks::link_branch_to_task(&dir, task_id, branch).expect("link");
+        }
+
+        auto_close_merged_tasks(&dir, branch);
+
+        let tasks = crate::tasks::list_all(&dir);
+        for task_id in task_ids {
+            let task = tasks
+                .iter()
+                .find(|task| task.id.as_str() == task_id)
+                .expect("task present");
+            assert_eq!(
+                task.status,
+                TaskStatus::Done,
+                "every exact structured task on a merged branch must close"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// #2037 (5) guard: a TEXT-fallback match (branch token in description,
     /// no structured link) stays Verified-only — a loose match must never
     /// close live work.
