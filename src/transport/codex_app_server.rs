@@ -30,6 +30,7 @@ use std::io::{BufRead, Read};
 const CODEX_PROTOCOL: &str = "v2";
 #[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_READINESS_DETAIL_BYTES: usize = 1024;
 
 pub(crate) struct CodexNativeShared {
     home: PathBuf,
@@ -125,7 +126,7 @@ impl CodexNativeShared {
             .map(|_| ());
         if let Err(error) = attach {
             let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
-            failed.detail = Some("NativeShared readiness failed closed".to_string());
+            failed.detail = Some(readiness_failure_detail(&error));
             store.record(failed)?;
             return Err(error);
         }
@@ -383,7 +384,10 @@ impl CodexNativeShared {
                 .filter(|thread_id| !thread_id.is_empty())
                 .map(str::to_string);
             if let Some(thread_id) = had_thread_id.as_deref() {
-                self.send_request("thread/resume", json!({"threadId": thread_id}))?;
+                self.send_request(
+                    "thread/resume",
+                    json!({"threadId": thread_id, "excludeTurns": true}),
+                )?;
             } else {
                 locator.thread_id = Some(self.discover_loaded_tui_thread()?);
             }
@@ -762,6 +766,21 @@ impl CodexNativeShared {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("Codex event stream produced no event"))
     }
+}
+
+fn readiness_failure_detail(error: &anyhow::Error) -> String {
+    let mut detail = format!("NativeShared readiness failed closed: {error}");
+    if detail.len() <= MAX_READINESS_DETAIL_BYTES {
+        return detail;
+    }
+    let suffix = "...";
+    let mut end = MAX_READINESS_DETAIL_BYTES - suffix.len();
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail.truncate(end);
+    detail.push_str(suffix);
+    detail
 }
 
 #[cfg(unix)]
@@ -1635,6 +1654,17 @@ mod tests {
         );
         assert!(detail.len() <= 1024, "receipt detail must remain bounded");
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn readiness_failure_detail_is_utf8_safe_and_bounded() {
+        let error = anyhow::anyhow!("{}", "界".repeat(MAX_READINESS_DETAIL_BYTES));
+
+        let detail = readiness_failure_detail(&error);
+
+        assert!(detail.len() <= MAX_READINESS_DETAIL_BYTES);
+        assert!(detail.starts_with("NativeShared readiness failed closed: "));
+        assert!(detail.ends_with("..."));
     }
 
     #[cfg(unix)]
