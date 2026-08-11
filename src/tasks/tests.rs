@@ -602,8 +602,13 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
     let pre_rec = pre.tasks.get(&tid).expect("seeded task present");
     assert_eq!(pre_rec.status, TaskStatus::InProgress, "pre: in_progress");
     assert!(pre_rec.owner.is_some(), "pre: owned");
+    crate::binding::bind(&home, worker.0.as_str(), "t-different", "feat/stale");
+    assert!(
+        crate::binding::signature_valid(&home, worker.0.as_str()),
+        "test precondition: a valid but task-mismatched binding exists"
+    );
 
-    // Subject: boot entrypoint with live=∅ (the bootstrap call site).
+    // Subject: an absent live owner plus a mismatched lease is a true orphan.
     let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
     assert_eq!(released, vec![tid.clone()], "the stuck task is released");
 

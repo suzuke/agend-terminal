@@ -393,12 +393,11 @@ pub(crate) type ResolvedFleet = (
 
 /// Load + normalize the fleet, resolve every instance into a spawn-ready
 /// [`AgentDef`], init the channel, and run the shared-state reconciles
-/// (binding / worktree-lease / canonical-hygiene / task-orphan sweeps).
+/// (binding / worktree-lease / canonical-hygiene / owner-orphan sweeps).
 ///
 /// Extracted (#1814) so the successor-handoff path can run the IDENTICAL work
 /// AFTER it has acquired the flock. These steps MUTATE shared state and
-/// several (notably `release_inprogress_orphans`, which assumes `live = ∅`)
-/// are only correct when this process is the sole daemon — so the handoff path
+/// several are only correct when this process is the sole daemon — so the handoff path
 /// must never call this during the two-daemon overlap window. Behaviour for
 /// the normal `prepare` path is unchanged — same calls, same order.
 pub(crate) fn resolve_fleet_and_reconcile(
@@ -495,25 +494,6 @@ pub(crate) fn resolve_fleet_and_reconcile(
     // which still fetches `live` from the running daemon.
     time_step("tasks::reconcile_orphan_owners_with_live", || {
         crate::tasks::reconcile_orphan_owners_with_live(home, &std::collections::HashSet::new());
-    });
-
-    // Boot orphan sweep (task t-20260526155509233515-8): a daemon restart
-    // replays the board and sees prev-session `in_progress` tasks, but can't
-    // tell an orphan from one being actively worked → they stick forever. Here
-    // we release every in_progress task back to open.
-    //
-    // PREMISE (binds the empty-`live` correctness): `auto_start_fleet` runs in
-    // `run_with_prepared`, AFTER this `prepare` returns — so at this point NO
-    // agent is alive and `live = ∅`. Every in_progress task is therefore
-    // provably a prev-session orphan (AgEnD agents re-spawn fresh; none resumes
-    // a mid-task in_progress), so releasing all of them cannot false-release an
-    // actively-running task. ⚠ If a future `--session-resume` feature lets an
-    // agent re-attach to a live in_progress across restart, THIS PREMISE BREAKS
-    // and the sweep must instead consult an authoritative post-spawn live set
-    // (see the `live` param on `scan_inprogress_orphans` + the per-tick variant
-    // deferred for that case). Lockless + pre-socket like the owner sweep above.
-    time_step("tasks::release_inprogress_orphans", || {
-        crate::tasks::release_inprogress_orphans_with_live(home, &std::collections::HashSet::new());
     });
 
     Ok((config, agents, telegram))
@@ -1161,7 +1141,6 @@ mod tests {
             "worktree_pool::reconcile_orphan_leases",
             "canonical_hygiene::run_hygiene",
             "tasks::reconcile_orphan_owners_with_live",
-            "tasks::release_inprogress_orphans",
         ];
         for step in expected_steps {
             assert!(

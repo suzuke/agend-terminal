@@ -127,19 +127,11 @@ pub fn cancel_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
 /// Boot orphan sweep (task t-20260526155509233515-8): the STATUS-orphan
 /// analogue of [`scan_orphan_candidates`] (which handles OWNER orphans).
 ///
-/// An `InProgress` task is a status-orphan when its owner is absent from `live`
-/// — or it has no owner at all (a malformed in_progress). At boot `live` is
-/// empty (see the bootstrap call site), so this returns ALL in_progress tasks —
-/// provably correct because no agent is alive to be actively working one
-/// (AgEnD agents re-spawn fresh on daemon restart; none resumes a mid-task
-/// in_progress).
+/// An `InProgress` task is a status-orphan candidate when its owner is absent
+/// from `live` — or it has no owner at all (a malformed in_progress).
 ///
-/// Crucially, unlike the owner sweep there is **no Soft-defer**: a fleet agent
-/// re-spawning will NOT resume its prior in_progress, so the task must be
-/// released to open for re-dispatch regardless of whether its owner is in
-/// fleet.yaml. The `live` parameter is kept so a future per-tick variant can
-/// pass an authoritative live set (then `owner ∈ live` ⇒ actively running ⇒
-/// keep) — but the boot caller passes `∅`.
+/// The release entrypoint applies the second half of the proof: an exact signed
+/// owner/task binding is a durable lease and also prevents release.
 pub fn scan_inprogress_orphans(
     state: &crate::task_events::TaskBoardState,
     live: &std::collections::HashSet<String>,
@@ -157,19 +149,19 @@ pub fn scan_inprogress_orphans(
         .collect()
 }
 
-/// Boot orphan sweep: release stale `InProgress` tasks (see
-/// [`scan_inprogress_orphans`]) back to `Open` by emitting one batched
+/// Post-spawn orphan sweep: release stale `InProgress` tasks (see
+/// [`scan_inprogress_orphans`]) that also lack an exact signed durable binding
+/// back to `Open` by emitting one batched
 /// [`crate::task_events::TaskEvent::Released`] per task (clears owner →
 /// re-dispatchable), under a single fsync. Returns the released ids.
 ///
-/// Best-effort operator courtesy: a single coalesced, file-based inbox notice
-/// (the loopback API socket is NOT bound at bootstrap, so an `api::call`-based
-/// delivery would fail — `inbox::enqueue` is a plain file append). The released
-/// tasks are also visible on the board (now `Open`) and in a `warn` log.
+/// Best-effort operator courtesy: a single coalesced, file-based inbox notice.
+/// This deliberately does not depend on the loopback API; the released tasks
+/// are also visible on the board (now `Open`) and in a `warn` log.
 ///
-/// Lock-free + pre-socket-safe by construction: runs in `bootstrap::prepare`
-/// before the agent registry and loopback socket exist, so there is no
-/// registry/core lock to hold across the inbox write → no #1492 concern.
+/// The daemon snapshots and drops the registry lock before entering here. Each
+/// binding is checked under the established agent-mutation → binding-file lock
+/// order; all binding guards are dropped before task event or inbox writes.
 pub fn release_inprogress_orphans_with_live(
     home: &Path,
     live: &std::collections::HashSet<String>,
@@ -182,7 +174,15 @@ pub fn release_inprogress_orphans_with_live(
             return Vec::new();
         }
     };
-    let orphans = scan_inprogress_orphans(&state, live);
+    let orphans: Vec<_> = scan_inprogress_orphans(&state, live)
+        .into_iter()
+        .filter(|task_id| {
+            let Some(task) = state.tasks.get(task_id) else {
+                return false;
+            };
+            !has_exact_signed_task_lease(home, task)
+        })
+        .collect();
     if orphans.is_empty() {
         tracing::debug!("boot orphan sweep: no in_progress orphans to release");
         return Vec::new();
@@ -209,6 +209,39 @@ pub fn release_inprogress_orphans_with_live(
     );
     notify_boot_orphan_release(home, &ids);
     orphans
+}
+
+/// Return true only for a binding whose signed bytes name this exact task and
+/// owner. Lock acquisition failure is treated as an unknown lease and therefore
+/// preserves the task: the sweep must never mutate state without proving the
+/// lease absent.
+fn has_exact_signed_task_lease(home: &Path, task: &crate::task_events::TaskRecord) -> bool {
+    let Some(owner) = task.owner.as_ref().map(|owner| owner.0.as_str()) else {
+        return false;
+    };
+    let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, owner) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(%owner, task_id = %task.id.0, %error, "boot orphan sweep: binding lease lock unavailable — preserving task");
+            return true;
+        }
+    };
+    let _binding_lock = match crate::binding::acquire_binding_file_lock(home, owner) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(%owner, task_id = %task.id.0, %error, "boot orphan sweep: binding file lock unavailable — preserving task");
+            return true;
+        }
+    };
+    let value = match crate::binding::guarded_binding_disk_fresh(home, owner) {
+        crate::binding::GuardedBinding::Known { value, .. } => value,
+        crate::binding::GuardedBinding::Absent | crate::binding::GuardedBinding::Opaque(_) => {
+            return false;
+        }
+    };
+    crate::binding::signature_valid(home, owner)
+        && value["agent"].as_str() == Some(owner)
+        && value["task_id"].as_str() == Some(task.id.0.as_str())
 }
 
 /// Coalesced, file-based operator notice for the boot orphan sweep. One inbox
