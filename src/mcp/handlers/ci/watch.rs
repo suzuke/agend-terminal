@@ -49,18 +49,18 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 });
             }
             let task_id = args["task_id"].as_str().unwrap_or("");
-            let Some(receipt) = crate::merge_receipt::find(home, repo, head_sha, task_id) else {
-                return json!({
-                    "error": "notification_only watch requires a matching merge receipt (repo + head_sha + task_id)",
-                    "code": "notification_only_no_receipt",
-                });
-            };
             if instance_name.is_empty() {
                 return json!({
                     "error": "notification_only watch requires an identified caller (not operator/empty)",
                     "code": "notification_only_empty_caller",
                 });
             }
+            let Some(receipt) = crate::merge_receipt::find(home, repo, head_sha, task_id) else {
+                return json!({
+                    "error": "notification_only watch requires a matching merge receipt (repo + head_sha + task_id)",
+                    "code": "notification_only_no_receipt",
+                });
+            };
             if receipt.task_assignee != instance_name {
                 return json!({
                     "error": format!(
