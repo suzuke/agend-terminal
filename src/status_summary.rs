@@ -152,8 +152,9 @@ pub fn parse_task_entry(text: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Auto-close tasks whose branch merged. Only closes tasks in `verified` status
-/// (v1.2 §10.3 lifecycle: verified → done). Skips ambiguous matches.
+/// Auto-close tasks whose branch merged. Exact structured branch links are
+/// authoritative, so every active task carrying the merged branch is closed.
+/// The legacy text-token fallback remains Verified-only and single-match.
 pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
     let tasks = crate::tasks::list_all(home);
     // #2037 (5): the Verified-only status filter was the zombie-task gap —
@@ -178,55 +179,61 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
                 | TaskStatus::Verified
         )
     };
-    let candidates: Vec<_> = tasks
+    let structured: Vec<_> = tasks
         .iter()
-        .filter(|t| {
-            let structured = t.branch.as_deref() == Some(branch);
-            let text_fallback =
-                contains_as_token(&t.description, branch) || contains_as_token(&t.title, branch);
-            (structured && active(&t.status)) || (text_fallback && t.status == TaskStatus::Verified)
-        })
+        .filter(|t| t.branch.as_deref() == Some(branch) && active(&t.status))
         .collect();
 
-    if candidates.is_empty() {
-        return;
-    }
-    if candidates.len() > 1 {
-        let ids: Vec<_> = candidates.iter().map(|t| t.id.as_str()).collect();
-        tracing::warn!(
-            branch,
-            count = candidates.len(),
-            ?ids,
-            "ambiguous branch→task match, skipping auto-close"
-        );
-        return;
-    }
-
-    let task = candidates[0];
-    let result = format!(
-        "auto-closed: branch '{}' merged (status at close: {})",
-        branch, task.status
-    );
-    // M4: use system:auto_close identity (in ACL allow-list) through
-    // tasks::handle() to get state-machine validation + proper ACL.
-    let resp = crate::tasks::handle(
-        home,
-        "system:auto_close",
-        &serde_json::json!({
-            "action": "done",
-            "id": task.id,
-            "result": result,
-            "done_source": {
-                "via": "AutoCloseOnPrMerge",
-                "branch": branch,
-                "merged_at": chrono::Utc::now().to_rfc3339(),
-            },
-        }),
-    );
-    if resp.get("error").is_some() {
-        tracing::warn!(task_id = %task.id, resp = %resp, "auto-close via handle() failed");
+    let candidates = if structured.is_empty() {
+        let fallback: Vec<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.status == TaskStatus::Verified
+                    && (contains_as_token(&t.description, branch)
+                        || contains_as_token(&t.title, branch))
+            })
+            .collect();
+        if fallback.len() > 1 {
+            let ids: Vec<_> = fallback.iter().map(|t| t.id.as_str()).collect();
+            tracing::warn!(
+                branch,
+                count = fallback.len(),
+                ?ids,
+                "ambiguous text branch→task match, skipping auto-close"
+            );
+            return;
+        }
+        fallback
     } else {
-        tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
+        structured
+    };
+
+    for task in candidates {
+        let result = format!(
+            "auto-closed: branch '{}' merged (status at close: {})",
+            branch, task.status
+        );
+        // M4: use system:auto_close identity (in ACL allow-list) through
+        // tasks::handle() to get state-machine validation + proper ACL.
+        let resp = crate::tasks::handle(
+            home,
+            "system:auto_close",
+            &serde_json::json!({
+                "action": "done",
+                "id": task.id,
+                "result": result,
+                "done_source": {
+                    "via": "AutoCloseOnPrMerge",
+                    "branch": branch,
+                    "merged_at": chrono::Utc::now().to_rfc3339(),
+                },
+            }),
+        );
+        if resp.get("error").is_some() {
+            tracing::warn!(task_id = %task.id, resp = %resp, "auto-close via handle() failed");
+        } else {
+            tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
+        }
     }
 }
 

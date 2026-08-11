@@ -328,6 +328,41 @@ fn upsert_hygiene(home: &Path, key: String, title: String, evidence: serde_json:
     }
 }
 
+const CLEANUP_INTENT_HYGIENE_AGE: chrono::Duration = chrono::Duration::hours(24);
+
+fn surface_aged_preserved_review_intents(
+    home: &Path,
+    aged: &[crate::cleanup_intents::CleanupIntent],
+    result: &crate::cleanup_intents::ReconcileResult,
+) {
+    for candidate in result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.outcome.starts_with("preserved:"))
+    {
+        let Some(intent) = aged.iter().find(|intent| {
+            intent.branch == candidate.branch
+                && intent.task_id == candidate.task_id
+                && intent.expected_head == candidate.expected_head
+        }) else {
+            continue;
+        };
+        upsert_hygiene(
+            home,
+            format!("cleanup-intent-preserved:{}", candidate.candidate_id),
+            format!("[hygiene] cleanup intent still blocked: {}", intent.branch),
+            serde_json::json!({
+                "repo": intent.repo,
+                "branch": intent.branch,
+                "expected_head": intent.expected_head,
+                "task_id": intent.task_id,
+                "created_at": intent.created_at,
+                "reason": candidate.outcome,
+            }),
+        );
+    }
+}
+
 pub fn sweep_from_registry(
     home: &Path,
     configs: &HashMap<String, Option<PathBuf>>,
@@ -367,7 +402,14 @@ pub fn sweep_from_registry(
         }
     }
 
-    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
+    crate::cleanup_intents::reconcile_merged_subject_tasks(home);
+    let aged_review_intents = crate::cleanup_intents::aged_review_intents(
+        home,
+        chrono::Utc::now(),
+        CLEANUP_INTENT_HYGIENE_AGE,
+    );
+    let review_reconcile = crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
+    surface_aged_preserved_review_intents(home, &aged_review_intents, &review_reconcile);
 
     let mut removed = Vec::new();
 
@@ -580,6 +622,12 @@ pub(crate) const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 *
 /// worktree-occupancy check regardless of age.
 const REVIEW_SCAFFOLD_TTL: Duration = Duration::from_secs(72 * 60 * 60);
 
+/// Generic unmerged branches receive a much longer grace period than review
+/// scaffolding. Once this expires they may be retired only after the normal
+/// task/binding/PR gates pass and a durable recovery ref protects the tip.
+const STALE_IDLE_BRANCH_TTL: Duration =
+    Duration::from_secs(crate::branch_sweep::STALE_IDLE_DEFAULT_DAYS as u64 * 24 * 60 * 60);
+
 /// #1750-B3/#P1-2607: `branch`'s tip SHA + committer-date unix timestamp, in
 /// ONE `git log` call (`%H%x09%ct`) — was two separate concerns (a `rev-parse`
 /// for the SHA, a `log --format=%ct` for the age) collapsed into one spawn,
@@ -614,6 +662,35 @@ fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
     Duration::from_secs(now.saturating_sub(tip_ts)) >= REVIEW_SCAFFOLD_TTL
 }
 
+fn is_stale_idle_branch(repo_root: &Path, branch: &str) -> bool {
+    if crate::branch_sweep::is_reviewer_checkout(branch) {
+        return false;
+    }
+    let Some((_, tip_ts)) = branch_tip_info(repo_root, branch) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Duration::from_secs(now.saturating_sub(tip_ts)) >= STALE_IDLE_BRANCH_TTL
+}
+
+fn delete_branch_ref_cas(repo_root: &Path, branch: &str, expected_tip: &str) -> Result<(), String> {
+    let full_ref = format!("refs/heads/{branch}");
+    let output =
+        crate::git_helpers::git_bypass(repo_root, &["update-ref", "-d", &full_ref, expected_tip])
+            .map_err(|error| format!("delete branch ref '{branch}' failed: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "delete branch ref '{branch}' failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 /// PR-D·D3: the branch-reap decision, delegated to the shared
 /// [`crate::worktree::disposition::branch_disposition`] classifier (L4). The
 /// SHARED "provably in default → delete" fail-direction lives in the classifier;
@@ -625,13 +702,11 @@ fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
 /// - `remote_gone` alone → `BranchSignal::RemoteGoneOnly → KeepBranch`
 ///   (CR-2026-06-14: remote-gone is NEVER an independent delete trigger — the
 ///   branch may hold committed-but-unpushed local work).
-/// - `scaffold_ttl` is a review-scaffold branch that is `NotMerged` (the classifier
-///   KEEPS it) but has aged past its TTL — an EXPLICIT external arm reproduces the
-///   reap the classifier can't model. Same shape as D2's #2010 `reviewer_bypass`:
-///   an override the pure classifier deliberately does not encode, kept outside so
-///   the delegation stays honest. Locked byte-for-byte by
+/// - `recoverable_ttl` is an aged review-scaffold or generic stale-idle branch
+///   that is `NotMerged` but has a durable recovery-ref path. It is an explicit
+///   external arm the pure classifier deliberately does not encode. Locked by
 ///   [`tests::branch_reap_delete_equals_pre_d3_gate`].
-fn branch_reap_delete(provably_in_default: bool, remote_gone: bool, scaffold_ttl: bool) -> bool {
+fn branch_reap_delete(provably_in_default: bool, remote_gone: bool, recoverable_ttl: bool) -> bool {
     use crate::worktree::disposition::{branch_disposition, BranchDisposition, BranchSignal};
     let signal = if provably_in_default {
         BranchSignal::ProvablyInDefault
@@ -640,7 +715,7 @@ fn branch_reap_delete(provably_in_default: bool, remote_gone: bool, scaffold_ttl
     } else {
         BranchSignal::NotMerged
     };
-    matches!(branch_disposition(signal), BranchDisposition::DeleteBranch) || scaffold_ttl
+    matches!(branch_disposition(signal), BranchDisposition::DeleteBranch) || recoverable_ttl
 }
 
 /// #P1-2607: process-wide cache of the STRUCTURAL squash-merged check (git
@@ -868,16 +943,19 @@ fn prune_orphaned_branches_with_home(
         // so the merged/squash paths never reap them — a TTL is their only live
         // terminal path (H1 in the RCA).
         let scaffold = !merged && !squash && is_stale_review_scaffold(repo_root, branch);
+        let stale_idle = !merged && !squash && !scaffold && is_stale_idle_branch(repo_root, branch);
         let provenance = if merged {
             crate::worktree::disposition::BranchProvenance::Merged
         } else if squash {
             crate::worktree::disposition::BranchProvenance::SquashMerged
         } else if scaffold {
             crate::worktree::disposition::BranchProvenance::ReviewerResidue
+        } else if stale_idle {
+            crate::worktree::disposition::BranchProvenance::StaleIdle
         } else {
             crate::worktree::disposition::BranchProvenance::Unknown
         };
-        let terminal = merged || squash || scaffold;
+        let terminal = merged || squash || scaffold || stale_idle;
         // #3011: a NON-terminal candidate is already a Keep — `branch_lifecycle_disposition`
         // returns Keep on `!terminal` before it reads task/holder/PR evidence
         // (worktree/disposition.rs:151-161) — so the strict task-ledger replay and the
@@ -905,7 +983,7 @@ fn prune_orphaned_branches_with_home(
             (false, Some(false)) => Some(false),
             _ => None,
         };
-        let open_pr = if merged || squash || scaffold {
+        let open_pr = if terminal {
             match open_pr_snapshot.status_for(branch) {
                 crate::branch_sweep::OpenPrStatus::Open => Some(true),
                 crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
@@ -923,63 +1001,120 @@ fn prune_orphaned_branches_with_home(
                 active_holder,
                 task_active,
                 open_pr,
-                // Reviewer residue is snapshotted into a recovery ref before
-                // deletion below; merged/squash work is already in `default`.
+                // TTL-retired branches are snapshotted into a recovery ref
+                // before deletion below; merged/squash work is already in
+                // `default`.
                 unique_unpreserved_work: Some(false),
             },
         );
         // PR-D·D3: the reap decision (L4) delegates to `branch_disposition` via
         // `branch_reap_delete`. `merged || squash` = ProvablyInDefault → delete;
-        // `scaffold` is the explicit external-arm override (a NotMerged branch the
-        // classifier keeps, aged past its TTL). Phase-2 does not compute remote-gone
-        // (CR-2026-06-14 dropped it as a trigger) → remote_gone=false. Byte-identical
-        // to the prior `!merged && !squash && !scaffold` continue-gate.
-        if !branch_reap_delete(merged || squash, false, scaffold)
-            || !matches!(
-                lifecycle,
-                crate::worktree::disposition::BranchLifecycleDisposition::Delete
-            )
-        {
+        // `scaffold || stale_idle` is the explicit recovery-ref-backed TTL arm.
+        // Phase-2 does not compute remote-gone (CR-2026-06-14 dropped it as a
+        // trigger) → remote_gone=false.
+        let reap_eligible = branch_reap_delete(merged || squash, false, scaffold || stale_idle);
+        let lifecycle_delete = matches!(
+            lifecycle,
+            crate::worktree::disposition::BranchLifecycleDisposition::Delete
+        );
+        if reap_eligible && !lifecycle_delete && !dry_run {
+            if let Some(home) = home {
+                upsert_hygiene(
+                    home,
+                    format!("residue-lifecycle-blocked:{}:{branch}", repo_root.display()),
+                    format!("[hygiene] branch cleanup blocked: {branch}"),
+                    serde_json::json!({
+                        "repo": repo_root.display().to_string(),
+                        "branch": branch,
+                        "provenance": format!("{provenance:?}"),
+                        "active_holder": active_holder,
+                        "task_active": task_active,
+                        "open_pr": open_pr,
+                    }),
+                );
+            }
+        }
+        if !reap_eligible || !lifecycle_delete {
             continue;
         }
-        // The scaffolding path never merged, so its commits survive only in the
-        // object store once the branch ref is gone — capture the tip SHA BEFORE
-        // deletion so the log keeps them recoverable.
-        let scaffold_tip = if scaffold {
+        // TTL paths never merged, so protect their exact tip before deleting
+        // the ordinary branch ref.
+        let recoverable_tip = if scaffold || stale_idle {
             branch_tip_info(repo_root, branch).map(|(sha, _)| sha)
         } else {
             None
         };
-        if scaffold && !dry_run {
-            if let Some(tip) = scaffold_tip.as_deref() {
-                if crate::branch_sweep::prepare_branch_recovery(
+        if (scaffold || stale_idle) && !dry_run {
+            if let Some(tip) = recoverable_tip.as_deref() {
+                if let Err(error) = crate::branch_sweep::prepare_branch_recovery(
                     home,
                     repo_root,
                     branch,
                     tip,
-                    "review-scaffold-ttl",
-                )
-                .is_err()
-                {
+                    if scaffold {
+                        "review-scaffold-ttl"
+                    } else {
+                        "stale-idle-ttl"
+                    },
+                ) {
+                    if let Some(home) = home {
+                        upsert_hygiene(
+                            home,
+                            format!("residue-recovery-failed:{}:{branch}", repo_root.display()),
+                            format!("[hygiene] branch recovery preparation failed: {branch}"),
+                            serde_json::json!({
+                                "repo": repo_root.display().to_string(),
+                                "branch": branch,
+                                "tip": tip,
+                                "reason": error,
+                            }),
+                        );
+                    }
                     continue;
                 }
             } else {
                 continue;
             }
         }
-        let ok = dry_run || crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
+        let deletion = if dry_run {
+            Ok(())
+        } else if let Some(tip) = recoverable_tip.as_deref() {
+            delete_branch_ref_cas(repo_root, branch, tip)
+        } else {
+            crate::git_helpers::git_cmd(repo_root, &["branch", "-D", branch])
+                .map(|_| ())
+                .map_err(|error| format!("delete branch '{branch}' failed: {error}"))
+        };
+        let ok = deletion.is_ok();
+        if let Err(error) = deletion {
+            if let Some(home) = home {
+                upsert_hygiene(
+                    home,
+                    format!("residue-delete-failed:{}:{branch}", repo_root.display()),
+                    format!("[hygiene] branch ref deletion failed: {branch}"),
+                    serde_json::json!({
+                        "repo": repo_root.display().to_string(),
+                        "branch": branch,
+                        "expected_tip": recoverable_tip,
+                        "reason": error,
+                    }),
+                );
+            }
+        }
         if ok {
             let reason = if merged {
                 "merged"
             } else if squash {
                 "squash-merged"
+            } else if stale_idle {
+                "stale-idle-ttl"
             } else {
                 "review-scaffold-ttl"
             };
             if dry_run {
-                tracing::info!(branch, reason, tip_sha = ?scaffold_tip, "would prune orphaned branch (dry-run)");
+                tracing::info!(branch, reason, tip_sha = ?recoverable_tip, "would prune orphaned branch (dry-run)");
             } else {
-                tracing::info!(branch, reason, tip_sha = ?scaffold_tip, "pruned orphaned branch");
+                tracing::info!(branch, reason, tip_sha = ?recoverable_tip, "pruned orphaned branch");
             }
             pruned.push((branch.clone(), reason));
         }

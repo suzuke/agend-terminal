@@ -25,6 +25,67 @@ pub(crate) struct CleanupIntent {
     pub pr_number: Option<u64>,
 }
 
+pub(crate) fn aged_review_intents(
+    home: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    min_age: chrono::Duration,
+) -> Vec<CleanupIntent> {
+    let entries = match std::fs::read_dir(intents_dir(home)) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|body| serde_json::from_str::<CleanupIntent>(&body).ok())
+        .filter(|intent| intent.branch.starts_with("review/"))
+        .filter(|intent| {
+            chrono::DateTime::parse_from_rfc3339(&intent.created_at)
+                .map(|created| now.signed_duration_since(created.with_timezone(&chrono::Utc)))
+                .is_ok_and(|age| age >= min_age)
+        })
+        .collect()
+}
+
+/// Retry the event-driven merged-branch task close from durable review intents.
+/// A merge observation can be missed, and older code also skipped every task
+/// when several exact structured links shared one branch. Review intents retain
+/// enough repo + task identity to heal that state on the periodic sweep.
+pub(crate) fn reconcile_merged_subject_tasks(home: &Path) {
+    let entries = match std::fs::read_dir(intents_dir(home)) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let mut checked = std::collections::HashSet::new();
+    for intent in entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|body| serde_json::from_str::<CleanupIntent>(&body).ok())
+        .filter(|intent| intent.branch.starts_with("review/"))
+    {
+        let Ok(task) = crate::tasks::load_routed(home, &intent.task_id) else {
+            continue;
+        };
+        if review_task_terminal(&task.record().status) {
+            continue;
+        }
+        let Some(subject_branch) = task.record().branch.as_deref() else {
+            continue;
+        };
+        let repo = Path::new(&intent.repo);
+        if !repo.is_dir() || !checked.insert((intent.repo.clone(), subject_branch.to_string())) {
+            continue;
+        }
+        let default = crate::git_helpers::default_branch(repo);
+        if matches!(
+            crate::branch_sweep::pr_merge_status(repo, &default, subject_branch),
+            crate::branch_sweep::PrMergeStatus::Merged
+        ) {
+            crate::status_summary::auto_close_merged_tasks(home, subject_branch);
+        }
+    }
+}
+
 pub(crate) fn persist_intent(
     home: &Path,
     repo: &str,
@@ -359,6 +420,15 @@ pub(crate) struct ReconcileResult {
     pub preserved: usize,
 }
 
+fn review_task_terminal(status: &crate::task_events::TaskStatus) -> bool {
+    matches!(
+        status,
+        crate::task_events::TaskStatus::Done
+            | crate::task_events::TaskStatus::Cancelled
+            | crate::task_events::TaskStatus::Verified
+    )
+}
+
 fn is_branch_checked_out(repo: &Path, branch: &str) -> bool {
     let output = match crate::git_helpers::git_bypass(repo, &["worktree", "list", "--porcelain"]) {
         Ok(o) if o.status.success() => o,
@@ -417,10 +487,7 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
         }
 
         let task_terminal = match crate::tasks::load_routed(home, &intent.task_id) {
-            Ok(rt) => matches!(
-                rt.record().status,
-                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Verified
-            ),
+            Ok(rt) => review_task_terminal(&rt.record().status),
             Err(_) => false,
         };
         if !task_terminal {
@@ -568,12 +635,7 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
 
         // Re-verify task terminal under lock.
         let still_terminal = crate::tasks::load_routed(home, &re_intent.task_id)
-            .map(|rt| {
-                matches!(
-                    rt.record().status,
-                    crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Verified
-                )
-            })
+            .map(|rt| review_task_terminal(&rt.record().status))
             .unwrap_or(false);
         if !still_terminal {
             result.preserved += 1;
