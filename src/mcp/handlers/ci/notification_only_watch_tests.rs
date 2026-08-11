@@ -599,14 +599,14 @@ fn notification_only_non_protected_ref_rejected() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// Empty/operator caller must not bypass notification_only assignee authority.
+/// Empty/operator caller must be rejected before receipt discovery so the
+/// authority result cannot depend on whether a receipt exists.
 #[test]
 fn notification_only_empty_caller_rejected() {
     let home = tmp_home("empty-caller");
     seed_fleet(&home, &["dev"]);
     let sha = "b".repeat(40);
     seed_binding(&home, "dev", "t-ec");
-    seed_receipt(&home, REPO, &sha, "t-ec", "dev");
     let r = handle_watch_ci(
         &home,
         &json!({
