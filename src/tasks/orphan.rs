@@ -235,8 +235,10 @@ fn has_exact_signed_task_lease(home: &Path, task: &crate::task_events::TaskRecor
     };
     let value = match crate::binding::guarded_binding_disk_fresh(home, owner) {
         crate::binding::GuardedBinding::Known { value, .. } => value,
-        crate::binding::GuardedBinding::Absent | crate::binding::GuardedBinding::Opaque(_) => {
-            return false;
+        crate::binding::GuardedBinding::Absent => return false,
+        crate::binding::GuardedBinding::Opaque(reason) => {
+            tracing::warn!(%owner, task_id = %task.id.0, %reason, "boot orphan sweep: binding state opaque — preserving task");
+            return true;
         }
     };
     crate::binding::signature_valid(home, owner)
