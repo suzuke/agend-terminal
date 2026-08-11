@@ -627,6 +627,66 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A signed binding that names the exact owner + task is a durable work lease.
+/// A daemon restart must not make that task re-dispatchable merely because the
+/// in-memory registry has not been rebuilt yet.
+#[test]
+fn release_inprogress_orphans_preserves_exact_signed_binding() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("release_inprogress_signed_binding");
+    let emitter = InstanceName::from("test:seed");
+    let tid = TaskId("t-bound-live-1".into());
+    let worker = InstanceName::from("dev-impl-1");
+    crate::task_events::append_batch(
+        &home,
+        &emitter,
+        vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "durably leased across restart".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(worker.clone()),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/live".into()),
+                bind: Some(true),
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: worker.clone(),
+            },
+            TaskEvent::InProgress {
+                task_id: tid.clone(),
+                by: worker.clone(),
+            },
+        ],
+    )
+    .expect("seed in_progress task");
+    crate::binding::bind(&home, worker.0.as_str(), tid.0.as_str(), "feat/live");
+    assert!(
+        crate::binding::signature_valid(&home, worker.0.as_str()),
+        "test precondition: binding has a valid HMAC sidecar"
+    );
+
+    let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
+    assert!(
+        released.is_empty(),
+        "an exact signed durable binding must prevent release"
+    );
+
+    let post = crate::task_events::replay(&home).expect("post replay");
+    let post_rec = post.tasks.get(&tid).expect("task still present");
+    assert_eq!(post_rec.status, TaskStatus::InProgress);
+    assert_eq!(post_rec.owner.as_ref(), Some(&worker));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn can_mutate_task_assignee_match() {
     let home = tmp_home("can_mutate_assignee");
