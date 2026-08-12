@@ -89,7 +89,7 @@ Drain 或管理 caller 的 durable inbox。
 
 - 不帶參數會 drain unread 訊息並標為 `delivering`；此時尚未標為 processed。回傳 row 包含 durable `delivery_count` 與 `first_delivered_at`；redelivery 也會在 production response 的 `redelivery_history` array 顯示 message id 與首次投遞時間，但不改變 canonical identity/text。
 - `message_id` 描述單一訊息；`thread_id` 取得 thread。可選 `instance` 可限定已授權查詢範圍。
-- `action:"ack"` 可確認目前 delivering 的單一 `message_id`；若 row 曾被投遞後 reclaim/requeue，只有 durable 歷史證明曾投遞時 targeted ack 才會成功。省略 ID 時只確認整批目前 in-flight batch，不會誤確認從未投遞的 unread row；回應會區分 `acked-after-reclaim`、`never-delivered` 與 `already-processed`。
+- `action:"ack"` 可確認目前 delivering 的單一 `message_id`；若 row 曾被投遞後 reclaim/requeue，只有 durable 歷史證明曾投遞時 targeted ack 才會成功。省略 ID 時只確認整批目前 in-flight batch，不會誤確認從未投遞的 unread row；回應會區分 `acked-after-reclaim`、`never-delivered` 與 `already-processed`。Storage 失敗會明確回傳 `outcome:"error"` 與 `code:"inbox_ack_failed"`，不會被當成 `no-delivering-rows`。
 - `action:"clear"` 精簡清除非 obligation 訊息，未回答的 query/task 仍維持 unread，並列在 `requires_response`。
 - `action:"discharge"` 需要 `message_id` 與非空 `reason`；它會在不回答的情況下關閉 channel-reply obligation，並通知 operator。
 - 再次 drain 會隱式 ack 前一批 delivery；未確認的 batch 約十分鐘後可能被 reclaim 並重新投遞。Fresh session reset 也會重新排入未確認 row，交由 successor recovery。這取代 #159 舊 settle rationale：寫入 `read_at` 雖能隱藏 stale delivery，卻可能靜默遺失未確認訊息。
