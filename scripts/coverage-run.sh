@@ -58,6 +58,7 @@ named_corrupt_paths() {
     [ -f "$log" ] || return 0
     grep -Ei 'invalid instrumentation profile data|malformed instrumentation|truncated profile data|raw profile' "$log" 2>/dev/null |
         grep -oE '[^[:space:]]+\.profraw' |
+        sed -e 's/^["'"'"']*//' |
         awk '!seen[$0]++'
 }
 
@@ -72,27 +73,46 @@ module_token() {
     printf '%s' "$1" | sed -nE 's/.*-([0-9]+)_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
 }
 
+# Resolve a producer-named token to a path. Absolute stays absolute; a bare
+# relative name resolves against the profile directory (llvm-profdata prints
+# either form). A token containing `..` is never followed — reporting a path is
+# not a licence to read outside the profile directory.
+resolve_named_path() {
+    case "$1" in
+        *..*) printf '' ;;
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$profile_dir" "$1" ;;
+    esac
+}
+
 describe_named_corrupt() {
-    local path="$1" base exists size header mtime in_response list
-    base="$(basename "$path")"
-    if [ -e "$path" ]; then
+    local token="$1" base path exists size header mtime in_response list entry
+    base="${token##*/}"
+    path="$(resolve_named_path "$token")"
+    if [ -n "$path" ] && [ -e "$path" ]; then
         exists=yes
         size="$(wc -c <"$path" | tr -d ' ')"
         header="$(od -An -tx1 -N8 <"$path" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
         mtime="$(file_mtime "$path")"
     else
-        exists=no
+        if [ -z "$path" ]; then exists=out-of-scope; else exists=no; fi
         size=n/a
         header=n/a
         mtime=n/a
     fi
+    # Exact basename equality — a substring test would call foo.profraw a member
+    # because the response file happens to list otherfoo.profraw.
     in_response=no
     for list in "$profile_dir"/*-profraw-list; do
         [ -e "$list" ] || continue
-        if grep -Fq "$base" "$list"; then
-            in_response=yes
-            break
-        fi
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            if [ "${entry##*/}" = "$base" ]; then
+                in_response=yes
+                break
+            fi
+        done <"$list"
+        [ "$in_response" = yes ] && break
     done
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
         "$base" "$exists" "$in_response" "$size" "$header" "$mtime" "$(module_token "$base")"
