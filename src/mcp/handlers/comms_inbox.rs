@@ -260,6 +260,68 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #3228: the real MCP ack entry point must preserve an unread row when
+    /// durable history proves it has never been delivered.
+    #[test]
+    fn targeted_ack_never_delivered_reports_safe_noop_3228() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-never-delivered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-3228-never-delivered".into()),
+                from: "lead".into(),
+                text: "must remain unread".into(),
+                kind: Some("query".into()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let result = handle_inbox_ack(
+            &home,
+            &json!({"message_id": "m-3228-never-delivered"}),
+            agent,
+        );
+        assert_eq!(result["acked"], 0);
+        assert_eq!(result["outcome"], "never-delivered");
+        let stored = crate::inbox::find_message(&home, "m-3228-never-delivered").unwrap();
+        assert!(stored.read_at.is_none());
+        assert_eq!(stored.delivery_count, 0);
+        assert_eq!(crate::inbox::drain(&home, agent).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Storage failures must remain distinguishable from a benign empty inbox.
+    #[test]
+    fn ack_storage_failure_is_error_response_3228() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-ack-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(home.join("inbox/agent1.jsonl")).unwrap();
+
+        let result = handle_inbox_ack(&home, &json!({"message_id": "m-3228-failure"}), "agent1");
+        assert_eq!(result["acked"], 0);
+        assert_eq!(result["outcome"], "error");
+        assert_eq!(result["code"], "inbox_ack_failed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #3228: the production inbox response, rather than a dead formatter,
     /// must make durable redelivery history visible without changing the
     /// canonical stored message identity or text.
