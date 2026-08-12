@@ -334,9 +334,16 @@ jobs:
         with:
           tool: cargo-audit
       - name: Cargo audit gate
+        id: cargo_audit_gate
         run: cargo audit
+      # This reporter owns a second cargo-audit invocation; the duplicate
+      # install/scan cost is accepted for UI reporting and does not alter the
+      # authoritative gate above.
       - name: RustSec advisory report
-        if: always()
+        if: >-
+          !cancelled() &&
+          (steps.cargo_audit_gate.outcome == 'success' ||
+          steps.cargo_audit_gate.outcome == 'failure')
         continue-on-error: true
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:

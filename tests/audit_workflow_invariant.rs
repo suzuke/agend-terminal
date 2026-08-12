@@ -1,11 +1,27 @@
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const AUDIT_CONFIG: &str = include_str!("../.cargo/audit.toml");
 
-fn audit_job() -> &'static str {
-    CI_WORKFLOW
+fn audit_job_from(workflow: &str) -> String {
+    let normalized = workflow.replace("\r\n", "\n");
+    normalized
         .split_once("\n  audit:\n")
         .and_then(|(_, rest)| rest.split_once("\n  coverage:\n"))
-        .map(|(job, _)| job)
+        .map(|(job, _)| job.to_owned())
         .expect("ci workflow must contain the audit and coverage jobs")
+}
+
+fn audit_job() -> String {
+    audit_job_from(CI_WORKFLOW)
+}
+
+#[test]
+fn workflow_matching_normalizes_crlf() {
+    let crlf_workflow = CI_WORKFLOW.replace("\r\n", "\n").replace('\n', "\r\n");
+    let job = audit_job_from(&crlf_workflow);
+    assert!(
+        job.contains("run: cargo audit\n"),
+        "CRLF workflow input must be normalized before matching"
+    );
 }
 
 #[test]
@@ -30,22 +46,32 @@ fn audit_gate_is_separate_from_best_effort_reporting() {
         "the standalone gate must use plain cargo audit"
     );
     assert!(
+        gate.contains("id: cargo_audit_gate\n"),
+        "the authoritative gate must expose a stable step id"
+    );
+    assert!(
+        !gate.contains("if:") && !gate.contains("continue-on-error:"),
+        "the authoritative gate must not be conditional or non-fatal"
+    );
+    assert!(
         !gate.contains("rustsec/audit-check"),
         "the authoritative gate must not be coupled to the reporting action"
     );
 
     let reporter = &job[report_start..];
     assert!(
-        reporter.contains("if: always()\n"),
-        "reporting must still be attempted after an audit result"
+        reporter.contains(
+            "if: >-\n          !cancelled() &&\n          (steps.cargo_audit_gate.outcome == 'success' ||\n          steps.cargo_audit_gate.outcome == 'failure')\n"
+        ),
+        "reporting must run only after an actual gate success/failure and not cancellation"
     );
     assert!(
         reporter.contains("continue-on-error: true\n"),
         "reporting failure must not change the authoritative audit result"
     );
     assert!(
-        reporter.contains("uses: rustsec/audit-check@"),
-        "the RustSec UI reporter must remain present"
+        reporter.contains("uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998\n"),
+        "the RustSec UI reporter must remain present at its exact reviewed SHA"
     );
     assert!(
         reporter.contains("The preceding plain `cargo audit` step is authoritative for the\n"),
@@ -58,5 +84,22 @@ fn audit_gate_is_separate_from_best_effort_reporting() {
     assert!(
         job.contains("uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026\n"),
         "cargo-audit installer must be pinned to an exact reviewed commit"
+    );
+}
+
+#[test]
+fn audit_config_documents_local_and_ci_authority() {
+    let config = AUDIT_CONFIG.replace("\n# ", " ");
+    assert!(
+        config.contains("local and authoritative CI `cargo audit` runs"),
+        "audit policy must document both local and authoritative CI cargo audit"
+    );
+    assert!(
+        config.contains("CI audit gate invokes `cargo audit` directly and reads this file"),
+        "audit policy must document that the CI gate reads this config"
+    );
+    assert!(
+        !config.contains("LOCAL `cargo audit` runs"),
+        "audit policy must not claim it is local-only"
     );
 }
