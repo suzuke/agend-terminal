@@ -15,6 +15,7 @@ pub(crate) const WORKTREE_COMPONENT_MAX_UNITS: usize =
 pub(crate) struct WorktreeTarget {
     pub path: PathBuf,
     pub mangled: String,
+    pub legacy: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,38 +33,70 @@ impl WorktreeTargetError {
     }
 
     pub(crate) fn into_response(self) -> Value {
+        let code = self.code();
         match self {
             Self::PathBudget {
                 path_units,
                 max_units,
             } => json!({
                 "error": "checkout worktree path exceeds the safe Git path budget",
-                "code": "worktree_path_budget",
+                "code": code,
                 "stage": "preflight",
                 "path_units": path_units,
                 "max_path_units": max_units,
             }),
             Self::IdentityConflict => json!({
                 "error": "legacy and bounded checkout worktree identities both exist",
-                "code": "worktree_identity_conflict",
+                "code": code,
                 "stage": "preflight",
             }),
         }
     }
 }
 
-/// Resolve the checkout target. The RED snapshot retains the historical
-/// full-source mangling; the GREEN implementation will replace only the new
-/// target while keeping the legacy candidate for safe adoption.
+/// Resolve the checkout target while preserving an existing legacy identity.
 pub(crate) fn resolve_worktree_target(
     home: &Path,
     instance_name: &str,
     source_path: &str,
 ) -> Result<WorktreeTarget, WorktreeTargetError> {
-    let mangled = legacy_mangled(instance_name, source_path);
+    let legacy_mangled = legacy_mangled(instance_name, source_path);
+    let legacy_path = home.join("worktrees").join(&legacy_mangled);
+    let bounded_mangled = bounded_mangled(instance_name, source_path);
+    let bounded_path = home.join("worktrees").join(&bounded_mangled);
+    let legacy_present = legacy_path.exists() || legacy_journal_exists(home, &legacy_mangled);
+    let bounded_present = bounded_path.exists() || legacy_journal_exists(home, &bounded_mangled);
+
+    if legacy_present && bounded_present && !same_existing_path(&legacy_path, &bounded_path) {
+        return Err(WorktreeTargetError::IdentityConflict);
+    }
+    if legacy_present {
+        return Ok(WorktreeTarget {
+            path: legacy_path,
+            mangled: legacy_mangled,
+            legacy: true,
+        });
+    }
+    if bounded_present {
+        return Ok(WorktreeTarget {
+            path: bounded_path,
+            mangled: bounded_mangled,
+            legacy: false,
+        });
+    }
+
+    let component_units = path_units(Path::new(&bounded_mangled));
+    let path_units = path_units(&bounded_path.join(".git"));
+    if component_units > WORKTREE_COMPONENT_MAX_UNITS || path_units > WORKTREE_GIT_PATH_MAX_UNITS {
+        return Err(WorktreeTargetError::PathBudget {
+            path_units,
+            max_units: WORKTREE_GIT_PATH_MAX_UNITS,
+        });
+    }
     Ok(WorktreeTarget {
-        path: home.join("worktrees").join(&mangled),
-        mangled,
+        path: bounded_path,
+        mangled: bounded_mangled,
+        legacy: false,
     })
 }
 
@@ -72,6 +105,42 @@ fn legacy_mangled(instance_name: &str, source_path: &str) -> String {
         "{instance_name}-{}",
         source_path.replace(['/', '\\', ':'], "_").replace('~', "")
     )
+}
+
+fn bounded_mangled(instance_name: &str, source_path: &str) -> String {
+    let label = Path::new(source_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(REPOSITORY_LABEL_MAX_UNITS)
+        .collect::<String>();
+    let label = if label.is_empty() { "repo" } else { &label };
+    let digest = crate::daemon::utils::sha256_hex(source_path.as_bytes());
+    format!(
+        "{instance_name}-{label}-{}",
+        &digest[..REPOSITORY_DIGEST_HEX_UNITS]
+    )
+}
+
+fn legacy_journal_exists(home: &Path, mangled: &str) -> bool {
+    let key = super::checkout_txn::journal_key(home, mangled);
+    super::checkout_txn::journal_path(home, mangled).exists()
+        || super::checkout_txn::journal_path(home, &key).exists()
+}
+
+fn same_existing_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn path_units(path: &Path) -> usize {
@@ -86,6 +155,7 @@ fn path_units(path: &Path) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -136,7 +206,7 @@ mod tests {
         let home = PathBuf::from(format!("/tmp/{}", "long-home/".repeat(30)));
         let candidate = home
             .join("worktrees")
-            .join("reviewer-_tmp_repo")
+            .join(bounded_mangled("reviewer", "/tmp/repo"))
             .join(".git");
         let candidate_units = path_units(&candidate);
         assert!(
@@ -152,5 +222,69 @@ mod tests {
                 max_units: POLICY_WORKTREE_GIT_PATH_MAX_UNITS,
             }
         );
+    }
+
+    #[test]
+    fn existing_legacy_target_is_adopted() {
+        let home =
+            std::env::temp_dir().join(format!("agend-checkout-path-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let source = "/tmp/project/repo";
+        let legacy = home
+            .join("worktrees")
+            .join(legacy_mangled("reviewer", source));
+        std::fs::create_dir_all(&legacy).unwrap();
+        let target = resolve_worktree_target(&home, "reviewer", source).unwrap();
+        assert!(target.legacy);
+        assert_eq!(target.path, legacy);
+        assert_eq!(target.mangled, legacy_mangled("reviewer", source));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn existing_legacy_journal_is_adopted() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-checkout-path-legacy-journal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let source = "/tmp/project/repo";
+        let mangled = legacy_mangled("reviewer", source);
+        let journal = super::super::checkout_txn::Journal::prepared(
+            "nonce",
+            home.join("worktrees").join(&mangled).display().to_string(),
+            source,
+            "main",
+            false,
+            "2026-01-01T00:00:00Z",
+        );
+        journal.save(&home, &mangled).unwrap();
+        let target = resolve_worktree_target(&home, "reviewer", source).unwrap();
+        assert!(target.legacy);
+        assert_eq!(target.mangled, mangled);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn legacy_and_bounded_targets_conflict_fail_closed() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-checkout-path-conflict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let source = "/tmp/project/repo";
+        let legacy = home
+            .join("worktrees")
+            .join(legacy_mangled("reviewer", source));
+        let bounded = home
+            .join("worktrees")
+            .join(bounded_mangled("reviewer", source));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&bounded).unwrap();
+        assert_eq!(
+            resolve_worktree_target(&home, "reviewer", source),
+            Err(WorktreeTargetError::IdentityConflict)
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

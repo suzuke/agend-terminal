@@ -77,6 +77,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let super::checkout_path::WorktreeTarget {
         path: worktree_dir,
         mangled,
+        ..
     } = target;
     if let Some(e) = validate_expected_head(args, &source_path, branch) {
         return e;
