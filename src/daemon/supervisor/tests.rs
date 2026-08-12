@@ -86,6 +86,31 @@ fn stall_notice_does_not_mistake_no_prefix_build_output_for_a_choice() {
 }
 
 #[test]
+fn stall_notice_anchors_unknown_question_prompt_above_status_noise() {
+    let mut tail = String::from("Apply this patch? (y/n)\n");
+    for idx in 0..12 {
+        tail.push_str(&format!("status line {idx}: waiting for input\n"));
+    }
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Apply this patch? (y/n)"));
+    assert!(!notice.contains("status line 11"));
+}
+
+#[test]
+fn stall_notice_unrecognized_fallback_keeps_identity_and_latest_tail() {
+    let tail = (0..20)
+        .map(|idx| format!("opaque line {idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notice = format_stall_notice("general", &tail, None);
+
+    assert!(notice.contains("opaque line 0"));
+    assert!(notice.contains("opaque line 19"));
+    assert!(!notice.contains("opaque line 1\n"));
+}
+
+#[test]
 fn formatted_stall_notice_survives_common_gate_without_second_omission_marker() {
     let tail = format!(
         "{}\nDangerous operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel",

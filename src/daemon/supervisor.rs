@@ -2093,6 +2093,7 @@ fn summarize_stall_tail(tail: &str) -> String {
             || lower.contains("continue?")
             || lower.contains("overwrite?")
             || lower.contains("replace existing")
+            || line.contains('?')
             || lower.contains("esc to cancel")
             || lower.contains("tab to amend")
             || matches!(first_word, "yes" | "no" | "allow" | "deny")
@@ -2103,7 +2104,11 @@ fn summarize_stall_tail(tail: &str) -> String {
         .filter_map(|(idx, line)| is_action_line(line).then_some(idx))
         .collect();
     let candidate_indices: Vec<usize> = if action_indices.is_empty() {
-        (lines.len().saturating_sub(STALL_REMOTE_TAIL_MAX_LINES)..lines.len()).collect()
+        let mut indices = vec![0];
+        indices.extend(lines.len().saturating_sub(STALL_REMOTE_TAIL_MAX_LINES - 1)..lines.len());
+        indices.sort_unstable();
+        indices.dedup();
+        indices
     } else {
         let first = action_indices[0].saturating_sub(1);
         let last = *action_indices.last().expect("non-empty action indices");
