@@ -1840,6 +1840,58 @@ fn p0x_release_full_via_handle_release_worktree_end_to_end() {
 }
 
 #[test]
+fn p0x_force_dry_run_rejects_before_s2_and_preserves_state_3224() {
+    let home = tmp_home("p0x-force-dry-run-3224");
+    let repo = tmp_repo("p0x-force-dry-run-3224-repo");
+    let lease = lease_bound(&home, &repo, "agent-force-dry", "feat/keep");
+    let binding_path = crate::paths::binding_path(&home, "agent-force-dry");
+    let binding_before = std::fs::read(&binding_path).expect("binding before release");
+    let metadata_before = worktree_list(&repo);
+
+    for attempt in 0..2 {
+        let result = crate::mcp::handlers::worktree_test_release(
+            &home,
+            &serde_json::json!({
+                "instance": "agent-force-dry",
+                "branch": "feat/keep",
+                "force": true,
+                "dry_run": true
+            }),
+        );
+        assert_eq!(
+            result["code"].as_str(),
+            Some("dry_run_unsupported"),
+            "attempt {attempt} must reject force+dry_run: {result}"
+        );
+        assert_eq!(result["released"].as_bool(), Some(false), "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("binding_state")),
+            "error must point callers to binding_state: {result}"
+        );
+        assert!(
+            lease.path.exists(),
+            "attempt {attempt} must preserve the worktree: {}",
+            lease.path.display()
+        );
+        assert_eq!(
+            std::fs::read(&binding_path).expect("binding after release"),
+            binding_before,
+            "attempt {attempt} must preserve binding evidence"
+        );
+        assert_eq!(
+            worktree_list(&repo),
+            metadata_before,
+            "attempt {attempt} must preserve exact Git worktree metadata"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn is_daemon_managed_excludes_human_worktrees() {
     let dir = tmp_home("human-wt");
     // No marker → not managed.

@@ -292,6 +292,14 @@ fn handle_release_worktree_force(
         });
     }
 
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        return json!({
+            "released": false,
+            "error": "release_worktree(force:true) does not support dry_run; use binding_state to inspect the authoritative binding",
+            "code": "dry_run_unsupported"
+        });
+    }
+
     // #826: optional operator-supplied `repository_path` arg. When present,
     // L2 GC skips enumeration and goes straight to the named repo.
     let source_repo_hint = args["repository_path"]
