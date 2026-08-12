@@ -75,9 +75,12 @@ escape_field() {
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
     # Anything still a control byte (ESC, BEL, VT, …) cannot be rendered
-    # faithfully on one line and is not a path character worth preserving.
+    # faithfully on one line and is not a path character worth preserving. It
+    # becomes `\?`, not `?`: backslash is already escaped above, so `\?` can
+    # only mean "a control byte was here" while a literal `?` — legal in a
+    # path — stays itself. A bare `?` would be indistinguishable from both.
     case "$s" in
-        *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C tr '[:cntrl:]' '?')" ;;
+        *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C sed 's/[[:cntrl:]]/\\?/g')" ;;
     esac
     printf '%s' "$s"
 }
@@ -346,7 +349,9 @@ response_contains_path() {
                 printf 'yes'
                 return 0
             fi
-        done <"$list"
+        # Grouped: an unreadable response file must not report its own path
+        # into the evidence block through the shell's redirection error.
+        done 2>/dev/null <"$list"
     done
     printf 'no'
 }
@@ -444,30 +449,52 @@ EOF
     # `member:` record. `awk END{NR}` rather than `wc -l`: a response file is not
     # guaranteed a trailing newline, and `wc -l` counts newlines, so a single
     # unterminated entry was reported as zero.
-    local list line
+    # EVERY open below is grouped with its own `2>/dev/null`. A redirection
+    # that fails is reported by the shell itself, on the live stderr, carrying
+    # the path unframed — the `exec` defect, repeated once per read command.
+    # And a read that did not happen reports `n/a`: an empty field is a
+    # fabricated fact, which is the rule the named route already follows.
+    local list line count
     for list in "$profile_dir"/*-profraw-list; do
         [ -e "$list" ] || continue
-        printf 'response_file=%s lines=%s\n' \
-            "$(escape_field "$list")" "$(awk 'END{print NR}' <"$list")"
+        count="$( { awk 'END{print NR}' <"$list"; } 2>/dev/null )"
+        case "$count" in
+            '' | *[!0-9]*) count=n/a ;;
+        esac
+        printf 'response_file=%s lines=%s\n' "$(escape_field "$list")" "$count"
         # A pipeline, not process substitution: nothing here mutates state that
         # has to survive the subshell, and `< <(…)` needs a working /dev/fd,
         # which is exactly what this script has already been bitten by.
-        head -n "$diag_max_files" "$list" |
+        { head -n "$diag_max_files" <"$list"; } 2>/dev/null |
             while IFS= read -r line || [ -n "$line" ]; do
                 printf '  response_line=%s\n' "$(escape_field "$line")"
             done
+        # The profraw survey discloses its cap; this must too, or `lines=` and
+        # the fragments below it disagree with no explanation.
+        if [ "$count" != "n/a" ] && [ "$count" -gt "$diag_max_files" ]; then
+            printf '  … more response lines not shown (cap=%s)\n' "$diag_max_files"
+        fi
     done
-    local shown=0 f
+    local shown=0 f fsize fheader
     for f in "$profile_dir"/*.profraw; do
         [ -e "$f" ] || continue
         if [ "$shown" -ge "$diag_max_files" ]; then
             echo "  … more profraw files not shown (cap=$diag_max_files)"
             break
         fi
+        fsize="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
+        case "$fsize" in
+            '' | *[!0-9]*)
+                fsize=n/a
+                fheader=n/a
+                ;;
+            *)
+                fheader="$( { od -An -tx1 -N8 <"$f"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+                [ -n "$fheader" ] || fheader=n/a
+                ;;
+        esac
         printf '  file=%s size_bytes=%s header=%s\n' \
-            "$(escape_field "$(basename "$f")")" \
-            "$(wc -c <"$f" | tr -d ' ')" \
-            "$(od -An -tx1 -N8 <"$f" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+            "$(escape_field "$(basename "$f")")" "$fsize" "$fheader"
         shown=$((shown + 1))
     done
     [ "$shown" -eq 0 ] && echo "  (no .profraw files present)"
@@ -480,7 +507,12 @@ EOF
 isolate_attempt_outputs() {
     rm -f "$profile_dir"/*.profraw 2>/dev/null
     local leftover
-    leftover="$(find "$profile_dir" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')"
+    # One line PER MATCH, not the matched names: `find … | wc -l` counts lines,
+    # so a single surviving profraw whose name holds two newlines was reported
+    # as three files. `-exec printf` is the portable spelling (`-printf` is GNU
+    # only, `-print0` is not guaranteed under MSYS).
+    leftover="$(find "$profile_dir" -maxdepth 1 -name '*.profraw' \
+        -exec printf 'x\n' \; 2>/dev/null | wc -l | tr -d ' ')"
     if [ "$leftover" != "0" ]; then
         printf '::error::coverage cannot isolate attempts: %s .profraw file(s) survived cleanup in %s\n' \
             "$leftover" "$(escape_field "$profile_dir")"
