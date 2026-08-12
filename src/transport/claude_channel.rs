@@ -2236,6 +2236,5 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    #[path = "../../claude_channel_self_kick_tests.rs"]
     mod self_kick_tests;
 }
