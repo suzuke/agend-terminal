@@ -54,12 +54,75 @@ CORRUPTION_SIGNATURE='profdata|\.profraw|malformed instrumentation|raw profile|i
 # omitted agend-terminal-56911-14119548425640577428_0.profraw, the only path
 # the producer named. This reports what was seen; it makes no claim about the
 # writer, which is still unresolved.
+
+# The profile directory as an absolute, lexically normalized path — the scope
+# boundary every named token is judged against.
+profile_dir_abs="$(cd "$profile_dir" 2>/dev/null && pwd -P)"
+[ -n "$profile_dir_abs" ] || profile_dir_abs="$PWD/$profile_dir"
+
+# Lexical path normalization: collapse empty and `.` components and resolve a
+# component that IS `..`. No filesystem access and no symlink following, so a
+# name that merely CONTAINS dots (`weird..name.profraw`) stays a normal
+# component — only a real parent reference is resolved away.
+normalize_path() {
+    local out="" comp
+    case "$1" in /*) ;; *) printf '' ; return ;; esac
+    while IFS= read -r comp; do
+        case "$comp" in
+            '' | .) ;;
+            ..) out="${out%/*}" ;;
+            *) out="$out/$comp" ;;
+        esac
+    done <<EOF
+$(printf '%s\n' "$1" | tr '/' '\n')
+EOF
+    printf '%s' "${out:-/}"
+}
+
+# Absolutize against the profile directory, then normalize. Empty result means
+# "not a path we may touch".
+resolve_in_profile_dir() {
+    local candidate="$1" norm dir leaf phys
+    case "$candidate" in
+        /*) ;;
+        *) candidate="$profile_dir_abs/$candidate" ;;
+    esac
+    norm="$(normalize_path "$candidate")"
+    # Compare physical paths on both sides: `profile_dir_abs` came from `pwd -P`,
+    # so a symlinked ancestor (macOS /var -> /private/var, a symlinked CI
+    # workspace) would otherwise fail the prefix test for a path that is in fact
+    # inside the profile directory.
+    leaf="${norm##*/}"
+    dir="${norm%/*}"
+    [ -n "$dir" ] || dir=/
+    phys="$(cd "$dir" 2>/dev/null && pwd -P)"
+    [ -n "$phys" ] && norm="$phys/$leaf"
+    case "$norm" in
+        "$profile_dir_abs" | "$profile_dir_abs"/*) printf '%s' "$norm" ;;
+        *) printf '' ;;
+    esac
+}
+
+# Strip surrounding quotes and a trailing CR (a response file is not guaranteed
+# to be LF-separated).
+clean_token() {
+    local t="$1"
+    t="${t%$'\r'}"
+    t="${t#\"}"
+    t="${t%\"}"
+    t="${t#\'}"
+    t="${t%\'}"
+    printf '%s' "$t"
+}
+
+# Extract named paths from the KNOWN diagnostic line structure
+# (`warning: <path>: <corruption phrase>`) rather than by scanning for anything
+# ending in .profraw — the anchor is what lets a path containing spaces survive
+# without broadening the match to unrelated text.
 named_corrupt_paths() {
     [ -f "$log" ] || return 0
-    grep -Ei 'invalid instrumentation profile data|malformed instrumentation|truncated profile data|raw profile' "$log" 2>/dev/null |
-        grep -oE '[^[:space:]]+\.profraw' |
-        sed -e 's/^["'"'"']*//' |
-        awk '!seen[$0]++'
+    sed -nE 's/^[[:space:]]*warning:[[:space:]]*"?(.+\.profraw)"?:[[:space:]]*(invalid instrumentation profile data|malformed instrumentation profile data|truncated profile data|raw profile).*/\1/p' \
+        "$log" 2>/dev/null | awk '!seen[$0]++'
 }
 
 # `date -r FILE` is the one mtime spelling BSD and GNU agree on (`stat` is not).
@@ -73,47 +136,56 @@ module_token() {
     printf '%s' "$1" | sed -nE 's/.*-([0-9]+)_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
 }
 
-# Resolve a producer-named token to a path. Absolute stays absolute; a bare
-# relative name resolves against the profile directory (llvm-profdata prints
-# either form). A token containing `..` is never followed — reporting a path is
-# not a licence to read outside the profile directory.
-resolve_named_path() {
-    case "$1" in
-        *..*) printf '' ;;
-        /*) printf '%s' "$1" ;;
-        *) printf '%s/%s' "$profile_dir" "$1" ;;
-    esac
+# Membership is exact and by NORMALIZED FULL PATH: a same-named file in another
+# directory is a different member, and a substring test would call foo.profraw a
+# member because the list happens to hold otherfoo.profraw.
+response_contains_path() {
+    local want="$1" list entry resolved
+    for list in "$profile_dir"/*-profraw-list; do
+        [ -e "$list" ] || continue
+        # `|| [ -n "$entry" ]` so a final entry without a trailing newline is
+        # still read.
+        while IFS= read -r entry || [ -n "$entry" ]; do
+            entry="$(clean_token "$entry")"
+            [ -n "$entry" ] || continue
+            resolved="$(resolve_in_profile_dir "$entry")"
+            [ -n "$resolved" ] || continue
+            if [ "$resolved" = "$want" ]; then
+                printf 'yes'
+                return 0
+            fi
+        done <"$list"
+    done
+    printf 'no'
 }
 
 describe_named_corrupt() {
-    local token="$1" base path exists size header mtime in_response list entry
+    local token base path exists size header mtime in_response
+    token="$(clean_token "$1")"
     base="${token##*/}"
-    path="$(resolve_named_path "$token")"
-    if [ -n "$path" ] && [ -e "$path" ]; then
-        exists=yes
-        size="$(wc -c <"$path" | tr -d ' ')"
-        header="$(od -An -tx1 -N8 <"$path" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
-        mtime="$(file_mtime "$path")"
-    else
-        if [ -z "$path" ]; then exists=out-of-scope; else exists=no; fi
+    path="$(resolve_in_profile_dir "$token")"
+    if [ -z "$path" ]; then
+        # Named, disclosed, and deliberately NOT touched: outside the profile
+        # directory (or a parent reference) is not ours to stat or read.
+        exists="out-of-scope"
         size=n/a
         header=n/a
         mtime=n/a
+        in_response=no
+    else
+        if [ -e "$path" ]; then
+            exists=yes
+            size="$(wc -c <"$path" | tr -d ' ')"
+            header="$(od -An -tx1 -N8 <"$path" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+            mtime="$(file_mtime "$path")"
+        else
+            exists=no
+            size=n/a
+            header=n/a
+            mtime=n/a
+        fi
+        in_response="$(response_contains_path "$path")"
     fi
-    # Exact basename equality — a substring test would call foo.profraw a member
-    # because the response file happens to list otherfoo.profraw.
-    in_response=no
-    for list in "$profile_dir"/*-profraw-list; do
-        [ -e "$list" ] || continue
-        while IFS= read -r entry; do
-            [ -n "$entry" ] || continue
-            if [ "${entry##*/}" = "$base" ]; then
-                in_response=yes
-                break
-            fi
-        done <"$list"
-        [ "$in_response" = yes ] && break
-    done
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
         "$base" "$exists" "$in_response" "$size" "$header" "$mtime" "$(module_token "$base")"
 }
@@ -155,7 +227,6 @@ EOF
     [ "$shown" -eq 0 ] && echo "  (no .profraw files present)"
     echo "::endgroup::"
 }
-
 
 # Narrowly scoped: only this run's raw profiles, only in the profile directory.
 # Verified afterwards — an unverified clean is how a retry ends up merging a
