@@ -1,5 +1,57 @@
 use super::*;
 
+/// Remote operator channels should carry the decision surface, not a verbatim
+/// terminal dump. This reproduces the 2026-08-12 Telegram incident where a
+/// Claude Bash permission dialog forwarded dozens of command lines.
+#[test]
+fn stall_notice_keeps_actionable_tail_but_bounds_remote_noise() {
+    let mut tail = String::from("Bash command\n");
+    for idx in 0..35 {
+        tail.push_str(&format!(
+            "command-{idx}: rm -rf /very/long/path/{}\n",
+            "x".repeat(120)
+        ));
+    }
+    tail.push_str(
+        "Dangerous rm operation on possibly-empty variable path\n\
+         Do you want to proceed?\n\
+         1. Yes\n\
+         2. No\n\
+         Esc to cancel · Tab to amend\n",
+    );
+
+    let notice = format_stall_notice("general", &tail, Some(33));
+
+    assert!(notice.contains("general"));
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("details omitted"));
+    assert!(
+        notice.chars().count() <= 1200,
+        "remote stall notice must stay compact, got {} chars",
+        notice.chars().count()
+    );
+    assert!(
+        !notice.contains("command-0:"),
+        "old pane history must not be forwarded verbatim"
+    );
+}
+
+#[test]
+fn stall_notice_truncates_one_oversized_prompt_line_on_char_boundary() {
+    let tail = format!(
+        "permission requested: {}尾\n1. Allow\n2. Deny",
+        "界".repeat(2000)
+    );
+    let notice = format_stall_notice("agent", &tail, None);
+
+    assert!(notice.contains("1. Allow"));
+    assert!(notice.contains("2. Deny"));
+    assert!(notice.contains('…'));
+    assert!(notice.chars().count() <= 1200);
+}
+
 /// #2033: the recovery-notice gate — actionable iff the operator was told
 /// about the block AND it lasted past the threshold (actionable-or-silent).
 #[test]
