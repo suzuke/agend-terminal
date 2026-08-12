@@ -17,7 +17,9 @@
 #   2. cleanup failure is surfaced, not swallowed
 #   3. a retry starts from a profile directory holding nothing a prior attempt
 #      produced, or the wrapper fails rather than merging across attempts
-#   4. corrupt/no-profile failure emits bounded, deterministic evidence
+#   4. corrupt/no-profile failure emits bounded, deterministic evidence, and
+#      a path the producer NAMED as corrupt is described regardless of where it
+#      sorts in the glob-ordered cap
 #
 # Seams (all default to the production values):
 #   COVERAGE_PRODUCER     command that produces coverage        [cargo llvm-cov …]
@@ -45,10 +47,72 @@ CORRUPTION_SIGNATURE='profdata|\.profraw|malformed instrumentation|raw profile|i
 # Bounded evidence for the unresolved corruption RCA: attempt, directory,
 # response-file membership, and per-file size + header bytes. Never echoes the
 # producer log — that is what made previous failures unreadable.
+# #3236: paths the producer EXPLICITLY named as corrupt are cap-exempt and are
+# described FIRST. The ordinary listing below is glob-ordered, so the one file
+# llvm-profdata named can sort outside the cap — observed in run 31619505420
+# job 94190482315, where the block printed ten unrelated valid profiles and
+# omitted agend-terminal-56911-14119548425640577428_0.profraw, the only path
+# the producer named. This reports what was seen; it makes no claim about the
+# writer, which is still unresolved.
+named_corrupt_paths() {
+    [ -f "$log" ] || return 0
+    grep -Ei 'invalid instrumentation profile data|malformed instrumentation|truncated profile data|raw profile' "$log" 2>/dev/null |
+        grep -oE '[^[:space:]]+\.profraw' |
+        awk '!seen[$0]++'
+}
+
+# `date -r FILE` is the one mtime spelling BSD and GNU agree on (`stat` is not).
+file_mtime() {
+    date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown
+}
+
+# The `%m` module token from `<name>-<pid>-<module>_<n>.profraw`; `unknown` when
+# the name does not carry one.
+module_token() {
+    printf '%s' "$1" | sed -nE 's/.*-([0-9]+)_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
+}
+
+describe_named_corrupt() {
+    local path="$1" base exists size header mtime in_response list
+    base="$(basename "$path")"
+    if [ -e "$path" ]; then
+        exists=yes
+        size="$(wc -c <"$path" | tr -d ' ')"
+        header="$(od -An -tx1 -N8 <"$path" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+        mtime="$(file_mtime "$path")"
+    else
+        exists=no
+        size=n/a
+        header=n/a
+        mtime=n/a
+    fi
+    in_response=no
+    for list in "$profile_dir"/*-profraw-list; do
+        [ -e "$list" ] || continue
+        if grep -Fq "$base" "$list"; then
+            in_response=yes
+            break
+        fi
+    done
+    printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
+        "$base" "$exists" "$in_response" "$size" "$header" "$mtime" "$(module_token "$base")"
+}
+
 emit_diagnostics() {
     local attempt="$1"
     echo "::group::coverage corruption evidence (attempt $attempt)"
     echo "profile_dir=$profile_dir"
+    # (a) cap-exempt: every path the producer itself named, in the order named.
+    local named=0 p
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        describe_named_corrupt "$p"
+        named=$((named + 1))
+    done <<EOF
+$(named_corrupt_paths)
+EOF
+    [ "$named" -eq 0 ] && echo "  (producer named no corrupt profile path)"
+    # (b) the ordinary, bounded survey.
     local list
     for list in "$profile_dir"/*-profraw-list; do
         [ -e "$list" ] || continue
@@ -71,6 +135,7 @@ emit_diagnostics() {
     [ "$shown" -eq 0 ] && echo "  (no .profraw files present)"
     echo "::endgroup::"
 }
+
 
 # Narrowly scoped: only this run's raw profiles, only in the profile directory.
 # Verified afterwards — an unverified clean is how a retry ends up merging a
