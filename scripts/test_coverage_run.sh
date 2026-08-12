@@ -439,6 +439,71 @@ PRODUCER
     fi
 }
 
+# ── 44-45. Isolation must fail closed when its own commands fail ────────────
+# The permission precheck only covers ONE way enumeration can fail. `rm`'s exit
+# status was ignored outright, and `find … | wc -l` discards find's status: a
+# failed enumeration produced a numeric 0, indistinguishable from "nothing
+# left", so the wrapper retried against state nobody verified. Each command is
+# failed INDEPENDENTLY as well as together, so the status attribution is real
+# rather than one check masking the other.
+#
+# `PATH` shims, not permissions: this is about command failure, and it must hold
+# on platforms where mode bits do not stop `rm`.
+drive_isolation_with_failing() {
+    local which="$1" sandbox out rc attempts seen
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/shim"
+    case "$which" in
+        rm | both) printf '#!/usr/bin/env bash\nexit 1\n' >"$sandbox/shim/rm" ;;
+    esac
+    case "$which" in
+        find | both) printf '#!/usr/bin/env bash\nexit 1\n' >"$sandbox/shim/find" ;;
+    esac
+    chmod +x "$sandbox/shim"/* 2>/dev/null
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+n=$(cat "$COV_ATT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$COV_ATT"
+if [ "$n" -gt 1 ]; then ls "$COVERAGE_PROFILE_DIR" >"$COV_SEEN" 2>/dev/null; fi
+printf 'stale' >"$COVERAGE_PROFILE_DIR/stale-1-1_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    echo 0 >"$sandbox/att"
+    : >"$sandbox/seen"
+    out="$(cd "$sandbox" && PATH="$sandbox/shim:$PATH" \
+        COV_ATT="$sandbox/att" COV_SEEN="$sandbox/seen" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN="true" \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    rc=$?
+    attempts="$(cat "$sandbox/att")"
+    seen="$(tr '\n' ' ' <"$sandbox/seen")"
+    rm -rf "$sandbox"
+    printf '%s|%s|%s|%s' "$attempts" "$rc" "$seen" "$(echo "$out" | grep -c 'cannot isolate')"
+}
+
+test_isolation_fails_closed_when_its_commands_fail() {
+    local which res attempts rc seen isolated bad=""
+    for which in rm find both; do
+        res="$(drive_isolation_with_failing "$which")"
+        attempts="${res%%|*}"; res="${res#*|}"
+        rc="${res%%|*}"; res="${res#*|}"
+        seen="${res%%|*}"; isolated="${res#*|}"
+        # It must stop at isolation: attempt 2 must never run, so it can never
+        # observe what attempt 1 left behind.
+        [ "$attempts" = "1" ] || bad="$bad [$which]ran-$attempts-attempts"
+        [ -n "$seen" ] && bad="$bad [$which]attempt2-saw($seen)"
+        [ "$rc" -ne 0 ] || bad="$bad [$which]exited-zero"
+        [ "$isolated" != "0" ] || bad="$bad [$which]no-isolation-error"
+    done
+    if [ -n "$bad" ]; then
+        report 1 "isolation fails closed when rm or find fails" "issues:$bad"
+    else
+        report 0 "isolation fails closed when rm or find fails"
+    fi
+}
+
 # ── 41-43. The corruption-phrase population (d-…211213152750-12) ────────────
 # The parser anchors on a `warning:` line; the warning COUNT deliberately does
 # not, so that a name containing a newline — which splits the producer's line
@@ -455,6 +520,39 @@ PRODUCER
 #     malformed instrumentation profile data
 #     raw profile version mismatch
 #     truncated profile data
+
+# A newline-bearing pathname is arbitrary bytes, so a path FRAGMENT may itself
+# contain an exact corruption phrase. The phrase then matches on two lines — the
+# path fragment and the real message — for ONE logical warning, and any exact
+# tally derived from line counts is wrong. Line framing cannot tell pathname
+# bytes from message bytes, so the honest disclosure is boolean: something was
+# unattributable, without claiming how many.
+test_phrase_bearing_path_fragment_claims_no_count() {
+    local sandbox out block bad="" markers
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'warning: /tmp/odd-invalid instrumentation profile data-\nname-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n'
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    markers="$(echo "$block" | grep -c 'corrupt=(unparseable)')"
+    rm -rf "$sandbox"
+    # Exactly ONE bounded generic marker for the one logical warning.
+    [ "$markers" -eq 1 ] || bad="$bad expected-1-marker-got-$markers"
+    echo "$block" | grep -q 'count=' && bad="$bad asserts-exact-count"
+    if [ -n "$bad" ]; then
+        report 1 "a phrase-bearing path fragment claims no count" \
+            "issues:$bad; got: $(echo "$block" | grep 'unparseable' | head -1)"
+    else
+        report 0 "a phrase-bearing path fragment claims no count"
+    fi
+}
 
 # Benign prose that merely mentions raw profiles, beside a real parsed warning.
 test_benign_raw_profile_prose_fabricates_no_record() {
@@ -535,9 +633,10 @@ PRODUCER
     line="$(echo "$block" | grep 'unparseable' | head -n 1)"
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad not-disclosed"
-    echo "$line" | grep -q 'count=1' || bad="$bad wrong-count"
-    # Generic: it must carry no facts attributed to a path it never resolved.
+    # Generic: it must carry no facts attributed to a path it never resolved,
+    # and no exact tally — see the overcount test below for why.
     echo "$line" | grep -q 'corrupt=(unparseable)' || bad="$bad not-generic"
+    echo "$line" | grep -q 'count=' && bad="$bad asserts-exact-count"
     echo "$line" | grep -q 'name-1-2_0' && bad="$bad leaked-partial-name"
     if [ -n "$bad" ]; then
         report 1 "a split exact raw-profile warning stays generically unparseable" \
@@ -863,29 +962,34 @@ PRODUCER
 test_isolation_counts_files_not_lines() {
     local sandbox out bad=""
     sandbox="$(new_sandbox)"
+    # An `rm` that reports success but removes nothing. Mode bits would make the
+    # real `rm` FAIL, which now fails closed BEFORE the count is reached — a
+    # different property, pinned separately. To exercise the COUNT the cleanup
+    # must look like it worked while a file survives. This is also portable, so
+    # the case no longer needs a mode-bit SKIP.
+    mkdir -p "$sandbox/shim"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$sandbox/shim/rm"
+    chmod +x "$sandbox/shim/rm"
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
 name="$(printf 'leftover-1-1_0.profraw\nsecond-line\nthird-9-9_0.profraw')"
 printf 'x' >"$COVERAGE_PROFILE_DIR/$name"
-# Make the directory unwritable so the wrapper's `rm -f` cannot remove it and
-# the isolation check has something to count.
-chmod 500 "$COVERAGE_PROFILE_DIR"
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
-    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+    out="$(cd "$sandbox" && PATH="$sandbox/shim:$PATH" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" \
         COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
-    chmod -R u+rwX "$sandbox" 2>/dev/null
     rm -rf "$sandbox"
-    # Premise: the isolation failure must actually have fired. Where mode bits
-    # do not stop `rm` (Git Bash), it does not — that is a premise gap.
+    # Premise: the survivor must have been detected at all.
     if ! echo "$out" | grep -q 'cannot isolate attempts'; then
-        report_skip "the isolation error counts files, not lines" \
-            "cleanup succeeded despite a read-only directory; premise unavailable"
+        report 1 "the isolation error counts files, not lines" \
+            "premise: no isolation error fired despite a surviving profraw"
         return
     fi
+    # One file whose name spans three lines is ONE file.
     echo "$out" | grep -qE 'cannot isolate attempts: 1 \.profraw' || bad="$bad wrong-count"
     if [ -n "$bad" ]; then
         report 1 "the isolation error counts files, not lines" \
@@ -1523,6 +1627,8 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_isolation_fails_closed_when_its_commands_fail
+test_phrase_bearing_path_fragment_claims_no_count
 test_benign_raw_profile_prose_fabricates_no_record
 test_exact_raw_profile_messages_are_parsed
 test_split_exact_raw_profile_warning_stays_unparseable
