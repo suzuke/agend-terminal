@@ -223,6 +223,7 @@ fn self_kick_receipt_cas_stress_has_one_terminal_winner() {
             .latest(envelope.delivery_id)
             .expect("latest")
             .expect("accepted");
+        // fire-and-forget: test workers are joined below after the CAS race.
         workers.push(thread::spawn(move || {
             barrier.wait();
             let mut ambiguous = receipt;
