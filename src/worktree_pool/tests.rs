@@ -1892,6 +1892,87 @@ fn p0x_force_dry_run_rejects_before_s2_and_preserves_state_3224() {
 }
 
 #[test]
+fn p0x_force_dry_run_rejects_present_non_boolean_values_3224() {
+    for (label, dry_run) in [("string", serde_json::json!("true")), ("number", serde_json::json!(1))] {
+        let home = tmp_home(&format!("p0x-force-dry-run-{label}-3224"));
+        let repo = tmp_repo(&format!("p0x-force-dry-run-{label}-3224-repo"));
+        let lease = lease_bound(&home, &repo, "agent-force-malformed", "feat/keep");
+        let binding_path = crate::paths::binding_path(&home, "agent-force-malformed");
+        let binding_before = std::fs::read(&binding_path).expect("binding before release");
+        let metadata_before = worktree_list(&repo);
+
+        for attempt in 0..2 {
+            let result = crate::mcp::handlers::worktree_test_release(
+                &home,
+                &serde_json::json!({
+                    "instance": "agent-force-malformed",
+                    "branch": "feat/keep",
+                    "force": true,
+                    "dry_run": dry_run
+                }),
+            );
+            assert_eq!(
+                result["code"].as_str(),
+                Some("dry_run_unsupported"),
+                "{label} attempt {attempt} must reject present non-boolean dry_run: {result}"
+            );
+            assert!(lease.path.exists(), "{label} must preserve worktree: {result}");
+            assert_eq!(
+                std::fs::read(&binding_path).expect("binding after release"),
+                binding_before,
+                "{label} must preserve binding evidence"
+            );
+            assert_eq!(
+                worktree_list(&repo),
+                metadata_before,
+                "{label} must preserve exact Git worktree metadata"
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+}
+
+#[test]
+fn p0x_force_dry_run_absent_null_false_keep_destructive_behavior_3224() {
+    for (label, dry_run) in [
+        ("absent", None),
+        ("null", Some(serde_json::Value::Null)),
+        ("false", Some(serde_json::json!(false))),
+    ] {
+        let home = tmp_home(&format!("p0x-force-dry-run-{label}-control-3224"));
+        let repo = tmp_repo(&format!("p0x-force-dry-run-{label}-control-3224-repo"));
+        let lease = lease_bound(&home, &repo, "agent-force-control", "feat/keep");
+        let mut args = serde_json::json!({
+            "instance": "agent-force-control",
+            "branch": "feat/keep",
+            "force": true
+        });
+        if let Some(dry_run) = dry_run {
+            args["dry_run"] = dry_run;
+        }
+
+        let result = crate::mcp::handlers::worktree_test_release(&home, &args);
+        assert_eq!(result["released"].as_bool(), Some(true), "{label}: {result}");
+        assert_eq!(result["dir_removed"].as_bool(), Some(true), "{label}: {result}");
+        assert!(!lease.path.exists(), "{label} must retain destructive force behavior");
+        assert!(
+            crate::binding::read(&home, "agent-force-control").is_none(),
+            "{label} must clear binding"
+        );
+        assert_eq!(
+            worktree_list(&repo).matches("worktree ").count(),
+            1,
+            "{label} must unregister the Git worktree"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+}
+
+#[test]
 fn is_daemon_managed_excludes_human_worktrees() {
     let dir = tmp_home("human-wt");
     // No marker → not managed.
