@@ -93,6 +93,13 @@ escape_field() {
 case "$diag_max_files" in
     '' | *[!0-9]*) diag_max_files=0 ;;
 esac
+# Digits alone are not enough. A value too large for a shell integer passes a
+# digits-only guard and then fails in BOTH `[ … -ge … ]` and `head -n`, which
+# reproduces the very defects this validation exists to prevent. Six digits is
+# already far beyond any real profile count, so anything longer is a typo.
+if [ "${#diag_max_files}" -gt 6 ]; then
+    diag_max_files=0
+fi
 if [ "$diag_max_files" -lt 1 ]; then
     echo "::warning::COVERAGE_DIAG_MAX_FILES=$(escape_field "${COVERAGE_DIAG_MAX_FILES-}") is not a positive integer; using 10"
     diag_max_files=10

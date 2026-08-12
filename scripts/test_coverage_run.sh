@@ -610,6 +610,40 @@ PRODUCER
     fi
 }
 
+# Digits alone are not enough. A value that does not fit a shell integer passes
+# a digits-only guard and then fails in `[ … -ge … ]` AND in `head -n`, which
+# reproduces both defects the validation exists to prevent: unframed shell
+# errors inside the group, once per file, and every response line silently
+# dropped while `lines=` still claims they exist.
+test_out_of_range_diag_cap_emits_no_raw_shell_error() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/cap-2-2_0.profraw"
+printf '%s/cap-2-2_0.profraw\n' "$COVERAGE_PROFILE_DIR" >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        COVERAGE_DIAG_MAX_FILES=99999999999999999999 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    echo "$block" | grep -q 'profile_dir=' || bad="$bad premise-no-block"
+    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$block" | grep -q 'response_line=' || bad="$bad lost-response-lines"
+    echo "$block" | grep -q 'file=cap-2-2_0.profraw' || bad="$bad lost-survey"
+    if [ -n "$bad" ]; then
+        report 1 "an out-of-range diagnostic cap emits no raw shell error" \
+            "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
+    else
+        report 0 "an out-of-range diagnostic cap emits no raw shell error"
+    fi
+}
+
 # ── 30-34. The reads BEHIND the fields (adversarial review of the framing) ───
 # Framing the field is only half of it. The commands that produce the numbers
 # printed beside that field open producer-controlled paths too, and a failed
@@ -1386,6 +1420,7 @@ test_zero_byte_named_path_reports_na_header
 test_duplicate_warning_fabricates_no_unparseable_record
 test_unreadable_profile_dir_fails_isolation_closed
 test_non_numeric_diag_cap_emits_no_raw_shell_error
+test_out_of_range_diag_cap_emits_no_raw_shell_error
 test_unreadable_profraw_emits_no_raw_shell_error
 test_unreadable_response_file_emits_no_raw_shell_error
 test_isolation_counts_files_not_lines
