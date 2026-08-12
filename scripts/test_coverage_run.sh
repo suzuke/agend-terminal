@@ -496,6 +496,117 @@ PRODUCER
     fi
 }
 
+# ── 16-17. Lazy boundary and check/open identity (R4) ────────────────────────
+
+# Production shape: a RELATIVE profile_dir that does not exist when the wrapper
+# loads, under a symlinked CWD. A lexical boundary recorded at load time cannot
+# match tokens that physicalize later, and every named path silently becomes
+# out-of-scope — the diagnostics go blind exactly when they are needed.
+test_relative_missing_profile_dir_under_symlinked_cwd() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/realdir"
+    ln -s "$sandbox/realdir" "$sandbox/linkdir" 2>/dev/null
+    if [ ! -L "$sandbox/linkdir" ]; then
+        rm -rf "$sandbox"
+        report_skip "relative missing profile_dir under a symlinked CWD" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    # cargo-llvm-cov CREATES the profile directory during the run, so it is
+    # absent when the wrapper loads and present (and physicalizable) by the time
+    # diagnostics run. That gap is the defect.
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+mkdir -p "$PWD/target/llvm-cov-target"
+printf 'partial' >"$PWD/target/llvm-cov-target/child-1-2_0.profraw"
+echo "warning: $PWD/target/llvm-cov-target/child-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox/linkdir" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="target/llvm-cov-target" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=yes'; then
+        report 0 "a relative missing profile_dir keeps its boundary under a symlinked CWD"
+    else
+        report 1 "a relative missing profile_dir keeps its boundary under a symlinked CWD" "got: $line"
+    fi
+}
+
+# The bytes reported must come from the path that was VALIDATED, and naming the
+# link must not cost membership.
+test_in_scope_symlink_opens_the_validated_target() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'TARGETOK' >"$sandbox/profiles/target-1-2_0.profraw"
+    ln -s "$sandbox/profiles/target-1-2_0.profraw" "$sandbox/profiles/alias-3-4_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/alias-3-4_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "an in-scope symlink opens the validated target" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    printf '%s\n' "$sandbox/profiles/alias-3-4_0.profraw" \
+        >"$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/alias-3-4_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q '54 41 52 47 45 54 4f 4b' && echo "$line" | grep -q 'in_response=yes'; then
+        report 0 "an in-scope symlink opens the validated target without losing membership"
+    else
+        report 1 "an in-scope symlink opens the validated target without losing membership" "got: $line"
+    fi
+}
+
+# ── 18. check/open identity (R4 primary, proven blocker) ────────────────────
+# Validation follows the link and approves a target; the bytes must then come
+# from THAT target. A controlled readlink seam reports an in-scope target while
+# the real link points outside: if the code validates `final` but opens `norm`,
+# the outside marker bytes are read and disclosed.
+test_validated_target_is_the_one_opened() {
+    local sandbox line outside shim
+    sandbox="$(new_sandbox)"
+    outside="$sandbox/outside-marker.bin"
+    printf 'OUTSIDEMARKER' >"$outside"
+    printf 'INSIDEDECOY' >"$sandbox/profiles/decoy-9-9_0.profraw"
+    ln -s "$outside" "$sandbox/profiles/leaf-5-5_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/leaf-5-5_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the validated target is the one opened" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    cat >"$shim/readlink" <<SHIM
+#!/usr/bin/env bash
+# Lie: report an in-scope target regardless of the real link.
+echo "$sandbox/profiles/decoy-9-9_0.profraw"
+SHIM
+    chmod +x "$shim/readlink"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $sandbox/profiles/leaf-5-5_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    line="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1 |
+        grep -E '^\s*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    # 4f 55 54 53 49 44 45 4d = "OUTSIDEM"
+    if echo "$line" | grep -q '4f 55 54 53 49 44 45 4d'; then
+        report 1 "the validated target is the one opened" "outside marker bytes disclosed: $line"
+    else
+        report 0 "the validated target is the one opened"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -511,6 +622,9 @@ test_named_path_with_spaces_is_extracted
 test_absolute_token_outside_profile_dir_is_out_of_scope
 test_symlink_leaf_cannot_escape_containment
 test_absolute_missing_profile_dir_keeps_its_boundary
+test_relative_missing_profile_dir_under_symlinked_cwd
+test_in_scope_symlink_opens_the_validated_target
+test_validated_target_is_the_one_opened
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
