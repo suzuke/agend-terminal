@@ -1,5 +1,5 @@
 use super::notify::route_notification;
-use super::storage::{inbox_path, inbox_path_for_id};
+use super::storage::{inbox_path, inbox_path_for_id, set_row_delivering_at_for_test};
 use super::*;
 use parking_lot::Mutex;
 use std::fs;
@@ -5082,6 +5082,166 @@ fn audit3_005_reclaim_stale_delivering_preserves_corrupt_line() {
         a3005_read(&home, "ag").contains("CORRUPT-005"),
         "reclaim_stale_delivering must PRESERVE the unparseable line"
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+// ── Durable redelivery history (#3228) ─────────────────────────────────
+
+/// A quiet agent can outlive several reclaim TTLs without losing the fact that
+/// the row was delivered.  The response must expose that history while the
+/// stored message identity and canonical text remain unchanged.
+#[test]
+fn redelivery_history_survives_repeated_quiet_cycles_and_targeted_ack() {
+    let home = tmp_home("redelivery-history");
+    let agent = "redelivery-history-agent";
+    let id = "m-redelivery-history";
+    let original = msg()
+        .id(id)
+        .sender("lead")
+        .text("do not mutate this canonical text")
+        .kind("query")
+        .build();
+    enqueue(&home, agent, original.clone()).unwrap();
+
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1);
+    let first_json = serde_json::to_value(&first[0]).unwrap();
+    assert_eq!(first_json["delivery_count"], 1);
+    let first_delivered_at = first_json["first_delivered_at"].clone();
+    assert!(first_delivered_at.is_string());
+    assert_eq!(first[0].id, original.id);
+    assert_eq!(first[0].text, original.text);
+
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let second = drain(&home, agent);
+    assert_eq!(second.len(), 1);
+    let second_json = serde_json::to_value(&second[0]).unwrap();
+    assert_eq!(second_json["delivery_count"], 2);
+    assert_eq!(second_json["first_delivered_at"], first_delivered_at);
+    assert_eq!(second[0].id, original.id);
+    assert_eq!(second[0].text, original.text);
+
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let third = drain(&home, agent);
+    assert_eq!(third.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&third[0]).unwrap()["delivery_count"],
+        3
+    );
+
+    // The row is unread again after reclaim, but targeted ack may settle it
+    // because durable history proves it was delivered before.
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    assert_eq!(ack(&home, agent, Some(id)), 1);
+    assert!(drain(&home, agent).is_empty());
+
+    // A never-delivered targeted ack remains conservative and cannot silently
+    // discard the message.
+    let never = msg()
+        .id("m-never-delivered")
+        .sender("lead")
+        .text("must survive")
+        .kind("query")
+        .build();
+    enqueue(&home, agent, never).unwrap();
+    assert_eq!(ack(&home, agent, Some("m-never-delivered")), 0);
+    assert_eq!(drain(&home, agent).len(), 1);
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Reclaim history is metadata-only: attachments and the canonical message
+/// payload must be byte-for-byte equivalent across redelivery.
+#[test]
+fn redelivery_history_preserves_attachment_payload() {
+    use crate::channel::event::{Attachment, AttachmentKind};
+
+    let home = tmp_home("redelivery-attachment");
+    let agent = "redelivery-attachment-agent";
+    let original = msg()
+        .id("m-redelivery-attachment")
+        .sender("telegram:user")
+        .text("caption stays canonical")
+        .kind("query")
+        .attachments(vec![Attachment {
+            kind: AttachmentKind::Photo,
+            path: "/tmp/redelivery-photo.jpg".into(),
+            mime: Some("image/jpeg".into()),
+            caption: Some("a caption".into()),
+            size_bytes: Some(1234),
+            original_filename: Some("photo.jpg".into()),
+        }])
+        .build();
+    enqueue(&home, agent, original.clone()).unwrap();
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1);
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        original.id.as_deref().unwrap(),
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let second = drain(&home, agent);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, original.id);
+    assert_eq!(second[0].text, original.text);
+    assert_eq!(
+        serde_json::to_value(&second[0].attachments).unwrap(),
+        serde_json::to_value(&original.attachments).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&second[0]).unwrap()["delivery_count"],
+        2
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Fresh reset is a context handoff, not an acknowledgement: unconfirmed
+/// delivering rows must be requeued for the successor session.
+#[test]
+fn fresh_reset_requeues_unconfirmed_delivering_rows() {
+    let home = tmp_home("fresh-reset-requeue");
+    let agent = "fresh-reset-requeue-agent";
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .id("m-fresh-reset-requeue")
+            .sender("lead")
+            .text("survive reset")
+            .kind("query")
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(drain(&home, agent).len(), 1);
+
+    assert_eq!(settle_delivering_for_session_reset(&home, agent), 1);
+    let content = fs::read_to_string(inbox_path(&home, agent)).unwrap();
+    let persisted: serde_json::Value =
+        serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(persisted["read_at"].is_null());
+    assert!(persisted["delivering_at"].is_null());
+    assert_eq!(persisted["delivery_count"], 1);
+    assert_eq!(drain(&home, agent).len(), 1);
     fs::remove_dir_all(&home).ok();
 }
 

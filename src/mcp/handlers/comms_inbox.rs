@@ -210,4 +210,46 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// Targeted ack after reclaim is a distinct contract outcome, so callers
+    /// can tell it apart from the normal in-flight batch acknowledgement.
+    #[test]
+    fn targeted_ack_after_reclaim_reports_distinct_outcome() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-targeted-ack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-3228-targeted".into()),
+                from: "lead".into(),
+                text: "ack after reclaim".into(),
+                kind: Some("query".into()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(crate::inbox::drain(&home, agent).len(), 1);
+        crate::inbox::storage::set_row_delivering_at_for_test(
+            &home,
+            agent,
+            "m-3228-targeted",
+            &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        );
+        crate::inbox::reclaim_stale_delivering(&home);
+
+        let result = handle_inbox_ack(&home, &json!({"message_id": "m-3228-targeted"}), agent);
+        assert_eq!(result["acked"], 1);
+        assert_eq!(result["outcome"], "acked-after-reclaim");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
