@@ -390,12 +390,25 @@ mod tests {
         journal.save(home, mangled).unwrap();
     }
 
+    fn resolve_test_target(
+        home: &Path,
+        instance_name: &str,
+        source_path: &str,
+    ) -> Result<WorktreeTarget, WorktreeTargetError> {
+        resolve_worktree_target_with_common_dir(
+            home,
+            instance_name,
+            source_path,
+            Some(Path::new("/tmp/agend-checkout-test-git-common")),
+        )
+    }
+
     #[test]
     fn bounded_target_path_and_component() {
         assert_policy_constants_are_unchanged();
         let home = Path::new("/tmp/agend-checkout-path-budget");
         let source = format!("/tmp/{}", "nested-source/".repeat(20));
-        let target = resolve_worktree_target(home, "reviewer", &source).unwrap();
+        let target = resolve_test_target(home, "reviewer", &source).unwrap();
         let component = target.path.file_name().unwrap().to_string_lossy();
         assert!(
             component.len() <= POLICY_WORKTREE_COMPONENT_MAX_UNITS,
@@ -412,8 +425,8 @@ mod tests {
     #[test]
     fn formerly_colliding_source_paths_get_distinct_targets() {
         let home = Path::new("/tmp/agend-checkout-path-collision");
-        let left = resolve_worktree_target(home, "reviewer", "/tmp/a/b/repo").unwrap();
-        let right = resolve_worktree_target(home, "reviewer", "/tmp/a_b/repo").unwrap();
+        let left = resolve_test_target(home, "reviewer", "/tmp/a/b/repo").unwrap();
+        let right = resolve_test_target(home, "reviewer", "/tmp/a_b/repo").unwrap();
         assert_ne!(left.path, right.path);
     }
 
@@ -435,7 +448,7 @@ mod tests {
             candidate_units > POLICY_WORKTREE_GIT_PATH_MAX_UNITS,
             "fixture must measure an over-budget candidate: {candidate_units}"
         );
-        let err = resolve_worktree_target(&home, "reviewer", "/tmp/repo").unwrap_err();
+        let err = resolve_test_target(&home, "reviewer", "/tmp/repo").unwrap_err();
         assert_eq!(err.code(), "worktree_path_budget");
         assert_eq!(
             err,
@@ -468,7 +481,7 @@ mod tests {
         );
         std::fs::create_dir_all(&legacy).unwrap();
         write_matching_legacy_journal(&home, &legacy_name, source);
-        let err = resolve_worktree_target(&home, "reviewer", source).unwrap_err();
+        let err = resolve_test_target(&home, "reviewer", source).unwrap_err();
         assert_eq!(
             err,
             WorktreeTargetError::PathBudget {
@@ -489,7 +502,7 @@ mod tests {
             std::process::id(),
             "long-home/".repeat(30)
         ));
-        let target = resolve_worktree_target(&home, "reviewer", "/tmp/repo").unwrap();
+        let target = resolve_test_target(&home, "reviewer", "/tmp/repo").unwrap();
         assert!(!target.legacy);
         assert!(path_units(&target.path.join(".git")) > POLICY_WORKTREE_GIT_PATH_MAX_UNITS);
         std::fs::remove_dir_all(home).ok();
@@ -637,7 +650,7 @@ mod tests {
             .join(legacy_mangled("reviewer", source));
         std::fs::create_dir_all(&legacy).unwrap();
         write_matching_legacy_journal(&home, &legacy_mangled("reviewer", source), source);
-        let target = resolve_worktree_target(&home, "reviewer", source).unwrap();
+        let target = resolve_test_target(&home, "reviewer", source).unwrap();
         assert!(target.legacy);
         assert_eq!(target.path, legacy);
         assert_eq!(target.mangled, legacy_mangled("reviewer", source));
@@ -657,7 +670,7 @@ mod tests {
         assert!(total_units <= POLICY_WORKTREE_GIT_PATH_MAX_UNITS);
         std::fs::create_dir_all(&legacy).unwrap();
         write_matching_legacy_journal(&home, &legacy_name, &source);
-        let target = resolve_worktree_target(&home, "reviewer", &source).unwrap();
+        let target = resolve_test_target(&home, "reviewer", &source).unwrap();
         assert!(target.legacy);
         assert_eq!(target.path, legacy);
         std::fs::remove_dir_all(home).unwrap();
@@ -673,7 +686,7 @@ mod tests {
         let source = "/tmp/project/repo";
         let mangled = legacy_mangled("reviewer", source);
         write_matching_legacy_journal(&home, &mangled, source);
-        let target = resolve_worktree_target(&home, "reviewer", source).unwrap();
+        let target = resolve_test_target(&home, "reviewer", source).unwrap();
         assert!(target.legacy);
         assert_eq!(target.mangled, mangled);
         std::fs::remove_dir_all(home).unwrap();
@@ -697,7 +710,7 @@ mod tests {
         std::fs::create_dir_all(&bounded).unwrap();
         write_matching_legacy_journal(&home, &legacy_mangled("reviewer", source), source);
         assert!(matches!(
-            resolve_worktree_target(&home, "reviewer", source),
+            resolve_test_target(&home, "reviewer", source),
             Err(WorktreeTargetError::IdentityConflict { .. })
         ));
         std::fs::remove_dir_all(home).unwrap();
@@ -718,7 +731,7 @@ mod tests {
         std::fs::create_dir_all(&legacy).unwrap();
         write_matching_legacy_journal(&home, &legacy_name, original_source);
         assert!(matches!(
-            resolve_worktree_target(&home, "reviewer", requested_source),
+            resolve_test_target(&home, "reviewer", requested_source),
             Err(WorktreeTargetError::IdentityConflict { .. })
         ));
         std::fs::remove_dir_all(home).unwrap();
