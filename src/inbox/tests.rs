@@ -5122,10 +5122,6 @@ fn redelivery_history_survives_repeated_quiet_cycles_and_targeted_ack() {
     assert_eq!(second_json["first_delivered_at"], first_delivered_at);
     assert_eq!(second[0].id, original.id);
     assert_eq!(second[0].text, original.text);
-    let redelivery_header = format_header(&second[0]);
-    assert!(redelivery_header.contains("redelivery_count=2"));
-    assert!(redelivery_header.contains("first_delivered_at="));
-
     set_row_delivering_at_for_test(
         &home,
         agent,

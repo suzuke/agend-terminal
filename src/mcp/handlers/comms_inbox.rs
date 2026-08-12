@@ -259,4 +259,58 @@ mod tests {
         assert_eq!(result["outcome"], "acked-after-reclaim");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #3228: the production inbox response, rather than a dead formatter,
+    /// must make durable redelivery history visible without changing the
+    /// canonical stored message identity or text.
+    #[test]
+    fn inbox_response_surfaces_real_redelivery_history_3228() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-inbox-redelivery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-3228-response".into()),
+                from: "lead".into(),
+                text: "canonical response text".into(),
+                kind: Some("query".into()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(crate::inbox::drain(&home, agent).len(), 1);
+        crate::inbox::storage::set_row_delivering_at_for_test(
+            &home,
+            agent,
+            "m-3228-response",
+            &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        );
+        crate::inbox::reclaim_stale_delivering(&home);
+
+        let response = super::super::handle_inbox(&home, agent);
+        assert_eq!(response["messages"][0]["id"], "m-3228-response");
+        assert_eq!(response["messages"][0]["text"], "canonical response text");
+        assert_eq!(response["messages"][0]["delivery_count"], 2);
+        assert_eq!(
+            response["redelivery_history"][0]["message_id"],
+            "m-3228-response"
+        );
+        assert_eq!(response["redelivery_history"][0]["delivery_count"], 2);
+        assert!(response["redelivery_history"][0]["first_delivered_at"].is_string());
+
+        let stored = crate::inbox::find_message(&home, "m-3228-response").unwrap();
+        assert_eq!(stored.id.as_deref(), Some("m-3228-response"));
+        assert_eq!(stored.text, "canonical response text");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
