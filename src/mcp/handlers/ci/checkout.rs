@@ -69,12 +69,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             Ok(pair) => pair,
             Err(e) => return e,
         };
-    // Windows-safe mangling (separators + drive colons) of the RESOLVED canonical root.
-    let worktree_dir = home.join("worktrees").join(format!(
-        "{}-{}",
-        instance_name,
-        source_path.replace(['/', '\\', ':'], "_").replace('~', "")
-    ));
+    let target =
+        match super::checkout_path::resolve_worktree_target(home, instance_name, &source_path) {
+            Ok(target) => target,
+            Err(error) => return error.into_response(),
+        };
+    let super::checkout_path::WorktreeTarget {
+        path: worktree_dir,
+        mangled,
+    } = target;
     if let Some(e) = validate_expected_head(args, &source_path, branch) {
         return e;
     }
@@ -172,11 +175,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // #2755: serialize reuse and fresh provision on the target path; journal + lock
     // remain outside the worktree so rollback cannot delete recovery state.
     let worktree_path_str = worktree_dir.display().to_string();
-    let mangled = worktree_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
     let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
         Ok(g) => g,
         Err(e) => {
