@@ -439,6 +439,221 @@ PRODUCER
     fi
 }
 
+# ── 24-27. Record framing: no field may forge a record (d-…191530082822-11) ──
+# The evidence block is LINE-ORIENTED, so any path- or command-bearing field
+# emitted raw can carry a newline and print further lines that read as further
+# records. llvm-profdata really does emit raw newline filenames, so this is a
+# production shape, not a contrived one.
+#
+# Shared fixture notes — three traps already paid for, do not re-discover them:
+#   1. The forged payload must contain NO `/`. A `/` makes the name a path into
+#      a directory that does not exist, the file is never created, and the block
+#      truthfully prints `(no .profraw files present)` — a test that then passes
+#      for the wrong reason.
+#   2. An unquoted heredoc interpolating a newline-bearing name puts a REAL
+#      newline in the generated producer's SOURCE and breaks it. The name is
+#      built INSIDE the producer with printf escapes, under a quoted heredoc.
+#   3. The PRODUCER must create the file, during the run. A file the harness
+#      creates beforehand is removed by the wrapper's cleanup before the survey
+#      runs, and the assertions then hold vacuously.
+
+# The survey and the response file both render a producer-controlled filename.
+# One newline-bearing name must not be able to forge corrupt=, file= or member:
+# records out of its own bytes.
+test_newline_field_cannot_forge_records() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+name="$(printf 'forge-1-1_0.profraw\n  corrupt=FORGEDCORRUPT exists=yes in_response=yes size_bytes=1\n  file=FORGEDFILE size_bytes=1 header=be ef\n  member: FORGEDMEMBER\ntail-9-9_0.profraw')"
+printf 'x' >"$COVERAGE_PROFILE_DIR/$name"
+printf '%s\n' "$COVERAGE_PROFILE_DIR/$name" >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    # Premise: the name must actually have reached the block. Without this the
+    # forgery assertions hold for a file that was never surveyed.
+    echo "$block" | grep -q 'forge-1-1_0.profraw' || bad="$bad premise-not-rendered"
+    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDCORRUPT' && bad="$bad forged-corrupt-record"
+    echo "$block" | grep -qE '^[[:space:]]*file=FORGEDFILE' && bad="$bad forged-file-record"
+    echo "$block" | grep -qE '^[[:space:]]*member: FORGEDMEMBER' && bad="$bad forged-member-record"
+    if [ -n "$bad" ]; then
+        report 1 "no diagnostic field can forge a record" "issues:$bad"
+    else
+        report 0 "no diagnostic field can forge a record"
+    fi
+}
+
+# The response file is read line by line, so its count is a count of LINES. One
+# pathname spanning five lines is not five entries, and labelling it `entries`
+# claims a reconstructable path count the reader cannot get back.
+test_response_count_is_labelled_by_lines() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+name="$(printf 'multi-1-1_0.profraw\nsecond-line\nthird-line\nfourth-9-9_0.profraw')"
+printf 'x' >"$COVERAGE_PROFILE_DIR/$name"
+printf '%s\n' "$COVERAGE_PROFILE_DIR/$name" >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -E '^response_file=' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad premise-no-response-line"
+    echo "$line" | grep -q 'entries=' && bad="$bad claims-path-entries"
+    echo "$line" | grep -q 'lines=' || bad="$bad no-line-count"
+    if [ -n "$bad" ]; then
+        report 1 "the response count is labelled by lines, not path entries" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "the response count is labelled by lines, not path entries"
+    fi
+}
+
+# The response file's own NAME is producer-controlled too: the wrapper finds it
+# by glob, so a newline in the filename forges records through `response_file=`.
+test_response_file_name_cannot_forge_records() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+name="$(printf 'evil-1-1\n  corrupt=FORGEDLIST exists=yes in_response=yes\nrest-profraw-list')"
+printf 'nothing\n' >"$COVERAGE_PROFILE_DIR/$name"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    echo "$block" | grep -q 'evil-1-1' || bad="$bad premise-not-rendered"
+    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDLIST' && bad="$bad forged-corrupt-record"
+    if [ -n "$bad" ]; then
+        report 1 "a response-file name cannot forge a record" "issues:$bad"
+    else
+        report 0 "a response-file name cannot forge a record"
+    fi
+}
+
+# `profile_dir` is echoed verbatim at the top of the block and again in the
+# isolation error. It is configuration rather than producer output, but it is
+# path-bearing and goes through the same framing.
+test_profile_dir_field_cannot_forge_records() {
+    local sandbox out block dir bad=""
+    sandbox="$(new_sandbox)"
+    dir="$(printf '%s/p1\n  corrupt=FORGEDDIR exists=yes in_response=yes\np2' "$sandbox")"
+    mkdir -p "$dir" || {
+        rm -rf "$sandbox"
+        report_skip "a profile_dir field cannot forge a record" \
+            "this platform cannot create a newline-bearing directory; premise unavailable"
+        return
+    }
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/dir-1-1_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$dir" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    echo "$block" | grep -q 'p1' || bad="$bad premise-not-rendered"
+    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDDIR' && bad="$bad forged-corrupt-record"
+    if [ -n "$bad" ]; then
+        report 1 "a profile_dir field cannot forge a record" "issues:$bad"
+    else
+        report 0 "a profile_dir field cannot forge a record"
+    fi
+}
+
+# ── 28-29. Unframed shell errors inside the block ────────────────────────────
+# The shell reports its own diagnostics on stderr in a format the wrapper does
+# not control, and inside the group they read as evidence. They are also
+# path-bearing, so they carry exactly the content the framing rules govern.
+# `grep -F 'line '` would be too loose; the bash prefix is `<script>: line N:`.
+
+# `exec 9<"$path" 2>/dev/null` does NOT suppress the message in bash 3.2: the
+# shell reports a failed redirection itself, before the `2>` takes effect. Any
+# named path that does not exist therefore prints a raw error into the block.
+test_missing_named_path_emits_no_raw_shell_error() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $sandbox/profiles/gone-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    # Premise: the missing path must actually have been described.
+    echo "$line" | grep -q 'exists=no' || bad="$bad premise-not-described"
+    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "a missing named path emits no raw shell error" \
+            "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
+    else
+        report 0 "a missing named path emits no raw shell error"
+    fi
+}
+
+# `grep -c` prints 0 AND exits 1 when nothing matches, so `grep -c … || printf 0`
+# emits TWO counts. The wrapper then compares a two-line string as an integer:
+# the shell errors into the block, and the unparseable accounting — which must
+# disclose every warning the parser could not represent — silently stops working.
+test_unmatched_warning_count_emits_no_raw_shell_error() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    # A corruption signature that is NOT one of the named CORRUPTION_PHRASES:
+    # the wrapper reaches diagnostics, but the phrase counter matches nothing.
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/count-1-1_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    # Premise: the block must have been emitted at all.
+    echo "$block" | grep -q 'profile_dir=' || bad="$bad premise-no-block"
+    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    # No warning was parseable and none was named: the honest answer is the
+    # "named nothing" line, not an unparseable count.
+    echo "$block" | grep -q 'producer named no corrupt profile path' || bad="$bad no-named-nothing-line"
+    if [ -n "$bad" ]; then
+        report 1 "an unmatched warning count emits no raw shell error" \
+            "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
+    else
+        report 0 "an unmatched warning count emits no raw shell error"
+    fi
+}
+
 # Membership must be an EXACT match: foo.profraw is not a member merely because
 # the response file lists otherfoo.profraw.
 test_membership_is_exact_not_substring() {
@@ -785,6 +1000,12 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_newline_field_cannot_forge_records
+test_response_count_is_labelled_by_lines
+test_response_file_name_cannot_forge_records
+test_profile_dir_field_cannot_forge_records
+test_missing_named_path_emits_no_raw_shell_error
+test_unmatched_warning_count_emits_no_raw_shell_error
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
