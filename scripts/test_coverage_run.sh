@@ -337,6 +337,102 @@ test_bare_relative_named_path_resolves() {
     fi
 }
 
+# ── 9-13. Named-path scope, normalization and membership (primary R2) ────────
+# Shared driver: producer names $2 verbatim; $1 is the profile dir to use.
+# Echoes the first corrupt= line.
+drive_named() {
+    local profiles="$1" named="$2" sandbox out
+    sandbox="$(dirname "$profiles")"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $named: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    echo "$out" | grep -E '^\s*corrupt=' | head -n 1
+}
+
+# A filename that merely CONTAINS dots is a normal component; only a component
+# that IS `..` is a parent reference.
+test_benign_dots_in_filename_are_not_traversal() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/weird..name-1-2_0.profraw"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/weird..name-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=yes'; then
+        report 0 "a filename containing dots is not treated as traversal"
+    else
+        report 1 "a filename containing dots is not treated as traversal" "got: $line"
+    fi
+}
+
+# Response entries may carry CRLF and may lack a final newline.
+test_response_entries_tolerate_crlf_and_no_final_newline() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/crlf-3-4_0.profraw"
+    printf '%s\r' "$sandbox/profiles/crlf-3-4_0.profraw" \
+        >"$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/crlf-3-4_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=yes'; then
+        report 0 "response entries tolerate CRLF and a missing final newline"
+    else
+        report 1 "response entries tolerate CRLF and a missing final newline" "got: $line"
+    fi
+}
+
+# Same basename in a different directory is NOT the same member.
+test_membership_compares_full_paths_not_basenames() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/elsewhere"
+    printf 'partial' >"$sandbox/profiles/dup-5-6_0.profraw"
+    printf '%s\n' "$sandbox/elsewhere/dup-5-6_0.profraw" \
+        >"$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/dup-5-6_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=no'; then
+        report 0 "membership compares full paths, not basenames"
+    else
+        report 1 "membership compares full paths, not basenames" "got: $line"
+    fi
+}
+
+# A named path containing spaces must survive extraction intact.
+test_named_path_with_spaces_is_extracted() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/has space-7-8_0.profraw"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/has space-7-8_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'corrupt=has space-7-8_0.profraw' && echo "$line" | grep -q 'exists=yes'; then
+        report 0 "a named path containing spaces is extracted intact"
+    else
+        report 1 "a named path containing spaces is extracted intact" "got: $line"
+    fi
+}
+
+# An absolute token outside the profile directory is never stat'd or read.
+test_absolute_token_outside_profile_dir_is_out_of_scope() {
+    local sandbox line outside
+    sandbox="$(new_sandbox)"
+    outside="$sandbox/outside-9-1_0.profraw"
+    printf 'OUTSIDEDATA' >"$outside"
+    line="$(drive_named "$sandbox/profiles" "$outside")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=out-of-scope'; then
+        report 0 "an absolute token outside the profile dir is out-of-scope"
+    else
+        report 1 "an absolute token outside the profile dir is out-of-scope" "got: $line"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -345,6 +441,11 @@ test_named_corrupt_path_is_cap_exempt
 test_membership_is_exact_not_substring
 test_quoted_absolute_named_path_resolves
 test_bare_relative_named_path_resolves
+test_benign_dots_in_filename_are_not_traversal
+test_response_entries_tolerate_crlf_and_no_final_newline
+test_membership_compares_full_paths_not_basenames
+test_named_path_with_spaces_is_extracted
+test_absolute_token_outside_profile_dir_is_out_of_scope
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed"
