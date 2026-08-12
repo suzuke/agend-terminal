@@ -103,17 +103,27 @@ resolve_leaf() {
     printf '%s' "$path"
 }
 
-# Physicalize a path's directory, leaving the leaf name attached.
-physicalize_parent() {
-    local p="$1" leaf dir phys
-    leaf="${p##*/}"
-    dir="${p%/*}"
-    [ -n "$dir" ] || dir=/
+# Physicalize a path by walking down to its nearest EXISTING ancestor and
+# re-appending the missing components. `pwd -P` needs a directory that exists,
+# and the profile directory does not exist yet on the first attempt — a purely
+# lexical fallback would record a boundary that later, physicalized tokens can
+# never match.
+physicalize_best_effort() {
+    local p="$1" missing="" dir phys
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    p="$(normalize_path "$p")"
+    dir="$p"
+    while [ "$dir" != "/" ] && [ -n "$dir" ] && [ ! -d "$dir" ]; do
+        missing="${dir##*/}${missing:+/$missing}"
+        dir="${dir%/*}"
+        [ -n "$dir" ] || dir=/
+    done
     phys="$(cd "$dir" 2>/dev/null && pwd -P)"
-    if [ -n "$phys" ]; then
-        printf '%s/%s' "$phys" "$leaf"
+    [ -n "$phys" ] || phys="$dir"
+    if [ -n "$missing" ]; then
+        printf '%s/%s' "${phys%/}" "$missing"
     else
-        printf '%s' "$p"
+        printf '%s' "$phys"
     fi
 }
 
@@ -124,45 +134,40 @@ in_profile_scope() {
     esac
 }
 
-# Absolutize against the profile directory, normalize lexically, then judge
-# containment on the physical path that would actually be opened. Empty result
-# means "not a path we may touch".
+# Absolutize against the profile directory, normalize, then judge containment on
+# the physical path that would actually be opened. Prints "<named>\t<final>":
+# `named` is the path as the producer referred to it (used for membership) and
+# `final` is the validated target that callers must open. Empty means "not a
+# path we may touch".
 resolve_in_profile_dir() {
     local candidate="$1" norm final
     case "$candidate" in
         /*) ;;
         *) candidate="$profile_dir_abs/$candidate" ;;
     esac
-    norm="$(physicalize_parent "$(normalize_path "$candidate")")"
+    norm="$(physicalize_best_effort "$candidate")"
     in_profile_scope "$norm" || { printf ''; return; }
-    # A symlinked LEAF inside the directory must not escape it. A link whose
-    # target is still in scope stays usable, so genuinely in-scope symlinked
-    # paths keep working.
+    # A symlinked LEAF must not escape. The target is validated AND returned:
+    # validating one path and then opening another is the gap this closes.
     final="$(resolve_leaf "$norm")"
     [ -n "$final" ] || { printf ''; return; }
     if [ "$final" != "$norm" ]; then
-        final="$(physicalize_parent "$(normalize_path "$final")")"
+        final="$(physicalize_best_effort "$final")"
         in_profile_scope "$final" || { printf ''; return; }
     fi
-    printf '%s' "$norm"
+    printf '%s\t%s' "$norm" "$final"
 }
 
 # The profile directory as an absolute, physical path — the scope boundary every
 # named token is judged against. When it does not exist yet, an already-absolute
 # setting keeps its own boundary (prepending $PWD would move it).
 resolve_profile_dir_abs() {
-    local abs
-    abs="$(cd "$profile_dir" 2>/dev/null && pwd -P)"
-    if [ -z "$abs" ]; then
-        case "$profile_dir" in
-            /*) abs="$profile_dir" ;;
-            *) abs="$PWD/$profile_dir" ;;
-        esac
-        abs="$(normalize_path "$abs")"
-    fi
-    printf '%s' "$abs"
+    physicalize_best_effort "$profile_dir"
 }
-profile_dir_abs="$(resolve_profile_dir_abs)"
+# Deliberately NOT computed at load time: the producer creates the profile
+# directory during the run, so the boundary must be derived when diagnostics
+# run or it is recorded before the directory it describes exists.
+profile_dir_abs=""
 
 # Strip surrounding quotes and a trailing CR (a response file is not guaranteed
 # to be LF-separated).
@@ -211,7 +216,9 @@ response_contains_path() {
             [ -n "$entry" ] || continue
             resolved="$(resolve_in_profile_dir "$entry")"
             [ -n "$resolved" ] || continue
-            if [ "$resolved" = "$want" ]; then
+            # Compare the NAMED half: membership is about the path the response
+            # file refers to, not the target a link happens to point at.
+            if [ "${resolved%%	*}" = "$want" ]; then
                 printf 'yes'
                 return 0
             fi
@@ -221,11 +228,13 @@ response_contains_path() {
 }
 
 describe_named_corrupt() {
-    local token base path exists size header mtime in_response
+    local token base resolved named path exists size header mtime in_response
     token="$(clean_token "$1")"
     base="${token##*/}"
-    path="$(resolve_in_profile_dir "$token")"
-    if [ -z "$path" ]; then
+    resolved="$(resolve_in_profile_dir "$token")"
+    named="${resolved%%	*}"
+    path="${resolved#*	}"
+    if [ -z "$resolved" ]; then
         # Named, disclosed, and deliberately NOT touched: outside the profile
         # directory (or a parent reference) is not ours to stat or read.
         exists="out-of-scope"
@@ -245,7 +254,7 @@ describe_named_corrupt() {
             header=n/a
             mtime=n/a
         fi
-        in_response="$(response_contains_path "$path")"
+        in_response="$(response_contains_path "$named")"
     fi
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
         "$base" "$exists" "$in_response" "$size" "$header" "$mtime" "$(module_token "$base")"
@@ -253,6 +262,7 @@ describe_named_corrupt() {
 
 emit_diagnostics() {
     local attempt="$1"
+    profile_dir_abs="$(resolve_profile_dir_abs)"
     echo "::group::coverage corruption evidence (attempt $attempt)"
     echo "profile_dir=$profile_dir"
     # (a) cap-exempt: every path the producer itself named, in the order named.
