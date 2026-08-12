@@ -296,6 +296,8 @@ pub struct BroadcastContext {
 
 impl InboxMessage {
     /// Latest schema version this binary can read and write.
+    // Keep this at 1: rollback binaries may drop derived redelivery metadata on
+    // rewrite, but a version bump would make newer rows undeliverable to them.
     pub const CURRENT_VERSION: u32 = 1;
 
     pub fn new_system(
