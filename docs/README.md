@@ -79,6 +79,7 @@ believed then, not a current contract.
 | Health & Monitoring | [EN](FEATURE-health.md) | [中文](FEATURE-health.zh-TW.md) | Liveness, hung detection, and blocked reasons |
 | Dispatch Idle | [EN](FEATURE-dispatch-idle.md) | [中文](FEATURE-dispatch-idle.zh-TW.md) | Idle work pickup and tracking |
 | Channels | [EN](FEATURE-channels.md) | [中文](FEATURE-channels.zh-TW.md) | Telegram and Discord adapters |
+| Remote Notification Policy | [EN](REMOTE-NOTIFICATION-POLICY.md) | [中文](REMOTE-NOTIFICATION-POLICY.zh-TW.md) | Actionable remote alerts and noise bounds |
 | Decisions | [EN](FEATURE-decisions.md) | [中文](FEATURE-decisions.zh-TW.md) | Scope decisions and corrections |
 | Schedules & Deployments | [EN](FEATURE-schedules.md) | [中文](FEATURE-schedules.zh-TW.md) | Recurring work and deployment templates |
 

@@ -1,3 +1,5 @@
+[繁體中文](REMOTE-NOTIFICATION-POLICY.zh-TW.md)
+
 # Remote notification policy
 
 Telegram and Discord are remote operator surfaces. They should show messages

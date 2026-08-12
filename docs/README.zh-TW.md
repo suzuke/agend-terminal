@@ -73,6 +73,7 @@ artifact 內提到的 issue/PR，或執行 `git log -- <former-path>`。歷史�
 | 健康與監控 | [EN](FEATURE-health.md) | [中文](FEATURE-health.zh-TW.md) | Liveness、hung detection 與 blocked reason |
 | Dispatch Idle | [EN](FEATURE-dispatch-idle.md) | [中文](FEATURE-dispatch-idle.zh-TW.md) | Idle work pickup 與 tracking |
 | Channels | [EN](FEATURE-channels.md) | [中文](FEATURE-channels.zh-TW.md) | Telegram 與 Discord adapter |
+| 遠端通知政策 | [EN](REMOTE-NOTIFICATION-POLICY.md) | [中文](REMOTE-NOTIFICATION-POLICY.zh-TW.md) | 可操作的遠端警示與噪音限制 |
 | 決策 | [EN](FEATURE-decisions.md) | [中文](FEATURE-decisions.zh-TW.md) | Scope decision 與 correction |
 | 排程與部署 | [EN](FEATURE-schedules.md) | [中文](FEATURE-schedules.zh-TW.md) | Recurring work 與 deployment template |
 
