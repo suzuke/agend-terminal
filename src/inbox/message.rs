@@ -72,6 +72,10 @@ impl NotifySource<'_> {
     }
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboxMessage {
     #[serde(default)]
@@ -99,6 +103,16 @@ pub struct InboxMessage {
     /// (`#[serde(default)]`) → reads as unread/processed exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivering_at: Option<String>,
+    /// Monotone count of actual unread → delivering transitions. Reclaim and
+    /// session reset clear `delivering_at` but never erase this history, so a
+    /// targeted ack can distinguish a previously delivered row from one that
+    /// was never handed to an agent. Zero is omitted for legacy/canonical rows.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub delivery_count: u64,
+    /// Timestamp of the first unread → delivering transition. Preserved across
+    /// reclaim and session reset; absent on legacy and never-delivered rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_delivered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

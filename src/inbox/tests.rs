@@ -4503,13 +4503,12 @@ fn reclaim_renudge_classifier_runs_unlocked_not_under_inbox_lock() {
     );
 }
 
-// ── Session-reset settle (agend-customization#159) ──────────────────────
+// ── Session-reset requeue (#3228) ───────────────────────────────────────
 
-/// settle_delivering_for_session_reset transitions all DELIVERING rows to
-/// PROCESSED (stamps read_at) — the core invariant. After settle, those rows
-/// must NOT be re-delivered by drain() nor reverted by reclaim_stale_delivering().
+/// A fresh session reset requeues all DELIVERING rows, preserving them for the
+/// successor rather than claiming they were processed by the lost context.
 #[test]
-fn settle_transitions_delivering_to_processed() {
+fn settle_requeues_delivering_for_successor() {
     let home = tmp_home("settle-basic");
     let agent = "settle-agent";
 
@@ -4530,18 +4529,18 @@ fn settle_transitions_delivering_to_processed() {
     assert_eq!(drained.len(), 3, "all 3 should drain");
 
     // At this point all 3 are DELIVERING (delivering_at set, read_at None).
-    // Settle them as if this were a session-reset.
+    // Requeue them as if this were a session-reset.
     let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 3, "all 3 delivering rows should be settled");
+    assert_eq!(settled, 3, "all 3 delivering rows should be requeued");
 
-    // Verify: a subsequent drain returns nothing (all are now PROCESSED).
+    // Verify: a subsequent drain returns all 3 for the successor.
     let post_settle_drain = drain(&home, agent);
-    assert!(
-        post_settle_drain.is_empty(),
-        "no messages should be drainable after settle"
-    );
+    assert_eq!(post_settle_drain.len(), 3);
+    assert!(post_settle_drain.iter().all(|m| m.read_at.is_none()));
+    assert!(post_settle_drain.iter().all(|m| m.delivery_count == 2));
 
-    // Verify: reclaim does NOT revert them (they have read_at set now).
+    // The successor's drain is now in flight; the normal next-drain implicit
+    // ack closes that batch, and reclaim cannot resurrect it while fresh.
     reclaim_stale_delivering(&home);
     let post_reclaim_drain = drain(&home, agent);
     assert!(
@@ -4552,8 +4551,8 @@ fn settle_transitions_delivering_to_processed() {
     fs::remove_dir_all(&home).ok();
 }
 
-/// settle must NOT touch UNREAD rows — only DELIVERING rows are settled.
-/// Unread messages (never drained) must remain available for the new session.
+/// Requeue must NOT touch UNREAD rows — both the prior delivering row and the
+/// never-drained row remain available for the new session.
 #[test]
 fn settle_does_not_touch_unread() {
     let home = tmp_home("settle-unread");
@@ -4581,14 +4580,15 @@ fn settle_does_not_touch_unread() {
     )
     .unwrap();
 
-    // Settle: should only settle the 1 delivering row, not the unread one.
+    // Requeue: should only requeue the 1 delivering row, not discard either.
     let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 1, "only the delivering row should be settled");
+    assert_eq!(settled, 1, "only the delivering row should be requeued");
 
-    // The unread message should still be drainable.
+    // Both messages should be drainable; neither was silently dropped.
     let post = drain(&home, agent);
-    assert_eq!(post.len(), 1, "the unread message must survive settle");
-    assert_eq!(post[0].text, "unread msg");
+    assert_eq!(post.len(), 2, "both messages must survive reset");
+    assert!(post.iter().any(|m| m.text == "drained msg"));
+    assert!(post.iter().any(|m| m.text == "unread msg"));
 
     fs::remove_dir_all(&home).ok();
 }
@@ -4610,18 +4610,17 @@ fn settle_is_idempotent() {
     let first = settle_delivering_for_session_reset(&home, agent);
     assert_eq!(first, 1);
 
-    // Second settle: already processed → 0 newly settled.
+    // Second reset: already requeued → 0 newly requeued.
     let second = settle_delivering_for_session_reset(&home, agent);
     assert_eq!(second, 0, "idempotent: no rows to settle on second call");
 
     fs::remove_dir_all(&home).ok();
 }
 
-/// #159 end-to-end: the reclaim-stale-delivering path must NOT re-page an
-/// agent whose delivering rows were settled by a session-reset. This is the
-/// specific scenario that caused stale re-injection.
+/// #3228 end-to-end: a stale delivering row is requeued by session reset and
+/// remains available to the successor instead of being processed.
 #[test]
-fn settled_rows_immune_to_reclaim_and_renudge() {
+fn reset_requeues_stale_delivering_row() {
     let home = tmp_home("settle-reclaim");
     let agent = "settle-reclaim-agent";
 
@@ -4646,19 +4645,16 @@ fn settled_rows_immune_to_reclaim_and_renudge() {
     )
     .unwrap();
 
-    // Settle it (session-reset path).
+    // Requeue it (session-reset path).
     let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 1, "the stale delivering row should be settled");
+    assert_eq!(settled, 1, "the stale delivering row should be requeued");
 
-    // Now run reclaim — it should find nothing to revert (read_at is set).
+    // Reclaim has nothing to do because reset already cleared delivering_at.
     reclaim_stale_delivering(&home);
 
-    // Verify the message is still PROCESSED (not reverted to unread).
+    // Verify the message is still available for the successor.
     let post = drain(&home, agent);
-    assert!(
-        post.is_empty(),
-        "settled row must not be reverted by reclaim → no drainable messages"
-    );
+    assert_eq!(post.len(), 1, "requeued row must remain drainable");
 
     fs::remove_dir_all(&home).ok();
 }
@@ -5126,6 +5122,9 @@ fn redelivery_history_survives_repeated_quiet_cycles_and_targeted_ack() {
     assert_eq!(second_json["first_delivered_at"], first_delivered_at);
     assert_eq!(second[0].id, original.id);
     assert_eq!(second[0].text, original.text);
+    let redelivery_header = format_header(&second[0]);
+    assert!(redelivery_header.contains("redelivery_count=2"));
+    assert!(redelivery_header.contains("first_delivered_at="));
 
     set_row_delivering_at_for_test(
         &home,

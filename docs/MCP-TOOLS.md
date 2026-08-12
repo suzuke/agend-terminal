@@ -87,12 +87,12 @@ Send to one instance or broadcast. This is the unified inter-agent messaging too
 
 Drain or manage the calling instance's durable inbox.
 
-- No arguments drains unread messages and marks them `delivering`; it does not yet mark them processed.
+- No arguments drains unread messages and marks them `delivering`; it does not yet mark them processed. Returned rows include durable `delivery_count` and `first_delivered_at`; redeliveries also surface their count in structured headers without changing canonical message identity/text.
 - `message_id` describes one message; `thread_id` fetches a thread. Optional `instance` scopes authorized lookups.
-- `action:"ack"` confirms one delivering `message_id`, or the whole in-flight batch when the ID is omitted.
+- `action:"ack"` confirms one current delivering `message_id`, or the whole in-flight batch when the ID is omitted. A targeted ID may acknowledge a reclaimed/requeued row only when durable delivery history proves prior delivery; the response reports `outcome:"acked-after-reclaim"`. Omitted-ID ack remains conservative and never settles a never-delivered unread row.
 - `action:"clear"` compact-clears non-obligations while keeping unanswered queries/tasks unread and reporting them in `requires_response`.
 - `action:"discharge"` requires `message_id` and non-empty `reason`; it closes a channel-reply obligation without answering and notifies the operator.
-- Re-draining implicitly acknowledges the previous delivery batch; an unconfirmed batch can be reclaimed for redelivery after about ten minutes.
+- Re-draining implicitly acknowledges the previous delivery batch; an unconfirmed batch can be reclaimed for redelivery after about ten minutes. A fresh session reset requeues unconfirmed rows for successor recovery instead of blanket-processing them.
 
 ### `reply`
 

@@ -1450,6 +1450,8 @@ fn enqueue_reply_ledger_lead_escalation(
         id: None,
         read_at: None,
         delivering_at: None,
+        delivery_count: 0,
+        first_delivered_at: None,
         thread_id: None,
         parent_id: None,
         task_id: None,

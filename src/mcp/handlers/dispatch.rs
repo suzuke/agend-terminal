@@ -532,7 +532,8 @@ pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 // `inbox` — branch on `args["action"]` then arg presence:
-//   - `action=ack`  → confirm processed (#2299; delivering → processed)
+//   - `action=ack`  → confirm processed (#2299/#3228; current delivering rows,
+//                      or a targeted previously-delivered/reclaimed row)
 //   - `action=discharge` → #2622: close a channel-reply obligation reply-less
 //   - `action=clear` → quiet compact-clear
 //   - `message_id` present → describe single message
@@ -542,7 +543,9 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
     let action = ctx.args.get("action").and_then(|v| v.as_str());
     if action == Some("ack") {
         // #2299 explicit ack (C): confirm the agent HANDLED what it drained →
-        // delivering → processed, so the reclaim-TTL won't re-deliver it.
+        // delivering → processed, so the reclaim-TTL won't re-deliver it. A
+        // targeted ack can also settle a requeued row when delivery history
+        // proves it was previously delivered; omitted-ID ack stays conservative.
         comms::handle_inbox_ack(ctx.home, ctx.args, ctx.instance_name)
     } else if action == Some("discharge") {
         // #2622: the deliberate exit for a channel-reply obligation that will

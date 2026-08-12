@@ -1964,6 +1964,8 @@ fn seed_drained_blocker(home: &std::path::Path, target: &str, kind: &str, corr: 
         id: Some(format!("m-blocker-{corr}")),
         read_at: Some(chrono::Utc::now().to_rfc3339()),
         delivering_at: None,
+        delivery_count: 0,
+        first_delivered_at: None,
         thread_id: None,
         parent_id: None,
         task_id: None,
@@ -2068,6 +2070,8 @@ fn b3_codex_report_keeps_absorption_when_blocker_undrained() {
         id: Some("m-undrained".to_string()),
         read_at: None, // ← key: not drained
         delivering_at: None,
+        delivery_count: 0,
+        first_delivered_at: None,
         thread_id: None,
         parent_id: None,
         task_id: None,

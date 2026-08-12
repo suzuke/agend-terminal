@@ -99,15 +99,22 @@ pub fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
 }
 
-/// #2299 explicit ack (C): confirm `delivering` messages as `processed`.
-/// `message_id` present → ack that one message; omitted → ack the caller's
-/// whole in-flight batch. The agent calls this after HANDLING what it drained,
-/// so the reclaim-TTL sweep never re-delivers an already-processed message.
-/// Returns `{"acked": N}` (rows newly transitioned to processed).
+/// #2299/#3228 explicit ack (C): confirm current `delivering` messages as
+/// `processed`, or target a previously delivered/reclaimed row when durable
+/// history proves prior delivery.
+/// `message_id` present → ack that one message (including a requeued row whose
+/// durable delivery history proves it was previously delivered); omitted → ack
+/// the caller's whole in-flight batch. The response includes a distinguishable
+/// outcome so callers can tell an ack-after-reclaim from a current in-flight
+/// ack, a never-delivered conservative no-op, or an already-processed row.
 pub fn handle_inbox_ack(home: &Path, args: &Value, instance_name: &str) -> Value {
     let msg_id = args["message_id"].as_str();
-    let acked = crate::inbox::ack(home, instance_name, msg_id);
-    json!({"acked": acked})
+    let outcome = crate::inbox::ack_with_outcome(home, instance_name, msg_id);
+    json!({
+        "acked": outcome.acked,
+        "scope": if msg_id.is_some() { "targeted" } else { "batch" },
+        "outcome": outcome.kind.as_str(),
+    })
 }
 
 /// #inbox-gc part a: quiet compact-clear. Marks non-obligation messages read

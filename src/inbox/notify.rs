@@ -38,7 +38,8 @@ fn sanitize_header_value(s: &str) -> String {
 }
 
 /// Format a single-line structured header for PTY injection.
-/// Fields: from / id / kind / thread / parent / size.
+/// Fields: from / id / kind / thread / parent / size. Redelivered messages
+/// additionally carry their durable delivery count and first-delivery time.
 /// Optional fields (thread/parent) omitted when None.
 #[allow(dead_code)]
 pub fn format_header(msg: &InboxMessage) -> String {
@@ -64,6 +65,15 @@ pub fn format_header(msg: &InboxMessage) -> String {
         parts.push(format!("parent={}", sanitize_header_value(parent)));
     }
     parts.push(format!("size={}", msg.text.chars().count()));
+    if msg.delivery_count > 1 {
+        parts.push(format!("redelivery_count={}", msg.delivery_count));
+        if let Some(first) = &msg.first_delivered_at {
+            parts.push(format!(
+                "first_delivered_at={}",
+                sanitize_header_value(first)
+            ));
+        }
+    }
     if !msg.attachments.is_empty() {
         let paths: Vec<&str> = msg
             .attachments
