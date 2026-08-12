@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::message::{InboxMessage, MessageStatus};
+use super::message::InboxMessage;
 
 mod ci_handoff;
 pub(crate) use ci_handoff::{
@@ -10,7 +10,11 @@ pub(crate) use ci_handoff::{
 };
 
 mod message_query;
-pub use message_query::{find_message, get_thread};
+pub(crate) use message_query::msg_already_drained_in_jsonl;
+pub use message_query::{
+    describe_message, find_message, get_thread, has_drained_blocker_for_correlation,
+    inbox_agent_names, unread_count,
+};
 
 // ── #inbox-gc retention bounds (decision d-20260607081209372642-1, part b) ──
 //
@@ -23,11 +27,8 @@ pub use message_query::{find_message, get_thread};
 //    can't provide (a burst inside ANY window still blows past the cap).
 //
 // EXEMPTION: drained `query`/`task` rows are "blockers" — they are read by
-// `has_drained_blocker_for_correlation` (ack-absorption / reply-routing, see
-// storage.rs `has_drained_blocker_for_correlation`) for the full task
-// turnaround, which has no finite upper bound (overnight / multi-day tasks).
-// They keep the original 7d window AND are exempt from the size cap so the
-// audit path never regresses. Unread rows (obligations) keep the 30d window.
+// `has_drained_blocker_for_correlation` for the full task turnaround, which has
+// no finite upper bound. They keep the original 7d window and size-cap exemption.
 
 /// Read (drained) NON-blocker messages expire this many hours after their
 /// timestamp. Lowered from 7 days — these are the high-volume `update`/`report`/
@@ -354,17 +355,6 @@ fn inbox_files(home: &Path) -> impl Iterator<Item = PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-}
-
-/// #2604: the agent names with an inbox file (the `*.jsonl` file stems under
-/// `home/inbox`). The offline-unread watchdog iterates these to reach agents
-/// that are NOT in the live registry (offline / never-existed) — the exact set
-/// `poll_reminder` (registry-driven) can never see. A `read_dir` error yields an
-/// empty iteration, same as [`inbox_files`].
-pub fn inbox_agent_names(home: &Path) -> Vec<String> {
-    inbox_files(home)
-        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
-        .collect()
 }
 
 /// Enqueue a message — in-place flock'd append + fsync (O(1) JSONL append).
@@ -1801,49 +1791,6 @@ fn extract_ci_fail_job(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Count unread messages (read_at == None) for an agent.
-pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
-    let path = inbox_path_resolved(home, name);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return (0, None),
-    };
-    let mut count = 0usize;
-    let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
-    for line in content.lines() {
-        // #t-84833-14 (R3 perf): same `UnreadProbe` cheap deserialize as the
-        // hot-path counter (skips big `text`/`from` allocs). The filter is
-        // unchanged:
-        // MED-3: a superseded-but-undrained row is NOT actionable unread —
-        // `drain` silently consumes it (stamps `read_at`, never surfaces it).
-        // Counting it here inflated the unread count, so a busy branch whose
-        // CI SHA churns (each `mark_ci_watch_superseded` leaves the prior row
-        // superseded + unread until the next drain) tripped
-        // `inbox_stuck_watchdog` into false-paging a healthy agent. Match
-        // drain's actionable-unread definition.
-        // #2299: a `delivering` row (`delivering_at` set, `read_at` None) is
-        // in-flight — already delivered to the agent, not actionable-unread.
-        // Counting it would re-page a healthy agent mid-turn (and the
-        // reclaim-TTL sweep, not the watchdog, owns re-delivery if it stalls).
-        if let Ok(probe) = serde_json::from_str::<UnreadProbe>(line) {
-            if probe.is_unread() {
-                count += 1;
-                // `oldest` over the unread rows — identical to the prior
-                // `msg.timestamp` parse (`timestamp` is a required field, so a
-                // parsed row always has it; an unparseable value leaves `oldest`
-                // untouched, as before).
-                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&probe.timestamp) {
-                    let ts_utc = ts.with_timezone(&chrono::Utc);
-                    if oldest.is_none_or(|t| t > ts_utc) {
-                        oldest = Some(ts_utc);
-                    }
-                }
-            }
-        }
-    }
-    (count, oldest)
-}
-
 /// #2524 P6-r2 (#2537): [`unread_count`], but a ci-fail row already discharged
 /// (`(head_sha, job)` — [`is_discharged_ci_fail`]) doesn't count. Byte-identical
 /// to `unread_count` for every row that isn't a discharged ci-fail — same TTL/
@@ -2512,49 +2459,6 @@ pub fn reclaim_stale_delivering(home: &Path) {
     }
 }
 
-/// Look up a message by ID in a specific agent's inbox file.
-/// If `instance` is provided, only that agent's inbox is searched.
-pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageStatus {
-    let path = inbox_path_resolved(home, instance);
-    // A missing/unreadable file → empty content → no match → `NotFound`
-    // fall-through (same result as the prior explicit exists/Err guards).
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let now = chrono::Utc::now();
-    for msg in parse_inbox_messages(&content) {
-        if msg.id.as_deref() != Some(msg_id) {
-            continue;
-        }
-        if let Some(ref read_at) = msg.read_at {
-            return MessageStatus::ReadAt(read_at.clone(), msg.delivery_mode.clone());
-        }
-        // #2299: a delivered-but-unconfirmed (delivering) row — report it as
-        // Delivering (not Unread/NotFound) so a delivery audit sees it WAS
-        // delivered and does not re-send. Reported regardless of age (a
-        // delivering row is short-lived: the reclaim-TTL reverts it to unread).
-        if msg.delivering_at.is_some() {
-            return MessageStatus::Delivering {
-                delivery_mode: msg.delivery_mode.clone(),
-                correlation_id: msg.correlation_id.clone(),
-            };
-        }
-        let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or(now);
-        if now.signed_duration_since(ts) > chrono::Duration::days(30) {
-            return MessageStatus::UnreadExpired;
-        }
-        // #bughunt-r2 #3: a live, not-yet-read message. Previously returned
-        // NotFound (indistinguishable from "no such id") — breaking delivery
-        // audit of an un-drained message. Report it as Unread with its
-        // delivery_mode + correlation_id for correlation tracking.
-        return MessageStatus::Unread {
-            delivery_mode: msg.delivery_mode.clone(),
-            correlation_id: msg.correlation_id.clone(),
-        };
-    }
-    MessageStatus::NotFound
-}
-
 /// #982 B-narrow: scan `agent_name`'s inbox for a delivered blocking
 /// dispatch (`kind ∈ {query, task}`) that shares the given `correlation_id`.
 /// Used by `api::handlers::messaging` to override codex ack-absorption when an
@@ -2567,56 +2471,6 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
 /// actively processing it, so a reply on that correlation should reach it
 /// (override absorption) just as a fully-drained one does. Safe either way:
 /// the reply is always enqueued; this only governs whether it ALSO wakes now.
-pub fn has_drained_blocker_for_correlation(
-    home: &Path,
-    agent_name: &str,
-    correlation_id: &str,
-) -> bool {
-    #[cfg(test)]
-    super::record_blocker_scan(agent_name);
-    let path = inbox_path_resolved(home, agent_name);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    for msg in parse_inbox_messages(&content) {
-        if msg.correlation_id.as_deref() == Some(correlation_id)
-            && (msg.read_at.is_some() || msg.delivering_at.is_some())
-            && matches!(msg.kind.as_deref(), Some("query") | Some("task"))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Read the agent's inbox JSONL and return `true` iff a message with
-/// the given `msg_id` exists AND has already been delivered — `read_at`
-/// set (processed) OR `delivering_at` set (#2299 in-flight).
-///
-/// #2299: a `delivering` row has been handed to the agent once; treating it
-/// as "already drained" keeps this #911 re-inject dedup from re-pushing an
-/// in-flight message. A daemon re-inject of a `delivering` row would make the
-/// agent re-drain it, and `drain`'s implicit-ack step would confirm-and-drop it
-/// (premature `read_at`) — silent loss. Controlled re-delivery instead happens
-/// only after the reclaim-TTL reverts it to plain `unread` (`delivering_at`
-/// cleared), at which point this returns `false` again and re-inject resumes.
-pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id: &str) -> bool {
-    // H12 (CR-2026-06-14): read the RESOLVED (UUID-when-id-native) path — the same
-    // one `drain` writes `read_at` to. The old `inbox_path` (raw name) path does
-    // not exist for an id-native instance, so this #911 JSONL dedup fallback read
-    // a nonexistent file and returned `false` unconditionally — a permanent no-op
-    // that let an already-drained message be re-injected after a daemon restart
-    // (when the in-memory `OnceLock` ledger is gone).
-    let path = inbox_path_resolved(home, agent_name);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    for msg in parse_inbox_messages(&content) {
-        if msg.id.as_deref() == Some(msg_id)
-            && (msg.read_at.is_some() || msg.delivering_at.is_some())
-        {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;
