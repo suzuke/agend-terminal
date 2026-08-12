@@ -50,7 +50,7 @@ AgEnD Terminal 的通訊系統讓 agent 之間能進行結構化的訊息傳遞�
 
 無參數呼叫會取出所有未讀訊息。也可以查詢特定訊息狀態或對話串。
 
-Drain 會把回傳的 batch 標為 `delivering`，而不是 processed。每個 row 會帶有 durable 的 `delivery_count` 與 `first_delivered_at`；這些是 delivery 歷史，不會改變 canonical id 或文字。處理完後請用 `{"action":"ack"}` 確認整批，或以 `message_id` 確認單一 row。被 reclaim 的 row 只有在 durable 歷史證明曾投遞時，才能用 targeted ack 關閉；回應會標示 `acked-after-reclaim`。Fresh session reset 會重新排入未確認 row，不會把它們默認當成已處理。
+Drain 會把回傳的 batch 標為 `delivering`，而不是 processed。每個 row 會帶有 durable 的 `delivery_count` 與 `first_delivered_at`；這些是 delivery 歷史，不會改變 canonical id 或文字。若 row 被重新投遞，同一個 production response 也會在 `redelivery_history` 顯示其 `message_id`、`delivery_count` 與 `first_delivered_at`；這是 authoritative 可見 redelivery projection。處理完後請用 `{"action":"ack"}` 確認整批，或以 `message_id` 確認單一 row。被 reclaim 的 row 只有在 durable 歷史證明曾投遞時，才能用 targeted ack 關閉；回應會標示 `acked-after-reclaim`。Fresh session reset 會重新排入未確認 row，不會把它們默認當成已處理：#159 舊 settle path 以 `read_at` 隱藏 stale delivery，而 #3228 選擇 visible recovery，避免未確認訊息被靜默遺失。
 
 ### `reply` — 回覆外部頻道
 

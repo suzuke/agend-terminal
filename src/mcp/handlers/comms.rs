@@ -395,6 +395,10 @@ pub(super) fn handle_broadcast(
 
 pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
     let messages = crate::inbox::drain(home, instance_name);
+    let redelivery_history: Vec<_> = messages
+        .iter()
+        .filter_map(crate::inbox::InboxMessage::redelivery_history)
+        .collect();
     if !messages.is_empty() {
         let meta_path = crate::agent_ops::metadata_path_resolved(home, instance_name);
         let mut processed_msg_ids: Vec<String> = Vec::new();
@@ -458,7 +462,7 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
             );
         }
     }
-    json!({"messages": messages})
+    json!({"messages": messages, "redelivery_history": redelivery_history})
 }
 
 // #1286: inbox describe handlers extracted to stay under file_size_invariant.

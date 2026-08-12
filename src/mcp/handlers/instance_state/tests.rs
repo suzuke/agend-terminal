@@ -641,7 +641,9 @@ fn fresh_restart_guards_uncommitted_worktree_2476() {
 }
 
 /// A real fresh-restart entry point must requeue, rather than process, the
-/// previous session's unconfirmed delivering rows.
+/// previous session's unconfirmed delivering rows. This pins #3228's visible
+/// recovery policy: #159's old settle path would have stamped `read_at` and
+/// hidden the row, risking silent loss.
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn fresh_restart_requeues_unconfirmed_inbox_rows_3228() {
@@ -683,6 +685,8 @@ fn fresh_restart_requeues_unconfirmed_inbox_rows_3228() {
     let post_restart = crate::inbox::drain(&home, "dev");
     assert_eq!(post_restart.len(), 1);
     assert_eq!(post_restart[0].id.as_deref(), Some("m-3228-fresh-reset"));
+    assert_eq!(post_restart[0].delivery_count, 2);
+    assert!(post_restart[0].first_delivered_at.is_some());
     std::fs::remove_dir_all(&home).ok();
 }
 

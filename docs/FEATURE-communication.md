@@ -241,7 +241,7 @@ The MCP bridge gives every proxied request a UUIDv4 `request_id`. After a retrya
 {}
 ```
 
-Returns unread messages and marks the batch `delivering`. This is a lease for the current turn, not final confirmation that the messages were handled. Each returned row carries durable `delivery_count` and `first_delivered_at` metadata; these fields describe delivery history and do not change the row's canonical id or text. A redelivery also surfaces `redelivery_count` in structured message headers.
+Returns unread messages and marks the batch `delivering`. This is a lease for the current turn, not final confirmation that the messages were handled. Each returned row carries durable `delivery_count` and `first_delivered_at` metadata; these fields describe delivery history and do not change the row's canonical id or text. When a row is redelivered, the same production response also includes it in `redelivery_history` with `message_id`, `delivery_count`, and `first_delivered_at`; this is the authoritative visible redelivery projection.
 
 After handling them, call:
 
@@ -249,7 +249,7 @@ After handling them, call:
 {"action": "ack"}
 ```
 
-This transitions the whole current in-flight batch to `processed`; add `message_id` to acknowledge only one row. A targeted ack may also settle a row that was reclaimed/requeued, but only when its durable delivery history proves it was previously delivered. The response identifies this as `acked-after-reclaim`. Untargeted ack remains conservative: it never acknowledges a never-delivered unread row. A new drain implicitly acknowledges the previous batch. If neither happens, a reclaim timeout of about ten minutes can return unconfirmed rows to unread for redelivery. A fresh session reset likewise requeues unconfirmed rows for the successor session rather than marking them processed.
+This transitions the whole current in-flight batch to `processed`; add `message_id` to acknowledge only one row. A targeted ack may also settle a row that was reclaimed/requeued, but only when its durable delivery history proves it was previously delivered. The response identifies this as `acked-after-reclaim`. Untargeted ack remains conservative: it never acknowledges a never-delivered unread row. A new drain implicitly acknowledges the previous batch. If neither happens, a reclaim timeout of about ten minutes can return unconfirmed rows to unread for redelivery. A fresh session reset likewise requeues unconfirmed rows for the successor session rather than marking them processed: #159's old settle path hid stale delivery by stamping `read_at`, while #3228 chooses visible recovery so an unconfirmed message cannot be silently lost.
 
 ### Query a Specific Message
 
