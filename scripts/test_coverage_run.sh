@@ -61,10 +61,12 @@ PRODUCER
     local attempts
     attempts="$(wc -l <"$sandbox/attempts" | tr -d ' ')"
 
+    # Match a POSITIVE flake claim only — the truthful message legitimately
+    # contains the word "flake" in "NOT a flake".
     if [ "$attempts" -ne 1 ]; then
         report 1 "real failure is not retried" "producer ran $attempts times, expected 1"
-    elif echo "$out" | grep -qi "flake"; then
-        report 1 "real failure is not relabelled as a flake" "output claimed a flake: $(echo "$out" | grep -i flake | head -1)"
+    elif echo "$out" | grep -qiE "hit .*flake|flake retries|is a flake|corruption flake"; then
+        report 1 "real failure is not relabelled as a flake" "output claimed a flake: $(echo "$out" | grep -iE 'hit .*flake|flake retries|is a flake|corruption flake' | head -1)"
     elif [ "$rc" -ne 101 ]; then
         report 1 "real failure preserves the producer exit code" "wrapper exited $rc, producer exited 101"
     else
@@ -168,13 +170,15 @@ PRODUCER
     echo "$out" | grep -qiE "size|bytes" || missing="$missing size"
     echo "$out" | grep -qiE "header" || missing="$missing header"
     echo "$out" | grep -qiE "attempt" || missing="$missing attempt"
-    local noise
-    noise="$(echo "$out" | grep -c "noise line")"
+    # The producer's own output is streamed once by design (CI needs progress).
+    # What must stay bounded is the DIAGNOSTIC block: it must not re-dump the log.
+    local diag_noise
+    diag_noise="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p' | grep -c "noise line")"
 
     if [ -n "$missing" ]; then
         report 1 "corrupt failure emits bounded diagnostics" "missing evidence:$missing"
-    elif [ "$noise" -gt 20 ]; then
-        report 1 "diagnostics stay bounded" "echoed $noise producer log lines"
+    elif [ "$diag_noise" -gt 0 ]; then
+        report 1 "diagnostics stay bounded" "diagnostic block re-dumped $diag_noise producer log lines"
     else
         report 0 "corrupt failure emits bounded, deterministic diagnostics"
     fi

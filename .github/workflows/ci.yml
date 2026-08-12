@@ -84,6 +84,15 @@ jobs:
         shell: bash
         run: scripts/test_fmt_owned.sh
 
+      # #3236: the coverage wrapper's failure semantics (real-failure precedence,
+      # truthful cleanup, attempt isolation, bounded diagnostics). Runs here
+      # rather than in the coverage job so a semantics regression is caught in
+      # seconds on every platform instead of after a 30-minute producer run.
+      - name: Coverage wrapper contract test
+        timeout-minutes: 5
+        shell: bash
+        run: scripts/test_coverage_run.sh
+
       # The former standalone repository CI now runs from the monorepo checkout.
       # Keep the same Unix test/clippy/package coverage and Windows advisory
       # build/core-test boundary without creating a second workflow.
@@ -387,39 +396,14 @@ jobs:
         timeout-minutes: 35
         env:
           AGEND_LOCK_AUDIT: "1"
-        # #1452: Coverage (non-required) can flake on transient llvm-profdata
-        # profraw corruption under llvm-cov's slow parallel run — that passes on a
-        # clean rerun, so retry (signature-gated, max 2 retries: double-flakes of
-        # the same signature in one run became frequent — 3 on 2026-06-11 alone —
-        # and each manual `gh run rerun` costs an operator round-trip).
-        #
-        # SMART RETRY: a plain `test ... FAILED` is a REAL, deterministic failure.
-        # The old loop retried it unconditionally AND labelled it "likely flake" —
-        # which wasted a second slow coverage run and, worse, MASKED real bugs as
-        # flakes (e.g. #1735's block_on invariant surfaced here and was dismissed
-        # as a Coverage flake). So: only retry when the failure carries an
-        # llvm-cov profraw/profdata-corruption signature; otherwise fail FAST with
-        # an honest label so the real `test ... FAILED` is trusted, not ignored.
-        run: |
-          set -o pipefail
-          attempt=1
-          while :; do
-            if cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
-              exit 0
-            fi
-            if [ "$attempt" -ge 3 ]; then
-              echo "::error::coverage failed after 2 signature-gated profraw-flake retries"
-              exit 1
-            fi
-            if grep -qiE 'profdata|\.profraw|malformed instrumentation|raw profile|invalid instrumentation profile|failed to (load|merge).*profile|no profile can be merged' cov-attempt.log; then
-              echo "::warning::coverage attempt $attempt hit an llvm-cov profraw/profdata corruption flake; cleaning + retrying (max 2 retries)"
-              cargo llvm-cov clean --workspace || true
-              attempt=$((attempt + 1))
-              continue
-            fi
-            echo "::error::coverage failed with a REAL test failure (no profraw-corruption signature) — NOT a flake; failing fast. See the 'test ... FAILED' above."
-            exit 1
-          done
+        # #3236: the retry/classification logic lives in scripts/coverage-run.sh
+        # so its failure semantics are testable (contract:
+        # scripts/test_coverage_run.sh, run in the Check job). A real
+        # `test … FAILED` now outranks the corruption signature, cleanup failure
+        # is surfaced, retries start from an isolated profile directory, and a
+        # corrupt/no-profile failure emits bounded evidence for the still-open
+        # corrupt-writer RCA. None of this claims to cure that corruption.
+        run: scripts/coverage-run.sh
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
