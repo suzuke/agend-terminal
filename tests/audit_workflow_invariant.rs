@@ -47,4 +47,16 @@ fn audit_gate_is_separate_from_best_effort_reporting() {
         reporter.contains("uses: rustsec/audit-check@"),
         "the RustSec UI reporter must remain present"
     );
+    assert!(
+        reporter.contains("The preceding plain `cargo audit` step is authoritative for the\n"),
+        "reporter comments must identify plain cargo audit as authoritative"
+    );
+    assert!(
+        !reporter.contains("The action gate still BLOCKS"),
+        "reporter comments must not claim the non-fatal reporter is the gate"
+    );
+    assert!(
+        job.contains("uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026\n"),
+        "cargo-audit installer must be pinned to an exact reviewed commit"
+    );
 }
