@@ -360,6 +360,85 @@ SHIM
     fi
 }
 
+# ── 21-23. Fabricated facts, temp-path trust, unparseable names (R6) ────────
+
+# A failed pinned read must never be dressed up as a successful one.
+test_failed_pinned_read_is_not_reported_as_success() {
+    local sandbox line shim
+    sandbox="$(new_sandbox)"
+    printf 'REALDATA' >"$sandbox/profiles/fail-1-2_0.profraw"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    cat >"$shim/cat" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+    chmod +x "$shim/cat"
+    line="$(drive_named_with_path "$shim" "$sandbox/profiles" "$sandbox/profiles/fail-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=yes' && echo "$line" | grep -q 'size_bytes=0'; then
+        report 1 "a failed pinned read is not reported as success" "fabricated: $line"
+    else
+        report 0 "a failed pinned read is not reported as success"
+    fi
+}
+
+# The scratch path must be a real, private regular file — never followed.
+test_temp_path_is_not_followed() {
+    local sandbox line shim outside
+    sandbox="$(new_sandbox)"
+    outside="$sandbox/sentinel.bin"
+    printf 'SENTINEL' >"$outside"
+    printf 'PROFILEBYTES' >"$sandbox/profiles/tmp-3-4_0.profraw"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    ln -s "$outside" "$sandbox/evil-temp" 2>/dev/null
+    if [ ! -L "$sandbox/evil-temp" ]; then
+        rm -rf "$sandbox"
+        report_skip "the scratch path is not followed" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    cat >"$shim/mktemp" <<SHIM
+#!/usr/bin/env bash
+echo "$sandbox/evil-temp"
+SHIM
+    chmod +x "$shim/mktemp"
+    line="$(drive_named_with_path "$shim" "$sandbox/profiles" "$sandbox/profiles/tmp-3-4_0.profraw")"
+    local sentinel
+    sentinel="$(cat "$outside" 2>/dev/null)"
+    rm -rf "$sandbox"
+    if [ "$sentinel" = "SENTINEL" ]; then
+        report 0 "the scratch path is not followed"
+    else
+        report 1 "the scratch path is not followed" "sentinel overwritten; line: $line"
+    fi
+}
+
+# A named path the parser cannot represent must be DISCLOSED as unparseable,
+# never silently dropped.
+test_unparseable_named_path_is_disclosed() {
+    local sandbox out
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'warning: /tmp/odd\nname-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n'
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    if echo "$out" | grep -qE 'corrupt=|unparseable'; then
+        report 0 "an unparseable named path is disclosed, not dropped"
+    else
+        report 1 "an unparseable named path is disclosed, not dropped" \
+            "block claimed the producer named nothing"
+    fi
+}
+
 # Membership must be an EXACT match: foo.profraw is not a member merely because
 # the response file lists otherfoo.profraw.
 test_membership_is_exact_not_substring() {
@@ -703,6 +782,9 @@ test_in_scope_symlink_opens_the_validated_target
 test_validated_target_is_the_one_opened
 test_tab_containing_path_is_reported
 test_reads_are_pinned_against_post_validation_swap
+test_failed_pinned_read_is_not_reported_as_success
+test_temp_path_is_not_followed
+test_unparseable_named_path_is_disclosed
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
