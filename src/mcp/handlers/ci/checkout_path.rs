@@ -34,9 +34,7 @@ pub(crate) enum WorktreeTargetError {
         bounded_path: Option<String>,
     },
     #[cfg_attr(not(windows), allow(dead_code))]
-    GitCommonDirUnavailable {
-        source_path: String,
-    },
+    GitCommonDirUnavailable { source_path: String },
 }
 
 impl WorktreeTargetError {
