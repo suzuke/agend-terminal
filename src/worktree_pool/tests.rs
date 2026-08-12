@@ -1893,7 +1893,10 @@ fn p0x_force_dry_run_rejects_before_s2_and_preserves_state_3224() {
 
 #[test]
 fn p0x_force_dry_run_rejects_present_non_boolean_values_3224() {
-    for (label, dry_run) in [("string", serde_json::json!("true")), ("number", serde_json::json!(1))] {
+    for (label, dry_run) in [
+        ("string", serde_json::json!("true")),
+        ("number", serde_json::json!(1)),
+    ] {
         let home = tmp_home(&format!("p0x-force-dry-run-{label}-3224"));
         let repo = tmp_repo(&format!("p0x-force-dry-run-{label}-3224-repo"));
         let lease = lease_bound(&home, &repo, "agent-force-malformed", "feat/keep");
@@ -1916,7 +1919,10 @@ fn p0x_force_dry_run_rejects_present_non_boolean_values_3224() {
                 Some("dry_run_unsupported"),
                 "{label} attempt {attempt} must reject present non-boolean dry_run: {result}"
             );
-            assert!(lease.path.exists(), "{label} must preserve worktree: {result}");
+            assert!(
+                lease.path.exists(),
+                "{label} must preserve worktree: {result}"
+            );
             assert_eq!(
                 std::fs::read(&binding_path).expect("binding after release"),
                 binding_before,
@@ -1954,9 +1960,20 @@ fn p0x_force_dry_run_absent_null_false_keep_destructive_behavior_3224() {
         }
 
         let result = crate::mcp::handlers::worktree_test_release(&home, &args);
-        assert_eq!(result["released"].as_bool(), Some(true), "{label}: {result}");
-        assert_eq!(result["dir_removed"].as_bool(), Some(true), "{label}: {result}");
-        assert!(!lease.path.exists(), "{label} must retain destructive force behavior");
+        assert_eq!(
+            result["released"].as_bool(),
+            Some(true),
+            "{label}: {result}"
+        );
+        assert_eq!(
+            result["dir_removed"].as_bool(),
+            Some(true),
+            "{label}: {result}"
+        );
+        assert!(
+            !lease.path.exists(),
+            "{label} must retain destructive force behavior"
+        );
         assert!(
             crate::binding::read(&home, "agent-force-control").is_none(),
             "{label} must clear binding"
