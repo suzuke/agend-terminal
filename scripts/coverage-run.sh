@@ -55,6 +55,33 @@ CORRUPTION_SIGNATURE='profdata|\.profraw|malformed instrumentation|raw profile|i
 # the producer named. This reports what was seen; it makes no claim about the
 # writer, which is still unresolved.
 
+# Render an arbitrary byte string as exactly ONE line. Every path- or
+# command-bearing field in the block and in the error paths goes through this.
+# The block is line-oriented, so a field emitted raw can carry a newline and
+# print further lines that read as further records: llvm-profdata really does
+# emit raw newline filenames, and one such name was able to forge `corrupt=`,
+# `file=` and `member:` records out of its own bytes.
+#
+# Backslash is escaped FIRST so the escapes introduced after it are unambiguous
+# and the original bytes stay recoverable. Only backslash and C0/DEL control
+# bytes are touched: `printf %q` would also quote spaces, and a profraw name
+# containing a space is legal and must stay readable (bash 3.2 has no `${x@Q}`).
+# Non-ASCII bytes are left alone — mangling a UTF-8 filename would lose the very
+# evidence this block exists to carry.
+escape_field() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    # Anything still a control byte (ESC, BEL, VT, …) cannot be rendered
+    # faithfully on one line and is not a path character worth preserving.
+    case "$s" in
+        *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C tr '[:cntrl:]' '?')" ;;
+    esac
+    printf '%s' "$s"
+}
+
 # Lexical path normalization: collapse empty and `.` components and resolve a
 # component that IS `..`. No filesystem access and no symlink following, so a
 # name that merely CONTAINS dots (`weird..name.profraw`) stays a normal
@@ -172,6 +199,24 @@ resolve_in_profile_dir() {
 # same in-scope object. Re-opening the path once per fact is what let a
 # replacement between validation and the reads disclose an outside file.
 # Returns 0 = facts collected, 1 = could not open, 2 = changed during the read.
+#
+# TRUTH CLAIM — an opened-descriptor snapshot (decision d-…191530082822-11).
+# What this block asserts, exactly: containment was validated, the path was
+# opened ONCE, and every fact below describes the object that descriptor
+# referred to AT THAT MOMENT. Nothing more is claimed.
+#   * A concurrent replacement of the same canonical name AFTER the open is
+#     explicitly OUT OF SCOPE. A same-path replacement that we do detect is
+#     still reported (`changed-during-read`), but detection is best-effort and
+#     is not promised: no identity anchor is taken. Portable Bash cannot bind
+#     validation, the opened bytes and the final pathname atomically —
+#     /dev/fd is not identity-portable (macOS devfs gives it its own dev/inode,
+#     so `-ef` reports DIFFERENT for a descriptor on the file itself),
+#     stat-before/open/stat-after still races, and hard-link anchoring moves the
+#     selection race while adding EXDEV, MSYS and cleanup failures.
+#   * Hostile same-UID control of the profile directory after the synchronous
+#     producer has exited is NOT a boundary this diagnostic block promises.
+#     These are RCA breadcrumbs for a corrupt-writer investigation, not an
+#     authentication decision.
 FACT_SIZE=""
 FACT_HEADER=""
 FACT_MTIME=""
@@ -180,7 +225,11 @@ read_pinned_facts() {
     FACT_SIZE=n/a
     FACT_HEADER=n/a
     FACT_MTIME=unknown
-    exec 9<"$path" 2>/dev/null || return 1
+    # The redirection is grouped, not suffixed: bash reports a FAILED
+    # redirection itself, before a trailing `2>/dev/null` on the same `exec`
+    # takes effect, so a missing named path used to print a raw shell error —
+    # carrying the path, unescaped — straight into the evidence block.
+    { exec 9<"$path"; } 2>/dev/null || return 1
     tmp="$(mktemp "${TMPDIR:-/tmp}/coverage-diag.XXXXXX" 2>/dev/null)"
     # The scratch pathname is not trusted: a redirect through a symlink would
     # write profile bytes into whatever it points at.
@@ -251,10 +300,20 @@ named_corrupt_paths() {
 # parser cannot represent (a name containing a newline) is DISCLOSED as
 # unparseable rather than silently dropped.
 count_corruption_warnings() {
+    local n
     [ -f "$log" ] || { printf '0'; return; }
     # Counted by PHRASE, not by a `warning:` prefix: a name containing a newline
     # splits the producer's line, leaving the phrase on a line of its own.
-    grep -cE "($CORRUPTION_PHRASES)" "$log" 2>/dev/null || printf '0'
+    #
+    # `grep -c` prints 0 AND exits 1 when nothing matches, so a `|| printf '0'`
+    # fallback emitted a SECOND count. The caller then compared the two-line
+    # string as an integer: the shell errored into the evidence block and the
+    # unparseable accounting below silently stopped working.
+    n="$(grep -cE "($CORRUPTION_PHRASES)" "$log" 2>/dev/null)"
+    case "$n" in
+        '' | *[!0-9]*) n=0 ;;
+    esac
+    printf '%s' "$n"
 }
 
 # `date -r FILE` is the one mtime spelling BSD and GNU agree on (`stat` is not).
@@ -341,15 +400,23 @@ describe_named_corrupt() {
         mtime=n/a
         in_response=no
     fi
+    # The module token is derived from the RAW basename, then the basename is
+    # rendered: deriving it from the escaped form would read `\n` as characters.
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
-        "$base" "$exists" "$in_response" "$size" "$header" "$mtime" "$(module_token "$base")"
+        "$(escape_field "$base")" "$exists" "$in_response" "$size" "$header" "$mtime" \
+        "$(module_token "$base")"
 }
 
 emit_diagnostics() {
     local attempt="$1"
     profile_dir_abs="$(resolve_profile_dir_abs)"
     echo "::group::coverage corruption evidence (attempt $attempt)"
-    echo "profile_dir=$profile_dir"
+    # `printf`, not `echo`, wherever an escaped field is emitted: the escaped
+    # form contains backslashes by construction, and `echo` re-interprets them
+    # under `xpg_echo` — undoing the framing at the last step. That option is
+    # off on all three CI platforms, so this is hardening rather than a fix for
+    # anything reachable here; the invariant simply should not rest on it.
+    printf 'profile_dir=%s\n' "$(escape_field "$profile_dir")"
     # (a) cap-exempt: every path the producer itself named, in the order named.
     local named=0 p
     while IFS= read -r p; do
@@ -369,11 +436,26 @@ EOF
         echo "  (producer named no corrupt profile path)"
     fi
     # (b) the ordinary, bounded survey.
-    local list
+    #
+    # The response file is read LINE by line, so what is reported is a count of
+    # lines and a set of line fragments — NOT path entries. One pathname holding
+    # a newline occupies several lines, so `entries=` claimed a path count the
+    # reader could not reconstruct, and each fragment rendered as its own
+    # `member:` record. `awk END{NR}` rather than `wc -l`: a response file is not
+    # guaranteed a trailing newline, and `wc -l` counts newlines, so a single
+    # unterminated entry was reported as zero.
+    local list line
     for list in "$profile_dir"/*-profraw-list; do
         [ -e "$list" ] || continue
-        echo "response_file=$list entries=$(wc -l <"$list" | tr -d ' ')"
-        head -n "$diag_max_files" "$list" | sed 's/^/  member: /'
+        printf 'response_file=%s lines=%s\n' \
+            "$(escape_field "$list")" "$(awk 'END{print NR}' <"$list")"
+        # A pipeline, not process substitution: nothing here mutates state that
+        # has to survive the subshell, and `< <(…)` needs a working /dev/fd,
+        # which is exactly what this script has already been bitten by.
+        head -n "$diag_max_files" "$list" |
+            while IFS= read -r line || [ -n "$line" ]; do
+                printf '  response_line=%s\n' "$(escape_field "$line")"
+            done
     done
     local shown=0 f
     for f in "$profile_dir"/*.profraw; do
@@ -383,7 +465,7 @@ EOF
             break
         fi
         printf '  file=%s size_bytes=%s header=%s\n' \
-            "$(basename "$f")" \
+            "$(escape_field "$(basename "$f")")" \
             "$(wc -c <"$f" | tr -d ' ')" \
             "$(od -An -tx1 -N8 <"$f" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
         shown=$((shown + 1))
@@ -400,7 +482,8 @@ isolate_attempt_outputs() {
     local leftover
     leftover="$(find "$profile_dir" -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')"
     if [ "$leftover" != "0" ]; then
-        echo "::error::coverage cannot isolate attempts: $leftover .profraw file(s) survived cleanup in $profile_dir"
+        printf '::error::coverage cannot isolate attempts: %s .profraw file(s) survived cleanup in %s\n' \
+            "$leftover" "$(escape_field "$profile_dir")"
         return 1
     fi
     return 0
@@ -436,7 +519,10 @@ while :; do
     echo "::warning::coverage attempt $attempt hit llvm-cov profile corruption; isolating outputs and retrying"
     # (2) cleanup truthfully.
     if ! eval "$clean_cmd"; then
-        echo "::error::coverage cleanup command failed (\`$clean_cmd\`); refusing to retry against unverified state"
+        # shellcheck disable=SC2016  # the backticks are literal message text,
+        # not command substitution: the format string must not expand anything.
+        printf '::error::coverage cleanup command failed (`%s`); refusing to retry against unverified state\n' \
+            "$(escape_field "$clean_cmd")"
         exit 1
     fi
     # (3) isolation, verified.
