@@ -178,6 +178,18 @@ mod tests {
         );
     }
 
+    fn write_matching_legacy_journal(home: &Path, mangled: &str, source: &str) {
+        let journal = super::super::checkout_txn::Journal::prepared(
+            "nonce",
+            home.join("worktrees").join(mangled).display().to_string(),
+            source,
+            "main",
+            false,
+            "2026-01-01T00:00:00Z",
+        );
+        journal.save(home, mangled).unwrap();
+    }
+
     #[test]
     fn bounded_target_path_and_component() {
         assert_policy_constants_are_unchanged();
@@ -205,6 +217,7 @@ mod tests {
         assert_ne!(left.path, right.path);
     }
 
+    #[cfg(windows)]
     #[test]
     fn overlong_home_returns_typed_budget_error() {
         assert_policy_constants_are_unchanged();
@@ -234,6 +247,7 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    #[cfg(windows)]
     #[test]
     fn overlong_legacy_target_returns_typed_budget_error() {
         assert_policy_constants_are_unchanged();
@@ -243,15 +257,15 @@ mod tests {
             "long-home/".repeat(30)
         ));
         let source = "/tmp/repo";
-        let legacy = home
-            .join("worktrees")
-            .join(legacy_mangled("reviewer", source));
+        let legacy_name = legacy_mangled("reviewer", source);
+        let legacy = home.join("worktrees").join(&legacy_name);
         let candidate_units = path_units(&legacy.join(".git"));
         assert!(
             candidate_units > POLICY_WORKTREE_GIT_PATH_MAX_UNITS,
             "fixture must measure an over-budget legacy target: {candidate_units}"
         );
         std::fs::create_dir_all(&legacy).unwrap();
+        write_matching_legacy_journal(&home, &legacy_name, source);
         let err = resolve_worktree_target(&home, "reviewer", source).unwrap_err();
         assert_eq!(
             err,
@@ -261,6 +275,28 @@ mod tests {
             }
         );
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_preserves_unbounded_total_path_behavior() {
+        let home = PathBuf::from(format!(
+            "/tmp/agend-checkout-path-non-windows-{}/{}",
+            std::process::id(),
+            "long-home/".repeat(30)
+        ));
+        let target = resolve_worktree_target(&home, "reviewer", "/tmp/repo").unwrap();
+        assert!(!target.legacy);
+        assert!(path_units(&target.path.join(".git")) > POLICY_WORKTREE_GIT_PATH_MAX_UNITS);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_budget_counts_git_visible_utf8_bytes() {
+        let path = PathBuf::from("é".repeat(111));
+        assert!(path.to_string_lossy().encode_utf16().count() <= 220);
+        assert!(path_units(&path) > 220);
     }
 
     #[test]
@@ -273,6 +309,7 @@ mod tests {
             .join("worktrees")
             .join(legacy_mangled("reviewer", source));
         std::fs::create_dir_all(&legacy).unwrap();
+        write_matching_legacy_journal(&home, &legacy_mangled("reviewer", source), source);
         let target = resolve_worktree_target(&home, "reviewer", source).unwrap();
         assert!(target.legacy);
         assert_eq!(target.path, legacy);
@@ -292,6 +329,7 @@ mod tests {
         assert!(component_units > POLICY_WORKTREE_COMPONENT_MAX_UNITS);
         assert!(total_units <= POLICY_WORKTREE_GIT_PATH_MAX_UNITS);
         std::fs::create_dir_all(&legacy).unwrap();
+        write_matching_legacy_journal(&home, &legacy_name, &source);
         let target = resolve_worktree_target(&home, "reviewer", &source).unwrap();
         assert!(target.legacy);
         assert_eq!(target.path, legacy);
@@ -307,15 +345,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let source = "/tmp/project/repo";
         let mangled = legacy_mangled("reviewer", source);
-        let journal = super::super::checkout_txn::Journal::prepared(
-            "nonce",
-            home.join("worktrees").join(&mangled).display().to_string(),
-            source,
-            "main",
-            false,
-            "2026-01-01T00:00:00Z",
-        );
-        journal.save(&home, &mangled).unwrap();
+        write_matching_legacy_journal(&home, &mangled, source);
         let target = resolve_worktree_target(&home, "reviewer", source).unwrap();
         assert!(target.legacy);
         assert_eq!(target.mangled, mangled);
@@ -338,8 +368,30 @@ mod tests {
             .join(bounded_mangled("reviewer", source));
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::create_dir_all(&bounded).unwrap();
+        write_matching_legacy_journal(&home, &legacy_mangled("reviewer", source), source);
         assert_eq!(
             resolve_worktree_target(&home, "reviewer", source),
+            Err(WorktreeTargetError::IdentityConflict)
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn mismatched_legacy_evidence_fails_closed() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-checkout-path-mismatched-legacy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let original_source = "/tmp/a/b/repo";
+        let requested_source = "/tmp/a_b/repo";
+        let legacy_name = legacy_mangled("reviewer", original_source);
+        assert_eq!(legacy_name, legacy_mangled("reviewer", requested_source));
+        let legacy = home.join("worktrees").join(&legacy_name);
+        std::fs::create_dir_all(&legacy).unwrap();
+        write_matching_legacy_journal(&home, &legacy_name, original_source);
+        assert_eq!(
+            resolve_worktree_target(&home, "reviewer", requested_source),
             Err(WorktreeTargetError::IdentityConflict)
         );
         std::fs::remove_dir_all(home).unwrap();
