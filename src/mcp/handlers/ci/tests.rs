@@ -2033,24 +2033,11 @@ fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::P
     let source = source
         .canonicalize()
         .unwrap_or_else(|_| source.to_path_buf());
-    let label = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("repo")
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(16)
-        .collect::<String>();
-    let label = if label.is_empty() { "repo" } else { &label };
-    let digest = crate::daemon::utils::sha256_hex(source.display().to_string().as_bytes());
     home.join("worktrees")
-        .join(format!("{agent}-{label}-{}", &digest[..32]))
+        .join(super::checkout_path::bounded_mangled(
+            agent,
+            &source.display().to_string(),
+        ))
 }
 
 #[cfg(unix)]
