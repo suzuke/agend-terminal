@@ -55,11 +55,6 @@ CORRUPTION_SIGNATURE='profdata|\.profraw|malformed instrumentation|raw profile|i
 # the producer named. This reports what was seen; it makes no claim about the
 # writer, which is still unresolved.
 
-# The profile directory as an absolute, lexically normalized path — the scope
-# boundary every named token is judged against.
-profile_dir_abs="$(cd "$profile_dir" 2>/dev/null && pwd -P)"
-[ -n "$profile_dir_abs" ] || profile_dir_abs="$PWD/$profile_dir"
-
 # Lexical path normalization: collapse empty and `.` components and resolve a
 # component that IS `..`. No filesystem access and no symlink following, so a
 # name that merely CONTAINS dots (`weird..name.profraw`) stays a normal
@@ -79,29 +74,95 @@ EOF
     printf '%s' "${out:-/}"
 }
 
-# Absolutize against the profile directory, then normalize. Empty result means
-# "not a path we may touch".
+# Follow a symlinked leaf to its final target, bounded. Containment must be
+# decided on the path that will actually be OPENED: physicalizing only the
+# parent leaves an in-directory symlink pointing anywhere. `readlink -f` is not
+# portable to macOS, so the chain is walked one link at a time.
+resolve_leaf() {
+    local path="$1" i=0 target dir
+    while [ -L "$path" ]; do
+        i=$((i + 1))
+        if [ "$i" -gt 32 ]; then
+            printf ''
+            return
+        fi
+        target="$(readlink "$path" 2>/dev/null)"
+        if [ -z "$target" ]; then
+            printf ''
+            return
+        fi
+        case "$target" in
+            /*) path="$target" ;;
+            *)
+                dir="${path%/*}"
+                [ -n "$dir" ] || dir=/
+                path="$dir/$target"
+                ;;
+        esac
+    done
+    printf '%s' "$path"
+}
+
+# Physicalize a path's directory, leaving the leaf name attached.
+physicalize_parent() {
+    local p="$1" leaf dir phys
+    leaf="${p##*/}"
+    dir="${p%/*}"
+    [ -n "$dir" ] || dir=/
+    phys="$(cd "$dir" 2>/dev/null && pwd -P)"
+    if [ -n "$phys" ]; then
+        printf '%s/%s' "$phys" "$leaf"
+    else
+        printf '%s' "$p"
+    fi
+}
+
+in_profile_scope() {
+    case "$1" in
+        "$profile_dir_abs" | "$profile_dir_abs"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Absolutize against the profile directory, normalize lexically, then judge
+# containment on the physical path that would actually be opened. Empty result
+# means "not a path we may touch".
 resolve_in_profile_dir() {
-    local candidate="$1" norm dir leaf phys
+    local candidate="$1" norm final
     case "$candidate" in
         /*) ;;
         *) candidate="$profile_dir_abs/$candidate" ;;
     esac
-    norm="$(normalize_path "$candidate")"
-    # Compare physical paths on both sides: `profile_dir_abs` came from `pwd -P`,
-    # so a symlinked ancestor (macOS /var -> /private/var, a symlinked CI
-    # workspace) would otherwise fail the prefix test for a path that is in fact
-    # inside the profile directory.
-    leaf="${norm##*/}"
-    dir="${norm%/*}"
-    [ -n "$dir" ] || dir=/
-    phys="$(cd "$dir" 2>/dev/null && pwd -P)"
-    [ -n "$phys" ] && norm="$phys/$leaf"
-    case "$norm" in
-        "$profile_dir_abs" | "$profile_dir_abs"/*) printf '%s' "$norm" ;;
-        *) printf '' ;;
-    esac
+    norm="$(physicalize_parent "$(normalize_path "$candidate")")"
+    in_profile_scope "$norm" || { printf ''; return; }
+    # A symlinked LEAF inside the directory must not escape it. A link whose
+    # target is still in scope stays usable, so genuinely in-scope symlinked
+    # paths keep working.
+    final="$(resolve_leaf "$norm")"
+    [ -n "$final" ] || { printf ''; return; }
+    if [ "$final" != "$norm" ]; then
+        final="$(physicalize_parent "$(normalize_path "$final")")"
+        in_profile_scope "$final" || { printf ''; return; }
+    fi
+    printf '%s' "$norm"
 }
+
+# The profile directory as an absolute, physical path — the scope boundary every
+# named token is judged against. When it does not exist yet, an already-absolute
+# setting keeps its own boundary (prepending $PWD would move it).
+resolve_profile_dir_abs() {
+    local abs
+    abs="$(cd "$profile_dir" 2>/dev/null && pwd -P)"
+    if [ -z "$abs" ]; then
+        case "$profile_dir" in
+            /*) abs="$profile_dir" ;;
+            *) abs="$PWD/$profile_dir" ;;
+        esac
+        abs="$(normalize_path "$abs")"
+    fi
+    printf '%s' "$abs"
+}
+profile_dir_abs="$(resolve_profile_dir_abs)"
 
 # Strip surrounding quotes and a trailing CR (a response file is not guaranteed
 # to be LF-separated).
