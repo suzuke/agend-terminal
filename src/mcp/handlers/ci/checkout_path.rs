@@ -83,14 +83,20 @@ pub(crate) fn resolve_worktree_target(
             legacy: false,
         }
     };
-    validate_target_budget(&target.path, &target.mangled)?;
+    validate_target_budget(&target.path, &target.mangled, target.legacy)?;
     Ok(target)
 }
 
-fn validate_target_budget(path: &Path, mangled: &str) -> Result<(), WorktreeTargetError> {
+fn validate_target_budget(
+    path: &Path,
+    mangled: &str,
+    legacy: bool,
+) -> Result<(), WorktreeTargetError> {
     let component_units = path_units(Path::new(mangled));
     let path_units = path_units(&path.join(".git"));
-    if component_units > WORKTREE_COMPONENT_MAX_UNITS || path_units > WORKTREE_GIT_PATH_MAX_UNITS {
+    if (!legacy && component_units > WORKTREE_COMPONENT_MAX_UNITS)
+        || path_units > WORKTREE_GIT_PATH_MAX_UNITS
+    {
         return Err(WorktreeTargetError::PathBudget {
             path_units,
             max_units: WORKTREE_GIT_PATH_MAX_UNITS,
@@ -271,6 +277,24 @@ mod tests {
         assert!(target.legacy);
         assert_eq!(target.path, legacy);
         assert_eq!(target.mangled, legacy_mangled("reviewer", source));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn legacy_component_over_bounded_cap_is_adopted_when_total_fits() {
+        assert_policy_constants_are_unchanged();
+        let home = PathBuf::from("/tmp/agend-checkout-legacy-component");
+        let source = format!("/tmp/{}", "legacy-segment/".repeat(9));
+        let legacy_name = legacy_mangled("reviewer", &source);
+        let legacy = home.join("worktrees").join(&legacy_name);
+        let component_units = path_units(Path::new(&legacy_name));
+        let total_units = path_units(&legacy.join(".git"));
+        assert!(component_units > POLICY_WORKTREE_COMPONENT_MAX_UNITS);
+        assert!(total_units <= POLICY_WORKTREE_GIT_PATH_MAX_UNITS);
+        std::fs::create_dir_all(&legacy).unwrap();
+        let target = resolve_worktree_target(&home, "reviewer", &source).unwrap();
+        assert!(target.legacy);
+        assert_eq!(target.path, legacy);
         std::fs::remove_dir_all(home).unwrap();
     }
 
