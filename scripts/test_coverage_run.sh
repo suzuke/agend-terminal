@@ -433,6 +433,51 @@ test_absolute_token_outside_profile_dir_is_out_of_scope() {
     fi
 }
 
+# ── 14-15. Leaf-symlink containment and the absolute-dir boundary (R3) ───────
+
+# A .profraw INSIDE the profile dir that is a SYMLINK to an outside file must
+# not be read: physicalizing only the parent leaves the leaf unresolved.
+test_symlink_leaf_cannot_escape_containment() {
+    local sandbox line outside
+    sandbox="$(new_sandbox)"
+    outside="$sandbox/secret.bin"
+    printf 'OUTSIDEBYTES' >"$outside"
+    ln -s "$outside" "$sandbox/profiles/leaf-1-2_0.profraw"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/leaf-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=out-of-scope' && ! echo "$line" | grep -qi '4f 55 54 53 49 44 45'; then
+        report 0 "a symlinked leaf cannot escape containment"
+    else
+        report 1 "a symlinked leaf cannot escape containment" "got: $line"
+    fi
+}
+
+# When COVERAGE_PROFILE_DIR is absolute but does not exist, a child of it is
+# still IN scope — it is simply missing. The cd-failure fallback must not
+# prepend $PWD to an already-absolute directory.
+test_absolute_missing_profile_dir_keeps_its_boundary() {
+    local sandbox line missing out
+    sandbox="$(new_sandbox)"
+    missing="$sandbox/not-created-yet"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $missing/child-3-4_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd / && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$missing" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=no'; then
+        report 0 "an absolute missing profile dir keeps its own boundary"
+    else
+        report 1 "an absolute missing profile dir keeps its own boundary" "got: $line"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -446,6 +491,8 @@ test_response_entries_tolerate_crlf_and_no_final_newline
 test_membership_compares_full_paths_not_basenames
 test_named_path_with_spaces_is_extracted
 test_absolute_token_outside_profile_dir_is_out_of_scope
+test_symlink_leaf_cannot_escape_containment
+test_absolute_missing_profile_dir_keeps_its_boundary
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed"
