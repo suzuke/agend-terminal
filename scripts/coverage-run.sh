@@ -514,7 +514,15 @@ EOF
         # comparison is against PARSED warning lines, not distinct paths —
         # `named` is deduped, so using it invented an unparseable path whenever
         # the producer named the same file twice.
-        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown count=$((warned - parsed))"
+        #
+        # BOOLEAN, not a tally. A newline-bearing pathname is arbitrary bytes,
+        # so a path FRAGMENT may itself contain an exact corruption phrase; the
+        # phrase then matches on two lines for ONE logical warning and any count
+        # derived from line matches overstates it. Line framing cannot tell
+        # pathname bytes from message bytes, and exact reconstruction is
+        # impossible by decision — so this discloses THAT something was
+        # unattributable, and claims nothing about how much.
+        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown"
     elif [ "$named" -eq 0 ]; then
         echo "  (producer named no corrupt profile path)"
     fi
@@ -596,14 +604,29 @@ isolate_attempt_outputs() {
             "$(escape_field "$profile_dir")"
         return 1
     fi
-    rm -f "$profile_dir"/*.profraw 2>/dev/null
-    local leftover
-    # One line PER MATCH, not the matched names: `find … | wc -l` counts lines,
-    # so a single surviving profraw whose name holds two newlines was reported
-    # as three files. `-exec printf` is the portable spelling (`-printf` is GNU
-    # only, `-print0` is not guaranteed under MSYS).
-    leftover="$(find "$profile_dir" -maxdepth 1 -name '*.profraw' \
-        -exec printf 'x\n' \; 2>/dev/null | wc -l | tr -d ' ')"
+    # The cleanup's own exit status is part of the gate. It was discarded, so a
+    # cleanup that removed nothing counted as a cleanup that had nothing to do.
+    if ! rm -f "$profile_dir"/*.profraw 2>/dev/null; then
+        printf '::error::coverage cannot isolate attempts: cleanup of %s failed\n' \
+            "$(escape_field "$profile_dir")"
+        return 1
+    fi
+    # ONE FIXED BYTE per match, captured as a string — never the names, and
+    # never a pipeline. `find … | wc -l` discards find's exit status (and
+    # `local x="$(…)"` would mask it too, because `local` returns 0), so a
+    # failed enumeration produced a numeric 0 that is indistinguishable from
+    # "nothing left" and the wrapper retried against unverified state. Counting
+    # bytes rather than lines also keeps a name containing newlines from
+    # inflating the total. `-exec printf` is the portable spelling: `-printf` is
+    # GNU only and `-print0` is not guaranteed under MSYS.
+    local marks leftover
+    if ! marks="$(find "$profile_dir" -maxdepth 1 -name '*.profraw' \
+        -exec printf 'x' \; 2>/dev/null)"; then
+        printf '::error::coverage cannot isolate attempts: enumerating %s failed\n' \
+            "$(escape_field "$profile_dir")"
+        return 1
+    fi
+    leftover="${#marks}"
     if [ "$leftover" != "0" ]; then
         printf '::error::coverage cannot isolate attempts: %s .profraw file(s) survived cleanup in %s\n' \
             "$leftover" "$(escape_field "$profile_dir")"
