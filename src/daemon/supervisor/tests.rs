@@ -100,6 +100,20 @@ fn stall_notice_anchors_unknown_question_prompt_above_status_noise() {
 }
 
 #[test]
+fn stall_notice_keeps_plain_question_between_preamble_and_choices() {
+    let mut tail = String::from("reviewing diff\n");
+    for idx in 0..20 {
+        tail.push_str(&format!("hunk {idx} applied cleanly\n"));
+    }
+    tail.push_str("Apply this patch?\n1. Yes\n2. No\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Apply this patch?"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+}
+
+#[test]
 fn stall_notice_unrecognized_fallback_keeps_identity_and_latest_tail() {
     let tail = (0..20)
         .map(|idx| format!("opaque line {idx}"))
@@ -144,6 +158,20 @@ fn stall_notice_keeps_choices_despite_trailing_question_mark_url() {
     assert!(notice.contains("2. No"));
     assert!(notice.contains("Esc to cancel"));
     assert!(!notice.contains("token=secret"));
+}
+
+#[test]
+fn stall_notice_reserves_context_when_many_choices_compete_for_slots() {
+    let mut tail = String::from("preamble\nDangerous rm operation\nDo you want to proceed?\n");
+    for idx in 1..=6 {
+        tail.push_str(&format!("{idx}. Yes option {idx}\n"));
+    }
+    tail.push_str("Esc to cancel\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("Do you want to proceed?"));
+    assert!(notice.contains("Esc to cancel"));
 }
 
 #[test]

@@ -2100,6 +2100,7 @@ fn summarize_stall_tail(tail: &str) -> String {
             || lower.contains("press enter")
             || lower.contains("(y/n)")
             || lower.contains("[y/n]")
+            || line.trim_end().ends_with('?')
         {
             2
         } else if lower.contains("permission") {
@@ -2128,16 +2129,42 @@ fn summarize_stall_tail(tail: &str) -> String {
         // it cannot drag unrelated output into the preview or evict the real
         // choices between two distant matches. Identity + newest content each
         // reserve one slot, and high-value choice/cancel lines win the rest.
-        action_indices.sort_unstable_by(|(idx_a, priority_a), (idx_b, priority_b)| {
-            priority_b.cmp(priority_a).then(idx_b.cmp(idx_a))
-        });
         let mut indices = vec![0, lines.len() - 1];
-        indices.extend(
-            action_indices
-                .into_iter()
-                .take(STALL_REMOTE_TAIL_MAX_LINES - 2)
-                .map(|(idx, _)| idx),
-        );
+        let action_slots = STALL_REMOTE_TAIL_MAX_LINES - 2;
+        let mut choices: Vec<usize> = action_indices
+            .iter()
+            .filter_map(|(idx, priority)| (*priority == 3).then_some(*idx))
+            .collect();
+        let mut context: Vec<usize> = action_indices
+            .iter()
+            .filter_map(|(idx, priority)| (*priority == 2).then_some(*idx))
+            .collect();
+        let mut permission: Vec<usize> = action_indices
+            .drain(..)
+            .filter_map(|(idx, priority)| (priority == 1).then_some(idx))
+            .collect();
+        choices.reverse();
+        context.reverse();
+        permission.reverse();
+
+        // Reserve up to two slots for the question/warning context before
+        // filling with choices. This prevents a long option menu from showing
+        // several answers without the question they answer. If no context was
+        // recognised, retain one permission line as the decision identity.
+        indices.extend(context.into_iter().take(2));
+        if indices.len() == 2 {
+            indices.extend(permission.iter().copied().take(1));
+        }
+        let used_action_slots = indices.len().saturating_sub(2);
+        indices.extend(choices.into_iter().take(action_slots - used_action_slots));
+        let used_action_slots = indices.len().saturating_sub(2);
+        if used_action_slots < action_slots {
+            indices.extend(
+                permission
+                    .into_iter()
+                    .take(action_slots - used_action_slots),
+            );
+        }
         indices.sort_unstable();
         indices.dedup();
         indices
