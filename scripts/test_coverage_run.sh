@@ -284,6 +284,82 @@ PRODUCER
     rm -rf "$sandbox"
 }
 
+# drive_named with an extra PATH prefix (for command seams).
+drive_named_with_path() {
+    local prefix="$1" profiles="$2" named="$3" sandbox out
+    sandbox="$(dirname "$profiles")"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $named: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$prefix:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    echo "$out" | grep -E '^\s*corrupt=' | head -n 1
+}
+
+# ── 19-20. Delimiter-free transport and pinned reads (R5) ───────────────────
+
+# A path may legitimately contain a tab; encoding two paths into one
+# tab-delimited string makes such a profile unreportable.
+test_tab_containing_path_is_reported() {
+    local sandbox line name
+    sandbox="$(new_sandbox)"
+    name="$(printf 'odd\tname-1-2_0.profraw')"
+    printf 'partial' >"$sandbox/profiles/$name"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/$name")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=yes'; then
+        report 0 "a path containing a tab is still reported"
+    else
+        report 1 "a path containing a tab is still reported" "got: $line"
+    fi
+}
+
+# Validation and the metadata reads must not be separately racey: once the
+# target is validated, the bytes reported must come from THAT object even if the
+# name is swapped immediately afterwards.
+test_reads_are_pinned_against_post_validation_swap() {
+    local sandbox line outside shim victim
+    sandbox="$(new_sandbox)"
+    outside="$sandbox/outside-marker.bin"
+    printf 'OUTSIDE-SWAPPED' >"$outside"
+    victim="$sandbox/profiles/victim-2-3_0.profraw"
+    printf 'INNOCENT' >"$victim"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # `wc` appears only in the READ phase (the size measurement), never during
+    # validation, so a swap here lands strictly between the two. `tr` would be
+    # too early: normalize_path uses it while validating.
+    cat >"$shim/wc" <<SHIM
+#!/usr/bin/env bash
+if [ ! -e "$sandbox/.swapped" ]; then
+    : >"$sandbox/.swapped"
+    rm -f "$victim"
+    ln -s "$outside" "$victim" 2>/dev/null
+fi
+exec /usr/bin/wc "\$@"
+SHIM
+    chmod +x "$shim/wc"
+    if ! ln -s "$outside" "$sandbox/.probe" 2>/dev/null || [ ! -L "$sandbox/.probe" ]; then
+        rm -rf "$sandbox"
+        report_skip "reads are pinned against a post-validation swap" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    line="$(drive_named_with_path "$shim" "$sandbox/profiles" "$victim")"
+    rm -rf "$sandbox"
+    # 4f 55 54 53 49 44 45 2d = "OUTSIDE-"
+    if echo "$line" | grep -q '4f 55 54 53 49 44 45 2d'; then
+        report 1 "reads are pinned against a post-validation swap" "outside bytes disclosed: $line"
+    else
+        report 0 "reads are pinned against a post-validation swap"
+    fi
+}
+
 # Membership must be an EXACT match: foo.profraw is not a member merely because
 # the response file lists otherfoo.profraw.
 test_membership_is_exact_not_substring() {
@@ -625,6 +701,8 @@ test_absolute_missing_profile_dir_keeps_its_boundary
 test_relative_missing_profile_dir_under_symlinked_cwd
 test_in_scope_symlink_opens_the_validated_target
 test_validated_target_is_the_one_opened
+test_tab_containing_path_is_reported
+test_reads_are_pinned_against_post_validation_swap
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
