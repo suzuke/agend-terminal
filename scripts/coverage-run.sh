@@ -135,27 +135,73 @@ in_profile_scope() {
 }
 
 # Absolutize against the profile directory, normalize, then judge containment on
-# the physical path that would actually be opened. Prints "<named>\t<final>":
-# `named` is the path as the producer referred to it (used for membership) and
-# `final` is the validated target that callers must open. Empty means "not a
-# path we may touch".
+# the physical path that would actually be opened. Results are returned in
+# globals, NOT as a delimited string: a command substitution cannot carry NUL and
+# any printable delimiter can occur in a valid path (a TAB-containing basename is
+# legal), so nothing is encoded.
+#   RESOLVED_NAMED — the path as the producer referred to it (membership)
+#   RESOLVED_FINAL — the validated target callers must open
+# Returns 0 when in scope, 1 otherwise.
+RESOLVED_NAMED=""
+RESOLVED_FINAL=""
 resolve_in_profile_dir() {
     local candidate="$1" norm final
+    RESOLVED_NAMED=""
+    RESOLVED_FINAL=""
     case "$candidate" in
         /*) ;;
         *) candidate="$profile_dir_abs/$candidate" ;;
     esac
     norm="$(physicalize_best_effort "$candidate")"
-    in_profile_scope "$norm" || { printf ''; return; }
-    # A symlinked LEAF must not escape. The target is validated AND returned:
+    in_profile_scope "$norm" || return 1
+    # A symlinked LEAF must not escape. The target is validated AND handed back:
     # validating one path and then opening another is the gap this closes.
     final="$(resolve_leaf "$norm")"
-    [ -n "$final" ] || { printf ''; return; }
+    [ -n "$final" ] || return 1
     if [ "$final" != "$norm" ]; then
         final="$(physicalize_best_effort "$final")"
-        in_profile_scope "$final" || { printf ''; return; }
+        in_profile_scope "$final" || return 1
     fi
-    printf '%s\t%s' "$norm" "$final"
+    RESOLVED_NAMED="$norm"
+    RESOLVED_FINAL="$final"
+    return 0
+}
+
+# All metadata comes from ONE descriptor opened on the validated target, and the
+# bytes are emitted only after re-confirming that the path still resolves to that
+# same in-scope object. Re-opening the path once per fact is what let a
+# replacement between validation and the reads disclose an outside file.
+# Returns 0 = facts collected, 1 = could not open, 2 = changed during the read.
+FACT_SIZE=""
+FACT_HEADER=""
+FACT_MTIME=""
+read_pinned_facts() {
+    local path="$1" tmp
+    FACT_SIZE=n/a
+    FACT_HEADER=n/a
+    FACT_MTIME=unknown
+    exec 9<"$path" 2>/dev/null || return 1
+    tmp="$(mktemp "${TMPDIR:-/tmp}/coverage-diag.XXXXXX" 2>/dev/null)"
+    if [ -z "$tmp" ]; then
+        exec 9<&-
+        return 1
+    fi
+    # Content is taken through the descriptor, so a later rename/replace of the
+    # NAME cannot change what was read.
+    cat <&9 >"$tmp" 2>/dev/null
+    # mtime from the descriptor where the platform exposes it; otherwise report
+    # `unknown` rather than re-opening a path that may have been replaced.
+    FACT_MTIME="$(date -u -r /dev/fd/9 '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+    if ! resolve_in_profile_dir "$path" || [ "$RESOLVED_FINAL" != "$path" ]; then
+        exec 9<&-
+        rm -f "$tmp"
+        return 2
+    fi
+    exec 9<&-
+    FACT_SIZE="$(wc -c <"$tmp" | tr -d ' ')"
+    FACT_HEADER="$(od -An -tx1 -N8 <"$tmp" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+    rm -f "$tmp"
+    return 0
 }
 
 # The profile directory as an absolute, physical path — the scope boundary every
@@ -206,7 +252,7 @@ module_token() {
 # directory is a different member, and a substring test would call foo.profraw a
 # member because the list happens to hold otherfoo.profraw.
 response_contains_path() {
-    local want="$1" list entry resolved
+    local want="$1" list entry
     for list in "$profile_dir"/*-profraw-list; do
         [ -e "$list" ] || continue
         # `|| [ -n "$entry" ]` so a final entry without a trailing newline is
@@ -214,11 +260,10 @@ response_contains_path() {
         while IFS= read -r entry || [ -n "$entry" ]; do
             entry="$(clean_token "$entry")"
             [ -n "$entry" ] || continue
-            resolved="$(resolve_in_profile_dir "$entry")"
-            [ -n "$resolved" ] || continue
-            # Compare the NAMED half: membership is about the path the response
+            resolve_in_profile_dir "$entry" || continue
+            # Compare the NAMED path: membership is about the path the response
             # file refers to, not the target a link happens to point at.
-            if [ "${resolved%%	*}" = "$want" ]; then
+            if [ "$RESOLVED_NAMED" = "$want" ]; then
                 printf 'yes'
                 return 0
             fi
@@ -228,13 +273,38 @@ response_contains_path() {
 }
 
 describe_named_corrupt() {
-    local token base resolved named path exists size header mtime in_response
+    local token base named path exists size header mtime in_response rc
     token="$(clean_token "$1")"
     base="${token##*/}"
-    resolved="$(resolve_in_profile_dir "$token")"
-    named="${resolved%%	*}"
-    path="${resolved#*	}"
-    if [ -z "$resolved" ]; then
+    if resolve_in_profile_dir "$token"; then
+        named="$RESOLVED_NAMED"
+        path="$RESOLVED_FINAL"
+        read_pinned_facts "$path"
+        rc=$?
+        case "$rc" in
+            0)
+                exists=yes
+                size="$FACT_SIZE"
+                header="$FACT_HEADER"
+                mtime="$FACT_MTIME"
+                ;;
+            2)
+                # The object was replaced between validation and the read; the
+                # honest answer is that we will not attribute bytes to it.
+                exists="changed-during-read"
+                size=n/a
+                header=n/a
+                mtime=n/a
+                ;;
+            *)
+                exists=no
+                size=n/a
+                header=n/a
+                mtime=n/a
+                ;;
+        esac
+        in_response="$(response_contains_path "$named")"
+    else
         # Named, disclosed, and deliberately NOT touched: outside the profile
         # directory (or a parent reference) is not ours to stat or read.
         exists="out-of-scope"
@@ -242,19 +312,6 @@ describe_named_corrupt() {
         header=n/a
         mtime=n/a
         in_response=no
-    else
-        if [ -e "$path" ]; then
-            exists=yes
-            size="$(wc -c <"$path" | tr -d ' ')"
-            header="$(od -An -tx1 -N8 <"$path" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
-            mtime="$(file_mtime "$path")"
-        else
-            exists=no
-            size=n/a
-            header=n/a
-            mtime=n/a
-        fi
-        in_response="$(response_contains_path "$named")"
     fi
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
         "$base" "$exists" "$in_response" "$size" "$header" "$mtime" "$(module_token "$base")"
