@@ -20,14 +20,30 @@ fn self_kick_fixture_with_acceptance(
     DeliveryEnvelope,
     String,
 ) {
+    self_kick_fixture_with_session(tag, accepted, None)
+}
+
+fn self_kick_fixture_with_session(
+    tag: &str,
+    accepted: bool,
+    session_id: Option<&str>,
+) -> (
+    std::path::PathBuf,
+    Arc<ChannelRuntime>,
+    DeliveryEnvelope,
+    String,
+) {
     let home = home(tag);
     let locator = test_published_locator(&home, "claude-agent");
     let runtime = Arc::new(ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime"));
-    let envelope = DeliveryEnvelope::self_kick(
+    let mut envelope = DeliveryEnvelope::self_kick(
         "claude-agent",
         locator,
         crate::agent::fresh_restart_self_kick_prompt(),
     );
+    if let Some(session_id) = session_id {
+        envelope.session.session_id = Some(session_id.to_string());
+    }
     let chat_id = chat_id_for_delivery("claude-agent", envelope.delivery_id);
     runtime
         .remember_inbound(
@@ -46,6 +62,77 @@ fn self_kick_fixture_with_acceptance(
         store.record(receipt).expect("accepted");
     }
     (home, runtime, envelope, chat_id)
+}
+
+#[test]
+fn self_kick_late_ack_after_four_minutes_is_admissible_and_completes() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("late-ack");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let accepted = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    let mut old = accepted;
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::minutes(4)
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64))
+    .to_rfc3339();
+    store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate")
+        .then_some(());
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now()).expect("watchdog"),
+        1
+    );
+    let started = mcp_message(
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+        }),
+        &runtime,
+    )
+    .expect("late start response");
+    assert_eq!(
+        started["result"]["structuredContent"]["state"], "TurnStarted",
+        "an overdue but truthful current-session ack must remain admissible"
+    );
+    let completed = mcp_message(
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"ack_complete","arguments":{"delivery_id":envelope.delivery_id}}
+        }),
+        &runtime,
+    )
+    .expect("late completion response");
+    assert_eq!(
+        completed["result"]["structuredContent"]["state"],
+        "Completed"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn self_kick_ack_rejects_predecessor_session_envelope() {
+    let (home, runtime, envelope, _chat_id) =
+        self_kick_fixture_with_session("predecessor-session", true, Some("old-session"));
+    let response = mcp_message(
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+        }),
+        &runtime,
+    )
+    .expect("predecessor response");
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("session"),
+        "predecessor-session rejection must identify the session mismatch"
+    );
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
@@ -197,12 +284,15 @@ fn self_kick_watchdog_replays_durable_acceptance_and_alerts_once() {
         0
     );
     assert_eq!(
-        store
-            .latest(envelope.delivery_id)
-            .expect("latest")
-            .expect("receipt")
-            .state,
-        DeliveryState::Ambiguous
+        format!(
+            "{:?}",
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state
+        ),
+        "AckOverdue"
     );
     let log = fs::read_to_string(home.join("event-log.jsonl")).expect("event log");
     assert_eq!(log.matches("claude_self_kick_ambiguous").count(), 1);
