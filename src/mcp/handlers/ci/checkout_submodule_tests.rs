@@ -1493,23 +1493,7 @@ fn mangled_for(instance: &str, source: &Path) -> String {
     let source = source
         .canonicalize()
         .unwrap_or_else(|_| source.to_path_buf());
-    let label = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("repo")
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(16)
-        .collect::<String>();
-    let label = if label.is_empty() { "repo" } else { &label };
-    let digest = crate::daemon::utils::sha256_hex(source.display().to_string().as_bytes());
-    format!("{instance}-{label}-{}", &digest[..32])
+    super::checkout_path::bounded_mangled(instance, &source.display().to_string())
 }
 
 /// BLOCKER 1 — a checked PREPARED-save failure is fatal-but-CLEAN: no worktree is
