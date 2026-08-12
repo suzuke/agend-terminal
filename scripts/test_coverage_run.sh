@@ -185,10 +185,73 @@ PRODUCER
     rm -rf "$sandbox"
 }
 
+# ── 5. Named-corrupt relevance ───────────────────────────────────────────────
+# #3236 (run 31619505420): the ordinary listing is capped in GLOB order, so the
+# one path llvm-profdata explicitly named as corrupt fell outside the cap and
+# the evidence block showed ten unrelated valid files instead. A path the
+# producer NAMES must be described regardless of where it sorts.
+test_named_corrupt_path_is_cap_exempt() {
+    local sandbox out rc corrupt
+    sandbox="$(new_sandbox)"
+    corrupt="agend-terminal-56911-14119548425640577428_0.profraw"
+    # Twelve valid files that all sort BEFORE the named one, so a glob-ordered
+    # cap of 10 can never reach it.
+    local i
+    for i in 01 02 03 04 05 06 07 08 09 10 11 12; do
+        printf 'valid-%s' "$i" >"$sandbox/profiles/agend-terminal-1$i-999$i""_0.profraw"
+    done
+    printf 'partial' >"$sandbox/profiles/$corrupt"
+    printf '%s\n' "$sandbox/profiles/$corrupt" >"$sandbox/profiles/agend-terminal-profraw-list"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $sandbox/profiles/$corrupt: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 \
+        "$wrapper" 2>&1)"
+    rc=$?
+
+    local block line missing=""
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -F "$corrupt" | grep -E '^\s*corrupt=' | head -n 1)"
+    [ -n "$line" ] || missing="$missing named-path"
+    if [ -n "$line" ]; then
+        echo "$line" | grep -q 'exists=' || missing="$missing exists"
+        echo "$line" | grep -q 'in_response=' || missing="$missing response-membership"
+        echo "$line" | grep -q 'size_bytes=' || missing="$missing size"
+        echo "$line" | grep -q 'header=' || missing="$missing header"
+        echo "$line" | grep -q 'mtime=' || missing="$missing mtime"
+        echo "$line" | grep -q 'module=' || missing="$missing module-token"
+    fi
+    # It must come BEFORE the ordinary capped listing, not after it.
+    local corrupt_at file_at
+    corrupt_at="$(echo "$block" | grep -nE '^\s*corrupt=' | head -n 1 | cut -d: -f1)"
+    file_at="$(echo "$block" | grep -nE '^\s*file=' | head -n 1 | cut -d: -f1)"
+    if [ -n "$corrupt_at" ] && [ -n "$file_at" ] && [ "$corrupt_at" -gt "$file_at" ]; then
+        missing="$missing precedes-cap"
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        report 1 "named corrupt path is cap-exempt" "wrapper exited 0 on a corrupt failure"
+    elif [ -n "$missing" ]; then
+        report 1 "named corrupt path is cap-exempt" "missing:$missing"
+    else
+        report 0 "named corrupt path is described despite the glob-ordered cap"
+    fi
+    rm -rf "$sandbox"
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
 test_corrupt_failure_emits_bounded_diagnostics
+test_named_corrupt_path_is_cap_exempt
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed"
