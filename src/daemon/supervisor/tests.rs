@@ -70,6 +70,22 @@ fn stall_notice_keeps_choices_when_status_noise_follows_prompt() {
 }
 
 #[test]
+fn stall_notice_does_not_mistake_no_prefix_build_output_for_a_choice() {
+    let mut tail = String::from(
+        "building project\nnote: using cached build directory\nnothing to commit\nnow building\n",
+    );
+    for idx in 0..20 {
+        tail.push_str(&format!("compiling crate-{idx}\n"));
+    }
+    tail.push_str("Continue? [y/N]\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Continue? [y/N]"));
+    assert!(!notice.contains("note: using cached build directory"));
+    assert!(!notice.contains("nothing to commit"));
+}
+
+#[test]
 fn formatted_stall_notice_survives_common_gate_without_second_omission_marker() {
     let tail = format!(
         "{}\nDangerous operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel",

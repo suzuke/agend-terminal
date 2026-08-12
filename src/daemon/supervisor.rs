@@ -2082,15 +2082,20 @@ fn summarize_stall_tail(tail: &str) -> String {
         let lower = line.to_ascii_lowercase();
         let choice = lower
             .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '>' || c == ' ');
+        let first_word = choice
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or_default();
         lower.contains("dangerous")
             || lower.contains("permission")
             || lower.contains("do you want")
             || lower.contains("proceed?")
+            || lower.contains("continue?")
+            || lower.contains("overwrite?")
+            || lower.contains("replace existing")
             || lower.contains("esc to cancel")
             || lower.contains("tab to amend")
-            || ["yes", "no", "allow", "deny"]
-                .iter()
-                .any(|prefix| choice.starts_with(prefix))
+            || matches!(first_word, "yes" | "no" | "allow" | "deny")
     };
     let action_indices: Vec<usize> = lines
         .iter()

@@ -566,7 +566,9 @@ fn truncate_remote_line(line: &str, max_chars: usize, keep_tail: bool) -> String
 }
 
 pub(crate) fn bound_remote_system_notice(message: &str) -> std::borrow::Cow<'_, str> {
-    let normalized = message.replace('\r', "\n");
+    // Collapse CRLF first so replacing remaining bare CR progress updates does
+    // not manufacture an empty line after every ordinary Windows/PTY line.
+    let normalized = message.replace("\r\n", "\n").replace('\r', "\n");
     let line_count = normalized.lines().count();
     if line_count <= REMOTE_SYSTEM_NOTICE_MAX_LINES
         && normalized.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS
@@ -880,6 +882,20 @@ mod tests {
         assert!(bounded.contains("progress 399"));
         assert!(bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES);
         assert!(bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS);
+    }
+
+    #[test]
+    fn remote_system_notice_normalizes_crlf_without_spending_budget_on_blank_lines() {
+        let message = (0..8)
+            .map(|idx| format!("real line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let bounded = bound_remote_system_notice(&message);
+
+        assert_eq!(bounded.lines().count(), 8);
+        assert!(!bounded.lines().any(str::is_empty));
+        assert!(bounded.contains("real line 2"));
+        assert!(bounded.contains("real line 7"));
     }
 
     /// Mock channel that records every `notify` call so tests can pin
