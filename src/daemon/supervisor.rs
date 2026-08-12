@@ -2078,7 +2078,7 @@ fn summarize_stall_tail(tail: &str) -> String {
     }
 
     const OMITTED: &str = "… pane details omitted; open TUI for full context …";
-    let is_action_line = |line: &&str| {
+    let action_priority = |line: &&str| {
         let lower = line.to_ascii_lowercase();
         let choice = lower
             .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '>' || c == ' ');
@@ -2086,22 +2086,35 @@ fn summarize_stall_tail(tail: &str) -> String {
             .split(|c: char| !c.is_ascii_alphabetic())
             .next()
             .unwrap_or_default();
-        lower.contains("dangerous")
-            || lower.contains("permission")
+        if matches!(first_word, "yes" | "no" | "allow" | "deny")
+            || lower.contains("esc to cancel")
+            || lower.contains("tab to amend")
+        {
+            3
+        } else if lower.contains("dangerous")
             || lower.contains("do you want")
             || lower.contains("proceed?")
             || lower.contains("continue?")
             || lower.contains("overwrite?")
             || lower.contains("replace existing")
-            || line.contains('?')
-            || lower.contains("esc to cancel")
-            || lower.contains("tab to amend")
-            || matches!(first_word, "yes" | "no" | "allow" | "deny")
+            || lower.contains("press enter")
+            || lower.contains("(y/n)")
+            || lower.contains("[y/n]")
+        {
+            2
+        } else if lower.contains("permission") {
+            1
+        } else {
+            0
+        }
     };
-    let action_indices: Vec<usize> = lines
+    let mut action_indices: Vec<(usize, u8)> = lines
         .iter()
         .enumerate()
-        .filter_map(|(idx, line)| is_action_line(line).then_some(idx))
+        .filter_map(|(idx, line)| {
+            let priority = action_priority(line);
+            (priority > 0).then_some((idx, priority))
+        })
         .collect();
     let candidate_indices: Vec<usize> = if action_indices.is_empty() {
         let mut indices = vec![0];
@@ -2110,14 +2123,23 @@ fn summarize_stall_tail(tail: &str) -> String {
         indices.dedup();
         indices
     } else {
-        let first = action_indices[0].saturating_sub(1);
-        let last = *action_indices.last().expect("non-empty action indices");
-        let mut indices: Vec<usize> = (first..=last).collect();
-        if indices.len() > STALL_REMOTE_TAIL_MAX_LINES {
-            let tail = indices.split_off(indices.len() - (STALL_REMOTE_TAIL_MAX_LINES - 2));
-            indices.truncate(2);
-            indices.extend(tail);
-        }
+        // Keep the matched action lines themselves, never the contiguous span
+        // between matches. A false positive can then spend at most one slot;
+        // it cannot drag unrelated output into the preview or evict the real
+        // choices between two distant matches. Identity + newest content each
+        // reserve one slot, and high-value choice/cancel lines win the rest.
+        action_indices.sort_unstable_by(|(idx_a, priority_a), (idx_b, priority_b)| {
+            priority_b.cmp(priority_a).then(idx_b.cmp(idx_a))
+        });
+        let mut indices = vec![0, lines.len() - 1];
+        indices.extend(
+            action_indices
+                .into_iter()
+                .take(STALL_REMOTE_TAIL_MAX_LINES - 2)
+                .map(|(idx, _)| idx),
+        );
+        indices.sort_unstable();
+        indices.dedup();
         indices
     };
     let mut remaining = STALL_REMOTE_TAIL_MAX_CHARS.saturating_sub(OMITTED.chars().count() + 1);

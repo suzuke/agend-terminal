@@ -66,7 +66,8 @@ fn stall_notice_keeps_choices_when_status_noise_follows_prompt() {
     assert!(notice.contains("1. Yes"));
     assert!(notice.contains("2. No"));
     assert!(notice.contains("Esc to cancel"));
-    assert!(!notice.contains("status line 11"));
+    assert!(notice.contains("status line 11"));
+    assert!(!notice.contains("status line 10"));
 }
 
 #[test]
@@ -94,7 +95,8 @@ fn stall_notice_anchors_unknown_question_prompt_above_status_noise() {
 
     let notice = format_stall_notice("general", &tail, None);
     assert!(notice.contains("Apply this patch? (y/n)"));
-    assert!(!notice.contains("status line 11"));
+    assert!(notice.contains("status line 11"));
+    assert!(!notice.contains("status line 10"));
 }
 
 #[test]
@@ -108,6 +110,40 @@ fn stall_notice_unrecognized_fallback_keeps_identity_and_latest_tail() {
     assert!(notice.contains("opaque line 0"));
     assert!(notice.contains("opaque line 19"));
     assert!(!notice.contains("opaque line 1\n"));
+}
+
+#[test]
+fn stall_notice_ignores_early_question_mark_in_compiler_output() {
+    let mut tail =
+        String::from("cargo build\nerror[E0277]: the `?` operator requires a Result return type\n");
+    for idx in 0..20 {
+        tail.push_str(&format!("compiling crate-{idx}\n"));
+    }
+    tail.push_str("Press Enter to continue\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Press Enter to continue"));
+    assert!(!notice.contains("error[E0277]"));
+}
+
+#[test]
+fn stall_notice_keeps_choices_despite_trailing_question_mark_url() {
+    let mut tail = String::from(
+        "Dangerous rm operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel\n",
+    );
+    for idx in 0..10 {
+        tail.push_str(&format!("status line {idx}: waiting\n"));
+    }
+    tail.push_str("fetching https://example.com/api?token=secret\n");
+    for idx in 10..14 {
+        tail.push_str(&format!("status line {idx}: waiting\n"));
+    }
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("Esc to cancel"));
+    assert!(!notice.contains("token=secret"));
 }
 
 #[test]
