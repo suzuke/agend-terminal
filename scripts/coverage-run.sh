@@ -248,6 +248,17 @@ read_pinned_facts() {
     FACT_SIZE=n/a
     FACT_HEADER=n/a
     FACT_MTIME=unknown
+    # ONLY REGULAR FILES ARE OPENED. Opening a FIFO for reading blocks until a
+    # writer appears, so a producer-named `*.profraw` FIFO hung the wrapper
+    # forever — in CI a silent step timeout with the evidence block truncated
+    # mid-print, which is strictly worse than a failure and is exactly the
+    # unreadable failure this wrapper exists to remove. `-e` first, so a path
+    # that simply does not exist still falls through to the open and is reported
+    # absent rather than mislabelled. The scratch file below is guarded the same
+    # way, for the same reason.
+    if [ -e "$path" ] && [ ! -f "$path" ]; then
+        return 5
+    fi
     # The redirection is grouped, not suffixed: bash reports a FAILED
     # redirection itself, before a trailing `2>/dev/null` on the same `exec`
     # takes effect, so a missing named path used to print a raw shell error —
@@ -395,7 +406,8 @@ module_token() {
 response_contains_path() {
     local want="$1" list entry
     for list in "$profile_dir"/*-profraw-list; do
-        [ -e "$list" ] || continue
+        # `-f`, not `-e`: a FIFO response file would block this read forever.
+        [ -f "$list" ] || continue
         # `|| [ -n "$entry" ]` so a final entry without a trailing newline is
         # still read.
         while IFS= read -r entry || [ -n "$entry" ]; do
@@ -443,6 +455,16 @@ describe_named_corrupt() {
                 # The object was replaced between validation and the read; the
                 # honest answer is that we will not attribute bytes to it.
                 exists="changed-during-read"
+                size=n/a
+                header=n/a
+                mtime=n/a
+                ;;
+            5)
+                # A FIFO, device or directory. It is there, it is not a profile,
+                # and it was deliberately NOT opened — reading it could block
+                # forever. Reporting what it IS beats reporting bytes it does
+                # not have.
+                exists="not-a-regular-file"
                 size=n/a
                 header=n/a
                 mtime=n/a
@@ -543,6 +565,13 @@ EOF
     local list line count
     for list in "$profile_dir"/*-profraw-list; do
         [ -e "$list" ] || continue
+        # The response file's NAME is producer-controlled by glob, so it can be
+        # a FIFO too — and the count, the listing and the membership read all
+        # open it. Disclosed, never read, never dropped.
+        if [ ! -f "$list" ]; then
+            printf 'response_file=%s lines=n/a\n' "$(escape_field "$list")"
+            continue
+        fi
         count="$( { awk 'END{print NR}' <"$list"; } 2>/dev/null )"
         case "$count" in
             '' | *[!0-9]*) count=n/a ;;
@@ -568,7 +597,12 @@ EOF
             echo "  … more profraw files not shown (cap=$diag_max_files)"
             break
         fi
-        fsize="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
+        # Same rule as the named route: never open a non-regular object.
+        if [ ! -f "$f" ]; then
+            fsize=""
+        else
+            fsize="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
+        fi
         case "$fsize" in
             '' | *[!0-9]*)
                 fsize=n/a
