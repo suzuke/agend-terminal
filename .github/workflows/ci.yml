@@ -328,8 +328,17 @@ jobs:
       checks: write
       issues: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Cargo audit gate
+        run: cargo audit
+      - name: RustSec advisory report
+        if: always()
+        continue-on-error: true
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # The action gate still BLOCKS on any real vulnerability — these are
