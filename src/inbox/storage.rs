@@ -1096,6 +1096,7 @@ pub struct AckOutcome {
 /// reclaim/session reset when `delivery_count > 0` proves prior delivery.
 /// Untargeted ack remains conservative and settles ONLY currently delivering
 /// rows, so it cannot discard a never-delivered message.
+#[allow(dead_code)]
 pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     ack_with_outcome(home, name, msg_id).acked
 }
@@ -1399,6 +1400,7 @@ pub fn requeue_delivering_for_session_reset(home: &Path, name: &str) -> usize {
 
 /// Backwards-compatible name for callers compiled against the pre-#3228 API.
 /// Session reset no longer acknowledges rows; it preserves and requeues them.
+#[allow(dead_code)]
 pub fn settle_delivering_for_session_reset(home: &Path, name: &str) -> usize {
     requeue_delivering_for_session_reset(home, name)
 }
