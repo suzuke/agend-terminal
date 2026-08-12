@@ -15,6 +15,15 @@ wrapper="$script_dir/coverage-run.sh"
 
 pass=0
 fail=0
+skip=0
+
+# A property this platform cannot exercise is SKIPPED, never silently passed:
+# a green count that includes an unverifiable property is a false green.
+report_skip() {
+    echo "SKIP  $1"
+    [ -n "${2:-}" ] && echo "      $2"
+    skip=$((skip + 1))
+}
 
 report() {
     local ok="$1" label="$2" detail="${3:-}"
@@ -442,7 +451,16 @@ test_symlink_leaf_cannot_escape_containment() {
     sandbox="$(new_sandbox)"
     outside="$sandbox/secret.bin"
     printf 'OUTSIDEBYTES' >"$outside"
-    ln -s "$outside" "$sandbox/profiles/leaf-1-2_0.profraw"
+    ln -s "$outside" "$sandbox/profiles/leaf-1-2_0.profraw" 2>/dev/null
+    # Git Bash on Windows defaults to MSYS winsymlinks=copy, so `ln -s` yields a
+    # regular file. There is then no symlink to contain and `exists=yes` is the
+    # truthful answer — the premise, not the property, is unavailable.
+    if [ ! -L "$sandbox/profiles/leaf-1-2_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "a symlinked leaf cannot escape containment" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/leaf-1-2_0.profraw")"
     rm -rf "$sandbox"
     if echo "$line" | grep -q 'exists=out-of-scope' && ! echo "$line" | grep -qi '4f 55 54 53 49 44 45'; then
@@ -495,5 +513,5 @@ test_symlink_leaf_cannot_escape_containment
 test_absolute_missing_profile_dir_keeps_its_boundary
 
 echo
-echo "coverage-run contract: $pass passed, $fail failed"
+echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
