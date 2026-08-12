@@ -127,6 +127,11 @@ Bind the fleet to a Telegram group for remote control (send messages to
 agents from your phone) and outbound notifications (stall / crash / CI
 alerts pushed back to the group).
 
+System notifications are filtered by operator actionability; full pane and
+command transcripts stay local. See
+[`REMOTE-NOTIFICATION-POLICY.md`](REMOTE-NOTIFICATION-POLICY.md) for the
+complete Telegram/Discord delivery inventory and severity rules.
+
 ### Minimum config
 
 ```yaml

@@ -2044,6 +2044,55 @@ enum NoticeAction {
     Recovered,
 }
 
+/// Remote channels are an operator decision surface, not a pane transcript.
+/// Keep enough of the *latest* prompt chrome to make the decision (warning,
+/// choices, cancel hint), while leaving the full command/output in the TUI.
+const STALL_REMOTE_TAIL_MAX_CHARS: usize = 820;
+const STALL_REMOTE_TAIL_MAX_LINES: usize = 10;
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn summarize_stall_tail(tail: &str) -> String {
+    let lines: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let full_chars: usize = lines.iter().map(|line| line.chars().count() + 1).sum();
+    if lines.len() <= STALL_REMOTE_TAIL_MAX_LINES && full_chars <= STALL_REMOTE_TAIL_MAX_CHARS {
+        return lines.join("\n");
+    }
+
+    const OMITTED: &str = "… pane details omitted; open TUI for full context …";
+    let mut remaining = STALL_REMOTE_TAIL_MAX_CHARS.saturating_sub(OMITTED.chars().count() + 1);
+    let mut kept = Vec::new();
+    for line in lines.iter().rev().take(STALL_REMOTE_TAIL_MAX_LINES) {
+        if remaining == 0 {
+            break;
+        }
+        let line_budget = remaining.saturating_sub(1);
+        let compact = truncate_chars(line, line_budget);
+        remaining = remaining.saturating_sub(compact.chars().count() + 1);
+        kept.push(compact);
+    }
+    kept.reverse();
+    if kept.is_empty() {
+        OMITTED.to_string()
+    } else {
+        format!("{OMITTED}\n{}", kept.join("\n"))
+    }
+}
+
 /// Build the Telegram notice shown when an agent is blocked on an interactive
 /// prompt. `silent_secs = Some` for the AwaitingOperator time-based fallback
 /// (reports how long the agent has been quiet); `None` for pattern-matched
@@ -2053,6 +2102,7 @@ fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> Stri
         Some(s) => format!("⚠️ {name} 靜默 {s}s，可能卡在互動 prompt"),
         None => format!("⚠️ {name} 卡在互動 prompt"),
     };
+    let tail = summarize_stall_tail(tail);
     format!(
         "{header}\n\
          ────────\n\
