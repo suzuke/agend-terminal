@@ -39,8 +39,8 @@ Discord by the notification layer:
 
 - `gated_notify` is the common authorization and operator-mode gate for system
   notifications. An absent/empty channel allowlist fails closed. It also applies
-  credential redaction for common `token`, API-key, password, authorization,
-  and credential assignment forms, then applies
+  best-effort credential redaction for common `token`, API-key, password,
+  authorization, and credential assignment forms in system notices, then applies
   a final 12-line / 1,200-character safety bound, retaining the opening event
   identity and latest action surface when an emitter accidentally supplies a
   transcript-sized body.

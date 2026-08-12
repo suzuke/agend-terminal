@@ -175,6 +175,25 @@ fn stall_notice_reserves_context_when_many_choices_compete_for_slots() {
 }
 
 #[test]
+fn stall_notice_does_not_spend_choice_slots_on_duplicate_identity_lines() {
+    let tail = "Dangerous rm operation\n\
+Do you want to proceed?\n\
+status: waiting\n\
+1. Yes\n\
+2. No\n\
+3. Allow\n\
+4. Deny\n\
+Esc to cancel\n";
+
+    let notice = format_stall_notice("general", tail, None);
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("Do you want to proceed?"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("Esc to cancel"));
+}
+
+#[test]
 fn formatted_stall_notice_survives_common_gate_without_second_omission_marker() {
     let tail = format!(
         "{}\nDangerous operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel",

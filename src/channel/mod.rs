@@ -548,14 +548,16 @@ fn redact_remote_system_notice_secrets(message: &str) -> std::borrow::Cow<'_, st
     static COLON_SECRET: OnceLock<regex::Regex> = OnceLock::new();
     static EQUALS_SECRET: OnceLock<regex::Regex> = OnceLock::new();
     static BEARER_SECRET: OnceLock<regex::Regex> = OnceLock::new();
-    const KEY: &str = r"(?:api[_-]?key|token|secret|password|passwd|authorization|credential)";
+    const KEY: &str = r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|passwd|authorization|credential)(?:[_-][A-Za-z0-9]+)*";
 
     let colon_secret = COLON_SECRET.get_or_init(|| {
-        regex::Regex::new(&format!(r"(?im)\b({KEY})\s*:\s*[^\r\n]*"))
-            .expect("remote colon-secret regex must compile")
+        regex::Regex::new(&format!(
+            r#"(?im)(^|[^A-Za-z0-9_-])(["']?)({KEY})["']?\s*:\s*[^\r\n]*"#
+        ))
+        .expect("remote colon-secret regex must compile")
     });
     let equals_secret = EQUALS_SECRET.get_or_init(|| {
-        regex::Regex::new(&format!(r"(?i)\b({KEY})\s*=\s*[^\s&;,]+"))
+        regex::Regex::new(&format!(r"(?i)(^|[^A-Za-z0-9_-])({KEY})\s*=\s*[^\r\n&;,]+"))
             .expect("remote equals-secret regex must compile")
     });
     let bearer_secret = BEARER_SECRET.get_or_init(|| {
@@ -563,8 +565,8 @@ fn redact_remote_system_notice_secrets(message: &str) -> std::borrow::Cow<'_, st
             .expect("remote bearer-secret regex must compile")
     });
 
-    let redacted = colon_secret.replace_all(message, "$1: ***REDACTED***");
-    let redacted = equals_secret.replace_all(redacted.as_ref(), "$1=***REDACTED***");
+    let redacted = colon_secret.replace_all(message, "$1$2$3$2: ***REDACTED***");
+    let redacted = equals_secret.replace_all(redacted.as_ref(), "$1$2=***REDACTED***");
     let redacted = bearer_secret.replace_all(redacted.as_ref(), "Bearer ***REDACTED***");
     if redacted == message {
         std::borrow::Cow::Borrowed(message)
@@ -1065,6 +1067,45 @@ the token was rotated; press Enter to continue";
         assert!(!delivered.contains("SECRET5DEADBEEF"));
         assert!(!delivered.contains("abc.def"));
         assert!(!delivered.contains("local-secret"));
+    }
+
+    #[test]
+    fn gated_notify_redacts_prefixed_environment_credentials_without_benign_suffix_matches() {
+        let ch = RecordingChannel::new(true);
+        let message = "export GITHUB_TOKEN=ghp_ABC123DEADBEEF\n\
+export OPENAI_API_KEY=sk-proj-ABC123DEADBEEF\n\
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG\n\
+refresh_token=oauth-refresh-value\n\
+MONKEY=banana";
+
+        gated_notify(&ch, "agent1", NotifySeverity::Error, message, false)
+            .expect("authorized notice should be delivered");
+
+        let delivered = ch.message().expect("authorized notice must be recorded");
+        assert!(delivered.contains("GITHUB_TOKEN=***REDACTED***"));
+        assert!(delivered.contains("OPENAI_API_KEY=***REDACTED***"));
+        assert!(delivered.contains("AWS_SECRET_ACCESS_KEY=***REDACTED***"));
+        assert!(delivered.contains("refresh_token=***REDACTED***"));
+        assert!(delivered.contains("MONKEY=banana"));
+        assert!(!delivered.contains("ghp_ABC123DEADBEEF"));
+        assert!(!delivered.contains("sk-proj-ABC123DEADBEEF"));
+        assert!(!delivered.contains("wJalrXUtnFEMIK7MDENG"));
+        assert!(!delivered.contains("oauth-refresh-value"));
+    }
+
+    #[test]
+    fn gated_notify_redacts_json_keys_and_complete_values_with_spaces() {
+        let ch = RecordingChannel::new(true);
+        let message = "{\"token\": \"json-secret\"}\npassword = \"hunter secret tail\"";
+
+        gated_notify(&ch, "agent1", NotifySeverity::Error, message, false)
+            .expect("authorized notice should be delivered");
+
+        let delivered = ch.message().expect("authorized notice must be recorded");
+        assert!(delivered.contains("\"token\": ***REDACTED***"));
+        assert!(delivered.contains("password=***REDACTED***"));
+        assert!(!delivered.contains("json-secret"));
+        assert!(!delivered.contains("hunter secret tail"));
     }
 
     #[test]

@@ -2129,8 +2129,7 @@ fn summarize_stall_tail(tail: &str) -> String {
         // it cannot drag unrelated output into the preview or evict the real
         // choices between two distant matches. Identity + newest content each
         // reserve one slot, and high-value choice/cancel lines win the rest.
-        let mut indices = vec![0, lines.len() - 1];
-        let action_slots = STALL_REMOTE_TAIL_MAX_LINES - 2;
+        let mut indices = std::collections::BTreeSet::from([0, lines.len() - 1]);
         let mut choices: Vec<usize> = action_indices
             .iter()
             .filter_map(|(idx, priority)| (*priority == 3).then_some(*idx))
@@ -2151,23 +2150,32 @@ fn summarize_stall_tail(tail: &str) -> String {
         // filling with choices. This prevents a long option menu from showing
         // several answers without the question they answer. If no context was
         // recognised, retain one permission line as the decision identity.
-        indices.extend(context.into_iter().take(2));
-        if indices.len() == 2 {
-            indices.extend(permission.iter().copied().take(1));
+        let mut context_count = 0;
+        for idx in context {
+            if context_count == 2 {
+                break;
+            }
+            indices.insert(idx);
+            context_count += 1;
         }
-        let used_action_slots = indices.len().saturating_sub(2);
-        indices.extend(choices.into_iter().take(action_slots - used_action_slots));
-        let used_action_slots = indices.len().saturating_sub(2);
-        if used_action_slots < action_slots {
-            indices.extend(
-                permission
-                    .into_iter()
-                    .take(action_slots - used_action_slots),
-            );
+        if context_count == 0 {
+            if let Some(idx) = permission.first() {
+                indices.insert(*idx);
+            }
         }
-        indices.sort_unstable();
-        indices.dedup();
-        indices
+        for idx in choices {
+            if indices.len() == STALL_REMOTE_TAIL_MAX_LINES {
+                break;
+            }
+            indices.insert(idx);
+        }
+        for idx in permission {
+            if indices.len() == STALL_REMOTE_TAIL_MAX_LINES {
+                break;
+            }
+            indices.insert(idx);
+        }
+        indices.into_iter().collect()
     };
     let mut remaining = STALL_REMOTE_TAIL_MAX_CHARS.saturating_sub(OMITTED.chars().count() + 1);
     let mut kept = Vec::new();

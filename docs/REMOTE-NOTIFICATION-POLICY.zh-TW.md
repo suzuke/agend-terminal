@@ -36,8 +36,9 @@ Telegram 與 Discord 是遠端操作者介面，只應顯示回覆操作者要�
 ## 路由規則
 
 - `gated_notify` 是系統通知共用的 authorization 與 operator-mode gate。
-  Channel allowlist 缺漏或為空時會 fail closed。它會先遮蔽常見的 `token`、
-  API key、password、authorization 與 credential assignment，再套用最後一道 12 行／
+  Channel allowlist 缺漏或為空時會 fail closed。它會先對 system notice 進行
+  best-effort 遮蔽，處理常見的 `token`、API key、password、authorization 與
+  credential assignment，再套用最後一道 12 行／
   1,200 字元保護：若 emitter 誤傳 transcript 大小的內容，會保留事件開頭與
   最新操作介面。
 - `Sleep` 只接收 Error；`Away` 接收 Warn 與 Error；`Active` 接收所有嚴重度。
