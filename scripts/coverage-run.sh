@@ -85,6 +85,19 @@ escape_field() {
     printf '%s' "$s"
 }
 
+# `diag_max_files` is used bare as an integer (`[ … -ge … ]`) and as `head -n`,
+# so an operator typo used to print bash's own errors — unframed — inside the
+# evidence group, once per file, and silently drop every response line. A cap
+# below 1 is meaningless here: it would disclose a truncation marker for a
+# listing it never started.
+case "$diag_max_files" in
+    '' | *[!0-9]*) diag_max_files=0 ;;
+esac
+if [ "$diag_max_files" -lt 1 ]; then
+    echo "::warning::COVERAGE_DIAG_MAX_FILES=$(escape_field "${COVERAGE_DIAG_MAX_FILES-}") is not a positive integer; using 10"
+    diag_max_files=10
+fi
+
 # Lexical path normalization: collapse empty and `.` components and resolve a
 # component that IS `..`. No filesystem access and no symlink following, so a
 # name that merely CONTAINS dots (`weird..name.profraw`) stays a normal
@@ -239,7 +252,10 @@ read_pinned_facts() {
     if [ -z "$tmp" ] || [ -L "$tmp" ] || [ ! -f "$tmp" ]; then
         exec 9<&-
         [ -n "$tmp" ] && [ ! -L "$tmp" ] && rm -f "$tmp"
-        return 1
+        # 4, not 1: OUR scratch failed. That says nothing whatever about the
+        # target, and reporting it as a property of the target would be a fact
+        # invented from a read that never happened.
+        return 4
     fi
     # Content is taken through the descriptor, so a later rename/replace of the
     # NAME cannot change what was read. A failed copy is a FAILED read — never
@@ -258,9 +274,16 @@ read_pinned_facts() {
         return 2
     fi
     exec 9<&-
-    FACT_SIZE="$(wc -c <"$tmp" | tr -d ' ')"
-    FACT_HEADER="$(od -An -tx1 -N8 <"$tmp" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+    FACT_SIZE="$( { wc -c <"$tmp"; } 2>/dev/null | tr -d ' ')"
+    FACT_HEADER="$( { od -An -tx1 -N8 <"$tmp"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
     rm -f "$tmp"
+    # `od` prints nothing at all for an empty file, so a 0-byte profile used to
+    # report `header=` blank here while the survey reported `header=n/a` for the
+    # same file. An empty field is a fabricated fact on either route.
+    case "$FACT_SIZE" in
+        '' | *[!0-9]*) FACT_SIZE=n/a ;;
+    esac
+    [ -n "$FACT_HEADER" ] || FACT_HEADER=n/a
     return 0
 }
 
@@ -293,10 +316,28 @@ clean_token() {
 # without broadening the match to unrelated text.
 CORRUPTION_PHRASES='invalid instrumentation profile data|malformed instrumentation profile data|truncated profile data|raw profile'
 
-named_corrupt_paths() {
+named_corrupt_paths_raw() {
     [ -f "$log" ] || return 0
     sed -nE "s/^[[:space:]]*warning:[[:space:]]*\"?(.+\.profraw)\"?:[[:space:]]*($CORRUPTION_PHRASES).*/\\1/p" \
-        "$log" 2>/dev/null | awk '!seen[$0]++'
+        "$log" 2>/dev/null
+}
+
+named_corrupt_paths() {
+    named_corrupt_paths_raw | awk '!seen[$0]++'
+}
+
+# How many warning lines the parser actually understood — counted BEFORE the
+# dedupe. The unparseable accounting compares warnings against this, not
+# against the number of distinct paths: a producer that names the same path
+# twice yields two warnings and one path, and subtracting those invented a
+# second, unparseable path that never existed.
+count_parsed_warnings() {
+    local n
+    n="$(named_corrupt_paths_raw | awk 'END{print NR}')"
+    case "$n" in
+        '' | *[!0-9]*) n=0 ;;
+    esac
+    printf '%s' "$n"
 }
 
 # How many corruption warnings the producer emitted, so a path the line-oriented
@@ -388,8 +429,23 @@ describe_named_corrupt() {
                 header=n/a
                 mtime=n/a
                 ;;
+            4)
+                # Our scratch file could not be created. We learned nothing
+                # about the target, so we assert nothing about it.
+                exists="undetermined"
+                size=n/a
+                header=n/a
+                mtime=n/a
+                ;;
             *)
-                exists=no
+                # The open failed. "Not there" and "there but not openable" are
+                # different facts, and reporting the second as the first
+                # asserts absence for a file the survey below lists by name.
+                if [ -e "$path" ]; then
+                    exists="unreadable"
+                else
+                    exists=no
+                fi
                 size=n/a
                 header=n/a
                 mtime=n/a
@@ -431,12 +487,16 @@ emit_diagnostics() {
     done <<EOF
 $(named_corrupt_paths)
 EOF
-    local warned
+    local warned parsed
     warned="$(count_corruption_warnings)"
-    if [ "$warned" -gt "$named" ]; then
+    parsed="$(count_parsed_warnings)"
+    if [ "$warned" -gt "$parsed" ]; then
         # Every corruption warning must be accounted for. A name the parser
-        # cannot represent is disclosed as unparseable, never dropped.
-        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown count=$((warned - named))"
+        # cannot represent is disclosed as unparseable, never dropped. The
+        # comparison is against PARSED warning lines, not distinct paths —
+        # `named` is deduped, so using it invented an unparseable path whenever
+        # the producer named the same file twice.
+        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown count=$((warned - parsed))"
     elif [ "$named" -eq 0 ]; then
         echo "  (producer named no corrupt profile path)"
     fi
@@ -505,6 +565,19 @@ EOF
 # Verified afterwards — an unverified clean is how a retry ends up merging a
 # previous attempt's output.
 isolate_attempt_outputs() {
+    # Nothing produced yet is nothing to isolate — the producer creates this
+    # directory during the run.
+    [ -d "$profile_dir" ] || return 0
+    # FAIL CLOSED when the directory cannot be listed. `find` failing and `find`
+    # matching nothing both count zero, so an unlistable directory — where the
+    # `rm` below silently does nothing — used to report successful isolation and
+    # the wrapper retried against state nobody had verified. This is the
+    # cross-attempt safety gate; an unverifiable clean is not a clean.
+    if [ ! -r "$profile_dir" ] || [ ! -x "$profile_dir" ]; then
+        printf '::error::coverage cannot isolate attempts: profile directory %s cannot be listed\n' \
+            "$(escape_field "$profile_dir")"
+        return 1
+    fi
     rm -f "$profile_dir"/*.profraw 2>/dev/null
     local leftover
     # One line PER MATCH, not the matched names: `find … | wc -l` counts lines,
