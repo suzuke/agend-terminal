@@ -1,8 +1,12 @@
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const AUDIT_CONFIG: &str = include_str!("../.cargo/audit.toml");
 
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn audit_job_from(workflow: &str) -> String {
-    let normalized = workflow.replace("\r\n", "\n");
+    let normalized = normalize_line_endings(workflow);
     normalized
         .split_once("\n  audit:\n")
         .and_then(|(_, rest)| rest.split_once("\n  coverage:\n"))
@@ -89,7 +93,7 @@ fn audit_gate_is_separate_from_best_effort_reporting() {
 
 #[test]
 fn audit_config_documents_local_and_ci_authority() {
-    let config = AUDIT_CONFIG.replace("\n# ", " ");
+    let config = normalize_line_endings(AUDIT_CONFIG).replace("\n# ", " ");
     assert!(
         config.contains("local and authoritative CI `cargo audit` runs"),
         "audit policy must document both local and authoritative CI cargo audit"
@@ -101,5 +105,15 @@ fn audit_config_documents_local_and_ci_authority() {
     assert!(
         !config.contains("LOCAL `cargo audit` runs"),
         "audit policy must not claim it is local-only"
+    );
+}
+
+#[test]
+fn audit_config_matching_normalizes_crlf() {
+    let crlf_config = normalize_line_endings(AUDIT_CONFIG).replace('\n', "\r\n");
+    let config = normalize_line_endings(&crlf_config).replace("\n# ", " ");
+    assert!(
+        config.contains("local and authoritative CI `cargo audit` runs"),
+        "CRLF audit config input must be normalized before matching"
     );
 }
