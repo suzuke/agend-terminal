@@ -439,6 +439,216 @@ PRODUCER
     fi
 }
 
+# ── 30-34. The reads BEHIND the fields (adversarial review of the framing) ───
+# Framing the field is only half of it. The commands that produce the numbers
+# printed beside that field open producer-controlled paths too, and a failed
+# open leaks the shell's own path-bearing message into the group — the same
+# defect as the `exec` one, in the survey rather than the named route.
+
+# Skip helper: a mode-000 file is readable anyway as root, and on a platform
+# without POSIX mode bits. Then the premise, not the property, is unavailable.
+cannot_make_unreadable() {
+    local probe="$1/unreadable-probe.bin"
+    printf 'probe' >"$probe"
+    chmod 000 "$probe" 2>/dev/null
+    if cat "$probe" >/dev/null 2>&1; then
+        chmod 644 "$probe" 2>/dev/null
+        rm -f "$probe"
+        return 0
+    fi
+    chmod 644 "$probe" 2>/dev/null
+    rm -f "$probe"
+    return 1
+}
+
+# `wc -c <"$f"` has NO stderr redirect and `od … <"$f" 2>/dev/null` applies its
+# redirect too late, so an unopenable .profraw prints bash's own message —
+# carrying the path, unframed — into the block. It also leaves `size_bytes=`
+# EMPTY, fabricating a blank fact from a read that did not happen.
+test_unreadable_profraw_emits_no_raw_shell_error() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    if cannot_make_unreadable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "an unreadable profraw emits no raw shell error" \
+            "this user can read a mode-000 file; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+name="$(printf 'boom-1-1_0.profraw\n  corrupt=FORGEDCORRUPT exists=yes in_response=yes\ntail-9-9_0.profraw')"
+printf 'x' >"$COVERAGE_PROFILE_DIR/$name"
+chmod 000 "$COVERAGE_PROFILE_DIR/$name"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -E '^[[:space:]]*file=boom-1-1_0' | head -n 1)"
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad premise-not-surveyed"
+    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDCORRUPT' && bad="$bad forged-record"
+    # A read that did not happen is `n/a`, never an empty field.
+    echo "$line" | grep -qE 'size_bytes=[[:space:]]*$|size_bytes= ' && bad="$bad blank-size"
+    echo "$line" | grep -q 'size_bytes=n/a' || bad="$bad size-not-na"
+    if [ -n "$bad" ]; then
+        report 1 "an unreadable profraw emits no raw shell error" "issues:$bad; got: $line"
+    else
+        report 0 "an unreadable profraw emits no raw shell error"
+    fi
+}
+
+# Same class on the response file: `awk … <"$list"` for the count, `head` for
+# the fragments, and `response_contains_path` reads it again for membership.
+test_unreadable_response_file_emits_no_raw_shell_error() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    if cannot_make_unreadable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "an unreadable response file emits no raw shell error" \
+            "this user can read a mode-000 file; premise unavailable"
+        return
+    fi
+    # The named warning makes membership run against the unreadable list too.
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+printf 'anything\n' >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+chmod 000 "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -E '^response_file=' | head -n 1)"
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad premise-no-response-line"
+    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$line" | grep -qE 'lines=[[:space:]]*$' && bad="$bad blank-count"
+    echo "$line" | grep -q 'lines=n/a' || bad="$bad count-not-na"
+    if [ -n "$bad" ]; then
+        report 1 "an unreadable response file emits no raw shell error" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "an unreadable response file emits no raw shell error"
+    fi
+}
+
+# `find … | wc -l` counts LINES and calls them FILES — the same untruthful
+# labelling as `entries=`, in the isolation error. One surviving profraw whose
+# name holds two newlines is reported as three files.
+test_isolation_counts_files_not_lines() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+name="$(printf 'leftover-1-1_0.profraw\nsecond-line\nthird-9-9_0.profraw')"
+printf 'x' >"$COVERAGE_PROFILE_DIR/$name"
+# Make the directory unwritable so the wrapper's `rm -f` cannot remove it and
+# the isolation check has something to count.
+chmod 500 "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    # Premise: the isolation failure must actually have fired. Where mode bits
+    # do not stop `rm` (Git Bash), it does not — that is a premise gap.
+    if ! echo "$out" | grep -q 'cannot isolate attempts'; then
+        report_skip "the isolation error counts files, not lines" \
+            "cleanup succeeded despite a read-only directory; premise unavailable"
+        return
+    fi
+    echo "$out" | grep -qE 'cannot isolate attempts: 1 \.profraw' || bad="$bad wrong-count"
+    if [ -n "$bad" ]; then
+        report 1 "the isolation error counts files, not lines" \
+            "issues:$bad; got: $(echo "$out" | grep 'cannot isolate attempts' | head -1)"
+    else
+        report 0 "the isolation error counts files, not lines"
+    fi
+}
+
+# The profraw survey discloses its cap; the response listing silently dropped
+# everything past it, so `lines=` and the rendered fragments disagreed with no
+# explanation.
+test_response_truncation_is_disclosed() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+i=1
+: >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+while [ "$i" -le 5 ]; do
+  printf '%s/entry-%s-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" "$i" \
+      >>"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+  i=$((i + 1))
+done
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        COVERAGE_DIAG_MAX_FILES=2 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    local shown
+    shown="$(echo "$block" | grep -c 'response_line=')"
+    echo "$block" | grep -q 'lines=5' || bad="$bad premise-wrong-count"
+    [ "$shown" -eq 2 ] || bad="$bad expected-2-shown-got-$shown"
+    echo "$block" | grep -qi 'more response lines not shown' || bad="$bad no-truncation-marker"
+    if [ -n "$bad" ]; then
+        report 1 "response-line truncation is disclosed" "issues:$bad"
+    else
+        report 0 "response-line truncation is disclosed"
+    fi
+}
+
+# A control byte the escaper cannot name must not be rendered as a character a
+# real path can also contain: `?` for ESC is indistinguishable from a literal
+# `?`. Backslash is escaped first, so `\?` can only mean "a control byte was
+# here" and a literal `?` stays itself.
+test_residual_control_byte_is_unambiguous() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+name="$(printf 'esc-1-1\033x-and-?-literal_0.profraw')"
+printf 'x' >"$COVERAGE_PROFILE_DIR/$name"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -E '^[[:space:]]*file=esc-1-1' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad premise-not-surveyed"
+    echo "$line" | grep -qF 'esc-1-1\?x-and-?-literal_0.profraw' || bad="$bad not-distinguishable"
+    if [ -n "$bad" ]; then
+        report 1 "a residual control byte is escaped unambiguously" "issues:$bad; got: $line"
+    else
+        report 0 "a residual control byte is escaped unambiguously"
+    fi
+}
+
 # ── 24-27. Record framing: no field may forge a record (d-…191530082822-11) ──
 # The evidence block is LINE-ORIENTED, so any path- or command-bearing field
 # emitted raw can carry a newline and print further lines that read as further
@@ -1000,6 +1210,11 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_unreadable_profraw_emits_no_raw_shell_error
+test_unreadable_response_file_emits_no_raw_shell_error
+test_isolation_counts_files_not_lines
+test_response_truncation_is_disclosed
+test_residual_control_byte_is_unambiguous
 test_newline_field_cannot_forge_records
 test_response_count_is_labelled_by_lines
 test_response_file_name_cannot_forge_records
