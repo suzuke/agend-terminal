@@ -57,7 +57,7 @@ pub(super) fn deliver_self_kick(
         let legacy_called_by_closure = Arc::clone(&legacy_called);
         let target_for_legacy = target.clone();
         let prompt = prompt.to_string();
-        let receipt = crate::transport::deliver_notification(
+        let receipt = crate::transport::deliver_self_kick_notification(
             home,
             target.name.as_str(),
             &prompt,

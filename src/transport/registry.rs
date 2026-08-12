@@ -431,6 +431,21 @@ fn envelope_for_mode(
     ))
 }
 
+fn self_kick_envelope_for_mode(
+    home: &Path,
+    instance: &str,
+    body: &str,
+    mode: TransportMode,
+) -> anyhow::Result<DeliveryEnvelope> {
+    let backend = backend_for_instance(home, instance);
+    let locator = if mode == TransportMode::ChannelBridge {
+        super::claude_channel::prepare_claude_channel(home, instance)?
+    } else {
+        locator_for_instance(home, instance, backend.as_ref(), mode)?
+    };
+    Ok(DeliveryEnvelope::self_kick(instance, locator, body))
+}
+
 /// Wait only for the fresh-spawn ChannelBridge publication/health window.
 /// Callers must do this before acquiring the keyed transport lane: ordinary
 /// queued notifications stay fail-fast, and same-agent teardown is never
@@ -480,12 +495,45 @@ pub(crate) fn deliver_notification<F>(
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
+    deliver_notification_kind(home, instance, body, false, legacy_injector)
+}
+
+/// Deliver the fresh-restart self-kick through the same exact-target and keyed
+/// transport lane as ordinary notifications, while persisting the distinct
+/// consumer-ack contract in the envelope. Structured failures still never
+/// fall through to PTY.
+pub(crate) fn deliver_self_kick_notification<F>(
+    home: &Path,
+    instance: &str,
+    body: &str,
+    legacy_injector: F,
+) -> anyhow::Result<DeliveryReceipt>
+where
+    F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
+{
+    deliver_notification_kind(home, instance, body, true, legacy_injector)
+}
+
+fn deliver_notification_kind<F>(
+    home: &Path,
+    instance: &str,
+    body: &str,
+    self_kick: bool,
+    legacy_injector: F,
+) -> anyhow::Result<DeliveryReceipt>
+where
+    F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
+{
     #[cfg(test)]
     if let Some(result) = test_support::run_delivery_hook(home, instance, body) {
         return result;
     }
     let mode = mode_for_instance(home, instance);
-    let envelope = envelope_for_mode(home, instance, body, mode)?;
+    let envelope = if self_kick {
+        self_kick_envelope_for_mode(home, instance, body, mode)?
+    } else {
+        envelope_for_mode(home, instance, body, mode)?
+    };
     match mode {
         TransportMode::NativeShared => match envelope.session.backend.as_str() {
             "codex" => {

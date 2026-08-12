@@ -47,6 +47,7 @@ pub(crate) mod canonical_heartbeat;
 pub(crate) mod check_schedules;
 pub(crate) mod checkout_txn_recover;
 pub(crate) mod ci_watch_poll;
+pub(crate) mod claude_self_kick;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
 pub(crate) mod context_thresholds;
@@ -82,6 +83,7 @@ pub(crate) use assignment_reconcile::AssignmentReconcileHandler;
 pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
+pub(crate) use claude_self_kick::ClaudeSelfKickHandler;
 pub(crate) use context_thresholds::ContextThresholdsHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
@@ -506,6 +508,11 @@ pub(crate) fn build_default_handlers(
         // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty
         // map); claude-only in practice (arm self-gates on hook history).
         Box::new(InjectDeliveryHandler::new(1)),
+        // #3230 Claude ChannelBridge self-kick watchdog: replay durable
+        // ProtocolAccepted rows after daemon/bridge restart and emit exactly
+        // one Ambiguous alert when the consumer never acknowledges the exact
+        // delivery id. It never retries or infers a turn from timing/hooks.
+        Box::new(ClaudeSelfKickHandler::new(1)),
         // ── W1.1 (#2050): the 12 trackers migrated from the supervisor
         // `run_loop` (supervisor.rs:384-395). Appended in their original
         // relative order; each self-throttles internally (TICKS_PER_SCAN), so
