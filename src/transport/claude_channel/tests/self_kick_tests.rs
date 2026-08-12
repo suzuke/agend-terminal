@@ -295,7 +295,7 @@ fn self_kick_watchdog_replays_durable_acceptance_and_alerts_once() {
         "AckOverdue"
     );
     let log = fs::read_to_string(home.join("event-log.jsonl")).expect("event log");
-    assert_eq!(log.matches("claude_self_kick_ambiguous").count(), 1);
+    assert_eq!(log.matches("claude_self_kick_ack_overdue").count(), 1);
     assert!(log.contains("no automatic retry"));
     let _ = fs::remove_dir_all(home);
 }
@@ -317,7 +317,7 @@ fn self_kick_receipt_cas_stress_has_one_terminal_winner() {
         workers.push(thread::spawn(move || {
             barrier.wait();
             let mut ambiguous = receipt;
-            ambiguous.state = DeliveryState::Ambiguous;
+            ambiguous.state = DeliveryState::AckOverdue;
             store
                 .record_if_latest_state(
                     ambiguous.delivery_id,
@@ -339,7 +339,7 @@ fn self_kick_receipt_cas_stress_has_one_terminal_winner() {
             .expect("latest")
             .expect("receipt")
             .state,
-        DeliveryState::Ambiguous
+        DeliveryState::AckOverdue
     );
     let _ = fs::remove_dir_all(home);
 }

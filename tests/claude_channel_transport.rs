@@ -251,7 +251,7 @@ fn stop(mut child: Child) {
     let _ = child.wait();
 }
 
-fn seed_self_kick_receipt(home: &Path, delivery_id: Uuid, body: &str) {
+fn seed_self_kick_receipt(home: &Path, delivery_id: Uuid, body: &str, session_id: &str) {
     let path = home
         .join("transport")
         .join("deliveries")
@@ -265,7 +265,7 @@ fn seed_self_kick_receipt(home: &Path, delivery_id: Uuid, body: &str) {
                 "backend": "claude",
                 "endpoint": null,
                 "thread_id": null,
-                "session_id": "seed-session",
+                "session_id": session_id,
                 "endpoint_url": "http://127.0.0.1:1",
                 "username": "bearer",
                 "password": "seed-token",
@@ -489,9 +489,9 @@ fn channel_bridge_production_entry_self_kick_ack_is_correlated_and_non_replying(
     let home = temporary_home();
     let delivery_id = Uuid::new_v4();
     let body = "[AGEND-RESUME] recover own state";
-    seed_self_kick_receipt(&home, delivery_id, body);
     let (mut child, mut stdin, mut stdout, stderr_capture) = spawn_bridge(&home);
     let locator = wait_for_locator(&home, None, &mut child, &stderr_capture);
+    seed_self_kick_receipt(&home, delivery_id, body, &locator.session_id);
     let endpoint = locator.endpoint.as_str();
     let token = locator.token.as_str();
 

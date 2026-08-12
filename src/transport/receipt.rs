@@ -24,6 +24,9 @@ pub(crate) enum DeliveryState {
     Completed,
     Failed,
     Ambiguous,
+    /// A self-kick exceeded its acknowledgement window but remains
+    /// nonterminal so a truthful late current-session ack can still start it.
+    AckOverdue,
 }
 
 impl DeliveryState {

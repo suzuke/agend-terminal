@@ -314,6 +314,9 @@ impl ChannelRuntime {
         if !envelope.self_kick {
             anyhow::bail!("delivery_id is not a fresh-restart self-kick")
         }
+        if envelope.session.session_id.as_deref() != Some(self.session_id.as_str()) {
+            anyhow::bail!("self-kick delivery belongs to a different Claude session")
+        }
         Ok((store, envelope, receipt))
     }
 
@@ -330,7 +333,7 @@ impl ChannelRuntime {
         }
         if !matches!(
             current.state,
-            DeliveryState::Queued | DeliveryState::ProtocolAccepted
+            DeliveryState::Queued | DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
         ) {
             anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
         }
@@ -359,7 +362,10 @@ impl ChannelRuntime {
         if current.state == DeliveryState::TurnStarted {
             return Ok(current);
         }
-        if current.state != DeliveryState::ProtocolAccepted {
+        if !matches!(
+            current.state,
+            DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+        ) {
             anyhow::bail!("self-kick delivery is not protocol-accepted")
         }
         let mut started = DeliveryReceipt::for_state(&envelope, DeliveryState::TurnStarted);
@@ -369,20 +375,24 @@ impl ChannelRuntime {
         started.backend_session_id = Some(self.session_id.clone());
         started.backend_event = Some("claude_channel_turn_started".to_string());
         started.detail = Some("consumer acknowledged exact self-kick delivery_id".to_string());
-        if store.record_if_latest_state(
-            delivery_id,
-            DeliveryState::ProtocolAccepted,
-            started.clone(),
-        )? {
-            return Ok(started);
-        }
-        let latest = store
-            .latest(delivery_id)?
-            .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during start ack"))?;
-        if latest.state == DeliveryState::TurnStarted {
-            Ok(latest)
-        } else {
-            anyhow::bail!("self-kick start acknowledgement lost a receipt race")
+        let mut expected = current.state;
+        loop {
+            if store.record_if_latest_state(delivery_id, expected, started.clone())? {
+                return Ok(started);
+            }
+            let latest = store
+                .latest(delivery_id)?
+                .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during start ack"))?;
+            if latest.state == DeliveryState::TurnStarted {
+                return Ok(latest);
+            }
+            if !matches!(
+                latest.state,
+                DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+            ) {
+                anyhow::bail!("self-kick start acknowledgement lost a receipt race")
+            }
+            expected = latest.state;
         }
     }
 
@@ -1090,7 +1100,8 @@ fn self_kick_ack_elapsed(recorded_at: &str, now: DateTime<Utc>) -> Option<Durati
 
 /// Reconcile accepted self-kicks from the durable receipt log. This scan is
 /// intentionally separate from Claude hook observations: elapsed time only
-/// creates a truthful Ambiguous alert, never a TurnStarted proof or retry.
+/// creates a truthful nonterminal AckOverdue alert, never a TurnStarted proof
+/// or retry.
 fn self_kick_watchdog_pass_at(
     home: &Path,
     instance: &str,
@@ -1106,22 +1117,22 @@ fn self_kick_watchdog_pass_at(
         {
             continue;
         }
-        let mut ambiguous = current.clone();
-        ambiguous.state = DeliveryState::Ambiguous;
-        ambiguous.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
-        ambiguous.detail = Some(format!(
+        let mut overdue = current.clone();
+        overdue.state = DeliveryState::AckOverdue;
+        overdue.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
+        overdue.detail = Some(format!(
             "ProtocolAccepted but no exact consumer ack within {:?}; no automatic retry; inspect the agent and reconcile delivery {}",
             SELF_KICK_ACK_WINDOW, envelope.delivery_id
         ));
         if !store.record_if_latest_state(
             envelope.delivery_id,
             DeliveryState::ProtocolAccepted,
-            ambiguous,
+            overdue,
         )? {
             continue;
         }
         let alert = format!(
-            "[claude-self-kick] {} accepted delivery {} but received no exact consumer ack within {:?}; state=Ambiguous; no automatic retry — inspect the agent and reconcile manually",
+            "[claude-self-kick] {} accepted delivery {} but received no exact consumer ack within {:?}; state=AckOverdue; no automatic retry — inspect the agent and reconcile manually",
             instance, envelope.delivery_id, SELF_KICK_ACK_WINDOW
         );
         let channels = crate::channel::notify_all_escalation_channels(
@@ -1133,7 +1144,7 @@ fn self_kick_watchdog_pass_at(
         tracing::warn!(agent = %instance, delivery_id = %envelope.delivery_id, "{alert}");
         crate::event_log::log(
             home,
-            "claude_self_kick_ambiguous",
+            "claude_self_kick_ack_overdue",
             instance,
             &format!("{alert} notified_channels={channels}"),
         );
@@ -1680,7 +1691,12 @@ pub(crate) fn deliver_resident(
     receipt.protocol_request_id = Some(envelope.delivery_id.to_string());
     receipt.backend_event = Some("webhook_accepted".to_string());
     if let Some(previous) = store.latest(envelope.delivery_id)? {
-        if previous.state.is_terminal() || previous.state == DeliveryState::TurnStarted {
+        if previous.state.is_terminal()
+            || matches!(
+                previous.state,
+                DeliveryState::TurnStarted | DeliveryState::AckOverdue
+            )
+        {
             // Claude may acknowledge (or complete) the self-kick while the
             // daemon-side delivery worker is still writing its post-202
             // receipt. Preserve every later state rather than appending a

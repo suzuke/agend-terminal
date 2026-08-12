@@ -1898,7 +1898,7 @@ impl OpenCodeNativeShared {
     fn state_rank(state: DeliveryState) -> u8 {
         match state {
             DeliveryState::Queued => 0,
-            DeliveryState::ProtocolAccepted => 1,
+            DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue => 1,
             DeliveryState::ObservedInSession => 2,
             DeliveryState::TurnStarted => 3,
             DeliveryState::Completed | DeliveryState::Failed | DeliveryState::Ambiguous => 4,
