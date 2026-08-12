@@ -531,6 +531,72 @@ fn should_notify_in_mode(
     }
 }
 
+/// Last-resort size guard for daemon-generated remote notices. Producers should
+/// still format a concise, semantic message of their own (the supervisor does
+/// this for interactive prompts), but this chokepoint prevents a future emitter
+/// from accidentally forwarding an unbounded pane/log transcript to Telegram
+/// or Discord. Explicit agent replies do not use `gated_notify` and therefore
+/// remain verbatim.
+const REMOTE_SYSTEM_NOTICE_MAX_CHARS: usize = 1_200;
+const REMOTE_SYSTEM_NOTICE_MAX_LINES: usize = 12;
+const REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS: usize = 180;
+
+fn truncate_remote_line(line: &str) -> String {
+    if line.chars().count() <= REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS {
+        return line.to_owned();
+    }
+    let mut out: String = line
+        .chars()
+        .take(REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
+}
+
+fn bound_remote_system_notice(message: &str) -> std::borrow::Cow<'_, str> {
+    let line_count = message.lines().count();
+    if line_count <= REMOTE_SYSTEM_NOTICE_MAX_LINES
+        && message.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS
+    {
+        return std::borrow::Cow::Borrowed(message);
+    }
+
+    let lines: Vec<&str> = message.lines().collect();
+    let mut selected = Vec::new();
+    if lines.len() > REMOTE_SYSTEM_NOTICE_MAX_LINES {
+        selected.extend(lines.iter().take(3).copied());
+        selected.push("… details omitted; open TUI/logs for full context …");
+        selected.extend(lines.iter().rev().take(8).rev().copied());
+    } else {
+        selected.extend(lines.iter().copied());
+    }
+
+    let compact = selected
+        .into_iter()
+        .map(truncate_remote_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if compact.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS {
+        return std::borrow::Cow::Owned(compact);
+    }
+
+    const MARKER: &str = "\n… details omitted; open TUI/logs for full context …\n";
+    let marker_chars = MARKER.chars().count();
+    let remaining = REMOTE_SYSTEM_NOTICE_MAX_CHARS.saturating_sub(marker_chars);
+    let head_chars = remaining / 3;
+    let tail_chars = remaining.saturating_sub(head_chars);
+    let head: String = compact.chars().take(head_chars).collect();
+    let tail: String = compact
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    std::borrow::Cow::Owned(format!("{head}{MARKER}{tail}"))
+}
+
 /// Outbound notify gate — only forwards to [`Channel::notify`] when the
 /// channel reports [`Channel::outbound_authorized`] = `true`. When the
 /// channel is unauthorised (no allowlist configured), the call is
@@ -582,7 +648,8 @@ pub fn gated_notify(
         auth::warn_once_user_allowlist_unconfigured(channel.kind(), instance);
         return Ok(());
     }
-    channel.notify(instance, severity, message, silent)
+    let message = bound_remote_system_notice(message);
+    channel.notify(instance, severity, message.as_ref(), silent)
 }
 
 /// Options passed to `Channel::create_binding`. Platform-specific hints live
@@ -734,6 +801,43 @@ mod tests {
         assert!(
             should_notify_in_mode(Error, Sleep),
             "Sleep passes Error (P0 — AwaitingOperator / crash)"
+        );
+    }
+
+    #[test]
+    fn remote_system_notice_keeps_normal_messages_verbatim() {
+        let message = "⚠️ agent: backend exited; restart or replace it.";
+        assert!(matches!(
+            bound_remote_system_notice(message),
+            std::borrow::Cow::Borrowed(s) if s == message
+        ));
+    }
+
+    #[test]
+    fn remote_system_notice_bounds_accidental_transcripts_and_keeps_action_tail() {
+        let mut message = String::from("⚠️ general is waiting for operator input\n");
+        for idx in 0..40 {
+            message.push_str(&format!(
+                "shell history {idx}: rm -rf /private/{}\n",
+                "界".repeat(120)
+            ));
+        }
+        message.push_str("Dangerous operation\n1. Yes\n2. No\nEsc to cancel");
+
+        let bounded = bound_remote_system_notice(&message);
+        assert!(bounded.contains("general is waiting"));
+        assert!(bounded.contains("Dangerous operation"));
+        assert!(bounded.contains("1. Yes"));
+        assert!(bounded.contains("2. No"));
+        assert!(bounded.contains("details omitted"));
+        assert!(!bounded.contains("shell history 20"));
+        assert!(
+            bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS,
+            "system notice must stay within the remote attention budget"
+        );
+        assert!(
+            bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES,
+            "system notice must stay scannable"
         );
     }
 

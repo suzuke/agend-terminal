@@ -36,12 +36,17 @@ Discord by the notification layer:
 ## Routing rules
 
 - `gated_notify` is the common authorization and operator-mode gate for system
-  notifications. An absent/empty channel allowlist fails closed.
+  notifications. An absent/empty channel allowlist fails closed. It also applies
+  a final 12-line / 1,200-character safety bound, retaining the opening event
+  identity and latest action surface when an emitter accidentally supplies a
+  transcript-sized body.
 - `Sleep` receives Error only; `Away` receives Warn and Error; `Active` receives
   all severities.
 - Error-class P0 alerts fan out to every configured channel. Routine Info
   messages never fan out merely because multiple channels exist.
 - Explicit agent replies are not shortened by the notification policy.
+- Necessary system notifications should lead with the event and affected agent,
+  then state whether operator action is required. Raw TUI, command, stack, and
+  log content is supporting context, never the notification body.
 - A prompt's complete pane text stays local. Remote prompt previews are
   tail-biased so the warning, choices, and cancel hint survive truncation.
-

@@ -1,5 +1,5 @@
 //! Per-agent supervisor loop — detects pre-ready interactive stalls and
-//! pushes a vterm tail to the agent's channel topic.
+//! pushes a bounded decision summary to the agent's channel topic.
 //!
 //! Runs as a background thread spawned from both daemon mode
 //! (`start_daemon`) and app mode (`app::run`). Both call paths create agents
@@ -27,7 +27,8 @@ mod reactions;
 pub(crate) mod usage_limit_control;
 pub(crate) use reactions::*;
 
-/// Vterm tail size pushed to Telegram when a stall is detected.
+/// Vterm tail size inspected locally when a stall is detected. Remote delivery
+/// is summarized by `format_stall_notice` before it reaches any channel.
 const TAIL_LINES: usize = 40;
 /// Debounce cooldown for member-state-change notify (Sprint 43).
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
