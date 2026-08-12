@@ -182,13 +182,21 @@ read_pinned_facts() {
     FACT_MTIME=unknown
     exec 9<"$path" 2>/dev/null || return 1
     tmp="$(mktemp "${TMPDIR:-/tmp}/coverage-diag.XXXXXX" 2>/dev/null)"
-    if [ -z "$tmp" ]; then
+    # The scratch pathname is not trusted: a redirect through a symlink would
+    # write profile bytes into whatever it points at.
+    if [ -z "$tmp" ] || [ -L "$tmp" ] || [ ! -f "$tmp" ]; then
         exec 9<&-
+        [ -n "$tmp" ] && [ ! -L "$tmp" ] && rm -f "$tmp"
         return 1
     fi
     # Content is taken through the descriptor, so a later rename/replace of the
-    # NAME cannot change what was read.
-    cat <&9 >"$tmp" 2>/dev/null
+    # NAME cannot change what was read. A failed copy is a FAILED read — never
+    # report zero bytes as though the file were empty.
+    if ! cat <&9 >"$tmp" 2>/dev/null; then
+        exec 9<&-
+        rm -f "$tmp"
+        return 3
+    fi
     # mtime from the descriptor where the platform exposes it; otherwise report
     # `unknown` rather than re-opening a path that may have been replaced.
     FACT_MTIME="$(date -u -r /dev/fd/9 '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
@@ -231,10 +239,22 @@ clean_token() {
 # (`warning: <path>: <corruption phrase>`) rather than by scanning for anything
 # ending in .profraw — the anchor is what lets a path containing spaces survive
 # without broadening the match to unrelated text.
+CORRUPTION_PHRASES='invalid instrumentation profile data|malformed instrumentation profile data|truncated profile data|raw profile'
+
 named_corrupt_paths() {
     [ -f "$log" ] || return 0
-    sed -nE 's/^[[:space:]]*warning:[[:space:]]*"?(.+\.profraw)"?:[[:space:]]*(invalid instrumentation profile data|malformed instrumentation profile data|truncated profile data|raw profile).*/\1/p' \
+    sed -nE "s/^[[:space:]]*warning:[[:space:]]*\"?(.+\.profraw)\"?:[[:space:]]*($CORRUPTION_PHRASES).*/\\1/p" \
         "$log" 2>/dev/null | awk '!seen[$0]++'
+}
+
+# How many corruption warnings the producer emitted, so a path the line-oriented
+# parser cannot represent (a name containing a newline) is DISCLOSED as
+# unparseable rather than silently dropped.
+count_corruption_warnings() {
+    [ -f "$log" ] || { printf '0'; return; }
+    # Counted by PHRASE, not by a `warning:` prefix: a name containing a newline
+    # splits the producer's line, leaving the phrase on a line of its own.
+    grep -cE "($CORRUPTION_PHRASES)" "$log" 2>/dev/null || printf '0'
 }
 
 # `date -r FILE` is the one mtime spelling BSD and GNU agree on (`stat` is not).
@@ -288,6 +308,14 @@ describe_named_corrupt() {
                 header="$FACT_HEADER"
                 mtime="$FACT_MTIME"
                 ;;
+            3)
+                # The copy through the descriptor failed. Reporting zero bytes
+                # here would fabricate a fact from a read that did not happen.
+                exists="read-failed"
+                size=n/a
+                header=n/a
+                mtime=n/a
+                ;;
             2)
                 # The object was replaced between validation and the read; the
                 # honest answer is that we will not attribute bytes to it.
@@ -331,7 +359,15 @@ emit_diagnostics() {
     done <<EOF
 $(named_corrupt_paths)
 EOF
-    [ "$named" -eq 0 ] && echo "  (producer named no corrupt profile path)"
+    local warned
+    warned="$(count_corruption_warnings)"
+    if [ "$warned" -gt "$named" ]; then
+        # Every corruption warning must be accounted for. A name the parser
+        # cannot represent is disclosed as unparseable, never dropped.
+        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown count=$((warned - named))"
+    elif [ "$named" -eq 0 ]; then
+        echo "  (producer named no corrupt profile path)"
+    fi
     # (b) the ordinary, bounded survey.
     local list
     for list in "$profile_dir"/*-profraw-list; do
