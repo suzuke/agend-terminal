@@ -70,34 +70,33 @@ pub(crate) fn resolve_worktree_target(
     if legacy_present && bounded_present && !same_existing_path(&legacy_path, &bounded_path) {
         return Err(WorktreeTargetError::IdentityConflict);
     }
-    if legacy_present {
-        return Ok(WorktreeTarget {
+    let target = if legacy_present {
+        WorktreeTarget {
             path: legacy_path,
             mangled: legacy_mangled,
             legacy: true,
-        });
-    }
-    if bounded_present {
-        return Ok(WorktreeTarget {
+        }
+    } else {
+        WorktreeTarget {
             path: bounded_path,
             mangled: bounded_mangled,
             legacy: false,
-        });
-    }
+        }
+    };
+    validate_target_budget(&target.path, &target.mangled)?;
+    Ok(target)
+}
 
-    let component_units = path_units(Path::new(&bounded_mangled));
-    let path_units = path_units(&bounded_path.join(".git"));
+fn validate_target_budget(path: &Path, mangled: &str) -> Result<(), WorktreeTargetError> {
+    let component_units = path_units(Path::new(mangled));
+    let path_units = path_units(&path.join(".git"));
     if component_units > WORKTREE_COMPONENT_MAX_UNITS || path_units > WORKTREE_GIT_PATH_MAX_UNITS {
         return Err(WorktreeTargetError::PathBudget {
             path_units,
             max_units: WORKTREE_GIT_PATH_MAX_UNITS,
         });
     }
-    Ok(WorktreeTarget {
-        path: bounded_path,
-        mangled: bounded_mangled,
-        legacy: false,
-    })
+    Ok(())
 }
 
 fn legacy_mangled(instance_name: &str, source_path: &str) -> String {
@@ -203,7 +202,11 @@ mod tests {
     #[test]
     fn overlong_home_returns_typed_budget_error() {
         assert_policy_constants_are_unchanged();
-        let home = PathBuf::from(format!("/tmp/{}", "long-home/".repeat(30)));
+        let home = PathBuf::from(format!(
+            "/tmp/agend-checkout-path-bounded-{}/{}",
+            std::process::id(),
+            "long-home/".repeat(30)
+        ));
         let candidate = home
             .join("worktrees")
             .join(bounded_mangled("reviewer", "/tmp/repo"))
@@ -222,6 +225,36 @@ mod tests {
                 max_units: POLICY_WORKTREE_GIT_PATH_MAX_UNITS,
             }
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn overlong_legacy_target_returns_typed_budget_error() {
+        assert_policy_constants_are_unchanged();
+        let home = PathBuf::from(format!(
+            "/tmp/agend-checkout-path-legacy-budget-{}/{}",
+            std::process::id(),
+            "long-home/".repeat(30)
+        ));
+        let source = "/tmp/repo";
+        let legacy = home
+            .join("worktrees")
+            .join(legacy_mangled("reviewer", source));
+        let candidate_units = path_units(&legacy.join(".git"));
+        assert!(
+            candidate_units > POLICY_WORKTREE_GIT_PATH_MAX_UNITS,
+            "fixture must measure an over-budget legacy target: {candidate_units}"
+        );
+        std::fs::create_dir_all(&legacy).unwrap();
+        let err = resolve_worktree_target(&home, "reviewer", source).unwrap_err();
+        assert_eq!(
+            err,
+            WorktreeTargetError::PathBudget {
+                path_units: candidate_units,
+                max_units: POLICY_WORKTREE_GIT_PATH_MAX_UNITS,
+            }
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
