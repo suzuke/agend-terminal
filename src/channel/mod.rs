@@ -537,64 +537,78 @@ fn should_notify_in_mode(
 /// from accidentally forwarding an unbounded pane/log transcript to Telegram
 /// or Discord. Explicit agent replies do not use `gated_notify` and therefore
 /// remain verbatim.
-const REMOTE_SYSTEM_NOTICE_MAX_CHARS: usize = 1_200;
-const REMOTE_SYSTEM_NOTICE_MAX_LINES: usize = 12;
+pub(crate) const REMOTE_SYSTEM_NOTICE_MAX_CHARS: usize = 1_200;
+pub(crate) const REMOTE_SYSTEM_NOTICE_MAX_LINES: usize = 12;
 const REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS: usize = 180;
 
-fn truncate_remote_line(line: &str) -> String {
-    if line.chars().count() <= REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS {
+fn truncate_remote_line(line: &str, max_chars: usize, keep_tail: bool) -> String {
+    if line.chars().count() <= max_chars {
         return line.to_owned();
     }
-    let mut out: String = line
-        .chars()
-        .take(REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS.saturating_sub(1))
-        .collect();
-    out.push('…');
-    out
+    if max_chars == 0 {
+        return String::new();
+    }
+    if keep_tail {
+        let tail: String = line
+            .chars()
+            .rev()
+            .take(max_chars.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("…{tail}")
+    } else {
+        let mut out: String = line.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
-fn bound_remote_system_notice(message: &str) -> std::borrow::Cow<'_, str> {
-    let line_count = message.lines().count();
+pub(crate) fn bound_remote_system_notice(message: &str) -> std::borrow::Cow<'_, str> {
+    let normalized = message.replace('\r', "\n");
+    let line_count = normalized.lines().count();
     if line_count <= REMOTE_SYSTEM_NOTICE_MAX_LINES
-        && message.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS
+        && normalized.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS
     {
-        return std::borrow::Cow::Borrowed(message);
+        return if normalized == message {
+            std::borrow::Cow::Borrowed(message)
+        } else {
+            std::borrow::Cow::Owned(normalized)
+        };
     }
 
-    let lines: Vec<&str> = message.lines().collect();
-    let mut selected = Vec::new();
-    if lines.len() > REMOTE_SYSTEM_NOTICE_MAX_LINES {
-        selected.extend(lines.iter().take(3).copied());
-        selected.push("… details omitted; open TUI/logs for full context …");
-        selected.extend(lines.iter().rev().take(8).rev().copied());
-    } else {
-        selected.extend(lines.iter().copied());
-    }
+    const MARKER: &str = "… details omitted; open TUI/logs for full context …";
+    let lines: Vec<&str> = normalized.lines().collect();
+    let head_count = lines.len().min(3);
+    let tail_count = lines.len().saturating_sub(head_count).min(8);
+    let content_count = head_count + tail_count;
+    let output_lines = content_count + 1;
+    let separators = output_lines.saturating_sub(1);
+    let content_budget =
+        REMOTE_SYSTEM_NOTICE_MAX_CHARS.saturating_sub(MARKER.chars().count() + separators);
+    let per_line_budget = content_budget
+        .checked_div(content_count)
+        .unwrap_or(0)
+        .min(REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS);
 
-    let compact = selected
-        .into_iter()
-        .map(truncate_remote_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if compact.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS {
-        return std::borrow::Cow::Owned(compact);
-    }
-
-    const MARKER: &str = "\n… details omitted; open TUI/logs for full context …\n";
-    let marker_chars = MARKER.chars().count();
-    let remaining = REMOTE_SYSTEM_NOTICE_MAX_CHARS.saturating_sub(marker_chars);
-    let head_chars = remaining / 3;
-    let tail_chars = remaining.saturating_sub(head_chars);
-    let head: String = compact.chars().take(head_chars).collect();
-    let tail: String = compact
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    std::borrow::Cow::Owned(format!("{head}{MARKER}{tail}"))
+    let mut selected = Vec::with_capacity(output_lines);
+    selected.extend(
+        lines
+            .iter()
+            .take(head_count)
+            .map(|line| truncate_remote_line(line, per_line_budget, false)),
+    );
+    selected.push(MARKER.to_string());
+    selected.extend(
+        lines
+            .iter()
+            .rev()
+            .take(tail_count)
+            .rev()
+            .map(|line| truncate_remote_line(line, per_line_budget, true)),
+    );
+    std::borrow::Cow::Owned(selected.join("\n"))
 }
 
 /// Outbound notify gate — only forwards to [`Channel::notify`] when the
@@ -839,6 +853,33 @@ mod tests {
             bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES,
             "system notice must stay scannable"
         );
+    }
+
+    #[test]
+    fn remote_system_notice_never_exceeds_line_cap_when_char_cap_triggers() {
+        let message = (0..REMOTE_SYSTEM_NOTICE_MAX_LINES)
+            .map(|idx| format!("line {idx}: {}", "x".repeat(92)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.chars().count() > REMOTE_SYSTEM_NOTICE_MAX_CHARS);
+
+        let bounded = bound_remote_system_notice(&message);
+        assert!(bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES);
+        assert!(bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS);
+    }
+
+    #[test]
+    fn remote_system_notice_normalizes_carriage_return_progress_and_keeps_latest_tail() {
+        let message = (0..400)
+            .map(|idx| format!("progress {idx}"))
+            .collect::<Vec<_>>()
+            .join("\r");
+        let bounded = bound_remote_system_notice(&message);
+
+        assert!(bounded.contains("progress 0"));
+        assert!(bounded.contains("progress 399"));
+        assert!(bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES);
+        assert!(bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS);
     }
 
     /// Mock channel that records every `notify` call so tests can pin

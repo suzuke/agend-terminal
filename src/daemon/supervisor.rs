@@ -2049,7 +2049,10 @@ enum NoticeAction {
 /// Keep enough of the *latest* prompt chrome to make the decision (warning,
 /// choices, cancel hint), while leaving the full command/output in the TUI.
 const STALL_REMOTE_TAIL_MAX_CHARS: usize = 820;
-const STALL_REMOTE_TAIL_MAX_LINES: usize = 10;
+// The formatted notice adds four fixed lines around this summary. Seven kept
+// lines plus one omission marker therefore fit the common 12-line channel cap
+// without a second truncation pass or duplicate omission marker.
+const STALL_REMOTE_TAIL_MAX_LINES: usize = 7;
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -2075,18 +2078,50 @@ fn summarize_stall_tail(tail: &str) -> String {
     }
 
     const OMITTED: &str = "… pane details omitted; open TUI for full context …";
+    let is_action_line = |line: &&str| {
+        let lower = line.to_ascii_lowercase();
+        let choice = lower
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '>' || c == ' ');
+        lower.contains("dangerous")
+            || lower.contains("permission")
+            || lower.contains("do you want")
+            || lower.contains("proceed?")
+            || lower.contains("esc to cancel")
+            || lower.contains("tab to amend")
+            || ["yes", "no", "allow", "deny"]
+                .iter()
+                .any(|prefix| choice.starts_with(prefix))
+    };
+    let action_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| is_action_line(line).then_some(idx))
+        .collect();
+    let candidate_indices: Vec<usize> = if action_indices.is_empty() {
+        (lines.len().saturating_sub(STALL_REMOTE_TAIL_MAX_LINES)..lines.len()).collect()
+    } else {
+        let first = action_indices[0].saturating_sub(1);
+        let last = *action_indices.last().expect("non-empty action indices");
+        let mut indices: Vec<usize> = (first..=last).collect();
+        if indices.len() > STALL_REMOTE_TAIL_MAX_LINES {
+            let tail = indices.split_off(indices.len() - (STALL_REMOTE_TAIL_MAX_LINES - 2));
+            indices.truncate(2);
+            indices.extend(tail);
+        }
+        indices
+    };
     let mut remaining = STALL_REMOTE_TAIL_MAX_CHARS.saturating_sub(OMITTED.chars().count() + 1);
     let mut kept = Vec::new();
-    for line in lines.iter().rev().take(STALL_REMOTE_TAIL_MAX_LINES) {
+    for (position, idx) in candidate_indices.iter().enumerate() {
         if remaining == 0 {
             break;
         }
-        let line_budget = remaining.saturating_sub(1);
-        let compact = truncate_chars(line, line_budget);
+        let lines_left = candidate_indices.len() - position;
+        let line_budget = remaining.saturating_sub(lines_left) / lines_left;
+        let compact = truncate_chars(lines[*idx], line_budget);
         remaining = remaining.saturating_sub(compact.chars().count() + 1);
         kept.push(compact);
     }
-    kept.reverse();
     if kept.is_empty() {
         OMITTED.to_string()
     } else {

@@ -61,13 +61,13 @@ fn telegram_client() -> reqwest::Client {
 }
 
 /// Send a notification to Telegram (instance topic or general).
-pub fn notify_telegram(home: &std::path::Path, instance_name: &str, text: &str) {
+pub(super) fn notify_telegram(home: &std::path::Path, instance_name: &str, text: &str) {
     let _ = notify_telegram_inner(home, instance_name, text, false);
 }
 
 /// Send a notification with Telegram's `disable_notification` flag set — the
 /// message still appears in the topic but does not push/vibrate the operator.
-pub fn notify_telegram_silent(home: &std::path::Path, instance_name: &str, text: &str) {
+pub(super) fn notify_telegram_silent(home: &std::path::Path, instance_name: &str, text: &str) {
     let _ = notify_telegram_inner(home, instance_name, text, true);
 }
 

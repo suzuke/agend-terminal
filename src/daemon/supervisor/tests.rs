@@ -52,6 +52,41 @@ fn stall_notice_truncates_one_oversized_prompt_line_on_char_boundary() {
     assert!(notice.chars().count() <= 1200);
 }
 
+#[test]
+fn stall_notice_keeps_choices_when_status_noise_follows_prompt() {
+    let mut tail = String::from(
+        "Dangerous rm operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel\n",
+    );
+    for idx in 0..12 {
+        tail.push_str(&format!("status line {idx}: waiting for input\n"));
+    }
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("Esc to cancel"));
+    assert!(!notice.contains("status line 11"));
+}
+
+#[test]
+fn formatted_stall_notice_survives_common_gate_without_second_omission_marker() {
+    let tail = format!(
+        "{}\nDangerous operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel",
+        (0..30)
+            .map(|idx| format!("command {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let notice = format_stall_notice("general", &tail, None);
+    let bounded = crate::channel::bound_remote_system_notice(&notice);
+
+    assert_eq!(bounded.matches("details omitted").count(), 1);
+    assert!(bounded.lines().count() <= 12);
+    assert!(bounded.contains("1. Yes"));
+    assert!(bounded.contains("2. No"));
+}
+
 /// #2033: the recovery-notice gate — actionable iff the operator was told
 /// about the block AND it lasted past the threshold (actionable-or-silent).
 #[test]
