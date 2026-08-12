@@ -439,6 +439,128 @@ PRODUCER
     fi
 }
 
+# ── 46-47. A non-regular object must never block the wrapper ────────────────
+# Opening a FIFO for reading blocks until a writer appears. Every read here is
+# on a producer-controlled path, so a `*.profraw` or `*-profraw-list` FIFO hangs
+# the wrapper forever: in CI that is a silent step timeout with the evidence
+# block truncated mid-print — strictly worse than a failure, and precisely the
+# unreadable failure this wrapper exists to remove.
+
+# Run the wrapper under a hard deadline. A test for a hang must not itself hang:
+# if the process is still alive at the deadline it is BLOCKED, and we release it
+# by OPENING each FIFO FOR WRITING — that completes the pending open-for-read, so
+# the wrapper finishes and no orphan is left behind. Safe precisely because we
+# only do it while a blocked reader is known to exist.
+run_wrapper_with_deadline() {
+    local sandbox="$1" secs="$2" pid waited=0 blocked=0 p
+    (
+        cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+            COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+            COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+            "$wrapper" >"$sandbox/out" 2>&1
+    ) &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    while kill -0 "$pid" 2>/dev/null; do
+        blocked=1
+        for p in "$sandbox/profiles"/*; do
+            [ -p "$p" ] || continue
+            ( exec 3>"$p"; exec 3>&- ) 2>/dev/null
+        done
+        sleep 1
+        waited=$((waited + 1))
+        if [ "$waited" -gt $((secs * 4)) ]; then
+            kill -9 "$pid" 2>/dev/null
+            break
+        fi
+    done
+    wait "$pid" 2>/dev/null
+    printf '%s' "$blocked"
+}
+
+# `mkfifo` is absent or a no-op on some platforms; then the premise, not the
+# property, is unavailable.
+fifos_unavailable() {
+    mkfifo "$1/fifo-probe" 2>/dev/null || return 0
+    [ -p "$1/fifo-probe" ] || { rm -f "$1/fifo-probe"; return 0; }
+    rm -f "$1/fifo-probe"
+    return 1
+}
+
+test_named_fifo_does_not_block_the_wrapper() {
+    local sandbox blocked out bad=""
+    sandbox="$(new_sandbox)"
+    if fifos_unavailable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "a producer-named FIFO does not block the wrapper" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+mkfifo "$COVERAGE_PROFILE_DIR/fifo-1-1_0.profraw"
+printf 'warning: %s/fifo-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
+    out="$(cat "$sandbox/out" 2>/dev/null)"
+    rm -f "$sandbox/profiles"/*.profraw 2>/dev/null
+    rm -rf "$sandbox"
+    [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
+    # It must still finish the block it started — a truncated group is the CI
+    # symptom that makes a hang worse than a failure.
+    echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
+    # And describe the object honestly rather than claiming bytes it never read.
+    echo "$out" | grep -qE '^[[:space:]]*corrupt=fifo-1-1_0\.profraw' || bad="$bad not-described"
+    echo "$out" | grep -q 'exists=not-a-regular-file' || bad="$bad not-labelled-non-regular"
+    if [ -n "$bad" ]; then
+        report 1 "a producer-named FIFO does not block the wrapper" \
+            "issues:$bad; got: $(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -1)"
+    else
+        report 0 "a producer-named FIFO does not block the wrapper"
+    fi
+}
+
+# The same hazard on the response file, whose NAME is producer-controlled by
+# glob: the count, the fragment listing and the membership read all open it.
+test_fifo_response_file_does_not_block_the_wrapper() {
+    local sandbox blocked out bad=""
+    sandbox="$(new_sandbox)"
+    if fifos_unavailable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "a FIFO response file does not block the wrapper" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/real-1-1_0.profraw"
+mkfifo "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/real-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
+    out="$(cat "$sandbox/out" 2>/dev/null)"
+    rm -f "$sandbox/profiles"/* 2>/dev/null
+    rm -rf "$sandbox"
+    [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
+    echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
+    # The real profile alongside it must still be described.
+    echo "$out" | grep -qE '^[[:space:]]*corrupt=real-1-1_0\.profraw' || bad="$bad real-path-lost"
+    if [ -n "$bad" ]; then
+        report 1 "a FIFO response file does not block the wrapper" "issues:$bad"
+    else
+        report 0 "a FIFO response file does not block the wrapper"
+    fi
+}
+
 # ── 44-45. Isolation must fail closed when its own commands fail ────────────
 # The permission precheck only covers ONE way enumeration can fail. `rm`'s exit
 # status was ignored outright, and `find … | wc -l` discards find's status: a
@@ -1628,6 +1750,8 @@ test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
 test_isolation_fails_closed_when_its_commands_fail
+test_named_fifo_does_not_block_the_wrapper
+test_fifo_response_file_does_not_block_the_wrapper
 test_phrase_bearing_path_fragment_claims_no_count
 test_benign_raw_profile_prose_fabricates_no_record
 test_exact_raw_profile_messages_are_parsed
