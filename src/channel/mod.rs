@@ -541,6 +541,38 @@ pub(crate) const REMOTE_SYSTEM_NOTICE_MAX_CHARS: usize = 1_200;
 pub(crate) const REMOTE_SYSTEM_NOTICE_MAX_LINES: usize = 12;
 const REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS: usize = 180;
 
+/// Redact common credential assignments before a daemon-generated notice
+/// leaves the machine. This deliberately targets credential-shaped syntax,
+/// not ordinary prose that merely mentions words such as "token" or "key".
+fn redact_remote_system_notice_secrets(message: &str) -> std::borrow::Cow<'_, str> {
+    static COLON_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    static EQUALS_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    static BEARER_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    const KEY: &str = r"(?:api[_-]?key|token|secret|password|passwd|authorization|credential)";
+
+    let colon_secret = COLON_SECRET.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?im)\b({KEY})\s*:\s*[^\r\n]*"))
+            .expect("remote colon-secret regex must compile")
+    });
+    let equals_secret = EQUALS_SECRET.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)\b({KEY})\s*=\s*[^\s&;,]+"))
+            .expect("remote equals-secret regex must compile")
+    });
+    let bearer_secret = BEARER_SECRET.get_or_init(|| {
+        regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*")
+            .expect("remote bearer-secret regex must compile")
+    });
+
+    let redacted = colon_secret.replace_all(message, "$1: ***REDACTED***");
+    let redacted = equals_secret.replace_all(redacted.as_ref(), "$1=***REDACTED***");
+    let redacted = bearer_secret.replace_all(redacted.as_ref(), "Bearer ***REDACTED***");
+    if redacted == message {
+        std::borrow::Cow::Borrowed(message)
+    } else {
+        std::borrow::Cow::Owned(redacted.into_owned())
+    }
+}
+
 fn truncate_remote_line(line: &str, max_chars: usize, keep_tail: bool) -> String {
     if line.chars().count() <= max_chars {
         return line.to_owned();
@@ -664,7 +696,8 @@ pub fn gated_notify(
         auth::warn_once_user_allowlist_unconfigured(channel.kind(), instance);
         return Ok(());
     }
-    let message = bound_remote_system_notice(message);
+    let redacted = redact_remote_system_notice_secrets(message);
+    let message = bound_remote_system_notice(redacted.as_ref());
     channel.notify(instance, severity, message.as_ref(), silent)
 }
 
@@ -905,6 +938,7 @@ mod tests {
         caps: ChannelCapabilities,
         outbound_ok: bool,
         notify_count: std::sync::atomic::AtomicUsize,
+        last_message: parking_lot::Mutex<Option<String>>,
     }
 
     impl RecordingChannel {
@@ -913,10 +947,14 @@ mod tests {
                 caps: ChannelCapabilities::default(),
                 outbound_ok,
                 notify_count: std::sync::atomic::AtomicUsize::new(0),
+                last_message: parking_lot::Mutex::new(None),
             }
         }
         fn count(&self) -> usize {
             self.notify_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn message(&self) -> Option<String> {
+            self.last_message.lock().clone()
         }
     }
 
@@ -960,11 +998,12 @@ mod tests {
             &self,
             _instance: &str,
             _severity: NotifySeverity,
-            _message: &str,
+            message: &str,
             _silent: bool,
         ) -> std::result::Result<(), ChannelError> {
             self.notify_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.last_message.lock() = Some(message.to_owned());
             Ok(())
         }
     }
@@ -1005,6 +1044,27 @@ mod tests {
             1,
             "authorised channel must receive exactly 1 notify call"
         );
+    }
+
+    #[test]
+    fn gated_notify_redacts_inline_credentials_before_remote_delivery() {
+        let ch = RecordingChannel::new(true);
+        let message = "fetching https://api.example.com/cb?token=SECRET5DEADBEEF\n\
+Authorization: Bearer abc.def\n\
+API_KEY=local-secret\n\
+the token was rotated; press Enter to continue";
+
+        gated_notify(&ch, "agent1", NotifySeverity::Error, message, false)
+            .expect("authorized notice should be delivered");
+
+        let delivered = ch.message().expect("authorized notice must be recorded");
+        assert!(delivered.contains("token=***REDACTED***"));
+        assert!(delivered.contains("Authorization: ***REDACTED***"));
+        assert!(delivered.contains("API_KEY=***REDACTED***"));
+        assert!(delivered.contains("the token was rotated"));
+        assert!(!delivered.contains("SECRET5DEADBEEF"));
+        assert!(!delivered.contains("abc.def"));
+        assert!(!delivered.contains("local-secret"));
     }
 
     #[test]
