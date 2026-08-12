@@ -321,7 +321,18 @@ clean_token() {
 # (`warning: <path>: <corruption phrase>`) rather than by scanning for anything
 # ending in .profraw — the anchor is what lets a path containing spaces survive
 # without broadening the match to unrelated text.
-CORRUPTION_PHRASES='invalid instrumentation profile data|malformed instrumentation profile data|truncated profile data|raw profile'
+# EXACT llvm-profdata messages only. The parser anchors on a `warning:` line;
+# the warning COUNT deliberately does not, so a name containing a newline —
+# which splits the producer's line and strands the phrase — is still counted and
+# disclosed. That only holds if the phrases cannot match anything else, and the
+# bare two-word alternative `raw profile` matched ordinary prose: a log line
+# reading `note: merging raw profile data from 4 inputs` was counted as a
+# corruption warning, so the two populations disagreed and the accounting
+# invented an unparseable path. It also failed to parse `empty raw profile
+# file`, because the alternative had to match at the start of the message.
+# Verified against the shipped binary rather than from memory:
+#   strings "$(xcrun --find llvm-profdata)" | grep -E '^(empty raw|raw profile|malformed|invalid|truncated) '
+CORRUPTION_PHRASES='invalid instrumentation profile data|malformed instrumentation profile data|truncated profile data|empty raw profile file|raw profile version mismatch'
 
 named_corrupt_paths_raw() {
     [ -f "$log" ] || return 0

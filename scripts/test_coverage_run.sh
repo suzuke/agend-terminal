@@ -439,6 +439,114 @@ PRODUCER
     fi
 }
 
+# ── 41-43. The corruption-phrase population (d-…211213152750-12) ────────────
+# The parser anchors on a `warning:` line; the warning COUNT deliberately does
+# not, so that a name containing a newline — which splits the producer's line
+# and leaves the phrase stranded — is still counted and disclosed. That only
+# works if the phrases themselves are exact llvm-profdata messages. The bare
+# two-word alternative `raw profile` matched ordinary prose, so the two
+# populations disagreed and the accounting invented a path.
+#
+# Message set verified against the shipped binary, not from memory:
+#   strings "$(xcrun --find llvm-profdata)" | grep -E '^(raw|empty raw|malformed|invalid|truncated) '
+#     empty raw profile file
+#     invalid instrumentation profile data (bad magic)
+#     invalid instrumentation profile data (file header is corrupt)
+#     malformed instrumentation profile data
+#     raw profile version mismatch
+#     truncated profile data
+
+# Benign prose that merely mentions raw profiles, beside a real parsed warning.
+test_benign_raw_profile_prose_fabricates_no_record() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'x' >"$COVERAGE_PROFILE_DIR/ok-1-1_0.profraw"
+printf 'warning: %s/ok-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "note: merging raw profile data from 4 inputs"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    # Premise: the one real warning must have been parsed and described.
+    echo "$block" | grep -q 'corrupt=ok-1-1_0.profraw' || bad="$bad premise-not-described"
+    echo "$block" | grep -q 'unparseable' && bad="$bad fabricated-unparseable"
+    if [ -n "$bad" ]; then
+        report 1 "benign raw-profile prose fabricates no record" "issues:$bad"
+    else
+        report 0 "benign raw-profile prose fabricates no record"
+    fi
+}
+
+# The exact raw-profile messages must still be recognised and described — the
+# narrowing must not cost coverage of real llvm output.
+test_exact_raw_profile_messages_are_parsed() {
+    local sandbox out line bad="" msg name
+    for msg in "raw profile version mismatch" "empty raw profile file"; do
+        sandbox="$(new_sandbox)"
+        name="exact-1-1_0.profraw"
+        cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+printf 'x' >"\$COVERAGE_PROFILE_DIR/$name"
+printf 'warning: %s/$name: $msg\n' "\$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+        chmod +x "$sandbox/producer.sh"
+        out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+            COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+            COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+        line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+        rm -rf "$sandbox"
+        echo "$line" | grep -q "corrupt=$name" || bad="$bad [$msg]not-parsed"
+        echo "$line" | grep -q 'exists=yes' || bad="$bad [$msg]not-described"
+        echo "$out" | grep -q 'unparseable' && bad="$bad [$msg]spurious-unparseable"
+    done
+    if [ -n "$bad" ]; then
+        report 1 "exact raw-profile messages are parsed and described" "issues:$bad"
+    else
+        report 0 "exact raw-profile messages are parsed and described"
+    fi
+}
+
+# A real warning carrying an exact raw-profile message, whose PATH contains a
+# newline, still cannot be attributed — and must still be disclosed generically,
+# with no named facts.
+test_split_exact_raw_profile_warning_stays_unparseable() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'warning: /tmp/odd\nname-1-2_0.profraw: raw profile version mismatch\n'
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep 'unparseable' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad not-disclosed"
+    echo "$line" | grep -q 'count=1' || bad="$bad wrong-count"
+    # Generic: it must carry no facts attributed to a path it never resolved.
+    echo "$line" | grep -q 'corrupt=(unparseable)' || bad="$bad not-generic"
+    echo "$line" | grep -q 'name-1-2_0' && bad="$bad leaked-partial-name"
+    if [ -n "$bad" ]; then
+        report 1 "a split exact raw-profile warning stays generically unparseable" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "a split exact raw-profile warning stays generically unparseable"
+    fi
+}
+
 # ── 35-39. Facts the block states about reads it could not make ─────────────
 # The rule 3e4a52b2 exists to enforce is that a read which did not happen
 # produces no fact. A BLANK field breaks it; so does an affirmative wrong one.
@@ -1415,6 +1523,9 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_benign_raw_profile_prose_fabricates_no_record
+test_exact_raw_profile_messages_are_parsed
+test_split_exact_raw_profile_warning_stays_unparseable
 test_unreadable_named_path_is_not_reported_absent
 test_zero_byte_named_path_reports_na_header
 test_duplicate_warning_fabricates_no_unparseable_record
