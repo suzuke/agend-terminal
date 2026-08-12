@@ -33,6 +33,10 @@ pub(crate) enum WorktreeTargetError {
         legacy_path: String,
         bounded_path: Option<String>,
     },
+    #[cfg_attr(not(windows), allow(dead_code))]
+    GitCommonDirUnavailable {
+        source_path: String,
+    },
 }
 
 impl WorktreeTargetError {
@@ -40,6 +44,7 @@ impl WorktreeTargetError {
         match self {
             Self::PathBudget { .. } => "worktree_path_budget",
             Self::IdentityConflict { .. } => "worktree_identity_conflict",
+            Self::GitCommonDirUnavailable { .. } => "worktree_git_common_dir_unavailable",
         }
     }
 
@@ -70,6 +75,12 @@ impl WorktreeTargetError {
                 "legacy_path": legacy_path,
                 "bounded_path": bounded_path,
             }),
+            Self::GitCommonDirUnavailable { source_path } => json!({
+                "error": "checkout source has no resolvable Git common directory",
+                "code": code,
+                "stage": "preflight",
+                "source_path": source_path,
+            }),
         }
     }
 }
@@ -90,6 +101,12 @@ fn resolve_worktree_target_with_common_dir(
     source_path: &str,
     git_common_dir: Option<&Path>,
 ) -> Result<WorktreeTarget, WorktreeTargetError> {
+    #[cfg(windows)]
+    if git_common_dir.is_none() {
+        return Err(WorktreeTargetError::GitCommonDirUnavailable {
+            source_path: source_path.to_string(),
+        });
+    }
     let legacy_mangled = legacy_mangled(instance_name, source_path);
     let legacy_path = home.join("worktrees").join(&legacy_mangled);
     let bounded_mangled = bounded_mangled(instance_name, source_path);
@@ -100,6 +117,7 @@ fn resolve_worktree_target_with_common_dir(
         &legacy_mangled,
         instance_name,
         source_path,
+        git_common_dir,
     )?;
     let bounded_present = bounded_path.exists() || legacy_journal_exists(home, &bounded_mangled);
 
@@ -212,6 +230,7 @@ fn legacy_identity_matches(
     mangled: &str,
     instance_name: &str,
     source_path: &str,
+    git_common_dir: Option<&Path>,
 ) -> Result<bool, WorktreeTargetError> {
     let path_present = legacy_path.exists();
     let mut source_verified = false;
@@ -232,10 +251,12 @@ fn legacy_identity_matches(
             Ok(None) => {}
             Err(()) => return Err(identity_conflict(legacy_path)),
         }
-        match legacy_git_source(legacy_path) {
-            Ok(Some(git_source)) => {
+        match legacy_git_common_dir(legacy_path) {
+            Ok(Some(legacy_common_dir)) => {
                 source_verified = true;
-                if !source_identity_paths_match(&git_source, Path::new(source_path)) {
+                if !git_common_dir.is_some_and(|common_dir| {
+                    source_identity_paths_match(&legacy_common_dir, common_dir)
+                }) {
                     return Err(identity_conflict(legacy_path));
                 }
             }
@@ -278,29 +299,14 @@ fn legacy_marker_identity(path: &Path) -> Result<Option<(String, Option<String>)
     Ok(Some((agent, source)))
 }
 
-fn legacy_git_source(path: &Path) -> Result<Option<PathBuf>, ()> {
+fn legacy_git_common_dir(path: &Path) -> Result<Option<PathBuf>, ()> {
     let git_file = path.join(".git");
-    if !git_file.is_file() {
+    if !git_file.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(git_file).map_err(|_| ())?;
-    let gitdir = content
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))
-        .ok_or(())?;
-    let gitdir = PathBuf::from(gitdir);
-    let gitdir = if gitdir.is_absolute() {
-        gitdir
-    } else {
-        path.join(gitdir)
-    };
-    let source = gitdir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or(())?;
-    Ok(Some(source))
+    super::source_resolve::repo_common_dir(path)
+        .ok_or(())
+        .map(Some)
 }
 
 fn legacy_journal_identity_matches(
@@ -526,6 +532,100 @@ mod tests {
                 max_units: WORKTREE_GIT_PATH_MAX_UNITS,
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_missing_git_common_dir_fails_closed() {
+        let home = PathBuf::from(r"C:\w");
+        let err = resolve_worktree_target_with_common_dir(
+            &home,
+            "reviewer",
+            r"C:\not-a-git-worktree",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            WorktreeTargetError::GitCommonDirUnavailable {
+                source_path: r"C:\not-a-git-worktree".to_string(),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_git_dir_legacy_target_is_adopted_by_git_common_identity() {
+        let base = std::env::temp_dir().join(format!(
+            "agend-checkout-path-separate-git-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let source = base.join("source");
+        let common = base.join("source-common.git");
+        std::fs::create_dir_all(&base).unwrap();
+        let init = std::process::Command::new("git")
+            .args([
+                "init",
+                "--separate-git-dir",
+                common.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ])
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed: {:?}", init);
+        std::fs::write(source.join("README"), "separate git dir").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "README"])
+            .current_dir(&source)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add failed: {:?}", add);
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=AgEnD Test",
+                "-c",
+                "user.email=agend@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&source)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {:?}", commit);
+
+        let home = base.join("home");
+        let source_path = source.display().to_string();
+        let legacy_name = legacy_mangled("reviewer", &source_path);
+        let legacy = home.join("worktrees").join(&legacy_name);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let add_worktree = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                legacy.to_str().unwrap(),
+                "HEAD",
+            ])
+            .current_dir(&source)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            add_worktree.status.success(),
+            "git worktree add failed: {:?}",
+            add_worktree
+        );
+
+        let target = resolve_worktree_target(&home, "reviewer", &source_path).unwrap();
+        assert!(target.legacy);
+        assert_eq!(target.path, legacy);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
