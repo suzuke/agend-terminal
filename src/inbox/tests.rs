@@ -4530,7 +4530,7 @@ fn settle_requeues_delivering_for_successor() {
 
     // At this point all 3 are DELIVERING (delivering_at set, read_at None).
     // Requeue them as if this were a session-reset.
-    let settled = settle_delivering_for_session_reset(&home, agent);
+    let settled = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(settled, 3, "all 3 delivering rows should be requeued");
 
     // Verify: a subsequent drain returns all 3 for the successor.
@@ -4581,7 +4581,7 @@ fn settle_does_not_touch_unread() {
     .unwrap();
 
     // Requeue: should only requeue the 1 delivering row, not discard either.
-    let settled = settle_delivering_for_session_reset(&home, agent);
+    let settled = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(settled, 1, "only the delivering row should be requeued");
 
     // Both messages should be drainable; neither was silently dropped.
@@ -4607,11 +4607,11 @@ fn settle_is_idempotent() {
     .unwrap();
     drain(&home, agent);
 
-    let first = settle_delivering_for_session_reset(&home, agent);
+    let first = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(first, 1);
 
     // Second reset: already requeued → 0 newly requeued.
-    let second = settle_delivering_for_session_reset(&home, agent);
+    let second = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(second, 0, "idempotent: no rows to settle on second call");
 
     fs::remove_dir_all(&home).ok();
@@ -4646,7 +4646,7 @@ fn reset_requeues_stale_delivering_row() {
     .unwrap();
 
     // Requeue it (session-reset path).
-    let settled = settle_delivering_for_session_reset(&home, agent);
+    let settled = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(settled, 1, "the stale delivering row should be requeued");
 
     // Reclaim has nothing to do because reset already cleared delivering_at.
@@ -5229,7 +5229,7 @@ fn fresh_reset_requeues_unconfirmed_delivering_rows() {
     .unwrap();
     assert_eq!(drain(&home, agent).len(), 1);
 
-    assert_eq!(settle_delivering_for_session_reset(&home, agent), 1);
+    assert_eq!(requeue_delivering_for_session_reset(&home, agent), 1);
     let content = fs::read_to_string(inbox_path(&home, agent)).unwrap();
     let persisted: serde_json::Value =
         serde_json::from_str(content.lines().next().unwrap()).unwrap();

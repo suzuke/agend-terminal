@@ -109,12 +109,23 @@ pub fn handle_describe_thread(home: &Path, args: &Value) -> Value {
 /// ack, a never-delivered conservative no-op, or an already-processed row.
 pub fn handle_inbox_ack(home: &Path, args: &Value, instance_name: &str) -> Value {
     let msg_id = args["message_id"].as_str();
-    let outcome = crate::inbox::ack_with_outcome(home, instance_name, msg_id);
-    json!({
-        "acked": outcome.acked,
-        "scope": if msg_id.is_some() { "targeted" } else { "batch" },
-        "outcome": outcome.kind.as_str(),
-    })
+    match crate::inbox::ack_with_outcome(home, instance_name, msg_id) {
+        Ok(outcome) => json!({
+            "acked": outcome.acked,
+            "scope": if msg_id.is_some() { "targeted" } else { "batch" },
+            "outcome": outcome.kind.as_str(),
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "inbox ack failed");
+            json!({
+                "acked": 0,
+                "scope": if msg_id.is_some() { "targeted" } else { "batch" },
+                "outcome": "error",
+                "error": "inbox ack failed",
+                "code": "inbox_ack_failed",
+            })
+        }
+    }
 }
 
 /// #inbox-gc part a: quiet compact-clear. Marks non-obligation messages read

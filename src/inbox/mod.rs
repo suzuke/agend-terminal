@@ -31,7 +31,7 @@ pub use disk::{check_disk_space, recover_half_writes};
 
 // Storage CRUD (pub)
 #[cfg(test)]
-pub(crate) use storage::{ack, settle_delivering_for_session_reset};
+pub(crate) use storage::ack;
 pub use storage::{
     ack_by_correlation, ack_with_outcome, clear_compact, describe_message, drain, enqueue,
     find_message, get_thread, has_drained_blocker_for_correlation, inbox_agent_names,

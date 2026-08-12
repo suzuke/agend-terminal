@@ -1098,26 +1098,33 @@ pub struct AckOutcome {
 /// rows, so it cannot discard a never-delivered message.
 #[allow(dead_code)]
 pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
-    ack_with_outcome(home, name, msg_id).acked
+    ack_with_outcome(home, name, msg_id)
+        .map(|outcome| outcome.acked)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "inbox ack failed");
+            0
+        })
 }
 
-pub fn ack_with_outcome(home: &Path, name: &str, msg_id: Option<&str>) -> AckOutcome {
+pub fn ack_with_outcome(
+    home: &Path,
+    name: &str,
+    msg_id: Option<&str>,
+) -> anyhow::Result<AckOutcome> {
     let path = inbox_path_resolved(home, name);
     if !path.exists() {
-        return AckOutcome {
+        return Ok(AckOutcome {
             acked: 0,
             kind: if msg_id.is_some() {
                 AckOutcomeKind::NotFound
             } else {
                 AckOutcomeKind::NoDeliveringRows
             },
-        };
+        });
     }
     let (outcome, settlement_intents) = with_inbox_lock(home, name, |path| {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return (AckOutcome::default(), Vec::new()),
-        };
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("read inbox for ack: {error}"))?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
@@ -1196,7 +1203,7 @@ pub fn ack_with_outcome(home: &Path, name: &str, msg_id: Option<&str>) -> AckOut
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox ack write-back failed");
-                return (AckOutcome::default(), Vec::new());
+                return Err(anyhow::anyhow!("write inbox ack state: {e}"));
             }
         }
         let kind = if msg_id.is_none() {
@@ -1218,12 +1225,8 @@ pub fn ack_with_outcome(home: &Path, name: &str, msg_id: Option<&str>) -> AckOut
         } else {
             AckOutcomeKind::NoDeliveringRows
         };
-        (AckOutcome { acked, kind }, settlement_intents)
-    })
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "inbox ack lock failed");
-        (AckOutcome::default(), Vec::new())
-    });
+        Ok((AckOutcome { acked, kind }, settlement_intents))
+    })??;
     for (target, correlation, episode) in settlement_intents {
         crate::daemon::ci_handoff_track::resolve_protected_episode(
             home,
@@ -1233,7 +1236,7 @@ pub fn ack_with_outcome(home: &Path, name: &str, msg_id: Option<&str>) -> AckOut
             "ack_protected",
         );
     }
-    outcome
+    Ok(outcome)
 }
 
 /// #2622 PR-2: settle the single row `msg_id` to `read` regardless of its
@@ -1396,13 +1399,6 @@ pub fn requeue_delivering_for_session_reset(home: &Path, name: &str) -> usize {
         );
     }
     requeued
-}
-
-/// Backwards-compatible name for callers compiled against the pre-#3228 API.
-/// Session reset no longer acknowledges rows; it preserves and requeues them.
-#[allow(dead_code)]
-pub fn settle_delivering_for_session_reset(home: &Path, name: &str) -> usize {
-    requeue_delivering_for_session_reset(home, name)
 }
 
 /// Scoped ack: settle DELIVERING rows for `name` where `task_id` matches
