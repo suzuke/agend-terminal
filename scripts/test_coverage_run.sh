@@ -247,11 +247,104 @@ PRODUCER
     rm -rf "$sandbox"
 }
 
+# ── 6-8. Named-path resolution and membership exactness ──────────────────────
+# Helper: run the wrapper over a sandbox whose producer names $1 verbatim.
+# $2..: extra files to create in profiles/. Echoes the corrupt= line.
+run_named_case() {
+    local named="$1" sandbox out
+    shift
+    sandbox="$(new_sandbox)"
+    local f
+    for f in "$@"; do
+        printf 'partial' >"$sandbox/profiles/$f"
+    done
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $named: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 \
+        "$wrapper" 2>&1)"
+    echo "$out" | grep -E '^\s*corrupt=' | head -n 1
+    rm -rf "$sandbox"
+}
+
+# Membership must be an EXACT match: foo.profraw is not a member merely because
+# the response file lists otherfoo.profraw.
+test_membership_is_exact_not_substring() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/foo-1-2_0.profraw"
+    printf '%s\n' "$sandbox/profiles/otherfoo-1-2_0.profraw" \
+        >"$sandbox/profiles/agend-terminal-profraw-list"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $sandbox/profiles/foo-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=no'; then
+        report 0 "response membership is exact, not substring"
+    else
+        report 1 "response membership is exact, not substring" "got: $line"
+    fi
+}
+
+# A quoted absolute path must still resolve to the real file.
+test_quoted_absolute_named_path_resolves() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/quoted-9-8_0.profraw"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: \"$sandbox/profiles/quoted-9-8_0.profraw\": invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'exists=yes'; then
+        report 0 "quoted absolute named path resolves"
+    else
+        report 1 "quoted absolute named path resolves" "got: $line"
+    fi
+}
+
+# A bare relative name must resolve against the profile directory, not the CWD.
+test_bare_relative_named_path_resolves() {
+    local line
+    line="$(run_named_case "bare-7-6_0.profraw" "bare-7-6_0.profraw")"
+    if echo "$line" | grep -q 'exists=yes'; then
+        report 0 "bare relative named path resolves against the profile dir"
+    else
+        report 1 "bare relative named path resolves against the profile dir" "got: $line"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
 test_corrupt_failure_emits_bounded_diagnostics
 test_named_corrupt_path_is_cap_exempt
+test_membership_is_exact_not_substring
+test_quoted_absolute_named_path_resolves
+test_bare_relative_named_path_resolves
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed"
