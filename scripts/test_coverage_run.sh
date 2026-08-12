@@ -439,6 +439,177 @@ PRODUCER
     fi
 }
 
+# ── 35-39. Facts the block states about reads it could not make ─────────────
+# The rule 3e4a52b2 exists to enforce is that a read which did not happen
+# produces no fact. A BLANK field breaks it; so does an affirmative wrong one.
+
+# `read_pinned_facts` returns 1 both for "not there" and "could not open it",
+# and the caller rendered both as `exists=no` — asserting absence for a file
+# that is present. The survey two lines below says `file=<same name>`, so the
+# block contradicts itself.
+test_unreadable_named_path_is_not_reported_absent() {
+    local sandbox out block line bad=""
+    sandbox="$(new_sandbox)"
+    if cannot_make_unreadable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "an unreadable named path is not reported absent" \
+            "this user can read a mode-000 file; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'REALBYTES' >"$COVERAGE_PROFILE_DIR/named-1-2_0.profraw"
+chmod 000 "$COVERAGE_PROFILE_DIR/named-1-2_0.profraw"
+printf 'warning: %s/named-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    line="$(echo "$block" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad premise-not-described"
+    echo "$line" | grep -q 'exists=no' && bad="$bad claims-absent"
+    echo "$line" | grep -q 'exists=unreadable' || bad="$bad not-labelled-unreadable"
+    if [ -n "$bad" ]; then
+        report 1 "an unreadable named path is not reported absent" "issues:$bad; got: $line"
+    else
+        report 0 "an unreadable named path is not reported absent"
+    fi
+}
+
+# `od` prints nothing for an empty file, so the named route emitted `header=`
+# blank while the survey reported `header=n/a` for the very same file.
+test_zero_byte_named_path_reports_na_header() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+: >"$COVERAGE_PROFILE_DIR/empty-1-1_0.profraw"
+printf 'warning: %s/empty-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    rm -rf "$sandbox"
+    echo "$line" | grep -q 'size_bytes=0' || bad="$bad premise-not-zero-byte"
+    echo "$line" | grep -qE 'header=[[:space:]]*mtime=' && bad="$bad blank-header"
+    echo "$line" | grep -q 'header=n/a' || bad="$bad header-not-na"
+    if [ -n "$bad" ]; then
+        report 1 "a zero-byte named path reports header=n/a, not blank" "issues:$bad; got: $line"
+    else
+        report 0 "a zero-byte named path reports header=n/a, not blank"
+    fi
+}
+
+# The named list is DEDUPED but the warning count is not, so a producer that
+# names the same path twice made the accounting invent a second, unparseable
+# path that never existed.
+test_duplicate_warning_fabricates_no_unparseable_record() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'x' >"$COVERAGE_PROFILE_DIR/dup-1-1_0.profraw"
+printf 'warning: %s/dup-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+printf 'warning: %s/dup-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    # Premise: the one real path must have been described.
+    echo "$block" | grep -q 'corrupt=dup-1-1_0.profraw' || bad="$bad premise-not-described"
+    echo "$block" | grep -q 'unparseable' && bad="$bad fabricated-unparseable"
+    if [ -n "$bad" ]; then
+        report 1 "a duplicated warning fabricates no unparseable record" "issues:$bad"
+    else
+        report 0 "a duplicated warning fabricates no unparseable record"
+    fi
+}
+
+# Isolation is a SAFETY gate (property 3). `find` failing and `find` matching
+# nothing both yield a count of zero, so an unreadable profile directory —
+# where `rm` silently did nothing — was reported as successfully isolated and
+# the wrapper retried against state nobody verified.
+test_unreadable_profile_dir_fails_isolation_closed() {
+    local sandbox out rc bad=""
+    sandbox="$(new_sandbox)"
+    if cannot_make_unreadable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "an unreadable profile dir fails isolation closed" \
+            "this user can read a mode-000 file; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'stale' >"$COVERAGE_PROFILE_DIR/stale-1-1_0.profraw"
+chmod 000 "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    rc=$?
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    echo "$out" | grep -qi 'cannot isolate' || bad="$bad no-isolation-error"
+    [ "$rc" -ne 0 ] || bad="$bad exited-zero"
+    if [ -n "$bad" ]; then
+        report 1 "an unreadable profile dir fails isolation closed" \
+            "issues:$bad; rc=$rc"
+    else
+        report 0 "an unreadable profile dir fails isolation closed"
+    fi
+}
+
+# `diag_max_files` is the one seam never validated, and it is used as a bare
+# integer in `[ … -ge … ]` and as `head -n`. A non-numeric value therefore
+# printed bash's own errors, unframed, INSIDE the group.
+test_non_numeric_diag_cap_emits_no_raw_shell_error() {
+    local sandbox out block bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/cap-1-1_0.profraw"
+printf '%s/cap-1-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        COVERAGE_DIAG_MAX_FILES=abc "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    echo "$block" | grep -q 'profile_dir=' || bad="$bad premise-no-block"
+    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    # A bad cap must not silently swallow the evidence either.
+    echo "$block" | grep -q 'response_line=' || bad="$bad lost-response-lines"
+    echo "$block" | grep -q 'file=cap-1-1_0.profraw' || bad="$bad lost-survey"
+    if [ -n "$bad" ]; then
+        report 1 "a non-numeric diagnostic cap emits no raw shell error" \
+            "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
+    else
+        report 0 "a non-numeric diagnostic cap emits no raw shell error"
+    fi
+}
+
 # ── 30-34. The reads BEHIND the fields (adversarial review of the framing) ───
 # Framing the field is only half of it. The commands that produce the numbers
 # printed beside that field open producer-controlled paths too, and a failed
@@ -1210,6 +1381,11 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_unreadable_named_path_is_not_reported_absent
+test_zero_byte_named_path_reports_na_header
+test_duplicate_warning_fabricates_no_unparseable_record
+test_unreadable_profile_dir_fails_isolation_closed
+test_non_numeric_diag_cap_emits_no_raw_shell_error
 test_unreadable_profraw_emits_no_raw_shell_error
 test_unreadable_response_file_emits_no_raw_shell_error
 test_isolation_counts_files_not_lines
