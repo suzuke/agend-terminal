@@ -1491,6 +1491,38 @@ PRODUCER
     fi
 }
 
+# #3247 deterministic RED control. The historical suite failure was
+# unidentified because a failed contract reported only the aggregate label.
+# This control requires the failure-only block to retain the exact contract and
+# assertion context while staying bounded; the existing baseline has no such
+# block, so it must fail before the diagnostics implementation lands.
+test_failure_diagnostics_are_bounded_and_failure_only() {
+    local sandbox failure success bad="" lines
+    sandbox="$(new_sandbox)"
+    failure="$(report 1 "synthetic failure assertion" "actual=Disconnected expected=Empty")"
+    success="$(report 0 "synthetic success assertion")"
+    lines="$(printf '%s\n' "$failure" | wc -l | tr -d ' ')"
+    echo "$failure" | grep -q '::group::coverage contract failure diagnostics' \
+        || bad="$bad missing-failure-block"
+    echo "$failure" | grep -q 'contract=test_failure_diagnostics_are_bounded_and_failure_only' \
+        || bad="$bad missing-contract"
+    echo "$failure" | grep -q 'assertion=synthetic failure assertion' \
+        || bad="$bad missing-assertion"
+    echo "$failure" | grep -q 'run_tmpdir=' || bad="$bad missing-run-tmpdir"
+    echo "$failure" | grep -q 'sandbox=' || bad="$bad missing-sandbox"
+    echo "$failure" | grep -q 'deadline_outcome=' \
+        || bad="$bad missing-deadline-outcome"
+    echo "$failure" | grep -q 'fifo_state=' || bad="$bad missing-fifo-state"
+    [ "$lines" -le 80 ] || bad="$bad unbounded-lines-$lines"
+    echo "$success" | grep -q '::group::' && bad="$bad success-emitted-diagnostics"
+    rm -rf "$sandbox"
+    if [ -n "$bad" ]; then
+        report 1 "failure diagnostics preserve bounded contract context" "issues:$bad"
+    else
+        report 0 "failure diagnostics preserve bounded contract context"
+    fi
+}
+
 # Membership must be an EXACT match: foo.profraw is not a member merely because
 # the response file lists otherfoo.profraw.
 test_membership_is_exact_not_substring() {
@@ -3183,6 +3215,7 @@ test_response_file_name_cannot_forge_records
 test_profile_dir_field_cannot_forge_records
 test_missing_named_path_emits_no_raw_shell_error
 test_unmatched_warning_count_emits_no_raw_shell_error
+test_failure_diagnostics_are_bounded_and_failure_only
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
