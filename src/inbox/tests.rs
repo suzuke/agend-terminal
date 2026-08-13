@@ -2,6 +2,7 @@ use super::notify::route_notification;
 use super::storage::{inbox_path, inbox_path_for_id, set_row_delivering_at_for_test};
 use super::*;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -49,6 +50,53 @@ fn tmp_home_starts_clean_when_suffix_is_reused() {
 
 fn make_msg(from: &str, text: &str) -> InboxMessage {
     msg().sender(from).text(text).build()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConcurrentEnqueueDiagnostics {
+    physical_rows: usize,
+    parseable_rows: usize,
+    malformed_rows: usize,
+    distinct_ids: usize,
+    duplicate_ids: usize,
+    missing_ids: usize,
+    unread_rows: usize,
+    delivering_rows: usize,
+    processed_rows: usize,
+    invalid_state_rows: usize,
+}
+
+fn classify_concurrent_enqueue_rows(raw: &str) -> ConcurrentEnqueueDiagnostics {
+    let mut diagnostics = ConcurrentEnqueueDiagnostics::default();
+    let mut ids = HashSet::new();
+
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        diagnostics.physical_rows += 1;
+        let Ok(message) = serde_json::from_str::<InboxMessage>(line) else {
+            diagnostics.malformed_rows += 1;
+            continue;
+        };
+
+        diagnostics.parseable_rows += 1;
+        match message.id {
+            Some(id) => {
+                if !ids.insert(id) {
+                    diagnostics.duplicate_ids += 1;
+                }
+            }
+            None => diagnostics.missing_ids += 1,
+        }
+
+        match (message.read_at.is_some(), message.delivering_at.is_some()) {
+            (false, false) => diagnostics.unread_rows += 1,
+            (false, true) => diagnostics.delivering_rows += 1,
+            (true, false) => diagnostics.processed_rows += 1,
+            (true, true) => diagnostics.invalid_state_rows += 1,
+        }
+    }
+
+    diagnostics.distinct_ids = ids.len();
+    diagnostics
 }
 
 struct TestMsgBuilder(InboxMessage);
@@ -2402,14 +2450,52 @@ fn test_enqueue_concurrent_same_agent() {
     }
 
     let msgs = drain(&home, "agent1");
-    assert_eq!(
-        msgs.len(),
-        20,
-        "all 20 concurrent enqueues must survive, got {}",
-        msgs.len()
-    );
+    if msgs.len() != 20 {
+        let diagnostics = match fs::read_to_string(inbox_path(&home, "agent1")) {
+            Ok(raw) => format!("{:#?}", classify_concurrent_enqueue_rows(&raw)),
+            Err(error) => format!("raw_read_error={error}"),
+        };
+        panic!(
+            "all 20 concurrent enqueues must survive, got {}; post-drain diagnostics={diagnostics}",
+            msgs.len()
+        );
+    }
 
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn concurrent_enqueue_classifier_is_bounded_and_counts_row_states() {
+    let unread = serde_json::to_string(&msg().sender("unread").id("m-1").build()).unwrap();
+    let mut delivering = msg().sender("delivering").id("m-1").build();
+    delivering.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
+    let delivering = serde_json::to_string(&delivering).unwrap();
+    let mut processed = msg().sender("processed").id("m-2").build();
+    processed.read_at = Some("2025-01-01T00:00:00Z".to_string());
+    let processed = serde_json::to_string(&processed).unwrap();
+    let mut invalid = msg().sender("invalid").id("m-3").build();
+    invalid.read_at = Some("2025-01-01T00:00:00Z".to_string());
+    invalid.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
+    let invalid = serde_json::to_string(&invalid).unwrap();
+    let missing_id = serde_json::to_string(&msg().sender("missing-id").build()).unwrap();
+    let raw =
+        format!("{unread}\n{delivering}\n{processed}\n{invalid}\n{missing_id}\n{{not-json}}\n");
+
+    assert_eq!(
+        classify_concurrent_enqueue_rows(&raw),
+        ConcurrentEnqueueDiagnostics {
+            physical_rows: 6,
+            parseable_rows: 5,
+            malformed_rows: 1,
+            distinct_ids: 3,
+            duplicate_ids: 1,
+            missing_ids: 1,
+            unread_rows: 2,
+            delivering_rows: 1,
+            processed_rows: 1,
+            invalid_state_rows: 1,
+        }
+    );
 }
 
 #[test]
