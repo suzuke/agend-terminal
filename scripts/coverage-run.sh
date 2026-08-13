@@ -505,17 +505,15 @@ pid_liveness() {
     local rc
     case "$(pid_authority)" in
         proc)
+            # PRESENCE proves existence. ABSENCE proves nothing, ever.
+            # hidepid is OWNER-SENSITIVE: PID 1 can be visible merely because it
+            # shares our UID while a foreign target stays hidden, so no /proc
+            # entry — not `self`, not `1` — can serve as a visibility proxy.
+            # After `kill -0` has already failed, a missing entry is
+            # indistinguishable from an invisible one, so it is `unknown`.
             if [ -d "$diag_proc_root/$1" ]; then
                 printf 'yes'
-            elif [ -d "$diag_proc_root/1" ]; then
-                # PID 1 is visible, so this /proc is not hiding other owners'
-                # processes and a missing entry really is absence.
-                printf 'no'
             else
-                # `/proc/self` proves only that /proc is mounted, NOT that the
-                # namespace is fully visible: under hidepid (or a restricted
-                # mount) self exists while other PIDs are hidden, so a missing
-                # entry is invisibility, not absence.
                 printf 'unknown'
             fi
             ;;

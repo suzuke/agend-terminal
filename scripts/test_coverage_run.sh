@@ -2538,7 +2538,12 @@ echo "error: no profile can be merged"
 exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
-    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_DIAG_PROC_ROOT="$procroot" \
+    # MSYSTEM/OSTYPE are checked BEFORE uname, so on Git Bash they would force
+    # authority=none and the shimmed uname would never be consulted. Clear them
+    # so this test exercises the proc branch on every platform — without that,
+    # it silently tested nothing on Windows and failed there.
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" MSYSTEM="" OSTYPE="" \
+        COVERAGE_DIAG_PROC_ROOT="$procroot" \
         COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN="true" \
         COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
         COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
@@ -2546,26 +2551,29 @@ PRODUCER
     printf '%s' "$(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
 }
 
-test_hidepid_proc_is_not_absence() {
+test_proc_absence_is_never_reported_as_no() {
     local base got bad=""
     base="$(mktemp -d "${TMPDIR:-/tmp}/procvis.XXXXXX")"
     # hidepid-like: /proc is mounted (self present) but PID 1 is hidden.
     mkdir -p "$base/hidden/self"
     got="$(drive_proc_visibility "$base/hidden")"
     [ "$got" = "pid_alive=unknown" ] || bad="$bad hidepid-got($got)"
-    # Normal: PID 1 visible, target genuinely absent -> absence is real.
+    # PID 1 VISIBLE but target absent must still be `unknown`, never `no`:
+    # hidepid is owner-sensitive, so PID 1 may be visible only because it shares
+    # our UID while the foreign target stays hidden. No /proc entry is a valid
+    # visibility proxy.
     mkdir -p "$base/open/self" "$base/open/1"
     got="$(drive_proc_visibility "$base/open")"
-    [ "$got" = "pid_alive=no" ] || bad="$bad open-got($got)"
+    [ "$got" = "pid_alive=unknown" ] || bad="$bad pid1-visible-target-absent-got($got)"
     # Target present -> alive.
     mkdir -p "$base/live/self" "$base/live/1" "$base/live/4294967294"
     got="$(drive_proc_visibility "$base/live")"
     [ "$got" = "pid_alive=yes" ] || bad="$bad live-got($got)"
     rm -rf "$base"
     if [ -n "$bad" ]; then
-        report 1 "a hidden-pid /proc is not read as absence" "issues:$bad"
+        report 1 "/proc absence is never reported as no" "issues:$bad"
     else
-        report 0 "a hidden-pid /proc is not read as absence"
+        report 0 "/proc absence is never reported as no"
     fi
 }
 
@@ -2619,7 +2627,7 @@ test_leading_zero_live_pid_is_not_resolved_by_exe
 test_absence_requires_platform_authority
 test_pid_authority_seam_classifies_platforms
 test_failed_authority_query_is_not_absence
-test_hidepid_proc_is_not_absence
+test_proc_absence_is_never_reported_as_no
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
