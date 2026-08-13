@@ -1469,9 +1469,9 @@ mod tests {
         lane_holder.join().expect("lane holder");
 
         assert_eq!(
-            delete_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("external delete outcome"),
+            delete_rx.recv().expect(
+                "external delete outcome sender dropped before sending outcome (RecvError)",
+            ),
             DeleteOutcome::External
         );
         delete_thread.join().expect("delete thread");
@@ -1508,6 +1508,21 @@ mod tests {
             "external delete must remove the external registry entry"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// A completion receiver must surface a dead producer promptly instead of
+    /// hiding the failure behind an arbitrary wall-clock budget. This control
+    /// owns and joins its only producer thread; no worker or detached sender is
+    /// left alive to make `recv()` succeed accidentally.
+    #[test]
+    fn external_delete_completion_disconnect_control() {
+        let (delete_tx, delete_rx) = std::sync::mpsc::channel::<DeleteOutcome>();
+        let delete_thread = std::thread::spawn(move || drop(delete_tx));
+        let disconnected: std::sync::mpsc::RecvError = delete_rx
+            .recv()
+            .expect_err("completion receiver must report a dropped sender");
+        let _ = disconnected;
+        delete_thread.join().expect("completion producer thread");
     }
 
     #[test]
