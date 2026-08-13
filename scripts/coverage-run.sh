@@ -1086,7 +1086,7 @@ while :; do
         contained_warnings="$(count_corruption_warnings)"
         if [ "$contained_warnings" -gt 0 ]; then
             emit_diagnostics "$attempt"
-            echo "::warning::coverage completed from valid profiles while llvm-profdata skipped $contained_warnings unreadable profile warning(s)"
+            echo "::warning::coverage completed from valid profiles while the producer reported at least one unreadable profile; see the evidence block above"
         fi
         exit 0
     fi

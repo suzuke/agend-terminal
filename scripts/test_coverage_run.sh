@@ -95,6 +95,9 @@ if [ "$COV_TEST_CASE" = "all-bad" ]; then
     echo 'error: no profile can be merged'
     exit 1
 fi
+# A second matching log line is not a second profile. The success warning must
+# disclose degradation without fabricating a profile or warning tally.
+echo 'note: diagnostic path fragment contains invalid instrumentation profile data'
 exit 0
 PRODUCER
     chmod +x "$sandbox/producer.sh"
@@ -105,8 +108,10 @@ PRODUCER
         COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rc=$?
     [ "$rc" -eq 0 ] || bad="$bad mixed-exit($rc)"
-    echo "$out" | grep -q 'coverage completed from valid profiles' \
+    echo "$out" | grep -q 'coverage completed from valid profiles while the producer reported at least one unreadable profile' \
         || bad="$bad mixed-warning-missing"
+    echo "$out" | grep -qE 'skipped [0-9]+|[0-9]+ unreadable profile warning' \
+        && bad="$bad mixed-warning-fabricated-tally"
     echo "$out" | grep -q 'corrupt=agend-terminal-42-777_0.profraw' \
         || bad="$bad mixed-evidence-missing"
 
