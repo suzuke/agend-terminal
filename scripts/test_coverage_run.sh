@@ -2321,6 +2321,97 @@ PRODUCER
     fi
 }
 
+# SPY: an invalid PID token must perform ZERO process lookups and must yield a
+# COHERENT tuple. Guarding each consumer separately previously let
+# writer_start/writer_exe look up `007969` and name a real process while
+# liveness said unknown — contradictory evidence from one record.
+drive_pid_spy() {
+    local token="$1" sandbox shim out
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # A `ps` that records that it was called at all.
+    cat >"$shim/ps" <<SHIM
+#!/usr/bin/env bash
+printf 'called\n' >>"$sandbox/ps-called"
+exit 1
+SHIM
+    chmod +x "$shim/ps"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+printf 'partial' >"\$COVERAGE_PROFILE_DIR/agend-terminal-$token-795_0.profraw"
+printf 'warning: %s/agend-terminal-$token-795_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "\$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    local called="no"
+    [ -s "$sandbox/ps-called" ] && called="yes"
+    rm -rf "$sandbox"
+    printf '%s|%s' "$called" "$(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_start=[^ ]*\|writer_exe=[^ ]*' | tr '\n' ' ')"
+}
+
+test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent() {
+    local token res called fields bad=""
+    for token in 0 007969 99999999999999999999; do
+        res="$(drive_pid_spy "$token")"
+        called="${res%%|*}"
+        fields="${res#*|}"
+        [ "$called" = "no" ] || bad="$bad [$token]ps-was-called"
+        case "$fields" in
+            *"pid_alive=unknown"*) ;;
+            *) bad="$bad [$token]not-unknown" ;;
+        esac
+        case "$fields" in
+            *"writer_start=unavailable"*) ;;
+            *) bad="$bad [$token]start-not-unavailable" ;;
+        esac
+        case "$fields" in
+            *"writer_exe=unavailable"*) ;;
+            *) bad="$bad [$token]exe-not-unavailable" ;;
+        esac
+    done
+    if [ -n "$bad" ]; then
+        report 1 "invalid pid tokens do no lookup and stay coherent" "issues:$bad"
+    else
+        report 0 "invalid pid tokens do no lookup and stay coherent"
+    fi
+}
+
+# The specific R3 repro: a LIVE pid encoded non-canonically must not be resolved
+# through the back door by start/exe.
+test_leading_zero_live_pid_is_not_resolved_by_exe() {
+    local sandbox out live bad=""
+    sandbox="$(new_sandbox)"
+    sleep 30 &
+    live=$!
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-0$COV_LIVE_PID-796_0.profraw"
+printf 'warning: %s/agend-terminal-0%s-796_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$COV_LIVE_PID"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COV_LIVE_PID="$live" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | grep -q 'writer_exe=unavailable' || bad="$bad exe-resolved-anyway"
+    echo "$out" | grep -q 'writer_start=unavailable' || bad="$bad start-resolved-anyway"
+    if [ -n "$bad" ]; then
+        report 1 "a non-canonical live pid is not resolved by exe/start" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_exe=[^ ]*\|writer_start=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "a non-canonical live pid is not resolved by exe/start"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2366,6 +2457,8 @@ test_unsignalable_live_pid_is_not_reported_absent
 test_no_contradictory_pid_evidence
 test_leading_zero_pid_is_not_reinterpreted
 test_max_length_pid_token_classifies
+test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent
+test_leading_zero_live_pid_is_not_resolved_by_exe
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper

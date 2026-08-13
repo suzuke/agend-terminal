@@ -433,39 +433,48 @@ pid_token() {
 # are recycled, so a live number is not proof that THE writer still runs; it is
 # one correlate, to be read with `writer_start`/`writer_exe`. `kill -0` needs no
 # /proc, so this fact holds on Linux, macOS and Git Bash alike.
-pid_liveness() {
-    # CANONICAL tokens only. A leading zero is not canonical: `007` would be
-    # reinterpreted as PID 7 — a DIFFERENT process — and `0` is never a writer.
+# ONE boundary parse. Every PID consumer below reads ONLY this result, so a
+# non-canonical token can never reach a kill/ps//proc lookup. Guarding each
+# consumer separately was the wrong shape: it left `writer_start`/`writer_exe`
+# free to look up `007969` and name a real process while liveness said unknown.
+# Empty result == not a usable PID.
+canonical_pid() {
     case "$1" in
-        '' | *[!0-9]* | 0*) printf 'unknown'; return ;;
+        # A leading zero is not canonical: `007` would be reinterpreted as PID 7,
+        # a DIFFERENT process. `0` is never a writer.
+        '' | *[!0-9]* | 0*) printf ''; return ;;
     esac
-    # Digits alone are not enough: a token too large for a shell integer passes
-    # a digits-only guard and then errors inside `[ … ]`, printing a raw shell
-    # diagnostic into the block. No real PID exceeds 10 digits.
-    [ "${#1}" -le 10 ] || { printf 'unknown'; return; }
+    # Digits alone are not enough — a token too large for a shell integer errors
+    # inside `[ … ]` and prints a raw shell diagnostic into the block.
+    [ "${#1}" -le 10 ] || { printf ''; return; }
+    printf '%s' "$1"
+}
 
-    # TRI-STATE, truthfully. `kill -0` fails for BOTH "no such process" (ESRCH)
-    # and "permission denied" (EPERM), so a bare failure is NOT proof of
-    # absence — reporting `no` for another user's live process is a false
-    # refutation, and contradicts `writer_exe` naming that same process.
-    #   yes     = existence proven
-    #   no      = absence proven by an authority that can see all processes
-    #   unknown = could not distinguish
+# Callers pass ONLY a canonical_pid result.
+#
+# TRI-STATE, truthfully. `kill -0` fails for BOTH "no such process" (ESRCH) and
+# "permission denied" (EPERM), so a bare failure is NOT proof of absence.
+#   yes     = existence proven
+#   no      = absence proven BY AN AUTHORITY THAT SEES ALL PROCESSES
+#   unknown = could not distinguish
+# Authority matters: MSYS `ps` lists only MSYS processes, so on Windows it can
+# not refute a native PID — measured, it reported PID 1 absent in CI.
+pid_liveness() {
+    [ -n "$1" ] || { printf 'unknown'; return; }
     if kill -0 "$1" 2>/dev/null; then
         printf 'yes'
         return
     fi
     if [ -d /proc ]; then
-        # /proc lists every process regardless of ownership, so it is
-        # authoritative in both directions on Linux.
         if [ -d "/proc/$1" ]; then printf 'yes'; else printf 'no'; fi
         return
     fi
-    if command -v ps >/dev/null 2>&1; then
-        # `ps -p` sees other users' processes, so it too is authoritative.
-        if ps -p "$1" -o pid= >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
-        return
-    fi
+    case "$(uname -s 2>/dev/null)" in
+        Darwin | *BSD)
+            if ps -p "$1" -o pid= >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
+            return
+            ;;
+    esac
     printf 'unknown'
 }
 
@@ -473,7 +482,7 @@ pid_liveness() {
 # Only the executable's BASENAME is emitted — never argv, never env — so the
 # block answers "which binary was this?" without carrying arbitrary content.
 writer_start() {
-    case "$1" in '' | *[!0-9]*) printf 'unavailable'; return ;; esac
+    [ -n "$1" ] || { printf 'unavailable'; return; }
     if [ -r "/proc/$1/stat" ]; then
         # comm (field 2) is parenthesised and may contain spaces or ')', so
         # counting fields from the start is wrong. Cut after the FINAL ')' and
@@ -486,7 +495,7 @@ writer_start() {
 
 writer_exe() {
     local raw=""
-    case "$1" in '' | *[!0-9]*) printf 'unavailable'; return ;; esac
+    [ -n "$1" ] || { printf 'unavailable'; return; }
     if [ -r "/proc/$1/cmdline" ]; then
         raw="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1)"
     fi
@@ -712,12 +721,15 @@ describe_named_corrupt() {
         "$(module_token "$base")"
     # Writer evidence on its own lines, so the corrupt= record above keeps the
     # exact shape every prior contract test pins.
-    local wpid
+    # Parse ONCE; an invalid token yields the coherent tuple
+    # (unknown, unavailable, unavailable) with ZERO process lookups.
+    local wpid cpid
     wpid="$(pid_token "$base")"
-    NAMED_WRITER_PIDS="$NAMED_WRITER_PIDS $wpid"
+    cpid="$(canonical_pid "$wpid")"
+    NAMED_WRITER_PIDS="$NAMED_WRITER_PIDS $cpid"
     printf '    writer_pid=%s pid_alive=%s writer_start=%s writer_exe=%s\n' \
-        "$wpid" "$(pid_liveness "$wpid")" \
-        "$(escape_field "$(writer_start "$wpid")")" "$(writer_exe "$wpid")"
+        "$(escape_field "$wpid")" "$(pid_liveness "$cpid")" \
+        "$(escape_field "$(writer_start "$cpid")")" "$(writer_exe "$cpid")"
     printf '    head64=%s\n' "$FACT_HEAD64"
     emit_module_exemplar "$base" "$(module_token "$base")"
 }
