@@ -1771,18 +1771,49 @@ PRODUCER
 # FIFO snapshots are attributed to the current assertion.
 test_stale_deadline_sidecar_is_not_attributed() {
     local stale_contract="foreign-deadline-contract" failure bad="" status_path fifo_path
+    local stale_status stale_fifos legacy_status legacy_fifos foreign_root foreign_fifos path i=1
+    foreign_root="$(mktemp -d "${run_tmpdir_parent}/cov-stale-sidecar.XXXXXX")"
+    foreign_fifos="$foreign_root/fifos.list"
+    if fifos_unavailable "$foreign_root"; then
+        rm -rf "$foreign_root"
+        report_skip "a stale deadline sidecar is not attributed" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    : >"$foreign_fifos"
+    while [ "$i" -le 12 ]; do
+        path="$foreign_root/foreign-$i.fifo"
+        mkfifo "$path"
+        printf '%s\n' "$path" >>"$foreign_fifos"
+        i=$((i + 1))
+    done
+    stale_status="$(deadline_status_for "$stale_contract")"
+    stale_fifos="$(deadline_fifos_for "$stale_contract")"
+    legacy_status="$diag_root/deadline-status"
+    legacy_fifos="$diag_root/deadline-fifos"
     status_path="$(deadline_status_for "${FUNCNAME[0]}")"
     fifo_path="$(deadline_fifos_for "${FUNCNAME[0]}")"
-    printf 'contract=%s\noutcome=blocked\nwaited_seconds=20\n' "$stale_contract" >"$status_path"
-    printf '%s/foreign.fifo\n' "$run_tmpdir" >"$fifo_path"
+    printf 'contract=%s\noutcome=completed\nwaited_seconds=1\ndeadline_seconds=5\nwait_status=1\n' \
+        "$stale_contract" >"$stale_status"
+    printf '%s\n' "$foreign_root"/foreign-*.fifo >"$stale_fifos"
+    cp "$stale_status" "$legacy_status"
+    cp "$stale_fifos" "$legacy_fifos"
+    cp "$stale_status" "$status_path"
+    cp "$stale_fifos" "$fifo_path"
     failure="$(report 1 "stale sidecar is not attributed" "sidecar=foreign")"
     echo "$failure" | grep -q '^deadline_outcome=not-recorded$' \
         || bad="$bad stale-deadline-was-attributed"
-    echo "$failure" | grep -q '^deadline_outcome=blocked$' \
-        && bad="$bad blocked-outcome-leaked"
-    echo "$failure" | grep -q '^fifo_snapshot=' \
-        && bad="$bad stale-fifo-was-attributed"
-    rm -f "$status_path" "$fifo_path"
+    echo "$failure" | grep -qE '^deadline_(waited_seconds|seconds|wait_status)=' \
+        && bad="$bad stale-deadline-fields-leaked"
+    echo "$failure" | grep -q '^deadline_fifo_state=not-recorded$' \
+        || bad="$bad stale-fifo-state-not-recorded-missing"
+    echo "$failure" | grep -q 'foreign-' \
+        && bad="$bad foreign-fifo-path-leaked"
+    echo "$failure" | grep -q '^fifo_state=none$' \
+        || bad="$bad foreign-fifo-state-not-none"
+    rm -f "$status_path" "$fifo_path" "$stale_status" "$stale_fifos" \
+        "$legacy_status" "$legacy_fifos"
+    rm -rf "$foreign_root"
     if [ -n "$bad" ]; then
         report 1 "a stale deadline sidecar is not attributed" "issues:$bad"
     else
