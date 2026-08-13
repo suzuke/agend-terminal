@@ -1726,6 +1726,243 @@ PRODUCER
     fi
 }
 
+# ── 48-54. Late-writer discriminator (#3236, d-…011320993265-24) ────────────
+# DIAGNOSTICS ONLY. These pin evidence, not a cure: nothing here may change the
+# failure, the retry policy or the classification. The open question they exist
+# to answer is whether the writer of a named corrupt profile is STILL ALIVE when
+# llvm-profdata runs.
+
+# Drive a corrupt run whose producer names $2 and optionally pre-creates files.
+drive_writer_case() {
+    local sandbox="$1" named="$2" attempts="${3:-1}"
+    (cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS="$attempts" \
+        "$wrapper" 2>&1)
+}
+
+# A profile whose writer is still running must be reported alive — the decisive
+# datum separating "late writer" from "died mid-merge".
+test_live_writer_is_reported_alive() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+sleep 30 &
+live=$!
+echo "$live" >"$COV_LIVE_PID"
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$live-777_0.profraw"
+printf 'warning: %s/agend-terminal-%s-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$live"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(COV_LIVE_PID="$sandbox/livepid" drive_writer_case "$sandbox" "" 1)"
+    local live; live="$(cat "$sandbox/livepid" 2>/dev/null)"
+    kill "$live" 2>/dev/null
+    rm -rf "$sandbox"
+    echo "$out" | grep -q "writer_pid=$live" || bad="$bad pid-not-reported"
+    echo "$out" | grep -q 'writer_alive=yes' || bad="$bad not-alive"
+    if [ -n "$bad" ]; then
+        report 1 "a live writer is reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "a live writer is reported alive"
+    fi
+}
+
+# A writer that has exited must be reported dead, not alive.
+test_dead_writer_is_reported_dead() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+sh -c 'exit 0' & dead=$!; wait "$dead" 2>/dev/null
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$dead-778_0.profraw"
+printf 'warning: %s/agend-terminal-%s-778_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$dead"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'writer_alive=' || bad="$bad no-liveness-field"
+    echo "$out" | grep -q 'writer_alive=yes' && bad="$bad claims-alive"
+    if [ -n "$bad" ]; then
+        report 1 "an exited writer is not reported alive" "issues:$bad"
+    else
+        report 0 "an exited writer is not reported alive"
+    fi
+}
+
+# A name carrying no parseable pid must degrade, never error.
+test_unparseable_writer_pid_is_unknown() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/nopid.profraw"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'warning: %s/nopid.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'writer_pid=unknown' || bad="$bad not-unknown"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "an unparseable writer pid is reported unknown" "issues:$bad"
+    else
+        report 0 "an unparseable writer pid is reported unknown"
+    fi
+}
+
+# The ownership timeline: three bounded inventories around cleanup.
+test_three_inventories_bracket_cleanup() {
+    local sandbox out bad="" order
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4242-779_0.profraw"
+printf 'warning: %s/agend-terminal-4242-779_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 2)"
+    rm -rf "$sandbox"
+    order="$(echo "$out" | grep -o 'inventory=[a-z-]*' | tr '\n' ',')"
+    [ "$order" = "inventory=pre-clean,inventory=post-clean,inventory=post-grace," ] \
+        || bad="$bad wrong-order($order)"
+    echo "$out" | grep -q 'profraw_files=' || bad="$bad no-file-count"
+    echo "$out" | grep -q 'live_writers=' || bad="$bad no-live-count"
+    if [ -n "$bad" ]; then
+        report 1 "three inventories bracket cleanup" "issues:$bad"
+    else
+        report 0 "three inventories bracket cleanup"
+    fi
+}
+
+# The grace is diagnostic-only: a PASSING run must not pay it, and must emit no
+# inventory at all.
+test_grace_and_inventory_only_on_corrupt_path() {
+    local sandbox out bad="" t0 t1
+    sandbox="$(new_sandbox)"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$sandbox/producer.sh"
+    chmod +x "$sandbox/producer.sh"
+    t0=$(date +%s)
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    t1=$(date +%s)
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'inventory=' && bad="$bad inventory-on-success"
+    [ $((t1 - t0)) -le 1 ] || bad="$bad success-path-delayed($((t1-t0))s)"
+    if [ -n "$bad" ]; then
+        report 1 "grace and inventory are corrupt-path only" "issues:$bad"
+    else
+        report 0 "grace and inventory are corrupt-path only"
+    fi
+}
+
+# 64 bytes, not just the magic — and still one line for a newline-bearing name.
+test_first_64_bytes_are_captured() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+i=0; while [ "$i" -lt 80 ]; do printf 'A'; i=$((i+1)); done >"$COVERAGE_PROFILE_DIR/agend-terminal-4243-780_0.profraw"
+printf 'warning: %s/agend-terminal-4243-780_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    line="$(echo "$out" | grep -o 'head64=.*' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad no-head64"
+    # 64 bytes of 0x41 => 64 "41" tokens.
+    [ "$(echo "$line" | grep -o '41' | wc -l | tr -d ' ')" = "64" ] || bad="$bad not-64-bytes"
+    if [ -n "$bad" ]; then
+        report 1 "the first 64 bytes are captured" "issues:$bad; got: ${line:0:60}"
+    else
+        report 0 "the first 64 bytes are captured"
+    fi
+}
+
+# Tool versions and LLVM_COV/LLVM_PROFDATA PRESENCE — never their values.
+test_toolchain_presence_without_values() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4244-781_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && LLVM_COV=/secret/path/llvm-cov COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -o 'toolchain .*' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad no-toolchain-line"
+    echo "$line" | grep -q 'LLVM_COV=set' || bad="$bad presence-not-reported"
+    # The VALUE must never appear anywhere in the output.
+    echo "$out" | grep -q '/secret/path' && bad="$bad LEAKED-ENV-VALUE"
+    if [ -n "$bad" ]; then
+        report 1 "toolchain presence is reported without env values" "issues:$bad"
+    else
+        report 0 "toolchain presence is reported without env values"
+    fi
+}
+
+# A healthy exemplar of the SAME module settles whether an odd size is a module
+# property or a corruption signal — the hole left open by the run-31655194748
+# analysis.
+test_healthy_same_module_exemplar() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4245-782_0.profraw"
+printf 'healthy-exemplar-bytes' >"$COVERAGE_PROFILE_DIR/agend-terminal-9999-782_0.profraw"
+printf 'warning: %s/agend-terminal-4245-782_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'exemplar=agend-terminal-9999-782_0.profraw' || bad="$bad no-exemplar"
+    echo "$out" | grep -qE 'exemplar=[^ ]+ size_bytes=22' || bad="$bad no-exemplar-size"
+    if [ -n "$bad" ]; then
+        report 1 "a healthy same-module exemplar is emitted" "issues:$bad; got: $(echo "$out" | grep -o 'exemplar=.*' | head -1)"
+    else
+        report 0 "a healthy same-module exemplar is emitted"
+    fi
+}
+
+# No same-module peer -> say so explicitly rather than omit the field.
+test_missing_exemplar_is_explicit() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4246-783_0.profraw"
+printf 'warning: %s/agend-terminal-4246-783_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'exemplar=none' || bad="$bad not-explicit"
+    if [ -n "$bad" ]; then
+        report 1 "a missing exemplar is stated explicitly" "issues:$bad"
+    else
+        report 0 "a missing exemplar is stated explicitly"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -1749,6 +1986,15 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_live_writer_is_reported_alive
+test_dead_writer_is_reported_dead
+test_unparseable_writer_pid_is_unknown
+test_three_inventories_bracket_cleanup
+test_grace_and_inventory_only_on_corrupt_path
+test_first_64_bytes_are_captured
+test_toolchain_presence_without_values
+test_healthy_same_module_exemplar
+test_missing_exemplar_is_explicit
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
