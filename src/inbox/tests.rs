@@ -68,9 +68,12 @@ struct ConcurrentEnqueueDiagnostics {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ConcurrentEnqueueFailureClass {
+    AppendSideCorruption,
     AppendSideAbsence,
+    IdentityAnomaly,
     DrainRewriteLoss,
     DrainStateOmission,
+    SnapshotUnavailable,
     Unclassified,
 }
 
@@ -107,15 +110,35 @@ fn classify_concurrent_enqueue_rows(raw: &str) -> ConcurrentEnqueueDiagnostics {
     diagnostics
 }
 
+fn read_concurrent_enqueue_diagnostics(
+    path: &Path,
+) -> std::io::Result<ConcurrentEnqueueDiagnostics> {
+    let raw = fs::read(path)?;
+    Ok(classify_concurrent_enqueue_rows(&String::from_utf8_lossy(
+        &raw,
+    )))
+}
+
 fn classify_concurrent_enqueue_failure(
     pre_drain: Option<&ConcurrentEnqueueDiagnostics>,
     post_drain: Option<&ConcurrentEnqueueDiagnostics>,
     drained_rows: usize,
 ) -> ConcurrentEnqueueFailureClass {
-    let (Some(pre_drain), Some(post_drain)) = (pre_drain, post_drain) else {
-        return ConcurrentEnqueueFailureClass::Unclassified;
+    let Some(pre_drain) = pre_drain else {
+        return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
     };
-    if pre_drain.physical_rows < 20 {
+    let Some(post_drain) = post_drain else {
+        return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
+    };
+    if pre_drain.malformed_rows > 0 || post_drain.malformed_rows > 0 {
+        ConcurrentEnqueueFailureClass::AppendSideCorruption
+    } else if pre_drain.duplicate_ids > 0
+        || pre_drain.missing_ids > 0
+        || post_drain.duplicate_ids > 0
+        || post_drain.missing_ids > 0
+    {
+        ConcurrentEnqueueFailureClass::IdentityAnomaly
+    } else if pre_drain.physical_rows < 20 {
         ConcurrentEnqueueFailureClass::AppendSideAbsence
     } else if post_drain.physical_rows < 20 {
         ConcurrentEnqueueFailureClass::DrainRewriteLoss
@@ -2477,22 +2500,21 @@ fn test_enqueue_concurrent_same_agent() {
     }
 
     let path = inbox_path_resolved(&home, "agent1");
-    let pre_drain = fs::read_to_string(&path)
-        .ok()
-        .map(|raw| classify_concurrent_enqueue_rows(&raw));
+    let pre_drain = read_concurrent_enqueue_diagnostics(&path).unwrap_or_else(|error| {
+        panic!("pre-drain snapshot failed for {}: {error}", path.display())
+    });
     let msgs = drain(&home, "agent1");
     if msgs.len() != 20 {
-        let post_drain = fs::read_to_string(&path)
-            .ok()
-            .map(|raw| classify_concurrent_enqueue_rows(&raw));
-        let failure_class = classify_concurrent_enqueue_failure(
-            pre_drain.as_ref(),
-            post_drain.as_ref(),
-            msgs.len(),
-        );
+        let (post_drain, post_drain_read_error) = match read_concurrent_enqueue_diagnostics(&path) {
+            Ok(diagnostics) => (Some(diagnostics), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let failure_class =
+            classify_concurrent_enqueue_failure(Some(&pre_drain), post_drain.as_ref(), msgs.len());
         panic!(
-            "all 20 concurrent enqueues must survive, got {}; failure_class={failure_class:?}; pre-drain diagnostics={pre_drain:#?}; post-drain diagnostics={post_drain:#?}",
+            "all 20 concurrent enqueues must survive, got {}; path={}; failure_class={failure_class:?}; pre-drain diagnostics={pre_drain:#?}; post-drain diagnostics={post_drain:#?}; post-drain read error={post_drain_read_error:?}",
             msgs.len(),
+            path.display(),
         );
     }
 
@@ -2500,7 +2522,7 @@ fn test_enqueue_concurrent_same_agent() {
 }
 
 #[test]
-fn concurrent_enqueue_classifier_is_bounded_and_counts_row_states() {
+fn concurrent_enqueue_classifier_counts_row_states_and_ids() {
     let unread = serde_json::to_string(&msg().sender("unread").id("m-1").build()).unwrap();
     let mut delivering = msg().sender("delivering").id("m-1").build();
     delivering.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
@@ -2531,6 +2553,16 @@ fn concurrent_enqueue_classifier_is_bounded_and_counts_row_states() {
             invalid_state_rows: 1,
         }
     );
+
+    let invalid_utf8 = String::from_utf8_lossy(b"{not-json\xff}\n");
+    assert_eq!(
+        classify_concurrent_enqueue_rows(&invalid_utf8),
+        ConcurrentEnqueueDiagnostics {
+            physical_rows: 1,
+            malformed_rows: 1,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -2551,6 +2583,49 @@ fn concurrent_enqueue_failure_classification_decision_table() {
     assert_eq!(
         classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(20)), 19),
         ConcurrentEnqueueFailureClass::DrainStateOmission
+    );
+
+    let malformed = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 19,
+        malformed_rows: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&malformed), Some(&malformed), 19),
+        ConcurrentEnqueueFailureClass::AppendSideCorruption
+    );
+
+    let duplicate = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 19,
+        duplicate_ids: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&duplicate), Some(&duplicate), 19),
+        ConcurrentEnqueueFailureClass::IdentityAnomaly
+    );
+
+    let missing = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 19,
+        missing_ids: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&missing), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::IdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(None, Some(&counts(20)), 19),
+        ConcurrentEnqueueFailureClass::SnapshotUnavailable
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), None, 19),
+        ConcurrentEnqueueFailureClass::SnapshotUnavailable
     );
 }
 
