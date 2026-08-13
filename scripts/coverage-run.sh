@@ -459,30 +459,50 @@ canonical_pid() {
 #   unknown = could not distinguish
 # Authority matters: MSYS `ps` lists only MSYS processes, so on Windows it can
 # not refute a native PID — measured, it reported PID 1 absent in CI.
+# Which authority, if any, can prove ABSENCE of an arbitrary PID on this host?
+# A NAMED SEAM, so Windows behaviour is testable from any platform.
+#   proc = /proc lists every process (Linux)
+#   ps   = `ps -p` lists every process (Darwin/BSD)
+#   none = no authority over the native PID space; absence is NOT knowable
+# Git Bash/MSYS is `none` even though it ships BOTH a /proc and a ps: each sees
+# only MSYS processes, so neither can refute a native Windows PID. Inferring
+# authority from `[ -d /proc ]` is exactly how PID 1 was twice declared absent
+# on Windows CI.
+pid_authority() {
+    case "${MSYSTEM:-}" in
+        ?*) printf 'none'; return ;;
+    esac
+    case "${OSTYPE:-}" in
+        msys* | cygwin* | win*) printf 'none'; return ;;
+    esac
+    case "$(uname -s 2>/dev/null)" in
+        Linux) printf 'proc' ;;
+        Darwin | *BSD) printf 'ps' ;;
+        *) printf 'none' ;;
+    esac
+}
+
+# Callers pass ONLY a canonical_pid result.
+#
+# TRI-STATE, truthfully. `kill -0` fails for BOTH ESRCH and EPERM, so a bare
+# failure is NOT proof of absence.
+#   yes     = existence proven
+#   no      = absence proven by an authority that sees EVERY process
+#   unknown = could not distinguish
 pid_liveness() {
     [ -n "$1" ] || { printf 'unknown'; return; }
     if kill -0 "$1" 2>/dev/null; then
         printf 'yes'
         return
     fi
-    # `kill -0` failing proves nothing on its own: it fails for BOTH ESRCH and
-    # EPERM. Absence may only be asserted by an authority that can see EVERY
-    # process on this system. Authority is decided by PLATFORM, never inferred
-    # from the presence of a file: MSYS ships a /proc that lists only MSYS
-    # processes, so "/proc exists" wrongly implied Linux and reported PID 1
-    # absent on Windows CI.
-    case "$(uname -s 2>/dev/null)" in
-        Linux)
+    case "$(pid_authority)" in
+        proc)
             if [ -d "/proc/$1" ]; then printf 'yes'; else printf 'no'; fi
             ;;
-        Darwin | *BSD)
+        ps)
             if ps -p "$1" -o pid= >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
             ;;
-        *)
-            # MINGW/MSYS/CYGWIN and anything unrecognised: no authority over the
-            # native PID space, so absence is NOT knowable here.
-            printf 'unknown'
-            ;;
+        *) printf 'unknown' ;;
     esac
 }
 

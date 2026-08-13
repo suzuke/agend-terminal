@@ -2356,7 +2356,9 @@ PRODUCER
 
 test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent() {
     local token res called fields bad=""
-    for token in 0 007969 99999999999999999999; do
+    # 0001 and 007 are the primary's exact repros; the whole TUPLE is
+    # asserted, not just pid_alive, because the contradiction lived in start/exe.
+    for token in 0 007 0001 007969 99999999999999999999; do
         res="$(drive_pid_spy "$token")"
         called="${res%%|*}"
         fields="${res#*|}"
@@ -2448,6 +2450,39 @@ PRODUCER
     fi
 }
 
+# The authority seam, exercised directly so Windows behaviour is testable here.
+# MSYS ships BOTH a /proc and a ps that see only MSYS processes, so it must
+# report `none` even where those exist.
+test_pid_authority_seam_classifies_platforms() {
+    local sandbox shim got bad="" fn
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # shim SOURCE: $FAKE_UNAME must reach it unexpanded
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$FAKE_UNAME"\n' >"$shim/uname"
+    chmod +x "$shim/uname"
+    # Extract the function rather than sourcing the wrapper: sourcing would run
+    # its main retry loop.
+    fn="$sandbox/fn.sh"
+    awk '/^pid_authority\(\) \{/,/^\}/' "$wrapper" >"$fn"
+    run_auth() {
+        # shellcheck disable=SC2016  # the sourced snippet must not expand here
+        env PATH="$shim:$PATH" FAKE_UNAME="$1" MSYSTEM="$2" OSTYPE="$3" \
+            bash -c '. "$1"; pid_authority' _ "$fn" 2>/dev/null
+    }
+    got="$(run_auth Linux MINGW64 '')";        [ "$got" = "none" ] || bad="$bad msystem($got)"
+    got="$(run_auth Linux '' msys)";           [ "$got" = "none" ] || bad="$bad ostype-msys($got)"
+    got="$(run_auth Linux '' '')";             [ "$got" = "proc" ] || bad="$bad linux($got)"
+    got="$(run_auth Darwin '' '')";            [ "$got" = "ps" ]   || bad="$bad darwin($got)"
+    got="$(run_auth MINGW64_NT-10.0 '' '')";   [ "$got" = "none" ] || bad="$bad mingw($got)"
+    rm -rf "$sandbox"
+    if [ -n "$bad" ]; then
+        report 1 "the pid authority seam classifies platforms" "issues:$bad"
+    else
+        report 0 "the pid authority seam classifies platforms"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2496,6 +2531,7 @@ test_max_length_pid_token_classifies
 test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent
 test_leading_zero_live_pid_is_not_resolved_by_exe
 test_absence_requires_platform_authority
+test_pid_authority_seam_classifies_platforms
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
