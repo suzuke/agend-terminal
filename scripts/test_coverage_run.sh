@@ -71,7 +71,7 @@ process_sidecar_has_authority() {
     local contract="$1" process_path
     process_path="$(deadline_processes_for "$contract")"
     process_sidecar_matches "$contract" || return 1
-    grep -qE '^scope=run-descendant [0-9]+ [0-9]+ [^[:space:]]+ ' \
+    grep -qE '^scope=run-descendant[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]' \
         "$process_path" 2>/dev/null
 }
 
@@ -1856,6 +1856,24 @@ test_process_authority_unavailable_is_not_passed() {
             "issues:$bad"
     else
         report 0 "unavailable process authority is not treated as pass"
+    fi
+}
+
+# `ps -axo pid=,ppid=,stat=,command=` right-aligns numeric fields. Keep the
+# padding in this fixture so authority detection accepts the real shape rather
+# than only the single-space shape produced by a hand-written fixture.
+test_process_authority_accepts_ps_padded_fields() {
+    local contract="${FUNCNAME[0]}" process_path bad=""
+    process_path="$(deadline_processes_for "$contract")"
+    printf 'contract=%s\nscope=run-descendant     123      45 S    /bin/sh\n' \
+        "$contract" >"$process_path"
+    process_sidecar_has_authority "$contract" \
+        || bad="padded-ps-row-rejected"
+    rm -f "$process_path"
+    if [ -n "$bad" ]; then
+        report 1 "padded ps fields retain process authority" "issues:$bad"
+    else
+        report 0 "padded ps fields retain process authority"
     fi
 }
 
@@ -3659,6 +3677,7 @@ test_missing_named_path_emits_no_raw_shell_error
 test_unmatched_warning_count_emits_no_raw_shell_error
 test_stale_deadline_sidecar_is_not_attributed
 test_process_authority_unavailable_is_not_passed
+test_process_authority_accepts_ps_padded_fields
 test_foreign_process_is_not_reported_as_run_process
 test_failure_diagnostics_are_bounded_and_failure_only
 
