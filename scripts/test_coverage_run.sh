@@ -2412,6 +2412,42 @@ PRODUCER
     fi
 }
 
+# Authority must be decided by PLATFORM, not inferred from a file. MSYS ships a
+# /proc listing only MSYS processes, so "/proc exists" wrongly implied Linux and
+# reported PID 1 absent on Windows CI — twice. A `uname` shim pins the rule on
+# any host: where we have no authority over the native PID space, absence is
+# NOT knowable and must degrade to unknown.
+test_absence_requires_platform_authority() {
+    local sandbox shim out bad="" plat
+    for plat in MINGW64_NT-10.0 CYGWIN_NT-10.0 SomethingUnknown; do
+        sandbox="$(new_sandbox)"
+        shim="$sandbox/shim"
+        mkdir -p "$shim"
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$plat" >"$shim/uname"
+        chmod +x "$shim/uname"
+        cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-1-797_0.profraw"
+printf 'warning: %s/agend-terminal-1-797_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+        chmod +x "$sandbox/producer.sh"
+        out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+            COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+            COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+        rm -rf "$sandbox"
+        # PID 1 may be signallable (yes) or not (unknown) — but NEVER `no`,
+        # because this platform cannot prove absence.
+        echo "$out" | grep -q 'pid_alive=no' && bad="$bad [$plat]claims-absence-without-authority"
+    done
+    if [ -n "$bad" ]; then
+        report 1 "absence is only asserted with platform authority" "issues:$bad"
+    else
+        report 0 "absence is only asserted with platform authority"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2459,6 +2495,7 @@ test_leading_zero_pid_is_not_reinterpreted
 test_max_length_pid_token_classifies
 test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent
 test_leading_zero_live_pid_is_not_resolved_by_exe
+test_absence_requires_platform_authority
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper

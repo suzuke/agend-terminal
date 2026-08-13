@@ -465,17 +465,25 @@ pid_liveness() {
         printf 'yes'
         return
     fi
-    if [ -d /proc ]; then
-        if [ -d "/proc/$1" ]; then printf 'yes'; else printf 'no'; fi
-        return
-    fi
+    # `kill -0` failing proves nothing on its own: it fails for BOTH ESRCH and
+    # EPERM. Absence may only be asserted by an authority that can see EVERY
+    # process on this system. Authority is decided by PLATFORM, never inferred
+    # from the presence of a file: MSYS ships a /proc that lists only MSYS
+    # processes, so "/proc exists" wrongly implied Linux and reported PID 1
+    # absent on Windows CI.
     case "$(uname -s 2>/dev/null)" in
+        Linux)
+            if [ -d "/proc/$1" ]; then printf 'yes'; else printf 'no'; fi
+            ;;
         Darwin | *BSD)
             if ps -p "$1" -o pid= >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
-            return
+            ;;
+        *)
+            # MINGW/MSYS/CYGWIN and anything unrecognised: no authority over the
+            # native PID space, so absence is NOT knowable here.
+            printf 'unknown'
             ;;
     esac
-    printf 'unknown'
 }
 
 # Start time and EXECUTABLE IDENTITY, both best-effort and both platform-guarded.
