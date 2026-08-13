@@ -70,14 +70,61 @@ CARGO
     args="$(tr '\n' ' ' <"$sandbox/args")"
 
     if [ "$rc" -ne 0 ]; then
-        report 1 "default producer contains partial profiles" "wrapper exited $rc: $out"
+        report 1 "default producer uses llvm-profdata failure-mode all" "wrapper exited $rc: $out"
     elif ! awk 'previous == "--failure-mode" && $0 == "all" { found = 1 }
         { previous = $0 } END { exit !found }' "$sandbox/args"; then
-        report 1 "default producer contains partial profiles" "cargo args: $args"
+        report 1 "default producer uses llvm-profdata failure-mode all" "cargo args: $args"
     else
         report 0 "default producer uses llvm-profdata failure-mode all"
     fi
     rm -rf "$sandbox"
+}
+
+# A contained partial is a successful but DEGRADED producer result. It must
+# remain observable, while the same corruption with no usable input must retain
+# the producer's failure. This pins wrapper behaviour rather than merely the
+# spelling of the cargo-llvm-cov flag above.
+test_contained_corruption_is_visible_and_all_bad_still_fails() {
+    local sandbox out rc bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-42-777_0.profraw"
+printf 'warning: %s/agend-terminal-42-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+if [ "$COV_TEST_CASE" = "all-bad" ]; then
+    echo 'error: no profile can be merged'
+    exit 1
+fi
+exit 0
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+
+    out="$(cd "$sandbox" && COV_TEST_CASE=mixed \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN=true \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rc=$?
+    [ "$rc" -eq 0 ] || bad="$bad mixed-exit($rc)"
+    echo "$out" | grep -q 'coverage completed from valid profiles' \
+        || bad="$bad mixed-warning-missing"
+    echo "$out" | grep -q 'corrupt=agend-terminal-42-777_0.profraw' \
+        || bad="$bad mixed-evidence-missing"
+
+    out="$(cd "$sandbox" && COV_TEST_CASE=all-bad \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN=true \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rc=$?
+    [ "$rc" -ne 0 ] || bad="$bad all-bad-succeeded"
+    echo "$out" | grep -q 'coverage failed with llvm-cov profile corruption' \
+        || bad="$bad all-bad-failure-missing"
+
+    rm -rf "$sandbox"
+    if [ -n "$bad" ]; then
+        report 1 "contained corruption stays visible and all-bad still fails" "issues:$bad"
+    else
+        report 0 "contained corruption stays visible and all-bad still fails"
+    fi
 }
 
 # ── 1. Failure precedence ────────────────────────────────────────────────────
@@ -3042,6 +3089,7 @@ test_proc_absence_is_never_reported_as_no() {
 }
 
 test_default_producer_contains_partial_profiles
+test_contained_corruption_is_visible_and_all_bad_still_fails
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw

@@ -6,8 +6,9 @@
 # SCOPE: diagnostics and failure semantics (decision
 # d-20260812161748154106-7), plus conservative containment of an unreadable
 # partial profile (decision d-20260813102525005763-1). The exact historical
-# signal owner remains unresolved; the reproduced failure mechanism is a
-# SIGKILL racing LLVM's exit-time profile write.
+# signal owner remains unresolved; a SIGKILL racing LLVM's exit-time profile
+# write reproduces this artifact class locally, but the CI authority is not
+# established.
 #
 # Five properties, pinned by scripts/test_coverage_run.sh:
 #   1. an observed `test … FAILED` outranks the corruption signature — a real
@@ -21,8 +22,8 @@
 #   4. corrupt/no-profile failure emits bounded, deterministic evidence, and
 #      a path the producer NAMED as corrupt is described regardless of where it
 #      sorts in the glob-ordered cap
-#   5. one unreadable partial profile cannot discard every valid profile;
-#      llvm-profdata still fails when every input is unusable
+#   5. the production command passes through `failure-mode all`; contained
+#      corruption remains visible, while an all-unusable producer still fails
 #
 # Seams (all default to the production values):
 #   COVERAGE_PRODUCER     command that produces coverage        [cargo llvm-cov …]
@@ -1078,6 +1079,15 @@ while :; do
     eval "$producer" 2>&1 | tee "$log"
     producer_rc="${PIPESTATUS[0]}"
     if [ "$producer_rc" -eq 0 ]; then
+        # `--failure-mode all` deliberately preserves usable profiles, but a
+        # contained partial must not disappear inside a successful 25k-line
+        # job log. Keep the same bounded evidence without entering retry or
+        # cleanup: this run produced a valid conservative report already.
+        contained_warnings="$(count_corruption_warnings)"
+        if [ "$contained_warnings" -gt 0 ]; then
+            emit_diagnostics "$attempt"
+            echo "::warning::coverage completed from valid profiles while llvm-profdata skipped $contained_warnings unreadable profile warning(s)"
+        fi
         exit 0
     fi
 
