@@ -66,6 +66,14 @@ struct ConcurrentEnqueueDiagnostics {
     invalid_state_rows: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConcurrentEnqueueFailureClass {
+    AppendSideAbsence,
+    DrainRewriteLoss,
+    DrainStateOmission,
+    Unclassified,
+}
+
 fn classify_concurrent_enqueue_rows(raw: &str) -> ConcurrentEnqueueDiagnostics {
     let mut diagnostics = ConcurrentEnqueueDiagnostics::default();
     let mut ids = HashSet::new();
@@ -97,6 +105,25 @@ fn classify_concurrent_enqueue_rows(raw: &str) -> ConcurrentEnqueueDiagnostics {
 
     diagnostics.distinct_ids = ids.len();
     diagnostics
+}
+
+fn classify_concurrent_enqueue_failure(
+    pre_drain: Option<&ConcurrentEnqueueDiagnostics>,
+    post_drain: Option<&ConcurrentEnqueueDiagnostics>,
+    drained_rows: usize,
+) -> ConcurrentEnqueueFailureClass {
+    let (Some(pre_drain), Some(post_drain)) = (pre_drain, post_drain) else {
+        return ConcurrentEnqueueFailureClass::Unclassified;
+    };
+    if pre_drain.physical_rows < 20 {
+        ConcurrentEnqueueFailureClass::AppendSideAbsence
+    } else if post_drain.physical_rows < 20 {
+        ConcurrentEnqueueFailureClass::DrainRewriteLoss
+    } else if drained_rows < 20 {
+        ConcurrentEnqueueFailureClass::DrainStateOmission
+    } else {
+        ConcurrentEnqueueFailureClass::Unclassified
+    }
 }
 
 struct TestMsgBuilder(InboxMessage);
@@ -2449,15 +2476,23 @@ fn test_enqueue_concurrent_same_agent() {
         h.join().expect("thread should not panic");
     }
 
+    let path = inbox_path_resolved(&home, "agent1");
+    let pre_drain = fs::read_to_string(&path)
+        .ok()
+        .map(|raw| classify_concurrent_enqueue_rows(&raw));
     let msgs = drain(&home, "agent1");
     if msgs.len() != 20 {
-        let diagnostics = match fs::read_to_string(inbox_path(&home, "agent1")) {
-            Ok(raw) => format!("{:#?}", classify_concurrent_enqueue_rows(&raw)),
-            Err(error) => format!("raw_read_error={error}"),
-        };
+        let post_drain = fs::read_to_string(&path)
+            .ok()
+            .map(|raw| classify_concurrent_enqueue_rows(&raw));
+        let failure_class = classify_concurrent_enqueue_failure(
+            pre_drain.as_ref(),
+            post_drain.as_ref(),
+            msgs.len(),
+        );
         panic!(
-            "all 20 concurrent enqueues must survive, got {}; post-drain diagnostics={diagnostics}",
-            msgs.len()
+            "all 20 concurrent enqueues must survive, got {}; failure_class={failure_class:?}; pre-drain diagnostics={pre_drain:#?}; post-drain diagnostics={post_drain:#?}",
+            msgs.len(),
         );
     }
 
@@ -2495,6 +2530,27 @@ fn concurrent_enqueue_classifier_is_bounded_and_counts_row_states() {
             processed_rows: 1,
             invalid_state_rows: 1,
         }
+    );
+}
+
+#[test]
+fn concurrent_enqueue_failure_classification_decision_table() {
+    let counts = |physical_rows| ConcurrentEnqueueDiagnostics {
+        physical_rows,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(19)), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteLoss
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(19)), Some(&counts(19)), 19),
+        ConcurrentEnqueueFailureClass::AppendSideAbsence
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(20)), 19),
+        ConcurrentEnqueueFailureClass::DrainStateOmission
     );
 }
 
