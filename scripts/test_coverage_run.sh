@@ -64,6 +64,17 @@ process_sidecar_matches() {
     [ "$first_line" = "contract=$contract" ]
 }
 
+# Process diagnostics are authoritative only when the sidecar contains a
+# descendant row with the fields emitted by the snapshot query. A sidecar
+# marker alone is not evidence that this platform can identify processes.
+process_sidecar_has_authority() {
+    local contract="$1" process_path
+    process_path="$(deadline_processes_for "$contract")"
+    process_sidecar_matches "$contract" || return 1
+    grep -qE '^scope=run-descendant [0-9]+ [0-9]+ [^[:space:]]+ ' \
+        "$process_path" 2>/dev/null
+}
+
 cleanup_run_tmpdir() {
     if [ "$fail" -eq 0 ]; then
         rm -rf "$run_tmpdir"
@@ -1824,6 +1835,30 @@ test_stale_deadline_sidecar_is_not_attributed() {
     fi
 }
 
+# An unavailable process query must select the explicit SKIP path in the
+# process-authority integration test, never the green/pass path. The
+# integration test itself emits the SKIP so the platform summary remains
+# truthful without manufacturing a skip on platforms where the capability is
+# available.
+test_process_authority_unavailable_is_not_passed() {
+    local contract="${FUNCNAME[0]}" process_path state bad=""
+    process_path="$(deadline_processes_for "$contract")"
+    printf 'contract=%s\nprocess_query=unavailable\n' "$contract" >"$process_path"
+    if process_sidecar_has_authority "$contract"; then
+        bad="authority-reported-available"
+    fi
+    state="$(emit_process_diagnostics "$contract")"
+    echo "$state" | grep -q '^process_state=unavailable$' \
+        || bad="$bad unavailable-state-not-classified"
+    rm -f "$process_path"
+    if [ -n "$bad" ]; then
+        report 1 "unavailable process authority is not treated as pass" \
+            "issues:$bad"
+    else
+        report 0 "unavailable process authority is not treated as pass"
+    fi
+}
+
 # A foreign suite may use the same historical command names. Seed this test's
 # process sidecar through the deadline helper first, then prove every emitted
 # process row carries the helper's descendant scope. Restoring the old global
@@ -1846,6 +1881,17 @@ exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
     run_wrapper_with_deadline "$sandbox" 5 >/dev/null
+    if ! process_sidecar_has_authority "${FUNCNAME[0]}"; then
+        owned_pid="$(cat "$sandbox/owned-child.pid" 2>/dev/null)"
+        [ -n "$owned_pid" ] && kill "$owned_pid" 2>/dev/null || true
+        [ -n "$owned_pid" ] && wait "$owned_pid" 2>/dev/null || true
+        kill "$foreign_pid" 2>/dev/null || true
+        wait "$foreign_pid" 2>/dev/null || true
+        rm -rf "$sandbox" "$foreign_root"
+        report_skip "a foreign process is not run evidence" \
+            "process authority unavailable"
+        return
+    fi
     owned_pid="$(cat "$sandbox/owned-child.pid" 2>/dev/null)"
     failure="$(report 1 "foreign process is not run evidence" "process=foreign")"
     [ -n "$owned_pid" ] && kill "$owned_pid" 2>/dev/null || true
@@ -3612,6 +3658,7 @@ test_profile_dir_field_cannot_forge_records
 test_missing_named_path_emits_no_raw_shell_error
 test_unmatched_warning_count_emits_no_raw_shell_error
 test_stale_deadline_sidecar_is_not_attributed
+test_process_authority_unavailable_is_not_passed
 test_foreign_process_is_not_reported_as_run_process
 test_failure_diagnostics_are_bounded_and_failure_only
 
