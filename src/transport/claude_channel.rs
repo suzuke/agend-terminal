@@ -2040,7 +2040,9 @@ mod tests {
     fn accept_error_is_fatal(kind: io::ErrorKind) -> bool {
         !matches!(
             kind,
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+            io::ErrorKind::WouldBlock
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::ConnectionAborted
         )
     }
 
@@ -2120,7 +2122,9 @@ mod tests {
                             // an accept poll, not a readiness budget.
                             thread::sleep(Duration::from_millis(5));
                         }
-                        Err(error) => break FakeChannelExit::AcceptFailed(error.kind().to_string()),
+                        Err(error) => {
+                            break FakeChannelExit::AcceptFailed(error.kind().to_string())
+                        }
                     }
                 };
                 *thread_exit.lock() = Some(reason);
@@ -2274,7 +2278,11 @@ mod tests {
         super::super::registry::save_session_locator(&home, "claude-agent", &locator)
             .expect("locator publication");
         let exit = channel.stop_and_join();
-        assert_eq!(exit, FakeChannelExit::StopRequested, "helper stopped on purpose");
+        assert_eq!(
+            exit,
+            FakeChannelExit::StopRequested,
+            "helper stopped on purpose"
+        );
         let legacy_called = Arc::new(AtomicBool::new(false));
         let legacy_called_by_closure = Arc::clone(&legacy_called);
         let error = super::super::registry::wait_for_notification_readiness(
