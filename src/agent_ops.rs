@@ -1293,6 +1293,34 @@ mod tests {
             },
         )));
 
+        // #3240 slice 2. Lane entry is an ORDERING fact, and this fixture used to
+        // assert it with a one-second wall-clock budget that had to cover a
+        // thread spawn, a global lane-map lock, a keyed mutex, this admission
+        // hook and an epoch-state lock — so a loaded machine failed a healthy
+        // run. The hook below deliberately pushes admission PAST that old budget
+        // exactly once, so re-introducing any clock-based readiness wait fails
+        // deterministically here instead of flaking somewhere else later.
+        //
+        // ONE-SHOT on purpose: the queued job's later dispatch goes through the
+        // same `with_transport_serial` seam, and delaying that too would just move
+        // the wall-clock pressure onto the dispatch assertion below.
+        const LANE_ADMISSION_DELAY: Duration = Duration::from_millis(1200);
+        let _admission_guard =
+            crate::daemon::delivery_worker::test_support::direct_transport_admission_hook_guard();
+        let admission_home = home.clone();
+        let admission_agent = agent.clone();
+        let admission_delayed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::daemon::delivery_worker::test_support::set_direct_transport_admission_hook(Some(
+            std::sync::Arc::new(move |hook_home: &std::path::Path, hook_agent: &str| {
+                if hook_home == admission_home.as_path()
+                    && hook_agent == admission_agent
+                    && !admission_delayed.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::sleep(LANE_ADMISSION_DELAY);
+                }
+            }),
+        ));
+
         let (lane_entered_tx, lane_entered_rx) = std::sync::mpsc::channel();
         let (lane_release_tx, lane_release_rx) = std::sync::mpsc::channel();
         let lane_home = home.clone();
@@ -1305,9 +1333,16 @@ mod tests {
                     .expect("lane release");
             });
         });
+        // A BARRIER, not a clock. What this fixture needs is the ordering fact
+        // "the holder is inside the lane", and no wall-clock budget can express
+        // that: too short flakes on a loaded machine, too long only delays the
+        // flake. The wait is bounded by DISCONNECTION instead — if the holder
+        // thread dies or panics, its sender drops and `recv()` returns `Err`
+        // immediately, so a genuine failure stays fast and named rather than
+        // becoming a hang. Teardown below keeps its own explicit bounds.
         lane_entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("lane holder must enter");
+            .recv()
+            .expect("lane holder must enter (sender dropped => holder thread died)");
 
         assert!(crate::daemon::delivery_worker::enqueue_transport_delivery(
             &home,
