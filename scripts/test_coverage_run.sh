@@ -2518,6 +2518,57 @@ PRODUCER
     fi
 }
 
+# SIXTH instance of the authority principle. `/proc/self` proves only that /proc
+# is MOUNTED, not that the namespace is fully VISIBLE: under hidepid, self
+# exists while other owners' PIDs are hidden, so a missing entry is
+# invisibility, not absence. PID 1's visibility is the usable proxy.
+drive_proc_visibility() {
+    local procroot="$1" sandbox shim out
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # shim SOURCE, must not expand here
+    printf '#!/usr/bin/env bash\nprintf "Linux\\n"\n' >"$shim/uname"
+    chmod +x "$shim/uname"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4294967294-799_0.profraw"
+printf 'warning: %s/agend-terminal-4294967294-799_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_DIAG_PROC_ROOT="$procroot" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN="true" \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    printf '%s' "$(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
+}
+
+test_hidepid_proc_is_not_absence() {
+    local base got bad=""
+    base="$(mktemp -d "${TMPDIR:-/tmp}/procvis.XXXXXX")"
+    # hidepid-like: /proc is mounted (self present) but PID 1 is hidden.
+    mkdir -p "$base/hidden/self"
+    got="$(drive_proc_visibility "$base/hidden")"
+    [ "$got" = "pid_alive=unknown" ] || bad="$bad hidepid-got($got)"
+    # Normal: PID 1 visible, target genuinely absent -> absence is real.
+    mkdir -p "$base/open/self" "$base/open/1"
+    got="$(drive_proc_visibility "$base/open")"
+    [ "$got" = "pid_alive=no" ] || bad="$bad open-got($got)"
+    # Target present -> alive.
+    mkdir -p "$base/live/self" "$base/live/1" "$base/live/4294967294"
+    got="$(drive_proc_visibility "$base/live")"
+    [ "$got" = "pid_alive=yes" ] || bad="$bad live-got($got)"
+    rm -rf "$base"
+    if [ -n "$bad" ]; then
+        report 1 "a hidden-pid /proc is not read as absence" "issues:$bad"
+    else
+        report 0 "a hidden-pid /proc is not read as absence"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2568,6 +2619,7 @@ test_leading_zero_live_pid_is_not_resolved_by_exe
 test_absence_requires_platform_authority
 test_pid_authority_seam_classifies_platforms
 test_failed_authority_query_is_not_absence
+test_hidepid_proc_is_not_absence
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper

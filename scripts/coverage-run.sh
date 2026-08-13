@@ -29,6 +29,7 @@
 #   COVERAGE_LOG          per-attempt producer log              [cov-attempt.log]
 #   COVERAGE_DIAG_MAX_FILES  profraw files described on failure [10]
 #   COVERAGE_DIAG_GRACE_SECS post-cleanup grace before final inventory [2]
+#   COVERAGE_DIAG_PROC_ROOT  /proc to consult for PID visibility          [/proc]
 set -o pipefail
 
 producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov}"
@@ -39,6 +40,9 @@ log="${COVERAGE_LOG:-cov-attempt.log}"
 diag_max_files="${COVERAGE_DIAG_MAX_FILES:-10}"
 # #3236: bounded post-cleanup grace before the final inventory (corrupt path only).
 diag_grace_secs="${COVERAGE_DIAG_GRACE_SECS:-2}"
+# Seam: the /proc to consult for PID visibility. Overridable so the hidepid and
+# restricted-namespace branches are testable off Linux.
+diag_proc_root="${COVERAGE_DIAG_PROC_ROOT:-/proc}"
 # Validated like the file cap, and HARD-BOUNDED. Unvalidated it leaked a raw
 # `sleep: invalid time interval` and an arbitrarily large value could re-time
 # the retry path — neither is acceptable for a diagnostics-only change.
@@ -501,12 +505,17 @@ pid_liveness() {
     local rc
     case "$(pid_authority)" in
         proc)
-            if [ -d "/proc/$1" ]; then
+            if [ -d "$diag_proc_root/$1" ]; then
                 printf 'yes'
-            elif [ -d /proc/self ]; then
-                # /proc is genuinely functioning, so absence here is real.
+            elif [ -d "$diag_proc_root/1" ]; then
+                # PID 1 is visible, so this /proc is not hiding other owners'
+                # processes and a missing entry really is absence.
                 printf 'no'
             else
+                # `/proc/self` proves only that /proc is mounted, NOT that the
+                # namespace is fully visible: under hidepid (or a restricted
+                # mount) self exists while other PIDs are hidden, so a missing
+                # entry is invisibility, not absence.
                 printf 'unknown'
             fi
             ;;
