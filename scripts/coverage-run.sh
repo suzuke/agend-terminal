@@ -434,22 +434,39 @@ pid_token() {
 # one correlate, to be read with `writer_start`/`writer_exe`. `kill -0` needs no
 # /proc, so this fact holds on Linux, macOS and Git Bash alike.
 pid_liveness() {
+    # CANONICAL tokens only. A leading zero is not canonical: `007` would be
+    # reinterpreted as PID 7 — a DIFFERENT process — and `0` is never a writer.
     case "$1" in
-        '' | *[!0-9]*) printf 'unknown'; return ;;
+        '' | *[!0-9]* | 0*) printf 'unknown'; return ;;
     esac
-    # Digits alone are not enough — the same trap as the diagnostic cap. A token
-    # too large for a shell integer passes a digits-only guard and then errors
-    # inside `[ … -gt … ]`, printing a raw shell diagnostic into the block. No
-    # real PID exceeds 10 digits.
+    # Digits alone are not enough: a token too large for a shell integer passes
+    # a digits-only guard and then errors inside `[ … ]`, printing a raw shell
+    # diagnostic into the block. No real PID exceeds 10 digits.
     [ "${#1}" -le 10 ] || { printf 'unknown'; return; }
-    # PID 0 is NOT a writer: `kill -0 0` signals the CALLER'S PROCESS GROUP and
-    # always succeeds, so a malformed 0 token reported a false `alive=yes` in
-    # the one field this whole discriminator rests on.
-    [ "$1" -gt 0 ] || { printf 'unknown'; return; }
-    # Liveness is of THAT PID NUMBER. PID reuse cannot be excluded from the
-    # number alone; `writer_start` is the disambiguator where the platform
-    # exposes it, which is why it is captured alongside.
-    if kill -0 "$1" 2>/dev/null; then printf 'yes'; else printf 'no'; fi
+
+    # TRI-STATE, truthfully. `kill -0` fails for BOTH "no such process" (ESRCH)
+    # and "permission denied" (EPERM), so a bare failure is NOT proof of
+    # absence — reporting `no` for another user's live process is a false
+    # refutation, and contradicts `writer_exe` naming that same process.
+    #   yes     = existence proven
+    #   no      = absence proven by an authority that can see all processes
+    #   unknown = could not distinguish
+    if kill -0 "$1" 2>/dev/null; then
+        printf 'yes'
+        return
+    fi
+    if [ -d /proc ]; then
+        # /proc lists every process regardless of ownership, so it is
+        # authoritative in both directions on Linux.
+        if [ -d "/proc/$1" ]; then printf 'yes'; else printf 'no'; fi
+        return
+    fi
+    if command -v ps >/dev/null 2>&1; then
+        # `ps -p` sees other users' processes, so it too is authoritative.
+        if ps -p "$1" -o pid= >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
+        return
+    fi
+    printf 'unknown'
 }
 
 # Start time and EXECUTABLE IDENTITY, both best-effort and both platform-guarded.

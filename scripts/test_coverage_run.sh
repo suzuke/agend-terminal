@@ -2218,6 +2218,109 @@ PRODUCER
     fi
 }
 
+# `kill -0` fails for BOTH ESRCH and EPERM, so a bare failure is not proof of
+# absence. PID 1 is alive and not ours: reporting `no` for it is a FALSE
+# refutation, and it contradicts writer_exe naming that very process.
+test_unsignalable_live_pid_is_not_reported_absent() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-1-791_0.profraw"
+printf 'warning: %s/agend-terminal-1-791_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    line="$(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -n 1)"
+    rm -rf "$sandbox"
+    # PID 1 always exists; `no` would be a proven-false claim.
+    [ "$line" = "pid_alive=no" ] && bad="$bad false-absence-for-pid-1"
+    [ -n "$line" ] || bad="$bad no-field"
+    if [ -n "$bad" ]; then
+        report 1 "an unsignalable live pid is not reported absent" "issues:$bad; got: $line"
+    else
+        report 0 "an unsignalable live pid is not reported absent"
+    fi
+}
+
+# The block must never carry contradictory evidence: naming an executable while
+# asserting the pid is absent.
+test_no_contradictory_pid_evidence() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-1-792_0.profraw"
+printf 'warning: %s/agend-terminal-1-792_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    # If an executable was identified, absence cannot also be asserted.
+    if echo "$out" | grep -q 'pid_alive=no' \
+        && echo "$out" | grep -qE 'writer_exe=[^ ]+' \
+        && ! echo "$out" | grep -q 'writer_exe=unavailable'; then
+        bad="$bad names-exe-while-claiming-absent"
+    fi
+    if [ -n "$bad" ]; then
+        report 1 "pid evidence is never self-contradictory" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_exe=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "pid evidence is never self-contradictory"
+    fi
+}
+
+# `007` must not be reinterpreted as PID 7 — a DIFFERENT process.
+test_leading_zero_pid_is_not_reinterpreted() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-007-793_0.profraw"
+printf 'warning: %s/agend-terminal-007-793_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "a leading-zero pid token is not reinterpreted" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
+    else
+        report 0 "a leading-zero pid token is not reinterpreted"
+    fi
+}
+
+# A 10-digit token is at the accepted boundary: it must classify, not error.
+test_max_length_pid_token_classifies() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4294967295-794_0.profraw"
+printf 'warning: %s/agend-terminal-4294967295-794_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE 'pid_alive=(yes|no|unknown)' || bad="$bad unclassified"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "a max-length pid token classifies without error" "issues:$bad"
+    else
+        report 0 "a max-length pid token classifies without error"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2259,6 +2362,10 @@ test_proc_stat_parse_survives_tricky_comm
 test_llvm_profdata_discovery_via_rustc_libdir
 test_absent_tools_degrade_to_unavailable
 test_oversized_pid_token_emits_no_raw_shell_error
+test_unsignalable_live_pid_is_not_reported_absent
+test_no_contradictory_pid_evidence
+test_leading_zero_pid_is_not_reinterpreted
+test_max_length_pid_token_classifies
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
