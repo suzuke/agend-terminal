@@ -1301,9 +1301,14 @@ mod tests {
         // exactly once, so re-introducing any clock-based readiness wait fails
         // deterministically here instead of flaking somewhere else later.
         //
-        // ONE-SHOT on purpose: the queued job's later dispatch goes through the
-        // same `with_transport_serial` seam, and delaying that too would just move
-        // the wall-clock pressure onto the dispatch assertion below.
+        // ONE-SHOT as a PRECAUTION, not because a second admission is known to
+        // happen here. The queued job's later dispatch also goes through
+        // `with_transport_serial`, so if it ever admits under this key the delay
+        // would land on the dispatch assertion below instead. Measured today it
+        // does not: removing the latch so every matching admission sleeps leaves
+        // the test passing in the same wall-clock time, i.e. this fixture admits
+        // exactly once. The latch keeps that future case from silently becoming
+        // a second budget; it is not load-bearing now.
         const LANE_ADMISSION_DELAY: Duration = Duration::from_millis(1200);
         let _admission_guard =
             crate::daemon::delivery_worker::test_support::direct_transport_admission_hook_guard();
@@ -1340,6 +1345,17 @@ mod tests {
         // thread dies or panics, its sender drops and `recv()` returns `Err`
         // immediately, so a genuine failure stays fast and named rather than
         // becoming a hang. Teardown below keeps its own explicit bounds.
+        //
+        // DISCONNECT-BOUNDED IS NOT DEADLOCK-BOUNDED, and the difference is not
+        // uniform across CI. If the holder neither finishes nor dies — wedged
+        // inside `TransportLaneGuard::acquire`, say — its sender never drops and
+        // this wait has no bound of its own. In the Check jobs nextest's `ci`
+        // profile terminates a stuck test after its slow-timeout periods and
+        // NAMES it. The Coverage job does not: it runs `cargo llvm-cov --tests`,
+        // i.e. libtest, which has no per-test timeout, so there the same wedge
+        // degrades into an anonymous step timeout. That is the trade this
+        // barrier makes against the wall-clock budget it replaced, recorded here
+        // rather than left for whoever meets it.
         lane_entered_rx
             .recv()
             .expect("lane holder must enter (sender dropped => holder thread died)");
