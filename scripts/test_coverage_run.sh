@@ -833,14 +833,21 @@ record_process_snapshot() {
     )
 }
 
+deadline_publish_rescue_result() {
+    local result="$1" state="$2" temporary="${result}.tmp.$$"
+    printf '%s\n' "$state" >"$temporary" || return 1
+    mv -f "$temporary" "$result" 2>/dev/null || return 1
+}
+
 deadline_rescue_fifo() {
     local fifo="$1" budget="${2:-1}" rescue_pid rescue_waited=0 rescue_rc
-    local result="${fifo}.rescue-result"
+    local result="${fifo}.rescue-result" worker_path="${fifo}.rescue-worker-pid"
     # Bash 3.2/MSYS has no portable O_NONBLOCK shell redirection. Isolate the
     # O_WRONLY open in a worker and bound that worker from the parent instead.
-    rm -f "$result"
-    ( exec 3>"$fifo"; : >"$result"; exec 3>&- ) 2>/dev/null &
+    rm -f "$result" "${result}.tmp.$$" "$worker_path"
+    ( exec 3>"$fifo"; exec 3>&- ) 2>/dev/null &
     rescue_pid=$!
+    printf '%s\n' "$rescue_pid" >"$worker_path"
     while kill -0 "$rescue_pid" 2>/dev/null && [ "$rescue_waited" -lt "$budget" ]; do
         sleep 1
         rescue_waited=$((rescue_waited + 1))
@@ -848,17 +855,32 @@ deadline_rescue_fifo() {
     if kill -0 "$rescue_pid" 2>/dev/null; then
         kill -9 "$rescue_pid" 2>/dev/null
         wait "$rescue_pid" 2>/dev/null || true
-        printf 'failed\n' >"$result"
+        rm -f "$worker_path"
+        deadline_publish_rescue_result "$result" failed
         return 1
     fi
     wait "$rescue_pid" 2>/dev/null
     rescue_rc=$?
-    if [ "$rescue_rc" -eq 0 ] && [ -f "$result" ]; then
-        printf 'released\n' >"$result"
+    rm -f "$worker_path"
+    if [ "$rescue_rc" -eq 0 ] && \
+        deadline_publish_rescue_result "$result" released; then
         return 0
     fi
-    printf 'failed\n' >"$result"
+    deadline_publish_rescue_result "$result" failed
     return 1
+}
+
+deadline_kill_rescue_workers() {
+    local root="$1" path pid
+    for path in "$root/profiles"/*.rescue-worker-pid; do
+        [ -f "$path" ] || continue
+        IFS= read -r pid <"$path" || pid=""
+        case "$pid" in
+            '' | *[!0-9]*) ;;
+            *) [ "$pid" -gt 1 ] && kill -9 "$pid" 2>/dev/null || true ;;
+        esac
+        rm -f "$path"
+    done
 }
 
 deadline_collect_rescue_results() {
@@ -871,6 +893,35 @@ deadline_collect_rescue_results() {
             failed) rescue_unreleased=1 ;;
         esac
     done
+}
+
+# Deadline fixtures may intentionally outlive the wrapper's hard stop. Keep
+# their known producer tree from becoming an orphan, and make that cleanup a
+# load-bearing assertion in every deadline control that creates these files.
+cleanup_deadline_producer() {
+    local sandbox="$1" path pid pids="" found=0 alive=0 waited=0
+    for path in "$sandbox/producer.pid" "$sandbox/producer-child.pid"; do
+        [ -f "$path" ] || continue
+        IFS= read -r pid <"$path" || pid=""
+        case "$pid" in
+            '' | *[!0-9]*) continue ;;
+            *) pids="$pids $pid"; found=1 ;;
+        esac
+    done
+    [ "$found" -eq 1 ] || return 1
+    for pid in $pids; do
+        [ "$pid" -gt 1 ] && kill -9 "$pid" 2>/dev/null || true
+    done
+    while [ "$waited" -lt 3 ]; do
+        alive=0
+        for pid in $pids; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    [ "$alive" -eq 0 ]
 }
 
 run_wrapper_with_deadline() {
@@ -983,6 +1034,10 @@ run_wrapper_with_deadline() {
                 wait "$rescue_pid" 2>/dev/null || true
             done
         fi
+        # A rescue function can itself be killed while its isolated O_WRONLY
+        # worker is blocked. The worker pid sidecar lets this parent reap that
+        # descendant too, including deterministic synchronous-rescue mutants.
+        deadline_kill_rescue_workers "$sandbox"
         deadline_collect_rescue_results "$sandbox"
         rescue_result_count=0
         for p in "$sandbox/profiles"/*.rescue-result; do
@@ -1093,9 +1148,9 @@ PRODUCER
     echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
     echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
     echo "$deadline_status" | grep -q '^hard_deadline_reached=no$' || bad="$bad hard-reached"
-    echo "$diagnostics" | grep -q '^deadline_reason=released_blockage$' || bad="$bad diagnostic-reason"
-    echo "$diagnostics" | grep -q '^deadline_elapsed_seconds=[0-9][0-9]*$' || bad="$bad diagnostic-elapsed"
-    echo "$diagnostics" | grep -q '^deadline_rescue=released$' || bad="$bad diagnostic-rescue"
+    echo "$diagnostics" | grep '^deadline_reason=released_blockage$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_rescue=released$' >/dev/null || bad="$bad diagnostic-rescue"
     if [ -n "$bad" ]; then
         report 1 "a producer-named FIFO does not block the wrapper" \
             "issues:$bad; got: $(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -1)"
@@ -1168,9 +1223,9 @@ PRODUCER
     echo "$deadline_status" | grep -q '^forced_stop=no$' || bad="$bad forced-stop"
     echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
     echo "$deadline_status" | grep -q '^hard_deadline_reached=no$' || bad="$bad hard-reached"
-    echo "$diagnostics" | grep -q '^deadline_reason=slow_success$' || bad="$bad diagnostic-reason"
-    echo "$diagnostics" | grep -q '^deadline_elapsed_seconds=[0-9][0-9]*$' || bad="$bad diagnostic-elapsed"
-    echo "$diagnostics" | grep -q '^deadline_rescue=none$' || bad="$bad diagnostic-rescue"
+    echo "$diagnostics" | grep '^deadline_reason=slow_success$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_rescue=none$' >/dev/null || bad="$bad diagnostic-rescue"
     case "$elapsed" in '' | *[!0-9]*) bad="$bad elapsed-invalid" ;; esac
     [ "${elapsed:-0}" -ge 1 ] || bad="$bad elapsed-too-short"
     if [ -n "$bad" ]; then
@@ -1195,7 +1250,10 @@ test_failed_rescue_is_distinct_from_slow_success() {
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
 mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
-sleep 2
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+sleep 2 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
@@ -1205,15 +1263,17 @@ PRODUCER
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
         "synthetic failed rescue" "deadline control")"
     elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
     echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad outcome"
     echo "$deadline_status" | grep -q '^reason=slow_success$' || bad="$bad reason"
     echo "$deadline_status" | grep -q '^rescue=failed$' || bad="$bad rescue"
     echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
     echo "$deadline_status" | grep -q '^forced_stop=no$' || bad="$bad forced-stop"
-    echo "$diagnostics" | grep -q '^deadline_reason=slow_success$' || bad="$bad diagnostic-reason"
-    echo "$diagnostics" | grep -q '^deadline_rescue=failed$' || bad="$bad diagnostic-rescue"
-    echo "$diagnostics" | grep -q '^deadline_rescue_completion=bounded$' || bad="$bad diagnostic-completion"
+    echo "$diagnostics" | grep '^deadline_reason=slow_success$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_rescue=failed$' >/dev/null || bad="$bad diagnostic-rescue"
+    echo "$diagnostics" | grep '^deadline_rescue_completion=bounded$' >/dev/null || bad="$bad diagnostic-completion"
     case "$elapsed" in
         '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
         *) [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 4 ] \
@@ -1229,7 +1289,8 @@ PRODUCER
 # A second, unreferenced FIFO has no reader. Its rescue worker must be bounded
 # independently of the named FIFO that the wrapper can positively release.
 test_readerless_fifo_rescue_is_hard_bounded() {
-    local sandbox deadline_status diagnostics elapsed producer_pid t0 t1 bad=""
+    local sandbox deadline_status diagnostics elapsed t0 t1
+    local result result_count=0 bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -1245,7 +1306,9 @@ mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
 printf 'warning: %s/fifo-2-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
 exec 4<"$COVERAGE_PROFILE_DIR/fifo-2-2_0.profraw"
 exec 4<&-
-sleep 30
+sleep 30 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
@@ -1257,8 +1320,15 @@ PRODUCER
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
         "synthetic readerless rescue" "deadline control")"
     elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
-    producer_pid="$(cat "$sandbox/producer.pid" 2>/dev/null)"
-    [ -n "$producer_pid" ] && kill -9 "$producer_pid" 2>/dev/null || true
+    for result in "$sandbox/profiles"/*.rescue-result; do
+        [ -f "$result" ] || continue
+        result_count=$((result_count + 1))
+        grep -qE '^(released|failed)$' "$result" \
+            || bad="$bad non-terminal-result"
+    done
+    [ "$result_count" -eq 2 ] || bad="$bad result-count($result_count)"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
     rm -f "$sandbox/profiles"/*.profraw "$sandbox/profiles"/*.fifo 2>/dev/null
     rm -rf "$sandbox"
     [ $((t1 - t0)) -le 10 ] || bad="$bad unbounded($((t1-t0))s)"
@@ -1269,9 +1339,9 @@ PRODUCER
     echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
     echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
     echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
-    echo "$diagnostics" | grep -q '^deadline_reason=hard_timeout$' || bad="$bad diagnostic-reason"
-    echo "$diagnostics" | grep -q '^deadline_elapsed_seconds=[0-9][0-9]*$' || bad="$bad diagnostic-elapsed"
-    echo "$diagnostics" | grep -q '^deadline_rescue=partial$' || bad="$bad diagnostic-rescue"
+    echo "$diagnostics" | grep '^deadline_reason=hard_timeout$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_rescue=partial$' >/dev/null || bad="$bad diagnostic-rescue"
     case "$elapsed" in
         '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
         *) [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 8 ] \
@@ -1291,7 +1361,10 @@ test_genuine_hard_timeout_is_recorded() {
     sandbox="$(new_sandbox)"
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
-sleep 30
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+sleep 30 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
 PRODUCER
     chmod +x "$sandbox/producer.sh"
     run_wrapper_with_deadline "$sandbox" 1 >/dev/null
@@ -1299,14 +1372,16 @@ PRODUCER
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
         "synthetic hard timeout" "deadline control")"
     elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
     echo "$deadline_status" | grep -q '^outcome=timeout$' || bad="$bad outcome"
     echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
     echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
     echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
     echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
-    echo "$diagnostics" | grep -q '^deadline_reason=hard_timeout$' || bad="$bad diagnostic-reason"
-    echo "$diagnostics" | grep -q '^deadline_elapsed_seconds=[0-9][0-9]*$' || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_reason=hard_timeout$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
     case "$elapsed" in
         '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
         *) [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 8 ] \
@@ -1326,7 +1401,10 @@ test_soft_deadline_precedes_hard_deadline() {
     sandbox="$(new_sandbox)"
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
-sleep 30
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+sleep 30 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
 PRODUCER
     chmod +x "$sandbox/producer.sh"
     COVERAGE_TEST_DEADLINE_SOFT_PAUSE_SECS=1 \
@@ -1335,6 +1413,8 @@ PRODUCER
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
         "synthetic ordered deadlines" "deadline control")"
     waited="$(echo "$deadline_status" | sed -n 's/^waited_seconds=//p')"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
     echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft"
     echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard"
@@ -1344,8 +1424,8 @@ PRODUCER
         '' | *[!0-9]*) bad="$bad waited-invalid" ;;
         *) [ "$waited" -ge 4 ] || bad="$bad hard-not-later" ;;
     esac
-    echo "$diagnostics" | grep -q '^deadline_soft_deadline_reached=yes$' || bad="$bad diagnostic-soft"
-    echo "$diagnostics" | grep -q '^deadline_hard_deadline_reached=yes$' || bad="$bad diagnostic-hard"
+    echo "$diagnostics" | grep '^deadline_soft_deadline_reached=yes$' >/dev/null || bad="$bad diagnostic-soft"
+    echo "$diagnostics" | grep '^deadline_hard_deadline_reached=yes$' >/dev/null || bad="$bad diagnostic-hard"
     if [ -n "$bad" ]; then
         report 1 "the soft deadline precedes the hard deadline" "issues:$bad"
     else
