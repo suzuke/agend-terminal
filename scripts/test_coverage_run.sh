@@ -1744,22 +1744,26 @@ drive_writer_case() {
 # A profile whose writer is still running must be reported alive — the decisive
 # datum separating "late writer" from "died mid-merge".
 test_live_writer_is_reported_alive() {
-    local sandbox out bad=""
+    local sandbox out live bad=""
     sandbox="$(new_sandbox)"
+    # The TEST owns the live process, so its lifetime is deterministic; relying
+    # on a background job orphaned by the producer is not (measured: it does not
+    # survive the producer on this platform).
+    sleep 30 &
+    live=$!
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
-sleep 30 &
-live=$!
-echo "$live" >"$COV_LIVE_PID"
-printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$live-777_0.profraw"
-printf 'warning: %s/agend-terminal-%s-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$live"
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$COV_LIVE_PID-777_0.profraw"
+printf 'warning: %s/agend-terminal-%s-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$COV_LIVE_PID"
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
-    out="$(COV_LIVE_PID="$sandbox/livepid" drive_writer_case "$sandbox" "" 1)"
-    local live; live="$(cat "$sandbox/livepid" 2>/dev/null)"
+    out="$(cd "$sandbox" && COV_LIVE_PID="$live" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     kill "$live" 2>/dev/null
+    wait "$live" 2>/dev/null
     rm -rf "$sandbox"
     echo "$out" | grep -q "writer_pid=$live" || bad="$bad pid-not-reported"
     echo "$out" | grep -q 'writer_alive=yes' || bad="$bad not-alive"

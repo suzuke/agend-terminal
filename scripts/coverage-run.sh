@@ -28,6 +28,7 @@
 #   COVERAGE_MAX_ATTEMPTS total producer executions             [3]
 #   COVERAGE_LOG          per-attempt producer log              [cov-attempt.log]
 #   COVERAGE_DIAG_MAX_FILES  profraw files described on failure [10]
+#   COVERAGE_DIAG_GRACE_SECS post-cleanup grace before final inventory [2]
 set -o pipefail
 
 producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov}"
@@ -36,6 +37,8 @@ profile_dir="${COVERAGE_PROFILE_DIR:-target/llvm-cov-target}"
 max_attempts="${COVERAGE_MAX_ATTEMPTS:-3}"
 log="${COVERAGE_LOG:-cov-attempt.log}"
 diag_max_files="${COVERAGE_DIAG_MAX_FILES:-10}"
+# #3236: bounded post-cleanup grace before the final inventory (corrupt path only).
+diag_grace_secs="${COVERAGE_DIAG_GRACE_SECS:-2}"
 
 # A genuine producer/test failure. Checked BEFORE the corruption signature:
 # corruption may accompany a real failure, and when it does the real failure is
@@ -243,11 +246,13 @@ resolve_in_profile_dir() {
 FACT_SIZE=""
 FACT_HEADER=""
 FACT_MTIME=""
+FACT_HEAD64=""
 read_pinned_facts() {
     local path="$1" tmp
     FACT_SIZE=n/a
     FACT_HEADER=n/a
     FACT_MTIME=unknown
+    FACT_HEAD64=n/a
     # ONLY REGULAR FILES ARE OPENED. Opening a FIFO for reading blocks until a
     # writer appears, so a producer-named `*.profraw` FIFO hung the wrapper
     # forever — in CI a silent step timeout with the evidence block truncated
@@ -294,6 +299,11 @@ read_pinned_facts() {
     exec 9<&-
     FACT_SIZE="$( { wc -c <"$tmp"; } 2>/dev/null | tr -d ' ')"
     FACT_HEADER="$( { od -An -tx1 -N8 <"$tmp"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+    # 64 bytes, from the SAME pinned copy — no second open. The magic alone was
+    # never the problem: it is valid LLVM raw magic, identical on healthy files.
+    # `-v`: without it od collapses repeated lines to `*`, silently truncating the
+    # very bytes this field exists to show.
+    FACT_HEAD64="$( { od -v -An -tx1 -N64 <"$tmp"; } 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')"
     rm -f "$tmp"
     # `od` prints nothing at all for an empty file, so a 0-byte profile used to
     # report `header=` blank here while the survey reported `header=n/a` for the
@@ -392,6 +402,106 @@ count_corruption_warnings() {
 # `date -r FILE` is the one mtime spelling BSD and GNU agree on (`stat` is not).
 file_mtime() {
     date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown
+}
+
+
+# ── #3236 late-writer discriminator (DIAGNOSTICS ONLY) ──────────────────────
+# None of this changes the failure, the retry policy or the classification. It
+# answers one open question: is the writer of a named corrupt profile still
+# ALIVE when llvm-profdata runs? Run 31655194748 showed one module's profiles at
+# four different page-aligned sizes — the shape of files caught mid-growth — but
+# liveness at merge was never observed, so the hypothesis stayed unproven.
+
+# The `%p` field from `<name>-<pid>-<module>_<n>.profraw`; `unknown` otherwise.
+pid_token() {
+    printf '%s' "$1" | sed -nE 's/.*-([0-9]+)-[0-9]+_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
+}
+
+# POSIX liveness. `kill -0` needs no /proc, so this is the one writer fact that
+# holds on Linux, macOS and Git Bash alike.
+writer_liveness() {
+    case "$1" in
+        '' | *[!0-9]*) printf 'unknown'; return ;;
+    esac
+    if kill -0 "$1" 2>/dev/null; then printf 'yes'; else printf 'no'; fi
+}
+
+# Start time and EXECUTABLE IDENTITY, both best-effort and both platform-guarded.
+# Only the executable's BASENAME is emitted — never argv, never env — so the
+# block answers "which binary was this?" without carrying arbitrary content.
+writer_start() {
+    case "$1" in '' | *[!0-9]*) printf 'unavailable'; return ;; esac
+    if [ -r "/proc/$1/stat" ]; then
+        awk '{print $22}' "/proc/$1/stat" 2>/dev/null | grep . && return
+    fi
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | grep . && return
+    printf 'unavailable'
+}
+
+writer_exe() {
+    local raw=""
+    case "$1" in '' | *[!0-9]*) printf 'unavailable'; return ;; esac
+    if [ -r "/proc/$1/cmdline" ]; then
+        raw="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1)"
+    fi
+    [ -n "$raw" ] || raw="$(ps -o comm= -p "$1" 2>/dev/null | head -n 1)"
+    [ -n "$raw" ] || { printf 'unavailable'; return; }
+    raw="${raw##*/}"
+    printf '%s' "$(escape_field "${raw:0:64}")"
+}
+
+# One healthy peer of the SAME module, so an odd size can be read against its
+# own module rather than against unrelated ones. Non-regular objects are never
+# opened, per the FIFO rule.
+emit_module_exemplar() {
+    local corrupt_base="$1" module="$2" f base sz
+    case "$module" in '' | unknown) printf '    exemplar=none\n'; return ;; esac
+    for f in "$profile_dir"/*-"$module"_*.profraw; do
+        [ -f "$f" ] || continue
+        base="${f##*/}"
+        [ "$base" = "$corrupt_base" ] && continue
+        sz="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
+        case "$sz" in '' | *[!0-9]*) sz=n/a ;; esac
+        printf '    exemplar=%s size_bytes=%s header=%s\n' \
+            "$(escape_field "$base")" "$sz" \
+            "$( { od -An -tx1 -N8 <"$f"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+        return
+    done
+    printf '    exemplar=none\n'
+}
+
+# PIDs named corrupt in THIS attempt, for the inventories below.
+NAMED_WRITER_PIDS=""
+
+# A bounded inventory: how many profraw files remain, and how many named writers
+# are still alive. NOT a process table — that would be unbounded and would carry
+# arbitrary cmdlines.
+emit_inventory() {
+    local label="$1" files=0 live=0 f pid
+    for f in "$profile_dir"/*.profraw; do
+        [ -e "$f" ] || continue
+        files=$((files + 1))
+    done
+    for pid in $NAMED_WRITER_PIDS; do
+        [ "$(writer_liveness "$pid")" = "yes" ] && live=$((live + 1))
+    done
+    printf '  inventory=%s profraw_files=%s live_writers=%s\n' "$label" "$files" "$live"
+}
+
+# Versions of the tools that actually ran, plus whether the two LLVM overrides
+# are set. PRESENCE ONLY — the values are paths and are deliberately not printed.
+emit_toolchain() {
+    local rustc_v cov_v pd_v cov_present=unset pd_present=unset
+    [ -n "${LLVM_COV:-}" ] && cov_present="set"
+    [ -n "${LLVM_PROFDATA:-}" ] && pd_present="set"
+    rustc_v="$( { rustc --version; } 2>/dev/null | head -n 1)"
+    cov_v="$( { cargo-llvm-cov --version; } 2>/dev/null | head -n 1)"
+    pd_v="$( { "${LLVM_PROFDATA:-llvm-profdata}" --version; } 2>/dev/null | head -n 1 | tr -s ' ')"
+    printf '  toolchain rustc=%s cargo_llvm_cov=%s llvm_profdata=%s LLVM_COV=%s LLVM_PROFDATA=%s\n' \
+        "$(escape_field "${rustc_v:-unavailable}")" \
+        "$(escape_field "${cov_v:-unavailable}")" \
+        "$(escape_field "${pd_v:-unavailable}")" \
+        "$cov_present" "$pd_present"
 }
 
 # The `%m` module token from `<name>-<pid>-<module>_<n>.profraw`; `unknown` when
@@ -506,10 +616,21 @@ describe_named_corrupt() {
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
         "$(escape_field "$base")" "$exists" "$in_response" "$size" "$header" "$mtime" \
         "$(module_token "$base")"
+    # Writer evidence on its own lines, so the corrupt= record above keeps the
+    # exact shape every prior contract test pins.
+    local wpid
+    wpid="$(pid_token "$base")"
+    NAMED_WRITER_PIDS="$NAMED_WRITER_PIDS $wpid"
+    printf '    writer_pid=%s writer_alive=%s writer_start=%s writer_exe=%s\n' \
+        "$wpid" "$(writer_liveness "$wpid")" \
+        "$(escape_field "$(writer_start "$wpid")")" "$(writer_exe "$wpid")"
+    printf '    head64=%s\n' "$FACT_HEAD64"
+    emit_module_exemplar "$base" "$(module_token "$base")"
 }
 
 emit_diagnostics() {
     local attempt="$1"
+    NAMED_WRITER_PIDS=""
     profile_dir_abs="$(resolve_profile_dir_abs)"
     echo "::group::coverage corruption evidence (attempt $attempt)"
     # `printf`, not `echo`, wherever an escaped field is emitted: the escaped
@@ -518,6 +639,7 @@ emit_diagnostics() {
     # off on all three CI platforms, so this is hardening rather than a fix for
     # anything reachable here; the invariant simply should not rest on it.
     printf 'profile_dir=%s\n' "$(escape_field "$profile_dir")"
+    emit_toolchain
     # (a) cap-exempt: every path the producer itself named, in the order named.
     local named=0 p
     while IFS= read -r p; do
@@ -697,6 +819,9 @@ while :; do
     fi
 
     echo "::warning::coverage attempt $attempt hit llvm-cov profile corruption; isolating outputs and retrying"
+    # #3236 ownership timeline. Corrupt path ONLY — a passing run never reaches
+    # here, so neither the inventories nor the grace touch the success path.
+    emit_inventory pre-clean
     # (2) cleanup truthfully.
     if ! eval "$clean_cmd"; then
         # shellcheck disable=SC2016  # the backticks are literal message text,
@@ -705,6 +830,11 @@ while :; do
             "$(escape_field "$clean_cmd")"
         exit 1
     fi
+    emit_inventory post-clean
+    # A short bounded grace, then look again: a writer that survives cleanup and
+    # is still alive here is the late writer the RCA is hunting.
+    sleep "$diag_grace_secs"
+    emit_inventory post-grace
     # (3) isolation, verified.
     isolate_attempt_outputs || exit 1
     attempt=$((attempt + 1))
