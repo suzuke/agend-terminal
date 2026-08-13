@@ -17,6 +17,28 @@ pass=0
 fail=0
 skip=0
 
+# #3247: every contract run gets one private temporary root. It is removed on
+# success and retained on failure so the failure block can point at the exact
+# run state without widening any production wrapper behavior.
+run_tmpdir_parent="${TMPDIR:-/tmp}"
+run_tmpdir="$(mktemp -d "$run_tmpdir_parent/cov-contract-run.XXXXXX")" || {
+    echo "FAIL  could not create isolated contract TMPDIR" >&2
+    exit 1
+}
+export TMPDIR="$run_tmpdir"
+diag_root="$run_tmpdir/diagnostics"
+mkdir -p "$diag_root"
+diag_item_cap=8
+
+cleanup_run_tmpdir() {
+    if [ "$fail" -eq 0 ]; then
+        rm -rf "$run_tmpdir"
+    else
+        echo "coverage failure diagnostics preserved at $diag_root"
+    fi
+}
+trap cleanup_run_tmpdir EXIT
+
 # A property this platform cannot exercise is SKIPPED, never silently passed:
 # a green count that includes an unverifiable property is a false green.
 report_skip() {
@@ -33,6 +55,7 @@ report() {
     else
         echo "FAIL  $label"
         [ -n "$detail" ] && echo "      $detail"
+        emit_failure_diagnostics "${FUNCNAME[1]:-unknown}" "$label" "$detail"
         fail=$((fail + 1))
     fi
 }
@@ -41,7 +64,143 @@ new_sandbox() {
     local dir
     dir="$(mktemp -d "${TMPDIR:-/tmp}/cov-run-test.XXXXXX")"
     mkdir -p "$dir/profiles"
+    printf '%s\n' "$dir" >"$diag_root/last_sandbox"
+    printf 'sandbox=%s\n' "$dir" >>"$diag_root/sandboxes"
     echo "$dir"
+}
+
+# Keep failure fields one-line and bounded. The exact bytes are less important
+# than preserving enough readable identity to correlate a failed contract with
+# its run state without letting a hostile path or command flood CI output.
+diag_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    case "$s" in
+        *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C sed 's/[[:cntrl:]]/\\?/g')" ;;
+    esac
+    if [ "${#s}" -gt 240 ]; then
+        s="${s:0:237}..."
+    fi
+    printf '%s' "$s"
+}
+
+emit_deadline_diagnostics() {
+    local line value found=0
+    if [ ! -f "$diag_root/deadline-status" ]; then
+        echo "deadline_outcome=not-recorded"
+        return
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            outcome=*)
+                value="${line#outcome=}"
+                printf 'deadline_outcome=%s\n' "$(diag_escape "$value")"
+                ;;
+            waited_seconds=*)
+                value="${line#waited_seconds=}"
+                printf 'deadline_waited_seconds=%s\n' "$(diag_escape "$value")"
+                ;;
+            deadline_seconds=*)
+                value="${line#deadline_seconds=}"
+                printf 'deadline_seconds=%s\n' "$(diag_escape "$value")"
+                ;;
+            forced_stop=*)
+                value="${line#forced_stop=}"
+                printf 'deadline_forced_stop=%s\n' "$(diag_escape "$value")"
+                ;;
+            wait_status=*)
+                value="${line#wait_status=}"
+                printf 'deadline_wait_status=%s\n' "$(diag_escape "$value")"
+                ;;
+        esac
+        found=1
+    done <"$diag_root/deadline-status"
+    [ "$found" -eq 1 ] || echo "deadline_outcome=unreadable"
+}
+
+emit_fifo_diagnostics() {
+    local path count=0 found=0
+    if ! command -v find >/dev/null 2>&1; then
+        echo "fifo_state=unavailable"
+        return
+    fi
+    if [ -f "$diag_root/deadline-fifos" ]; then
+        while IFS= read -r path || [ -n "$path" ]; do
+            [ -n "$path" ] || continue
+            found=1
+            if [ "$count" -ge "$diag_item_cap" ]; then
+                continue
+            fi
+            printf 'fifo_snapshot=%s\n' "$(diag_escape "$path")"
+            count=$((count + 1))
+        done <"$diag_root/deadline-fifos"
+    fi
+    while IFS= read -r path || [ -n "$path" ]; do
+        [ -n "$path" ] || continue
+        found=1
+        if [ "$count" -ge "$diag_item_cap" ]; then
+            continue
+        fi
+        printf 'fifo=%s\n' "$(diag_escape "$path")"
+        count=$((count + 1))
+    done <<EOF
+$(find "$run_tmpdir" -type p -print 2>/dev/null)
+EOF
+    if [ "$found" -eq 0 ]; then
+        echo "fifo_state=none"
+    elif [ "$count" -lt "$diag_item_cap" ]; then
+        echo "fifo_state=present"
+    else
+        echo "fifo_state=present-capped"
+    fi
+}
+
+emit_process_diagnostics() {
+    local line count=0 found=0
+    if ! command -v ps >/dev/null 2>&1; then
+        echo "process_state=unavailable"
+        return
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        found=1
+        if [ "$count" -ge "$diag_item_cap" ]; then
+            continue
+        fi
+        printf 'process=%s\n' "$(diag_escape "$line")"
+        count=$((count + 1))
+    done <<EOF
+$(ps -axo pid=,ppid=,stat=,command= 2>/dev/null |
+    awk '/coverage-run\.sh|test_coverage_run\.sh|cov-contract-run|cov-run-test/ && !/awk/ { print }')
+EOF
+    if [ "$found" -eq 0 ]; then
+        echo "process_state=none"
+    elif [ "$count" -lt "$diag_item_cap" ]; then
+        echo "process_state=present"
+    else
+        echo "process_state=present-capped"
+    fi
+}
+
+emit_failure_diagnostics() {
+    local contract="$1" assertion="$2" detail="$3" sandbox="" sandbox_exists=no
+    if [ -f "$diag_root/last_sandbox" ]; then
+        sandbox="$(tail -n 1 "$diag_root/last_sandbox" 2>/dev/null)"
+        [ -d "$sandbox" ] && sandbox_exists=yes
+    fi
+    echo "::group::coverage contract failure diagnostics"
+    printf 'contract=%s\n' "$(diag_escape "$contract")"
+    printf 'assertion=%s\n' "$(diag_escape "$assertion")"
+    printf 'assertion_detail=%s\n' "$(diag_escape "$detail")"
+    printf 'run_tmpdir=%s\n' "$(diag_escape "$run_tmpdir")"
+    printf 'sandbox=%s exists=%s\n' "$(diag_escape "${sandbox:-not-recorded}")" "$sandbox_exists"
+    emit_deadline_diagnostics
+    emit_fifo_diagnostics
+    emit_process_diagnostics
+    echo "::endgroup::"
 }
 
 # ── 0. Conservative partial-profile containment ────────────────────────────
@@ -540,7 +699,7 @@ PRODUCER
 # the wrapper finishes and no orphan is left behind. Safe precisely because we
 # only do it while a blocked reader is known to exist.
 run_wrapper_with_deadline() {
-    local sandbox="$1" secs="$2" pid waited=0 blocked=0 p
+    local sandbox="$1" secs="$2" pid waited=0 blocked=0 hard_stop=0 wait_status=0 p
     (
         cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
             COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
@@ -562,10 +721,19 @@ run_wrapper_with_deadline() {
         waited=$((waited + 1))
         if [ "$waited" -gt $((secs * 4)) ]; then
             kill -9 "$pid" 2>/dev/null
+            hard_stop=1
             break
         fi
     done
-    wait "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || wait_status=$?
+    find "$sandbox" -type p -print 2>/dev/null >"$diag_root/deadline-fifos"
+    {
+        printf 'outcome=%s\n' "$([ "$blocked" -eq 1 ] && echo blocked || echo completed)"
+        printf 'waited_seconds=%s\n' "$waited"
+        printf 'deadline_seconds=%s\n' "$secs"
+        printf 'forced_stop=%s\n' "$([ "$hard_stop" -eq 1 ] && echo yes || echo no)"
+        printf 'wait_status=%s\n' "$wait_status"
+    } >"$diag_root/deadline-status"
     printf '%s' "$blocked"
 }
 
@@ -579,7 +747,7 @@ fifos_unavailable() {
 }
 
 test_named_fifo_does_not_block_the_wrapper() {
-    local sandbox blocked out bad=""
+    local sandbox blocked out deadline_status bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -597,6 +765,7 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
     out="$(cat "$sandbox/out" 2>/dev/null)"
+    deadline_status="$(cat "$diag_root/deadline-status" 2>/dev/null)"
     rm -f "$sandbox/profiles"/*.profraw 2>/dev/null
     rm -rf "$sandbox"
     [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
@@ -606,6 +775,7 @@ PRODUCER
     # And describe the object honestly rather than claiming bytes it never read.
     echo "$out" | grep -qE '^[[:space:]]*corrupt=fifo-1-1_0\.profraw' || bad="$bad not-described"
     echo "$out" | grep -q 'exists=not-a-regular-file' || bad="$bad not-labelled-non-regular"
+    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
     if [ -n "$bad" ]; then
         report 1 "a producer-named FIFO does not block the wrapper" \
             "issues:$bad; got: $(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -1)"
@@ -617,7 +787,7 @@ PRODUCER
 # The same hazard on the response file, whose NAME is producer-controlled by
 # glob: the count, the fragment listing and the membership read all open it.
 test_fifo_response_file_does_not_block_the_wrapper() {
-    local sandbox blocked out bad=""
+    local sandbox blocked out deadline_status bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -636,12 +806,14 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
     out="$(cat "$sandbox/out" 2>/dev/null)"
+    deadline_status="$(cat "$diag_root/deadline-status" 2>/dev/null)"
     rm -f "$sandbox/profiles"/* 2>/dev/null
     rm -rf "$sandbox"
     [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
     echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
     # The real profile alongside it must still be described.
     echo "$out" | grep -qE '^[[:space:]]*corrupt=real-1-1_0\.profraw' || bad="$bad real-path-lost"
+    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
     if [ -n "$bad" ]; then
         report 1 "a FIFO response file does not block the wrapper" "issues:$bad"
     else
@@ -1497,8 +1669,11 @@ PRODUCER
 # assertion context while staying bounded; the existing baseline has no such
 # block, so it must fail before the diagnostics implementation lands.
 test_failure_diagnostics_are_bounded_and_failure_only() {
-    local sandbox failure success bad="" lines
+    local sandbox failure success bad="" lines fifo_created=0
     sandbox="$(new_sandbox)"
+    if mkfifo "$sandbox/diagnostic.fifo" 2>/dev/null; then
+        fifo_created=1
+    fi
     failure="$(report 1 "synthetic failure assertion" "actual=Disconnected expected=Empty")"
     success="$(report 0 "synthetic success assertion")"
     lines="$(printf '%s\n' "$failure" | wc -l | tr -d ' ')"
@@ -1513,6 +1688,10 @@ test_failure_diagnostics_are_bounded_and_failure_only() {
     echo "$failure" | grep -q 'deadline_outcome=' \
         || bad="$bad missing-deadline-outcome"
     echo "$failure" | grep -q 'fifo_state=' || bad="$bad missing-fifo-state"
+    echo "$failure" | grep -q 'process_state=' || bad="$bad missing-process-state"
+    if [ "$fifo_created" -eq 1 ]; then
+        echo "$failure" | grep -q '^fifo=' || bad="$bad missing-fifo-entry"
+    fi
     [ "$lines" -le 80 ] || bad="$bad unbounded-lines-$lines"
     echo "$success" | grep -q '::group::' && bad="$bad success-emitted-diagnostics"
     rm -rf "$sandbox"
