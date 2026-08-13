@@ -1820,6 +1820,7 @@ mod tests {
     use crate::backend::Backend;
     use crate::transport::{mode_for_backend, mode_for_instance};
     use std::fs;
+    use std::sync::atomic::AtomicUsize;
 
     fn home(tag: &str) -> std::path::PathBuf {
         let home =
@@ -2021,59 +2022,159 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    /// Why the fake channel server's accept loop ended. The fixture used to
+    /// `break` on ANY non-`WouldBlock` accept error and leave no trace, so a
+    /// transient `Interrupted`/`ConnectionAborted` silently killed the helper and
+    /// every later request failed with `Broken pipe (os error 32)` — a dead test
+    /// server that read as a product failure. The reason is recorded so the test
+    /// can assert the loop ended because we stopped it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FakeChannelExit {
+        StopRequested,
+        AcceptFailed(String),
+    }
+
+    /// `WouldBlock` is the nonblocking-accept idle case; `Interrupted` and
+    /// `ConnectionAborted` are transient kernel conditions that say nothing about
+    /// the listener's health. Only something else is a reason to stop serving.
+    fn accept_error_is_fatal(kind: io::ErrorKind) -> bool {
+        !matches!(
+            kind,
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+        )
+    }
+
+    struct FakeChannel {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        health_probes: Arc<AtomicUsize>,
+        not_ready_answers: Arc<AtomicUsize>,
+        exit: Arc<Mutex<Option<FakeChannelExit>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeChannel {
+        /// Readiness is an ORDERING fact here, not a delay: `/health` answers
+        /// `ready: false` until it has served `ready_from_probe` probes, so
+        /// readiness arrives strictly AFTER the waiter has observed not-ready.
+        /// The old fixture simulated lateness with `sleep(150ms)` + `sleep(200ms)`
+        /// inside a 1-second budget, which proved nothing about ordering and
+        /// failed outright when the machine was loaded.
+        fn spawn(ready_from_probe: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("fake channel listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let port = listener.local_addr().expect("listener address").port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let health_probes = Arc::new(AtomicUsize::new(0));
+            let not_ready_answers = Arc::new(AtomicUsize::new(0));
+            let exit = Arc::new(Mutex::new(None));
+            let thread_stop = Arc::clone(&stop);
+            let thread_probes = Arc::clone(&health_probes);
+            let thread_not_ready = Arc::clone(&not_ready_answers);
+            let thread_exit = Arc::clone(&exit);
+            let handle = thread::spawn(move || {
+                let reason = loop {
+                    if thread_stop.load(Ordering::Acquire) {
+                        break FakeChannelExit::StopRequested;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut request = [0_u8; 4096];
+                            let read = stream.read(&mut request).unwrap_or(0);
+                            let request = String::from_utf8_lossy(&request[..read]);
+                            let path = request.split_whitespace().nth(1).unwrap_or("/");
+                            let (status, body) = if path == "/health" {
+                                let served = thread_probes.fetch_add(1, Ordering::AcqRel) + 1;
+                                let ready = served >= ready_from_probe;
+                                if !ready {
+                                    thread_not_ready.fetch_add(1, Ordering::AcqRel);
+                                }
+                                (
+                                    "200 OK",
+                                    json!({
+                                        "ready": ready,
+                                        "session_id": "claude-registry-session",
+                                        "backend_version": "2.1.89",
+                                        "capabilities": {
+                                            "claude/channel": ready,
+                                            "tools": ready
+                                        }
+                                    })
+                                    .to_string(),
+                                )
+                            } else if path == "/webhook" {
+                                ("202 Accepted", json!({"accepted": true}).to_string())
+                            } else {
+                                ("404 Not Found", json!({"reply": null}).to_string())
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(error) if !accept_error_is_fatal(error.kind()) => {
+                            // Idle or transient: keep serving. The 5 ms backoff is
+                            // an accept poll, not a readiness budget.
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => break FakeChannelExit::AcceptFailed(error.kind().to_string()),
+                    }
+                };
+                *thread_exit.lock() = Some(reason);
+            });
+            Self {
+                port,
+                stop,
+                health_probes,
+                not_ready_answers,
+                exit,
+                handle: Some(handle),
+            }
+        }
+
+        fn stop_and_join(&mut self) -> FakeChannelExit {
+            self.stop.store(true, Ordering::Release);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            self.exit
+                .lock()
+                .clone()
+                .expect("fake channel must record why its accept loop ended")
+        }
+    }
+
+    #[test]
+    fn accept_loop_treats_transient_errors_as_nonfatal() {
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                !accept_error_is_fatal(kind),
+                "{kind:?} is transient: killing the helper on it is what produced \
+                 the historical Broken pipe"
+            );
+        }
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::PermissionDenied] {
+            assert!(
+                accept_error_is_fatal(kind),
+                "{kind:?} must still end the loop, with the reason recorded"
+            );
+        }
+    }
+
     #[test]
     fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
         let _delivery_hook_guard = super::super::registry::test_support::delivery_hook_guard();
         let home = home("registry-delivery");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fake channel listener");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
-        let port = listener.local_addr().expect("listener address").port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let ready = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let thread_ready = Arc::clone(&ready);
-        let server = thread::spawn(move || {
-            while !thread_stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&request[..read]);
-                        let path = request.split_whitespace().nth(1).unwrap_or("/");
-                        let (status, body) = if path == "/health" {
-                            (
-                                "200 OK",
-                                json!({
-                                    "ready": thread_ready.load(Ordering::Acquire),
-                                    "session_id": "claude-registry-session",
-                                    "backend_version": "2.1.89",
-                                    "capabilities": {
-                                        "claude/channel": thread_ready.load(Ordering::Acquire),
-                                        "tools": thread_ready.load(Ordering::Acquire)
-                                    }
-                                })
-                                .to_string(),
-                            )
-                        } else if path == "/webhook" {
-                            ("202 Accepted", json!({"accepted": true}).to_string())
-                        } else {
-                            ("404 Not Found", json!({"reply": null}).to_string())
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        // Ready only from the SECOND probe: the waiter must see not-ready once.
+        let mut channel = FakeChannel::spawn(2);
+        let port = channel.port;
         let mut locator = SessionLocator::claude(
             format!("http://127.0.0.1:{port}"),
             "claude-registry-session".to_string(),
@@ -2087,20 +2188,12 @@ mod tests {
             "instances:\n  claude-agent:\n    backend: claude\n",
         )
         .expect("fleet");
-        let publisher_home = home.clone();
-        let publisher_locator = locator.clone();
-        let publisher_ready = Arc::clone(&ready);
-        let publisher = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
-            super::super::registry::save_session_locator(
-                &publisher_home,
-                "claude-agent",
-                &publisher_locator,
-            )
-            .expect("delayed locator publication");
-            thread::sleep(Duration::from_millis(200));
-            publisher_ready.store(true, Ordering::Release);
-        });
+        // The locator is published up front and readiness is withheld by the
+        // server instead. The delay under test is READINESS, and gating it on the
+        // probe count makes "the bridge became ready after we started waiting" an
+        // observable ordering fact rather than a race against two sleeps.
+        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
+            .expect("locator publication");
         let legacy_called = Arc::new(AtomicBool::new(false));
         let legacy_called_by_closure = Arc::clone(&legacy_called);
         let result = super::super::registry::wait_for_notification_readiness(
@@ -2119,7 +2212,6 @@ mod tests {
                 },
             )
         });
-        publisher.join().expect("delayed publisher");
         if let Ok(receipt) = &result {
             assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
             assert!(!legacy_called.load(Ordering::Acquire));
@@ -2131,10 +2223,98 @@ mod tests {
             assert_eq!(stored.state, DeliveryState::ProtocolAccepted);
         }
         stop_instance_state(&home, "claude-agent");
-        stop.store(true, Ordering::Release);
-        let _ = server.join();
+        let probes = channel.health_probes.load(Ordering::Acquire);
+        let not_ready = channel.not_ready_answers.load(Ordering::Acquire);
+        let exit = channel.stop_and_join();
         let _ = fs::remove_dir_all(home);
         result.expect("ChannelBridge delivery must wait for delayed readiness");
+        // The delivery only proves WAITING if a probe was actually answered
+        // not-ready. Counting probes alone does not: the delivery path probes
+        // `/health` again after the wait, so `probes >= 2` holds even when
+        // readiness was there from the first answer — a vacuous assertion that a
+        // spawn(1) mutant passed.
+        assert!(
+            not_ready >= 1,
+            "readiness must have been withheld for at least one probe \
+             (probes={probes}, not_ready={not_ready})"
+        );
+        // And the helper must have outlived the delivery: an accept-loop exit for
+        // any other reason is the historical failure mode, where the dead server
+        // turned into `Broken pipe` on the next request.
+        assert_eq!(
+            exit,
+            FakeChannelExit::StopRequested,
+            "fake channel must end because the test stopped it"
+        );
+    }
+
+    /// The historical shape, pinned deterministically: when the helper dies for
+    /// good, delivery fails with a transport error rather than falling back or
+    /// hanging. This is what the old fixture produced by accident whenever a
+    /// transient accept error broke its loop.
+    #[test]
+    fn permanently_terminated_channel_helper_surfaces_transport_error() {
+        let _delivery_hook_guard = super::super::registry::test_support::delivery_hook_guard();
+        let home = home("registry-delivery-dead");
+        let mut channel = FakeChannel::spawn(1);
+        let port = channel.port;
+        let mut locator = SessionLocator::claude(
+            format!("http://127.0.0.1:{port}"),
+            "claude-registry-session".to_string(),
+            "registry-token".to_string(),
+        );
+        locator.managed = true;
+        locator.server_pid = Some(std::process::id());
+        locator.server_start_token = crate::process::process_start_token(std::process::id());
+        fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  claude-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
+            .expect("locator publication");
+        let exit = channel.stop_and_join();
+        assert_eq!(exit, FakeChannelExit::StopRequested, "helper stopped on purpose");
+        let legacy_called = Arc::new(AtomicBool::new(false));
+        let legacy_called_by_closure = Arc::clone(&legacy_called);
+        let error = super::super::registry::wait_for_notification_readiness(
+            &home,
+            "claude-agent",
+            Duration::from_secs(1),
+        )
+        .and_then(|()| {
+            super::super::registry::deliver_notification(
+                &home,
+                "claude-agent",
+                "registry delivery",
+                move |_, _, _| {
+                    legacy_called_by_closure.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+        })
+        .expect_err("a dead channel helper cannot accept a delivery");
+        stop_instance_state(&home, "claude-agent");
+        let _ = fs::remove_dir_all(home);
+        // The exact errno differs by platform and client (`Broken pipe`,
+        // `Connection refused`, a closed connection), so the assertion pins the
+        // CLASS and prints what was actually observed — a fixture about a flaky
+        // failure must not itself be platform-flaky.
+        let rendered = format!("{error:#}").to_ascii_lowercase();
+        assert!(
+            rendered.contains("broken pipe")
+                || rendered.contains("connection refused")
+                || rendered.contains("connection reset")
+                || rendered.contains("connection closed")
+                || rendered.contains("os error 32")
+                || rendered.contains("os error 61")
+                || rendered.contains("channel bridge"),
+            "dead helper must surface a transport failure, got: {error:#}"
+        );
+        assert!(
+            !legacy_called.load(Ordering::Acquire),
+            "a dead bridge must not silently fall back to the legacy path"
+        );
     }
 
     #[test]
