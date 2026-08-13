@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # #3236 — behavioural contract for scripts/coverage-run.sh.
 #
-# Scope (decision d-20260812161748154106-7): failure precedence, cleanup
-# truthfulness, attempt isolation, bounded diagnostics. These tests say NOTHING
-# about the corrupt-profraw writer itself, which is unresolved — they only pin
-# how the wrapper must BEHAVE when corruption is present.
+# Scope: failure precedence, cleanup truthfulness, attempt isolation, bounded
+# diagnostics, and conservative partial-profile containment. The exact signal
+# owner remains unresolved; decision d-20260813102525005763-1 authorizes
+# `failure-mode all` for the independently reproduced exit-write kill race.
 #
 # Usage: ./scripts/test_coverage_run.sh   (exit 0 on all-pass, 1 otherwise)
 
@@ -42,6 +42,42 @@ new_sandbox() {
     dir="$(mktemp -d "${TMPDIR:-/tmp}/cov-run-test.XXXXXX")"
     mkdir -p "$dir/profiles"
     echo "$dir"
+}
+
+# ── 0. Conservative partial-profile containment ────────────────────────────
+# cargo-llvm-cov owns the llvm-profdata invocation, so the wrapper must pass
+# `--failure-mode all` through its production default. That mode keeps valid
+# profiles when one killed process leaves a partial, but still fails when every
+# input is unusable. COVERAGE_PRODUCER remains an exact test seam and is not
+# rewritten.
+test_default_producer_contains_partial_profiles() {
+    local sandbox out rc args
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/bin"
+    cat >"$sandbox/bin/cargo" <<'CARGO'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$COV_TEST_ARGS"
+exit 0
+CARGO
+    chmod +x "$sandbox/bin/cargo"
+
+    out="$(cd "$sandbox" && PATH="$sandbox/bin:$PATH" \
+        COV_TEST_ARGS="$sandbox/args" \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" \
+        "$wrapper" 2>&1)"
+    rc=$?
+    args="$(tr '\n' ' ' <"$sandbox/args")"
+
+    if [ "$rc" -ne 0 ]; then
+        report 1 "default producer contains partial profiles" "wrapper exited $rc: $out"
+    elif ! awk 'previous == "--failure-mode" && $0 == "all" { found = 1 }
+        { previous = $0 } END { exit !found }' "$sandbox/args"; then
+        report 1 "default producer contains partial profiles" "cargo args: $args"
+    else
+        report 0 "default producer uses llvm-profdata failure-mode all"
+    fi
+    rm -rf "$sandbox"
 }
 
 # ── 1. Failure precedence ────────────────────────────────────────────────────
@@ -3005,6 +3041,7 @@ test_proc_absence_is_never_reported_as_no() {
     fi
 }
 
+test_default_producer_contains_partial_profiles
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw

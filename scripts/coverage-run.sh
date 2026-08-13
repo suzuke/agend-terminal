@@ -3,12 +3,13 @@
 # `Run coverage` step in .github/workflows/ci.yml so its failure semantics are
 # testable (same pattern as fmt-owned.sh + test_fmt_owned.sh).
 #
-# SCOPE (decision d-20260812161748154106-7): diagnostics and failure semantics
-# ONLY. The corrupt-profraw writer is UNRESOLVED and nothing here claims to cure
-# it — this wrapper's job is to stop lying about what failed and to leave behind
-# enough evidence to finish that RCA.
+# SCOPE: diagnostics and failure semantics (decision
+# d-20260812161748154106-7), plus conservative containment of an unreadable
+# partial profile (decision d-20260813102525005763-1). The exact historical
+# signal owner remains unresolved; the reproduced failure mechanism is a
+# SIGKILL racing LLVM's exit-time profile write.
 #
-# Four properties, pinned by scripts/test_coverage_run.sh:
+# Five properties, pinned by scripts/test_coverage_run.sh:
 #   1. an observed `test … FAILED` outranks the corruption signature — a real
 #      failure is never retried and never relabelled a flake, and the producer's
 #      own exit code survives (previously the signature was checked first, so a
@@ -20,6 +21,8 @@
 #   4. corrupt/no-profile failure emits bounded, deterministic evidence, and
 #      a path the producer NAMED as corrupt is described regardless of where it
 #      sorts in the glob-ordered cap
+#   5. one unreadable partial profile cannot discard every valid profile;
+#      llvm-profdata still fails when every input is unusable
 #
 # Seams (all default to the production values):
 #   COVERAGE_PRODUCER     command that produces coverage        [cargo llvm-cov …]
@@ -32,7 +35,11 @@
 #   COVERAGE_DIAG_PROC_ROOT  /proc to consult for PID visibility          [/proc]
 set -o pipefail
 
-producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov}"
+# `all` keeps every valid profile when one killed process leaves a partial raw
+# file. Missing counters can only lower measured coverage; real test failures
+# still make cargo-llvm-cov fail, and llvm-profdata still fails when every input
+# is unusable.
+producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --failure-mode all --lcov --output-path coverage.lcov}"
 clean_cmd="${COVERAGE_CLEAN:-cargo llvm-cov clean --workspace}"
 profile_dir="${COVERAGE_PROFILE_DIR:-target/llvm-cov-target}"
 max_attempts="${COVERAGE_MAX_ATTEMPTS:-3}"
