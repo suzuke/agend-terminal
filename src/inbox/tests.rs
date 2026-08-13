@@ -132,13 +132,15 @@ fn classify_concurrent_enqueue_failure(
     let Some(post_drain) = post_drain else {
         return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
     };
-    if pre_drain.malformed_rows > 0 {
+    let pre_identity_anomalies = pre_drain.duplicate_ids + pre_drain.missing_ids;
+    let post_identity_anomalies = post_drain.duplicate_ids + post_drain.missing_ids;
+    if pre_drain.malformed_rows > 0 && post_drain.malformed_rows <= pre_drain.malformed_rows {
         ConcurrentEnqueueFailureClass::AppendSideCorruption
-    } else if post_drain.malformed_rows > 0 {
+    } else if post_drain.malformed_rows > pre_drain.malformed_rows {
         ConcurrentEnqueueFailureClass::DrainRewriteCorruption
-    } else if pre_drain.duplicate_ids > 0 || pre_drain.missing_ids > 0 {
+    } else if pre_identity_anomalies > 0 && post_identity_anomalies <= pre_identity_anomalies {
         ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
-    } else if post_drain.duplicate_ids > 0 || post_drain.missing_ids > 0 {
+    } else if post_identity_anomalies > pre_identity_anomalies {
         ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
     } else if pre_drain.physical_rows < 20 {
         ConcurrentEnqueueFailureClass::AppendSideAbsence
@@ -2601,6 +2603,16 @@ fn concurrent_enqueue_failure_classification_decision_table() {
         classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&malformed), 19),
         ConcurrentEnqueueFailureClass::DrainRewriteCorruption
     );
+    let more_malformed = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 18,
+        malformed_rows: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&malformed), Some(&more_malformed), 18),
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    );
 
     let duplicate = ConcurrentEnqueueDiagnostics {
         physical_rows: 20,
@@ -2631,6 +2643,17 @@ fn concurrent_enqueue_failure_classification_decision_table() {
     );
     assert_eq!(
         classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    let more_duplicate = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 18,
+        duplicate_ids: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&duplicate), Some(&more_duplicate), 18),
         ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
     );
     assert_eq!(
