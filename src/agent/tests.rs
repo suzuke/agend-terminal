@@ -3209,7 +3209,10 @@ fn deleted_guard_suppresses_exit_event_at_source_rank4() {
     let (handle, id) = make_crash_exit_handle(true);
     let rx = run_pty_close_capturing_crash(handle, id);
     assert!(
-        rx.try_recv().is_err(),
+        matches!(
+            rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ),
         "Rank4: a deleted handle's CRASH-classified exit must emit NO event — \
          handle_pty_close must suppress at the SOURCE (the only net against \
          restart/replace double-spawn; the name-keyed sink gates would miss it)"
