@@ -66,6 +66,168 @@ struct ConcurrentEnqueueDiagnostics {
     invalid_state_rows: usize,
 }
 
+const CLEAR_COMPACT_ROW_SAMPLE_CAP: usize = 12;
+const CLEAR_COMPACT_ID_TRACK_CAP: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClearCompactRowEvidence {
+    line: usize,
+    byte_len: usize,
+    class: &'static str,
+    identity: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClearCompactInputDiagnostics {
+    physical_rows: usize,
+    parseable_rows: usize,
+    malformed_rows: usize,
+    forward_schema_rows: usize,
+    pre_read_rows: usize,
+    delivering_rows: usize,
+    total_bytes: usize,
+    tracked_distinct_ids: usize,
+    duplicate_ids_observed: usize,
+    missing_ids: usize,
+    identity_rows_untracked: usize,
+    sampled_rows: Vec<ClearCompactRowEvidence>,
+    samples_omitted: usize,
+}
+
+fn bounded_row_identity(line: &str, message: Option<&InboxMessage>) -> String {
+    if let Some(id) = message.and_then(|message| message.id.as_deref()) {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(id.as_bytes());
+        let prefix = digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        return format!("id_sha256={prefix},id_bytes={}", id.len());
+    }
+
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(line.as_bytes());
+    let prefix = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256={prefix}")
+}
+
+fn clear_compact_id_digest(id: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(id.as_bytes()).into()
+}
+
+fn classify_clear_compact_input(raw: &str) -> ClearCompactInputDiagnostics {
+    let mut diagnostics = ClearCompactInputDiagnostics {
+        total_bytes: raw.len(),
+        ..Default::default()
+    };
+    let mut tracked_ids = HashSet::with_capacity(CLEAR_COMPACT_ID_TRACK_CAP);
+    let mut priority = Vec::with_capacity(CLEAR_COMPACT_ROW_SAMPLE_CAP);
+    let mut first_clean = Vec::new();
+    let mut last_clean = Vec::new();
+
+    for (index, line) in raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        diagnostics.physical_rows += 1;
+        let parsed = serde_json::from_str::<InboxMessage>(line).ok();
+        let (class, noteworthy) = match parsed.as_ref() {
+            None => {
+                diagnostics.malformed_rows += 1;
+                ("malformed", true)
+            }
+            Some(message) if message.schema_version > InboxMessage::CURRENT_VERSION => {
+                diagnostics.parseable_rows += 1;
+                diagnostics.forward_schema_rows += 1;
+                ("forward-schema", true)
+            }
+            Some(message) => {
+                diagnostics.parseable_rows += 1;
+                if message.read_at.is_some() {
+                    diagnostics.pre_read_rows += 1;
+                }
+                if message.delivering_at.is_some() {
+                    diagnostics.delivering_rows += 1;
+                }
+                match message.id.as_deref() {
+                    Some(id) => {
+                        let digest = clear_compact_id_digest(id);
+                        if tracked_ids.contains(&digest) {
+                            diagnostics.duplicate_ids_observed += 1;
+                        } else if tracked_ids.len() < CLEAR_COMPACT_ID_TRACK_CAP {
+                            tracked_ids.insert(digest);
+                        } else {
+                            diagnostics.identity_rows_untracked += 1;
+                        }
+                    }
+                    None => diagnostics.missing_ids += 1,
+                }
+                if message.read_at.is_some() {
+                    ("pre-read", true)
+                } else if message.delivering_at.is_some() {
+                    ("delivering", true)
+                } else if message.id.is_none() {
+                    ("missing-id", true)
+                } else {
+                    ("current-schema", false)
+                }
+            }
+        };
+        let evidence = ClearCompactRowEvidence {
+            line: index + 1,
+            byte_len: line.len(),
+            class,
+            identity: bounded_row_identity(line, parsed.as_ref()),
+        };
+        if noteworthy {
+            if priority.len() < CLEAR_COMPACT_ROW_SAMPLE_CAP {
+                priority.push(evidence);
+            }
+        } else {
+            if first_clean.len() < 2 {
+                first_clean.push(evidence.clone());
+            }
+            last_clean.push(evidence);
+            if last_clean.len() > 2 {
+                last_clean.remove(0);
+            }
+        }
+    }
+
+    for evidence in priority.into_iter().chain(first_clean).chain(last_clean) {
+        if diagnostics.sampled_rows.len() == CLEAR_COMPACT_ROW_SAMPLE_CAP {
+            break;
+        }
+        if diagnostics
+            .sampled_rows
+            .iter()
+            .any(|sample| sample.line == evidence.line)
+        {
+            continue;
+        }
+        diagnostics.sampled_rows.push(evidence);
+    }
+    diagnostics.samples_omitted = diagnostics
+        .physical_rows
+        .saturating_sub(diagnostics.sampled_rows.len());
+    diagnostics.tracked_distinct_ids = tracked_ids.len();
+    diagnostics
+}
+
+fn read_clear_compact_input_diagnostics(
+    path: &Path,
+) -> std::io::Result<ClearCompactInputDiagnostics> {
+    let raw = fs::read(path)?;
+    Ok(classify_clear_compact_input(&String::from_utf8_lossy(&raw)))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ConcurrentEnqueueFailureClass {
     AppendSideCorruption,
@@ -2350,7 +2512,21 @@ fn clear_compact_summaries_bounded() {
         )
         .unwrap();
     }
+    let path = inbox_path_resolved(&home, "a1");
+    let pre_clear = read_clear_compact_input_diagnostics(&path).unwrap_or_else(|error| {
+        panic!(
+            "pre-clear input census failed for retained artifact {}: {error}",
+            path.display()
+        )
+    });
     let r = clear_compact(&home, "a1", |_| None);
+    if r.cleared_count != 250 {
+        panic!(
+            "all 250 rows must clear; got {}; retained_artifact={}; pre_clear={pre_clear:#?}",
+            r.cleared_count,
+            path.display()
+        );
+    }
     assert_eq!(r.cleared_count, 250, "all 250 cleared");
     assert_eq!(
         r.summaries.len(),
@@ -2362,6 +2538,99 @@ fn clear_compact_summaries_bounded() {
         "overflow counted, not dropped silently"
     );
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn clear_compact_input_diagnostics_distinguish_failure_branches() {
+    let clean_row = |i: usize| {
+        serde_json::to_string(
+            &msg()
+                .sender("x")
+                .kind("update")
+                .id(&format!("u{i}"))
+                .build(),
+        )
+        .unwrap()
+    };
+
+    let mut malformed_rows = (0..249).map(&clean_row).collect::<Vec<_>>();
+    malformed_rows.push("{not-json".to_string());
+    let malformed = classify_clear_compact_input(&(malformed_rows.join("\n") + "\n"));
+    assert_eq!(malformed.physical_rows, 250);
+    assert_eq!(malformed.parseable_rows, 249);
+    assert_eq!(malformed.malformed_rows, 1);
+    assert!(malformed
+        .sampled_rows
+        .iter()
+        .any(|row| row.class == "malformed" && row.byte_len == 9));
+
+    let capped_rows = (0..20)
+        .map(|i| format!("{{malformed-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let capped = classify_clear_compact_input(&capped_rows);
+    assert_eq!(capped.physical_rows, 20);
+    assert_eq!(capped.sampled_rows.len(), CLEAR_COMPACT_ROW_SAMPLE_CAP);
+    assert_eq!(capped.samples_omitted, 8);
+
+    let mut pre_read_rows = Vec::new();
+    for i in 0..250 {
+        let mut message = msg()
+            .sender("x")
+            .kind("update")
+            .id(&format!("u{i}"))
+            .build();
+        if i == 137 {
+            message.read_at = Some("2025-01-01T00:00:00Z".to_string());
+        }
+        pre_read_rows.push(serde_json::to_string(&message).unwrap());
+    }
+    let pre_read = classify_clear_compact_input(&(pre_read_rows.join("\n") + "\n"));
+    assert_eq!(pre_read.physical_rows, 250);
+    assert_eq!(pre_read.parseable_rows, 250);
+    assert_eq!(pre_read.pre_read_rows, 1);
+    assert!(pre_read
+        .sampled_rows
+        .iter()
+        .any(|row| row.class == "pre-read"
+            && row.identity.starts_with("id_sha256=")
+            && row.identity.ends_with(",id_bytes=4")));
+
+    let oversized_id = "sensitive-id".repeat(10_000);
+    let oversized = msg().sender("x").id(&oversized_id).build();
+    let oversized =
+        classify_clear_compact_input(&(serde_json::to_string(&oversized).unwrap() + "\n"));
+    assert!(!oversized.sampled_rows[0].identity.contains("sensitive-id"));
+    assert!(oversized.sampled_rows[0].identity.len() < 64);
+
+    let many_unique_ids = (0..300).map(clean_row).collect::<Vec<_>>().join("\n") + "\n";
+    let many_unique_ids = classify_clear_compact_input(&many_unique_ids);
+    assert_eq!(
+        many_unique_ids.tracked_distinct_ids,
+        CLEAR_COMPACT_ID_TRACK_CAP
+    );
+    assert_eq!(many_unique_ids.identity_rows_untracked, 44);
+    assert_eq!(many_unique_ids.duplicate_ids_observed, 0);
+
+    let absent_rows = (0..249).map(clean_row).collect::<Vec<_>>().join("\n") + "\n";
+    let absent = classify_clear_compact_input(&absent_rows);
+    assert_eq!(absent.physical_rows, 249);
+    assert_eq!(absent.parseable_rows, 249);
+    assert_eq!(absent.malformed_rows, 0);
+    assert_eq!(absent.pre_read_rows, 0);
+    assert!(absent
+        .sampled_rows
+        .iter()
+        .any(|row| row.line == 249 && row.identity.ends_with(",id_bytes=4")));
+
+    let mut forward = msg().sender("newer").id("future").build();
+    forward.schema_version = InboxMessage::CURRENT_VERSION + 1;
+    let forward = classify_clear_compact_input(&(serde_json::to_string(&forward).unwrap() + "\n"));
+    assert_eq!(forward.physical_rows, 1);
+    assert_eq!(forward.parseable_rows, 1);
+    assert_eq!(forward.forward_schema_rows, 1);
+    assert_eq!(forward.sampled_rows[0].class, "forward-schema");
 }
 
 #[test]
