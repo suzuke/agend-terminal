@@ -529,15 +529,46 @@ emit_inventory() {
     printf '  inventory=%s profraw_files=%s live_writers=%s\n' "$label" "$files" "$live"
 }
 
+# Resolve the llvm-profdata that cargo-llvm-cov ACTUALLY uses. Plain
+# `llvm-profdata` is not on PATH in CI — the real one ships with the rustup
+# llvm-tools component beside the target libdir, which is why the first version
+# of this reported `unavailable` for a tool that had just run.
+resolve_llvm_profdata() {
+    local libdir cand
+    if [ -n "${LLVM_PROFDATA:-}" ]; then
+        printf '%s' "$LLVM_PROFDATA"
+        return
+    fi
+    libdir="$( { rustc --print target-libdir; } 2>/dev/null )"
+    if [ -n "$libdir" ]; then
+        cand="${libdir%/lib}/bin/llvm-profdata"
+        if [ -x "$cand" ]; then
+            printf '%s' "$cand"
+            return
+        fi
+    fi
+    command -v llvm-profdata 2>/dev/null || printf ''
+}
+
+# cargo-llvm-cov answers to both the direct binary and the cargo subcommand;
+# try both before concluding it is absent.
+resolve_cargo_llvm_cov_version() {
+    local v
+    v="$( { cargo-llvm-cov --version; } 2>/dev/null | head -n 1)"
+    [ -n "$v" ] || v="$( { cargo llvm-cov --version; } 2>/dev/null | head -n 1)"
+    printf '%s' "$v"
+}
+
 # Versions of the tools that actually ran, plus whether the two LLVM overrides
 # are set. PRESENCE ONLY — the values are paths and are deliberately not printed.
 emit_toolchain() {
-    local rustc_v cov_v pd_v cov_present=unset pd_present=unset
+    local rustc_v cov_v pd_v pd_bin cov_present=unset pd_present=unset
     [ -n "${LLVM_COV:-}" ] && cov_present="set"
     [ -n "${LLVM_PROFDATA:-}" ] && pd_present="set"
     rustc_v="$( { rustc --version; } 2>/dev/null | head -n 1)"
-    cov_v="$( { cargo-llvm-cov --version; } 2>/dev/null | head -n 1)"
-    pd_v="$( { "${LLVM_PROFDATA:-llvm-profdata}" --version; } 2>/dev/null | head -n 1 | tr -s ' ')"
+    cov_v="$(resolve_cargo_llvm_cov_version)"
+    pd_bin="$(resolve_llvm_profdata)"
+    [ -n "$pd_bin" ] && pd_v="$( { "$pd_bin" --version; } 2>/dev/null | head -n 1 | tr -s ' ')"
     printf '  toolchain rustc=%s cargo_llvm_cov=%s llvm_profdata=%s LLVM_COV=%s LLVM_PROFDATA=%s\n' \
         "$(escape_field "${rustc_v:-unavailable}")" \
         "$(escape_field "${cov_v:-unavailable}")" \

@@ -2123,6 +2123,73 @@ test_proc_stat_parse_survives_tricky_comm() {
     fi
 }
 
+# CI reported `llvm_profdata=unavailable` for a tool that had just run, because
+# plain `llvm-profdata` is not on PATH — the real one sits beside the rustup
+# target libdir. Discovery is pinned with shims so it cannot silently regress.
+test_llvm_profdata_discovery_via_rustc_libdir() {
+    local sandbox shim toolbin out bad=""
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"; toolbin="$sandbox/rustlib/host/bin"
+    mkdir -p "$shim" "$toolbin" "$sandbox/rustlib/host/lib"
+    printf '#!/usr/bin/env bash\nprintf "SHIMMED-PROFDATA 9.9\\n"\n' >"$toolbin/llvm-profdata"
+    chmod +x "$toolbin/llvm-profdata"
+    cat >"$shim/rustc" <<SHIM
+#!/usr/bin/env bash
+case "\$1" in
+  --print) printf '%s\n' "$sandbox/rustlib/host/lib" ;;
+  *) printf 'rustc 9.9.9 (shim)\n' ;;
+esac
+SHIM
+    chmod +x "$shim/rustc"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4249-786_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'llvm_profdata=SHIMMED-PROFDATA 9.9' || bad="$bad not-discovered"
+    if [ -n "$bad" ]; then
+        report 1 "llvm-profdata is discovered beside the rustc target libdir" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'llvm_profdata=[^ ]*' | head -1)"
+    else
+        report 0 "llvm-profdata is discovered beside the rustc target libdir"
+    fi
+}
+
+# When genuinely absent, say `unavailable` — never crash, never guess.
+test_absent_tools_degrade_to_unavailable() {
+    local sandbox shim out bad=""
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"; mkdir -p "$shim"
+    # A rustc that reports a libdir with no llvm-tools beside it.
+    # shellcheck disable=SC2016  # this is the shim's SOURCE; $1 must reach it unexpanded
+    printf '#!/usr/bin/env bash\ncase "$1" in --print) printf "%%s\\n" "/nonexistent/lib";; *) printf "rustc 9.9.9 (shim)\\n";; esac\n' >"$shim/rustc"
+    chmod +x "$shim/rustc"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4250-787_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:/usr/bin:/bin" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'llvm_profdata=unavailable' || bad="$bad not-unavailable"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "absent tools degrade to unavailable" "issues:$bad"
+    else
+        report 0 "absent tools degrade to unavailable"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2161,6 +2228,8 @@ test_invalid_grace_is_validated
 test_grace_is_hard_bounded
 test_unrelated_live_pid_is_not_claimed_as_writer
 test_proc_stat_parse_survives_tricky_comm
+test_llvm_profdata_discovery_via_rustc_libdir
+test_absent_tools_degrade_to_unavailable
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
