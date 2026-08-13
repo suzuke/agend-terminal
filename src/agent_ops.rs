@@ -1268,6 +1268,10 @@ mod tests {
     /// without reaching an adapter or recreating receipt state.
     #[test]
     fn external_delete_fences_queued_transport_before_early_return() {
+        run_external_delete_fixture(true);
+    }
+
+    fn run_external_delete_fixture(send_outcome: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -1439,14 +1443,10 @@ mod tests {
                 externals: &delete_externals,
                 notifier: None,
             };
-            delete_tx
-                .send(delete_instance(
-                    &delete_home,
-                    &delete_agent,
-                    &context,
-                    false,
-                ))
-                .expect("delete outcome observer");
+            let outcome = delete_instance(&delete_home, &delete_agent, &context, false);
+            if send_outcome {
+                delete_tx.send(outcome).expect("delete outcome observer");
+            }
         });
 
         let marker_observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1468,12 +1468,23 @@ mod tests {
         lane_release_tx.send(()).expect("release lane");
         lane_holder.join().expect("lane holder");
 
-        assert_eq!(
-            delete_rx.recv().expect(
+        if send_outcome {
+            assert_eq!(
+                delete_rx.recv().expect(
+                    "external delete outcome sender dropped before sending outcome (RecvError)",
+                ),
+                DeleteOutcome::External
+            );
+        } else {
+            let disconnected: std::sync::mpsc::RecvError = delete_rx.recv().expect_err(
                 "external delete outcome sender dropped before sending outcome (RecvError)",
-            ),
-            DeleteOutcome::External
-        );
+            );
+            assert_eq!(
+                format!("{disconnected:?}"),
+                "RecvError",
+                "external delete completion must fail with the named RecvError"
+            );
+        }
         delete_thread.join().expect("delete thread");
 
         let dispatch_deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1510,19 +1521,11 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
-    /// A completion receiver must surface a dead producer promptly instead of
-    /// hiding the failure behind an arbitrary wall-clock budget. This control
-    /// owns and joins its only producer thread; no worker or detached sender is
-    /// left alive to make `recv()` succeed accidentally.
+    /// The real external-delete thread can disconnect before reporting its
+    /// outcome; the fixture's own completion receiver must surface RecvError.
     #[test]
     fn external_delete_completion_disconnect_control() {
-        let (delete_tx, delete_rx) = std::sync::mpsc::channel::<DeleteOutcome>();
-        let delete_thread = std::thread::spawn(move || drop(delete_tx));
-        let disconnected: std::sync::mpsc::RecvError = delete_rx
-            .recv()
-            .expect_err("completion receiver must report a dropped sender");
-        let _ = disconnected;
-        delete_thread.join().expect("completion producer thread");
+        run_external_delete_fixture(false);
     }
 
     #[test]
