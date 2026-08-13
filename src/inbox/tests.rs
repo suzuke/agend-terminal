@@ -70,7 +70,9 @@ struct ConcurrentEnqueueDiagnostics {
 enum ConcurrentEnqueueFailureClass {
     AppendSideCorruption,
     AppendSideAbsence,
-    IdentityAnomaly,
+    AppendSideIdentityAnomaly,
+    DrainRewriteCorruption,
+    DrainRewriteIdentityAnomaly,
     DrainRewriteLoss,
     DrainStateOmission,
     SnapshotUnavailable,
@@ -130,14 +132,14 @@ fn classify_concurrent_enqueue_failure(
     let Some(post_drain) = post_drain else {
         return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
     };
-    if pre_drain.malformed_rows > 0 || post_drain.malformed_rows > 0 {
+    if pre_drain.malformed_rows > 0 {
         ConcurrentEnqueueFailureClass::AppendSideCorruption
-    } else if pre_drain.duplicate_ids > 0
-        || pre_drain.missing_ids > 0
-        || post_drain.duplicate_ids > 0
-        || post_drain.missing_ids > 0
-    {
-        ConcurrentEnqueueFailureClass::IdentityAnomaly
+    } else if post_drain.malformed_rows > 0 {
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    } else if pre_drain.duplicate_ids > 0 || pre_drain.missing_ids > 0 {
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    } else if post_drain.duplicate_ids > 0 || post_drain.missing_ids > 0 {
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
     } else if pre_drain.physical_rows < 20 {
         ConcurrentEnqueueFailureClass::AppendSideAbsence
     } else if post_drain.physical_rows < 20 {
@@ -2595,6 +2597,10 @@ fn concurrent_enqueue_failure_classification_decision_table() {
         classify_concurrent_enqueue_failure(Some(&malformed), Some(&malformed), 19),
         ConcurrentEnqueueFailureClass::AppendSideCorruption
     );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&malformed), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    );
 
     let duplicate = ConcurrentEnqueueDiagnostics {
         physical_rows: 20,
@@ -2605,7 +2611,7 @@ fn concurrent_enqueue_failure_classification_decision_table() {
     };
     assert_eq!(
         classify_concurrent_enqueue_failure(Some(&duplicate), Some(&duplicate), 19),
-        ConcurrentEnqueueFailureClass::IdentityAnomaly
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
     );
 
     let missing = ConcurrentEnqueueDiagnostics {
@@ -2617,7 +2623,15 @@ fn concurrent_enqueue_failure_classification_decision_table() {
     };
     assert_eq!(
         classify_concurrent_enqueue_failure(Some(&missing), Some(&missing), 19),
-        ConcurrentEnqueueFailureClass::IdentityAnomaly
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&duplicate), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
     );
     assert_eq!(
         classify_concurrent_enqueue_failure(None, Some(&counts(20)), 19),
