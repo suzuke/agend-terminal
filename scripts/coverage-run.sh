@@ -39,6 +39,10 @@ log="${COVERAGE_LOG:-cov-attempt.log}"
 diag_max_files="${COVERAGE_DIAG_MAX_FILES:-10}"
 # #3236: bounded post-cleanup grace before the final inventory (corrupt path only).
 diag_grace_secs="${COVERAGE_DIAG_GRACE_SECS:-2}"
+# Validated like the file cap, and HARD-BOUNDED. Unvalidated it leaked a raw
+# `sleep: invalid time interval` and an arbitrarily large value could re-time
+# the retry path — neither is acceptable for a diagnostics-only change.
+DIAG_GRACE_MAX_SECS=30
 
 # A genuine producer/test failure. Checked BEFORE the corruption signature:
 # corruption may accompany a real failure, and when it does the real failure is
@@ -102,6 +106,14 @@ esac
 # already far beyond any real profile count, so anything longer is a typo.
 if [ "${#diag_max_files}" -gt 6 ]; then
     diag_max_files=0
+fi
+case "$diag_grace_secs" in
+    '' | *[!0-9]*) diag_grace_secs=-1 ;;
+esac
+if [ "$diag_grace_secs" = "-1" ] || [ "${#diag_grace_secs}" -gt 3 ] \
+    || [ "$diag_grace_secs" -gt "$DIAG_GRACE_MAX_SECS" ]; then
+    echo "::warning::COVERAGE_DIAG_GRACE_SECS=$(escape_field "${COVERAGE_DIAG_GRACE_SECS-}") is not an integer in 0..$DIAG_GRACE_MAX_SECS; using 2"
+    diag_grace_secs=2
 fi
 if [ "$diag_max_files" -lt 1 ]; then
     echo "::warning::COVERAGE_DIAG_MAX_FILES=$(escape_field "${COVERAGE_DIAG_MAX_FILES-}") is not a positive integer; using 10"
@@ -417,12 +429,21 @@ pid_token() {
     printf '%s' "$1" | sed -nE 's/.*-([0-9]+)-[0-9]+_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
 }
 
-# POSIX liveness. `kill -0` needs no /proc, so this is the one writer fact that
-# holds on Linux, macOS and Git Bash alike.
-writer_liveness() {
+# POSIX liveness of a PID NUMBER — deliberately NOT called writer_alive. PIDs
+# are recycled, so a live number is not proof that THE writer still runs; it is
+# one correlate, to be read with `writer_start`/`writer_exe`. `kill -0` needs no
+# /proc, so this fact holds on Linux, macOS and Git Bash alike.
+pid_liveness() {
     case "$1" in
         '' | *[!0-9]*) printf 'unknown'; return ;;
     esac
+    # PID 0 is NOT a writer: `kill -0 0` signals the CALLER'S PROCESS GROUP and
+    # always succeeds, so a malformed 0 token reported a false `alive=yes` in
+    # the one field this whole discriminator rests on.
+    [ "$1" -gt 0 ] || { printf 'unknown'; return; }
+    # Liveness is of THAT PID NUMBER. PID reuse cannot be excluded from the
+    # number alone; `writer_start` is the disambiguator where the platform
+    # exposes it, which is why it is captured alongside.
     if kill -0 "$1" 2>/dev/null; then printf 'yes'; else printf 'no'; fi
 }
 
@@ -432,7 +453,10 @@ writer_liveness() {
 writer_start() {
     case "$1" in '' | *[!0-9]*) printf 'unavailable'; return ;; esac
     if [ -r "/proc/$1/stat" ]; then
-        awk '{print $22}' "/proc/$1/stat" 2>/dev/null | grep . && return
+        # comm (field 2) is parenthesised and may contain spaces or ')', so
+        # counting fields from the start is wrong. Cut after the FINAL ')' and
+        # take the 20th remaining field (starttime is field 22 overall).
+        sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}' | grep . && return
     fi
     ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | grep . && return
     printf 'unavailable'
@@ -453,6 +477,18 @@ writer_exe() {
 # One healthy peer of the SAME module, so an odd size can be read against its
 # own module rather than against unrelated ones. Non-regular objects are never
 # opened, per the FIFO rule.
+# Is this basename one the producer named corrupt?
+is_named_corrupt_base() {
+    local want="$1" b
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        [ "$b" = "$want" ] && return 0
+    done <<EOF
+$NAMED_CORRUPT_BASES
+EOF
+    return 1
+}
+
 emit_module_exemplar() {
     local corrupt_base="$1" module="$2" f base sz
     case "$module" in '' | unknown) printf '    exemplar=none\n'; return ;; esac
@@ -460,6 +496,7 @@ emit_module_exemplar() {
         [ -f "$f" ] || continue
         base="${f##*/}"
         [ "$base" = "$corrupt_base" ] && continue
+        is_named_corrupt_base "$base" && continue
         sz="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
         case "$sz" in '' | *[!0-9]*) sz=n/a ;; esac
         printf '    exemplar=%s size_bytes=%s header=%s\n' \
@@ -472,6 +509,10 @@ emit_module_exemplar() {
 
 # PIDs named corrupt in THIS attempt, for the inventories below.
 NAMED_WRITER_PIDS=""
+# Basenames the producer NAMED corrupt this attempt. A named-corrupt file must
+# never be offered as another's "healthy" exemplar — that inverts the field's
+# entire purpose.
+NAMED_CORRUPT_BASES=""
 
 # A bounded inventory: how many profraw files remain, and how many named writers
 # are still alive. NOT a process table — that would be unbounded and would carry
@@ -483,7 +524,7 @@ emit_inventory() {
         files=$((files + 1))
     done
     for pid in $NAMED_WRITER_PIDS; do
-        [ "$(writer_liveness "$pid")" = "yes" ] && live=$((live + 1))
+        [ "$(pid_liveness "$pid")" = "yes" ] && live=$((live + 1))
     done
     printf '  inventory=%s profraw_files=%s live_writers=%s\n' "$label" "$files" "$live"
 }
@@ -621,8 +662,8 @@ describe_named_corrupt() {
     local wpid
     wpid="$(pid_token "$base")"
     NAMED_WRITER_PIDS="$NAMED_WRITER_PIDS $wpid"
-    printf '    writer_pid=%s writer_alive=%s writer_start=%s writer_exe=%s\n' \
-        "$wpid" "$(writer_liveness "$wpid")" \
+    printf '    writer_pid=%s pid_alive=%s writer_start=%s writer_exe=%s\n' \
+        "$wpid" "$(pid_liveness "$wpid")" \
         "$(escape_field "$(writer_start "$wpid")")" "$(writer_exe "$wpid")"
     printf '    head64=%s\n' "$FACT_HEAD64"
     emit_module_exemplar "$base" "$(module_token "$base")"
@@ -640,6 +681,17 @@ emit_diagnostics() {
     # anything reachable here; the invariant simply should not rest on it.
     printf 'profile_dir=%s\n' "$(escape_field "$profile_dir")"
     emit_toolchain
+    # Collect every named-corrupt basename FIRST, so the exemplar search below
+    # can exclude all of them rather than only the file being described.
+    local ncb
+    while IFS= read -r ncb; do
+        [ -n "$ncb" ] || continue
+        ncb="$(clean_token "$ncb")"
+        NAMED_CORRUPT_BASES="$NAMED_CORRUPT_BASES
+${ncb##*/}"
+    done <<EOF
+$(named_corrupt_paths)
+EOF
     # (a) cap-exempt: every path the producer itself named, in the order named.
     local named=0 p
     while IFS= read -r p; do

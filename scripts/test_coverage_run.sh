@@ -1766,7 +1766,7 @@ PRODUCER
     wait "$live" 2>/dev/null
     rm -rf "$sandbox"
     echo "$out" | grep -q "writer_pid=$live" || bad="$bad pid-not-reported"
-    echo "$out" | grep -q 'writer_alive=yes' || bad="$bad not-alive"
+    echo "$out" | grep -q 'pid_alive=yes' || bad="$bad not-alive"
     if [ -n "$bad" ]; then
         report 1 "a live writer is reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
     else
@@ -1789,8 +1789,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'writer_alive=' || bad="$bad no-liveness-field"
-    echo "$out" | grep -q 'writer_alive=yes' && bad="$bad claims-alive"
+    echo "$out" | grep -q 'pid_alive=' || bad="$bad no-liveness-field"
+    echo "$out" | grep -q 'pid_alive=yes' && bad="$bad claims-alive"
     if [ -n "$bad" ]; then
         report 1 "an exited writer is not reported alive" "issues:$bad"
     else
@@ -1967,6 +1967,162 @@ PRODUCER
     fi
 }
 
+# ── 57-60. Blockers from the PR #3243 secondary review ──────────────────────
+
+# `kill -0 0` signals the CALLER'S PROCESS GROUP and always succeeds, so a
+# malformed pid token of 0 produced a FALSE pid_alive=yes — in the one field
+# the whole discriminator rests on.
+test_pid_zero_is_not_reported_alive() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-0-777_0.profraw"
+printf 'warning: %s/agend-terminal-0-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=yes' && bad="$bad false-alive-for-pid-0"
+    echo "$out" | grep -q 'writer_pid=' || bad="$bad no-pid-field"
+    if [ -n "$bad" ]; then
+        report 1 "pid 0 is never reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "pid 0 is never reported alive"
+    fi
+}
+
+# A file the producer itself named CORRUPT must never be offered as the healthy
+# exemplar for another corrupt file of the same module — that inverts the whole
+# point of the exemplar.
+test_exemplar_excludes_other_named_corrupt() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'aaa' >"$COVERAGE_PROFILE_DIR/agend-terminal-123-777_0.profraw"
+printf 'bbb' >"$COVERAGE_PROFILE_DIR/agend-terminal-124-777_0.profraw"
+printf 'warning: %s/agend-terminal-123-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+printf 'warning: %s/agend-terminal-124-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'exemplar=agend-terminal-123-777_0.profraw' && bad="$bad corrupt-123-as-exemplar"
+    echo "$out" | grep -q 'exemplar=agend-terminal-124-777_0.profraw' && bad="$bad corrupt-124-as-exemplar"
+    echo "$out" | grep -q 'exemplar=none' || bad="$bad should-be-none"
+    if [ -n "$bad" ]; then
+        report 1 "the exemplar excludes other named-corrupt files" "issues:$bad; got: $(echo "$out" | grep -o 'exemplar=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "the exemplar excludes other named-corrupt files"
+    fi
+}
+
+# An invalid grace must not leak a raw `sleep:` error nor change the retry path.
+test_invalid_grace_is_validated() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4247-784_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_DIAG_GRACE_SECS=bogus COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qi 'invalid time interval' && bad="$bad raw-sleep-error"
+    echo "$out" | grep -q 'inventory=post-grace' || bad="$bad grace-inventory-lost"
+    if [ -n "$bad" ]; then
+        report 1 "an invalid grace is validated, not passed to sleep" "issues:$bad"
+    else
+        report 0 "an invalid grace is validated, not passed to sleep"
+    fi
+}
+
+# A grace large enough to re-time the retry is not "bounded"; it must be capped.
+test_grace_is_hard_bounded() {
+    local sandbox out t0 t1 bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4248-785_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    t0=$(date +%s)
+    out="$(cd "$sandbox" && COVERAGE_DIAG_GRACE_SECS=45 COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    t1=$(date +%s)
+    rm -rf "$sandbox"
+    # 45 is over the cap; a correct build spends ~2s here. Deliberately NOT a
+    # huge value: a test for an unbounded wait must not itself become one.
+    [ $((t1 - t0)) -le 35 ] || bad="$bad unbounded($((t1-t0))s)"
+    echo "$out" | grep -q 'inventory=post-grace' || bad="$bad grace-inventory-lost"
+    if [ -n "$bad" ]; then
+        report 1 "the grace is hard-bounded" "issues:$bad"
+    else
+        report 0 "the grace is hard-bounded"
+    fi
+}
+
+# A LIVE but UNRELATED pid must never be described as the writer: the field says
+# pid_alive, and executable/start are separate correlation evidence.
+test_unrelated_live_pid_is_not_claimed_as_writer() {
+    local sandbox out live bad=""
+    sandbox="$(new_sandbox)"
+    sleep 30 &
+    live=$!
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$COV_LIVE_PID-790_0.profraw"
+printf 'warning: %s/agend-terminal-%s-790_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$COV_LIVE_PID"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COV_LIVE_PID="$live" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+    rm -rf "$sandbox"
+    # The claim must be about the PID, not about "the writer".
+    echo "$out" | grep -q 'pid_alive=yes' || bad="$bad no-pid-alive"
+    echo "$out" | grep -q 'writer_alive=' && bad="$bad claims-writer-alive"
+    if [ -n "$bad" ]; then
+        report 1 "a live pid is reported as pid_alive, not writer_alive" "issues:$bad"
+    else
+        report 0 "a live pid is reported as pid_alive, not writer_alive"
+    fi
+}
+
+# /proc/PID/stat comm is parenthesised and may contain spaces and ')'. Counting
+# fields from the start mis-parses starttime; the parse must cut after the FINAL
+# ')'. Exercised directly against a synthetic stat line.
+test_proc_stat_parse_survives_tricky_comm() {
+    local tmp got bad=""
+    tmp="$(mktemp "${TMPDIR:-/tmp}/statparse.XXXXXX")"
+    # comm = "(evil ) proc)" — spaces AND a ')'. starttime is field 22 overall,
+    # i.e. the 20th field after the final ')'.
+    printf '%s' "1234 (evil ) proc) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0 0" >"$tmp"
+    got="$(sed 's/.*) //' "$tmp" | awk '{print $20}')"
+    rm -f "$tmp"
+    [ "$got" = "987654" ] || bad="$bad got($got)want(987654)"
+    if [ -n "$bad" ]; then
+        report 1 "/proc stat starttime parses past a tricky comm" "issues:$bad"
+    else
+        report 0 "/proc stat starttime parses past a tricky comm"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -1999,6 +2155,12 @@ test_first_64_bytes_are_captured
 test_toolchain_presence_without_values
 test_healthy_same_module_exemplar
 test_missing_exemplar_is_explicit
+test_pid_zero_is_not_reported_alive
+test_exemplar_excludes_other_named_corrupt
+test_invalid_grace_is_validated
+test_grace_is_hard_bounded
+test_unrelated_live_pid_is_not_claimed_as_writer
+test_proc_stat_parse_survives_tricky_comm
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
