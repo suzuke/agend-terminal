@@ -437,6 +437,11 @@ pid_liveness() {
     case "$1" in
         '' | *[!0-9]*) printf 'unknown'; return ;;
     esac
+    # Digits alone are not enough — the same trap as the diagnostic cap. A token
+    # too large for a shell integer passes a digits-only guard and then errors
+    # inside `[ … -gt … ]`, printing a raw shell diagnostic into the block. No
+    # real PID exceeds 10 digits.
+    [ "${#1}" -le 10 ] || { printf 'unknown'; return; }
     # PID 0 is NOT a writer: `kill -0 0` signals the CALLER'S PROCESS GROUP and
     # always succeeds, so a malformed 0 token reported a false `alive=yes` in
     # the one field this whole discriminator rests on.

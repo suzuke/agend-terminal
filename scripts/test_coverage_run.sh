@@ -2190,6 +2190,34 @@ PRODUCER
     fi
 }
 
+# Digits alone are not enough: a producer-controlled basename can carry a
+# numeric PID too large for a shell integer, which passes a digits-only guard
+# and then errors inside `[ … -gt … ]` — a raw shell diagnostic in the block.
+# Same class as the diagnostic-cap range bug; pinned here so it cannot recur.
+test_oversized_pid_token_emits_no_raw_shell_error() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-99999999999999999999-777_0.profraw"
+printf 'warning: %s/agend-terminal-99999999999999999999-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | grep -qi 'integer expression expected' && bad="$bad integer-error"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "an oversized pid token emits no raw shell error" \
+            "issues:$bad; got: $(echo "$out" | grep -E ': line [0-9]+:' | head -1)"
+    else
+        report 0 "an oversized pid token emits no raw shell error"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2230,6 +2258,7 @@ test_unrelated_live_pid_is_not_claimed_as_writer
 test_proc_stat_parse_survives_tricky_comm
 test_llvm_profdata_discovery_via_rustc_libdir
 test_absent_tools_degrade_to_unavailable
+test_oversized_pid_token_emits_no_raw_shell_error
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
