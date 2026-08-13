@@ -1532,6 +1532,143 @@ test_membership_compares_full_paths_not_basenames() {
     fi
 }
 
+# ── Membership is TRI-STATE, and `no` is the claim that needs an authority ────
+# `no` asserts that every present response list was read to its end and none
+# named this path. A list that could not be examined establishes nothing, and
+# the survey below the record already discloses exactly those lists as
+# `lines=n/a` — so `in_response=no` printed beside `lines=n/a` was ONE record
+# making two contradictory claims, with `in_response` the half asserting absence
+# it never had the authority for. Same class as `ps` exit 127, `kill -0` EPERM
+# and an absent `/proc` entry: a query that did not answer is not a `no`.
+
+# Non-regular: the response file's NAME is producer-controlled by glob, so it can
+# land on a directory. `-f` correctly refuses to read it — and refusing to read
+# is precisely why membership cannot then be denied.
+test_membership_unknown_when_list_is_non_regular() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/nonreg-1-2_0.profraw"
+    # A DIRECTORY, not a symlink or a FIFO: every platform can create one, so
+    # this contract RUNS where the symlink and mode-000 premises are unavailable
+    # (a property only exercised on Linux is a property Windows never guards).
+    mkdir "$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/nonreg-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "a non-regular response list is not evidence of non-membership"
+    else
+        report 1 "a non-regular response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# The same hazard on the shape that also BLOCKS: a FIFO must stay unread, and an
+# unread list must stay unknown. Deadline-bounded, because a test for a
+# potentially blocking open must not itself be able to hang the suite.
+test_membership_unknown_when_list_is_a_fifo() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    if fifos_unavailable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "a FIFO response list is not evidence of non-membership" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/fifomem-1-2_0.profraw"
+mkfifo "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/fifomem-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 5 >/dev/null
+    out="$(cat "$sandbox/out" 2>/dev/null)"
+    rm -f "$sandbox/profiles"/* 2>/dev/null
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=fifomem' | head -n 1)"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "a FIFO response list is not evidence of non-membership"
+    else
+        report 1 "a FIFO response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# The exhibit: the list NAMES this profile, so the truth is `yes`. Only the mode
+# stops the read. Reporting `no` here is not a conservative default — it is the
+# opposite of the fact, printed beside a `lines=n/a` that admits we never looked.
+test_membership_unknown_when_list_is_unreadable() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    if cannot_make_unreadable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "an unreadable response list is not evidence of non-membership" \
+            "this user can read a mode-000 file; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/hidden-1-2_0.profraw"
+printf '%s/hidden-1-2_0.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+chmod 000 "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/hidden-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "an unreadable response list is not evidence of non-membership"
+    else
+        report 1 "an unreadable response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# No list at all is not a list that excludes us. It is also indistinguishable
+# from a directory we could not enumerate, which is the second reason `no` is
+# unavailable here.
+test_membership_unknown_when_no_response_list_exists() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/nolist-1-2_0.profraw"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/nolist-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "an absent response list is not evidence of non-membership"
+    else
+        report 1 "an absent response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# And the tri-state must not swallow the `no` it replaces: a list that WAS read
+# end to end, and does not name us, still says `no`. Two existing contracts pin
+# that (exact-not-substring, full-paths-not-basenames); this one pins that the
+# unknown-producing paths above did not simply disable `no` everywhere.
+test_membership_no_survives_a_fully_examined_list() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/present-1-2_0.profraw"
+    printf '%s\n' "$sandbox/profiles/someone-else-9-9_0.profraw" \
+        >"$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/present-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=no'; then
+        report 0 "a fully examined list still yields no"
+    else
+        report 1 "a fully examined list still yields no" "got: $line"
+    fi
+}
+
 # A named path containing spaces must survive extraction intact.
 test_named_path_with_spaces_is_extracted() {
     local sandbox line
@@ -2588,6 +2725,11 @@ test_bare_relative_named_path_resolves
 test_benign_dots_in_filename_are_not_traversal
 test_response_entries_tolerate_crlf_and_no_final_newline
 test_membership_compares_full_paths_not_basenames
+test_membership_unknown_when_list_is_non_regular
+test_membership_unknown_when_list_is_a_fifo
+test_membership_unknown_when_list_is_unreadable
+test_membership_unknown_when_no_response_list_exists
+test_membership_no_survives_a_fully_examined_list
 test_named_path_with_spaces_is_extracted
 test_absolute_token_outside_profile_dir_is_out_of_scope
 test_symlink_leaf_cannot_escape_containment

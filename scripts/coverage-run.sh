@@ -670,28 +670,69 @@ module_token() {
 # Membership is exact and by NORMALIZED FULL PATH: a same-named file in another
 # directory is a different member, and a substring test would call foo.profraw a
 # member because the list happens to hold otherfoo.profraw.
+#
+# TRI-STATE, because `no` is the strongest claim in this record and it needs an
+# authority. `yes` needs one matching entry. `no` needs the far stronger fact
+# that EVERY present list was read to its end — so a list we could not examine
+# (a directory or FIFO the producer's glob name landed on; a regular file whose
+# open failed) yields `unknown`, never `no`. The survey below discloses those
+# same lists as `lines=n/a`: emitting `in_response=no` beside `lines=n/a` made
+# one record assert absence and admit ignorance at the same time, and the
+# assertion was the false half. An empty glob is `unknown` too — no list to read
+# is not a list that excludes us, and it is indistinguishable from a profile
+# directory that could not be enumerated.
+#
+# This is the `ps` exit-127 rule and the `/proc`-absence rule at their fourth
+# site: a query that did not answer is not a `no`. Membership was the last field
+# in the record without a third state.
 response_contains_path() {
-    local want="$1" list entry
+    local want="$1" list entry examined=0 unexamined=0
     for list in "$profile_dir"/*-profraw-list; do
+        # An unmatched glob leaves the pattern itself; `-e` also drops a list
+        # that vanished between the glob and this test.
+        [ -e "$list" ] || continue
         # `-f`, not `-e`: a FIFO response file would block this read forever.
-        [ -f "$list" ] || continue
-        # `|| [ -n "$entry" ]` so a final entry without a trailing newline is
-        # still read.
-        while IFS= read -r entry || [ -n "$entry" ]; do
-            entry="$(clean_token "$entry")"
-            [ -n "$entry" ] || continue
-            resolve_in_profile_dir "$entry" || continue
-            # Compare the NAMED path: membership is about the path the response
-            # file refers to, not the target a link happens to point at.
-            if [ "$RESOLVED_NAMED" = "$want" ]; then
-                printf 'yes'
-                return 0
-            fi
-        # Grouped: an unreadable response file must not report its own path
-        # into the evidence block through the shell's redirection error.
-        done 2>/dev/null <"$list"
+        # Refusing to read it is exactly why membership cannot then be denied.
+        if [ ! -f "$list" ]; then
+            unexamined=1
+            continue
+        fi
+        # The open we TEST is the open we READ FROM. A separate `: <"$list"`
+        # probe would validate one open and consume another — the
+        # validate-one-path-open-another gap this script has already closed
+        # once. The loop's own status is that of its last body command, so `:`
+        # forces zero; a non-zero status here can then ONLY mean the redirection
+        # itself failed, which is the difference between a list that omits us
+        # and a list we never read.
+        #
+        # `2>/dev/null` BEFORE `<"$list"`: redirections apply left to right, so
+        # ordering them the other way lets a failed open print bash's own
+        # message — carrying the path, unframed — into the evidence block.
+        if { while IFS= read -r entry || [ -n "$entry" ]; do
+                 # `|| [ -n "$entry" ]` above so a final entry without a
+                 # trailing newline is still read.
+                 entry="$(clean_token "$entry")"
+                 [ -n "$entry" ] || continue
+                 resolve_in_profile_dir "$entry" || continue
+                 # Compare the NAMED path: membership is about the path the
+                 # response file refers to, not the target a link happens to
+                 # point at.
+                 if [ "$RESOLVED_NAMED" = "$want" ]; then
+                     printf 'yes'
+                     return 0
+                 fi
+             done
+             :; } 2>/dev/null <"$list"; then
+            examined=1
+        else
+            unexamined=1
+        fi
     done
-    printf 'no'
+    if [ "$unexamined" -eq 1 ] || [ "$examined" -eq 0 ]; then
+        printf 'unknown'
+    else
+        printf 'no'
+    fi
 }
 
 describe_named_corrupt() {
@@ -766,7 +807,12 @@ describe_named_corrupt() {
         size=n/a
         header=n/a
         mtime=n/a
-        in_response=no
+        # `unknown`, not `no`, and not by analogy — by the same defect: the
+        # membership walk SKIPS every entry that resolves outside the profile
+        # directory, so a response list may name this exact path while we
+        # deliberately ignore it. `no` claimed an exclusion that the comparison
+        # is structurally unable to establish for an out-of-scope path.
+        in_response=unknown
     fi
     # The module token is derived from the RAW basename, then the basename is
     # rendered: deriving it from the escaped form would read `\n` as characters.
@@ -837,7 +883,10 @@ EOF
         # pathname bytes from message bytes, and exact reconstruction is
         # impossible by decision — so this discloses THAT something was
         # unattributable, and claims nothing about how much.
-        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown"
+        # `in_response=unknown`: there is no path here to look up. Membership was
+        # never queried, and a record that cannot even name its subject is the
+        # last place to assert that subject is absent from a list.
+        echo "  corrupt=(unparseable) exists=unparseable in_response=unknown size_bytes=n/a header=n/a mtime=n/a module=unknown"
     elif [ "$named" -eq 0 ]; then
         echo "  (producer named no corrupt profile path)"
     fi
