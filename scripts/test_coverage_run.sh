@@ -1829,8 +1829,13 @@ test_stale_deadline_sidecar_is_not_attributed() {
 # process row carries the helper's descendant scope. Restoring the old global
 # ps regex makes this exact control fail because it also emits the foreign row.
 test_foreign_process_is_not_reported_as_run_process() {
-    local sandbox foreign_root foreign_pid owned_pid failure process_rows row bad=""
+    local sandbox foreign_root foreign_pid owned_pid failure process_rows row pid bad=""
     sandbox="$(new_sandbox)"
+    foreign_root="$(mktemp -d "${run_tmpdir_parent}/cov-foreign-suite.XXXXXX")"
+    printf '#!/usr/bin/env bash\nsleep 30\n' >"$foreign_root/cov-run-test-foreign.sh"
+    chmod +x "$foreign_root/cov-run-test-foreign.sh"
+    "$foreign_root/cov-run-test-foreign.sh" &
+    foreign_pid=$!
     cat >"$sandbox/producer.sh" <<PRODUCER
 #!/usr/bin/env bash
 sleep 30 >/dev/null 2>&1 &
@@ -1842,11 +1847,6 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     run_wrapper_with_deadline "$sandbox" 5 >/dev/null
     owned_pid="$(cat "$sandbox/owned-child.pid" 2>/dev/null)"
-    foreign_root="$(mktemp -d "${run_tmpdir_parent}/cov-foreign-suite.XXXXXX")"
-    printf '#!/usr/bin/env bash\nsleep 30\n' >"$foreign_root/cov-run-test-foreign.sh"
-    chmod +x "$foreign_root/cov-run-test-foreign.sh"
-    "$foreign_root/cov-run-test-foreign.sh" &
-    foreign_pid=$!
     failure="$(report 1 "foreign process is not run evidence" "process=foreign")"
     [ -n "$owned_pid" ] && kill "$owned_pid" 2>/dev/null || true
     [ -n "$owned_pid" ] && wait "$owned_pid" 2>/dev/null || true
@@ -1861,11 +1861,15 @@ PRODUCER
     while IFS= read -r row || [ -n "$row" ]; do
         [ -n "$row" ] || continue
         case "$row" in
-            process=scope=run-descendant\ *) ;;
+            process=scope=run-descendant\ *)
+                pid="${row#process=scope=run-descendant }"
+                pid="${pid%% *}"
+                [ "$pid" = "$foreign_pid" ] && bad="$bad foreign-pid-$pid-leaked"
+                ;;
             *) bad="$bad unscoped-process-row" ;;
         esac
     done <<<"$process_rows"
-    echo "$process_rows" | grep -q 'foreign-' && bad="$bad foreign-process-leaked"
+    echo "$process_rows" | grep -q 'foreign-' && bad="$bad foreign-path-leaked"
     if [ -n "$bad" ]; then
         report 1 "a foreign process is not run evidence" "issues:$bad"
     else
