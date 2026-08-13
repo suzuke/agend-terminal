@@ -752,6 +752,9 @@ PRODUCER
 # by OPENING each FIFO FOR WRITING — that completes the pending open-for-read, so
 # the wrapper finishes and no orphan is left behind. Safe precisely because we
 # only do it while a blocked reader is known to exist.
+# Process snapshots add measured observation overhead (~45ms per `ps` on CI);
+# that cost is diagnostic-only. The loop/deadline comparisons, FIFO rescue, and
+# kill semantics remain the same.
 record_process_snapshot() {
     local output="$1" root_pid="$2" snapshot line
     if ! command -v ps >/dev/null 2>&1; then
@@ -1821,22 +1824,48 @@ test_stale_deadline_sidecar_is_not_attributed() {
     fi
 }
 
-# A foreign suite may use the same historical command names. Machine-wide ps
-# regexes must not turn that process into evidence for this run.
+# A foreign suite may use the same historical command names. Seed this test's
+# process sidecar through the deadline helper first, then prove every emitted
+# process row carries the helper's descendant scope. Restoring the old global
+# ps regex makes this exact control fail because it also emits the foreign row.
 test_foreign_process_is_not_reported_as_run_process() {
-    local foreign_root foreign_pid failure bad=""
+    local sandbox foreign_root foreign_pid owned_pid failure process_rows row bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+sleep 30 >/dev/null 2>&1 &
+printf '%s\n' "\$!" >"$sandbox/owned-child.pid"
+sleep 3
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 5 >/dev/null
+    owned_pid="$(cat "$sandbox/owned-child.pid" 2>/dev/null)"
     foreign_root="$(mktemp -d "${run_tmpdir_parent}/cov-foreign-suite.XXXXXX")"
     printf '#!/usr/bin/env bash\nsleep 30\n' >"$foreign_root/cov-run-test-foreign.sh"
     chmod +x "$foreign_root/cov-run-test-foreign.sh"
     "$foreign_root/cov-run-test-foreign.sh" &
     foreign_pid=$!
     failure="$(report 1 "foreign process is not run evidence" "process=foreign")"
+    [ -n "$owned_pid" ] && kill "$owned_pid" 2>/dev/null || true
+    [ -n "$owned_pid" ] && wait "$owned_pid" 2>/dev/null || true
     kill "$foreign_pid" 2>/dev/null || true
     wait "$foreign_pid" 2>/dev/null || true
+    rm -rf "$sandbox"
     rm -rf "$foreign_root"
-    echo "$failure" | grep -q '^process_state=not-recorded$' \
-        || bad="$bad process-state-not-recorded-missing"
-    echo "$failure" | grep -q '^process=' && bad="$bad machine-wide-process-leaked"
+    echo "$failure" | grep -qE '^process_state=present(-capped)?$' \
+        || bad="$bad process-state-present-missing"
+    process_rows="$(echo "$failure" | grep '^process=' || true)"
+    [ -n "$process_rows" ] || bad="$bad process-sidecar-empty"
+    while IFS= read -r row || [ -n "$row" ]; do
+        [ -n "$row" ] || continue
+        case "$row" in
+            process=scope=run-descendant\ *) ;;
+            *) bad="$bad unscoped-process-row" ;;
+        esac
+    done <<<"$process_rows"
+    echo "$process_rows" | grep -q 'foreign-' && bad="$bad foreign-process-leaked"
     if [ -n "$bad" ]; then
         report 1 "a foreign process is not run evidence" "issues:$bad"
     else
