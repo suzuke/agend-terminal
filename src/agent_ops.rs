@@ -1310,6 +1310,8 @@ mod tests {
         const LANE_ADMISSION_DELAY: Duration = Duration::from_millis(1200);
         let _admission_guard =
             crate::daemon::delivery_worker::test_support::direct_transport_admission_hook_guard();
+        let _cleanup_before_lane_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_before_lane_acquire_hook_guard();
         let admission_home = home.clone();
         let admission_agent = agent.clone();
         crate::daemon::delivery_worker::test_support::set_direct_transport_admission_hook(Some(
@@ -1384,7 +1386,37 @@ mod tests {
         let delete_registry = std::sync::Arc::clone(&registry);
         let delete_configs = std::sync::Arc::clone(&configs);
         let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let (marker_tx, marker_rx) = std::sync::mpsc::channel();
+        let (marker_continue_tx, marker_continue_rx) = std::sync::mpsc::channel();
+        // #3240 slice 4: this is a fixed pre-acquire rendezvous, not a marker
+        // observer. The marker assertion runs while the delete thread is held
+        // at this seam, before it can acquire the already-held transport lane.
+        // Named RED controls exercised during implementation (temporary only):
+        // M2 moves mark_deleting after lane acquire; old-clock delays delete
+        // entry by 1200ms; child-death panics before this seam. Each must fail
+        // or disconnect without leaving a sender owned by the test thread.
+        let marker_home = home.clone();
+        let marker_agent = agent.clone();
+        let expected_marker_home = home.clone();
+        let expected_marker_agent = agent.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_before_lane_acquire_hook(Some(
+            std::sync::Arc::new(move |hook_home, hook_agent| {
+                if hook_home == expected_marker_home.as_path()
+                    && hook_agent == expected_marker_agent
+                {
+                    crate::daemon::delivery_worker::test_support::
+                        notify_cleanup_before_lane_acquire(hook_home, hook_agent);
+                }
+            }),
+        ));
         let delete_thread = std::thread::spawn(move || {
+            let _marker_observer =
+                crate::daemon::delivery_worker::test_support::cleanup_before_lane_acquire_observer(
+                    &marker_home,
+                    &marker_agent,
+                    marker_tx,
+                    marker_continue_rx,
+                );
             let context = DeleteContext {
                 registry: &delete_registry,
                 configs: &delete_configs,
@@ -1401,23 +1433,25 @@ mod tests {
                 .expect("delete outcome observer");
         });
 
-        let marker_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !crate::agent::deleting::is_deleting(&home, &agent)
-            && std::time::Instant::now() < marker_deadline
-        {
-            std::thread::yield_now();
-        }
-        assert!(
-            crate::agent::deleting::is_deleting(&home, &agent),
-            "external delete must mark the name before waiting for its transport lane"
-        );
-        assert!(
-            delete_rx.try_recv().is_err(),
-            "external delete must remain behind the held transport lane"
-        );
+        let marker_observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            marker_rx.recv().expect(
+                "external delete marker observer disconnected: delete thread died before cleanup lane",
+            );
+            assert!(
+                crate::agent::deleting::is_deleting(&home, &agent),
+                "external delete must mark the name before waiting for its transport lane"
+            );
+            assert!(
+                delete_rx.try_recv().is_err(),
+                "external delete must remain behind the held transport lane"
+            );
+        }));
+        let _ = marker_continue_tx.send(());
+        marker_observation.expect("external delete marker ordering observation");
 
         lane_release_tx.send(()).expect("release lane");
         lane_holder.join().expect("lane holder");
+
         assert_eq!(
             delete_rx
                 .recv_timeout(Duration::from_secs(1))

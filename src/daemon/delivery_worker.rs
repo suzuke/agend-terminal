@@ -370,6 +370,11 @@ pub(crate) fn begin_transport_generation_transition(
 }
 
 pub(crate) fn begin_transport_cleanup(home: &Path, agent: &str) -> TransportGenerationGuard {
+    // Fixed test seam: the marker must already exist when cleanup is about to
+    // acquire this lane. Keep this boundary separate from mark_deleting so an
+    // ordering mutation cannot move the observation with the marker.
+    #[cfg(test)]
+    test_support::run_cleanup_before_lane_acquire_hook(home, agent);
     let serial = TransportLaneGuard::acquire(home, agent);
     let key = (home.to_path_buf(), agent.to_string());
     let state = transport_epoch_state(home, agent);
@@ -697,6 +702,8 @@ pub(crate) mod test_support {
         std::sync::Arc<dyn Fn(&std::path::Path, &str) + Send + Sync>;
     pub(crate) type DirectTransportAdmissionHook =
         std::sync::Arc<dyn Fn(&std::path::Path, &str) + Send + Sync>;
+    pub(crate) type CleanupBeforeLaneAcquireHook =
+        std::sync::Arc<dyn Fn(&std::path::Path, &str) + Send + Sync>;
     pub(crate) type QueueFullBeforeRecordHook =
         std::sync::Arc<dyn Fn(&std::path::Path, &str, u64) + Send + Sync>;
     pub(crate) type TransportAcceptedBeforeArmHook =
@@ -713,6 +720,10 @@ pub(crate) mod test_support {
     static DIRECT_ADMISSION_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     static DIRECT_ADMISSION_HOOK: std::sync::OnceLock<
         parking_lot::Mutex<Option<DirectTransportAdmissionHook>>,
+    > = std::sync::OnceLock::new();
+    static CLEANUP_BEFORE_LANE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static CLEANUP_BEFORE_LANE_HOOK: std::sync::OnceLock<
+        parking_lot::Mutex<Option<CleanupBeforeLaneAcquireHook>>,
     > = std::sync::OnceLock::new();
     static QUEUE_FULL_BEFORE_RECORD_HOOK: std::sync::OnceLock<
         parking_lot::Mutex<Option<QueueFullBeforeRecordHook>>,
@@ -851,6 +862,103 @@ pub(crate) mod test_support {
     impl Drop for DirectTransportAdmissionHookGuard {
         fn drop(&mut self) {
             set_direct_transport_admission_hook(None);
+        }
+    }
+
+    struct CleanupBeforeLaneAcquireObserver {
+        home: std::path::PathBuf,
+        agent: String,
+        entered_tx: std::sync::mpsc::Sender<()>,
+        continue_rx: std::sync::mpsc::Receiver<()>,
+    }
+
+    std::thread_local! {
+        static CLEANUP_BEFORE_LANE_OBSERVER:
+            std::cell::RefCell<Option<CleanupBeforeLaneAcquireObserver>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct CleanupBeforeLaneAcquireObserverGuard;
+
+    pub(crate) fn cleanup_before_lane_acquire_observer(
+        home: &std::path::Path,
+        agent: &str,
+        entered_tx: std::sync::mpsc::Sender<()>,
+        continue_rx: std::sync::mpsc::Receiver<()>,
+    ) -> CleanupBeforeLaneAcquireObserverGuard {
+        CLEANUP_BEFORE_LANE_OBSERVER.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "cleanup-before-lane observer already installed on this thread"
+            );
+            *slot.borrow_mut() = Some(CleanupBeforeLaneAcquireObserver {
+                home: home.to_path_buf(),
+                agent: agent.to_string(),
+                entered_tx,
+                continue_rx,
+            });
+        });
+        CleanupBeforeLaneAcquireObserverGuard
+    }
+
+    pub(crate) fn notify_cleanup_before_lane_acquire(home: &std::path::Path, agent: &str) {
+        let observer = CLEANUP_BEFORE_LANE_OBSERVER.with(|slot| {
+            let matches = slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|observer| observer.home == home && observer.agent == agent);
+            matches.then(|| slot.borrow_mut().take()).flatten()
+        });
+        if let Some(observer) = observer {
+            observer
+                .entered_tx
+                .send(())
+                .expect("cleanup-before-lane observer receiver");
+            observer
+                .continue_rx
+                .recv()
+                .expect("cleanup-before-lane observer release");
+        }
+    }
+
+    impl Drop for CleanupBeforeLaneAcquireObserverGuard {
+        fn drop(&mut self) {
+            CLEANUP_BEFORE_LANE_OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(crate) struct CleanupBeforeLaneAcquireHookGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn cleanup_before_lane_acquire_hook_guard() -> CleanupBeforeLaneAcquireHookGuard {
+        let lock = CLEANUP_BEFORE_LANE_LOCK.lock();
+        set_cleanup_before_lane_acquire_hook(None);
+        CleanupBeforeLaneAcquireHookGuard { _lock: lock }
+    }
+
+    pub(crate) fn set_cleanup_before_lane_acquire_hook(hook: Option<CleanupBeforeLaneAcquireHook>) {
+        *CLEANUP_BEFORE_LANE_HOOK
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock() = hook;
+    }
+
+    pub(super) fn run_cleanup_before_lane_acquire_hook(home: &std::path::Path, agent: &str) {
+        let hook = CLEANUP_BEFORE_LANE_HOOK
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock()
+            .as_ref()
+            .cloned();
+        if let Some(hook) = hook {
+            hook(home, agent);
+        }
+    }
+
+    impl Drop for CleanupBeforeLaneAcquireHookGuard {
+        fn drop(&mut self) {
+            set_cleanup_before_lane_acquire_hook(None);
         }
     }
 
