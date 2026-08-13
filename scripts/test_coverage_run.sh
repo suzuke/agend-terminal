@@ -1726,6 +1726,178 @@ test_symlink_leaf_cannot_escape_containment() {
     fi
 }
 
+# ── Containment belongs to EVERY reader, not only the named leaf ─────────────
+# The named route resolves its leaf through resolve_in_profile_dir. Three other
+# readers glob a producer-controlled name inside the profile dir and then let
+# `-f`/`-e` FOLLOW a symlink, so a link planted under one of those names hands
+# the reader a file outside the directory — and the block discloses what it
+# found there: the response list by CONTENT (`response_line=`), the survey and
+# the exemplar by SIZE and FIRST BYTES. The name is producer-controlled data we
+# already print; the CONTENT of an outside file is not ours to disclose.
+
+# Same driver as drive_named, but echoes the WHOLE block: these contracts are
+# about what must not appear ANYWHERE in it, which one grepped line cannot show.
+drive_named_block() {
+    local profiles="$1" named="$2" sandbox
+    sandbox="$(dirname "$profiles")"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $named: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    (cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)
+}
+
+test_symlinked_response_list_discloses_nothing_outside() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'OUTSIDE-SENTINEL-LIST\n' >"$sandbox/secret-list.txt"
+    printf 'partial' >"$sandbox/profiles/listlink-1-2_0.profraw"
+    ln -s "$sandbox/secret-list.txt" \
+        "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
+        rm -rf "$sandbox"
+        report_skip "a symlinked response list discloses nothing from outside" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/listlink-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    echo "$out" | grep -q 'OUTSIDE-SENTINEL-LIST' && bad="$bad content-disclosed"
+    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
+    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "a symlinked response list discloses nothing from outside" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "a symlinked response list discloses nothing from outside"
+    fi
+}
+
+test_symlinked_survey_profile_discloses_no_outside_bytes() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'SECRETBYTES' >"$sandbox/secret.bin"
+    printf 'partial' >"$sandbox/profiles/real-1-2_0.profraw"
+    ln -s "$sandbox/secret.bin" "$sandbox/profiles/leak-9-9_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/leak-9-9_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the survey discloses no bytes from an escaping profile" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/real-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    # 'SECR' — the first bytes od would print for the outside file.
+    echo "$out" | grep -qi '53 45 43 52' && bad="$bad header-disclosed"
+    echo "$out" | grep -qE '^[[:space:]]*file=leak-9-9_0\.profraw size_bytes=n/a header=n/a' ||
+        bad="$bad not-marked-unread"
+    if [ -n "$bad" ]; then
+        report 1 "the survey discloses no bytes from an escaping profile" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'file=leak' | head -1)"
+    else
+        report 0 "the survey discloses no bytes from an escaping profile"
+    fi
+}
+
+test_symlinked_exemplar_discloses_no_outside_bytes() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'EXEMPLARSECRET' >"$sandbox/secret.bin"
+    printf 'partial' >"$sandbox/profiles/victim-1-77_0.profraw"
+    ln -s "$sandbox/secret.bin" "$sandbox/profiles/peer-2-77_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/peer-2-77_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "an escaping peer is never offered as an exemplar" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/victim-1-77_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*exemplar=' | head -n 1)"
+    # 'EXEM' — the first bytes od would print for the outside file.
+    echo "$out" | grep -qi '45 58 45 4d' && bad="$bad header-disclosed"
+    echo "$line" | grep -q 'exemplar=none' || bad="$bad escaping-peer-offered"
+    if [ -n "$bad" ]; then
+        report 1 "an escaping peer is never offered as an exemplar" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "an escaping peer is never offered as an exemplar"
+    fi
+}
+
+# The over-blocking guard. Containment must reject what ESCAPES, not everything
+# that is a symlink: an in-scope link is a legitimate object this block has
+# always read, and a fix that silently blinds the survey and the exemplar would
+# pass every test above while destroying the diagnostic.
+test_in_scope_symlinks_are_still_read() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'REALBYTES' >"$sandbox/profiles/target-1-88_0.profraw"
+    ln -s "$sandbox/profiles/target-1-88_0.profraw" \
+        "$sandbox/profiles/alias-2-88_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/alias-2-88_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "an in-scope symlink is still surveyed and still an exemplar" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    printf 'partial' >"$sandbox/profiles/victim-3-88_0.profraw"
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/victim-3-88_0.profraw")"
+    rm -rf "$sandbox"
+    # 9 bytes, and the header od prints for 'REALBYTES'.
+    echo "$out" | grep -qE 'exemplar=alias-2-88_0\.profraw size_bytes=9 header=52 45 41 4c' ||
+        bad="$bad exemplar-blinded"
+    echo "$out" | grep -qE '^[[:space:]]*file=alias-2-88_0\.profraw size_bytes=9' ||
+        bad="$bad survey-blinded"
+    if [ -n "$bad" ]; then
+        report 1 "an in-scope symlink is still surveyed and still an exemplar" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'exemplar=|file=alias' | head -2 | tr '\n' ' ')"
+    else
+        report 0 "an in-scope symlink is still surveyed and still an exemplar"
+    fi
+}
+
+# The list object is judged by SHAPE, not by where it resolves to. cargo-llvm-cov
+# writes the response file with `fs::write`, so a legitimate producer never
+# presents a symlink here: supporting one buys nothing and costs a resolved
+# second path, which is the validate-one/open-another shape this script has
+# already been bitten by. So even an IN-SCOPE symlinked list is refused — and a
+# refused list is unexamined, which under the tri-state is `unknown`, never `no`.
+test_in_scope_symlinked_response_list_is_refused_not_read() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/member-4-5_0.profraw"
+    printf '%s\n' "$sandbox/profiles/member-4-5_0.profraw" \
+        >"$sandbox/profiles/real-list"
+    ln -s "$sandbox/profiles/real-list" \
+        "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
+        rm -rf "$sandbox"
+        report_skip "an in-scope symlinked response list is refused, not read" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/member-4-5_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    # It names the profile, so a reader that FOLLOWED it would answer `yes`.
+    # Refusing to read it is exactly why the answer must be `unknown` instead.
+    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
+    if [ -n "$bad" ]; then
+        report 1 "an in-scope symlinked response list is refused, not read" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "an in-scope symlinked response list is refused, not read"
+    fi
+}
+
 # When COVERAGE_PROFILE_DIR is absolute but does not exist, a child of it is
 # still IN scope — it is simply missing. The cd-failure fallback must not
 # prepend $PWD to an already-absolute directory.
@@ -2733,6 +2905,11 @@ test_membership_no_survives_a_fully_examined_list
 test_named_path_with_spaces_is_extracted
 test_absolute_token_outside_profile_dir_is_out_of_scope
 test_symlink_leaf_cannot_escape_containment
+test_symlinked_response_list_discloses_nothing_outside
+test_symlinked_survey_profile_discloses_no_outside_bytes
+test_symlinked_exemplar_discloses_no_outside_bytes
+test_in_scope_symlinks_are_still_read
+test_in_scope_symlinked_response_list_is_refused_not_read
 test_absolute_missing_profile_dir_keeps_its_boundary
 test_relative_missing_profile_dir_under_symlinked_cwd
 test_in_scope_symlink_opens_the_validated_target

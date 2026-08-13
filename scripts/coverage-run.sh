@@ -575,18 +575,31 @@ EOF
 }
 
 emit_module_exemplar() {
-    local corrupt_base="$1" module="$2" f base sz
+    local corrupt_base="$1" module="$2" f base
     case "$module" in '' | unknown) printf '    exemplar=none\n'; return ;; esac
     for f in "$profile_dir"/*-"$module"_*.profraw; do
-        [ -f "$f" ] || continue
+        [ -e "$f" ] || continue
         base="${f##*/}"
         [ "$base" = "$corrupt_base" ] && continue
         is_named_corrupt_base "$base" && continue
-        sz="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
-        case "$sz" in '' | *[!0-9]*) sz=n/a ;; esac
+        # CONTAINMENT, then ONE SNAPSHOT — the same two steps the named route
+        # takes, not a second mechanism. `wc -c` plus `od` were two more opens
+        # of a producer-controlled name that `-f` had already followed, so a
+        # peer symlinked outside the profile directory was offered as this
+        # module's "healthy" exemplar and its first bytes printed.
+        #
+        # BASENAME, never "$f": resolve_in_profile_dir prepends $profile_dir_abs
+        # to any non-absolute candidate, and $profile_dir defaults to the
+        # RELATIVE `target/llvm-cov-target` — handing it the glob's own path
+        # would double the prefix and silently blind this field in exactly the
+        # configuration CI runs.
+        resolve_in_profile_dir "$base" || continue
+        # Any non-zero is a candidate we could not read as a healthy peer —
+        # escaping, non-regular, replaced mid-read, or our own scratch failing.
+        # An exemplar is an offer, so the honest move is to offer the next one.
+        read_pinned_facts "$RESOLVED_FINAL" || continue
         printf '    exemplar=%s size_bytes=%s header=%s\n' \
-            "$(escape_field "$base")" "$sz" \
-            "$( { od -An -tx1 -N8 <"$f"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+            "$(escape_field "$base")" "$FACT_SIZE" "$FACT_HEADER"
         return
     done
     printf '    exemplar=none\n'
@@ -691,6 +704,24 @@ response_contains_path() {
         # An unmatched glob leaves the pattern itself; `-e` also drops a list
         # that vanished between the glob and this test.
         [ -e "$list" ] || continue
+        # A SYMLINKED LIST IS REFUSED OUTRIGHT, in scope or not. The name is
+        # producer-controlled by glob, and cargo-llvm-cov writes this file with
+        # `fs::write` — a legitimate producer never presents a link here, so
+        # supporting one buys nothing and costs a resolved second path, which is
+        # the validate-one/open-another shape this script has already been bitten
+        # by. Judging the SHAPE needs no resolution at all.
+        #
+        # HONEST BOUND: this does not eliminate TOCTOU. `[ -L ]` and the open
+        # below are separate syscalls and nothing anchors the object between
+        # them; refusing outright removes the resolved detour and fails closed,
+        # nothing more. A HARD link to an outside file defeats this test and the
+        # resolving alternative alike — `-L` is false and the path genuinely is
+        # inside the directory — and that requires same-UID write access to the
+        # profile directory, which this block already declares out of scope.
+        if [ -L "$list" ]; then
+            unexamined=1
+            continue
+        fi
         # `-f`, not `-e`: a FIFO response file would block this read forever.
         # Refusing to read it is exactly why membership cannot then be denied.
         if [ ! -f "$list" ]; then
@@ -910,7 +941,13 @@ EOF
         # The response file's NAME is producer-controlled by glob, so it can be
         # a FIFO too — and the count, the listing and the membership read all
         # open it. Disclosed, never read, never dropped.
-        if [ ! -f "$list" ]; then
+        #
+        # `-L` first, and for the same reason membership refuses it: a symlink
+        # under this name is not a shape any legitimate producer creates, and
+        # following one disclosed the CONTENT of a file outside the profile
+        # directory as `response_line=` records. The NAME is producer-controlled
+        # data this block already prints; the bytes behind a link are not ours.
+        if [ -L "$list" ] || [ ! -f "$list" ]; then
             printf 'response_file=%s lines=n/a\n' "$(escape_field "$list")"
             continue
         fi
@@ -932,31 +969,33 @@ EOF
             printf '  … more response lines not shown (cap=%s)\n' "$diag_max_files"
         fi
     done
-    local shown=0 f fsize fheader
+    local shown=0 f fbase fsize fheader
     for f in "$profile_dir"/*.profraw; do
         [ -e "$f" ] || continue
         if [ "$shown" -ge "$diag_max_files" ]; then
             echo "  … more profraw files not shown (cap=$diag_max_files)"
             break
         fi
-        # Same rule as the named route: never open a non-regular object.
-        if [ ! -f "$f" ]; then
-            fsize=""
+        fbase="${f##*/}"
+        # CONTAINMENT, then ONE SNAPSHOT, exactly as the named route does it.
+        # `-f` FOLLOWS a link, so `wc -c` and `od` used to read — and print the
+        # size and first bytes of — a file outside the profile directory that a
+        # producer had linked to under an in-directory name. The two reads were
+        # also two separate opens, so the size and the header could describe
+        # different objects; one pinned copy answers both.
+        # BASENAME for the same prefix-doubling reason as the exemplar above.
+        if resolve_in_profile_dir "$fbase" && read_pinned_facts "$RESOLVED_FINAL"; then
+            fsize="$FACT_SIZE"
+            fheader="$FACT_HEADER"
         else
-            fsize="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
+            # Escaping, non-regular, replaced mid-read, or our own scratch
+            # failed. The NAME is still disclosed — never dropped — and no fact
+            # is invented for a read that did not happen.
+            fsize=n/a
+            fheader=n/a
         fi
-        case "$fsize" in
-            '' | *[!0-9]*)
-                fsize=n/a
-                fheader=n/a
-                ;;
-            *)
-                fheader="$( { od -An -tx1 -N8 <"$f"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
-                [ -n "$fheader" ] || fheader=n/a
-                ;;
-        esac
         printf '  file=%s size_bytes=%s header=%s\n' \
-            "$(escape_field "$(basename "$f")")" "$fsize" "$fheader"
+            "$(escape_field "$fbase")" "$fsize" "$fheader"
         shown=$((shown + 1))
     done
     [ "$shown" -eq 0 ] && echo "  (no .profraw files present)"
