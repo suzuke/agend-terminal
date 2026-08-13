@@ -1301,26 +1301,20 @@ mod tests {
         // exactly once, so re-introducing any clock-based readiness wait fails
         // deterministically here instead of flaking somewhere else later.
         //
-        // ONE-SHOT as a PRECAUTION, not because a second admission is known to
-        // happen here. The queued job's later dispatch also goes through
-        // `with_transport_serial`, so if it ever admits under this key the delay
-        // would land on the dispatch assertion below instead. Measured today it
-        // does not: removing the latch so every matching admission sleeps leaves
-        // the test passing in the same wall-clock time, i.e. this fixture admits
-        // exactly once. The latch keeps that future case from silently becoming
-        // a second budget; it is not load-bearing now.
+        // The delay is UNCONDITIONAL, and nothing else needs to be: the hook runs
+        // only inside `with_transport_serial` (daemon/delivery_worker.rs:337-340),
+        // while the queued worker takes the lane itself and hands the guard to
+        // `dispatch_transport` (:468-471), which never runs the hook. So this
+        // delay cannot reach the dispatch assertion further down, and a latch to
+        // keep it away from there would be guarding a path that does not exist.
         const LANE_ADMISSION_DELAY: Duration = Duration::from_millis(1200);
         let _admission_guard =
             crate::daemon::delivery_worker::test_support::direct_transport_admission_hook_guard();
         let admission_home = home.clone();
         let admission_agent = agent.clone();
-        let admission_delayed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         crate::daemon::delivery_worker::test_support::set_direct_transport_admission_hook(Some(
             std::sync::Arc::new(move |hook_home: &std::path::Path, hook_agent: &str| {
-                if hook_home == admission_home.as_path()
-                    && hook_agent == admission_agent
-                    && !admission_delayed.swap(true, Ordering::SeqCst)
-                {
+                if hook_home == admission_home.as_path() && hook_agent == admission_agent {
                     std::thread::sleep(LANE_ADMISSION_DELAY);
                 }
             }),
@@ -1338,10 +1332,14 @@ mod tests {
                     .expect("lane release");
             });
         });
-        // A BARRIER, not a clock. What this fixture needs is the ordering fact
-        // "the holder is inside the lane", and no wall-clock budget can express
-        // that: too short flakes on a loaded machine, too long only delays the
-        // flake. The wait is bounded by DISCONNECTION instead — if the holder
+        // A BARRIER, not a clock. The ordering fact this fixture needs is
+        // narrow and worth stating exactly: the holder has entered the
+        // SYNCHRONOUS `with_transport_serial` path — past the lane acquire and
+        // past the test admission hook — because that is where it sends. It
+        // says nothing about the queued worker, which reaches
+        // `dispatch_transport` by a different route. No wall-clock budget can
+        // express even that much: too short flakes on a loaded machine, too
+        // long only delays the flake. The wait is bounded by DISCONNECTION instead — if the holder
         // thread dies or panics, its sender drops and `recv()` returns `Err`
         // immediately, so a genuine failure stays fast and named rather than
         // becoming a hang. Teardown below keeps its own explicit bounds.
