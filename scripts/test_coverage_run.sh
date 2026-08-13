@@ -2483,6 +2483,41 @@ test_pid_authority_seam_classifies_platforms() {
     fi
 }
 
+# FIFTH instance of the same principle: the authority must actually ANSWER. A
+# `ps` that exits 127 because it is missing proves nothing about the process,
+# yet a bare non-zero status was being read as proven absence.
+test_failed_authority_query_is_not_absence() {
+    local sandbox shim out bad=""
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # shim SOURCE, must not expand here
+    printf '#!/usr/bin/env bash\nprintf "Darwin\\n"\n' >"$shim/uname"
+    # A `ps` that cannot run at all. 127 is "command not found", not "absent".
+    printf '#!/usr/bin/env bash\nexit 127\n' >"$shim/ps"
+    chmod +x "$shim/uname" "$shim/ps"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4294967295-798_0.profraw"
+printf 'warning: %s/agend-terminal-4294967295-798_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=no' && bad="$bad absence-from-failed-query"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "a failed authority query is not absence" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
+    else
+        report 0 "a failed authority query is not absence"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -2532,6 +2567,7 @@ test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent
 test_leading_zero_live_pid_is_not_resolved_by_exe
 test_absence_requires_platform_authority
 test_pid_authority_seam_classifies_platforms
+test_failed_authority_query_is_not_absence
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper

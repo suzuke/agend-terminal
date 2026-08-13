@@ -495,12 +495,31 @@ pid_liveness() {
         printf 'yes'
         return
     fi
+    # The authority must actually ANSWER. A failed query proves nothing: `ps`
+    # exiting 127 because it is missing is not evidence that the process is
+    # gone, and neither is a /proc that is not mounted.
+    local rc
     case "$(pid_authority)" in
         proc)
-            if [ -d "/proc/$1" ]; then printf 'yes'; else printf 'no'; fi
+            if [ -d "/proc/$1" ]; then
+                printf 'yes'
+            elif [ -d /proc/self ]; then
+                # /proc is genuinely functioning, so absence here is real.
+                printf 'no'
+            else
+                printf 'unknown'
+            fi
             ;;
         ps)
-            if ps -p "$1" -o pid= >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
+            ps -p "$1" -o pid= >/dev/null 2>&1
+            rc=$?
+            case "$rc" in
+                0) printf 'yes' ;;
+                # POSIX `ps` exits 1 for "no matching process" — the only
+                # non-zero status that actually proves absence.
+                1) printf 'no' ;;
+                *) printf 'unknown' ;;
+            esac
             ;;
         *) printf 'unknown' ;;
     esac
