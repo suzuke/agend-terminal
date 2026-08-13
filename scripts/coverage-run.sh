@@ -618,7 +618,12 @@ NAMED_CORRUPT_BASES=""
 emit_inventory() {
     local label="$1" files=0 live=0 f pid
     for f in "$profile_dir"/*.profraw; do
-        [ -e "$f" ] || continue
+        # `-e` FOLLOWS the link, so a DANGLING symlink is false and used to
+        # vanish from this count. A count is the one field a reader trusts
+        # without checking, and an entry the producer created is present
+        # whether or not its target is. Widened, never followed: the entry is
+        # counted, nothing is opened.
+        [ -e "$f" ] || [ -L "$f" ] || continue
         files=$((files + 1))
     done
     for pid in $NAMED_WRITER_PIDS; do
@@ -701,9 +706,12 @@ module_token() {
 response_contains_path() {
     local want="$1" list entry examined=0 unexamined=0
     for list in "$profile_dir"/*-profraw-list; do
-        # An unmatched glob leaves the pattern itself; `-e` also drops a list
-        # that vanished between the glob and this test.
-        [ -e "$list" ] || continue
+        # An unmatched glob leaves the pattern itself, and neither test matches
+        # it. `-e` alone also dropped a DANGLING symlink — it follows the link,
+        # so a broken one was skipped before the refusal below could class it
+        # as unexamined. Widened so the entry reaches that refusal; the link is
+        # still never followed.
+        [ -e "$list" ] || [ -L "$list" ] || continue
         # A SYMLINKED LIST IS REFUSED OUTRIGHT, in scope or not. The name is
         # producer-controlled by glob, and cargo-llvm-cov writes this file with
         # `fs::write` — a legitimate producer never presents a link here, so
@@ -937,7 +945,11 @@ EOF
     # fabricated fact, which is the rule the named route already follows.
     local list line count
     for list in "$profile_dir"/*-profraw-list; do
-        [ -e "$list" ] || continue
+        # Widened for the same reason as membership: a dangling list symlink is
+        # a present entry, and dropping it left the block silent about a file
+        # the producer created. It falls into the `lines=n/a` branch below,
+        # disclosed by name and never opened.
+        [ -e "$list" ] || [ -L "$list" ] || continue
         # The response file's NAME is producer-controlled by glob, so it can be
         # a FIFO too — and the count, the listing and the membership read all
         # open it. Disclosed, never read, never dropped.
@@ -971,7 +983,11 @@ EOF
     done
     local shown=0 f fbase fsize fheader
     for f in "$profile_dir"/*.profraw; do
-        [ -e "$f" ] || continue
+        # Widened, NOT turned into a refusal: an IN-SCOPE symlinked profile is
+        # legitimate here and is still read through. A dangling one simply
+        # reaches the containment-and-snapshot path below and fails there, so
+        # it is disclosed by name with n/a facts instead of disappearing.
+        [ -e "$f" ] || [ -L "$f" ] || continue
         if [ "$shown" -ge "$diag_max_files" ]; then
             echo "  … more profraw files not shown (cap=$diag_max_files)"
             break

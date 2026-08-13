@@ -1869,6 +1869,125 @@ test_in_scope_symlinks_are_still_read() {
 # second path, which is the validate-one/open-another shape this script has
 # already been bitten by. So even an IN-SCOPE symlinked list is refused — and a
 # refused list is unexamined, which under the tri-state is `unknown`, never `no`.
+# ── A DANGLING link is a present directory entry ─────────────────────────────
+# Every enumeration guard here was `[ -e "$x" ] || continue`, and `-e` FOLLOWS
+# the link — so a broken symlink is false and the entry vanished from the block
+# BEFORE any refusal or containment policy could describe it. Nothing escapes,
+# but producer-controlled evidence is silently dropped, and "disclosed, never
+# read, never dropped" is the contract this block is FOR. The guards are widened
+# to `[ -e "$x" ] || [ -L "$x" ] || continue` so the entry reaches the policy
+# that already exists at each site; none of them follows the link.
+#
+# The ENUMERATION guard is now uniform. The POLICIES behind it deliberately are
+# not, and these contracts are named for the intent so nobody "tidies" them into
+# one rule later:
+#   * the response LIST is never followed — refused by shape, disclosed by name;
+#   * the SURVEY names every entry, including ones it will not open;
+#   * the EXEMPLAR offers only a healthy peer, so a candidate it cannot read is
+#     skipped rather than named — an offer that discloses nothing drops nothing.
+# Note also what is NOT pinned: a dangling link's `exists=` on the named route
+# depends on where the target would have been (outside vs missing in-scope), so
+# these contracts pin the basename, the n/a facts and the absence of a read —
+# never one universal value for a field that legitimately differs.
+
+test_dangling_response_list_is_disclosed_not_dropped() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/dangle-1-2_0.profraw"
+    ln -s "$sandbox/never-created-list.txt" \
+        "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
+        rm -rf "$sandbox"
+        report_skip "a dangling response list is disclosed by name and never followed" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/dangle-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    # The disclosure line is the part that was missing; membership already lands
+    # on `unknown` here, by the empty-glob rule rather than by refusal. Both are
+    # required after the fix, so both are pinned.
+    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-entry-dropped"
+    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "a dangling response list is disclosed by name and never followed" \
+            "issues:$bad; got: $(echo "$out" | grep -E '^response_file=' | head -1)"
+    else
+        report 0 "a dangling response list is disclosed by name and never followed"
+    fi
+}
+
+# BOTH dangling shapes, because they are not the same fact: one would have
+# pointed OUTSIDE the profile directory, the other at a MISSING IN-SCOPE target.
+# The survey's promise is identical for both — name it, open nothing, invent no
+# facts — and pinning both is what proves the property is not an accident of one.
+test_dangling_profraw_is_surveyed_not_dropped() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/real-6-6_0.profraw"
+    ln -s "$sandbox/never-created.bin" "$sandbox/profiles/gone-7-7_0.profraw" 2>/dev/null
+    ln -s "$sandbox/profiles/also-never-created.bin" \
+        "$sandbox/profiles/inly-8-7_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/gone-7-7_0.profraw" ] ||
+        [ ! -L "$sandbox/profiles/inly-8-7_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the survey names a dangling profile it will not open" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/real-6-6_0.profraw")"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE '^[[:space:]]*file=gone-7-7_0\.profraw size_bytes=n/a header=n/a' ||
+        bad="$bad outside-target-entry-dropped"
+    echo "$out" | grep -qE '^[[:space:]]*file=inly-8-7_0\.profraw size_bytes=n/a header=n/a' ||
+        bad="$bad in-scope-target-entry-dropped"
+    if [ -n "$bad" ]; then
+        report 1 "the survey names a dangling profile it will not open" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'file=' | head -4 | tr '\n' ' ')"
+    else
+        report 0 "the survey names a dangling profile it will not open"
+    fi
+}
+
+# The inventory is a COUNT, so a dropped entry is not a missing line — it is a
+# wrong number, and a number is exactly what an RCA reader trusts without
+# checking. `profraw_files` undercounted every dangling entry.
+test_dangling_profraw_is_counted_in_the_inventory() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/counted-8-8_0.profraw"
+    ln -s "$sandbox/never-created.bin" "$sandbox/profiles/missing-9-9_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/missing-9-9_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the inventory counts an entry it never opens" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    # The inventories exist ONLY on the retry path — a single-attempt run never
+    # reaches them — so this contract needs two attempts, and a zero grace so a
+    # test about a count does not also wait out the late-writer window.
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $sandbox/profiles/counted-8-8_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 \
+        COVERAGE_DIAG_GRACE_SECS=0 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE 'inventory=[^ ]+ profraw_files=2' || bad="$bad undercounted"
+    if [ -n "$bad" ]; then
+        report 1 "the inventory counts an entry it never opens" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'inventory=' | head -1)"
+    else
+        report 0 "the inventory counts an entry it never opens"
+    fi
+}
+
 test_in_scope_symlinked_response_list_is_refused_not_read() {
     local sandbox out line bad=""
     sandbox="$(new_sandbox)"
@@ -2910,6 +3029,9 @@ test_symlinked_survey_profile_discloses_no_outside_bytes
 test_symlinked_exemplar_discloses_no_outside_bytes
 test_in_scope_symlinks_are_still_read
 test_in_scope_symlinked_response_list_is_refused_not_read
+test_dangling_response_list_is_disclosed_not_dropped
+test_dangling_profraw_is_surveyed_not_dropped
+test_dangling_profraw_is_counted_in_the_inventory
 test_absolute_missing_profile_dir_keeps_its_boundary
 test_relative_missing_profile_dir_under_symlinked_cwd
 test_in_scope_symlink_opens_the_validated_target
