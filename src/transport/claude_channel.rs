@@ -2304,20 +2304,20 @@ mod tests {
         .expect_err("a dead channel helper cannot accept a delivery");
         stop_instance_state(&home, "claude-agent");
         let _ = fs::remove_dir_all(home);
-        // The exact errno differs by platform and client (`Broken pipe`,
-        // `Connection refused`, a closed connection), so the assertion pins the
-        // CLASS and prints what was actually observed — a fixture about a flaky
-        // failure must not itself be platform-flaky.
+        // Assert the PRODUCT'S failure path, never the platform's vocabulary for
+        // it. The errno is the part that differs — `Broken pipe (os error 32)`,
+        // `Connection refused (os error 61)`, and on Windows `No connection could
+        // be made because the target machine actively refused it. (os error
+        // 10061)`. An allowlist of the strings one happens to have seen is a
+        // platform-shaped assertion wearing a portability comment: this fixture
+        // exists because of a flaky failure and must not become one. What is
+        // stable is the product's own message, which every platform reaches by
+        // the same route when the bridge cannot be contacted. The full error is
+        // kept in the failure message so a real divergence stays diagnosable.
         let rendered = format!("{error:#}").to_ascii_lowercase();
         assert!(
-            rendered.contains("broken pipe")
-                || rendered.contains("connection refused")
-                || rendered.contains("connection reset")
-                || rendered.contains("connection closed")
-                || rendered.contains("os error 32")
-                || rendered.contains("os error 61")
-                || rendered.contains("channel bridge"),
-            "dead helper must surface a transport failure, got: {error:#}"
+            rendered.contains("did not become ready") || rendered.contains("channelbridge"),
+            "dead helper must fail the readiness/transport path, got: {error:#}"
         );
         assert!(
             !legacy_called.load(Ordering::Acquire),
