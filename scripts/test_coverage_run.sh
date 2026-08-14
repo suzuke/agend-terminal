@@ -469,7 +469,7 @@ test_sink_failure_preserves_producer_failure_without_classification() {
     elif echo "$out" | grep -qiE 'unclassified|grep:'; then
         report 1 "tee sink failure skips log classification" \
             "log-dependent diagnostic leaked: $out"
-    elif echo "$out" | grep -qiE 'retry|corruption'; then
+    elif echo "$out" | grep -qiE 'coverage attempt .*retrying|llvm-cov profile corruption'; then
         report 1 "tee sink failure skips retry classification" \
             "sink failure entered retry/classification path: $out"
     else
