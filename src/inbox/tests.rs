@@ -45,12 +45,11 @@ fn tmp_home(suffix: &str) -> PathBuf {
 /// so the test then fails somewhere unrelated — or passes for the wrong reason.
 #[test]
 fn tmp_home_fails_closed_when_the_directory_cannot_be_created() {
-    let blocker = std::env::temp_dir().join(format!(
-        "agend-inbox-{}-{}",
-        "failclosed-3245",
-        std::process::id()
-    ));
-    fs::remove_dir_all(&blocker).ok();
+    // Derive the path THROUGH the helper instead of re-spelling its shape: a
+    // second `agend-inbox-` literal here is itself a prefix-overlap offender,
+    // and baselining it would defeat the ratchet this PR introduces.
+    let blocker = tmp_home("failclosed-3245");
+    fs::remove_dir_all(&blocker).unwrap();
     fs::write(&blocker, b"not a directory").unwrap();
 
     let attempt = std::panic::catch_unwind(|| tmp_home("failclosed-3245"));

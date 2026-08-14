@@ -209,7 +209,6 @@ const KNOWN_PREFIX_OVERLAPS: &[(&str, &str)] = &[
     ("src/fleet/tests.rs::test_channel_config_telegram_parsing", "src/fleet/tests.rs::test_channels_plural_multi_entry_picks_first_by_name"),
     ("src/fleet/tests.rs::test_channel_config_telegram_parsing", "src/fleet/tests.rs::test_channels_plural_single_entry_collapses_to_singular"),
     ("src/inbox/tests.rs::tmp_home", "src/daemon/per_tick/inbox_maintenance.rs::run_is_no_op_on_empty_fixtures"),
-    ("src/inbox/tests.rs::tmp_home_fails_closed_when_the_directory_cannot_be_created", "src/daemon/per_tick/inbox_maintenance.rs::run_is_no_op_on_empty_fixtures"),
     ("src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_settles_feature_row_after_track_resolved_3179", "src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_resolved_feature_episode_mismatch_leaves_row_untouched_3179"),
     ("src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_settles_feature_row_after_track_resolved_3179", "src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_resolved_feature_lock_failure_is_reported_3179"),
     ("src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_settles_feature_row_after_track_resolved_3179", "src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_resolved_protected_row_is_not_feature_fallback_3179"),
