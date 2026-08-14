@@ -76,20 +76,48 @@ impl PerTickHandler for InboxStuckHandler {
         }
         let now = chrono::Utc::now();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): snapshot live agent
-        // names (registry locked then dropped — BEFORE locking the latch, so no
-        // nesting) so the `last_alerted` dedup latch can drop deleted agents
-        // below; else a same-name redeploy inherits a stale re-alert timer.
-        let live: std::collections::HashSet<String> = {
+        // names and the live usage/quota predicate (registry L0 → core L1,
+        // then both locks dropped BEFORE scanner file IO). A same-name
+        // redeploy must not inherit a stale re-alert timer or blocked episode.
+        let (live, usage_blocked): (
+            std::collections::HashSet<String>,
+            HashMap<String, Option<String>>,
+        ) = {
             let reg = crate::agent::lock_registry(ctx.registry);
-            reg.values().map(|h| h.name.as_str().to_string()).collect()
+            let mut live = std::collections::HashSet::new();
+            let mut usage_blocked = HashMap::new();
+            for handle in reg.values() {
+                let name = handle.name.as_str().to_string();
+                live.insert(name.clone());
+                let core = handle.core.lock();
+                let state = crate::daemon::shadow::operated_state(
+                    core.state.current,
+                    core.observed_status.as_ref(),
+                );
+                let quota = matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::QuotaExceeded)
+                );
+                if crate::daemon::per_tick::reclaim::is_usage_blocked(state, quota) {
+                    let tail = core.vterm.tail_lines(10);
+                    usage_blocked.insert(name, crate::daemon::supervisor::parse_unlock_at(&tail));
+                }
+            }
+            (live, usage_blocked)
         };
         let mut last = self.last_alerted.lock();
-        crate::daemon::inbox_stuck_watchdog::scan_and_emit(ctx.home, &now, &mut last);
+        crate::daemon::inbox_stuck_watchdog::scan_and_emit_with_blocked(
+            ctx.home,
+            &now,
+            &mut last,
+            &usage_blocked,
+        );
         last.retain(|name, _| live.contains(name));
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};

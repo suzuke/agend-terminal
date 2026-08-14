@@ -158,16 +158,22 @@ pub(crate) fn record_usage_limit_notified(
     name: &str,
     unlock_at: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
-) {
+) -> bool {
     let record = UsageNotifyRecord {
         unlock_at: unlock_at.map(String::from),
         notified_at: now.to_rfc3339(),
     };
-    let _ = crate::store::with_json_state_or_create(
+    match crate::store::with_json_state_or_create(
         &usage_limit_notify_path(home),
         std::collections::HashMap::<String, UsageNotifyRecord>::new,
         |map| {
             map.insert(name.to_string(), record);
         },
-    );
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, agent = %name, "usage_limit notify ledger write failed");
+            false
+        }
+    }
 }

@@ -48,7 +48,7 @@ const RECLAIM_CAP: u32 = 3;
 /// NEVER be reclaimed even if a stale `QuotaExceeded` reason lingers. (`IdleLong`
 /// in the issue is a *health* state, not an `AgentState`; a merely-idle agent is
 /// excluded anyway because it fails the usage-limit gate below.)
-fn is_excluded_state(state: AgentState) -> bool {
+pub(crate) fn is_excluded_state(state: AgentState) -> bool {
     matches!(
         state,
         AgentState::RateLimit
@@ -64,6 +64,13 @@ fn is_excluded_state(state: AgentState) -> bool {
     )
 }
 
+/// Shared live usage/quota authority for reclaim and inbox-stuck suppression.
+/// Keep the excluded-state guard adjacent to the UsageLimit/QuotaExceeded OR so
+/// a stale quota latch cannot swallow transient/error alerts.
+pub(crate) fn is_usage_blocked(state: AgentState, quota_exceeded: bool) -> bool {
+    !is_excluded_state(state) && (state == AgentState::UsageLimit || quota_exceeded)
+}
+
 /// The pure reclaim predicate (testable in isolation). See module docs for the
 /// rationale of each clause.
 pub(crate) fn should_reclaim(
@@ -73,11 +80,7 @@ pub(crate) fn should_reclaim(
     remaining: Duration,
     grace: Duration,
 ) -> bool {
-    if is_excluded_state(state) {
-        return false;
-    }
-    let usage_blocked = state == AgentState::UsageLimit || quota_exceeded;
-    if !usage_blocked {
+    if !is_usage_blocked(state, quota_exceeded) {
         return false;
     }
     if recovered {
@@ -211,7 +214,9 @@ fn reroute_dispatches(home: &Path, agent: &str, blocked: &HashSet<String>) -> (u
                         crate::inbox::InboxMessage::new_system(
                             "system:reclaim_usage_limit",
                             "update",
-                            format!("{msg}(原 dispatcher {from} 自身 usage_limit,轉知團隊 orchestrator)"),
+                            format!(
+                                "{msg}(原 dispatcher {from} 自身 usage_limit,轉知團隊 orchestrator)"
+                            ),
                         ),
                     ) {
                         tracing::warn!(orchestrator = %o, error = %err, "#2127 P2 escalate enqueue failed");
@@ -428,7 +433,7 @@ impl PerTickHandler for ReclaimHandler {
                     Some(crate::health::BlockedReason::QuotaExceeded)
                 );
                 drop(core);
-                if (state == AgentState::UsageLimit || quota) && !is_excluded_state(state) {
+                if is_usage_blocked(state, quota) {
                     blocked.insert(name.clone());
                     eligible.push((name, state, quota));
                 }

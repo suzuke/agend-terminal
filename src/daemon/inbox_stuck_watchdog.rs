@@ -33,10 +33,24 @@ pub(crate) const FALLBACK_RECIPIENT: &str = "lead";
 /// pile of unread inbox messages. `last_alerted` is owned by the caller (the
 /// per-tick handler) so dedup state survives across ticks; `now` is injected
 /// for deterministic tests.
+#[cfg(test)]
 pub(crate) fn scan_and_emit(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+) {
+    scan_and_emit_with_blocked(home, now, last_alerted, &HashMap::new());
+}
+
+/// Scan with the per-tick live usage/quota snapshot. The snapshot is produced
+/// under registry/core locks by [`InboxStuckHandler`] and is intentionally
+/// consumed only after those locks are dropped, because this function reads
+/// fleet and inbox files.
+pub(crate) fn scan_and_emit_with_blocked(
+    home: &Path,
+    now: &chrono::DateTime<chrono::Utc>,
+    last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+    usage_blocked: &HashMap<String, Option<String>>,
 ) {
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return;
@@ -50,6 +64,23 @@ pub(crate) fn scan_and_emit(
         let age_min = now.signed_duration_since(oldest).num_minutes();
         if age_min < STUCK_AFTER_MINS {
             continue;
+        }
+        if let Some(unlock_at) = usage_blocked.get(agent) {
+            // A usage-limit notice is the acknowledgeable signal. If the
+            // supervisor already recorded one for this episode, or this path
+            // successfully delivers the readable fallback, the redundant
+            // inbox-stuck alert is suppressed. Failed fallback delivery leaves
+            // the ordinary alert path active rather than silently muting it.
+            if ensure_readable_usage_notice(
+                home,
+                &fleet,
+                agent,
+                unlock_at.as_deref(),
+                usage_blocked,
+                *now,
+            ) {
+                continue;
+            }
         }
         // Dedup: skip if we already alerted about this agent recently.
         if let Some(prev) = last_alerted.get(agent) {
@@ -111,6 +142,59 @@ pub(crate) fn scan_and_emit(
         );
         last_alerted.insert(agent.clone(), *now);
     }
+}
+
+/// Prove or establish a readable UsageLimit notice before repeat suppression.
+/// The existing usage-limit ledger is only a notice ledger: it never decides
+/// whether `agent` is currently blocked (that authority is the live snapshot).
+fn ensure_readable_usage_notice(
+    home: &Path,
+    fleet: &crate::fleet::FleetConfig,
+    agent: &str,
+    unlock_at: Option<&str>,
+    usage_blocked: &HashMap<String, Option<String>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if crate::daemon::supervisor::usage_limit_notify_suppressed(home, agent, unlock_at, now) {
+        return true;
+    }
+    let recipient = orchestrator_for(fleet, agent)
+        .filter(|orch| orch != agent)
+        .filter(|orch| fleet.instances.contains_key(orch))
+        .filter(|orch| !usage_blocked.contains_key(orch))
+        .or_else(|| {
+            (fleet.instances.contains_key("general")
+                && !usage_blocked.contains_key("general")
+                && agent != "general")
+                .then(|| "general".to_string())
+        })
+        .or_else(|| {
+            (fleet.instances.contains_key(FALLBACK_RECIPIENT)
+                && !usage_blocked.contains_key(FALLBACK_RECIPIENT)
+                && agent != FALLBACK_RECIPIENT)
+                .then(|| FALLBACK_RECIPIENT.to_string())
+        });
+    let Some(recipient) = recipient else {
+        return false;
+    };
+    let text = format!(
+        "[usage_limit_watchdog] agent '{agent}' is in a live UsageLimit/QuotaExceeded episode. \
+         The inbox-stuck repeat alert is suppressed while this episode remains live; \
+         wait for reset or switch backend."
+    );
+    if let Err(error) = crate::inbox::notify_system(
+        home,
+        &recipient,
+        "system:usage_limit_watchdog",
+        "usage_limit_watchdog",
+        text,
+        Some(agent),
+        None,
+    ) {
+        tracing::warn!(%agent, %recipient, %error, "usage_limit_watchdog: readable fallback failed");
+        return false;
+    }
+    crate::daemon::supervisor::record_usage_limit_notified(home, agent, unlock_at, now)
 }
 
 /// The orchestrator of the first team that lists `agent` as a member.

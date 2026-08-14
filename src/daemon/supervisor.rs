@@ -240,7 +240,7 @@ pub(crate) struct RateLimitRetry {
 }
 
 /// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
-fn parse_unlock_at(pane_text: &str) -> Option<String> {
+pub(crate) fn parse_unlock_at(pane_text: &str) -> Option<String> {
     // Common patterns: "resets at HH:MM", "try again after HH:MM", "limit resets HH:MM"
     for line in pane_text.lines().rev() {
         let lower = line.to_lowercase();
