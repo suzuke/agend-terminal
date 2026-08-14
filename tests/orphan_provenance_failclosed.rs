@@ -58,11 +58,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use syn::visit::{self, Visit};
 
 use agend_terminal::admin::orphan_provenance::{
-    classify, load_ledger, prune_observations, render_human, sample_from_owner_source,
-    sample_tool_call_shells, scope_reparented, BackendOwner, BackendOwnerSource, DisplayColumns,
-    ObservationMiss, OrphanReport, PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport,
-    SampleOutcome, ScopeCounts, ScopeInput, ShellObservation, ShellToolEvidence, ShellToolKind,
-    UnprovenReason, MAX_OBSERVATIONS, OBSERVATION_RETENTION_MS,
+    classify, ledger_stats, load_ledger, prune_observations, render_human,
+    sample_from_owner_source, sample_tool_call_shells, scope_reparented, BackendOwner,
+    BackendOwnerSource, DisplayColumns, ObservationMiss, OrphanReport, PersistOutcome, ProcFacts,
+    ProcessOracle, ProvenanceSupport, SampleOutcome, ScopeCounts, ScopeInput, ShellObservation,
+    ShellToolEvidence, ShellToolKind, UnprovenReason, MAX_OBSERVATIONS, OBSERVATION_RETENTION_MS,
 };
 use agend_terminal::instructions::background_process_guidance;
 
@@ -1714,15 +1714,13 @@ fn observations_are_capped_deterministically_keeping_the_most_recent() {
 }
 
 /// A baseline is only ever compared against the SAME backend generation, so a
-/// generation that is gone can never be used again. Without eviction the file
-/// grows by one entry — plus that generation's whole child list — per restart,
-/// forever, on the daemon tick.
+/// generation that is gone can never be used again. Asserted on the LEDGER
+/// ITSELF: an earlier version of this test only checked downstream behaviour,
+/// which stale and fresh baselines coexisting would also have satisfied.
 #[test]
-fn baselines_for_dead_backend_generations_are_evicted() {
+fn baselines_are_bounded_by_the_current_owner_identities() {
     let home = tmp_home("baselineprune");
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::session_leader(900, 9_000))
-        .with(920, FakeProc::inherited(9_200).child_of(900));
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
     baseline_tick(&home, &world, 0);
     world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
     sample_tool_call_shells(
@@ -1731,36 +1729,88 @@ fn baselines_for_dead_backend_generations_are_evicted() {
         &[owner("dev-1", 900, bash_tool(7, 0))],
         1_000,
     );
-    assert_eq!(load_ledger(&home).len(), 1);
-
-    // The backend restarts: same pid, new identity. The old generation's
-    // baseline is now unusable and must not survive.
-    world.insert(900, FakeProc::session_leader(900, 4_242));
-    let outcome = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 2_000);
-    assert!(matches!(
-        outcome.persisted,
-        agend_terminal::admin::orphan_provenance::PersistOutcome::Written
-    ));
-
-    // The observation survives (a later orphan may still relate to it), but the
-    // stale generation's baseline does not: the next active window has to
-    // report BaselineUnavailable rather than diff against a dead generation.
     assert_eq!(
-        load_ledger(&home).len(),
-        1,
-        "observations are not collateral"
+        ledger_stats(&home),
+        agend_terminal::admin::orphan_provenance::LedgerStats {
+            observations: 1,
+            baselines: 1,
+        }
     );
-    world.insert(930, FakeProc::group_leader(930, 9_300).child_of(900));
-    let after = sample_tool_call_shells(
+
+    // Twenty restarts of the same instance, each a NEW generation under the
+    // same pid. Without eviction this is twenty baselines, each carrying that
+    // generation's whole child list, forever.
+    for gen in 1..=20u64 {
+        world.insert(900, FakeProc::session_leader(900, 9_000 + gen));
+        sample_tool_call_shells(
+            &home,
+            &world,
+            &[owner("dev-1", 900, None)],
+            2_000 + gen as i64,
+        );
+        let stats = ledger_stats(&home);
+        assert_eq!(
+            stats.baselines, 1,
+            "generation {gen}: exactly the current owner identity may persist, got {stats:?}"
+        );
+    }
+
+    // The stale generations are gone, but the observation they produced is not:
+    // a later orphan may still relate to it.
+    assert_eq!(ledger_stats(&home).observations, 1);
+}
+
+/// A backend process that outlives its instance must not pin a baseline. The
+/// process is still alive, so a liveness-only retain would keep it forever.
+#[test]
+fn a_baseline_is_dropped_when_its_instance_is_no_longer_owned() {
+    let home = tmp_home("ownerscope");
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(901, FakeProc::session_leader(901, 9_010));
+    sample_tool_call_shells(
         &home,
         &world,
-        &[owner("dev-1", 900, bash_tool(9, 2_500))],
-        3_000,
+        &[owner("dev-1", 900, None), owner("dev-2", 901, None)],
+        0,
+    );
+    assert_eq!(ledger_stats(&home).baselines, 2);
+
+    // dev-2 is removed from the fleet. Its backend process 901 is STILL ALIVE.
+    sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 1_000);
+
+    assert!(
+        world.is_alive(901),
+        "precondition: the process outlives the instance"
     );
     assert_eq!(
-        after.observed.len(),
+        ledger_stats(&home).baselines,
         1,
-        "the NEW generation baselines normally"
+        "retention is by current OWNER identity, not by 'some process still has that pid'"
+    );
+}
+
+/// Replacing the ledger repeatedly must keep working and leave no temp files —
+/// the rename-over-existing path is exercised on every sample.
+#[test]
+fn repeated_ledger_replacement_leaves_one_readable_file() {
+    let home = tmp_home("replace");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    for tick in 0..25i64 {
+        sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], tick * 100);
+    }
+
+    assert_eq!(ledger_stats(&home).baselines, 1);
+    let dir = ledger_path(&home).parent().unwrap().to_path_buf();
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no temp file may survive a successful replacement: {leftovers:?}"
     );
 }
 
@@ -1812,11 +1862,11 @@ fn an_unknown_backend_identity_is_refused_and_cannot_reuse_a_stale_baseline() {
 /// A torn write would be read back as an EMPTY ledger by `unwrap_or_default`,
 /// silently discarding every observation. The write must therefore be atomic:
 /// when it fails, the last valid ledger must still be there.
-#[cfg(unix)]
+///
+/// Driven by an explicit failure seam rather than by chmod: ambient permissions
+/// can lie under elevated or ACL-governed environments, and are Unix-shaped.
 #[test]
 fn a_failed_ledger_write_preserves_the_last_valid_ledger() {
-    use std::os::unix::fs::PermissionsExt;
-
     let home = tmp_home("atomicfail");
     let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
     baseline_tick(&home, &world, 0);
@@ -1830,20 +1880,20 @@ fn a_failed_ledger_write_preserves_the_last_valid_ledger() {
     let before = load_ledger(&home);
     assert_eq!(before.len(), 1);
 
-    // Make the ledger's directory read-only so the next write cannot land.
-    let dir = ledger_path(&home).parent().unwrap().to_path_buf();
-    let original = std::fs::metadata(&dir).unwrap().permissions();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    world.insert(930, FakeProc::group_leader(930, 9_300).child_of(900));
-    let outcome = sample_tool_call_shells(
-        &home,
-        &world,
-        &[owner("dev-1", 900, bash_tool(8, 1_500))],
-        2_000,
-    );
-
-    std::fs::set_permissions(&dir, original).unwrap();
+    let outcome = {
+        // Path-scoped so this cannot break the other tests sharing the
+        // process: only THIS fixture's ledger write is made to fail.
+        std::env::set_var("AGEND_ORPHAN_LEDGER_FAIL_WRITE", ledger_path(&home));
+        world.insert(930, FakeProc::group_leader(930, 9_300).child_of(900));
+        let outcome = sample_tool_call_shells(
+            &home,
+            &world,
+            &[owner("dev-1", 900, bash_tool(8, 1_500))],
+            2_000,
+        );
+        std::env::remove_var("AGEND_ORPHAN_LEDGER_FAIL_WRITE");
+        outcome
+    };
 
     assert!(
         matches!(
@@ -1852,7 +1902,10 @@ fn a_failed_ledger_write_preserves_the_last_valid_ledger() {
         ),
         "a write that could not land must say so"
     );
-    assert!(outcome.observed.is_empty());
+    assert!(
+        outcome.observed.is_empty(),
+        "nothing durable landed, so nothing may be reported as observed"
+    );
     let after = load_ledger(&home);
     assert_eq!(
         after.len(),
@@ -1881,5 +1934,77 @@ fn an_unsupported_platform_report_still_carries_the_unproven_framing() {
     assert!(
         rendered.contains("not available on this platform (not a global clean result)"),
         "and must not read it as an all-clear: {rendered}"
+    );
+}
+
+/// Retention is a storage bound, not a statement about the orphan. When an
+/// observation ages out, the process must still be listed — UNPROVEN, with no
+/// suggested owner — never dropped and never read as resolved. The RCA census
+/// found 44-day processes, so this degradation is the normal case for anything
+/// long-lived, not an edge case.
+#[test]
+fn an_expired_observation_degrades_to_no_suggestion_and_never_hides_the_process() {
+    let home = tmp_home("expiry");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    world.reap(910);
+    world.insert(911, FakeProc::inherited(9_110).group(Some(910)).orphan());
+
+    // While the observation is inside the horizon it supplies a suggestion.
+    let fresh = classify(&home, &world, 2_000);
+    assert_eq!(
+        candidate(&fresh, 911).suggested_instance.as_deref(),
+        Some("dev-1")
+    );
+
+    // Age the ledger past the horizon by sampling far in the future, which is
+    // what prunes it. The orphan itself is untouched and still running.
+    let later = 1_000 + OBSERVATION_RETENTION_MS + 1;
+    sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], later);
+    assert!(
+        load_ledger(&home).is_empty(),
+        "precondition: the observation has aged out"
+    );
+
+    let aged = classify(&home, &world, later);
+
+    let c = candidate(&aged, 911);
+    assert!(
+        c.suggested_instance.is_none(),
+        "an expired suggestion must simply be absent"
+    );
+    assert_eq!(
+        c.unproven_reason,
+        UnprovenReason::NoObservation,
+        "and the process must still be listed, not dropped or resolved"
+    );
+    assert!(
+        render_human(&aged).contains("911"),
+        "the report must still show the process after its observation expired"
+    );
+}
+
+/// The report must disclose that expiry, or an operator reading
+/// `suggested=unknown` cannot tell "never observed" from "observed too long ago".
+#[test]
+fn the_report_discloses_that_owner_suggestions_expire() {
+    let home = tmp_home("expiry-disclosed");
+    let world = FakeOracle::supported().with(911, FakeProc::inherited(9_110).orphan());
+    let rendered = render_human(&classify(&home, &world, 40 * HOUR_MS));
+
+    assert!(
+        rendered.contains("Owner suggestions are kept for a bounded window"),
+        "the expiry must be stated where the result is stated: {rendered}"
+    );
+    assert!(
+        rendered.contains("says nothing about the process"),
+        "and must not be read as a finding: {rendered}"
     );
 }
