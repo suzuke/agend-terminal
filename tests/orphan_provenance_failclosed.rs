@@ -59,9 +59,9 @@ use syn::visit::{self, Visit};
 
 use agend_terminal::admin::orphan_provenance::{
     classify, load_ledger, render_human, sample_from_owner_source, sample_tool_call_shells,
-    BackendOwner, BackendOwnerSource, DisplayColumns, ObservationMiss, OrphanReport,
-    PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport, SampleOutcome, ShellToolEvidence,
-    ShellToolKind, UnprovenReason,
+    scope_reparented, BackendOwner, BackendOwnerSource, DisplayColumns, ObservationMiss,
+    OrphanReport, PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport, SampleOutcome,
+    ScopeCounts, ScopeInput, ShellToolEvidence, ShellToolKind, UnprovenReason,
 };
 use agend_terminal::instructions::background_process_guidance;
 
@@ -1349,4 +1349,215 @@ fn the_doctor_subcommand_dispatches_to_run_doctor() {
         "#3273 §3.9: the `Doctor` subcommand arm must call `run_doctor`, or the doctor entry pin \
          proves nothing about what a user actually runs"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 11. The scope filter is a pinned pure function, and the report admits its scope
+// ---------------------------------------------------------------------------
+
+/// `PPID == 1` is not "orphaned" on macOS: launchd is the DESIGNED parent of
+/// hundreds of per-user agents and XPC services that were never anybody's
+/// child. The kernel separates them without any text heuristic — a process that
+/// created its own session has `sid == pid`, one adopted at boot sits in
+/// session 1 — and only a process holding a session it did NOT create is
+/// evidence that whatever made that session is gone.
+///
+/// This is production's real filter, so it is pinned as a pure function with
+/// every exclusion counted. Counting matters as much as filtering: an excluded
+/// process that is never counted is indistinguishable from one that does not
+/// exist, and this report's whole purpose is to be honest about what it cannot
+/// see.
+#[test]
+fn the_scope_filter_includes_only_processes_holding_a_session_they_did_not_create() {
+    let rows = vec![
+        // Included: reparented, ours, and holding a session it did not create.
+        ScopeInput {
+            pid: 911,
+            ppid: 1,
+            uid: OUR_UID,
+            sid: Some(910),
+        },
+        // Adopted by init at boot — not left behind by anything.
+        ScopeInput {
+            pid: 571,
+            ppid: 1,
+            uid: OUR_UID,
+            sid: Some(1),
+        },
+        // Created its own session: nothing lost it.
+        ScopeInput {
+            pid: 396,
+            ppid: 1,
+            uid: OUR_UID,
+            sid: Some(396),
+        },
+        // Another user's process: outside our capability entirely.
+        ScopeInput {
+            pid: 42,
+            ppid: 1,
+            uid: 0,
+            sid: Some(41),
+        },
+        // Still has a living parent, so it is not reparented at all.
+        ScopeInput {
+            pid: 1234,
+            ppid: 900,
+            uid: OUR_UID,
+            sid: Some(910),
+        },
+        // getsid failed: we cannot tell, so we must not guess either way.
+        ScopeInput {
+            pid: 777,
+            ppid: 1,
+            uid: OUR_UID,
+            sid: None,
+        },
+    ];
+
+    let (included, counts) = scope_reparented(&rows, Some(OUR_UID));
+
+    assert_eq!(
+        included,
+        vec![911],
+        "only the inherited-session orphan belongs in the report"
+    );
+    assert_eq!(counts.scanned, 6);
+    assert_eq!(counts.included, 1);
+    assert_eq!(counts.excluded_init_session, 1, "sid == 1 must be counted");
+    assert_eq!(
+        counts.excluded_session_leader, 1,
+        "sid == pid must be counted"
+    );
+    assert_eq!(counts.excluded_foreign_uid, 1);
+    assert_eq!(counts.excluded_not_reparented, 1);
+    assert_eq!(
+        counts.excluded_session_unknown, 1,
+        "a process whose session could not be read must be counted, not silently dropped"
+    );
+}
+
+/// The filter under test must be the filter that ships. Without this, the pure
+/// function above could be a well-tested function nothing calls.
+#[test]
+fn the_platform_oracle_uses_the_pinned_scope_filter() {
+    #[derive(Default)]
+    struct ScopeCallFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for ScopeCallFinder {
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if p.segments.iter().any(|s| s.ident == "scope_reparented") {
+                self.found = true;
+            }
+            visit::visit_path(self, p);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if m.tokens.to_string().contains("scope_reparented") {
+                self.found = true;
+            }
+            visit::visit_macro(self, m);
+        }
+    }
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/daemon/per_tick/tool_call_provenance.rs");
+    let src = std::fs::read_to_string(&path).expect("read tool_call_provenance.rs");
+    let file = syn::parse_file(&src).expect("parse tool_call_provenance.rs");
+    let oracle_impl = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Impl(i) => {
+                let is_oracle = i.trait_.as_ref().is_some_and(|(path, _)| {
+                    path.segments
+                        .last()
+                        .is_some_and(|s| s.ident == "ProcessOracle")
+                });
+                is_oracle.then_some(i)
+            }
+            _ => None,
+        })
+        .expect("`impl ProcessOracle for PlatformOracle` must exist");
+    let reparented = oracle_impl
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::ImplItem::Fn(f) if f.sig.ident == "reparented" => Some(f),
+            _ => None,
+        })
+        .expect("the oracle must implement `reparented`");
+
+    let mut finder = ScopeCallFinder::default();
+    finder.visit_impl_item_fn(reparented);
+    assert!(
+        finder.found,
+        "#3273: `PlatformOracle::reparented` must delegate to `scope_reparented` — the scoping \
+         rule that ships has to be the one the tests pin, not a second copy of it"
+    );
+}
+
+/// An empty list is the most dangerous output this command can produce: read
+/// carelessly it says "your machine is clean". It is not — it says nothing was
+/// found INSIDE a deliberately narrow scope, with known blind spots.
+#[test]
+fn an_empty_report_says_it_is_a_scoped_snapshot_not_a_clean_bill() {
+    let home = tmp_home("emptyscope");
+    let world = FakeOracle::supported();
+    let mut report = classify(&home, &world, 40 * HOUR_MS);
+    report.scope = ScopeCounts {
+        scanned: 861,
+        included: 0,
+        excluded_not_reparented: 302,
+        excluded_foreign_uid: 302,
+        excluded_session_leader: 215,
+        excluded_init_session: 297,
+        excluded_session_unknown: 4,
+    };
+
+    let rendered = render_human(&report);
+
+    assert!(
+        rendered.contains("none found in this scoped snapshot (not a global clean result)"),
+        "an empty list must not read as a clean bill of health: {rendered}"
+    );
+    assert!(
+        rendered.contains("setsid"),
+        "the blind spot must be stated wherever the result is stated: {rendered}"
+    );
+    for count in ["297", "215", "4"] {
+        assert!(
+            rendered.contains(count),
+            "excluded counts for session-1, session-leader and unreadable-session must be \
+             printed ({count} missing): {rendered}"
+        );
+    }
+}
+
+/// The same scope accounting has to appear when candidates DO exist, or an
+/// operator reading a short list cannot tell whether it is short because the
+/// machine is quiet or because the scope threw most of it away.
+#[test]
+fn a_non_empty_report_still_prints_its_scope_accounting() {
+    let home = tmp_home("scopeaccounting");
+    let world = FakeOracle::supported().with(911, FakeProc::inherited(9_110).orphan());
+    let mut report = classify(&home, &world, 40 * HOUR_MS);
+    report.scope = ScopeCounts {
+        scanned: 861,
+        included: 1,
+        excluded_not_reparented: 302,
+        excluded_foreign_uid: 302,
+        excluded_session_leader: 215,
+        excluded_init_session: 297,
+        excluded_session_unknown: 4,
+    };
+
+    let rendered = render_human(&report);
+
+    assert!(rendered.contains("911"));
+    assert!(
+        rendered.contains("861"),
+        "scanned total must be printed: {rendered}"
+    );
+    assert!(rendered.contains("297") && rendered.contains("215") && rendered.contains("4"));
+    assert!(rendered.contains("setsid"));
 }
