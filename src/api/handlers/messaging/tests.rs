@@ -3586,6 +3586,39 @@ fn typed_unverified_is_evidence_block_exempt_but_still_assignment_bound_2760() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn typed_unverified_cannot_claim_terminal_completion_3207() {
+    let home = tmp_home("3207-unverified-terminal");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    let mut params = typed_review_params(assignment.assignment_id, "unverified", "UNVERIFIED");
+    params["terminal"] = json!(true);
+    params["text"] = json!(crate::mcp::handlers::build_report_text(
+        "UNVERIFIED — claimed but unproven",
+        Some("t-code-review-2760"),
+        None,
+    ));
+
+    let result = handle_send(&params, &test_ctx(&home));
+    assert_eq!(
+        result["ok"], false,
+        "provisional verdict cannot be terminal"
+    );
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("terminal=false")),
+        "failure must tell the reviewer how to submit a provisional verdict: {result}"
+    );
+    assert!(crate::inbox::drain(&home, "fixup-lead").is_empty());
+    let state = crate::daemon::pr_state::load(&home, "owner/repo", "fix/typed").unwrap();
+    assert!(state.validated_review_receipts.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Missing/foreign assignment, same-name identity ABA, legacy schema, and
 /// revoked generation all reject before delivery. These are distinct
 /// authorization failures but share the same production API entry and

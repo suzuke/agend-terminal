@@ -1251,6 +1251,128 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    fn seed_provisional_assignment(
+        home: &Path,
+        target: &str,
+        verdict: crate::review_receipt::ReviewVerdict,
+        green: bool,
+    ) -> store::ActiveAssignment {
+        seed_open_task(home, "t-rev-1");
+        let instance_id = crate::types::InstanceId::new();
+        let head = "a".repeat(40);
+        let rec = store::ActiveAssignment::new_pending_typed(
+            "o/r",
+            "feat/x",
+            target,
+            instance_id,
+            7,
+            &head,
+            crate::review_receipt::ReviewSlot::Primary,
+            "lead",
+            "t-rev-1",
+            ReviewClass::Dual,
+            ReviewAuthor::External("octocat".into()),
+            "Please review PR",
+            None,
+            None,
+            "2026-08-14T00:00:00Z",
+        );
+        store::persist(home, &rec).unwrap();
+        let mut state = pr_state::new_for_branch("o/r", "feat/x", &head, ReviewClass::Dual);
+        state.pr_number = 7;
+        state.merge_state = MergeState::NotReady;
+        if green {
+            state.ci_state = pr_state::CiState::Green {
+                sha: head.clone(),
+                observed_at: "2026-08-14T00:00:01Z".into(),
+            };
+        }
+        state.validated_review_receipts = vec![crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "r-3207".into(),
+            source_id: "s-3207".into(),
+            evidence_digest: "c".repeat(64),
+            assignment_id: rec.assignment_id,
+            reviewer_instance_id: instance_id,
+            reviewer_name: target.into(),
+            repo: "o/r".into(),
+            pr_number: 7,
+            branch: "feat/x".into(),
+            task_id: "t-rev-1".into(),
+            reviewed_head: head,
+            review_class: ReviewClass::Dual,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict,
+        }];
+        pr_state::save(home, &state).unwrap();
+        rec
+    }
+
+    fn continuation_rows(home: &Path, target: &str) -> Vec<crate::inbox::InboxMessage> {
+        crate::inbox::drain(home, target)
+            .into_iter()
+            .filter(|msg| msg.kind.as_deref() == Some("ci-ready-for-action"))
+            .collect()
+    }
+
+    #[test]
+    fn green_ci_after_provisional_unverified_delivers_once_3207() {
+        let home = tmp_home("3207-green-provisional");
+        let rec = seed_provisional_assignment(
+            &home,
+            "reviewer",
+            crate::review_receipt::ReviewVerdict::Unverified,
+            true,
+        );
+
+        reconcile_all_collect(&home, "2026-08-14T00:00:02Z");
+        let rows = continuation_rows(&home, "reviewer");
+        assert_eq!(
+            rows.len(),
+            1,
+            "green exact-head CI must continue provisional review"
+        );
+        assert_eq!(
+            rows[0].reviewed_head.as_deref(),
+            rec.reviewed_head.as_deref()
+        );
+        assert_eq!(
+            rows[0].review_assignment.as_ref().map(|a| a.assignment_id),
+            Some(rec.assignment_id)
+        );
+
+        reconcile_all_collect(&home, "2026-08-14T00:00:03Z");
+        assert!(
+            continuation_rows(&home, "reviewer").is_empty(),
+            "same reviewer/head continuation must be durably deduplicated"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn continuation_excludes_rejected_and_pending_ci_3207() {
+        for (tag, verdict, green) in [
+            (
+                "rejected",
+                crate::review_receipt::ReviewVerdict::Rejected,
+                true,
+            ),
+            (
+                "pending",
+                crate::review_receipt::ReviewVerdict::Unverified,
+                false,
+            ),
+        ] {
+            let home = tmp_home(&format!("3207-{tag}"));
+            seed_provisional_assignment(&home, "reviewer", verdict, green);
+            reconcile_all_collect(&home, "2026-08-14T00:00:02Z");
+            assert!(
+                continuation_rows(&home, "reviewer").is_empty(),
+                "{tag} must not receive a CI continuation"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
     /// C3: head comparison must be exact full-SHA byte-for-byte — no prefix matching,
     /// no normalization, no case folding. Two SHAs that share a prefix but differ in
     /// the last byte must trigger retirement.

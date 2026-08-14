@@ -1331,6 +1331,34 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn target_scoped_resolution_by_task_id_preserves_peer_reviewer_3207() {
+        let home = tmp_home("3207-target-taskid");
+        let task_id = "t-20260814000100000000-1";
+        for target in ["gapfix-dev", "reviewer-b"] {
+            record(
+                &home,
+                target,
+                "o/r@b",
+                "2026-08-14T00:00:00Z",
+                None,
+                Some(task_id),
+            );
+        }
+
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &serde_json::json!({}),
+            "gapfix-dev",
+            "lead",
+            &typed_review_report(task_id),
+        );
+        let left = list(&home);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].1.target, "reviewer-b");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Sibling of the above: a track with NO recorded `task_id` (the common
     /// case before this fix, or any dispatch path that never had one) must
     /// still resolve normally by its `repo@branch` correlation — the new OR
