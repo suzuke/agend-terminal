@@ -9,7 +9,16 @@ use std::path::PathBuf;
 use std::os::unix::fs::PermissionsExt;
 
 fn tmp_home(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("agend-capture-test-{tag}"));
+    // #3245: this helper wipes on entry, so uniqueness must come from here, not
+    // from callers picking distinct tags. The pid separates concurrent test
+    // processes; the counter separates calls within one process.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "agend-capture-test-{tag}-{}-{seq}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir); // clear any leftovers from previous run
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -27,7 +36,9 @@ fn tmp_home_is_unique_per_call() {
         "two tmp_home calls resolved to one directory; the second wiped the first"
     );
     assert!(
-        first.to_string_lossy().contains(&std::process::id().to_string()),
+        first
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()),
         "temp home must carry the pid so concurrent test processes cannot collide: {}",
         first.display()
     );

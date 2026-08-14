@@ -28,7 +28,15 @@ impl Drop for TestReadonlyGuard {
 fn tmp_home(suffix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agend-inbox-{}-{}", suffix, std::process::id()));
     fs::remove_dir_all(&dir).ok();
-    fs::create_dir_all(&dir).ok();
+    // #3245: fail closed. Ignoring this returned a path to a directory that did
+    // not exist, so the test failed later somewhere unrelated — or passed for
+    // the wrong reason.
+    fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!(
+            "inbox fixture home {} could not be created: {e}",
+            dir.display()
+        )
+    });
     dir
 }
 

@@ -162,8 +162,7 @@ fn temp_dir_helpers() -> Vec<Helper> {
             if shapes.is_empty() {
                 continue;
             }
-            let destructive =
-                body.contains("remove_dir_all") || body.contains("remove_dir(");
+            let destructive = body.contains("remove_dir_all") || body.contains("remove_dir(");
             helpers.push(Helper {
                 file: file.clone(),
                 name,
@@ -183,6 +182,68 @@ fn fixed_prefix(shape: &str) -> String {
         None => shape.to_string(),
     }
 }
+
+/// Pre-existing prefix-overlapping pairs, recorded 2026-08-14 as the baseline
+/// for the #3245 ratchet decision (dual-RCA consensus; lead decision "(a)
+/// ratchet", correlation t-20260814085625832974-5272-7).
+///
+/// THIS LIST IS NOT AN APPROVAL. Every entry is a real overlap that can still
+/// resolve two helpers to one directory; they are exempted only so the guard
+/// could be introduced without the 15-file rename the consensus excluded. The
+/// invariant this file enforces is therefore "no NEW offenders", and the list
+/// may only ever shrink — `known_overlaps_have_no_stale_entries` fails if an
+/// entry stops offending and is not removed.
+const KNOWN_PREFIX_OVERLAPS: &[(&str, &str)] = &[
+    ("src/api/handlers/mcp_proxy.rs::restart_daemon_real_entry_shutdown_flag_2454", "src/api/handlers/mcp_proxy.rs::restart_daemon_real_entry_without_shutdown_fails_closed_2454"),
+    ("src/daemon/delivery_worker.rs::cleanup_rejects_enqueue_during_final_release_tail", "src/daemon/delivery_worker.rs::cleanup_tail_is_keyed_and_unrelated_enqueue_completes"),
+    ("src/daemon/delivery_worker.rs::stale_transport_delivery_cannot_recreate_receipts_after_cleanup", "src/daemon/delivery_worker.rs::delivery_enqueued_during_teardown_cannot_resurrect_receipts"),
+    ("src/daemon/per_tick/reconcile_backups_gc.rs::backups_root", "src/daemon/per_tick/reconcile_backups_gc.rs::gc_missing_root_is_noop"),
+    ("src/daemon/router.rs::mirror_dispatch_uses_named_channel_in_multi_channel_fleet", "src/daemon/router.rs::mirror_dispatch_falls_back_to_active_channel_when_lookup_fails"),
+    ("src/daemon/shadow/grok.rs::exact_cwd_and_session_tail_reaches_shared_buffer", "src/daemon/shadow/grok.rs::discovery_rejects_same_named_workspace_outside_daemon_home"),
+    ("src/fleet/tests.rs::resolve_instance_model_tier_policy_2477", "src/fleet/tests.rs::resolve_instance_instance_model_tier_overrides_defaults_model_2477"),
+    ("src/fleet/tests.rs::test_channel_config_telegram_parsing", "src/fleet/tests.rs::test_channel_absent_when_neither_form_set"),
+    ("src/fleet/tests.rs::test_channel_config_telegram_parsing", "src/fleet/tests.rs::test_channel_singular_wins_when_both_set"),
+    ("src/fleet/tests.rs::test_channel_config_telegram_parsing", "src/fleet/tests.rs::test_channels_plural_multi_entry_picks_first_by_name"),
+    ("src/fleet/tests.rs::test_channel_config_telegram_parsing", "src/fleet/tests.rs::test_channels_plural_single_entry_collapses_to_singular"),
+    ("src/inbox/tests.rs::tmp_home", "src/daemon/per_tick/inbox_maintenance.rs::run_is_no_op_on_empty_fixtures"),
+    ("src/inbox/tests.rs::tmp_home_fails_closed_when_the_directory_cannot_be_created", "src/daemon/per_tick/inbox_maintenance.rs::run_is_no_op_on_empty_fixtures"),
+    ("src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_settles_feature_row_after_track_resolved_3179", "src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_resolved_feature_episode_mismatch_leaves_row_untouched_3179"),
+    ("src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_settles_feature_row_after_track_resolved_3179", "src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_resolved_feature_lock_failure_is_reported_3179"),
+    ("src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_settles_feature_row_after_track_resolved_3179", "src/mcp/handlers/ci/ack_handoff_tests.rs::ack_handoff_resolved_protected_row_is_not_feature_fallback_3179"),
+    ("src/mcp/handlers/ci/checkout_path.rs::existing_legacy_target_is_adopted", "src/mcp/handlers/ci/checkout_path.rs::existing_legacy_journal_is_adopted"),
+    ("src/mcp/handlers/ci/notification_only_watch_tests.rs::tmp_home", "src/mcp/handlers/ci/notification_only_watch_tests.rs::notification_only_pre_terminal_repeat_idempotent"),
+    ("src/mcp/handlers/ci/tests.rs::dispatch_with_branch_and_repo_auto_invokes_watch_ci", "src/mcp/handlers/ci/tests.rs::dispatch_idempotent_double_watch_safe"),
+    ("src/mcp/handlers/ci/watch_tests.rs::status_message_id_matches_by_target_correlation_episode", "src/mcp/handlers/ci/watch_tests.rs::status_message_id_rejects_wrong_correlation"),
+    ("src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_idempotent_existing_watch", "src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task"),
+    ("src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_with_repo_creates_ci_watch", "src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task"),
+    ("src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_without_repo_no_ci_watch", "src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task"),
+    ("src/mcp/handlers/dispatch_hook/tests.rs::repo_with_remotes", "src/mcp/handlers/dispatch_hook/tests.rs::ensure_branch_exists_creates_from_non_origin_remote_2010"),
+    ("src/mcp/handlers/dispatch_hook/tests.rs::same_agent_different_branch_rejects", "src/mcp/handlers/dispatch_hook/tests.rs::delegate_task_same_agent_different_branch_without_delivering"),
+    ("src/mcp/handlers/instance_queries.rs::list_instances_exposes_topic_binding_mode_991", "src/mcp/handlers/instance_queries.rs::list_instances_omits_topic_binding_mode_when_unset_991"),
+    ("src/mcp/handlers/r3_46776_red_tests.rs::tmp_home", "src/inbox/storage/perf_r3_equiv.rs::tmp_home"),
+    ("src/mcp/usage_stats.rs::tmp_home", "src/daemon/supervisor/usage_limit_control.rs::tmp_home"),
+    ("src/mcp/usage_stats.rs::tmp_home", "src/mcp/usage_stats.rs::record_appends_durable_jsonl_lines_2055"),
+    ("src/quickstart/tests.rs::emitted_yaml_with_channel_includes_user_allowlist", "src/quickstart/tests.rs::emitted_yaml_without_channel_mentions_user_allowlist"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::context_pcts_default_and_toggleable"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::copy_on_select_default_on_and_toggleable_via_on_off"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::future_schema_version_config_kept_last_good"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::invalid_key_rejected"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::nan_env_override_falls_back_not_poisons"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::observed_badge_default_on_and_toggleable_via_on_off"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::old_config_without_schema_version_loads"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::reload_tolerates_retired_progress_mode_key_2549"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::resolve_effective_thresholds_drives_warn_latch"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::set_hang_auto_recovery_enabled"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::set_refuses_to_overwrite_future_version_file"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::set_uses_disk_base_preserves_concurrent_key_audit2_012"),
+    ("src/runtime_config.rs::set_and_get_key", "src/runtime_config.rs::show_pane_state_default_on_and_toggleable"),
+    ("src/transport/opencode_server/tests.rs::restore_probe_failure_clears_gate_as_ambiguous", "src/transport/opencode_server/tests.rs::restore_idle_without_target_history_proof_is_ambiguous"),
+    ("src/transport/opencode_server/tests.rs::restore_probe_failure_clears_gate_as_ambiguous", "src/transport/opencode_server/tests.rs::restore_reconciles_msg_prefixed_history_target"),
+    ("src/transport/receipt.rs::receipt_store_survives_and_reconciles_state_transitions", "src/transport/receipt.rs::opencode_seed_lookup_prefers_the_receipts_actual_backend_session"),
+    ("src/transport/receipt.rs::receipt_store_survives_and_reconciles_state_transitions", "src/transport/receipt.rs::opencode_seed_lookup_scopes_session_and_ignores_legacy_ids_after_reload"),
+    ("src/transport/receipt.rs::receipt_store_survives_and_reconciles_state_transitions", "src/transport/receipt.rs::protocol_request_id_survives_terminal_compaction_and_reload"),
+    ("src/transport/receipt.rs::receipt_store_survives_and_reconciles_state_transitions", "src/transport/receipt.rs::receipt_store_compacts_and_keeps_one_body_owner_per_delivery"),
+];
 
 #[test]
 fn temp_fixture_shapes_do_not_prefix_overlap() {
@@ -212,6 +273,13 @@ fn temp_fixture_shapes_do_not_prefix_overlap() {
                 continue;
             }
             if b_prefix.starts_with(a_prefix.as_str()) {
+                let key = (format!("{a_file}::{a_name}"), format!("{b_file}::{b_name}"));
+                if KNOWN_PREFIX_OVERLAPS
+                    .iter()
+                    .any(|(a, b)| *a == key.0 && *b == key.1)
+                {
+                    continue;
+                }
                 offenders.push(format!(
                     "{a_file}::{a_name} {a_prefix:?} is a prefix of {b_file}::{b_name} {b_prefix:?} \
                      — a label starting with {:?} makes the two resolve to one directory",
@@ -224,7 +292,8 @@ fn temp_fixture_shapes_do_not_prefix_overlap() {
     offenders.dedup();
     assert!(
         offenders.is_empty(),
-        "temp-fixture path shapes can collide across helpers:\n  {}",
+        "NEW temp-fixture path-shape collisions (the #3245 ratchet only permits \
+         the dated baseline, never additions):\n  {}",
         offenders.join("\n  ")
     );
 }
@@ -310,4 +379,42 @@ fn enclosing_fn(src: &str, offset: usize) -> String {
             .collect(),
         None => "<file>".to_string(),
     }
+}
+
+/// The ratchet may only tighten: an allowlisted pair that no longer overlaps
+/// must be deleted from the baseline, or the list silently protects nothing.
+#[test]
+fn known_overlaps_have_no_stale_entries() {
+    let helpers = temp_dir_helpers();
+    let mut live = Vec::new();
+    let mut shapes: Vec<(String, String)> = Vec::new();
+    for helper in helpers.iter().filter(|h| h.destructive) {
+        for shape in &helper.shapes {
+            let prefix = fixed_prefix(shape);
+            if prefix.len() >= 4 {
+                shapes.push((prefix, format!("{}::{}", helper.file, helper.name)));
+            }
+        }
+    }
+    for (a_prefix, a_id) in &shapes {
+        for (b_prefix, b_id) in &shapes {
+            if a_id == b_id || a_prefix == b_prefix {
+                continue;
+            }
+            if b_prefix.starts_with(a_prefix.as_str()) {
+                live.push((a_id.clone(), b_id.clone()));
+            }
+        }
+    }
+    let stale: Vec<String> = KNOWN_PREFIX_OVERLAPS
+        .iter()
+        .filter(|(a, b)| !live.iter().any(|(la, lb)| la == a && lb == b))
+        .map(|(a, b)| format!("{a} -> {b}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these baseline entries no longer overlap and must be removed from \
+         KNOWN_PREFIX_OVERLAPS:\n  {}",
+        stale.join("\n  ")
+    );
 }

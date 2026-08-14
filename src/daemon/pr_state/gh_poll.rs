@@ -712,7 +712,11 @@ pub(crate) mod tests {
     }
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("agend-986-{}-{}", tag, std::process::id()));
+        // #3245: "agend-986-" was a prefix of both "agend-986-int-" and
+        // "agend-986-worker-", so a tag like "int-x" resolved to another
+        // helper's directory. "poll-" cannot prefix either.
+        let dir =
+            std::env::temp_dir().join(format!("agend-986-poll-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
