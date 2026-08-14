@@ -57,12 +57,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use syn::visit::{self, Visit};
 
 use agend_terminal::admin::orphan_provenance::{
-    classify, load_ledger, render_human, sample_tool_call_shells, BackendOwner, BackendOwnerSource,
-    DisplayColumns, ObservationMiss, OrphanReport, PersistOutcome, ProcFacts, ProcessOracle,
-    ProvenanceSupport, SampleOutcome, ShellToolEvidence, ShellToolKind, ToolCallProvenanceHandler,
-    UnprovenReason,
+    classify, load_ledger, render_human, sample_from_owner_source, sample_tool_call_shells,
+    BackendOwner, BackendOwnerSource, DisplayColumns, ObservationMiss, OrphanReport,
+    PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport, SampleOutcome, ShellToolEvidence,
+    ShellToolKind, UnprovenReason,
 };
-use agend_terminal::daemon::per_tick::{run_handlers_with_panic_guard, PerTickHandler};
 use agend_terminal::instructions::background_process_guidance;
 
 const HOUR_MS: i64 = 3_600_000;
@@ -799,26 +798,96 @@ fn the_provenance_module_contains_no_signalling_path() {
 // 6. Entry point — daemon-driven, NOT gated on a metrics subscriber
 // ---------------------------------------------------------------------------
 
+/// The owner-service seam the handler runs on, driven behaviourally. It takes a
+/// `BackendOwnerSource` and a `ProcessOracle` and NOTHING else — no metrics
+/// handle exists to pass, so a headless daemon and a subscribed TUI observe
+/// identically. The handler itself is pinned to this seam structurally below,
+/// because `PerTickHandler`/`TickContext` are crate-private and a `tests/` file
+/// cannot construct an `AgentRegistry` to drive the loop for real.
 #[test]
-fn the_real_per_tick_pipeline_observes_with_no_metrics_subscriber() {
+fn the_owner_service_seam_observes_with_no_metrics_input() {
     let home = tmp_home("headless");
     let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
     let owners = HeadlessOwners(vec![owner("dev-1", 900, bash_tool(7, 0))]);
 
-    let mut handlers: Vec<Box<dyn PerTickHandler>> =
-        vec![Box::new(ToolCallProvenanceHandler::new(&world, &owners))];
-    run_handlers_with_panic_guard(&mut handlers, &home, 0);
-
+    sample_from_owner_source(&home, &world, &owners, 0);
     world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
-    run_handlers_with_panic_guard(&mut handlers, &home, 1_000);
+    let outcome = sample_from_owner_source(&home, &world, &owners, 1_000);
 
+    assert_eq!(outcome.observed.len(), 1);
     let ledger = load_ledger(&home);
     assert_eq!(
         ledger.len(),
         1,
-        "the daemon tick observes with no metrics subscriber in play"
+        "the owner-service seam observes with no metrics subscriber in play"
     );
     assert_eq!(ledger[0].shell_pid, 910);
+}
+
+/// Structural half: the daemon handler is a REAL `PerTickHandler` and its `run`
+/// goes through the seam above. Without this, the behavioural test proves only
+/// that a free function works.
+#[test]
+fn the_provenance_handler_is_a_real_per_tick_handler_that_uses_the_seam() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/daemon/per_tick/tool_call_provenance.rs");
+    let src =
+        std::fs::read_to_string(&path).expect("read src/daemon/per_tick/tool_call_provenance.rs");
+    let file = syn::parse_file(&src).expect("parse tool_call_provenance.rs");
+
+    let impl_block = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Impl(i) => {
+                let trait_is_per_tick = i.trait_.as_ref().is_some_and(|(_, path, _)| {
+                    path.segments
+                        .last()
+                        .is_some_and(|s| s.ident == "PerTickHandler")
+                });
+                let self_is_handler = matches!(&*i.self_ty, syn::Type::Path(tp)
+                    if tp.path.segments.last()
+                        .is_some_and(|s| s.ident == "ToolCallProvenanceHandler"));
+                (trait_is_per_tick && self_is_handler).then_some(i)
+            }
+            _ => None,
+        })
+        .expect(
+            "#3273: `impl PerTickHandler for ToolCallProvenanceHandler` must exist — the sampler \
+             has to be a real daemon handler, not a look-alike with its own loop",
+        );
+
+    #[derive(Default)]
+    struct SeamFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for SeamFinder {
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if p.segments
+                .iter()
+                .any(|s| s.ident == "sample_from_owner_source")
+            {
+                self.found = true;
+            }
+            visit::visit_path(self, p);
+        }
+    }
+    let run = impl_block
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::ImplItem::Fn(f) if f.sig.ident == "run" => Some(f),
+            _ => None,
+        })
+        .expect("the handler must implement `run`");
+
+    let mut finder = SeamFinder::default();
+    finder.visit_impl_item_fn(run);
+    assert!(
+        finder.found,
+        "#3273: `PerTickHandler::run` must call `sample_from_owner_source` — the tested seam and \
+         the production tick must be the same code path"
+    );
 }
 
 #[test]
