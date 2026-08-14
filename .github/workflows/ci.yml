@@ -84,6 +84,34 @@ jobs:
         shell: bash
         run: scripts/test_fmt_owned.sh
 
+      # #3248: the canary's own contract — MSYS option composition and that the
+      # probe can see a link that exists. Linux-only for the same reason as the
+      # step above: one run of a portable shell contract is enough, and the
+      # assertions are platform-independent by construction.
+      - name: Windows-symlink canary contract test
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        shell: bash
+        run: scripts/test_windows_symlink_canary.sh
+
+      # #3248: readiness OBSERVATION, deliberately non-blocking. The wrapper
+      # contract below skips 14 symlink premises on Windows because Git Bash's
+      # `ln -s` deep-copies by default. Making those fail-closed first would be a
+      # bet on three facts no documentation settles: whether this hosted image
+      # can create a native symlink at all (SeCreateSymbolicLinkPrivilege is
+      # Administrators-only and UAC-guarded), whether nativestrict accepts a
+      # DANGLING target (Windows symlinks are typed, and there is nothing to type
+      # from), and whether it accepts a DIRECTORY target. Lose that bet and 14
+      # honest skips become a permanently red required job. This step answers all
+      # three from a real run instead; it runs BEFORE the wrapper contract so the
+      # answer sits directly above the skips it explains.
+      - name: Windows native-symlink readiness canary (#3248)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: scripts/windows_symlink_canary.sh
+
       # #3236: the coverage wrapper's failure semantics (real-failure precedence,
       # truthful cleanup, attempt isolation, bounded diagnostics). Runs here
       # rather than in the coverage job so a semantics regression is caught in
