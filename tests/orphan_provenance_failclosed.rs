@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! #3273 V1 — report-only orphan visibility and a non-authoritative
 //! tool-call observation ledger.
 //!
@@ -283,10 +284,10 @@ fn miss(outcome: &SampleOutcome, instance: &str) -> ObservationMiss {
         .unwrap_or_else(|| panic!("instance {instance} must report a visible observation miss"))
 }
 
-fn candidate<'a>(
-    report: &'a OrphanReport,
+fn candidate(
+    report: &OrphanReport,
     pid: u32,
-) -> &'a agend_terminal::admin::orphan_provenance::OrphanCandidate {
+) -> &agend_terminal::admin::orphan_provenance::OrphanCandidate {
     report
         .candidates
         .iter()
