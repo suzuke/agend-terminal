@@ -568,7 +568,12 @@ fn a_first_tick_while_a_generation_is_already_active_is_a_visible_miss() {
 #[test]
 fn a_generation_whose_shell_was_never_sampled_is_a_visible_miss() {
     let home = tmp_home("dropped");
-    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    // The backend HAS a child — a pre-existing helper — so "nothing new
+    // appeared" is a different fact from "nothing is below this backend at
+    // all", which is the sibling-topology case pinned separately below.
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
     baseline_tick(&home, &world, 0);
 
     // The shell was born and reaped entirely between two ticks.
@@ -581,6 +586,119 @@ fn a_generation_whose_shell_was_never_sampled_is_a_visible_miss() {
 
     assert!(outcome.observed.is_empty());
     assert_eq!(miss(&outcome, "dev-1"), ObservationMiss::NoNewCandidate);
+}
+
+/// The Codex app-server sibling topology is a standing fact about that backend,
+/// not a one-off first-tick condition. Every window where the backend has no
+/// children at all must say so, including after a baseline exists — otherwise
+/// the second and later windows silently downgrade to "nothing new appeared"
+/// and the operator never learns that agend cannot see the execution owner.
+#[test]
+fn every_window_with_no_backend_children_reports_the_sibling_topology() {
+    let home = tmp_home("sibling-standing");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+
+    let first = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    assert_eq!(
+        miss(&first, "dev-1"),
+        ObservationMiss::ExecutionOwnerNotABackendChild
+    );
+
+    // A baseline (empty) now exists. The topology has not changed, so neither
+    // may the diagnosis.
+    baseline_tick(&home, &world, 2_000);
+    let later = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(8, 3_000))],
+        3_000,
+    );
+    assert!(later.observed.is_empty());
+    assert_eq!(
+        miss(&later, "dev-1"),
+        ObservationMiss::ExecutionOwnerNotABackendChild,
+        "a backend with no children is a topology fact on every window, not just the first"
+    );
+}
+
+/// An observation records the shell's ACTUAL sid and pgid, which are not its
+/// pid when the shell inherited them. Relating an orphan through `shell_pid`
+/// therefore misses exactly the inherited case the contract insists on
+/// supporting, and the suggestion — the only thing the ledger is for — never
+/// appears.
+#[test]
+fn an_observation_relates_through_its_recorded_container_not_the_shell_pid() {
+    let home = tmp_home("container-key");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    // shell_pid 910, but it leads neither: pgid 777, sid the backend's.
+    world.insert(
+        910,
+        FakeProc::inherited(9_100).child_of(900).group(Some(777)),
+    );
+    let sampled = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    assert_eq!(sampled.observed.len(), 1);
+    assert_eq!(sampled.observed[0].shell_pid, 910);
+    assert_eq!(sampled.observed[0].pgid, 777);
+
+    world.reap(910);
+    // The job it left behind carries the GROUP, which is not the shell's pid.
+    world.insert(911, FakeProc::inherited(9_110).group(Some(777)).orphan());
+
+    let report = classify(&home, &world, 40 * HOUR_MS);
+
+    assert_eq!(
+        candidate(&report, 911).suggested_instance.as_deref(),
+        Some("dev-1"),
+        "the ledger must relate through the recorded pgid/sid, not through shell_pid"
+    );
+    assert_eq!(
+        reason(&report, 911),
+        UnprovenReason::ObservedButNotAuthoritative,
+        "relating it is a suggestion; it must not become anything stronger"
+    );
+}
+
+/// The report promises that elapsed and CPU are display columns. A promise
+/// about columns it never prints is worse than silence: the operator is told
+/// the data was considered and shown, and it was not.
+#[test]
+fn the_report_carries_and_prints_elapsed_and_cpu() {
+    let home = tmp_home("agecpu");
+    let world = FakeOracle::supported().with(
+        911,
+        FakeProc::inherited(9_110).orphan().display(DisplayColumns {
+            argv: Some("zsh -c ( while : ; do : ; done ) &".to_string()),
+            cwd: Some("/Users/x/.agend-terminal/workspace/dev-1".to_string()),
+            elapsed_secs: Some(40 * 3_600),
+            cpu_percent: Some(96.5),
+        }),
+    );
+
+    let report = classify(&home, &world, 40 * HOUR_MS);
+    let c = candidate(&report, 911);
+    assert_eq!(c.elapsed_secs, Some(40 * 3_600));
+    assert_eq!(c.cpu_percent, Some(96.5));
+
+    let rendered = render_human(&report);
+    assert!(
+        rendered.contains("144000"),
+        "elapsed must reach the rendered report: {rendered}"
+    );
+    assert!(
+        rendered.contains("96.5"),
+        "CPU must reach the rendered report: {rendered}"
+    );
 }
 
 #[test]
