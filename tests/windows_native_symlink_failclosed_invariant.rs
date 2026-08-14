@@ -24,13 +24,21 @@ fn coverage_contract_step() -> String {
 
 #[test]
 fn exactly_fourteen_symlink_premise_skips_are_fail_closed() {
-    let count = COVERAGE_CONTRACT
+    let skip_count = COVERAGE_CONTRACT
         .lines()
         .filter(|line| line.trim_start().starts_with("report_symlink_skip \""))
         .count();
     assert_eq!(
-        count, 14,
-        "only the fourteen symlink-premise skips may be gated; found {count}"
+        skip_count, 14,
+        "only the fourteen symlink-premise skips may be gated; found {skip_count}"
+    );
+    let wrapper_count = COVERAGE_CONTRACT
+        .lines()
+        .filter(|line| line.trim_start().starts_with("run_native_symlink_test test_"))
+        .count();
+    assert_eq!(
+        wrapper_count, 14,
+        "exactly the fourteen symlink-premise functions must use the scoped wrapper; found {wrapper_count}"
     );
 }
 
@@ -41,6 +49,8 @@ fn native_msys_normalization_is_deterministic_and_bounded() {
         "winsymlinks:nativestrict",
         "awk",
         "native-symlink MSYS before=",
+        "native_msys_scope_preserves_unrelated_probe",
+        "run_native_symlink_test",
         "COVERAGE_REQUIRE_NATIVE_SYMLINKS",
     ] {
         assert!(

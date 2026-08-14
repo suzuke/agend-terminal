@@ -4338,6 +4338,76 @@ test_native_msys_token_matrix() {
     fi
 }
 
+test_native_msys_scope_preserves_unrelated_probe() {
+    if ! type run_native_symlink_test >/dev/null 2>&1; then
+        report 1 "native-symlink MSYS scope preserves unrelated probes" \
+            "scoped native-symlink wrapper is missing"
+        return
+    fi
+
+    local old_required="${COVERAGE_REQUIRE_NATIVE_SYMLINKS-}"
+    local old_runner="${RUNNER_OS-}" old_msys="${MSYS-}"
+    local had_required=0 had_runner=0 had_msys=0
+    local observed_in_function="" observed_child="" expected=""
+    local bad=""
+    [ "${COVERAGE_REQUIRE_NATIVE_SYMLINKS+x}" = x ] && had_required=1
+    [ "${RUNNER_OS+x}" = x ] && had_runner=1
+    [ "${MSYS+x}" = x ] && had_msys=1
+
+    native_msys_scope_probe() {
+        observed_in_function="${MSYS-}"
+        observed_child="$(env | awk -F= '$1 == "MSYS" { print substr($0, index($0, "=") + 1) }')"
+    }
+
+    expected="keep tail winsymlinks:nativestrict"
+    COVERAGE_REQUIRE_NATIVE_SYMLINKS=0
+    RUNNER_OS=Windows
+    MSYS="keep winsymlinks:lnk tail"
+    export COVERAGE_REQUIRE_NATIVE_SYMLINKS RUNNER_OS MSYS
+    run_native_symlink_test native_msys_scope_probe
+    [ "$observed_in_function" = "keep winsymlinks:lnk tail" ] ||
+        bad="$bad default-mode-mutated-shell"
+    [ "$observed_child" = "keep winsymlinks:lnk tail" ] ||
+        bad="$bad default-mode-mutated-child"
+
+    observed_in_function=""
+    observed_child=""
+    COVERAGE_REQUIRE_NATIVE_SYMLINKS=1
+    export COVERAGE_REQUIRE_NATIVE_SYMLINKS
+    run_native_symlink_test native_msys_scope_probe
+    [ "$observed_in_function" = "$expected" ] ||
+        bad="$bad required-mode-did-not-normalize"
+    [ "$observed_child" = "$expected" ] ||
+        bad="$bad required-mode-child-not-normalized"
+    [ "$MSYS" = "keep winsymlinks:lnk tail" ] ||
+        bad="$bad required-mode-leaked-to-shell"
+
+    if [ "$had_required" -eq 1 ]; then
+        COVERAGE_REQUIRE_NATIVE_SYMLINKS="$old_required"
+        export COVERAGE_REQUIRE_NATIVE_SYMLINKS
+    else
+        unset COVERAGE_REQUIRE_NATIVE_SYMLINKS
+    fi
+    if [ "$had_runner" -eq 1 ]; then
+        RUNNER_OS="$old_runner"
+        export RUNNER_OS
+    else
+        unset RUNNER_OS
+    fi
+    if [ "$had_msys" -eq 1 ]; then
+        MSYS="$old_msys"
+        export MSYS
+    else
+        unset MSYS
+    fi
+
+    if [ -n "$bad" ]; then
+        report 1 "native-symlink MSYS scope preserves unrelated probes" "issues:$bad"
+    else
+        report 0 "native-symlink MSYS scope preserves unrelated probes"
+    fi
+}
+
 test_native_symlink_skip_gate_is_scoped() {
     local gate_fn=report_symlink_skip old_required="${COVERAGE_REQUIRE_NATIVE_SYMLINKS-}"
     local old_fail="$fail" old_skip="$skip" bad=""
@@ -4448,6 +4518,7 @@ test_absence_requires_platform_authority
 test_pid_authority_seam_classifies_platforms
 test_failed_authority_query_is_not_absence
 test_proc_absence_is_never_reported_as_no
+test_native_msys_scope_preserves_unrelated_probe
 test_native_msys_token_matrix
 test_native_symlink_skip_gate_is_scoped
 test_isolation_fails_closed_when_its_commands_fail
