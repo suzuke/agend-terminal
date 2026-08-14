@@ -15,6 +15,26 @@ fn tmp_home(tag: &str) -> PathBuf {
     dir
 }
 
+/// #3245: this helper wipes its directory on entry, so two callers that resolve
+/// to the same path delete each other's fixture. Uniqueness must come from the
+/// helper, not from callers remembering to pass distinct tags.
+#[test]
+fn tmp_home_is_unique_per_call() {
+    let first = tmp_home("same-tag");
+    let second = tmp_home("same-tag");
+    assert_ne!(
+        first, second,
+        "two tmp_home calls resolved to one directory; the second wiped the first"
+    );
+    assert!(
+        first.to_string_lossy().contains(&std::process::id().to_string()),
+        "temp home must carry the pid so concurrent test processes cannot collide: {}",
+        first.display()
+    );
+    std::fs::remove_dir_all(&first).ok();
+    std::fs::remove_dir_all(&second).ok();
+}
+
 #[test]
 #[serial(capture_env)]
 fn capture_writer_writes_cap_and_meta_when_env_set() {

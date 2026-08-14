@@ -32,6 +32,29 @@ fn tmp_home(suffix: &str) -> PathBuf {
     dir
 }
 
+/// #3245: a fixture that cannot be built must fail AT the fixture, named.
+/// Ignoring `create_dir_all` returns a path to a directory that does not exist,
+/// so the test then fails somewhere unrelated — or passes for the wrong reason.
+#[test]
+fn tmp_home_fails_closed_when_the_directory_cannot_be_created() {
+    let blocker = std::env::temp_dir().join(format!(
+        "agend-inbox-{}-{}",
+        "failclosed-3245",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&blocker).ok();
+    fs::write(&blocker, b"not a directory").unwrap();
+
+    let attempt = std::panic::catch_unwind(|| tmp_home("failclosed-3245"));
+    fs::remove_file(&blocker).ok();
+
+    assert!(
+        attempt.is_err(),
+        "tmp_home returned a path whose directory could not be created; \
+         fixture construction must fail closed"
+    );
+}
+
 #[test]
 fn tmp_home_starts_clean_when_suffix_is_reused() {
     let first = tmp_home("freshness");
