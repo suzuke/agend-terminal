@@ -446,7 +446,11 @@ fn archive_batch_audit_lookup_uses_exact_fields_3227() {
         home.join("event-log.jsonl"),
         serde_json::json!({
             "kind": "decision_batch_archived",
-            "detail": "id=d-one-extra token=12345678-1234-1234-1234-123456789abc"
+            "detail": serde_json::json!({
+                "id": "d-one-extra",
+                "token": "12345678-1234-1234-1234-123456789abc",
+                "audit_reason": "cleanup id=d-one"
+            }).to_string()
         })
         .to_string()
             + "\n",
@@ -461,7 +465,10 @@ fn archive_batch_audit_lookup_uses_exact_fields_3227() {
         home.join("event-log.jsonl"),
         serde_json::json!({
             "kind": "unrelated_event",
-            "detail": "id=d-one token=12345678-1234-1234-1234-123456789abc"
+            "detail": serde_json::json!({
+                "id": "d-one",
+                "token": "12345678-1234-1234-1234-123456789abc"
+            }).to_string()
         })
         .to_string()
             + "\n",
@@ -476,7 +483,11 @@ fn archive_batch_audit_lookup_uses_exact_fields_3227() {
         home.join("event-log.jsonl"),
         serde_json::json!({
             "kind": "decision_batch_archived",
-            "detail": "id=d-one token=12345678-1234-1234-1234-123456789abc"
+            "detail": serde_json::json!({
+                "id": "d-one",
+                "token": "12345678-1234-1234-1234-123456789abc",
+                "audit_reason": "cleanup id=d-other"
+            }).to_string()
         })
         .to_string()
             + "\n",
@@ -487,6 +498,50 @@ fn archive_batch_audit_lookup_uses_exact_fields_3227() {
         "12345678-1234-1234-1234-123456789abc",
         "d-one"
     ));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn archive_batch_reason_cannot_forge_another_candidates_audit_3227() {
+    let home = tmp_home("batch-audit-reason-injection-3227");
+    write_named_decision(&home, "001.json", &old_batch_decision("alice", "d-a"));
+    write_named_decision(&home, "002.json", &old_batch_decision("alice", "d-b"));
+    let audit_reason = "cleanup id=d-b";
+    let preview = archive_batch(
+        &home,
+        "alice",
+        &serde_json::json!({
+            "until": "2021-01-01T00:00:00Z",
+            "audit_reason": audit_reason
+        }),
+    );
+    let token = preview["confirm_token"].as_str().unwrap();
+    let archive = decisions_dir(&home).join(".archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::rename(
+        decisions_dir(&home).join("002.json"),
+        archive.join("002.json"),
+    )
+    .unwrap();
+
+    let applied = archive_batch(
+        &home,
+        "alice",
+        &serde_json::json!({
+            "apply": true,
+            "confirm_token": token,
+            "confirm_ids": ["d-a", "d-b"],
+            "audit_reason": audit_reason
+        }),
+    );
+    assert_eq!(
+        applied["partial"], false,
+        "apply must repair d-b: {applied}"
+    );
+    assert_eq!(applied["outcomes"][0]["outcome"], "archived");
+    assert_eq!(applied["outcomes"][1]["outcome"], "audit_repaired");
+    assert!(durable_batch_audit_exists(&home, token, "d-a"));
+    assert!(durable_batch_audit_exists(&home, token, "d-b"));
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -510,6 +565,26 @@ fn archive_batch_preview_discloses_candidate_cap_3227() {
             .unwrap();
     assert!(confirmation.candidates_capped);
     assert_eq!(confirmation.candidate_cap, MAX_BATCH_CANDIDATES);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn archive_batch_preview_reaps_expired_confirmations_3227() {
+    let home = tmp_home("batch-confirmation-reap-3227");
+    write_named_decision(&home, "001.json", &old_batch_decision("alice", "d-one"));
+    let preview = batch_preview(&home, "alice");
+    let expired_token = preview["confirm_token"].as_str().unwrap();
+    let expired_path = confirmation_path(&home, expired_token).unwrap();
+    let mut confirmation: BatchConfirmation =
+        serde_json::from_slice(&std::fs::read(&expired_path).unwrap()).unwrap();
+    confirmation.created_at =
+        (chrono::Utc::now() - chrono::Duration::seconds(BATCH_CONFIRM_TTL_SECS + 1)).to_rfc3339();
+    crate::store::save_atomic(&expired_path, &confirmation).unwrap();
+
+    let fresh = batch_preview(&home, "alice");
+    let fresh_path = confirmation_path(&home, fresh["confirm_token"].as_str().unwrap()).unwrap();
+    assert!(!expired_path.exists());
+    assert!(fresh_path.exists());
     std::fs::remove_dir_all(&home).ok();
 }
 

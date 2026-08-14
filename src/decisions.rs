@@ -851,9 +851,35 @@ fn confirmation_path(home: &Path, token: &str) -> Option<PathBuf> {
     }
 }
 
+fn reap_expired_confirmations(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(confirmation_dir(home)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_regular_json = entry.file_type().is_ok_and(|kind| kind.is_file())
+            && path.extension().and_then(|value| value.to_str()) == Some("json");
+        if !is_regular_json {
+            continue;
+        }
+        let age = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<BatchConfirmation>(&raw).ok())
+            .and_then(|confirmation| {
+                chrono::DateTime::parse_from_rfc3339(&confirmation.created_at).ok()
+            })
+            .map(|created| {
+                chrono::Utc::now()
+                    .signed_duration_since(created)
+                    .num_seconds()
+            });
+        if age.is_none_or(|age| !(0..=BATCH_CONFIRM_TTL_SECS).contains(&age)) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn durable_batch_audit_exists(home: &Path, token: &str, id: &str) -> bool {
-    let needle_token = format!("token={token}");
-    let needle_id = format!("id={id}");
     (0..=5).any(|generation| {
         let path = if generation == 0 {
             home.join("event-log.jsonl")
@@ -871,9 +897,9 @@ fn durable_batch_audit_exists(home: &Path, token: &str, id: &str) -> bool {
                 let Some(detail) = event["detail"].as_str() else {
                     return false;
                 };
-                let mut fields = detail.split_whitespace();
-                fields.any(|field| field == needle_token)
-                    && detail.split_whitespace().any(|field| field == needle_id)
+                serde_json::from_str::<serde_json::Value>(detail).is_ok_and(|detail| {
+                    detail["id"].as_str() == Some(id) && detail["token"].as_str() == Some(token)
+                })
             })
         })
     })
@@ -885,15 +911,15 @@ fn batch_audit_detail(
     confirmation: &BatchConfirmation,
     audit_reason: &str,
 ) -> String {
-    format!(
-        "id={} token={} preview_digest={} source_digest={} policy_digest={} audit_reason={}",
-        candidate.id,
-        token,
-        confirmation.preview_digest,
-        confirmation.source_digest,
-        confirmation.policy_digest,
-        audit_reason
-    )
+    serde_json::json!({
+        "id": candidate.id,
+        "token": token,
+        "preview_digest": confirmation.preview_digest,
+        "source_digest": confirmation.source_digest,
+        "policy_digest": confirmation.policy_digest,
+        "audit_reason": audit_reason,
+    })
+    .to_string()
 }
 
 fn write_batch_audit(
@@ -1003,6 +1029,7 @@ pub fn archive_batch(home: &Path, caller: &str, args: &Value) -> Value {
 }
 
 fn archive_batch_preview(home: &Path, caller: &str, args: &Value, audit_reason: &str) -> Value {
+    reap_expired_confirmations(home);
     if let Some(status) = args["status"].as_str() {
         if !matches!(status, "pending" | "answered" | "expired") {
             return serde_json::json!({"error": format!("invalid status filter '{status}'")});
