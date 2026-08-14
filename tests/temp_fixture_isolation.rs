@@ -153,7 +153,10 @@ fn temp_dir_helpers() -> Vec<Helper> {
             .strip_prefix(env!("CARGO_MANIFEST_DIR"))
             .unwrap_or(&path)
             .display()
-            .to_string();
+            .to_string()
+            // Windows renders separators as `\\`; the baseline below is written
+            // with `/`, so normalise or every key misses on one platform.
+            .replace('\\', "/");
         for (name, body) in functions_of(&src) {
             if !body.contains("temp_dir()") {
                 continue;
@@ -314,7 +317,10 @@ fn temp_fixture_labels_are_not_reused_across_test_functions() {
             .strip_prefix(env!("CARGO_MANIFEST_DIR"))
             .unwrap_or(&path)
             .display()
-            .to_string();
+            .to_string()
+            // Windows renders separators as `\\`; the baseline below is written
+            // with `/`, so normalise or every key misses on one platform.
+            .replace('\\', "/");
         let destructive: Vec<String> = functions_of(&src)
             .into_iter()
             .filter(|(_, body)| {
