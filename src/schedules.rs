@@ -267,7 +267,7 @@ fn validate_fire_strategy(
     match linked_task_id {
         Some(id) if task_exists(home, id) => Ok(()),
         Some(id) => Err(format!(
-            "fire_strategy=until_success requires an existing linked_task_id (task '{id}' not found)"
+            "fire_strategy=until_success requires an existing linked_task_id (task '{id}' not found; point linked_task_id at an existing task in the same update)"
         )),
         None => {
             Err("fire_strategy=until_success requires 'linked_task_id'".to_string())
@@ -679,6 +679,17 @@ pub fn list(home: &Path, args: &Value) -> Value {
         .map(|s| {
             let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
             if let Value::Object(map) = &mut v {
+                if s.fire_strategy != FireStrategy::UntilSuccess {
+                    map.remove("last_success_date");
+                }
+                map.insert(
+                    "linked_task_exists".to_string(),
+                    Value::Bool(
+                        s.linked_task_id
+                            .as_deref()
+                            .is_some_and(|task_id| task_exists(home, task_id)),
+                    ),
+                );
                 map.insert(
                     "next_scheduled_fire_at".to_string(),
                     next_fire_at(s).map_or(Value::Null, Value::String),
@@ -750,6 +761,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
         .find(|s| s.id == id)
     {
         Some(schedule) => {
+            let previous_fire_strategy = schedule.fire_strategy;
             // Materialize the effective key before applying message edits so a
             // migrated AGEND-AUTO row cannot silently change replacement scope.
             if schedule.replacement_key.is_none() {
@@ -806,6 +818,11 @@ pub fn update(home: &Path, args: &Value) -> Value {
                 // Re-pointing (or clearing) the task invalidates a prior
                 // same-day success suppression.
                 schedule.linked_task_id = lt.clone();
+                schedule.last_success_date = None;
+            }
+            if previous_fire_strategy == FireStrategy::UntilSuccess
+                && schedule.fire_strategy != FireStrategy::UntilSuccess
+            {
                 schedule.last_success_date = None;
             }
             if let Err(e) = validate_fire_strategy(
@@ -1372,6 +1389,109 @@ mod tests {
         let s = &load(&home).schedules[0];
         assert_eq!(s.fire_strategy, FireStrategy::UntilSuccess);
         assert_eq!(s.linked_task_id.as_deref(), Some("t-real"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_away_from_until_success_clears_date_but_retains_link() {
+        let home = tmp_home("3246-transition-away");
+        seed_real_task(&home, "t-live");
+        let created = create(
+            &home,
+            "a",
+            &serde_json::json!({
+                "cron": "0 9 * * *",
+                "message": "x",
+                "fire_strategy": "until_success",
+                "linked_task_id": "t-live"
+            }),
+        );
+        let id = created["id"].as_str().expect("id");
+        mark_success_today(&home, id, "2026-08-14");
+
+        let updated = update(
+            &home,
+            &serde_json::json!({"id": id, "fire_strategy": "always"}),
+        );
+        assert_eq!(updated["status"], "updated", "resp: {updated}");
+        let stored = load(&home);
+        let schedule = &stored.schedules[0];
+        assert_eq!(schedule.fire_strategy, FireStrategy::Always);
+        assert_eq!(schedule.linked_task_id.as_deref(), Some("t-live"));
+        assert!(schedule.last_success_date.is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn list_masks_legacy_date_and_reports_link_existence() {
+        let home = tmp_home("3246-list-projection");
+        seed_real_task(&home, "t-live");
+        let created = create(
+            &home,
+            "a",
+            &serde_json::json!({
+                "cron": "0 9 * * *",
+                "message": "x",
+                "linked_task_id": "t-live"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        crate::store::mutate_versioned(&store_path(&home), |store: &mut ScheduleStore| {
+            let schedule = store.schedules.iter_mut().find(|s| s.id == id).unwrap();
+            schedule.last_success_date = Some("2026-07-01".into());
+            Ok(())
+        })
+        .expect("seed legacy fossil");
+
+        assert_eq!(
+            load(&home).schedules[0].last_success_date.as_deref(),
+            Some("2026-07-01"),
+            "load must preserve legacy bytes"
+        );
+        let listed = list(&home, &serde_json::json!({}));
+        let row = &listed["schedules"][0];
+        assert!(row.get("last_success_date").is_none(), "row: {row}");
+        assert_eq!(row["linked_task_exists"], true, "row: {row}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn list_reports_dangling_link_and_same_update_can_repoint_when_arming() {
+        let home = tmp_home("3246-repoint");
+        seed_real_task(&home, "t-live");
+        let created = create(
+            &home,
+            "a",
+            &serde_json::json!({
+                "cron": "0 9 * * *",
+                "message": "x",
+                "linked_task_id": "t-missing"
+            }),
+        );
+        let id = created["id"].as_str().expect("id");
+        let before = list(&home, &serde_json::json!({}));
+        assert_eq!(before["schedules"][0]["linked_task_exists"], false);
+
+        let rejected = update(
+            &home,
+            &serde_json::json!({"id": id, "fire_strategy": "until_success"}),
+        );
+        assert!(rejected["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not found")));
+        assert_eq!(load(&home).schedules[0].fire_strategy, FireStrategy::Always);
+
+        let armed = update(
+            &home,
+            &serde_json::json!({
+                "id": id,
+                "fire_strategy": "until_success",
+                "linked_task_id": "t-live"
+            }),
+        );
+        assert_eq!(armed["status"], "updated", "resp: {armed}");
+        let after = list(&home, &serde_json::json!({}));
+        assert_eq!(after["schedules"][0]["linked_task_exists"], true);
         std::fs::remove_dir_all(&home).ok();
     }
 
