@@ -1,5 +1,5 @@
 //! Per-agent supervisor loop — detects pre-ready interactive stalls and
-//! pushes a vterm tail to the agent's channel topic.
+//! pushes a bounded decision summary to the agent's channel topic.
 //!
 //! Runs as a background thread spawned from both daemon mode
 //! (`start_daemon`) and app mode (`app::run`). Both call paths create agents
@@ -27,7 +27,8 @@ mod reactions;
 pub(crate) mod usage_limit_control;
 pub(crate) use reactions::*;
 
-/// Vterm tail size pushed to Telegram when a stall is detected.
+/// Vterm tail size inspected locally when a stall is detected. Remote delivery
+/// is summarized by `format_stall_notice` before it reaches any channel.
 const TAIL_LINES: usize = 40;
 /// Debounce cooldown for member-state-change notify (Sprint 43).
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
@@ -1449,6 +1450,8 @@ fn enqueue_reply_ledger_lead_escalation(
         id: None,
         read_at: None,
         delivering_at: None,
+        delivery_count: 0,
+        first_delivered_at: None,
         thread_id: None,
         parent_id: None,
         task_id: None,
@@ -2044,6 +2047,157 @@ enum NoticeAction {
     Recovered,
 }
 
+/// Remote channels are an operator decision surface, not a pane transcript.
+/// Keep enough of the *latest* prompt chrome to make the decision (warning,
+/// choices, cancel hint), while leaving the full command/output in the TUI.
+const STALL_REMOTE_TAIL_MAX_CHARS: usize = 820;
+// The formatted notice adds four fixed lines around this summary. Seven kept
+// lines plus one omission marker therefore fit the common 12-line channel cap
+// without a second truncation pass or duplicate omission marker.
+const STALL_REMOTE_TAIL_MAX_LINES: usize = 7;
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn summarize_stall_tail(tail: &str) -> String {
+    let lines: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let full_chars: usize = lines.iter().map(|line| line.chars().count() + 1).sum();
+    if lines.len() <= STALL_REMOTE_TAIL_MAX_LINES && full_chars <= STALL_REMOTE_TAIL_MAX_CHARS {
+        return lines.join("\n");
+    }
+
+    const OMITTED: &str = "… pane details omitted; open TUI for full context …";
+    let action_priority = |line: &&str| {
+        let lower = line.to_ascii_lowercase();
+        let choice = lower
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '>' || c == ' ');
+        let first_word = choice
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or_default();
+        if matches!(first_word, "yes" | "no" | "allow" | "deny")
+            || lower.contains("esc to cancel")
+            || lower.contains("tab to amend")
+        {
+            3
+        } else if lower.contains("dangerous")
+            || lower.contains("do you want")
+            || lower.contains("proceed?")
+            || lower.contains("continue?")
+            || lower.contains("overwrite?")
+            || lower.contains("replace existing")
+            || lower.contains("press enter")
+            || lower.contains("(y/n)")
+            || lower.contains("[y/n]")
+            || line.trim_end().ends_with('?')
+        {
+            2
+        } else if lower.contains("permission") {
+            1
+        } else {
+            0
+        }
+    };
+    let mut action_indices: Vec<(usize, u8)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let priority = action_priority(line);
+            (priority > 0).then_some((idx, priority))
+        })
+        .collect();
+    let candidate_indices: Vec<usize> = if action_indices.is_empty() {
+        let mut indices = vec![0];
+        indices.extend(lines.len().saturating_sub(STALL_REMOTE_TAIL_MAX_LINES - 1)..lines.len());
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    } else {
+        // Keep the matched action lines themselves, never the contiguous span
+        // between matches. A false positive can then spend at most one slot;
+        // it cannot drag unrelated output into the preview or evict the real
+        // choices between two distant matches. Identity + newest content each
+        // reserve one slot, and high-value choice/cancel lines win the rest.
+        let mut indices = std::collections::BTreeSet::from([0, lines.len() - 1]);
+        let mut choices: Vec<usize> = action_indices
+            .iter()
+            .filter_map(|(idx, priority)| (*priority == 3).then_some(*idx))
+            .collect();
+        let mut context: Vec<usize> = action_indices
+            .iter()
+            .filter_map(|(idx, priority)| (*priority == 2).then_some(*idx))
+            .collect();
+        let mut permission: Vec<usize> = action_indices
+            .drain(..)
+            .filter_map(|(idx, priority)| (priority == 1).then_some(idx))
+            .collect();
+        choices.reverse();
+        context.reverse();
+        permission.reverse();
+
+        // Reserve up to two slots for the question/warning context before
+        // filling with choices. This prevents a long option menu from showing
+        // several answers without the question they answer. If no context was
+        // recognised, retain one permission line as the decision identity.
+        let mut context_count = 0;
+        for idx in context {
+            if context_count == 2 {
+                break;
+            }
+            indices.insert(idx);
+            context_count += 1;
+        }
+        if context_count == 0 {
+            if let Some(idx) = permission.first() {
+                indices.insert(*idx);
+            }
+        }
+        for idx in choices {
+            if indices.len() == STALL_REMOTE_TAIL_MAX_LINES {
+                break;
+            }
+            indices.insert(idx);
+        }
+        for idx in permission {
+            if indices.len() == STALL_REMOTE_TAIL_MAX_LINES {
+                break;
+            }
+            indices.insert(idx);
+        }
+        indices.into_iter().collect()
+    };
+    let mut remaining = STALL_REMOTE_TAIL_MAX_CHARS.saturating_sub(OMITTED.chars().count() + 1);
+    let mut kept = Vec::new();
+    for (position, idx) in candidate_indices.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let lines_left = candidate_indices.len() - position;
+        let line_budget = remaining.saturating_sub(lines_left) / lines_left;
+        let compact = truncate_chars(lines[*idx], line_budget);
+        remaining = remaining.saturating_sub(compact.chars().count() + 1);
+        kept.push(compact);
+    }
+    if kept.is_empty() {
+        OMITTED.to_string()
+    } else {
+        format!("{OMITTED}\n{}", kept.join("\n"))
+    }
+}
+
 /// Build the Telegram notice shown when an agent is blocked on an interactive
 /// prompt. `silent_secs = Some` for the AwaitingOperator time-based fallback
 /// (reports how long the agent has been quiet); `None` for pattern-matched
@@ -2053,6 +2207,7 @@ fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> Stri
         Some(s) => format!("⚠️ {name} 靜默 {s}s，可能卡在互動 prompt"),
         None => format!("⚠️ {name} 卡在互動 prompt"),
     };
+    let tail = summarize_stall_tail(tail);
     format!(
         "{header}\n\
          ────────\n\

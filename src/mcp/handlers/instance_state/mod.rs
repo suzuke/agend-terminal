@@ -617,13 +617,16 @@ pub(super) fn handle_restart_instance_with_runtime(
     // the operator's submit arrives via the TUI write path, not this thread.
     await_unsent_draft_or_grace(home, name, args["force"].as_bool().unwrap_or(false));
 
-    // Session-reset inbox settle: for a FRESH restart (context-lost), settle
-    // all DELIVERING rows to PROCESSED before killing the old instance.
-    // Resume restarts preserve context → the implicit next-drain ack (A)
-    // handles it; settle would prematurely close messages the resumed agent
-    // still has in context. (agend-customization#159)
+    // Session-reset inbox handoff: for a FRESH restart (context-lost), requeue
+    // all unconfirmed DELIVERING rows before killing the old instance. The
+    // successor must be able to recover them; durable delivery history lets a
+    // later targeted ack close exactly one requeued row. #159's old settle
+    // rationale avoided stale re-injection by stamping read_at, but could
+    // silently lose an unconfirmed message; #3228 intentionally chooses
+    // visible redelivery and recovery. Resume restarts preserve context → the
+    // implicit next-drain ack (A) handles it.
     if mode != "resume" {
-        crate::inbox::settle_delivering_for_session_reset(home, name);
+        crate::inbox::requeue_delivering_for_session_reset(home, name);
     }
 
     let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {

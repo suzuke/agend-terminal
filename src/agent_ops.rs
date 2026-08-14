@@ -1268,6 +1268,10 @@ mod tests {
     /// without reaching an adapter or recreating receipt state.
     #[test]
     fn external_delete_fences_queued_transport_before_early_return() {
+        run_external_delete_fixture(true);
+    }
+
+    fn run_external_delete_fixture(send_outcome: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -1276,6 +1280,8 @@ mod tests {
         let _full_guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(false);
         let _delivery_hook = crate::transport::test_support::delivery_hook_guard();
+        let _cleanup_release_tail_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_release_tail_hook_guard();
         let adapter_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let adapter_calls_hook = std::sync::Arc::clone(&adapter_calls);
         let expected_home = home.clone();
@@ -1293,6 +1299,49 @@ mod tests {
             },
         )));
 
+        // #3240 slice 2. Lane entry is an ORDERING fact, and this fixture used to
+        // assert it with a one-second wall-clock budget that had to cover a
+        // thread spawn, a global lane-map lock, a keyed mutex, this admission
+        // hook and an epoch-state lock — so a loaded machine failed a healthy
+        // run. The hook below deliberately pushes admission PAST that old budget
+        // exactly once, so re-introducing any clock-based readiness wait fails
+        // deterministically here instead of flaking somewhere else later.
+        //
+        // The delay is UNCONDITIONAL, and nothing else needs to be: the hook runs
+        // only inside `with_transport_serial` (daemon/delivery_worker.rs:337-340),
+        // while the queued worker takes the lane itself and hands the guard to
+        // `dispatch_transport` (:468-471), which never runs the hook. So this
+        // delay cannot reach the dispatch assertion further down, and a latch to
+        // keep it away from there would be guarding a path that does not exist.
+        const LANE_ADMISSION_DELAY: Duration = Duration::from_millis(1200);
+        let _admission_guard =
+            crate::daemon::delivery_worker::test_support::direct_transport_admission_hook_guard();
+        let _cleanup_before_lane_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_before_lane_acquire_hook_guard();
+        let admission_home = home.clone();
+        let admission_agent = agent.clone();
+        crate::daemon::delivery_worker::test_support::set_direct_transport_admission_hook(Some(
+            std::sync::Arc::new(move |hook_home: &std::path::Path, hook_agent: &str| {
+                if hook_home == admission_home.as_path() && hook_agent == admission_agent {
+                    std::thread::sleep(LANE_ADMISSION_DELAY);
+                }
+            }),
+        ));
+
+        // Deterministic treatment for the completion clock: the cleanup tail
+        // is a real post-lane release path, so delaying it here reproduces the
+        // Windows panic without relying on scheduler or filesystem load.
+        const CLEANUP_RELEASE_TAIL_DELAY: Duration = Duration::from_millis(1200);
+        let tail_home = home.clone();
+        let tail_agent = agent.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_release_tail_hook(Some(
+            std::sync::Arc::new(move |hook_home, hook_agent| {
+                if hook_home == tail_home.as_path() && hook_agent == tail_agent {
+                    std::thread::sleep(CLEANUP_RELEASE_TAIL_DELAY);
+                }
+            }),
+        ));
+
         let (lane_entered_tx, lane_entered_rx) = std::sync::mpsc::channel();
         let (lane_release_tx, lane_release_rx) = std::sync::mpsc::channel();
         let lane_home = home.clone();
@@ -1305,9 +1354,31 @@ mod tests {
                     .expect("lane release");
             });
         });
+        // A BARRIER, not a clock. The ordering fact this fixture needs is
+        // narrow and worth stating exactly: the holder has entered the
+        // SYNCHRONOUS `with_transport_serial` path — past the lane acquire and
+        // past the test admission hook — because that is where it sends. It
+        // says nothing about the queued worker, which reaches
+        // `dispatch_transport` by a different route. No wall-clock budget can
+        // express even that much: too short flakes on a loaded machine, too
+        // long only delays the flake. The wait is bounded by DISCONNECTION instead — if the holder
+        // thread dies or panics, its sender drops and `recv()` returns `Err`
+        // immediately, so a genuine failure stays fast and named rather than
+        // becoming a hang. Teardown below keeps its own explicit bounds.
+        //
+        // DISCONNECT-BOUNDED IS NOT DEADLOCK-BOUNDED, and the difference is not
+        // uniform across CI. If the holder neither finishes nor dies — wedged
+        // inside `TransportLaneGuard::acquire`, say — its sender never drops and
+        // this wait has no bound of its own. In the Check jobs nextest's `ci`
+        // profile terminates a stuck test after its slow-timeout periods and
+        // NAMES it. The Coverage job does not: it runs `cargo llvm-cov --tests`,
+        // i.e. libtest, which has no per-test timeout, so there the same wedge
+        // degrades into an anonymous step timeout. That is the trade this
+        // barrier makes against the wall-clock budget it replaced, recorded here
+        // rather than left for whoever meets it.
         lane_entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("lane holder must enter");
+            .recv()
+            .expect("lane holder must enter (sender dropped => holder thread died)");
 
         assert!(crate::daemon::delivery_worker::enqueue_transport_delivery(
             &home,
@@ -1335,46 +1406,85 @@ mod tests {
         let delete_registry = std::sync::Arc::clone(&registry);
         let delete_configs = std::sync::Arc::clone(&configs);
         let (delete_tx, delete_rx) = std::sync::mpsc::channel();
+        let (marker_tx, marker_rx) = std::sync::mpsc::channel();
+        let (marker_continue_tx, marker_continue_rx) = std::sync::mpsc::channel();
+        // #3240 slice 4: this is a fixed pre-acquire rendezvous, not a marker
+        // observer. The marker assertion runs while the delete thread is held
+        // at this seam, before it can acquire the already-held transport lane.
+        // Named RED controls exercised during implementation (temporary only):
+        // M2 moves mark_deleting after lane acquire; old-clock delays delete
+        // entry by 1200ms; child-death panics before this seam. Each must fail
+        // or disconnect without leaving a sender owned by the test thread.
+        let marker_home = home.clone();
+        let marker_agent = agent.clone();
+        let expected_marker_home = home.clone();
+        let expected_marker_agent = agent.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_before_lane_acquire_hook(Some(
+            std::sync::Arc::new(move |hook_home, hook_agent| {
+                if hook_home == expected_marker_home.as_path()
+                    && hook_agent == expected_marker_agent
+                {
+                    crate::daemon::delivery_worker::test_support::
+                        notify_cleanup_before_lane_acquire(hook_home, hook_agent);
+                }
+            }),
+        ));
         let delete_thread = std::thread::spawn(move || {
+            let _marker_observer =
+                crate::daemon::delivery_worker::test_support::cleanup_before_lane_acquire_observer(
+                    &marker_home,
+                    &marker_agent,
+                    marker_tx,
+                    marker_continue_rx,
+                );
             let context = DeleteContext {
                 registry: &delete_registry,
                 configs: &delete_configs,
                 externals: &delete_externals,
                 notifier: None,
             };
-            delete_tx
-                .send(delete_instance(
-                    &delete_home,
-                    &delete_agent,
-                    &context,
-                    false,
-                ))
-                .expect("delete outcome observer");
+            let outcome = delete_instance(&delete_home, &delete_agent, &context, false);
+            if send_outcome {
+                delete_tx.send(outcome).expect("delete outcome observer");
+            }
         });
 
-        let marker_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !crate::agent::deleting::is_deleting(&home, &agent)
-            && std::time::Instant::now() < marker_deadline
-        {
-            std::thread::yield_now();
-        }
-        assert!(
-            crate::agent::deleting::is_deleting(&home, &agent),
-            "external delete must mark the name before waiting for its transport lane"
-        );
-        assert!(
-            delete_rx.try_recv().is_err(),
-            "external delete must remain behind the held transport lane"
-        );
+        let marker_observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            marker_rx.recv().expect(
+                "external delete marker observer disconnected: delete thread died before cleanup lane",
+            );
+            assert!(
+                crate::agent::deleting::is_deleting(&home, &agent),
+                "external delete must mark the name before waiting for its transport lane"
+            );
+            assert!(
+                delete_rx.try_recv().is_err(),
+                "external delete must remain behind the held transport lane"
+            );
+        }));
+        let _ = marker_continue_tx.send(());
+        marker_observation.expect("external delete marker ordering observation");
 
         lane_release_tx.send(()).expect("release lane");
         lane_holder.join().expect("lane holder");
-        assert_eq!(
-            delete_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("external delete outcome"),
-            DeleteOutcome::External
-        );
+
+        if send_outcome {
+            assert_eq!(
+                delete_rx.recv().expect(
+                    "external delete outcome sender dropped before sending outcome (RecvError)",
+                ),
+                DeleteOutcome::External
+            );
+        } else {
+            let disconnected: std::sync::mpsc::RecvError = delete_rx.recv().expect_err(
+                "external delete outcome sender dropped before sending outcome (RecvError)",
+            );
+            assert_eq!(
+                format!("{disconnected:?}"),
+                "RecvError",
+                "external delete completion must fail with the named RecvError"
+            );
+        }
         delete_thread.join().expect("delete thread");
 
         let dispatch_deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1409,6 +1519,13 @@ mod tests {
             "external delete must remove the external registry entry"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// The real external-delete thread can disconnect before reporting its
+    /// outcome; the fixture's own completion receiver must surface RecvError.
+    #[test]
+    fn external_delete_completion_disconnect_control() {
+        run_external_delete_fixture(false);
     }
 
     #[test]

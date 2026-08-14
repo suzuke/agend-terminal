@@ -72,6 +72,10 @@ impl NotifySource<'_> {
     }
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboxMessage {
     #[serde(default)]
@@ -99,6 +103,16 @@ pub struct InboxMessage {
     /// (`#[serde(default)]`) → reads as unread/processed exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivering_at: Option<String>,
+    /// Monotone count of actual unread → delivering transitions. Reclaim and
+    /// session reset clear `delivering_at` but never erase this history, so a
+    /// targeted ack can distinguish a previously delivered row from one that
+    /// was never handed to an agent. Zero is omitted for legacy/canonical rows.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub delivery_count: u64,
+    /// Timestamp of the first unread → delivering transition. Preserved across
+    /// reclaim and session reset; absent on legacy and never-delivered rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_delivered_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +239,15 @@ pub struct InboxMessage {
     pub ci_handoff_settlement: Option<CiHandoffSettlement>,
 }
 
+/// Delivery history projected into a live inbox response. This is derived
+/// metadata, not a second copy of the canonical message payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeliveryHistory {
+    pub message_id: Option<String>,
+    pub delivery_count: u64,
+    pub first_delivered_at: Option<String>,
+}
+
 /// Reply-to correlation context for a quoted bot message (resolved from the
 /// `sent_ledger`). Kept as its own struct rather than reusing the top-level
 /// `task_id`/`correlation_id` fields, which carry THIS message's own dispatch
@@ -273,6 +296,8 @@ pub struct BroadcastContext {
 
 impl InboxMessage {
     /// Latest schema version this binary can read and write.
+    // Keep this at 1: rollback binaries may drop derived redelivery metadata on
+    // rewrite, but a version bump would make newer rows undeliverable to them.
     pub const CURRENT_VERSION: u32 = 1;
 
     pub fn new_system(
@@ -302,6 +327,17 @@ impl InboxMessage {
     pub fn with_delivery_mode(mut self, mode: impl Into<String>) -> Self {
         self.delivery_mode = Some(mode.into());
         self
+    }
+
+    /// Build the response metadata for a row delivered more than once.
+    /// Keeping this projection beside the durable fields gives every live
+    /// response producer the same identity-preserving redelivery contract.
+    pub fn redelivery_history(&self) -> Option<DeliveryHistory> {
+        (self.delivery_count > 1).then(|| DeliveryHistory {
+            message_id: self.id.clone(),
+            delivery_count: self.delivery_count,
+            first_delivered_at: self.first_delivered_at.clone(),
+        })
     }
 }
 

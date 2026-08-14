@@ -1,7 +1,8 @@
 use super::notify::route_notification;
-use super::storage::{inbox_path, inbox_path_for_id};
+use super::storage::{inbox_path, inbox_path_for_id, set_row_delivering_at_for_test};
 use super::*;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -49,6 +50,269 @@ fn tmp_home_starts_clean_when_suffix_is_reused() {
 
 fn make_msg(from: &str, text: &str) -> InboxMessage {
     msg().sender(from).text(text).build()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConcurrentEnqueueDiagnostics {
+    physical_rows: usize,
+    parseable_rows: usize,
+    malformed_rows: usize,
+    distinct_ids: usize,
+    duplicate_ids: usize,
+    missing_ids: usize,
+    unread_rows: usize,
+    delivering_rows: usize,
+    processed_rows: usize,
+    invalid_state_rows: usize,
+}
+
+const CLEAR_COMPACT_ROW_SAMPLE_CAP: usize = 12;
+const CLEAR_COMPACT_ID_TRACK_CAP: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClearCompactRowEvidence {
+    line: usize,
+    byte_len: usize,
+    class: &'static str,
+    identity: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClearCompactInputDiagnostics {
+    physical_rows: usize,
+    parseable_rows: usize,
+    malformed_rows: usize,
+    forward_schema_rows: usize,
+    pre_read_rows: usize,
+    delivering_rows: usize,
+    total_bytes: usize,
+    tracked_distinct_ids: usize,
+    duplicate_ids_observed: usize,
+    missing_ids: usize,
+    identity_rows_untracked: usize,
+    sampled_rows: Vec<ClearCompactRowEvidence>,
+    samples_omitted: usize,
+}
+
+fn bounded_row_identity(line: &str, message: Option<&InboxMessage>) -> String {
+    if let Some(id) = message.and_then(|message| message.id.as_deref()) {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(id.as_bytes());
+        let prefix = digest
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        return format!("id_sha256={prefix},id_bytes={}", id.len());
+    }
+
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(line.as_bytes());
+    let prefix = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256={prefix}")
+}
+
+fn clear_compact_id_digest(id: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(id.as_bytes()).into()
+}
+
+fn classify_clear_compact_input(raw: &str) -> ClearCompactInputDiagnostics {
+    let mut diagnostics = ClearCompactInputDiagnostics {
+        total_bytes: raw.len(),
+        ..Default::default()
+    };
+    let mut tracked_ids = HashSet::with_capacity(CLEAR_COMPACT_ID_TRACK_CAP);
+    let mut priority = Vec::with_capacity(CLEAR_COMPACT_ROW_SAMPLE_CAP);
+    let mut first_clean = Vec::new();
+    let mut last_clean = Vec::new();
+
+    for (index, line) in raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        diagnostics.physical_rows += 1;
+        let parsed = serde_json::from_str::<InboxMessage>(line).ok();
+        let (class, noteworthy) = match parsed.as_ref() {
+            None => {
+                diagnostics.malformed_rows += 1;
+                ("malformed", true)
+            }
+            Some(message) if message.schema_version > InboxMessage::CURRENT_VERSION => {
+                diagnostics.parseable_rows += 1;
+                diagnostics.forward_schema_rows += 1;
+                ("forward-schema", true)
+            }
+            Some(message) => {
+                diagnostics.parseable_rows += 1;
+                if message.read_at.is_some() {
+                    diagnostics.pre_read_rows += 1;
+                }
+                if message.delivering_at.is_some() {
+                    diagnostics.delivering_rows += 1;
+                }
+                match message.id.as_deref() {
+                    Some(id) => {
+                        let digest = clear_compact_id_digest(id);
+                        if tracked_ids.contains(&digest) {
+                            diagnostics.duplicate_ids_observed += 1;
+                        } else if tracked_ids.len() < CLEAR_COMPACT_ID_TRACK_CAP {
+                            tracked_ids.insert(digest);
+                        } else {
+                            diagnostics.identity_rows_untracked += 1;
+                        }
+                    }
+                    None => diagnostics.missing_ids += 1,
+                }
+                if message.read_at.is_some() {
+                    ("pre-read", true)
+                } else if message.delivering_at.is_some() {
+                    ("delivering", true)
+                } else if message.id.is_none() {
+                    ("missing-id", true)
+                } else {
+                    ("current-schema", false)
+                }
+            }
+        };
+        let evidence = ClearCompactRowEvidence {
+            line: index + 1,
+            byte_len: line.len(),
+            class,
+            identity: bounded_row_identity(line, parsed.as_ref()),
+        };
+        if noteworthy {
+            if priority.len() < CLEAR_COMPACT_ROW_SAMPLE_CAP {
+                priority.push(evidence);
+            }
+        } else {
+            if first_clean.len() < 2 {
+                first_clean.push(evidence.clone());
+            }
+            last_clean.push(evidence);
+            if last_clean.len() > 2 {
+                last_clean.remove(0);
+            }
+        }
+    }
+
+    for evidence in priority.into_iter().chain(first_clean).chain(last_clean) {
+        if diagnostics.sampled_rows.len() == CLEAR_COMPACT_ROW_SAMPLE_CAP {
+            break;
+        }
+        if diagnostics
+            .sampled_rows
+            .iter()
+            .any(|sample| sample.line == evidence.line)
+        {
+            continue;
+        }
+        diagnostics.sampled_rows.push(evidence);
+    }
+    diagnostics.samples_omitted = diagnostics
+        .physical_rows
+        .saturating_sub(diagnostics.sampled_rows.len());
+    diagnostics.tracked_distinct_ids = tracked_ids.len();
+    diagnostics
+}
+
+fn read_clear_compact_input_diagnostics(
+    path: &Path,
+) -> std::io::Result<ClearCompactInputDiagnostics> {
+    let raw = fs::read(path)?;
+    Ok(classify_clear_compact_input(&String::from_utf8_lossy(&raw)))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConcurrentEnqueueFailureClass {
+    AppendSideCorruption,
+    AppendSideAbsence,
+    AppendSideIdentityAnomaly,
+    DrainRewriteCorruption,
+    DrainRewriteIdentityAnomaly,
+    DrainRewriteLoss,
+    DrainStateOmission,
+    SnapshotUnavailable,
+    Unclassified,
+}
+
+fn classify_concurrent_enqueue_rows(raw: &str) -> ConcurrentEnqueueDiagnostics {
+    let mut diagnostics = ConcurrentEnqueueDiagnostics::default();
+    let mut ids = HashSet::new();
+
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        diagnostics.physical_rows += 1;
+        let Ok(message) = serde_json::from_str::<InboxMessage>(line) else {
+            diagnostics.malformed_rows += 1;
+            continue;
+        };
+
+        diagnostics.parseable_rows += 1;
+        match message.id {
+            Some(id) => {
+                if !ids.insert(id) {
+                    diagnostics.duplicate_ids += 1;
+                }
+            }
+            None => diagnostics.missing_ids += 1,
+        }
+
+        match (message.read_at.is_some(), message.delivering_at.is_some()) {
+            (false, false) => diagnostics.unread_rows += 1,
+            (false, true) => diagnostics.delivering_rows += 1,
+            (true, false) => diagnostics.processed_rows += 1,
+            (true, true) => diagnostics.invalid_state_rows += 1,
+        }
+    }
+
+    diagnostics.distinct_ids = ids.len();
+    diagnostics
+}
+
+fn read_concurrent_enqueue_diagnostics(
+    path: &Path,
+) -> std::io::Result<ConcurrentEnqueueDiagnostics> {
+    let raw = fs::read(path)?;
+    Ok(classify_concurrent_enqueue_rows(&String::from_utf8_lossy(
+        &raw,
+    )))
+}
+
+fn classify_concurrent_enqueue_failure(
+    pre_drain: Option<&ConcurrentEnqueueDiagnostics>,
+    post_drain: Option<&ConcurrentEnqueueDiagnostics>,
+    drained_rows: usize,
+) -> ConcurrentEnqueueFailureClass {
+    let Some(pre_drain) = pre_drain else {
+        return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
+    };
+    let Some(post_drain) = post_drain else {
+        return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
+    };
+    let pre_identity_anomalies = pre_drain.duplicate_ids + pre_drain.missing_ids;
+    let post_identity_anomalies = post_drain.duplicate_ids + post_drain.missing_ids;
+    if pre_drain.malformed_rows > 0 && post_drain.malformed_rows <= pre_drain.malformed_rows {
+        ConcurrentEnqueueFailureClass::AppendSideCorruption
+    } else if post_drain.malformed_rows > pre_drain.malformed_rows {
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    } else if pre_identity_anomalies > 0 && post_identity_anomalies <= pre_identity_anomalies {
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    } else if post_identity_anomalies > pre_identity_anomalies {
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    } else if pre_drain.physical_rows < 20 {
+        ConcurrentEnqueueFailureClass::AppendSideAbsence
+    } else if post_drain.physical_rows < 20 {
+        ConcurrentEnqueueFailureClass::DrainRewriteLoss
+    } else if drained_rows < 20 {
+        ConcurrentEnqueueFailureClass::DrainStateOmission
+    } else {
+        ConcurrentEnqueueFailureClass::Unclassified
+    }
 }
 
 struct TestMsgBuilder(InboxMessage);
@@ -2248,7 +2512,21 @@ fn clear_compact_summaries_bounded() {
         )
         .unwrap();
     }
+    let path = inbox_path_resolved(&home, "a1");
+    let pre_clear = read_clear_compact_input_diagnostics(&path).unwrap_or_else(|error| {
+        panic!(
+            "pre-clear input census failed for retained artifact {}: {error}",
+            path.display()
+        )
+    });
     let r = clear_compact(&home, "a1", |_| None);
+    if r.cleared_count != 250 {
+        panic!(
+            "all 250 rows must clear; got {}; retained_artifact={}; pre_clear={pre_clear:#?}",
+            r.cleared_count,
+            path.display()
+        );
+    }
     assert_eq!(r.cleared_count, 250, "all 250 cleared");
     assert_eq!(
         r.summaries.len(),
@@ -2260,6 +2538,99 @@ fn clear_compact_summaries_bounded() {
         "overflow counted, not dropped silently"
     );
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn clear_compact_input_diagnostics_distinguish_failure_branches() {
+    let clean_row = |i: usize| {
+        serde_json::to_string(
+            &msg()
+                .sender("x")
+                .kind("update")
+                .id(&format!("u{i}"))
+                .build(),
+        )
+        .unwrap()
+    };
+
+    let mut malformed_rows = (0..249).map(&clean_row).collect::<Vec<_>>();
+    malformed_rows.push("{not-json".to_string());
+    let malformed = classify_clear_compact_input(&(malformed_rows.join("\n") + "\n"));
+    assert_eq!(malformed.physical_rows, 250);
+    assert_eq!(malformed.parseable_rows, 249);
+    assert_eq!(malformed.malformed_rows, 1);
+    assert!(malformed
+        .sampled_rows
+        .iter()
+        .any(|row| row.class == "malformed" && row.byte_len == 9));
+
+    let capped_rows = (0..20)
+        .map(|i| format!("{{malformed-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let capped = classify_clear_compact_input(&capped_rows);
+    assert_eq!(capped.physical_rows, 20);
+    assert_eq!(capped.sampled_rows.len(), CLEAR_COMPACT_ROW_SAMPLE_CAP);
+    assert_eq!(capped.samples_omitted, 8);
+
+    let mut pre_read_rows = Vec::new();
+    for i in 0..250 {
+        let mut message = msg()
+            .sender("x")
+            .kind("update")
+            .id(&format!("u{i}"))
+            .build();
+        if i == 137 {
+            message.read_at = Some("2025-01-01T00:00:00Z".to_string());
+        }
+        pre_read_rows.push(serde_json::to_string(&message).unwrap());
+    }
+    let pre_read = classify_clear_compact_input(&(pre_read_rows.join("\n") + "\n"));
+    assert_eq!(pre_read.physical_rows, 250);
+    assert_eq!(pre_read.parseable_rows, 250);
+    assert_eq!(pre_read.pre_read_rows, 1);
+    assert!(pre_read
+        .sampled_rows
+        .iter()
+        .any(|row| row.class == "pre-read"
+            && row.identity.starts_with("id_sha256=")
+            && row.identity.ends_with(",id_bytes=4")));
+
+    let oversized_id = "sensitive-id".repeat(10_000);
+    let oversized = msg().sender("x").id(&oversized_id).build();
+    let oversized =
+        classify_clear_compact_input(&(serde_json::to_string(&oversized).unwrap() + "\n"));
+    assert!(!oversized.sampled_rows[0].identity.contains("sensitive-id"));
+    assert!(oversized.sampled_rows[0].identity.len() < 64);
+
+    let many_unique_ids = (0..300).map(clean_row).collect::<Vec<_>>().join("\n") + "\n";
+    let many_unique_ids = classify_clear_compact_input(&many_unique_ids);
+    assert_eq!(
+        many_unique_ids.tracked_distinct_ids,
+        CLEAR_COMPACT_ID_TRACK_CAP
+    );
+    assert_eq!(many_unique_ids.identity_rows_untracked, 44);
+    assert_eq!(many_unique_ids.duplicate_ids_observed, 0);
+
+    let absent_rows = (0..249).map(clean_row).collect::<Vec<_>>().join("\n") + "\n";
+    let absent = classify_clear_compact_input(&absent_rows);
+    assert_eq!(absent.physical_rows, 249);
+    assert_eq!(absent.parseable_rows, 249);
+    assert_eq!(absent.malformed_rows, 0);
+    assert_eq!(absent.pre_read_rows, 0);
+    assert!(absent
+        .sampled_rows
+        .iter()
+        .any(|row| row.line == 249 && row.identity.ends_with(",id_bytes=4")));
+
+    let mut forward = msg().sender("newer").id("future").build();
+    forward.schema_version = InboxMessage::CURRENT_VERSION + 1;
+    let forward = classify_clear_compact_input(&(serde_json::to_string(&forward).unwrap() + "\n"));
+    assert_eq!(forward.physical_rows, 1);
+    assert_eq!(forward.parseable_rows, 1);
+    assert_eq!(forward.forward_schema_rows, 1);
+    assert_eq!(forward.sampled_rows[0].class, "forward-schema");
 }
 
 #[test]
@@ -2401,15 +2772,167 @@ fn test_enqueue_concurrent_same_agent() {
         h.join().expect("thread should not panic");
     }
 
+    let path = inbox_path_resolved(&home, "agent1");
+    let pre_drain = read_concurrent_enqueue_diagnostics(&path).unwrap_or_else(|error| {
+        panic!("pre-drain snapshot failed for {}: {error}", path.display())
+    });
     let msgs = drain(&home, "agent1");
-    assert_eq!(
-        msgs.len(),
-        20,
-        "all 20 concurrent enqueues must survive, got {}",
-        msgs.len()
-    );
+    if msgs.len() != 20 {
+        let (post_drain, post_drain_read_error) = match read_concurrent_enqueue_diagnostics(&path) {
+            Ok(diagnostics) => (Some(diagnostics), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let failure_class =
+            classify_concurrent_enqueue_failure(Some(&pre_drain), post_drain.as_ref(), msgs.len());
+        panic!(
+            "all 20 concurrent enqueues must survive, got {}; path={}; failure_class={failure_class:?}; pre-drain diagnostics={pre_drain:#?}; post-drain diagnostics={post_drain:#?}; post-drain read error={post_drain_read_error:?}",
+            msgs.len(),
+            path.display(),
+        );
+    }
 
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn concurrent_enqueue_classifier_counts_row_states_and_ids() {
+    let unread = serde_json::to_string(&msg().sender("unread").id("m-1").build()).unwrap();
+    let mut delivering = msg().sender("delivering").id("m-1").build();
+    delivering.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
+    let delivering = serde_json::to_string(&delivering).unwrap();
+    let mut processed = msg().sender("processed").id("m-2").build();
+    processed.read_at = Some("2025-01-01T00:00:00Z".to_string());
+    let processed = serde_json::to_string(&processed).unwrap();
+    let mut invalid = msg().sender("invalid").id("m-3").build();
+    invalid.read_at = Some("2025-01-01T00:00:00Z".to_string());
+    invalid.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
+    let invalid = serde_json::to_string(&invalid).unwrap();
+    let missing_id = serde_json::to_string(&msg().sender("missing-id").build()).unwrap();
+    let raw =
+        format!("{unread}\n{delivering}\n{processed}\n{invalid}\n{missing_id}\n{{not-json}}\n");
+
+    assert_eq!(
+        classify_concurrent_enqueue_rows(&raw),
+        ConcurrentEnqueueDiagnostics {
+            physical_rows: 6,
+            parseable_rows: 5,
+            malformed_rows: 1,
+            distinct_ids: 3,
+            duplicate_ids: 1,
+            missing_ids: 1,
+            unread_rows: 2,
+            delivering_rows: 1,
+            processed_rows: 1,
+            invalid_state_rows: 1,
+        }
+    );
+
+    let invalid_utf8 = String::from_utf8_lossy(b"{not-json\xff}\n");
+    assert_eq!(
+        classify_concurrent_enqueue_rows(&invalid_utf8),
+        ConcurrentEnqueueDiagnostics {
+            physical_rows: 1,
+            malformed_rows: 1,
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn concurrent_enqueue_failure_classification_decision_table() {
+    let counts = |physical_rows| ConcurrentEnqueueDiagnostics {
+        physical_rows,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(19)), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteLoss
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(19)), Some(&counts(19)), 19),
+        ConcurrentEnqueueFailureClass::AppendSideAbsence
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(20)), 19),
+        ConcurrentEnqueueFailureClass::DrainStateOmission
+    );
+
+    let malformed = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 19,
+        malformed_rows: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&malformed), Some(&malformed), 19),
+        ConcurrentEnqueueFailureClass::AppendSideCorruption
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&malformed), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    );
+    let more_malformed = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 18,
+        malformed_rows: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&malformed), Some(&more_malformed), 18),
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    );
+
+    let duplicate = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 19,
+        duplicate_ids: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&duplicate), Some(&duplicate), 19),
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    );
+
+    let missing = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 19,
+        missing_ids: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&missing), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&duplicate), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    let more_duplicate = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 18,
+        duplicate_ids: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&duplicate), Some(&more_duplicate), 18),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(None, Some(&counts(20)), 19),
+        ConcurrentEnqueueFailureClass::SnapshotUnavailable
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), None, 19),
+        ConcurrentEnqueueFailureClass::SnapshotUnavailable
+    );
 }
 
 #[test]
@@ -4503,13 +5026,12 @@ fn reclaim_renudge_classifier_runs_unlocked_not_under_inbox_lock() {
     );
 }
 
-// ── Session-reset settle (agend-customization#159) ──────────────────────
+// ── Session-reset requeue (#3228) ───────────────────────────────────────
 
-/// settle_delivering_for_session_reset transitions all DELIVERING rows to
-/// PROCESSED (stamps read_at) — the core invariant. After settle, those rows
-/// must NOT be re-delivered by drain() nor reverted by reclaim_stale_delivering().
+/// A fresh session reset requeues all DELIVERING rows, preserving them for the
+/// successor rather than claiming they were processed by the lost context.
 #[test]
-fn settle_transitions_delivering_to_processed() {
+fn settle_requeues_delivering_for_successor() {
     let home = tmp_home("settle-basic");
     let agent = "settle-agent";
 
@@ -4530,18 +5052,18 @@ fn settle_transitions_delivering_to_processed() {
     assert_eq!(drained.len(), 3, "all 3 should drain");
 
     // At this point all 3 are DELIVERING (delivering_at set, read_at None).
-    // Settle them as if this were a session-reset.
-    let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 3, "all 3 delivering rows should be settled");
+    // Requeue them as if this were a session-reset.
+    let settled = requeue_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 3, "all 3 delivering rows should be requeued");
 
-    // Verify: a subsequent drain returns nothing (all are now PROCESSED).
+    // Verify: a subsequent drain returns all 3 for the successor.
     let post_settle_drain = drain(&home, agent);
-    assert!(
-        post_settle_drain.is_empty(),
-        "no messages should be drainable after settle"
-    );
+    assert_eq!(post_settle_drain.len(), 3);
+    assert!(post_settle_drain.iter().all(|m| m.read_at.is_none()));
+    assert!(post_settle_drain.iter().all(|m| m.delivery_count == 2));
 
-    // Verify: reclaim does NOT revert them (they have read_at set now).
+    // The successor's drain is now in flight; the normal next-drain implicit
+    // ack closes that batch, and reclaim cannot resurrect it while fresh.
     reclaim_stale_delivering(&home);
     let post_reclaim_drain = drain(&home, agent);
     assert!(
@@ -4552,8 +5074,8 @@ fn settle_transitions_delivering_to_processed() {
     fs::remove_dir_all(&home).ok();
 }
 
-/// settle must NOT touch UNREAD rows — only DELIVERING rows are settled.
-/// Unread messages (never drained) must remain available for the new session.
+/// Requeue must NOT touch UNREAD rows — both the prior delivering row and the
+/// never-drained row remain available for the new session.
 #[test]
 fn settle_does_not_touch_unread() {
     let home = tmp_home("settle-unread");
@@ -4581,14 +5103,15 @@ fn settle_does_not_touch_unread() {
     )
     .unwrap();
 
-    // Settle: should only settle the 1 delivering row, not the unread one.
-    let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 1, "only the delivering row should be settled");
+    // Requeue: should only requeue the 1 delivering row, not discard either.
+    let settled = requeue_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 1, "only the delivering row should be requeued");
 
-    // The unread message should still be drainable.
+    // Both messages should be drainable; neither was silently dropped.
     let post = drain(&home, agent);
-    assert_eq!(post.len(), 1, "the unread message must survive settle");
-    assert_eq!(post[0].text, "unread msg");
+    assert_eq!(post.len(), 2, "both messages must survive reset");
+    assert!(post.iter().any(|m| m.text == "drained msg"));
+    assert!(post.iter().any(|m| m.text == "unread msg"));
 
     fs::remove_dir_all(&home).ok();
 }
@@ -4607,21 +5130,20 @@ fn settle_is_idempotent() {
     .unwrap();
     drain(&home, agent);
 
-    let first = settle_delivering_for_session_reset(&home, agent);
+    let first = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(first, 1);
 
-    // Second settle: already processed → 0 newly settled.
-    let second = settle_delivering_for_session_reset(&home, agent);
+    // Second reset: already requeued → 0 newly requeued.
+    let second = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(second, 0, "idempotent: no rows to settle on second call");
 
     fs::remove_dir_all(&home).ok();
 }
 
-/// #159 end-to-end: the reclaim-stale-delivering path must NOT re-page an
-/// agent whose delivering rows were settled by a session-reset. This is the
-/// specific scenario that caused stale re-injection.
+/// #3228 end-to-end: a stale delivering row is requeued by session reset and
+/// remains available to the successor instead of being processed.
 #[test]
-fn settled_rows_immune_to_reclaim_and_renudge() {
+fn reset_requeues_stale_delivering_row() {
     let home = tmp_home("settle-reclaim");
     let agent = "settle-reclaim-agent";
 
@@ -4646,19 +5168,16 @@ fn settled_rows_immune_to_reclaim_and_renudge() {
     )
     .unwrap();
 
-    // Settle it (session-reset path).
-    let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 1, "the stale delivering row should be settled");
+    // Requeue it (session-reset path).
+    let settled = requeue_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 1, "the stale delivering row should be requeued");
 
-    // Now run reclaim — it should find nothing to revert (read_at is set).
+    // Reclaim has nothing to do because reset already cleared delivering_at.
     reclaim_stale_delivering(&home);
 
-    // Verify the message is still PROCESSED (not reverted to unread).
+    // Verify the message is still available for the successor.
     let post = drain(&home, agent);
-    assert!(
-        post.is_empty(),
-        "settled row must not be reverted by reclaim → no drainable messages"
-    );
+    assert_eq!(post.len(), 1, "requeued row must remain drainable");
 
     fs::remove_dir_all(&home).ok();
 }
@@ -5082,6 +5601,165 @@ fn audit3_005_reclaim_stale_delivering_preserves_corrupt_line() {
         a3005_read(&home, "ag").contains("CORRUPT-005"),
         "reclaim_stale_delivering must PRESERVE the unparseable line"
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+// ── Durable redelivery history (#3228) ─────────────────────────────────
+
+/// A quiet agent can outlive several reclaim TTLs without losing the fact that
+/// the row was delivered.  The response must expose that history while the
+/// stored message identity and canonical text remain unchanged.
+#[test]
+fn redelivery_history_survives_repeated_quiet_cycles_and_targeted_ack() {
+    let home = tmp_home("redelivery-history");
+    let agent = "redelivery-history-agent";
+    let id = "m-redelivery-history";
+    let original = msg()
+        .id(id)
+        .sender("lead")
+        .text("do not mutate this canonical text")
+        .kind("query")
+        .build();
+    enqueue(&home, agent, original.clone()).unwrap();
+
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1);
+    let first_json = serde_json::to_value(&first[0]).unwrap();
+    assert_eq!(first_json["delivery_count"], 1);
+    let first_delivered_at = first_json["first_delivered_at"].clone();
+    assert!(first_delivered_at.is_string());
+    assert_eq!(first[0].id, original.id);
+    assert_eq!(first[0].text, original.text);
+
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let second = drain(&home, agent);
+    assert_eq!(second.len(), 1);
+    let second_json = serde_json::to_value(&second[0]).unwrap();
+    assert_eq!(second_json["delivery_count"], 2);
+    assert_eq!(second_json["first_delivered_at"], first_delivered_at);
+    assert_eq!(second[0].id, original.id);
+    assert_eq!(second[0].text, original.text);
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let third = drain(&home, agent);
+    assert_eq!(third.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&third[0]).unwrap()["delivery_count"],
+        3
+    );
+
+    // The row is unread again after reclaim, but targeted ack may settle it
+    // because durable history proves it was delivered before.
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    assert_eq!(ack(&home, agent, Some(id)), 1);
+    assert!(drain(&home, agent).is_empty());
+
+    // A never-delivered targeted ack remains conservative and cannot silently
+    // discard the message.
+    let never = msg()
+        .id("m-never-delivered")
+        .sender("lead")
+        .text("must survive")
+        .kind("query")
+        .build();
+    enqueue(&home, agent, never).unwrap();
+    assert_eq!(ack(&home, agent, Some("m-never-delivered")), 0);
+    assert_eq!(drain(&home, agent).len(), 1);
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Reclaim history is metadata-only: attachments and the canonical message
+/// payload must be byte-for-byte equivalent across redelivery.
+#[test]
+fn redelivery_history_preserves_attachment_payload() {
+    use crate::channel::event::{Attachment, AttachmentKind};
+
+    let home = tmp_home("redelivery-attachment");
+    let agent = "redelivery-attachment-agent";
+    let original = msg()
+        .id("m-redelivery-attachment")
+        .sender("telegram:user")
+        .text("caption stays canonical")
+        .kind("query")
+        .attachments(vec![Attachment {
+            kind: AttachmentKind::Photo,
+            path: "/tmp/redelivery-photo.jpg".into(),
+            mime: Some("image/jpeg".into()),
+            caption: Some("a caption".into()),
+            size_bytes: Some(1234),
+            original_filename: Some("photo.jpg".into()),
+        }])
+        .build();
+    enqueue(&home, agent, original.clone()).unwrap();
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1);
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        original.id.as_deref().unwrap(),
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let second = drain(&home, agent);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, original.id);
+    assert_eq!(second[0].text, original.text);
+    assert_eq!(
+        serde_json::to_value(&second[0].attachments).unwrap(),
+        serde_json::to_value(&original.attachments).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&second[0]).unwrap()["delivery_count"],
+        2
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Fresh reset is a context handoff, not an acknowledgement: unconfirmed
+/// delivering rows must be requeued for the successor session.
+#[test]
+fn fresh_reset_requeues_unconfirmed_delivering_rows() {
+    let home = tmp_home("fresh-reset-requeue");
+    let agent = "fresh-reset-requeue-agent";
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .id("m-fresh-reset-requeue")
+            .sender("lead")
+            .text("survive reset")
+            .kind("query")
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(drain(&home, agent).len(), 1);
+
+    assert_eq!(requeue_delivering_for_session_reset(&home, agent), 1);
+    let content = fs::read_to_string(inbox_path(&home, agent)).unwrap();
+    let persisted: serde_json::Value =
+        serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(persisted["read_at"].is_null());
+    assert!(persisted["delivering_at"].is_null());
+    assert_eq!(persisted["delivery_count"], 1);
+    assert_eq!(drain(&home, agent).len(), 1);
     fs::remove_dir_all(&home).ok();
 }
 

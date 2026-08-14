@@ -1,10 +1,11 @@
-# cargo-audit config (RustSec) for LOCAL `cargo audit` runs. NOTE: the CI
-# `audit` job uses `rustsec/audit-check`, which does NOT read this file — it
-# only honors its own `ignore:` input, so the SAME list is mirrored there
-# (ci.yml, `audit` job). Keep the two in sync. Neither weakens the gate: both
-# still BLOCK on any real vulnerability — these ignores only suppress
-# WARNING-class advisories that have NO usable fix for us, so the audit output
-# stays focused on actionable items. Re-review when the GTK3 stack upgrades.
+# cargo-audit config (RustSec) for local and authoritative CI `cargo audit`
+# runs. The CI audit gate invokes `cargo audit` directly and reads this file.
+# The separate `rustsec/audit-check` reporter does NOT read it — it only honors
+# its own `ignore:` input, so the SAME list is mirrored there (ci.yml, `audit`
+# job). Keep the two in sync. Neither weakens the gate: both still BLOCK on
+# any real vulnerability — these ignores only suppress WARNING-class
+# advisories that have NO usable fix for us, so the audit output stays focused
+# on actionable items. Re-review when the GTK3 stack upgrades.
 
 [advisories]
 ignore = [

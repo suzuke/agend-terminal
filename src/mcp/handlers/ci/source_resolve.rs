@@ -133,7 +133,7 @@ fn canonical_repo_root(path: &Path) -> Option<PathBuf> {
 /// resolution is the authority (never lexical gitlink arithmetic — cf. the
 /// canonical-identity rule in `ci/release.rs`); `--path-format=absolute` makes the
 /// answer directly canonicalizable however the gitlink is spelled.
-fn repo_common_dir(path: &Path) -> Option<PathBuf> {
+pub(super) fn repo_common_dir(path: &Path) -> Option<PathBuf> {
     let out = crate::git_helpers::git_cmd(
         path,
         &[

@@ -24,6 +24,9 @@ pub(crate) enum DeliveryState {
     Completed,
     Failed,
     Ambiguous,
+    /// A self-kick exceeded its acknowledgement window but remains
+    /// nonterminal so a truthful late current-session ack can still start it.
+    AckOverdue,
 }
 
 impl DeliveryState {
@@ -133,9 +136,39 @@ impl ReceiptStore {
         })
     }
 
+    /// Append `next` only when the latest durable state is `expected`.
+    ///
+    /// The compare-and-append is held under the same per-instance lock as
+    /// receipt writes. The self-kick ack and timeout watchdog therefore
+    /// linearize: an ack that wins prevents the watchdog from emitting a
+    /// stale Ambiguous receipt, and a timeout that wins cannot be overwritten
+    /// by a late ack.
+    pub(crate) fn record_if_latest_state(
+        &self,
+        delivery_id: Uuid,
+        expected: DeliveryState,
+        next: DeliveryReceipt,
+    ) -> anyhow::Result<bool> {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        let latest = self.latest_locked(delivery_id)?;
+        if latest.as_ref().map(|receipt| receipt.state) != Some(expected) {
+            return Ok(false);
+        }
+        self.append_locked(DurableRecord {
+            envelope: None,
+            receipt: next,
+        })?;
+        Ok(true)
+    }
+
     pub(crate) fn latest(&self, delivery_id: Uuid) -> anyhow::Result<Option<DeliveryReceipt>> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
+        self.latest_locked(delivery_id)
+    }
+
+    fn latest_locked(&self, delivery_id: Uuid) -> anyhow::Result<Option<DeliveryReceipt>> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -271,6 +304,10 @@ impl ReceiptStore {
     fn append(&self, record: DurableRecord) -> anyhow::Result<()> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
+        self.append_locked(record)
+    }
+
+    fn append_locked(&self, record: DurableRecord) -> anyhow::Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)

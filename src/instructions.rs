@@ -235,7 +235,7 @@ pub(crate) fn build_instructions_body(
         "  - Report-mode optional fields: `correlation_id`, `reviewed_head`, `artifacts`\n",
     );
     content.push_str("  - Threading: `thread_id`, `parent_id`\n");
-    content.push_str("- `inbox` — check pending OR query specific. No params = drain pending. With `message_id` = describe message status. With `thread_id` = fetch thread messages.\n");
+    content.push_str("- `inbox` — check pending OR query specific. No params = drain pending; returned rows expose durable `delivery_count` + `first_delivered_at`, and redeliveries also appear in the production response's `redelivery_history` without changing canonical id/text. With `message_id` = describe message status. With `thread_id` = fetch thread messages. `action=ack` with a message_id can settle a previously delivered/reclaimed row only when durable history proves prior delivery; omitted message_id acknowledges only the current in-flight batch. The response distinguishes `acked-after-reclaim` from `never-delivered` and `already-processed`; storage failures return `outcome:error` with `code:inbox_ack_failed`. Fresh session reset requeues unconfirmed rows for successor recovery because visible recovery prevents the silent loss of #159's old settle path.\n");
     content.push_str("- `reply` — reply to operator/user via the active channel (NOT for inter-agent — use `send`)\n");
     content.push_str("- `list_instances` — see all running agents\n");
     content.push_str("- `download_attachment` — download a telegram multimedia attachment (images / audio / documents) by `file_id`. Use when an inbox message contains `attachments=[...]` and you need the actual media bytes.\n\n");

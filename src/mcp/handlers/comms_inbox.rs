@@ -99,15 +99,33 @@ pub fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
 }
 
-/// #2299 explicit ack (C): confirm `delivering` messages as `processed`.
-/// `message_id` present → ack that one message; omitted → ack the caller's
-/// whole in-flight batch. The agent calls this after HANDLING what it drained,
-/// so the reclaim-TTL sweep never re-delivers an already-processed message.
-/// Returns `{"acked": N}` (rows newly transitioned to processed).
+/// #2299/#3228 explicit ack (C): confirm current `delivering` messages as
+/// `processed`, or target a previously delivered/reclaimed row when durable
+/// history proves prior delivery.
+/// `message_id` present → ack that one message (including a requeued row whose
+/// durable delivery history proves it was previously delivered); omitted → ack
+/// the caller's whole in-flight batch. The response includes a distinguishable
+/// outcome so callers can tell an ack-after-reclaim from a current in-flight
+/// ack, a never-delivered conservative no-op, or an already-processed row.
 pub fn handle_inbox_ack(home: &Path, args: &Value, instance_name: &str) -> Value {
     let msg_id = args["message_id"].as_str();
-    let acked = crate::inbox::ack(home, instance_name, msg_id);
-    json!({"acked": acked})
+    match crate::inbox::ack_with_outcome(home, instance_name, msg_id) {
+        Ok(outcome) => json!({
+            "acked": outcome.acked,
+            "scope": if msg_id.is_some() { "targeted" } else { "batch" },
+            "outcome": outcome.kind.as_str(),
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "inbox ack failed");
+            json!({
+                "acked": 0,
+                "scope": if msg_id.is_some() { "targeted" } else { "batch" },
+                "outcome": "error",
+                "error": "inbox ack failed",
+                "code": "inbox_ack_failed",
+            })
+        }
+    }
 }
 
 /// #inbox-gc part a: quiet compact-clear. Marks non-obligation messages read
@@ -208,6 +226,164 @@ mod tests {
         );
         assert_eq!(nf["status"], "not_found");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Targeted ack after reclaim is a distinct contract outcome, so callers
+    /// can tell it apart from the normal in-flight batch acknowledgement.
+    #[test]
+    fn targeted_ack_after_reclaim_reports_distinct_outcome() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-targeted-ack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-3228-targeted".into()),
+                from: "lead".into(),
+                text: "ack after reclaim".into(),
+                kind: Some("query".into()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(crate::inbox::drain(&home, agent).len(), 1);
+        crate::inbox::storage::set_row_delivering_at_for_test(
+            &home,
+            agent,
+            "m-3228-targeted",
+            &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        );
+        crate::inbox::reclaim_stale_delivering(&home);
+
+        let result = handle_inbox_ack(&home, &json!({"message_id": "m-3228-targeted"}), agent);
+        assert_eq!(result["acked"], 1);
+        assert_eq!(result["outcome"], "acked-after-reclaim");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3228: the real MCP ack entry point must preserve an unread row when
+    /// durable history proves it has never been delivered.
+    #[test]
+    fn targeted_ack_never_delivered_reports_safe_noop_3228() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-never-delivered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-3228-never-delivered".into()),
+                from: "lead".into(),
+                text: "must remain unread".into(),
+                kind: Some("query".into()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let result = handle_inbox_ack(
+            &home,
+            &json!({"message_id": "m-3228-never-delivered"}),
+            agent,
+        );
+        assert_eq!(result["acked"], 0);
+        assert_eq!(result["outcome"], "never-delivered");
+        let stored = crate::inbox::find_message(&home, "m-3228-never-delivered").unwrap();
+        assert!(stored.read_at.is_none());
+        assert_eq!(stored.delivery_count, 0);
+        assert_eq!(crate::inbox::drain(&home, agent).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Storage failures must remain distinguishable from a benign empty inbox.
+    #[test]
+    fn ack_storage_failure_is_error_response_3228() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-ack-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(home.join("inbox/agent1.jsonl")).unwrap();
+
+        let result = handle_inbox_ack(&home, &json!({"message_id": "m-3228-failure"}), "agent1");
+        assert_eq!(result["acked"], 0);
+        assert_eq!(result["outcome"], "error");
+        assert_eq!(result["code"], "inbox_ack_failed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3228: the production inbox response, rather than a dead formatter,
+    /// must make durable redelivery history visible without changing the
+    /// canonical stored message identity or text.
+    #[test]
+    fn inbox_response_surfaces_real_redelivery_history_3228() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-inbox-redelivery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("m-3228-response".into()),
+                from: "lead".into(),
+                text: "canonical response text".into(),
+                kind: Some("query".into()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(crate::inbox::drain(&home, agent).len(), 1);
+        crate::inbox::storage::set_row_delivering_at_for_test(
+            &home,
+            agent,
+            "m-3228-response",
+            &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+        );
+        crate::inbox::reclaim_stale_delivering(&home);
+
+        let response = super::super::handle_inbox(&home, agent);
+        assert_eq!(response["messages"][0]["id"], "m-3228-response");
+        assert_eq!(response["messages"][0]["text"], "canonical response text");
+        assert_eq!(response["messages"][0]["delivery_count"], 2);
+        assert_eq!(
+            response["redelivery_history"][0]["message_id"],
+            "m-3228-response"
+        );
+        assert_eq!(response["redelivery_history"][0]["delivery_count"], 2);
+        assert!(response["redelivery_history"][0]["first_delivered_at"].is_string());
+
+        let stored = crate::inbox::find_message(&home, "m-3228-response").unwrap();
+        assert_eq!(stored.id.as_deref(), Some("m-3228-response"));
+        assert_eq!(stored.text, "canonical response text");
         std::fs::remove_dir_all(&home).ok();
     }
 }

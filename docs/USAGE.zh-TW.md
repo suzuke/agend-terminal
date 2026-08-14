@@ -102,6 +102,10 @@ agend-terminal tray (menu-bar resident)
 
 將 fleet 綁定到一個 Telegram 群組，以進行遠端控制（從手機向 agent 發送訊息）以及對外通知（將停滯／crash／CI 警示推送回群組）。
 
+系統通知會依操作者是否需要採取行動來篩選；完整 pane 與指令 transcript
+只保留在本機。完整的 Telegram／Discord 傳送來源盤點與嚴重度規則請見
+[`REMOTE-NOTIFICATION-POLICY.zh-TW.md`](REMOTE-NOTIFICATION-POLICY.zh-TW.md)。
+
 ### 最小設定
 
 ```yaml

@@ -531,6 +531,122 @@ fn should_notify_in_mode(
     }
 }
 
+/// Last-resort size guard for daemon-generated remote notices. Producers should
+/// still format a concise, semantic message of their own (the supervisor does
+/// this for interactive prompts), but this chokepoint prevents a future emitter
+/// from accidentally forwarding an unbounded pane/log transcript to Telegram
+/// or Discord. Explicit agent replies do not use `gated_notify` and therefore
+/// remain verbatim.
+pub(crate) const REMOTE_SYSTEM_NOTICE_MAX_CHARS: usize = 1_200;
+pub(crate) const REMOTE_SYSTEM_NOTICE_MAX_LINES: usize = 12;
+const REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS: usize = 180;
+
+/// Redact common credential assignments before a daemon-generated notice
+/// leaves the machine. This deliberately targets credential-shaped syntax,
+/// not ordinary prose that merely mentions words such as "token" or "key".
+fn redact_remote_system_notice_secrets(message: &str) -> std::borrow::Cow<'_, str> {
+    static COLON_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    static EQUALS_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    static BEARER_SECRET: OnceLock<regex::Regex> = OnceLock::new();
+    const KEY: &str = r"(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|passwd|authorization|credential)(?:[_-][A-Za-z0-9]+)*";
+
+    let colon_secret = COLON_SECRET.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r#"(?im)(^|[^A-Za-z0-9_-])(["']?)({KEY})["']?\s*:\s*[^\r\n]*"#
+        ))
+        .expect("remote colon-secret regex must compile")
+    });
+    let equals_secret = EQUALS_SECRET.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?i)(^|[^A-Za-z0-9_-])({KEY})\s*=\s*[^\r\n&;,]+"))
+            .expect("remote equals-secret regex must compile")
+    });
+    let bearer_secret = BEARER_SECRET.get_or_init(|| {
+        regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*")
+            .expect("remote bearer-secret regex must compile")
+    });
+
+    let redacted = colon_secret.replace_all(message, "$1$2$3$2: ***REDACTED***");
+    let redacted = equals_secret.replace_all(redacted.as_ref(), "$1$2=***REDACTED***");
+    let redacted = bearer_secret.replace_all(redacted.as_ref(), "Bearer ***REDACTED***");
+    if redacted == message {
+        std::borrow::Cow::Borrowed(message)
+    } else {
+        std::borrow::Cow::Owned(redacted.into_owned())
+    }
+}
+
+fn truncate_remote_line(line: &str, max_chars: usize, keep_tail: bool) -> String {
+    if line.chars().count() <= max_chars {
+        return line.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if keep_tail {
+        let tail: String = line
+            .chars()
+            .rev()
+            .take(max_chars.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("…{tail}")
+    } else {
+        let mut out: String = line.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+pub(crate) fn bound_remote_system_notice(message: &str) -> std::borrow::Cow<'_, str> {
+    // Collapse CRLF first so replacing remaining bare CR progress updates does
+    // not manufacture an empty line after every ordinary Windows/PTY line.
+    let normalized = message.replace("\r\n", "\n").replace('\r', "\n");
+    let line_count = normalized.lines().count();
+    if line_count <= REMOTE_SYSTEM_NOTICE_MAX_LINES
+        && normalized.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS
+    {
+        return if normalized == message {
+            std::borrow::Cow::Borrowed(message)
+        } else {
+            std::borrow::Cow::Owned(normalized)
+        };
+    }
+
+    const MARKER: &str = "… details omitted; open TUI/logs for full context …";
+    let lines: Vec<&str> = normalized.lines().collect();
+    let head_count = lines.len().min(3);
+    let tail_count = lines.len().saturating_sub(head_count).min(8);
+    let content_count = head_count + tail_count;
+    let output_lines = content_count + 1;
+    let separators = output_lines.saturating_sub(1);
+    let content_budget =
+        REMOTE_SYSTEM_NOTICE_MAX_CHARS.saturating_sub(MARKER.chars().count() + separators);
+    let per_line_budget = content_budget
+        .checked_div(content_count)
+        .unwrap_or(0)
+        .min(REMOTE_SYSTEM_NOTICE_LINE_MAX_CHARS);
+
+    let mut selected = Vec::with_capacity(output_lines);
+    selected.extend(
+        lines
+            .iter()
+            .take(head_count)
+            .map(|line| truncate_remote_line(line, per_line_budget, false)),
+    );
+    selected.push(MARKER.to_string());
+    selected.extend(
+        lines
+            .iter()
+            .rev()
+            .take(tail_count)
+            .rev()
+            .map(|line| truncate_remote_line(line, per_line_budget, true)),
+    );
+    std::borrow::Cow::Owned(selected.join("\n"))
+}
+
 /// Outbound notify gate — only forwards to [`Channel::notify`] when the
 /// channel reports [`Channel::outbound_authorized`] = `true`. When the
 /// channel is unauthorised (no allowlist configured), the call is
@@ -582,7 +698,9 @@ pub fn gated_notify(
         auth::warn_once_user_allowlist_unconfigured(channel.kind(), instance);
         return Ok(());
     }
-    channel.notify(instance, severity, message, silent)
+    let redacted = redact_remote_system_notice_secrets(message);
+    let message = bound_remote_system_notice(redacted.as_ref());
+    channel.notify(instance, severity, message.as_ref(), silent)
 }
 
 /// Options passed to `Channel::create_binding`. Platform-specific hints live
@@ -737,6 +855,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_system_notice_keeps_normal_messages_verbatim() {
+        let message = "⚠️ agent: backend exited; restart or replace it.";
+        assert!(matches!(
+            bound_remote_system_notice(message),
+            std::borrow::Cow::Borrowed(s) if s == message
+        ));
+    }
+
+    #[test]
+    fn remote_system_notice_bounds_accidental_transcripts_and_keeps_action_tail() {
+        let mut message = String::from("⚠️ general is waiting for operator input\n");
+        for idx in 0..40 {
+            message.push_str(&format!(
+                "shell history {idx}: rm -rf /private/{}\n",
+                "界".repeat(120)
+            ));
+        }
+        message.push_str("Dangerous operation\n1. Yes\n2. No\nEsc to cancel");
+
+        let bounded = bound_remote_system_notice(&message);
+        assert!(bounded.contains("general is waiting"));
+        assert!(bounded.contains("Dangerous operation"));
+        assert!(bounded.contains("1. Yes"));
+        assert!(bounded.contains("2. No"));
+        assert!(bounded.contains("details omitted"));
+        assert!(!bounded.contains("shell history 20"));
+        assert!(
+            bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS,
+            "system notice must stay within the remote attention budget"
+        );
+        assert!(
+            bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES,
+            "system notice must stay scannable"
+        );
+    }
+
+    #[test]
+    fn remote_system_notice_never_exceeds_line_cap_when_char_cap_triggers() {
+        let message = (0..REMOTE_SYSTEM_NOTICE_MAX_LINES)
+            .map(|idx| format!("line {idx}: {}", "x".repeat(92)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.chars().count() > REMOTE_SYSTEM_NOTICE_MAX_CHARS);
+
+        let bounded = bound_remote_system_notice(&message);
+        assert!(bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES);
+        assert!(bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS);
+    }
+
+    #[test]
+    fn remote_system_notice_normalizes_carriage_return_progress_and_keeps_latest_tail() {
+        let message = (0..400)
+            .map(|idx| format!("progress {idx}"))
+            .collect::<Vec<_>>()
+            .join("\r");
+        let bounded = bound_remote_system_notice(&message);
+
+        assert!(bounded.contains("progress 0"));
+        assert!(bounded.contains("progress 399"));
+        assert!(bounded.lines().count() <= REMOTE_SYSTEM_NOTICE_MAX_LINES);
+        assert!(bounded.chars().count() <= REMOTE_SYSTEM_NOTICE_MAX_CHARS);
+    }
+
+    #[test]
+    fn remote_system_notice_normalizes_crlf_without_spending_budget_on_blank_lines() {
+        let message = (0..8)
+            .map(|idx| format!("real line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let bounded = bound_remote_system_notice(&message);
+
+        assert_eq!(bounded.lines().count(), 8);
+        assert!(!bounded.lines().any(str::is_empty));
+        assert!(bounded.contains("real line 2"));
+        assert!(bounded.contains("real line 7"));
+    }
+
     /// Mock channel that records every `notify` call so tests can pin
     /// the gate's pass / drop semantics. Used by the [`gated_notify`]
     /// tests below.
@@ -744,6 +940,7 @@ mod tests {
         caps: ChannelCapabilities,
         outbound_ok: bool,
         notify_count: std::sync::atomic::AtomicUsize,
+        last_message: parking_lot::Mutex<Option<String>>,
     }
 
     impl RecordingChannel {
@@ -752,10 +949,14 @@ mod tests {
                 caps: ChannelCapabilities::default(),
                 outbound_ok,
                 notify_count: std::sync::atomic::AtomicUsize::new(0),
+                last_message: parking_lot::Mutex::new(None),
             }
         }
         fn count(&self) -> usize {
             self.notify_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn message(&self) -> Option<String> {
+            self.last_message.lock().clone()
         }
     }
 
@@ -799,11 +1000,12 @@ mod tests {
             &self,
             _instance: &str,
             _severity: NotifySeverity,
-            _message: &str,
+            message: &str,
             _silent: bool,
         ) -> std::result::Result<(), ChannelError> {
             self.notify_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.last_message.lock() = Some(message.to_owned());
             Ok(())
         }
     }
@@ -844,6 +1046,66 @@ mod tests {
             1,
             "authorised channel must receive exactly 1 notify call"
         );
+    }
+
+    #[test]
+    fn gated_notify_redacts_inline_credentials_before_remote_delivery() {
+        let ch = RecordingChannel::new(true);
+        let message = "fetching https://api.example.com/cb?token=SECRET5DEADBEEF\n\
+Authorization: Bearer abc.def\n\
+API_KEY=local-secret\n\
+the token was rotated; press Enter to continue";
+
+        gated_notify(&ch, "agent1", NotifySeverity::Error, message, false)
+            .expect("authorized notice should be delivered");
+
+        let delivered = ch.message().expect("authorized notice must be recorded");
+        assert!(delivered.contains("token=***REDACTED***"));
+        assert!(delivered.contains("Authorization: ***REDACTED***"));
+        assert!(delivered.contains("API_KEY=***REDACTED***"));
+        assert!(delivered.contains("the token was rotated"));
+        assert!(!delivered.contains("SECRET5DEADBEEF"));
+        assert!(!delivered.contains("abc.def"));
+        assert!(!delivered.contains("local-secret"));
+    }
+
+    #[test]
+    fn gated_notify_redacts_prefixed_environment_credentials_without_benign_suffix_matches() {
+        let ch = RecordingChannel::new(true);
+        let message = "export GITHUB_TOKEN=ghp_ABC123DEADBEEF\n\
+export OPENAI_API_KEY=sk-proj-ABC123DEADBEEF\n\
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG\n\
+refresh_token=oauth-refresh-value\n\
+MONKEY=banana";
+
+        gated_notify(&ch, "agent1", NotifySeverity::Error, message, false)
+            .expect("authorized notice should be delivered");
+
+        let delivered = ch.message().expect("authorized notice must be recorded");
+        assert!(delivered.contains("GITHUB_TOKEN=***REDACTED***"));
+        assert!(delivered.contains("OPENAI_API_KEY=***REDACTED***"));
+        assert!(delivered.contains("AWS_SECRET_ACCESS_KEY=***REDACTED***"));
+        assert!(delivered.contains("refresh_token=***REDACTED***"));
+        assert!(delivered.contains("MONKEY=banana"));
+        assert!(!delivered.contains("ghp_ABC123DEADBEEF"));
+        assert!(!delivered.contains("sk-proj-ABC123DEADBEEF"));
+        assert!(!delivered.contains("wJalrXUtnFEMIK7MDENG"));
+        assert!(!delivered.contains("oauth-refresh-value"));
+    }
+
+    #[test]
+    fn gated_notify_redacts_json_keys_and_complete_values_with_spaces() {
+        let ch = RecordingChannel::new(true);
+        let message = "{\"token\": \"json-secret\"}\npassword = \"hunter secret tail\"";
+
+        gated_notify(&ch, "agent1", NotifySeverity::Error, message, false)
+            .expect("authorized notice should be delivered");
+
+        let delivered = ch.message().expect("authorized notice must be recorded");
+        assert!(delivered.contains("\"token\": ***REDACTED***"));
+        assert!(delivered.contains("password=***REDACTED***"));
+        assert!(!delivered.contains("json-secret"));
+        assert!(!delivered.contains("hunter secret tail"));
     }
 
     #[test]

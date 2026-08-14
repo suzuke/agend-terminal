@@ -602,8 +602,13 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
     let pre_rec = pre.tasks.get(&tid).expect("seeded task present");
     assert_eq!(pre_rec.status, TaskStatus::InProgress, "pre: in_progress");
     assert!(pre_rec.owner.is_some(), "pre: owned");
+    crate::binding::bind(&home, worker.0.as_str(), "t-different", "feat/stale");
+    assert!(
+        crate::binding::signature_valid(&home, worker.0.as_str()),
+        "test precondition: a valid but task-mismatched binding exists"
+    );
 
-    // Subject: boot entrypoint with live=∅ (the bootstrap call site).
+    // Subject: an absent live owner plus a mismatched lease is a true orphan.
     let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
     assert_eq!(released, vec![tid.clone()], "the stuck task is released");
 
@@ -623,6 +628,91 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
     // Idempotent: re-running finds no in_progress orphan → no-op.
     let again = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
     assert!(again.is_empty(), "re-run is a no-op once released to open");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A signed binding that names the exact owner + task is a durable work lease.
+/// A daemon restart must not make that task re-dispatchable merely because the
+/// in-memory registry has not been rebuilt yet.
+#[test]
+fn release_inprogress_orphans_preserves_exact_signed_binding() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("release_inprogress_signed_binding");
+    let emitter = InstanceName::from("test:seed");
+    let tid = TaskId("t-bound-live-1".into());
+    let worker = InstanceName::from("dev-impl-1");
+    crate::task_events::append_batch(
+        &home,
+        &emitter,
+        vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "durably leased across restart".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(worker.clone()),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/live".into()),
+                bind: Some(true),
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: worker.clone(),
+            },
+            TaskEvent::InProgress {
+                task_id: tid.clone(),
+                by: worker.clone(),
+            },
+        ],
+    )
+    .expect("seed in_progress task");
+    crate::binding::bind(&home, worker.0.as_str(), tid.0.as_str(), "feat/live");
+    assert!(
+        crate::binding::signature_valid(&home, worker.0.as_str()),
+        "test precondition: binding has a valid HMAC sidecar"
+    );
+
+    let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
+    assert!(
+        released.is_empty(),
+        "an exact signed durable binding must prevent release"
+    );
+
+    let post = crate::task_events::replay(&home).expect("post replay");
+    let post_rec = post.tasks.get(&tid).expect("task still present");
+    assert_eq!(post_rec.status, TaskStatus::InProgress);
+    assert_eq!(post_rec.owner.as_ref(), Some(&worker));
+
+    // A future-schema binding is explicitly Opaque, not Absent. Even when the
+    // current daemon cannot interpret it, that uncertainty is not authority to
+    // destroy the durable lease and re-dispatch the task.
+    let binding_path = crate::paths::binding_path(&home, worker.0.as_str());
+    let mut future_binding: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&binding_path).expect("read exact binding fixture"))
+            .expect("parse exact binding fixture");
+    future_binding["version"] = serde_json::json!(u64::MAX);
+    let future_body = serde_json::to_vec_pretty(&future_binding).expect("serialize future binding");
+    let future_sig = agentic_git_core::integrity_core::sign_binding(&home, &future_body)
+        .expect("sign future binding fixture");
+    std::fs::write(&binding_path, &future_body).expect("write future binding fixture");
+    std::fs::write(binding_path.with_file_name("binding.json.sig"), future_sig)
+        .expect("write future binding signature");
+    assert!(matches!(
+        crate::binding::guarded_binding_disk_fresh(&home, worker.0.as_str()),
+        crate::binding::GuardedBinding::Opaque(_)
+    ));
+
+    let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
+    assert!(
+        released.is_empty(),
+        "an opaque binding is not proof that the durable lease is absent"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }

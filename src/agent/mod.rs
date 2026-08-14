@@ -2810,7 +2810,10 @@ pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
 pub(crate) fn fresh_restart_self_kick_prompt() -> String {
     format!(
         "{DAEMON_RESUME_INJECT_MARKER} You were just fresh-restarted and lost your in-memory \
-         context. Recover your OWN state now, in this order: (1) rebuild your in-flight picture \
+         context. If this arrives through Claude ChannelBridge, first call its ack_start tool \
+         with the exact delivery_id from the channel metadata, before any recovery action; after \
+         the bounded recovery sequence call ack_complete with that same delivery_id; these acks \
+         do not send an outward reply. Recover your OWN state now, in this order: (1) rebuild your in-flight picture \
          from the AUTHORITATIVE live sources — the task board (your claimed/assigned tasks) and \
          list_instances (peers + any dangling sub-agents); (2) drain your inbox; (3) read \
          SESSION-HANDOFF.md as a STALE-TOLERANT hint only — if it is missing or looks out of \

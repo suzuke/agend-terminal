@@ -3108,7 +3108,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
     let mut cmd = portable_pty::CommandBuilder::new("sh");
     cmd.arg("-c");
     cmd.arg("exit 3");
-    let child = portable_pty::native_pty_system()
+    let mut child = portable_pty::native_pty_system()
         .openpty(PtySize {
             rows: 24,
             cols: 80,
@@ -3119,6 +3119,10 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
         .slave
         .spawn_command(cmd)
         .unwrap();
+    // Establish the child-exit happens-before edge before the production PTY
+    // close path performs its nonblocking status probe. This makes the fixture
+    // deterministic on Windows without changing production wait behavior.
+    child.wait().unwrap();
     let handle = AgentHandle {
         id,
         name: "rank4-guard".to_string().into(),
@@ -3157,12 +3161,17 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
 /// reader and `shutdown=false` (so the close path is NOT short-circuited by the
 /// `is_shutdown` early return and actually reaches the `deleted` check /
 /// `classify_exit`). Returns the crash channel receiver so the caller can assert
-/// whether an `AgentExitEvent` was emitted.
+/// whether an `AgentExitEvent` was emitted. The sender guard must remain alive
+/// through the caller's assertion so `try_recv()` can distinguish `Empty` from
+/// `Disconnected`.
 #[allow(clippy::unwrap_used)]
 fn run_pty_close_capturing_crash(
     handle: AgentHandle,
     id: crate::types::InstanceId,
-) -> crossbeam_channel::Receiver<crate::agent::AgentExitEvent> {
+) -> (
+    crossbeam_channel::Receiver<crate::agent::AgentExitEvent>,
+    crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+) {
     use std::collections::HashMap;
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let core = Arc::clone(&handle.core);
@@ -3171,6 +3180,7 @@ fn run_pty_close_capturing_crash(
     let generation = handle.generation;
     registry.lock().insert(id, handle);
     let (tx, rx) = crossbeam_channel::unbounded();
+    let tx_guard = tx.clone();
     let ctx = PtyReadContext {
         name: "rank4-guard".to_string(),
         instance_id: id,
@@ -3193,7 +3203,7 @@ fn run_pty_close_capturing_crash(
     let mut reader = EofReader;
     let capture = crate::capture::make_capture_writer(None, "rank4-guard", "test");
     pty_read_loop(&mut reader, &ctx, capture);
-    rx
+    (rx, tx_guard)
 }
 
 /// Rank4 spike invariant — the decisive one. A `deleted = true` handle (the state
@@ -3207,9 +3217,9 @@ fn run_pty_close_capturing_crash(
 #[allow(clippy::unwrap_used)]
 fn deleted_guard_suppresses_exit_event_at_source_rank4() {
     let (handle, id) = make_crash_exit_handle(true);
-    let rx = run_pty_close_capturing_crash(handle, id);
+    let (rx, _sender) = run_pty_close_capturing_crash(handle, id);
     assert!(
-        rx.try_recv().is_err(),
+        matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)),
         "Rank4: a deleted handle's CRASH-classified exit must emit NO event — \
          handle_pty_close must suppress at the SOURCE (the only net against \
          restart/replace double-spawn; the name-keyed sink gates would miss it)"
@@ -3224,7 +3234,7 @@ fn deleted_guard_suppresses_exit_event_at_source_rank4() {
 #[allow(clippy::unwrap_used)]
 fn deleted_guard_is_precise_real_crash_still_emits_rank4() {
     let (handle, id) = make_crash_exit_handle(false);
-    let rx = run_pty_close_capturing_crash(handle, id);
+    let (rx, _sender) = run_pty_close_capturing_crash(handle, id);
     let got = rx.try_recv();
     assert!(
         matches!(got, Ok(crate::agent::AgentExitEvent::Crash(_))),
@@ -3241,7 +3251,7 @@ fn deleted_guard_is_precise_real_crash_still_emits_rank4() {
 fn crash_publication_carries_exact_generation_context_slice1_red() {
     let (handle, id) = make_crash_exit_handle(false);
     let expected_generation = handle.generation;
-    let rx = run_pty_close_capturing_crash(handle, id);
+    let (rx, _sender) = run_pty_close_capturing_crash(handle, id);
     let got = rx.try_recv().unwrap();
     let crate::agent::AgentExitEvent::Crash(observation) = got else {
         panic!("real crash must publish a Crash observation");

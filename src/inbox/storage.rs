@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::message::{InboxMessage, MessageStatus};
+use super::message::InboxMessage;
 
 mod ci_handoff;
 pub(crate) use ci_handoff::{
@@ -10,7 +10,11 @@ pub(crate) use ci_handoff::{
 };
 
 mod message_query;
-pub use message_query::{find_message, get_thread};
+pub(crate) use message_query::msg_already_drained_in_jsonl;
+pub use message_query::{
+    describe_message, find_message, get_thread, has_drained_blocker_for_correlation,
+    inbox_agent_names, unread_count,
+};
 
 // ── #inbox-gc retention bounds (decision d-20260607081209372642-1, part b) ──
 //
@@ -23,11 +27,8 @@ pub use message_query::{find_message, get_thread};
 //    can't provide (a burst inside ANY window still blows past the cap).
 //
 // EXEMPTION: drained `query`/`task` rows are "blockers" — they are read by
-// `has_drained_blocker_for_correlation` (ack-absorption / reply-routing, see
-// storage.rs `has_drained_blocker_for_correlation`) for the full task
-// turnaround, which has no finite upper bound (overnight / multi-day tasks).
-// They keep the original 7d window AND are exempt from the size cap so the
-// audit path never regresses. Unread rows (obligations) keep the 30d window.
+// `has_drained_blocker_for_correlation` for the full task turnaround, which has
+// no finite upper bound. They keep the original 7d window and size-cap exemption.
 
 /// Read (drained) NON-blocker messages expire this many hours after their
 /// timestamp. Lowered from 7 days — these are the high-volume `update`/`report`/
@@ -354,17 +355,6 @@ fn inbox_files(home: &Path) -> impl Iterator<Item = PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-}
-
-/// #2604: the agent names with an inbox file (the `*.jsonl` file stems under
-/// `home/inbox`). The offline-unread watchdog iterates these to reach agents
-/// that are NOT in the live registry (offline / never-existed) — the exact set
-/// `poll_reminder` (registry-driven) can never see. A `read_dir` error yields an
-/// empty iteration, same as [`inbox_files`].
-pub fn inbox_agent_names(home: &Path) -> Vec<String> {
-    inbox_files(home)
-        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
-        .collect()
 }
 
 /// Enqueue a message — in-place flock'd append + fsync (O(1) JSONL append).
@@ -901,6 +891,10 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                         // until the agent acks (explicit `inbox ack` / implicit next-drain)
                         // or the reclaim-TTL resets it. A turn dying after this drain leaves
                         // the row `delivering` → reclaimed → re-delivered (no silent loss).
+                        msg.delivery_count = msg.delivery_count.saturating_add(1);
+                        if msg.first_delivered_at.is_none() {
+                            msg.first_delivered_at = Some(now.clone());
+                        }
                         msg.delivering_at = Some(now.clone());
                     }
                     changed = true;
@@ -1046,32 +1040,89 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
 // the (d) byte cap above is what keeps that recovery from being defeated by an
 // `Oversized` response.
 
+/// The externally visible result class for an explicit inbox ack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AckOutcomeKind {
+    /// The targeted row was currently in-flight and is now processed.
+    AckedInFlight,
+    /// The targeted row had been delivered before, reclaimed/requeued, and is
+    /// now processed using its durable delivery history.
+    AckedAfterReclaim,
+    /// The un-targeted batch had no currently delivering rows.
+    #[default]
+    NoDeliveringRows,
+    /// The target id does not exist in this inbox.
+    NotFound,
+    /// The target exists but has never been delivered, so it remains unread.
+    NeverDelivered,
+    /// The target was already processed; ack is idempotent.
+    AlreadyProcessed,
+}
+
+impl AckOutcomeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AckedInFlight => "acked-in-flight",
+            Self::AckedAfterReclaim => "acked-after-reclaim",
+            Self::NoDeliveringRows => "no-delivering-rows",
+            Self::NotFound => "not-found",
+            Self::NeverDelivered => "never-delivered",
+            Self::AlreadyProcessed => "already-processed",
+        }
+    }
+}
+
+/// Detailed result for [`ack_with_outcome`]. The legacy [`ack`] wrapper keeps
+/// the existing count-only storage API for non-MCP callers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AckOutcome {
+    pub acked: usize,
+    pub kind: AckOutcomeKind,
+}
+
 /// #2299 explicit ack (C): confirm `delivering` rows as `processed` (stamp
 /// `read_at`). Called by the `inbox action=ack` MCP path after an agent has
-/// HANDLED what it drained. This is the primary, unambiguous confirm signal —
-/// the implicit next-drain ack (A) and the reclaim-TTL (the net) only cover
-/// agents that don't (or can't) ack.
-///
-/// `msg_id`: `Some(id)` acks exactly that message; `None` acks EVERY currently
-/// `delivering` row for the caller (the "I've processed this whole batch" path).
-/// Only `delivering` rows (`delivering_at` set, `read_at` None) transition —
-/// an already-processed row is an idempotent no-op, and a plain `unread` row is
-/// left untouched (acking a never-delivered message would be a silent drop).
-/// Returns the count of rows newly transitioned to `processed`.
+/// HANDLED what it drained. A targeted ack may also settle an unread row after
+/// reclaim/session reset when `delivery_count > 0` proves prior delivery.
+/// Untargeted ack remains conservative and settles ONLY currently delivering
+/// rows, so it cannot discard a never-delivered message.
+#[allow(dead_code)]
 pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
+    ack_with_outcome(home, name, msg_id)
+        .map(|outcome| outcome.acked)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "inbox ack failed");
+            0
+        })
+}
+
+pub fn ack_with_outcome(
+    home: &Path,
+    name: &str,
+    msg_id: Option<&str>,
+) -> anyhow::Result<AckOutcome> {
     let path = inbox_path_resolved(home, name);
     if !path.exists() {
-        return 0;
+        return Ok(AckOutcome {
+            acked: 0,
+            kind: if msg_id.is_some() {
+                AckOutcomeKind::NotFound
+            } else {
+                AckOutcomeKind::NoDeliveringRows
+            },
+        });
     }
-    let (acked, settlement_intents) = with_inbox_lock(home, name, |path| {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return (0, Vec::new()),
-        };
+    let (outcome, settlement_intents) = with_inbox_lock(home, name, |path| {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("read inbox for ack: {error}"))?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut acked = 0usize;
+        let mut target_found = false;
+        let mut target_never_delivered = false;
+        let mut target_already_processed = false;
+        let mut acked_after_reclaim = false;
         let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         let mut changed = false;
         for line in content.lines() {
@@ -1082,16 +1133,42 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                 continue;
             };
-            // Only an in-flight `delivering` row is ackable. Match on id when given.
+            // Match on id when given. Untargeted ack intentionally never enters
+            // the history-based branch: it is the conservative whole-batch path.
             let is_target = msg_id.is_none_or(|id| msg.id.as_deref() == Some(id));
-            if is_target && msg.read_at.is_none() && msg.delivering_at.is_some() {
-                if let Some(identity) = protected_settlement_identity(&msg, name) {
-                    settlement_intents.push(identity);
+            if is_target {
+                if msg_id.is_some() {
+                    target_found = true;
                 }
-                msg.read_at = Some(now.clone());
-                msg.delivering_at = None;
-                acked += 1;
-                changed = true;
+                if msg.read_at.is_none() && msg.delivering_at.is_some() {
+                    if let Some(identity) = protected_settlement_identity(&msg, name) {
+                        settlement_intents.push(identity);
+                    }
+                    msg.read_at = Some(now.clone());
+                    msg.delivering_at = None;
+                    acked += 1;
+                    changed = true;
+                } else if msg_id.is_some()
+                    && msg.read_at.is_none()
+                    && msg.delivering_at.is_none()
+                    && msg.delivery_count > 0
+                {
+                    // Reclaim/session reset leaves the row unread but durable
+                    // history proves it was previously handed to the agent.
+                    if let Some(identity) = protected_settlement_identity(&msg, name) {
+                        settlement_intents.push(identity);
+                    }
+                    msg.read_at = Some(now.clone());
+                    acked += 1;
+                    acked_after_reclaim = true;
+                    changed = true;
+                } else if msg_id.is_some() {
+                    if msg.read_at.is_some() {
+                        target_already_processed = true;
+                    } else {
+                        target_never_delivered = true;
+                    }
+                }
             }
             all.push(msg);
         }
@@ -1116,15 +1193,30 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox ack write-back failed");
-                return (0, Vec::new());
+                return Err(anyhow::anyhow!("write inbox ack state: {e}"));
             }
         }
-        (acked, settlement_intents)
-    })
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "inbox ack lock failed");
-        (0, Vec::new())
-    });
+        let kind = if msg_id.is_none() {
+            if acked > 0 {
+                AckOutcomeKind::AckedInFlight
+            } else {
+                AckOutcomeKind::NoDeliveringRows
+            }
+        } else if acked_after_reclaim {
+            AckOutcomeKind::AckedAfterReclaim
+        } else if acked > 0 {
+            AckOutcomeKind::AckedInFlight
+        } else if !target_found {
+            AckOutcomeKind::NotFound
+        } else if target_never_delivered {
+            AckOutcomeKind::NeverDelivered
+        } else if target_already_processed {
+            AckOutcomeKind::AlreadyProcessed
+        } else {
+            AckOutcomeKind::NoDeliveringRows
+        };
+        Ok((AckOutcome { acked, kind }, settlement_intents))
+    })??;
     for (target, correlation, episode) in settlement_intents {
         crate::daemon::ci_handoff_track::resolve_protected_episode(
             home,
@@ -1134,7 +1226,7 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             "ack_protected",
         );
     }
-    acked
+    Ok(outcome)
 }
 
 /// #2622 PR-2: settle the single row `msg_id` to `read` regardless of its
@@ -1221,35 +1313,82 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
     settled
 }
 
-/// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
-/// transitioning them to `processed` so [`reclaim_stale_delivering`] will not
-/// revert them to `unread` for re-delivery.
+/// Session-reset requeue: clear `delivering_at` on ALL unconfirmed rows for
+/// `name`, returning them to `unread` while preserving `delivery_count` and
+/// `first_delivered_at`.
 ///
-/// Called by the daemon when an agent's session is **intentionally reset** —
-/// `restart_instance mode=fresh` — where the agent's context is known to be
-/// lost. The old session already drained these messages (they are
-/// `delivering`), so treating them as "delivered and processed" is correct:
-/// re-injecting them into a fresh, context-less session would cause the
-/// stale-resend pattern (agend-customization#159).
-///
-/// This does NOT break #2299's at-least-once guarantee for crashes: an
-/// unintentional interruption (OOM, kill -9, backend crash) never reaches this
-/// code path — only the explicit `restart mode=fresh` handler calls it — so
-/// `reclaim_stale_delivering` still recovers those.
-///
-/// `restart_instance mode=resume` deliberately does NOT call this: the resumed
-/// session retains context and the implicit next-drain ack (A) handles it.
-pub fn settle_delivering_for_session_reset(home: &Path, name: &str) -> usize {
-    let settled = ack(home, name, None);
-    if settled > 0 {
+/// Called by `restart_instance mode=fresh` before the old context is dropped.
+/// A fresh successor cannot safely claim that the old session handled what it
+/// drained, so rows remain available for recovery. Targeted ack can still
+/// settle a requeued row because the durable history proves prior delivery;
+/// untargeted ack remains limited to rows currently in flight.
+pub fn requeue_delivering_for_session_reset(home: &Path, name: &str) -> usize {
+    let path = inbox_path_resolved(home, name);
+    if !path.exists() {
+        return 0;
+    }
+    let requeued = with_inbox_lock(home, name, |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let mut all: Vec<InboxMessage> = Vec::new();
+        let mut preserved_forward: Vec<String> = Vec::new();
+        let mut requeued = 0usize;
+        let mut changed = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
+                continue;
+            };
+            if msg.read_at.is_none() && msg.delivering_at.is_some() {
+                msg.delivering_at = None;
+                requeued += 1;
+                changed = true;
+            }
+            all.push(msg);
+        }
+        if changed {
+            let tmp = path.with_extension("jsonl.tmp");
+            let result = (|| -> anyhow::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                for msg in &all {
+                    writeln!(f, "{}", serde_json::to_string(msg)?)?;
+                }
+                for raw in &preserved_forward {
+                    writeln!(f, "{raw}")?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&tmp, path)?;
+                crate::store::fsync_parent_dir(path);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                tracing::warn!(%error, "inbox session-reset requeue write-back failed");
+                return 0;
+            }
+        }
+        requeued
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "inbox session-reset requeue lock failed");
+        0
+    });
+    if requeued > 0 {
         tracing::info!(
-            tag = "#2299-session-settle",
+            tag = "#3228-session-reset-requeue",
             agent = %name,
-            count = settled,
-            "session-reset: settled delivering rows to processed (preventing stale re-inject)"
+            count = requeued,
+            "session-reset: requeued unconfirmed delivering rows for successor recovery"
         );
     }
-    settled
+    requeued
 }
 
 /// Scoped ack: settle DELIVERING rows for `name` where `task_id` matches
@@ -1650,49 +1789,6 @@ fn extract_ci_fail_job(text: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-/// Count unread messages (read_at == None) for an agent.
-pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
-    let path = inbox_path_resolved(home, name);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return (0, None),
-    };
-    let mut count = 0usize;
-    let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
-    for line in content.lines() {
-        // #t-84833-14 (R3 perf): same `UnreadProbe` cheap deserialize as the
-        // hot-path counter (skips big `text`/`from` allocs). The filter is
-        // unchanged:
-        // MED-3: a superseded-but-undrained row is NOT actionable unread —
-        // `drain` silently consumes it (stamps `read_at`, never surfaces it).
-        // Counting it here inflated the unread count, so a busy branch whose
-        // CI SHA churns (each `mark_ci_watch_superseded` leaves the prior row
-        // superseded + unread until the next drain) tripped
-        // `inbox_stuck_watchdog` into false-paging a healthy agent. Match
-        // drain's actionable-unread definition.
-        // #2299: a `delivering` row (`delivering_at` set, `read_at` None) is
-        // in-flight — already delivered to the agent, not actionable-unread.
-        // Counting it would re-page a healthy agent mid-turn (and the
-        // reclaim-TTL sweep, not the watchdog, owns re-delivery if it stalls).
-        if let Ok(probe) = serde_json::from_str::<UnreadProbe>(line) {
-            if probe.is_unread() {
-                count += 1;
-                // `oldest` over the unread rows — identical to the prior
-                // `msg.timestamp` parse (`timestamp` is a required field, so a
-                // parsed row always has it; an unparseable value leaves `oldest`
-                // untouched, as before).
-                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&probe.timestamp) {
-                    let ts_utc = ts.with_timezone(&chrono::Utc);
-                    if oldest.is_none_or(|t| t > ts_utc) {
-                        oldest = Some(ts_utc);
-                    }
-                }
-            }
-        }
-    }
-    (count, oldest)
 }
 
 /// #2524 P6-r2 (#2537): [`unread_count`], but a ci-fail row already discharged
@@ -2363,49 +2459,6 @@ pub fn reclaim_stale_delivering(home: &Path) {
     }
 }
 
-/// Look up a message by ID in a specific agent's inbox file.
-/// If `instance` is provided, only that agent's inbox is searched.
-pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageStatus {
-    let path = inbox_path_resolved(home, instance);
-    // A missing/unreadable file → empty content → no match → `NotFound`
-    // fall-through (same result as the prior explicit exists/Err guards).
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let now = chrono::Utc::now();
-    for msg in parse_inbox_messages(&content) {
-        if msg.id.as_deref() != Some(msg_id) {
-            continue;
-        }
-        if let Some(ref read_at) = msg.read_at {
-            return MessageStatus::ReadAt(read_at.clone(), msg.delivery_mode.clone());
-        }
-        // #2299: a delivered-but-unconfirmed (delivering) row — report it as
-        // Delivering (not Unread/NotFound) so a delivery audit sees it WAS
-        // delivered and does not re-send. Reported regardless of age (a
-        // delivering row is short-lived: the reclaim-TTL reverts it to unread).
-        if msg.delivering_at.is_some() {
-            return MessageStatus::Delivering {
-                delivery_mode: msg.delivery_mode.clone(),
-                correlation_id: msg.correlation_id.clone(),
-            };
-        }
-        let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or(now);
-        if now.signed_duration_since(ts) > chrono::Duration::days(30) {
-            return MessageStatus::UnreadExpired;
-        }
-        // #bughunt-r2 #3: a live, not-yet-read message. Previously returned
-        // NotFound (indistinguishable from "no such id") — breaking delivery
-        // audit of an un-drained message. Report it as Unread with its
-        // delivery_mode + correlation_id for correlation tracking.
-        return MessageStatus::Unread {
-            delivery_mode: msg.delivery_mode.clone(),
-            correlation_id: msg.correlation_id.clone(),
-        };
-    }
-    MessageStatus::NotFound
-}
-
 /// #982 B-narrow: scan `agent_name`'s inbox for a delivered blocking
 /// dispatch (`kind ∈ {query, task}`) that shares the given `correlation_id`.
 /// Used by `api::handlers::messaging` to override codex ack-absorption when an
@@ -2418,56 +2471,6 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
 /// actively processing it, so a reply on that correlation should reach it
 /// (override absorption) just as a fully-drained one does. Safe either way:
 /// the reply is always enqueued; this only governs whether it ALSO wakes now.
-pub fn has_drained_blocker_for_correlation(
-    home: &Path,
-    agent_name: &str,
-    correlation_id: &str,
-) -> bool {
-    #[cfg(test)]
-    super::record_blocker_scan(agent_name);
-    let path = inbox_path_resolved(home, agent_name);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    for msg in parse_inbox_messages(&content) {
-        if msg.correlation_id.as_deref() == Some(correlation_id)
-            && (msg.read_at.is_some() || msg.delivering_at.is_some())
-            && matches!(msg.kind.as_deref(), Some("query") | Some("task"))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Read the agent's inbox JSONL and return `true` iff a message with
-/// the given `msg_id` exists AND has already been delivered — `read_at`
-/// set (processed) OR `delivering_at` set (#2299 in-flight).
-///
-/// #2299: a `delivering` row has been handed to the agent once; treating it
-/// as "already drained" keeps this #911 re-inject dedup from re-pushing an
-/// in-flight message. A daemon re-inject of a `delivering` row would make the
-/// agent re-drain it, and `drain`'s implicit-ack step would confirm-and-drop it
-/// (premature `read_at`) — silent loss. Controlled re-delivery instead happens
-/// only after the reclaim-TTL reverts it to plain `unread` (`delivering_at`
-/// cleared), at which point this returns `false` again and re-inject resumes.
-pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id: &str) -> bool {
-    // H12 (CR-2026-06-14): read the RESOLVED (UUID-when-id-native) path — the same
-    // one `drain` writes `read_at` to. The old `inbox_path` (raw name) path does
-    // not exist for an id-native instance, so this #911 JSONL dedup fallback read
-    // a nonexistent file and returned `false` unconditionally — a permanent no-op
-    // that let an already-drained message be re-injected after a daemon restart
-    // (when the in-memory `OnceLock` ledger is gone).
-    let path = inbox_path_resolved(home, agent_name);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    for msg in parse_inbox_messages(&content) {
-        if msg.id.as_deref() == Some(msg_id)
-            && (msg.read_at.is_some() || msg.delivering_at.is_some())
-        {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;

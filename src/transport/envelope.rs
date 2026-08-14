@@ -130,6 +130,11 @@ pub(crate) struct DeliveryEnvelope {
     pub kind: DeliveryKind,
     pub body: String,
     pub correlation_id: Option<String>,
+    /// Fresh-restart self-kicks have a consumer acknowledgement contract.
+    /// This is persisted with the envelope so a bridge restart can replay the
+    /// watchdog without treating ordinary notifications as missing acks.
+    #[serde(default)]
+    pub self_kick: bool,
     pub created_at: String,
     /// Digest of the exact structured payload.  This is persisted with the
     /// receipt so reconnect/reconcile never has to compare prompt text.
@@ -153,9 +158,20 @@ impl DeliveryEnvelope {
             kind,
             body,
             correlation_id,
+            self_kick: false,
             created_at: Utc::now().to_rfc3339(),
             payload_digest,
         }
+    }
+
+    pub(crate) fn self_kick(
+        instance: impl Into<String>,
+        session: SessionLocator,
+        body: impl Into<String>,
+    ) -> Self {
+        let mut envelope = Self::new(instance, session, DeliveryKind::Notification, body, None);
+        envelope.self_kick = true;
+        envelope
     }
 }
 

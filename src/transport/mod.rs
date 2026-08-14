@@ -22,7 +22,8 @@ pub(crate) use registry::mode_for_backend;
 pub(crate) use registry::test_support;
 
 pub(crate) use registry::{
-    deliver_notification, mode_for_instance, record_delivery_drop, wait_for_notification_readiness,
+    deliver_notification, deliver_self_kick_notification, mode_for_instance, record_delivery_drop,
+    wait_for_notification_readiness,
 };
 
 pub(crate) use registry::{

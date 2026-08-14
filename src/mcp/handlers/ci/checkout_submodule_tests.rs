@@ -1493,15 +1493,7 @@ fn mangled_for(instance: &str, source: &Path) -> String {
     let source = source
         .canonicalize()
         .unwrap_or_else(|_| source.to_path_buf());
-    format!(
-        "{}-{}",
-        instance,
-        source
-            .display()
-            .to_string()
-            .replace(['/', '\\', ':'], "_")
-            .replace('~', "")
-    )
+    super::checkout_path::bounded_mangled(instance, &source.display().to_string())
 }
 
 /// BLOCKER 1 — a checked PREPARED-save failure is fatal-but-CLEAN: no worktree is

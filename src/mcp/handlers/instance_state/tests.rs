@@ -640,6 +640,56 @@ fn fresh_restart_guards_uncommitted_worktree_2476() {
     std::fs::remove_dir_all(&wt).ok();
 }
 
+/// A real fresh-restart entry point must requeue, rather than process, the
+/// previous session's unconfirmed delivering rows. This pins #3228's visible
+/// recovery policy: #159's old settle path would have stamped `read_at` and
+/// hidden the row, risking silent loss.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_requeues_unconfirmed_inbox_rows_3228() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3228-fresh-reset-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: /definitely-missing-agent-binary-3228\n",
+    )
+    .unwrap();
+    crate::inbox::enqueue(
+        &home,
+        "dev",
+        crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-3228-fresh-reset".into()),
+            from: "lead".into(),
+            text: "survive fresh restart".into(),
+            kind: Some("query".into()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(crate::inbox::drain(&home, "dev").len(), 1);
+
+    let _ = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+    );
+
+    let post_restart = crate::inbox::drain(&home, "dev");
+    assert_eq!(post_restart.len(), 1);
+    assert_eq!(post_restart[0].id.as_deref(), Some("m-3228-fresh-reset"));
+    assert_eq!(post_restart[0].delivery_count, 2);
+    assert!(post_restart[0].first_delivered_at.is_some());
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // #1625: every restart, regardless of mode, must carry the same-tab layout
 // hint so the respawned pane returns to its original tab (the fresh path
 // previously omitted it and fell out into a new tab).

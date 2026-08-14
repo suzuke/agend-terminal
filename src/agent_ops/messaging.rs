@@ -424,6 +424,8 @@ fn build_message(
         id: None,
         read_at: None,
         delivering_at: None,
+        delivery_count: 0,
+        first_delivered_at: None,
         thread_id,
         parent_id,
         task_id,

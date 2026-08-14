@@ -20,6 +20,7 @@ mod source_resolve;
 // the re-exports below preserve EVERY `ci::handle_*` path used by dispatch.rs and
 // every `super::*` path used by the child `tests` module (zero caller/test edits).
 mod checkout;
+mod checkout_path;
 // Architecture-14 disposable-review purpose validation and remote-absence
 // preflight live in a sibling module to keep checkout.rs below the LOC ceiling.
 mod checkout_disposable;

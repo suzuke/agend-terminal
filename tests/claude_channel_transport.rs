@@ -251,6 +251,56 @@ fn stop(mut child: Child) {
     let _ = child.wait();
 }
 
+fn seed_self_kick_receipt(home: &Path, delivery_id: Uuid, body: &str, session_id: &str) {
+    let path = home
+        .join("transport")
+        .join("deliveries")
+        .join("claude-agent.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = json!({
+        "envelope": {
+            "delivery_id": delivery_id,
+            "instance": "claude-agent",
+            "session": {
+                "backend": "claude",
+                "endpoint": null,
+                "thread_id": null,
+                "session_id": session_id,
+                "endpoint_url": "http://127.0.0.1:1",
+                "username": "bearer",
+                "password": "seed-token",
+                "model": null,
+                "event_cursor": 0,
+                "managed": false,
+                "server_pid": null,
+                "server_start_token": null
+            },
+            "kind": "Notification",
+            "body": body,
+            "correlation_id": null,
+            "self_kick": true,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "payload_digest": "seed-digest"
+        },
+        "receipt": {
+            "delivery_id": delivery_id,
+            "state": "Queued",
+            "payload_digest": "seed-digest",
+            "protocol_request_id": null,
+            "backend_session_id": null,
+            "backend_event": null,
+            "tui_visibility": null,
+            "detail": null,
+            "recorded_at": chrono::Utc::now().to_rfc3339()
+        }
+    });
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+}
+
 #[test]
 fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() {
     let home = temporary_home();
@@ -429,6 +479,109 @@ fn channel_bridge_production_entry_preserves_wire_and_receipts_across_restart() 
     );
     assert_eq!(status, 200, "reply receipt must survive bridge restart");
     assert_eq!(receipt["reply"]["text"], "reply from Claude");
+    stop(child);
+    drop(stdin);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn channel_bridge_production_entry_self_kick_ack_is_correlated_and_non_replying() {
+    let home = temporary_home();
+    let delivery_id = Uuid::new_v4();
+    let body = "[AGEND-RESUME] recover own state";
+    let (mut child, mut stdin, mut stdout, stderr_capture) = spawn_bridge(&home);
+    let locator = wait_for_locator(&home, None, &mut child, &stderr_capture);
+    seed_self_kick_receipt(&home, delivery_id, body, &locator.session_id);
+    let endpoint = locator.endpoint.as_str();
+    let token = locator.token.as_str();
+
+    write_mcp(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"clientInfo":{"name":"claude-code","version":"2.1.89"}}
+        }),
+    );
+    let _ = read_mcp(&mut stdout);
+    let _ = wait_for_health(endpoint, token);
+    let (status, _) = http_request(
+        endpoint,
+        token,
+        "POST",
+        "/webhook",
+        &serde_json::to_vec(&json!({
+            "delivery_id": delivery_id,
+            "chat_id": format!("agend:claude-agent:{delivery_id}"),
+            "sender_id": "agend-terminal",
+            "text": body
+        }))
+        .unwrap(),
+    );
+    assert_eq!(status, 202);
+    let notification = read_mcp(&mut stdout);
+    assert_eq!(
+        notification["params"]["meta"]["delivery_id"],
+        delivery_id.to_string()
+    );
+
+    write_mcp(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"ack_start","arguments":{"delivery_id":Uuid::new_v4()}
+        }}),
+    );
+    let wrong = read_mcp(&mut stdout);
+    assert_eq!(wrong["error"]["code"], -32602);
+
+    write_mcp(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"ack_start","arguments":{"delivery_id":delivery_id}
+        }}),
+    );
+    let started = read_mcp(&mut stdout);
+    assert_eq!(
+        started["result"]["structuredContent"]["state"],
+        "TurnStarted"
+    );
+    let (status, receipt) = http_request(
+        endpoint,
+        token,
+        "GET",
+        &format!("/receipts/{delivery_id}"),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(receipt["state"], "TurnStarted");
+    assert!(
+        receipt["reply"].is_null(),
+        "start ack must not create reply receipt"
+    );
+
+    write_mcp(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+            "name":"ack_complete","arguments":{"delivery_id":delivery_id}
+        }}),
+    );
+    let completed = read_mcp(&mut stdout);
+    assert_eq!(
+        completed["result"]["structuredContent"]["state"],
+        "Completed"
+    );
+    let (status, receipt) = http_request(
+        endpoint,
+        token,
+        "GET",
+        &format!("/receipts/{delivery_id}"),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(receipt["state"], "Completed");
+    assert!(
+        receipt["reply"].is_null(),
+        "completion ack must not create reply receipt"
+    );
     stop(child);
     drop(stdin);
     let _ = std::fs::remove_dir_all(home);

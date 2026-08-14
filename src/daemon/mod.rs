@@ -847,6 +847,14 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     spawn_fleet_agents(home, &agents, &ctx);
 
+    // #boot-orphan-live-lease: the initial full spawn is a synchronous barrier
+    // (each successful agent is registered and ready before it returns). Take an
+    // owned snapshot so the registry lock is dropped before binding locks, task
+    // event fsyncs, and inbox writes. Do not repeat this at the recover-as-primary
+    // respawn below: that path is not a fresh authoritative boot census.
+    let live = crate::agent::live_agent_names(&ctx.registry);
+    crate::tasks::release_inprogress_orphans_with_live(home, &live);
+
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::bootstrap::signals::install(Arc::clone(&ctx.shutdown), shutdown_tx);
 
@@ -2541,6 +2549,39 @@ mod tests {
             "Phase 1 RCA #554 Audit 6 chose enrich-not-duplicate; \
              a parallel event name appearing in production code would \
              break downstream query / grep paths"
+        );
+    }
+
+    #[test]
+    fn boot_orphan_sweep_runs_once_after_initial_spawn_barrier() {
+        let daemon_src = include_str!("./mod.rs");
+        let prod_end = daemon_src.find("\nmod tests {").unwrap_or(daemon_src.len());
+        let prod = &daemon_src[..prod_end];
+        let sweep = "crate::tasks::release_inprogress_orphans_with_live(home, &live);";
+        assert_eq!(
+            prod.matches(sweep).count(),
+            1,
+            "the destructive sweep must not also run in recover-as-primary"
+        );
+        let initial_spawn = prod
+            .find("spawn_fleet_agents(home, &agents, &ctx);")
+            .expect("initial spawn barrier");
+        let sweep_pos = prod.find(sweep).expect("post-spawn orphan sweep");
+        let signal_setup = prod
+            .find("let (shutdown_tx, shutdown_rx)")
+            .expect("post-boot signal setup");
+        assert!(
+            initial_spawn < sweep_pos && sweep_pos < signal_setup,
+            "the sweep must consume the initial full-spawn census before normal serving"
+        );
+
+        let bootstrap_src = include_str!("../bootstrap/mod.rs");
+        let bootstrap_prod_end = bootstrap_src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .unwrap_or(bootstrap_src.len());
+        assert!(
+            !bootstrap_src[..bootstrap_prod_end].contains("release_inprogress_orphans_with_live"),
+            "pre-registry bootstrap must never run the destructive task sweep"
         );
     }
 

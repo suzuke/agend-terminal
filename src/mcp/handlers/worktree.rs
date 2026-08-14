@@ -292,6 +292,17 @@ fn handle_release_worktree_force(
         });
     }
 
+    // Preserve force-only behavior for absent, null, and explicit false, but
+    // fail closed for every present value that could be mistaken for a preview.
+    let dry_run = &args["dry_run"];
+    if (!dry_run.is_null() && !dry_run.is_boolean()) || dry_run.as_bool() == Some(true) {
+        return json!({
+            "released": false,
+            "error": "release_worktree(force:true) does not support dry_run=true or non-boolean values; use binding_state to inspect the authoritative binding",
+            "code": "dry_run_unsupported"
+        });
+    }
+
     // #826: optional operator-supplied `repository_path` arg. When present,
     // L2 GC skips enumeration and goes straight to the named repo.
     let source_repo_hint = args["repository_path"]

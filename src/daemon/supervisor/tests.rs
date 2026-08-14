@@ -1,5 +1,216 @@
 use super::*;
 
+/// Remote operator channels should carry the decision surface, not a verbatim
+/// terminal dump. This reproduces the 2026-08-12 Telegram incident where a
+/// Claude Bash permission dialog forwarded dozens of command lines.
+#[test]
+fn stall_notice_keeps_actionable_tail_but_bounds_remote_noise() {
+    let mut tail = String::from("Bash command\n");
+    for idx in 0..35 {
+        tail.push_str(&format!(
+            "command-{idx}: rm -rf /very/long/path/{}\n",
+            "x".repeat(120)
+        ));
+    }
+    tail.push_str(
+        "Dangerous rm operation on possibly-empty variable path\n\
+         Do you want to proceed?\n\
+         1. Yes\n\
+         2. No\n\
+         Esc to cancel · Tab to amend\n",
+    );
+
+    let notice = format_stall_notice("general", &tail, Some(33));
+
+    assert!(notice.contains("general"));
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("details omitted"));
+    assert!(
+        notice.chars().count() <= 1200,
+        "remote stall notice must stay compact, got {} chars",
+        notice.chars().count()
+    );
+    assert!(
+        !notice.contains("command-0:"),
+        "old pane history must not be forwarded verbatim"
+    );
+}
+
+#[test]
+fn stall_notice_truncates_one_oversized_prompt_line_on_char_boundary() {
+    let tail = format!(
+        "permission requested: {}尾\n1. Allow\n2. Deny",
+        "界".repeat(2000)
+    );
+    let notice = format_stall_notice("agent", &tail, None);
+
+    assert!(notice.contains("1. Allow"));
+    assert!(notice.contains("2. Deny"));
+    assert!(notice.contains('…'));
+    assert!(notice.chars().count() <= 1200);
+}
+
+#[test]
+fn stall_notice_keeps_choices_when_status_noise_follows_prompt() {
+    let mut tail = String::from(
+        "Dangerous rm operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel\n",
+    );
+    for idx in 0..12 {
+        tail.push_str(&format!("status line {idx}: waiting for input\n"));
+    }
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("Esc to cancel"));
+    assert!(notice.contains("status line 11"));
+    assert!(!notice.contains("status line 10"));
+}
+
+#[test]
+fn stall_notice_does_not_mistake_no_prefix_build_output_for_a_choice() {
+    let mut tail = String::from(
+        "building project\nnote: using cached build directory\nnothing to commit\nnow building\n",
+    );
+    for idx in 0..20 {
+        tail.push_str(&format!("compiling crate-{idx}\n"));
+    }
+    tail.push_str("Continue? [y/N]\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Continue? [y/N]"));
+    assert!(!notice.contains("note: using cached build directory"));
+    assert!(!notice.contains("nothing to commit"));
+}
+
+#[test]
+fn stall_notice_anchors_unknown_question_prompt_above_status_noise() {
+    let mut tail = String::from("Apply this patch? (y/n)\n");
+    for idx in 0..12 {
+        tail.push_str(&format!("status line {idx}: waiting for input\n"));
+    }
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Apply this patch? (y/n)"));
+    assert!(notice.contains("status line 11"));
+    assert!(!notice.contains("status line 10"));
+}
+
+#[test]
+fn stall_notice_keeps_plain_question_between_preamble_and_choices() {
+    let mut tail = String::from("reviewing diff\n");
+    for idx in 0..20 {
+        tail.push_str(&format!("hunk {idx} applied cleanly\n"));
+    }
+    tail.push_str("Apply this patch?\n1. Yes\n2. No\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Apply this patch?"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+}
+
+#[test]
+fn stall_notice_unrecognized_fallback_keeps_identity_and_latest_tail() {
+    let tail = (0..20)
+        .map(|idx| format!("opaque line {idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notice = format_stall_notice("general", &tail, None);
+
+    assert!(notice.contains("opaque line 0"));
+    assert!(notice.contains("opaque line 19"));
+    assert!(!notice.contains("opaque line 1\n"));
+}
+
+#[test]
+fn stall_notice_ignores_early_question_mark_in_compiler_output() {
+    let mut tail =
+        String::from("cargo build\nerror[E0277]: the `?` operator requires a Result return type\n");
+    for idx in 0..20 {
+        tail.push_str(&format!("compiling crate-{idx}\n"));
+    }
+    tail.push_str("Press Enter to continue\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Press Enter to continue"));
+    assert!(!notice.contains("error[E0277]"));
+}
+
+#[test]
+fn stall_notice_keeps_choices_despite_trailing_question_mark_url() {
+    let mut tail = String::from(
+        "Dangerous rm operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel\n",
+    );
+    for idx in 0..10 {
+        tail.push_str(&format!("status line {idx}: waiting\n"));
+    }
+    tail.push_str("fetching https://example.com/api?token=secret\n");
+    for idx in 10..14 {
+        tail.push_str(&format!("status line {idx}: waiting\n"));
+    }
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("Esc to cancel"));
+    assert!(!notice.contains("token=secret"));
+}
+
+#[test]
+fn stall_notice_reserves_context_when_many_choices_compete_for_slots() {
+    let mut tail = String::from("preamble\nDangerous rm operation\nDo you want to proceed?\n");
+    for idx in 1..=6 {
+        tail.push_str(&format!("{idx}. Yes option {idx}\n"));
+    }
+    tail.push_str("Esc to cancel\n");
+
+    let notice = format_stall_notice("general", &tail, None);
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("Do you want to proceed?"));
+    assert!(notice.contains("Esc to cancel"));
+}
+
+#[test]
+fn stall_notice_does_not_spend_choice_slots_on_duplicate_identity_lines() {
+    let tail = "Dangerous rm operation\n\
+Do you want to proceed?\n\
+status: waiting\n\
+1. Yes\n\
+2. No\n\
+3. Allow\n\
+4. Deny\n\
+Esc to cancel\n";
+
+    let notice = format_stall_notice("general", tail, None);
+    assert!(notice.contains("Dangerous rm operation"));
+    assert!(notice.contains("Do you want to proceed?"));
+    assert!(notice.contains("1. Yes"));
+    assert!(notice.contains("2. No"));
+    assert!(notice.contains("Esc to cancel"));
+}
+
+#[test]
+fn formatted_stall_notice_survives_common_gate_without_second_omission_marker() {
+    let tail = format!(
+        "{}\nDangerous operation\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel",
+        (0..30)
+            .map(|idx| format!("command {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let notice = format_stall_notice("general", &tail, None);
+    let bounded = crate::channel::bound_remote_system_notice(&notice);
+
+    assert_eq!(bounded.matches("details omitted").count(), 1);
+    assert!(bounded.lines().count() <= 12);
+    assert!(bounded.contains("1. Yes"));
+    assert!(bounded.contains("2. No"));
+}
+
 /// #2033: the recovery-notice gate — actionable iff the operator was told
 /// about the block AND it lasted past the threshold (actionable-or-silent).
 #[test]

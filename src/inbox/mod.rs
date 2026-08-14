@@ -30,12 +30,14 @@ pub use message::{
 pub use disk::{check_disk_space, recover_half_writes};
 
 // Storage CRUD (pub)
+#[cfg(test)]
+pub(crate) use storage::ack;
 pub use storage::{
-    ack, ack_by_correlation, clear_compact, describe_message, drain, enqueue, find_message,
-    get_thread, has_drained_blocker_for_correlation, inbox_agent_names, mark_ci_watch_superseded,
-    obligation_reason, reclaim_stale_delivering, settle_delivering_for_session_reset,
-    sweep_expired, unread_count, unread_count_after_discharge, unread_obligation_summary,
-    UnreadObligationSummary,
+    ack_by_correlation, ack_with_outcome, clear_compact, describe_message, drain, enqueue,
+    find_message, get_thread, has_drained_blocker_for_correlation, inbox_agent_names,
+    mark_ci_watch_superseded, obligation_reason, reclaim_stale_delivering,
+    requeue_delivering_for_session_reset, sweep_expired, unread_count,
+    unread_count_after_discharge, unread_obligation_summary, UnreadObligationSummary,
 };
 // Storage CRUD (pub(crate))
 pub(crate) use storage::inbox_path_resolved;

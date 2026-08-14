@@ -157,7 +157,7 @@ fn force_rejects_invalid_agent_name() {
     let home = tmp_home("force-invalid-agent");
     let result = handle_release_worktree(
         &home,
-        &json!({"instance": "../etc/passwd", "branch": "feature/x", "force": true}),
+        &json!({"instance": "../etc/passwd", "branch": "feature/x", "force": true, "dry_run": true}),
         &None,
     );
     assert!(result["error"].is_string());
@@ -170,7 +170,7 @@ fn force_rejects_invalid_branch_name() {
     let home = tmp_home("force-invalid-branch");
     let result = handle_release_worktree(
         &home,
-        &json!({"instance": "dev", "branch": "../../escape", "force": true}),
+        &json!({"instance": "dev", "branch": "../../escape", "force": true, "dry_run": true}),
         &None,
     );
     assert!(result["error"].is_string());
@@ -181,7 +181,11 @@ fn force_rejects_invalid_branch_name() {
 #[test]
 fn force_rejects_missing_branch() {
     let home = tmp_home("force-missing-branch");
-    let result = handle_release_worktree(&home, &json!({"instance": "dev", "force": true}), &None);
+    let result = handle_release_worktree(
+        &home,
+        &json!({"instance": "dev", "force": true, "dry_run": true}),
+        &None,
+    );
     assert_eq!(
         result["error"].as_str(),
         Some("missing 'branch'"),
@@ -630,7 +634,7 @@ fn force_denies_non_owner_non_orchestrator() {
     let attacker = crate::identity::Sender::new("attacker");
     let result = handle_release_worktree(
         &home,
-        &json!({"instance": "victim", "branch": "feat/x", "force": true}),
+        &json!({"instance": "victim", "branch": "feat/x", "force": true, "dry_run": true}),
         &attacker,
     );
     assert_eq!(

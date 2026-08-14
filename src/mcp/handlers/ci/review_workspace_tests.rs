@@ -172,14 +172,11 @@ fn derived_worktree(home: &Path, instance: &str, source: &Path) -> std::path::Pa
     let source = source
         .canonicalize()
         .unwrap_or_else(|_| source.to_path_buf());
-    home.join("worktrees").join(format!(
-        "{instance}-{}",
-        source
-            .display()
-            .to_string()
-            .replace(['/', '\\', ':'], "_")
-            .replace('~', "")
-    ))
+    home.join("worktrees")
+        .join(super::checkout_path::bounded_mangled(
+            instance,
+            &source.display().to_string(),
+        ))
 }
 
 // ══════════════════════════════════════════════════════════════════════
