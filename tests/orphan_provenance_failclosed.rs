@@ -58,10 +58,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use syn::visit::{self, Visit};
 
 use agend_terminal::admin::orphan_provenance::{
-    classify, load_ledger, render_human, sample_from_owner_source, sample_tool_call_shells,
-    scope_reparented, BackendOwner, BackendOwnerSource, DisplayColumns, ObservationMiss,
-    OrphanReport, PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport, SampleOutcome,
-    ScopeCounts, ScopeInput, ShellToolEvidence, ShellToolKind, UnprovenReason,
+    classify, load_ledger, prune_observations, render_human, sample_from_owner_source,
+    sample_tool_call_shells, scope_reparented, BackendOwner, BackendOwnerSource, DisplayColumns,
+    ObservationMiss, OrphanReport, PersistOutcome, ProcFacts, ProcessOracle, ProvenanceSupport,
+    SampleOutcome, ScopeCounts, ScopeInput, ShellObservation, ShellToolEvidence, ShellToolKind,
+    UnprovenReason, MAX_OBSERVATIONS, OBSERVATION_RETENTION_MS,
 };
 use agend_terminal::instructions::background_process_guidance;
 
@@ -148,6 +149,12 @@ impl FakeProc {
 
     fn group(mut self, pgid: Option<u32>) -> Self {
         self.pgid = pgid;
+        self
+    }
+
+    /// `None` models an unreadable OS start token — identity unknown.
+    fn token(mut self, start_token: Option<u64>) -> Self {
+        self.start_token = start_token;
         self
     }
 
@@ -1212,8 +1219,8 @@ fn the_doctor_command_emits_the_orphan_provenance_section() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("Orphaned agent-attributable processes"),
-        "`agend-terminal doctor` must emit the orphan section: {stdout}"
+        stdout.contains("Reparented processes in scope (attribution UNPROVEN)"),
+        "`agend-terminal doctor` must emit the scoped-orphan section: {stdout}"
     );
     assert!(
         stdout.contains("UNPROVEN"),
@@ -1633,4 +1640,246 @@ fn a_non_empty_report_still_prints_its_scope_accounting() {
     );
     assert!(rendered.contains("294") && rendered.contains("215") && rendered.contains("4"));
     assert!(rendered.contains("setsid"));
+}
+
+// ---------------------------------------------------------------------------
+// 12. The ledger is bounded, durable, and refuses an unknown backend identity
+// ---------------------------------------------------------------------------
+
+fn observation(pid: u32, last_seen_ms: i64) -> ShellObservation {
+    ShellObservation {
+        instance: "dev-1".to_string(),
+        shell_pid: pid,
+        sid: BACKEND_SESSION,
+        pgid: pid,
+        shell_start_token: u64::from(pid),
+        tool_generation: 1,
+        first_seen_ms: last_seen_ms,
+        last_seen_ms,
+    }
+}
+
+/// A dead shell's observation is what relates its surviving orphans, so age is
+/// the only thing allowed to evict it — never "its pid is gone".
+#[test]
+fn observations_age_out_but_recent_dead_shell_evidence_is_kept() {
+    let now = 100 * OBSERVATION_RETENTION_MS;
+    let mut obs = vec![
+        observation(1, now),                                // now
+        observation(2, now - OBSERVATION_RETENTION_MS / 2), // inside the window
+        observation(3, now - OBSERVATION_RETENTION_MS),     // exactly on the edge: kept
+        observation(4, now - OBSERVATION_RETENTION_MS - 1), // one ms past: dropped
+        observation(5, 0),                                  // ancient
+    ];
+
+    prune_observations(&mut obs, now);
+
+    let kept: Vec<u32> = obs.iter().map(|o| o.shell_pid).collect();
+    assert_eq!(
+        kept,
+        vec![1, 2, 3],
+        "retention must keep everything within the horizon and drop only what is past it"
+    );
+}
+
+/// High churn inside the window must still be bounded, and the survivors must
+/// be the most RECENT — those are the ones a later orphan could relate to.
+#[test]
+fn observations_are_capped_deterministically_keeping_the_most_recent() {
+    let now = 10 * OBSERVATION_RETENTION_MS;
+    let overflow = MAX_OBSERVATIONS + 500;
+    // Oldest first, all inside the retention window.
+    let mut obs: Vec<ShellObservation> = (0..overflow)
+        .map(|i| observation(i as u32 + 1, now - (overflow - i) as i64))
+        .collect();
+
+    prune_observations(&mut obs, now);
+
+    assert_eq!(obs.len(), MAX_OBSERVATIONS, "the cap must be absolute");
+    // The survivors must be exactly the newest MAX_OBSERVATIONS, i.e. the
+    // contiguous block ending at `now - 1` — not an arbitrary slice.
+    let oldest_kept = obs.iter().map(|o| o.last_seen_ms).min().unwrap();
+    let newest_kept = obs.iter().map(|o| o.last_seen_ms).max().unwrap();
+    assert_eq!(
+        newest_kept,
+        now - 1,
+        "the most recent observation must survive the cap"
+    );
+    assert_eq!(
+        oldest_kept,
+        now - MAX_OBSERVATIONS as i64,
+        "eviction must take the oldest first: {oldest_kept} vs {}",
+        now - MAX_OBSERVATIONS as i64
+    );
+}
+
+/// A baseline is only ever compared against the SAME backend generation, so a
+/// generation that is gone can never be used again. Without eviction the file
+/// grows by one entry — plus that generation's whole child list — per restart,
+/// forever, on the daemon tick.
+#[test]
+fn baselines_for_dead_backend_generations_are_evicted() {
+    let home = tmp_home("baselineprune");
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    assert_eq!(load_ledger(&home).len(), 1);
+
+    // The backend restarts: same pid, new identity. The old generation's
+    // baseline is now unusable and must not survive.
+    world.insert(900, FakeProc::session_leader(900, 4_242));
+    let outcome = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 2_000);
+    assert!(matches!(
+        outcome.persisted,
+        agend_terminal::admin::orphan_provenance::PersistOutcome::Written
+    ));
+
+    // The observation survives (a later orphan may still relate to it), but the
+    // stale generation's baseline does not: the next active window has to
+    // report BaselineUnavailable rather than diff against a dead generation.
+    assert_eq!(
+        load_ledger(&home).len(),
+        1,
+        "observations are not collateral"
+    );
+    world.insert(930, FakeProc::group_leader(930, 9_300).child_of(900));
+    let after = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(9, 2_500))],
+        3_000,
+    );
+    assert_eq!(
+        after.observed.len(),
+        1,
+        "the NEW generation baselines normally"
+    );
+}
+
+/// `src/process.rs` documents `None` as "identity unknown — fail closed".
+/// Keying a baseline as `(pid, None)` would let a recycled backend pid inherit
+/// the previous generation's child list, after which a fresh child could be
+/// recorded as an observation for the wrong owner.
+#[test]
+fn an_unknown_backend_identity_is_refused_and_cannot_reuse_a_stale_baseline() {
+    let home = tmp_home("tokenless");
+    // Generation A: pid 900, token unreadable.
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000).token(None))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
+
+    let inactive = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 0);
+    assert_eq!(
+        miss(&inactive, "dev-1"),
+        ObservationMiss::BackendIdentityUnknown,
+        "an unknown backend identity must be visible, not a silent skip"
+    );
+    assert!(
+        load_ledger(&home).is_empty(),
+        "no baseline may be written for an unidentifiable backend"
+    );
+
+    // Generation B: the pid is reused by a DIFFERENT backend, token also
+    // unreadable. If (pid, None) had been stored, this window would diff
+    // against generation A's children and record 910 as dev-1's tool shell.
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    let active = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert!(
+        active.observed.is_empty(),
+        "no observation may be attributed through an unidentifiable backend"
+    );
+    assert_eq!(
+        miss(&active, "dev-1"),
+        ObservationMiss::BackendIdentityUnknown
+    );
+    assert!(load_ledger(&home).is_empty());
+}
+
+/// A torn write would be read back as an EMPTY ledger by `unwrap_or_default`,
+/// silently discarding every observation. The write must therefore be atomic:
+/// when it fails, the last valid ledger must still be there.
+#[cfg(unix)]
+#[test]
+fn a_failed_ledger_write_preserves_the_last_valid_ledger() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tmp_home("atomicfail");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    let before = load_ledger(&home);
+    assert_eq!(before.len(), 1);
+
+    // Make the ledger's directory read-only so the next write cannot land.
+    let dir = ledger_path(&home).parent().unwrap().to_path_buf();
+    let original = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    world.insert(930, FakeProc::group_leader(930, 9_300).child_of(900));
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(8, 1_500))],
+        2_000,
+    );
+
+    std::fs::set_permissions(&dir, original).unwrap();
+
+    assert!(
+        matches!(
+            outcome.persisted,
+            agend_terminal::admin::orphan_provenance::PersistOutcome::Failed(_)
+        ),
+        "a write that could not land must say so"
+    );
+    assert!(outcome.observed.is_empty());
+    let after = load_ledger(&home);
+    assert_eq!(
+        after.len(),
+        1,
+        "the last valid ledger must survive a failed write, not be truncated away"
+    );
+    assert_eq!(after[0].shell_pid, before[0].shell_pid);
+}
+
+/// The platform that cannot support this view must still be told so in the same
+/// frame as everyone else — never an unlabelled blank that reads as "clean".
+#[test]
+fn an_unsupported_platform_report_still_carries_the_unproven_framing() {
+    let home = tmp_home("unsupported-render");
+    let world = FakeOracle::unsupported();
+    let report = classify(&home, &world, 40 * HOUR_MS);
+
+    let rendered = render_human(&report);
+
+    assert!(rendered.contains("Reparented processes in scope (attribution UNPROVEN)"));
+    assert!(rendered.contains("display only"));
+    assert!(
+        rendered.contains("unsupported on windows"),
+        "the operator must learn the view does not apply here: {rendered}"
+    );
+    assert!(
+        rendered.contains("not available on this platform (not a global clean result)"),
+        "and must not read it as an all-clear: {rendered}"
+    );
 }
