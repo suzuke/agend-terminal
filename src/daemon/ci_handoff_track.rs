@@ -701,6 +701,41 @@ pub(crate) fn resolve_for_target_correlation_reason(
     resolved
 }
 
+/// Resolve only `agent`'s track while accepting either correlation convention:
+/// the track's `repo@branch` correlation or its durable review task id. A typed
+/// receipt belongs to one reviewer, so it must never clear a peer reviewer's
+/// handoff merely because both assignments share the same task correlation.
+pub(crate) fn resolve_for_target_correlation_or_task_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == agent
+            && (track.correlation == correlation || track.task_id.as_deref() == Some(correlation))
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#3207-track-resolved",
+                agent = %track.target,
+                %correlation,
+                reason,
+                "reviewer's exact CI handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
 /// Resolve an explicit-discharge legacy handoff without inferring identity
 /// for a newer protected episode that reuses the same target/correlation key.
 /// Feature and classless tracks retain the pre-episode discharge behavior;

@@ -233,6 +233,9 @@ fn request_to_authorize_params(req: &SendRequest) -> serde_json::Value {
     if let Some(ref cid) = req.correlation_id {
         p["correlation_id"] = serde_json::json!(cid);
     }
+    if let Some(terminal) = req.terminal {
+        p["terminal"] = serde_json::json!(terminal);
+    }
     p
 }
 
@@ -737,11 +740,13 @@ pub(crate) fn track_dispatch(
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             let _ = crate::daemon::dispatch_idle::mark_resolved(home, corr, from);
             if msg.validated_code_review.is_some() {
-                let _ = crate::daemon::ci_handoff_track::resolve_by_correlation(
-                    home,
-                    corr,
-                    "validated_code_review_arrived",
-                );
+                let _ =
+                    crate::daemon::ci_handoff_track::resolve_for_target_correlation_or_task_reason(
+                        home,
+                        from,
+                        corr,
+                        "validated_code_review_arrived",
+                    );
             }
             if corr.starts_with("t-") {
                 let _ = crate::tasks::auto_close::auto_close_on_report(

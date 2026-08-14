@@ -220,6 +220,11 @@ pub(crate) fn authorize_report(
             "code_review purpose requires a typed code_review object".to_string()
         })?)
         .map_err(|e| format!("invalid code_review request: {e}"))?;
+    if matches!(request.verdict, ReviewVerdict::Unverified)
+        && params["terminal"].as_bool() == Some(true)
+    {
+        return Err("provisional UNVERIFIED code_review requires terminal=false".into());
+    }
     validate_request_shape(&request, visible_text)?;
     if server_message_id.is_empty() {
         return Err("server failed to assign a source message id".into());

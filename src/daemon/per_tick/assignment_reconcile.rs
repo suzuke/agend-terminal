@@ -105,15 +105,47 @@ fn log_legacy_cutover_census(home: &Path) {
 /// Reconcile every active branch, then fire the collected A3 WAKE pointers OUTSIDE
 /// all flocks (self-IPC nudge; best-effort). Production entry.
 pub(crate) fn reconcile_all(home: &Path, now: &str) {
-    for target in reconcile_all_collect(home, now) {
+    let wakes = reconcile_all_collect_wakes(home, now);
+    for target in wakes.assignment_targets {
         crate::inbox::notify::wake_review_assignment(home, &target);
+    }
+    for wake in wakes.continuations {
+        if let Err(error) = crate::inbox::wake_persisted_pointer(
+            home,
+            &wake.target,
+            &wake.id,
+            "ci-ready-for-action",
+            "system:ci",
+        ) {
+            tracing::warn!(
+                error = %error,
+                target = %wake.target,
+                "#3207: continuation pointer wake dropped; durable row remains"
+            );
+        }
     }
 }
 
 /// Deterministic tested core: reconcile every active branch and RETURN the set of
 /// targets to WAKE (A3), so the caller emits the self-IPC pointers lock-free. Takes
 /// `now` injected — no unmockable clock inside.
+#[cfg(test)]
 pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
+    reconcile_all_collect_wakes(home, now).assignment_targets
+}
+
+#[derive(Default)]
+struct ReconcileWakes {
+    assignment_targets: Vec<String>,
+    continuations: Vec<ContinuationWake>,
+}
+
+struct ContinuationWake {
+    target: String,
+    id: String,
+}
+
+fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     // Workset = dedup UNION of two `(repo,branch)` identity sources (codex m-…-416):
     //   (a) `store::active_branches` — branches discovered via a PARSEABLE authority
     //       record. It reads the FIRST parseable record to name a branch, so a branch
@@ -132,21 +164,25 @@ pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
     workset.extend(store::active_branches(home));
     workset.extend(crate::daemon::pr_state::list_state_identities(home));
 
-    let mut wakes = Vec::new();
+    let mut wakes = ReconcileWakes::default();
     for (repo, branch) in workset {
-        wakes.extend(reconcile_branch(home, &repo, &branch, now));
+        let branch_wakes = reconcile_branch(home, &repo, &branch, now);
+        wakes
+            .assignment_targets
+            .extend(branch_wakes.assignment_targets);
+        wakes.continuations.extend(branch_wakes.continuations);
     }
     wakes
 }
 
 /// One branch. Returns the targets to WAKE (A3). No lock is held across the calls
 /// below — each store op locks internally, so they never nest (no re-lock deadlock).
-fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<String> {
+fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> ReconcileWakes {
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
     store::tombstone_terminal_matches(home, repo, branch);
 
-    let mut wakes = Vec::new();
+    let mut wakes = ReconcileWakes::default();
     // Load PrState ONCE per branch (shared across all records on this branch).
     let raw_prstate = crate::daemon::pr_state::load(home, repo, branch);
     for record in store::list_active(home, repo, branch) {
@@ -223,6 +259,11 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<Str
         let prstate = raw_prstate
             .as_ref()
             .filter(|p| p.pr_number == record.pr_number);
+        if let Some(state) = prstate {
+            if let Some(wake) = deliver_ci_continuation(home, &record, state, now) {
+                wakes.continuations.push(wake);
+            }
+        }
         // A3/A4: ONLY Unengaged is nudge/repair-eligible. `repair_row` self-gates on
         // the FIXED-interval lease (returns false when not due) and advances it, so
         // two ticks in one interval fire at most once (I12). Wake fires on an
@@ -230,7 +271,7 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<Str
         if store::classify_assignment(&record, prstate) == store::AssignmentEvidence::Unengaged
             && store::repair_row(home, repo, branch, &record.target, now).unwrap_or(false)
         {
-            wakes.push(record.target.clone());
+            wakes.assignment_targets.push(record.target.clone());
         }
     }
 
@@ -238,6 +279,124 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<Str
     // pr_state-INNER). Convergent across restart; a no-op when no pr_state exists.
     store::redrive_reserved(home, repo, branch);
     wakes
+}
+
+/// Level-triggered #3207 continuation: CI may become green before or after a
+/// reviewer submits a provisional UNVERIFIED receipt. Reconciliation observes
+/// both durable facts and emits one exact-head, exact-reviewer continuation.
+/// REJECTED and unengaged assignments are deliberately excluded.
+fn deliver_ci_continuation(
+    home: &Path,
+    record: &store::ActiveAssignment,
+    state: &crate::daemon::pr_state::PrState,
+    now: &str,
+) -> Option<ContinuationWake> {
+    use crate::daemon::ci_delivery_ledger::{DeliveryError, DeliveryKey, DeliveryOutcome};
+    use crate::daemon::pr_state::{CiState, DraftState, MergeState};
+    use crate::review_receipt::{ReviewAssignmentEnvelope, ReviewVerdict};
+
+    let (Some(target_instance_id), Some(reviewed_head), Some(slot)) = (
+        record.target_instance_id,
+        record.reviewed_head.as_deref(),
+        record.review_slot,
+    ) else {
+        return None;
+    };
+    if !record.is_receipt_capable()
+        || !matches!(state.draft_state, DraftState::Ready)
+        || matches!(
+            state.merge_state,
+            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+        )
+    {
+        return None;
+    }
+    let CiState::Green { sha, .. } = &state.ci_state else {
+        return None;
+    };
+    if sha != &state.head_sha || reviewed_head != state.head_sha {
+        return None;
+    }
+    let provisional = state.validated_review_receipts.iter().any(|receipt| {
+        receipt.assignment_id == record.assignment_id
+            && receipt.reviewer_instance_id == target_instance_id
+            && receipt.reviewer_name == record.target
+            && receipt.task_id == record.task_id
+            && receipt.slot == slot
+            && receipt.matches_state(state)
+            && matches!(receipt.verdict, ReviewVerdict::Unverified)
+    });
+    if !provisional {
+        return None;
+    }
+    let Ok(delivered_at) =
+        chrono::DateTime::parse_from_rfc3339(now).map(|value| value.with_timezone(&chrono::Utc))
+    else {
+        tracing::warn!(%now, "#3207: invalid injected reconcile timestamp; continuation skipped");
+        return None;
+    };
+    let Ok(key) = DeliveryKey::new(
+        &record.repo,
+        record.pr_number,
+        reviewed_head,
+        &record.target,
+        "ci-ready-for-action",
+    ) else {
+        tracing::warn!(
+            target = %record.target,
+            head = %reviewed_head,
+            "#3207: invalid exact-head continuation key; delivery skipped"
+        );
+        return None;
+    };
+    let mut msg = crate::inbox::InboxMessage {
+        from: "system:ci".into(),
+        text: format!(
+            "[ci-ready-for-action] {repo}#{pr} passed CI at exact head {head}; submit the final verdict for assignment {assignment}.",
+            repo = record.repo,
+            pr = record.pr_number,
+            head = reviewed_head,
+            assignment = record.assignment_id,
+        ),
+        kind: Some("ci-ready-for-action".into()),
+        timestamp: now.into(),
+        task_id: Some(record.task_id.clone()),
+        correlation_id: Some(record.task_id.clone()),
+        reviewed_head: Some(reviewed_head.into()),
+        pr_number: Some(record.pr_number),
+        review_assignment: Some(ReviewAssignmentEnvelope {
+            assignment_id: record.assignment_id,
+            repo: record.repo.clone(),
+            pr_number: record.pr_number,
+            branch: record.branch.clone(),
+            task_id: record.task_id.clone(),
+            reviewed_head: reviewed_head.into(),
+            review_class: record.review_class,
+            slot,
+            target_instance_id,
+        }),
+        ..Default::default()
+    };
+    let id = crate::inbox::stamp_message_id(&mut msg);
+    let recipient = record.target.clone();
+    let result = crate::daemon::ci_delivery_ledger::deliver_once(home, &key, delivered_at, || {
+        crate::inbox::enqueue(home, &recipient, msg)
+    });
+    let should_wake = matches!(
+        &result,
+        Ok(DeliveryOutcome::Delivered) | Err(DeliveryError::RecordFailedAfterEnqueue(_))
+    );
+    if let Err(error) = result {
+        tracing::warn!(
+            error = %error,
+            target = %record.target,
+            "#3207: continuation ledger delivery failed"
+        );
+    }
+    should_wake.then(|| ContinuationWake {
+        target: record.target.clone(),
+        id,
+    })
 }
 
 #[cfg(test)]
