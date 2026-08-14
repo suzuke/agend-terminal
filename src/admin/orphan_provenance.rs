@@ -245,6 +245,12 @@ pub enum ObservationMiss {
     /// The backend has no children whatsoever, so whatever runs the tool
     /// command is not below it (measured: the Codex app-server sibling).
     ExecutionOwnerNotABackendChild,
+    /// The backend's OS start token could not be read, so its identity is
+    /// unknown. `src/process.rs` documents `None` as "identity unknown, fail
+    /// closed", and keying a baseline as `(pid, None)` would let a recycled
+    /// backend pid inherit the previous generation's child list — after which a
+    /// fresh child could be recorded as an observation for the wrong owner.
+    BackendIdentityUnknown,
 }
 
 /// Whether the ledger write actually landed. A sample that could not be
@@ -271,7 +277,9 @@ pub struct SampleOutcome {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BackendBaseline {
     backend_pid: u32,
-    backend_start_token: Option<u64>,
+    /// Never optional: an unknown backend identity is refused before a baseline
+    /// is read or written, so `(pid, unknown)` cannot exist.
+    backend_start_token: u64,
     /// `(pid, start_token)` of children present before the current generation.
     known: Vec<(u32, u64)>,
 }
@@ -283,6 +291,16 @@ struct LedgerFile {
     #[serde(default)]
     baselines: Vec<BackendBaseline>,
 }
+
+/// How long an observation stays useful: only while an orphan it could explain
+/// might still be around. Seven days is far beyond the 40-hour #3273 incident
+/// and bounds the file. This is what makes `last_seen_ms` load-bearing rather
+/// than decorative.
+pub const OBSERVATION_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Hard cap so a pathological burst inside the retention window cannot outgrow
+/// it. Oldest-by-`last_seen_ms` are dropped first.
+pub const MAX_OBSERVATIONS: usize = 4_096;
 
 /// Canonical ledger location. The fail-closed tests make this path unwritable,
 /// so a rename is a contract change.
@@ -309,9 +327,74 @@ fn write_ledger(home: &Path, ledger: &LedgerFile) -> PersistOutcome {
         Ok(body) => body,
         Err(e) => return PersistOutcome::Failed(format!("encode ledger: {e}")),
     };
-    match std::fs::write(&path, body) {
+    match atomic_write(&path, body.as_bytes()) {
         Ok(()) => PersistOutcome::Written,
         Err(e) => PersistOutcome::Failed(format!("write {}: {e}", path.display())),
+    }
+}
+
+/// Write via a sibling temp file, fsync, then rename, so a reader never sees a
+/// half-written ledger. `read_ledger` recovers from a corrupt file by returning
+/// an empty one, which would silently discard every observation and baseline —
+/// so the write must not be able to tear in the first place.
+///
+/// Deliberately local rather than `crate::store::atomic_write`, which has the
+/// same semantics: this module is compiled into the library shim as well as the
+/// binary (see the module docs), and `store` depends on `event_log`,
+/// `sync_audit` and `paths`, none of which exist there. The duplication is the
+/// price of that self-containment and is called out here so it is a choice
+/// rather than an oversight.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+    let write_then_sync = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    match write_then_sync() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Bound the ledger. Nothing else in the crate evicts from it, so without this
+/// it grows once per backend generation and once per tool-call shell, forever,
+/// and every sample pays an O(n) read + serialize + write on the daemon tick.
+/// A diagnostic that exists to catch unbounded resource growth must not be an
+/// instance of it.
+fn prune(ledger: &mut LedgerFile, oracle: &dyn ProcessOracle, now_ms: i64) {
+    // A baseline is only ever compared against the SAME backend generation, so
+    // once that generation is gone its child list can never be used again.
+    ledger.baselines.retain(|b| {
+        oracle
+            .facts(b.backend_pid)
+            .is_some_and(|f| f.start_token == Some(b.backend_start_token))
+    });
+    // Observations outlive their shell on purpose — a dead shell's orphans are
+    // exactly what the report relates — so age them out rather than dropping
+    // them when the pid dies.
+    prune_observations(&mut ledger.observations, now_ms);
+}
+
+/// Age-out then cap, as a pure function so the bounds are testable without
+/// driving thousands of samples through the oracle.
+///
+/// Deliberately NOT "drop it when the shell exits": a dead shell's observation
+/// is exactly what relates its surviving orphans, which is the whole point of
+/// the ledger. Recency wins on the cap for the same reason.
+pub fn prune_observations(observations: &mut Vec<ShellObservation>, now_ms: i64) {
+    observations.retain(|o| now_ms.saturating_sub(o.last_seen_ms) <= OBSERVATION_RETENTION_MS);
+    if observations.len() > MAX_OBSERVATIONS {
+        observations.sort_by_key(|o| o.last_seen_ms);
+        let excess = observations.len() - MAX_OBSERVATIONS;
+        observations.drain(..excess);
     }
 }
 
@@ -361,7 +444,17 @@ pub fn sample_tool_call_shells(
     let mut misses = Vec::new();
 
     for owner in owners {
-        let backend_token = oracle.facts(owner.backend_pid).and_then(|f| f.start_token);
+        let Some(backend_token) = oracle.facts(owner.backend_pid).and_then(|f| f.start_token)
+        else {
+            // Fail closed BEFORE touching the ledger, in either direction: no
+            // baseline read, no baseline write, no observation. A visible miss
+            // rather than a silent skip.
+            misses.push((
+                owner.instance.clone(),
+                ObservationMiss::BackendIdentityUnknown,
+            ));
+            continue;
+        };
         let children: Vec<ProcFacts> = oracle
             .children_of(owner.backend_pid)
             .into_iter()
@@ -447,6 +540,7 @@ pub fn sample_tool_call_shells(
         }
     }
 
+    prune(&mut ledger, oracle, now_ms);
     let persisted = write_ledger(home, &ledger);
     if matches!(persisted, PersistOutcome::Failed(_)) {
         // Nothing durable landed, so nothing may be reported as observed.
@@ -464,7 +558,7 @@ pub fn sample_tool_call_shells(
 fn upsert_baseline(
     ledger: &mut LedgerFile,
     backend_pid: u32,
-    backend_start_token: Option<u64>,
+    backend_start_token: u64,
     children: &[ProcFacts],
 ) {
     let known: Vec<(u32, u64)> = children
@@ -620,17 +714,23 @@ pub fn classify(home: &Path, oracle: &dyn ProcessOracle, _now_ms: i64) -> Orphan
 /// scanning for a "PROVEN" section finds none.
 pub fn render_human(report: &OrphanReport) -> String {
     let mut out = String::new();
-    out.push_str("Orphaned agent-attributable processes\n");
-
-    if let ProvenanceSupport::Unsupported { platform, reason } = &report.support {
-        out.push_str(&format!("  unsupported on {platform}: {reason}\n"));
-        return out;
-    }
-
+    // The heading claims only what the filter establishes. It is NOT
+    // "agent-attributable": the scope is reparented + same-uid + holding a
+    // session it did not create, and on a real machine most of what that
+    // catches belongs to the operator or to third-party apps.
+    out.push_str("Reparented processes in scope (attribution UNPROVEN)\n");
     out.push_str(
         "  Every entry is UNPROVEN: agend cannot prove it owns any of these. argv, cwd, \
          elapsed and CPU are display only and never evidence of ownership.\n",
     );
+
+    if let ProvenanceSupport::Unsupported { platform, reason } = &report.support {
+        // Still framed, so a Windows operator reads "this view does not apply"
+        // rather than an unlabelled blank — and never "nothing was found".
+        out.push_str(&format!("  unsupported on {platform}: {reason}\n"));
+        out.push_str("  UNPROVEN: not available on this platform (not a global clean result)\n");
+        return out;
+    }
 
     if report.candidates.is_empty() {
         // The most dangerous output this command can produce: read carelessly
