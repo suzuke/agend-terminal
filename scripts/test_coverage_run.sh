@@ -143,10 +143,6 @@ cleanup_run_tmpdir() {
 }
 trap cleanup_run_tmpdir EXIT
 
-if [ "${COVERAGE_REQUIRE_NATIVE_SYMLINKS:-0}" = "1" ] && native_symlink_host; then
-    normalize_native_msys
-fi
-
 # A property this platform cannot exercise is SKIPPED, never silently passed:
 # a green count that includes an unverifiable property is a false green.
 report_skip() {
@@ -161,6 +157,17 @@ report_symlink_skip() {
     else
         report_skip "$1" "${2:-native symlink premise unavailable}"
     fi
+}
+
+run_native_symlink_test() {
+    if [ "${COVERAGE_REQUIRE_NATIVE_SYMLINKS:-0}" = "1" ] && native_symlink_host; then
+        local MSYS="${MSYS-}"
+        export MSYS
+        normalize_native_msys
+        "$@"
+        return $?
+    fi
+    "$@"
 }
 
 report() {
@@ -4472,23 +4479,23 @@ test_membership_unknown_when_no_response_list_exists
 test_membership_no_survives_a_fully_examined_list
 test_named_path_with_spaces_is_extracted
 test_absolute_token_outside_profile_dir_is_out_of_scope
-test_symlink_leaf_cannot_escape_containment
-test_symlinked_response_list_discloses_nothing_outside
-test_symlinked_survey_profile_discloses_no_outside_bytes
-test_symlinked_exemplar_discloses_no_outside_bytes
-test_in_scope_symlinks_are_still_read
-test_in_scope_symlinked_response_list_is_refused_not_read
-test_dangling_response_list_is_disclosed_not_dropped
-test_dangling_profraw_is_surveyed_not_dropped
-test_dangling_profraw_is_counted_in_the_inventory
+run_native_symlink_test test_symlink_leaf_cannot_escape_containment
+run_native_symlink_test test_symlinked_response_list_discloses_nothing_outside
+run_native_symlink_test test_symlinked_survey_profile_discloses_no_outside_bytes
+run_native_symlink_test test_symlinked_exemplar_discloses_no_outside_bytes
+run_native_symlink_test test_in_scope_symlinks_are_still_read
+run_native_symlink_test test_in_scope_symlinked_response_list_is_refused_not_read
+run_native_symlink_test test_dangling_response_list_is_disclosed_not_dropped
+run_native_symlink_test test_dangling_profraw_is_surveyed_not_dropped
+run_native_symlink_test test_dangling_profraw_is_counted_in_the_inventory
 test_absolute_missing_profile_dir_keeps_its_boundary
-test_relative_missing_profile_dir_under_symlinked_cwd
-test_in_scope_symlink_opens_the_validated_target
-test_validated_target_is_the_one_opened
+run_native_symlink_test test_relative_missing_profile_dir_under_symlinked_cwd
+run_native_symlink_test test_in_scope_symlink_opens_the_validated_target
+run_native_symlink_test test_validated_target_is_the_one_opened
 test_tab_containing_path_is_reported
-test_reads_are_pinned_against_post_validation_swap
+run_native_symlink_test test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
-test_temp_path_is_not_followed
+run_native_symlink_test test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
 test_live_writer_is_reported_alive
 test_dead_writer_is_reported_dead

@@ -34,7 +34,10 @@ fn exactly_fourteen_symlink_premise_skips_are_fail_closed() {
     );
     let wrapper_count = COVERAGE_CONTRACT
         .lines()
-        .filter(|line| line.trim_start().starts_with("run_native_symlink_test test_"))
+        .filter(|line| {
+            line.trim_start()
+                .starts_with("run_native_symlink_test test_")
+        })
         .count();
     assert_eq!(
         wrapper_count, 14,
