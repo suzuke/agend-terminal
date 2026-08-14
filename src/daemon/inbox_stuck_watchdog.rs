@@ -315,6 +315,92 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    #[test]
+    fn no_readable_usage_fallback_recipient_keeps_ordinary_alert_active() {
+        let home = tmp_home("usage-no-recipient");
+        // Every present readable-notice candidate is usage-blocked, but the
+        // ordinary team orchestrator remains present and must still receive
+        // the inbox-stuck alert.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            r#"instances:
+  worker:
+    backend: claude
+  lead:
+    backend: claude
+  general:
+    backend: claude
+teams:
+  t:
+    members: [worker, lead]
+    orchestrator: lead
+"#,
+        )
+        .unwrap();
+        seed_unread(&home, "worker", 4, 45);
+
+        let mut usage_blocked = HashMap::new();
+        usage_blocked.insert("worker".to_string(), None);
+        usage_blocked.insert("lead".to_string(), None);
+        usage_blocked.insert("general".to_string(), None);
+        let mut last = HashMap::new();
+        scan_and_emit_with_blocked(&home, &chrono::Utc::now(), &mut last, &usage_blocked);
+
+        let lead_messages = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead_messages
+                .iter()
+                .any(|message| message.kind.as_deref() == Some("inbox_stuck_watchdog")),
+            "no readable fallback recipient must preserve the ordinary alert: {lead_messages:?}"
+        );
+        assert!(
+            last.contains_key("worker"),
+            "ordinary alert delivery must stamp its own re-alert dedup state"
+        );
+        assert!(
+            !crate::daemon::supervisor::usage_limit_notify_path(&home).exists(),
+            "without a readable fallback recipient the usage-limit notice must not be marked"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn usage_limit_ledger_write_failure_keeps_ordinary_alert_active() {
+        let home = tmp_home("usage-ledger-failure");
+        write_fleet(&home);
+        seed_unread(&home, "worker", 4, 45);
+
+        let ledger_path = crate::daemon::supervisor::usage_limit_notify_path(&home);
+        crate::store::fail_next_atomic_write_for_test(&ledger_path);
+        let mut usage_blocked = HashMap::new();
+        usage_blocked.insert("worker".to_string(), None);
+        let mut last = HashMap::new();
+        scan_and_emit_with_blocked(&home, &chrono::Utc::now(), &mut last, &usage_blocked);
+
+        let lead_messages = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead_messages
+                .iter()
+                .any(|message| message.kind.as_deref() == Some("usage_limit_watchdog")),
+            "the readable fallback must be delivered before ledger persistence fails: {lead_messages:?}"
+        );
+        assert!(
+            lead_messages
+                .iter()
+                .any(|message| message.kind.as_deref() == Some("inbox_stuck_watchdog")),
+            "ledger persistence failure must preserve the ordinary alert: {lead_messages:?}"
+        );
+        assert!(
+            last.contains_key("worker"),
+            "ordinary alert delivery must stamp its own re-alert dedup state"
+        );
+        assert!(
+            !ledger_path.exists(),
+            "failed ledger persistence must not create false durable suppression proof"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
     /// Ghost-inbox guard rollout (t-20260724035332273132-42380-3): a stuck
     /// alert must not be enqueued to a recipient with no fleet.yaml instance —
     /// pre-fix the team-less `FALLBACK_RECIPIENT` ("lead") grew
