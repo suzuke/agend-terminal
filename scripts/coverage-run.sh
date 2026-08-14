@@ -1077,7 +1077,25 @@ isolate_attempt_outputs() {
 attempt=1
 while :; do
     eval "$producer" 2>&1 | tee "$log"
-    producer_rc="${PIPESTATUS[0]}"
+    pipeline_status=("${PIPESTATUS[@]}")
+    producer_rc="${pipeline_status[0]}"
+    tee_rc="${pipeline_status[1]}"
+
+    # The log is the evidence source for every classifier below. A tee failure
+    # means it is absent or partial, so never grep, diagnose, or retry against
+    # it. Preserve the producer's failure when both sides fail; a successful
+    # producer must instead fail with tee's status rather than become a false
+    # success. Do not key this on 141: Bash/Git Bash signal status varies, and
+    # the tee status is the causal sink-failure signal.
+    if [ "$tee_rc" -ne 0 ]; then
+        printf '::error::coverage log sink failed (tee exit %s, log %s); producer exit %s; refusing log classification/retry\n' \
+            "$tee_rc" "$(escape_field "$log")" "$producer_rc"
+        if [ "$producer_rc" -eq 0 ]; then
+            exit "$tee_rc"
+        fi
+        exit "$producer_rc"
+    fi
+
     if [ "$producer_rc" -eq 0 ]; then
         # `--failure-mode all` deliberately preserves usable profiles, but a
         # contained partial must not disappear inside a successful 25k-line
