@@ -840,7 +840,7 @@ fn the_provenance_handler_is_a_real_per_tick_handler_that_uses_the_seam() {
         .iter()
         .find_map(|it| match it {
             syn::Item::Impl(i) => {
-                let trait_is_per_tick = i.trait_.as_ref().is_some_and(|(_, path, _)| {
+                let trait_is_per_tick = i.trait_.as_ref().is_some_and(|(path, _)| {
                     path.segments
                         .last()
                         .is_some_and(|s| s.ident == "PerTickHandler")
@@ -929,6 +929,10 @@ fn provenance_sampling_never_references_the_metrics_subscriber_gate() {
 
 #[test]
 fn the_provenance_handler_is_wired_into_the_default_per_tick_handlers() {
+    // The handler list is built with `vec![...]`, and syn does not parse a
+    // macro's token stream into expressions — a `visit_path`-only walk is blind
+    // to every entry in it. So inspect macro tokens too, still scoped to this
+    // one function rather than grepping the file.
     #[derive(Default)]
     struct HandlerFinder {
         found: bool,
@@ -942,6 +946,12 @@ fn the_provenance_handler_is_wired_into_the_default_per_tick_handlers() {
                 self.found = true;
             }
             visit::visit_path(self, p);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if m.tokens.to_string().contains("ToolCallProvenanceHandler") {
+                self.found = true;
+            }
+            visit::visit_macro(self, m);
         }
     }
 
