@@ -39,6 +39,26 @@ fn windows_canary_is_bounded_and_non_blocking() {
 }
 
 #[test]
+fn canary_runs_before_blocking_contract_checks() {
+    let (_, check_job) = CI_WORKFLOW
+        .split_once("\n  check:\n")
+        .expect("CI workflow must contain the check job");
+    let (check_job, _) = check_job
+        .split_once("\n  msrv:\n")
+        .expect("CI workflow must contain the msrv job");
+    let canary = check_job
+        .find("- name: Windows native symlink readiness canary (#3248)")
+        .expect("check job must contain the Windows symlink canary");
+    let coverage = check_job
+        .find("- name: Coverage wrapper contract test")
+        .expect("check job must contain the coverage contract test");
+    assert!(
+        canary < coverage,
+        "canary must run before blocking coverage checks so it cannot be skipped by their failure"
+    );
+}
+
+#[test]
 fn canary_contract_covers_three_link_shapes_and_preserves_msys_options() {
     let script = std::fs::read_to_string("scripts/test_windows_native_symlink_canary.sh")
         .expect("Windows symlink canary script must exist");

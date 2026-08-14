@@ -84,6 +84,18 @@ jobs:
         shell: bash
         run: scripts/test_fmt_owned.sh
 
+      # #3248: diagnostic-only readiness probe for the native-symlink premise.
+      # Keep this non-blocking until a live runner proves all three shapes; the
+      # coverage contracts remain unchanged and continue to report unavailable
+      # symlink premises as skips. Keep it before blocking checks so readiness
+      # evidence is emitted even when an unrelated contract fails.
+      - name: Windows native symlink readiness canary (#3248)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: scripts/test_windows_native_symlink_canary.sh
+
       # #3236: the coverage wrapper's failure semantics (real-failure precedence,
       # truthful cleanup, attempt isolation, bounded diagnostics). Runs here
       # rather than in the coverage job so a semantics regression is caught in
@@ -92,17 +104,6 @@ jobs:
         timeout-minutes: 5
         shell: bash
         run: scripts/test_coverage_run.sh
-
-      # #3248: diagnostic-only readiness probe for the native-symlink premise.
-      # Keep this non-blocking until a live runner proves all three shapes; the
-      # coverage contracts remain unchanged and continue to report unavailable
-      # symlink premises as skips.
-      - name: Windows native symlink readiness canary (#3248)
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 5
-        shell: bash
-        run: scripts/test_windows_native_symlink_canary.sh
 
       # The former standalone repository CI now runs from the monorepo checkout.
       # Keep the same Unix test/clippy/package coverage and Windows advisory
