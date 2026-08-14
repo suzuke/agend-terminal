@@ -93,6 +93,17 @@ jobs:
         shell: bash
         run: scripts/test_coverage_run.sh
 
+      # #3248: diagnostic-only readiness probe for the native-symlink premise.
+      # Keep this non-blocking until a live runner proves all three shapes; the
+      # coverage contracts remain unchanged and continue to report unavailable
+      # symlink premises as skips.
+      - name: Windows native symlink readiness canary (#3248)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: scripts/test_windows_native_symlink_canary.sh
+
       # The former standalone repository CI now runs from the monorepo checkout.
       # Keep the same Unix test/clippy/package coverage and Windows advisory
       # build/core-test boundary without creating a second workflow.
