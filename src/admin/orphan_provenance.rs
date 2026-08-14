@@ -94,11 +94,10 @@ pub struct ScopeCounts {
     pub included: usize,
     pub excluded_not_reparented: usize,
     pub excluded_foreign_uid: usize,
-    /// Leads its own session (`sid == pid`). Out of scope for this view, not a
-    /// verdict that nothing lost it.
+    /// Leads its own session (`sid == pid`). A scope boundary, not a verdict
+    /// about the process.
     pub excluded_session_leader: usize,
-    /// Session 1. Out of scope for this view, not a verdict that it was never
-    /// anybody's child.
+    /// Session 1. A scope boundary, not a verdict about the process.
     pub excluded_init_session: usize,
     /// `getsid` failed. Excluded because we cannot tell, never guessed.
     pub excluded_session_unknown: usize,
@@ -685,9 +684,10 @@ pub fn render_human(report: &OrphanReport) -> String {
 fn render_scope(scope: &ScopeCounts) -> String {
     format!(
         "  Scope: scanned {} process(es); excluded {} not reparented, {} owned by another user, \
-{} session leaders that created their own session, {} in session 1 adopted by init at boot, \
+{} leading their own session (outside this view), {} in session 1 (outside this view), \
 {} whose session could not be read.\n  Blind spot: a leaked process that called setsid() itself \
-becomes its own session leader and is invisible here.\n",
+leads its own session and is therefore outside this view too. An exclusion here is a scope \
+boundary, not a finding that the process is fine.\n",
         scope.scanned,
         scope.excluded_not_reparented,
         scope.excluded_foreign_uid,
