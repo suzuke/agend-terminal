@@ -1005,6 +1005,14 @@ fn the_doctor_command_emits_the_orphan_provenance_section() {
         .expect("doctor must run");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
+    // Without this, a doctor that printed the section and then died would pass:
+    // partial stdout is not a working command.
+    assert!(
+        output.status.success(),
+        "`agend-terminal doctor` must exit 0; status={:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         stdout.contains("Orphaned agent-attributable processes"),
         "`agend-terminal doctor` must emit the orphan section: {stdout}"
@@ -1029,14 +1037,24 @@ fn the_doctor_command_emits_the_orphan_provenance_section() {
 /// module, so a hard-coded placeholder cannot satisfy the test above.
 #[test]
 fn run_doctor_invokes_the_orphan_provenance_module() {
+    // Deliberately NOT "mentions orphan_provenance anywhere": a `use` line or a
+    // doc reference would satisfy that. Require the two calls that actually
+    // produce the section — classify it, then render it.
     #[derive(Default)]
     struct ProvenanceCallFinder {
-        found: bool,
+        classifies: bool,
+        renders: bool,
     }
     impl<'ast> Visit<'ast> for ProvenanceCallFinder {
         fn visit_path(&mut self, p: &'ast syn::Path) {
-            if p.segments.iter().any(|s| s.ident == "orphan_provenance") {
-                self.found = true;
+            let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+            for pair in segs.windows(2) {
+                if pair[0] == "orphan_provenance" && pair[1] == "classify" {
+                    self.classifies = true;
+                }
+                if pair[0] == "orphan_provenance" && pair[1] == "render_human" {
+                    self.renders = true;
+                }
             }
             visit::visit_path(self, p);
         }
@@ -1057,9 +1075,12 @@ fn run_doctor_invokes_the_orphan_provenance_module() {
     let mut finder = ProvenanceCallFinder::default();
     finder.visit_item_fn(run_doctor);
     assert!(
-        finder.found,
-        "#3273 §3.9: `run_doctor` must call `admin::orphan_provenance` — a sampler that renders \
-         a report nothing reaches is not a reported orphan"
+        finder.classifies && finder.renders,
+        "#3273 §3.9: `run_doctor` must call BOTH `orphan_provenance::classify` and \
+         `orphan_provenance::render_human` — a sampler whose report nothing reaches is not a \
+         reported orphan, and a mere import proves nothing. classify={} render={}",
+        finder.classifies,
+        finder.renders
     );
 }
 
