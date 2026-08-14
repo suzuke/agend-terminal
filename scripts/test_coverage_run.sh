@@ -18,6 +18,56 @@ wrapper="$script_dir/coverage-run.sh"
 # `set -o pipefail` outside both branches: pipefail is required by the wrapper.
 errexit_guard_pattern='^[[:space:]]*set[[:space:]]+-[[:alpha:]]*e[[:alpha:]]*([[:space:]]|$)|^[[:space:]]*set[[:space:]]+-o[[:space:]]+errexit([[:space:]]|$)'
 
+native_symlink_host() {
+    case "${RUNNER_OS:-}" in
+        Windows) return 0 ;;
+    esac
+    case "${MSYSTEM:-}" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    case "${OSTYPE:-}" in
+        mingw*|msys*|cygwin*) return 0 ;;
+    esac
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    esac
+    return 1
+}
+
+native_msys_diag_value() {
+    local value="$1"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    if [ "${#value}" -gt 160 ]; then
+        value="${value:0:157}..."
+    fi
+    printf '%s' "$value"
+}
+
+normalize_native_msys() {
+    local before="${MSYS:-}" after
+    after="$(printf '%s\n' "$before" | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i !~ /^winsymlinks:/) {
+                    if (kept != "") kept = kept " "
+                    kept = kept $i
+                }
+            }
+        }
+        END {
+            if (kept != "") kept = kept " "
+            print kept "winsymlinks:nativestrict"
+        }
+    ')"
+    MSYS="$after"
+    export MSYS
+    printf 'native-symlink MSYS before=%s after=%s\n' \
+        "$(native_msys_diag_value "$before")" \
+        "$(native_msys_diag_value "$after")" >&2
+}
+
 errexit_enabled_in() {
     grep -qE "$errexit_guard_pattern" "$1"
 }
@@ -93,12 +143,24 @@ cleanup_run_tmpdir() {
 }
 trap cleanup_run_tmpdir EXIT
 
+if [ "${COVERAGE_REQUIRE_NATIVE_SYMLINKS:-0}" = "1" ] && native_symlink_host; then
+    normalize_native_msys
+fi
+
 # A property this platform cannot exercise is SKIPPED, never silently passed:
 # a green count that includes an unverifiable property is a false green.
 report_skip() {
     echo "SKIP  $1"
     [ -n "${2:-}" ] && echo "      $2"
     skip=$((skip + 1))
+}
+
+report_symlink_skip() {
+    if [ "${COVERAGE_REQUIRE_NATIVE_SYMLINKS:-0}" = "1" ]; then
+        report 1 "$1" "${2:-native symlink premise unavailable; fail-closed}"
+    else
+        report_skip "$1" "${2:-native symlink premise unavailable}"
+    fi
 }
 
 report() {
@@ -842,7 +904,7 @@ SHIM
     chmod +x "$shim/wc"
     if ! ln -s "$outside" "$sandbox/.probe" 2>/dev/null || [ ! -L "$sandbox/.probe" ]; then
         rm -rf "$sandbox"
-        report_skip "reads are pinned against a post-validation swap" \
+        report_symlink_skip "reads are pinned against a post-validation swap" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -891,7 +953,7 @@ test_temp_path_is_not_followed() {
     ln -s "$outside" "$sandbox/evil-temp" 2>/dev/null
     if [ ! -L "$sandbox/evil-temp" ]; then
         rm -rf "$sandbox"
-        report_skip "the scratch path is not followed" \
+        report_symlink_skip "the scratch path is not followed" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -2942,7 +3004,7 @@ test_symlink_leaf_cannot_escape_containment() {
     # truthful answer — the premise, not the property, is unavailable.
     if [ ! -L "$sandbox/profiles/leaf-1-2_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "a symlinked leaf cannot escape containment" \
+        report_symlink_skip "a symlinked leaf cannot escape containment" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -2990,7 +3052,7 @@ test_symlinked_response_list_discloses_nothing_outside() {
         "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
     if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
         rm -rf "$sandbox"
-        report_skip "a symlinked response list discloses nothing from outside" \
+        report_symlink_skip "a symlinked response list discloses nothing from outside" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3016,7 +3078,7 @@ test_symlinked_survey_profile_discloses_no_outside_bytes() {
     ln -s "$sandbox/secret.bin" "$sandbox/profiles/leak-9-9_0.profraw" 2>/dev/null
     if [ ! -L "$sandbox/profiles/leak-9-9_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "the survey discloses no bytes from an escaping profile" \
+        report_symlink_skip "the survey discloses no bytes from an escaping profile" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3042,7 +3104,7 @@ test_symlinked_exemplar_discloses_no_outside_bytes() {
     ln -s "$sandbox/secret.bin" "$sandbox/profiles/peer-2-77_0.profraw" 2>/dev/null
     if [ ! -L "$sandbox/profiles/peer-2-77_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "an escaping peer is never offered as an exemplar" \
+        report_symlink_skip "an escaping peer is never offered as an exemplar" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3072,7 +3134,7 @@ test_in_scope_symlinks_are_still_read() {
         "$sandbox/profiles/alias-2-88_0.profraw" 2>/dev/null
     if [ ! -L "$sandbox/profiles/alias-2-88_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "an in-scope symlink is still surveyed and still an exemplar" \
+        report_symlink_skip "an in-scope symlink is still surveyed and still an exemplar" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3127,7 +3189,7 @@ test_dangling_response_list_is_disclosed_not_dropped() {
         "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
     if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
         rm -rf "$sandbox"
-        report_skip "a dangling response list is disclosed by name and never followed" \
+        report_symlink_skip "a dangling response list is disclosed by name and never followed" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3161,7 +3223,7 @@ test_dangling_profraw_is_surveyed_not_dropped() {
     if [ ! -L "$sandbox/profiles/gone-7-7_0.profraw" ] ||
         [ ! -L "$sandbox/profiles/inly-8-7_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "the survey names a dangling profile it will not open" \
+        report_symlink_skip "the survey names a dangling profile it will not open" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3189,7 +3251,7 @@ test_dangling_profraw_is_counted_in_the_inventory() {
     ln -s "$sandbox/never-created.bin" "$sandbox/profiles/missing-9-9_0.profraw" 2>/dev/null
     if [ ! -L "$sandbox/profiles/missing-9-9_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "the inventory counts an entry it never opens" \
+        report_symlink_skip "the inventory counts an entry it never opens" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3227,7 +3289,7 @@ test_in_scope_symlinked_response_list_is_refused_not_read() {
         "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
     if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
         rm -rf "$sandbox"
-        report_skip "an in-scope symlinked response list is refused, not read" \
+        report_symlink_skip "an in-scope symlinked response list is refused, not read" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3285,7 +3347,7 @@ test_relative_missing_profile_dir_under_symlinked_cwd() {
     ln -s "$sandbox/realdir" "$sandbox/linkdir" 2>/dev/null
     if [ ! -L "$sandbox/linkdir" ]; then
         rm -rf "$sandbox"
-        report_skip "relative missing profile_dir under a symlinked CWD" \
+        report_symlink_skip "relative missing profile_dir under a symlinked CWD" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3322,7 +3384,7 @@ test_in_scope_symlink_opens_the_validated_target() {
     ln -s "$sandbox/profiles/target-1-2_0.profraw" "$sandbox/profiles/alias-3-4_0.profraw" 2>/dev/null
     if [ ! -L "$sandbox/profiles/alias-3-4_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "an in-scope symlink opens the validated target" \
+        report_symlink_skip "an in-scope symlink opens the validated target" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -3351,7 +3413,7 @@ test_validated_target_is_the_one_opened() {
     ln -s "$outside" "$sandbox/profiles/leaf-5-5_0.profraw" 2>/dev/null
     if [ ! -L "$sandbox/profiles/leaf-5-5_0.profraw" ]; then
         rm -rf "$sandbox"
-        report_skip "the validated target is the one opened" \
+        report_symlink_skip "the validated target is the one opened" \
             "this platform does not create real symlinks; premise unavailable"
         return
     fi
@@ -4234,6 +4296,86 @@ test_proc_absence_is_never_reported_as_no() {
     fi
 }
 
+test_native_msys_token_matrix() {
+    local original_msys="${MSYS-}" had_msys=0 input expected actual first bad=""
+    [ "${MSYS+x}" = x ] && had_msys=1
+
+    native_msys_case() {
+        input="$1"
+        expected="$2"
+        MSYS="$input"
+        normalize_native_msys
+        actual="$MSYS"
+        [ "$actual" = "$expected" ] || bad="$bad got($actual) expected($expected)"
+    }
+
+    native_msys_case "" "winsymlinks:nativestrict"
+    native_msys_case "winsymlinks:deepcopy" "winsymlinks:nativestrict"
+    native_msys_case "winsymlinks:lnk" "winsymlinks:nativestrict"
+    native_msys_case "winsymlinks:native" "winsymlinks:nativestrict"
+    native_msys_case "winsymlinks:nativestrict" "winsymlinks:nativestrict"
+    native_msys_case "foo bar" "foo bar winsymlinks:nativestrict"
+    native_msys_case $'foo\twinsymlinks:lnk\tbar' "foo bar winsymlinks:nativestrict"
+    native_msys_case "keep winsymlinks:copy winsymlinks:deepcopy other" \
+        "keep other winsymlinks:nativestrict"
+
+    MSYS="left winsymlinks:lnk right"
+    normalize_native_msys
+    first="$MSYS"
+    normalize_native_msys
+    [ "$MSYS" = "$first" ] || bad="$bad not-idempotent"
+
+    if [ "$had_msys" -eq 1 ]; then
+        MSYS="$original_msys"
+        export MSYS
+    else
+        unset MSYS
+    fi
+    if [ -n "$bad" ]; then
+        report 1 "MSYS native-symlink token matrix" "issues:$bad"
+    else
+        report 0 "MSYS native-symlink token matrix"
+    fi
+}
+
+test_native_symlink_skip_gate_is_scoped() {
+    local gate_fn=report_symlink_skip old_required="${COVERAGE_REQUIRE_NATIVE_SYMLINKS-}"
+    local old_fail="$fail" old_skip="$skip" bad=""
+
+    fail=0
+    skip=0
+    COVERAGE_REQUIRE_NATIVE_SYMLINKS=1 "$gate_fn" "gated symlink premise" "premise unavailable" \
+        >/dev/null 2>&1
+    [ "$fail" -eq 1 ] || bad="$bad required-mode-not-fail-closed"
+    [ "$skip" -eq 0 ] || bad="$bad required-mode-counted-as-skip"
+
+    fail=0
+    skip=0
+    COVERAGE_REQUIRE_NATIVE_SYMLINKS=0 "$gate_fn" "ungated symlink premise" "premise unavailable"
+    [ "$fail" -eq 0 ] || bad="$bad default-mode-failed"
+    [ "$skip" -eq 1 ] || bad="$bad default-mode-not-skipped"
+
+    fail=0
+    skip=0
+    COVERAGE_REQUIRE_NATIVE_SYMLINKS=1 report_skip "FIFO premise" "premise unavailable"
+    [ "$fail" -eq 0 ] || bad="$bad FIFO-failed-closed"
+    [ "$skip" -eq 1 ] || bad="$bad FIFO-not-skipped"
+
+    if [ -n "$old_required" ]; then
+        COVERAGE_REQUIRE_NATIVE_SYMLINKS="$old_required"
+        export COVERAGE_REQUIRE_NATIVE_SYMLINKS
+    else
+        unset COVERAGE_REQUIRE_NATIVE_SYMLINKS
+    fi
+    fail="$old_fail"
+    skip="$old_skip"
+    if [ -n "$bad" ]; then
+        report 1 "native-symlink skip gate is scoped" "issues:$bad"
+    else
+        report 0 "native-symlink skip gate is scoped"
+    fi
+}
+
 test_default_producer_contains_partial_profiles
 test_contained_corruption_is_visible_and_all_bad_still_fails
 test_real_failure_wins_over_corruption_signature
@@ -4306,6 +4448,8 @@ test_absence_requires_platform_authority
 test_pid_authority_seam_classifies_platforms
 test_failed_authority_query_is_not_absence
 test_proc_absence_is_never_reported_as_no
+test_native_msys_token_matrix
+test_native_symlink_skip_gate_is_scoped
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
