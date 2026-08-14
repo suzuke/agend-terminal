@@ -25,3 +25,23 @@ pub mod daemon {
         }
     }
 }
+
+/// Re-export for integration tests. Same source file as the binary crate's
+/// `admin::orphan_provenance` module (`#[path]`), so the #3273 contract tests
+/// exercise the identical code the daemon and `doctor` run. The module is
+/// deliberately self-contained (std + serde) so it compiles in both crates.
+#[path = "admin/orphan_provenance.rs"]
+pub mod orphan_provenance_impl;
+
+pub mod admin {
+    pub use super::orphan_provenance_impl as orphan_provenance;
+}
+
+/// Re-export for integration tests: the agent-facing background-job guidance
+/// text, whose content and instruction-path wiring are pinned by #3273.
+#[path = "background_guidance.rs"]
+pub mod background_guidance_impl;
+
+pub mod instructions {
+    pub use super::background_guidance_impl::background_process_guidance;
+}

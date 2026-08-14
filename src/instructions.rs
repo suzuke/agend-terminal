@@ -130,6 +130,10 @@ pub(crate) fn build_instructions_body(
     content.push_str("# AgEnD — Multi-Agent Coordination\n\n");
     content.push_str("You are managed by AgEnD (Agent Environment Daemon).\n");
     content.push_str("You have MCP tools for communicating with other agents.\n\n");
+    // #3273 fix 2: prevention half — cleaning up background jobs is incidence
+    // reduction, never a containment guarantee (a SIGKILLed shell runs no trap).
+    content.push_str(crate::background_guidance::background_process_guidance());
+    content.push('\n');
 
     if let Some(ctx) = ctx {
         let safe_name = sanitize_identifier(ctx.name);

@@ -237,7 +237,30 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     for line in staleness_report.lines() {
         println!("    {line}");
     }
+
+    // #3273 V1: report-only orphan visibility. Every entry is UNPROVEN and the
+    // section offers no action — disposition is an operator decision.
+    println!();
+    let oracle = crate::daemon::per_tick::tool_call_provenance::PlatformOracle::snapshot();
+    let mut report = crate::admin::orphan_provenance::classify(home, &oracle, now_epoch_ms());
+    let cwds = crate::daemon::per_tick::tool_call_provenance::resolve_cwds(
+        &report.candidates.iter().map(|c| c.pid).collect::<Vec<_>>(),
+    );
+    for candidate in &mut report.candidates {
+        candidate.cwd = cwds.get(&candidate.pid).cloned();
+    }
+    for line in crate::admin::orphan_provenance::render_human(&report).lines() {
+        println!("  {line}");
+    }
+
     Ok(())
+}
+
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// Sprint 58 Wave 2 PR-1 (#11): per-helper staleness summary line.

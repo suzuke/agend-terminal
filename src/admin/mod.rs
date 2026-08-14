@@ -1,6 +1,12 @@
 //! Admin utilities — manual maintenance commands.
 
 pub mod cleanup_zombies;
+// #3273 V1. Dead-code analysis is per-crate: the binary uses only the subset
+// `doctor` and the per-tick handler need, while the full surface (tool-evidence
+// types, `SampleOutcome`, the `Unsupported` arm) is exercised through the
+// library re-export by `tests/orphan_provenance_failclosed.rs`.
+#[allow(dead_code)]
+pub mod orphan_provenance;
 
 use std::path::Path;
 

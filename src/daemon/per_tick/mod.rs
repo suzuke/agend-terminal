@@ -75,6 +75,7 @@ pub(crate) mod snapshot;
 pub(crate) mod supervisor_trackers;
 pub(crate) mod thread_dump;
 pub(crate) mod tmp_review_gc;
+pub(crate) mod tool_call_provenance;
 pub(crate) mod watchdog;
 pub(crate) mod workspace_boundary_sweep;
 pub(crate) mod worktree_registry_sweep;
@@ -390,6 +391,12 @@ pub(crate) fn build_default_handlers(
         Box::new(RespawnWatchdogHandler::new()),
         Box::new(WatchdogHandler::new(watchdog_dry_run)),
         Box::new(ExternalLivenessHandler::new()),
+        // #3273 V1: maintain the pre-tool direct-child baseline per backend so a
+        // future tool-call observation has something to diff against, and keep it
+        // on the DAEMON tick rather than `instance_monitor::collect` — that sweep
+        // is subscriber-gated by `LAST_METRICS_READ`, so a headless daemon would
+        // skip it. Read-only with respect to every other handler's state.
+        Box::new(tool_call_provenance::ToolCallProvenanceHandler::new()),
         // #t-…83936-4: canonical source_repo existence heartbeat — pages the
         // operator if a registered canonical repo vanishes (the 40-min-silent
         // deletion incident). 60-tick backstop; the real-time path is
