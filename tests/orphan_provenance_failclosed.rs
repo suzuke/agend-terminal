@@ -1355,36 +1355,42 @@ fn the_doctor_subcommand_dispatches_to_run_doctor() {
 // 11. The scope filter is a pinned pure function, and the report admits its scope
 // ---------------------------------------------------------------------------
 
-/// `PPID == 1` is not "orphaned" on macOS: launchd is the DESIGNED parent of
-/// hundreds of per-user agents and XPC services that were never anybody's
-/// child. The kernel separates them without any text heuristic — a process that
-/// created its own session has `sid == pid`, one adopted at boot sits in
-/// session 1 — and only a process holding a session it did NOT create is
-/// evidence that whatever made that session is gone.
+/// `PPID == 1` on its own makes an unreadable list: on macOS launchd is the
+/// parent of hundreds of per-user agents and XPC services. This view therefore
+/// narrows to processes holding a session id they did not create, which is the
+/// shape the #3273 RCA measured for a background job outliving its tool-call
+/// shell.
+///
+/// That narrowing is a SCOPING CHOICE, not a finding about ownership. A process
+/// in session 1, or one that leads its own session, is not thereby proven to be
+/// nobody's leftover — it is a topology category this view does not cover, and
+/// therefore a known blind spot. Nothing here concludes anything about who owns
+/// what; every survivor is still UNPROVEN.
 ///
 /// This is production's real filter, so it is pinned as a pure function with
 /// every exclusion counted. Counting matters as much as filtering: an excluded
 /// process that is never counted is indistinguishable from one that does not
-/// exist, and this report's whole purpose is to be honest about what it cannot
-/// see.
+/// exist, and the point of this report is to be honest about what it did not
+/// look at.
 #[test]
 fn the_scope_filter_includes_only_processes_holding_a_session_they_did_not_create() {
     let rows = vec![
-        // Included: reparented, ours, and holding a session it did not create.
+        // Kept: reparented, ours, and holding a session it did not create.
         ScopeInput {
             pid: 911,
             ppid: 1,
             uid: OUR_UID,
             sid: Some(910),
         },
-        // Adopted by init at boot — not left behind by anything.
+        // Session 1: outside this view's scope, and a known blind spot.
         ScopeInput {
             pid: 571,
             ppid: 1,
             uid: OUR_UID,
             sid: Some(1),
         },
-        // Created its own session: nothing lost it.
+        // Leads its own session: outside this view's scope. Says nothing
+        // about whether anything lost it — see the setsid blind spot.
         ScopeInput {
             pid: 396,
             ppid: 1,
@@ -1419,7 +1425,7 @@ fn the_scope_filter_includes_only_processes_holding_a_session_they_did_not_creat
     assert_eq!(
         included,
         vec![911],
-        "only the inherited-session orphan belongs in the report"
+        "only the inherited-session candidate is in scope for this view"
     );
     assert_eq!(counts.scanned, 6);
     assert_eq!(counts.included, 1);
@@ -1433,6 +1439,53 @@ fn the_scope_filter_includes_only_processes_holding_a_session_they_did_not_creat
     assert_eq!(
         counts.excluded_session_unknown, 1,
         "a process whose session could not be read must be counted, not silently dropped"
+    );
+    // The buckets are mutually exclusive and exhaustive: every scanned process
+    // lands in exactly one. Without this, a miscounted bucket could hide
+    // processes that were neither reported nor accounted for.
+    assert_eq!(
+        counts.scanned,
+        counts.included
+            + counts.excluded_not_reparented
+            + counts.excluded_foreign_uid
+            + counts.excluded_session_leader
+            + counts.excluded_init_session
+            + counts.excluded_session_unknown,
+        "scope accounting must balance: {counts:?}"
+    );
+}
+
+/// The accounting invariant is the property, not the six numbers in the table
+/// above: any input must balance.
+#[test]
+fn the_scope_filter_accounting_always_balances() {
+    let rows: Vec<ScopeInput> = (0..40u32)
+        .map(|i| ScopeInput {
+            pid: 1_000 + i,
+            ppid: if i % 5 == 0 { 900 } else { 1 },
+            uid: if i % 7 == 0 { 0 } else { OUR_UID },
+            sid: match i % 4 {
+                0 => None,
+                1 => Some(1),
+                2 => Some(1_000 + i),
+                _ => Some(500 + i),
+            },
+        })
+        .collect();
+
+    let (included, counts) = scope_reparented(&rows, Some(OUR_UID));
+
+    assert_eq!(counts.scanned, 40);
+    assert_eq!(counts.included, included.len());
+    assert_eq!(
+        counts.scanned,
+        counts.included
+            + counts.excluded_not_reparented
+            + counts.excluded_foreign_uid
+            + counts.excluded_session_leader
+            + counts.excluded_init_session
+            + counts.excluded_session_unknown,
+        "scope accounting must balance for any input: {counts:?}"
     );
 }
 
@@ -1505,14 +1558,24 @@ fn an_empty_report_says_it_is_a_scoped_snapshot_not_a_clean_bill() {
     let world = FakeOracle::supported();
     let mut report = classify(&home, &world, 40 * HOUR_MS);
     report.scope = ScopeCounts {
-        scanned: 861,
+        scanned: 1_012,
         included: 0,
-        excluded_not_reparented: 302,
-        excluded_foreign_uid: 302,
+        excluded_not_reparented: 183,
+        excluded_foreign_uid: 316,
         excluded_session_leader: 215,
-        excluded_init_session: 297,
+        excluded_init_session: 294,
         excluded_session_unknown: 4,
     };
+    assert_eq!(
+        report.scope.scanned,
+        report.scope.included
+            + report.scope.excluded_not_reparented
+            + report.scope.excluded_foreign_uid
+            + report.scope.excluded_session_leader
+            + report.scope.excluded_init_session
+            + report.scope.excluded_session_unknown,
+        "fixture must be a state the filter could actually produce"
+    );
 
     let rendered = render_human(&report);
 
@@ -1524,7 +1587,7 @@ fn an_empty_report_says_it_is_a_scoped_snapshot_not_a_clean_bill() {
         rendered.contains("setsid"),
         "the blind spot must be stated wherever the result is stated: {rendered}"
     );
-    for count in ["297", "215", "4"] {
+    for count in ["294", "215", "4"] {
         assert!(
             rendered.contains(count),
             "excluded counts for session-1, session-leader and unreadable-session must be \
@@ -1542,22 +1605,32 @@ fn a_non_empty_report_still_prints_its_scope_accounting() {
     let world = FakeOracle::supported().with(911, FakeProc::inherited(9_110).orphan());
     let mut report = classify(&home, &world, 40 * HOUR_MS);
     report.scope = ScopeCounts {
-        scanned: 861,
+        scanned: 1_013,
         included: 1,
-        excluded_not_reparented: 302,
-        excluded_foreign_uid: 302,
+        excluded_not_reparented: 183,
+        excluded_foreign_uid: 316,
         excluded_session_leader: 215,
-        excluded_init_session: 297,
+        excluded_init_session: 294,
         excluded_session_unknown: 4,
     };
+    assert_eq!(
+        report.scope.scanned,
+        report.scope.included
+            + report.scope.excluded_not_reparented
+            + report.scope.excluded_foreign_uid
+            + report.scope.excluded_session_leader
+            + report.scope.excluded_init_session
+            + report.scope.excluded_session_unknown,
+        "fixture must be a state the filter could actually produce"
+    );
 
     let rendered = render_human(&report);
 
     assert!(rendered.contains("911"));
     assert!(
-        rendered.contains("861"),
+        rendered.contains("1013"),
         "scanned total must be printed: {rendered}"
     );
-    assert!(rendered.contains("297") && rendered.contains("215") && rendered.contains("4"));
+    assert!(rendered.contains("294") && rendered.contains("215") && rendered.contains("4"));
     assert!(rendered.contains("setsid"));
 }
