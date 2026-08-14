@@ -292,10 +292,14 @@ struct LedgerFile {
     baselines: Vec<BackendBaseline>,
 }
 
-/// How long an observation stays useful: only while an orphan it could explain
-/// might still be around. Seven days is far beyond the 40-hour #3273 incident
-/// and bounds the file. This is what makes `last_seen_ms` load-bearing rather
-/// than decorative.
+/// Bounded diagnostic horizon for keeping observations — a storage decision,
+/// NOT a claim about how long an orphan lives. Orphans routinely outlive it:
+/// the #3273 RCA census found 44-day-old processes. When an observation ages
+/// out, the process it related to is still listed, still UNPROVEN, and simply
+/// loses its suggested owner; expiry never means the orphan is gone.
+/// Seven days covers the 40-hour incident with wide margin while bounding the
+/// file, and it is what makes `last_seen_ms` load-bearing rather than
+/// decorative.
 pub const OBSERVATION_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// Hard cap so a pathological burst inside the retention window cannot outgrow
@@ -346,18 +350,51 @@ fn write_ledger(home: &Path, ledger: &LedgerFile) -> PersistOutcome {
 /// rather than an oversight.
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+
+    // Deterministic failure seam, mirroring the repo's `AGEND_FORCE_*` idiom, so
+    // the "a failed write preserves the last valid ledger" contract can be
+    // tested without ambient filesystem permissions — those can lie under
+    // elevated or ACL-governed environments and are Unix-shaped besides.
+    //
+    // Scoped to an exact path rather than a bare on/off flag: the variable is
+    // process-global, and an integration-test binary runs its tests as threads,
+    // so a boolean seam would make unrelated concurrent tests fail. Keyed by
+    // path, only the fixture that opted in is affected — the same shape as
+    // `store::atomic_write`'s path-keyed failure registry.
+    if std::env::var_os("AGEND_ORPHAN_LEDGER_FAIL_WRITE")
+        .is_some_and(|target| target == path.as_os_str())
+    {
+        return Err(std::io::Error::other(
+            "forced ledger write failure (AGEND_ORPHAN_LEDGER_FAIL_WRITE)",
+        ));
+    }
+
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Unique per process AND per call, so concurrent writers cannot collide on
+    // the temp name — same shape as `store::atomic_write`.
     let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
-    let write_then_sync = || -> std::io::Result<()> {
+    let write_then_rename = || -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        // `std::fs::rename` replaces an existing destination on every supported
+        // platform (MoveFileExW on Windows), which is what `store::atomic_write`
+        // relies on too.
+        std::fs::rename(&tmp, path)?;
+        // Durability parity with `store::atomic_write`: fsync the parent so the
+        // new directory entry survives a crash right after the rename. Unix
+        // idiom; std has no clean Windows equivalent, so it is skipped there.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     };
-    match write_then_sync() {
+    match write_then_rename() {
         Ok(()) => Ok(()),
         Err(e) => {
+            // Never leave the temp behind on failure.
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
@@ -369,14 +406,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// and every sample pays an O(n) read + serialize + write on the daemon tick.
 /// A diagnostic that exists to catch unbounded resource growth must not be an
 /// instance of it.
-fn prune(ledger: &mut LedgerFile, oracle: &dyn ProcessOracle, now_ms: i64) {
-    // A baseline is only ever compared against the SAME backend generation, so
-    // once that generation is gone its child list can never be used again.
-    ledger.baselines.retain(|b| {
-        oracle
-            .facts(b.backend_pid)
-            .is_some_and(|f| f.start_token == Some(b.backend_start_token))
-    });
+fn prune(ledger: &mut LedgerFile, live_owners: &[(u32, u64)], now_ms: i64) {
+    // Retained against the CURRENT OWNER identities, not merely "some live
+    // process still has that pid": an instance that was removed while its
+    // backend process kept running would otherwise leave its baseline in the
+    // file forever, which is the same unbounded growth by another route.
+    ledger
+        .baselines
+        .retain(|b| live_owners.contains(&(b.backend_pid, b.backend_start_token)));
     // Observations outlive their shell on purpose — a dead shell's orphans are
     // exactly what the report relates — so age them out rather than dropping
     // them when the pid dies.
@@ -395,6 +432,23 @@ pub fn prune_observations(observations: &mut Vec<ShellObservation>, now_ms: i64)
         observations.sort_by_key(|o| o.last_seen_ms);
         let excess = observations.len() - MAX_OBSERVATIONS;
         observations.drain(..excess);
+    }
+}
+
+/// Ledger size, so a caller can prove what pruning did rather than infer it
+/// from downstream behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerStats {
+    pub observations: usize,
+    pub baselines: usize,
+}
+
+/// Counts of what is currently persisted.
+pub fn ledger_stats(home: &Path) -> LedgerStats {
+    let ledger = read_ledger(home);
+    LedgerStats {
+        observations: ledger.observations.len(),
+        baselines: ledger.baselines.len(),
     }
 }
 
@@ -442,6 +496,9 @@ pub fn sample_tool_call_shells(
     let mut ledger = read_ledger(home);
     let mut observed = Vec::new();
     let mut misses = Vec::new();
+    // Exact identities of the backends this tick actually owns; anything else
+    // in the ledger is unreachable state.
+    let mut live_owner_identities: Vec<(u32, u64)> = Vec::new();
 
     for owner in owners {
         let Some(backend_token) = oracle.facts(owner.backend_pid).and_then(|f| f.start_token)
@@ -455,6 +512,7 @@ pub fn sample_tool_call_shells(
             ));
             continue;
         };
+        live_owner_identities.push((owner.backend_pid, backend_token));
         let children: Vec<ProcFacts> = oracle
             .children_of(owner.backend_pid)
             .into_iter()
@@ -540,7 +598,7 @@ pub fn sample_tool_call_shells(
         }
     }
 
-    prune(&mut ledger, oracle, now_ms);
+    prune(&mut ledger, &live_owner_identities, now_ms);
     let persisted = write_ledger(home, &ledger);
     if matches!(persisted, PersistOutcome::Failed(_)) {
         // Nothing durable landed, so nothing may be reported as observed.
@@ -722,6 +780,11 @@ pub fn render_human(report: &OrphanReport) -> String {
     out.push_str(
         "  Every entry is UNPROVEN: agend cannot prove it owns any of these. argv, cwd, \
          elapsed and CPU are display only and never evidence of ownership.\n",
+    );
+    out.push_str(
+        "  Owner suggestions are kept for a bounded window (7 days). A process older than that \
+         stays listed with suggested=unknown — an expired suggestion says nothing about the \
+         process.\n",
     );
 
     if let ProvenanceSupport::Unsupported { platform, reason } = &report.support {

@@ -309,7 +309,10 @@ fn ps_snapshot() -> std::collections::HashMap<u32, PsRow> {
     std::collections::HashMap::new()
 }
 
-/// `ps` elapsed time: `[[dd-]hh:]mm:ss`.
+/// `ps` elapsed time: `[[dd-]hh:]mm:ss`. Unix-only, matching its sole call site
+/// in the `#[cfg(unix)]` `ps_snapshot`: on Windows there is no `ps` snapshot to
+/// parse, and strict clippy correctly rejects it as dead code there.
+#[cfg(unix)]
 fn parse_etime(raw: &str) -> u64 {
     let (days, rest) = match raw.split_once('-') {
         Some((d, rest)) => (d.parse::<u64>().unwrap_or_default(), rest),
@@ -366,7 +369,7 @@ pub(crate) fn resolve_cwds(_pids: &[u32]) -> std::collections::HashMap<u32, Stri
     std::collections::HashMap::new()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
