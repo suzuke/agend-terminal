@@ -273,6 +273,48 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    #[test]
+    fn failed_usage_limit_fallback_keeps_ordinary_alert_active() {
+        let home = tmp_home("usage-fallback-failure");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker:\n    backend: claude\n  lead:\n    backend: claude\n  general:\n    backend: claude\n\
+             teams:\n  t:\n    members: [worker, lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        seed_unread(&home, "worker", 4, 45);
+
+        // Make only the readable UsageLimit fallback recipient fail. The
+        // ordinary inbox-stuck alert still targets the team lead, whose inbox
+        // remains writable. This is the same resolved-path failure shape used
+        // by the messaging failure tests and works on all platforms.
+        let fallback_path = crate::inbox::storage::inbox_path_resolved(&home, "general");
+        std::fs::create_dir_all(&fallback_path).unwrap();
+
+        let mut usage_blocked = HashMap::new();
+        usage_blocked.insert("worker".to_string(), None);
+        usage_blocked.insert("lead".to_string(), None);
+        let mut last = HashMap::new();
+        scan_and_emit_with_blocked(&home, &chrono::Utc::now(), &mut last, &usage_blocked);
+
+        let lead_messages = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead_messages
+                .iter()
+                .any(|message| message.kind.as_deref() == Some("inbox_stuck_watchdog")),
+            "fallback delivery failure must preserve the ordinary alert: {lead_messages:?}"
+        );
+        assert!(
+            last.contains_key("worker"),
+            "ordinary alert delivery must stamp its own re-alert dedup state"
+        );
+        assert!(
+            !crate::daemon::supervisor::usage_limit_notify_path(&home).exists(),
+            "failed fallback must not mark the usage-limit notice ledger"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
     /// Ghost-inbox guard rollout (t-20260724035332273132-42380-3): a stuck
     /// alert must not be enqueued to a recipient with no fleet.yaml instance —
     /// pre-fix the team-less `FALLBACK_RECIPIENT` ("lead") grew
