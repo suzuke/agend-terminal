@@ -6,31 +6,51 @@
 //! signature per the reviewer RED-protocol ("the new tests compile-fail, fail
 //! at runtime, or fail with the expected error signature").
 //!
-//! The contract under test is decision `d-20260814163653190377-20`, which the
-//! primary and adversarial RCAs agreed on:
+//! The contract under test is decision `d-20260814163653190377-20` as
+//! corrected by the orchestrator's RED review: kill authority comes ONLY from
+//! provenance agend recorded itself, and **selection is temporal, never
+//! shape-based**.
 //!
-//! * Kill authority comes ONLY from provenance agend itself recorded while the
-//!   tool-call shell was a direct child of a backend — never from `PPID == 1`,
-//!   argv, cwd, age or CPU. Those four are display columns.
-//! * "Direct backend child" is not sufficient on its own: a backend also owns
-//!   transport, helper and plugin subprocesses. A tool-call shell is
-//!   distinguished by kernel-attested facts (it leads its OWN session and
-//!   process group, because the backend `setsid`s it) taken together with
-//!   active shell-tool evidence for that instance. Both are required.
-//! * A shell that lived and died between two samples is a sampling miss. It
-//!   stays visible as UNPROVEN forever and is never promoted.
+//! Selection (which process is a tool-call shell):
+//! * an active shell-tool generation has a start boundary;
+//! * a candidate is a direct backend child FIRST OBSERVED during that
+//!   generation — children already present when the generation opened are
+//!   pre-existing helpers (MCP servers, transport, plugin hosts) and are
+//!   excluded;
+//! * exactly one new candidate is required. Zero is a sampling miss, more than
+//!   one is ambiguous, and both yield NO record and NO authority.
+//! * `sid == pgid == pid` is NOT a selection test. agend's own code only
+//!   `setsid`s the backend; whether an inner tool shell does is a per-backend,
+//!   per-platform fact this repo does not control, so a shell that inherits the
+//!   backend's session and group must still be recorded.
+//!
+//! Attribution (which orphan belongs to a recorded shell) uses the recorded
+//! sid/pgid as a CONTAINMENT key only — never as authority on its own.
+//! Authority comes from the temporal record; the container merely says which
+//! surviving pids that record covers. An orphan is attributable only through a
+//! container the recorded shell actually LED — its session if
+//! `sid == shell_pid`, or its group if `pgid == shell_pid` — because only then
+//! is the id unique to that tool call. A shell that led neither leaves orphans
+//! indistinguishable from the backend's other descendants, so those stay
+//! UNPROVEN. A process that merely happens to sit in some non-backend session
+//! is never promoted: with no temporal record naming it, shape proves nothing.
+//!
+//! Everything else the RCAs agreed on:
+//! * `PPID == 1`, argv, cwd, age and CPU are display columns and can never
+//!   promote a candidate.
+//! * A shell born and reaped between two samples stays UNPROVEN forever.
 //! * Cleanup is dry-run -> `confirm_ids` -> `audit_reason`, and re-proves
 //!   identity via the start token before EVERY signal, because the TERM->KILL
 //!   grace window is exactly when a PID can be recycled.
-//! * Where the platform cannot attest the identity — or where the ledger
-//!   cannot be persisted — the surface says so and signals nothing.
+//! * Where the platform cannot attest identity — or the ledger cannot be
+//!   persisted — the surface says so and signals nothing.
 //!
 //! Sampling is owner-service/daemon-driven. It must NOT hang off
 //! `instance_monitor::collect()`, which is subscriber-gated by
 //! `LAST_METRICS_READ`: a headless daemon, or a TUI not on the Monitor pane,
 //! skips that sweep entirely and would silently stop recording provenance.
-//! Pinned two ways below — behaviourally through the daemon-tick entry point,
-//! and structurally with a `syn` AST walk.
+//! Pinned three ways below — through the real per-tick handler pipeline, and
+//! with two `syn` AST walks (negative coupling, positive wiring).
 //!
 //! Determinism: no real processes, no sleeps. The process world is a
 //! `FakeOracle` the test mutates directly, so PID recycling and
@@ -47,12 +67,16 @@ use agend_terminal::admin::orphan_provenance::{
     classify, execute_cleanup, load_ledger, render_human, sample_tool_call_shells, BackendOwner,
     BackendOwnerSource, CandidateClass, CleanupOutcome, CleanupPolicy, CleanupRefusal,
     CleanupRequest, DisplayColumns, OrphanReport, PersistOutcome, ProcFacts, ProcessOracle,
-    ProvenanceSupport, SampleSkip, ShellToolEvidence, ShellToolKind, SignalAction, Signaller,
-    SkipReason, ToolCallProvenanceHandler, UnprovenReason,
+    ProvenanceSupport, SampleMiss, SampleOutcome, SampleSkip, ShellToolEvidence, ShellToolKind,
+    SignalAction, Signaller, SkipReason, ToolCallProvenanceHandler, UnprovenReason,
 };
+use agend_terminal::daemon::per_tick::{run_handlers_with_panic_guard, PerTickHandler};
+use agend_terminal::instructions::background_process_guidance;
 
 const HOUR_MS: i64 = 3_600_000;
 const OUR_UID: u32 = 501;
+/// The session every backend-owned process shares unless something `setsid`s.
+const BACKEND_SESSION: u32 = 63_542;
 
 /// #3245: never wipe a shared fixture path on entry — one unique dir per test.
 fn tmp_home(tag: &str) -> PathBuf {
@@ -62,6 +86,12 @@ fn tmp_home(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("agend-3273-{}-{}-{}", tag, std::process::id(), id));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// The ledger's canonical location. Pinned here because the fail-closed tests
+/// must be able to make it unwritable; a rename is a contract change.
+fn ledger_path(home: &Path) -> PathBuf {
+    home.join("state").join("tool_call_provenance.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -79,28 +109,36 @@ struct FakeProc {
 }
 
 impl FakeProc {
-    /// A session/group leader — the shape the backend gives a tool-call shell.
-    fn leader(pid: u32, token: u64) -> Self {
+    /// The default shape: inherits the backend's session AND group. This is
+    /// what the corrected contract must accept, because nothing in this repo
+    /// proves an inner tool shell calls `setsid`.
+    fn inherited(token: u64) -> Self {
         Self {
             ppid: None,
-            sid: Some(pid),
-            pgid: Some(pid),
+            sid: Some(BACKEND_SESSION),
+            pgid: Some(BACKEND_SESSION),
             uid: Some(OUR_UID),
             start_token: Some(token),
             display: DisplayColumns::default(),
         }
     }
 
-    /// A helper that stayed in its parent's session — transport, plugin, MCP
-    /// server. Never a tool-call shell.
-    fn follower(session_of: u32, token: u64) -> Self {
+    /// Leads its own group but stays in the backend's session — the measured
+    /// shape of every live `codex` helper on this machine.
+    fn group_leader(pid: u32, token: u64) -> Self {
         Self {
-            ppid: None,
-            sid: Some(session_of),
-            pgid: Some(session_of),
-            uid: Some(OUR_UID),
-            start_token: Some(token),
-            display: DisplayColumns::default(),
+            pgid: Some(pid),
+            ..Self::inherited(token)
+        }
+    }
+
+    /// Leads its own session and group — the measured shape of a live `claude`
+    /// tool-call shell. Accepted, but never REQUIRED.
+    fn session_leader(pid: u32, token: u64) -> Self {
+        Self {
+            sid: Some(pid),
+            pgid: Some(pid),
+            ..Self::inherited(token)
         }
     }
 
@@ -304,11 +342,11 @@ impl BackendOwnerSource for HeadlessOwners {
     }
 }
 
-fn bash_tool(generation: u64) -> Option<ShellToolEvidence> {
+fn bash_tool(generation: u64, started_ms: i64) -> Option<ShellToolEvidence> {
     Some(ShellToolEvidence {
         kind: ShellToolKind::Bash,
         generation,
-        started_ms: 0,
+        started_ms,
     })
 }
 
@@ -352,10 +390,7 @@ fn unproven_reason(report: &OrphanReport, pid: u32) -> UnprovenReason {
     }
 }
 
-fn skip_reason(
-    outcome: &agend_terminal::admin::orphan_provenance::SampleOutcome,
-    pid: u32,
-) -> SampleSkip {
+fn skip_reason(outcome: &SampleOutcome, pid: u32) -> SampleSkip {
     outcome
         .skipped
         .iter()
@@ -364,107 +399,351 @@ fn skip_reason(
         .unwrap_or_else(|| panic!("pid {pid} must be reported as a visible sampling skip"))
 }
 
-/// The common fixture: instance `dev-1`'s backend 900 runs a Bash tool call in
-/// shell 910 (its own session), which is sampled while alive, then leaves
-/// orphan 911 behind and dies.
+fn miss(outcome: &SampleOutcome, instance: &str) -> SampleMiss {
+    outcome
+        .misses
+        .iter()
+        .find(|(name, _)| name == instance)
+        .map(|(_, m)| m.clone())
+        .unwrap_or_else(|| panic!("instance {instance} must report a visible sampling miss"))
+}
+
+/// The continuously-maintained pre-tool baseline: a tick with NO active shell
+/// tool records which direct children pre-date any subsequent generation.
+fn baseline_tick(home: &Path, world: &FakeOracle, now_ms: i64) -> SampleOutcome {
+    sample_tool_call_shells(home, world, &[owner("dev-1", 900, None)], now_ms)
+}
+
+/// The common fixture — deliberately the shape of the actual #3273 incident.
+/// Backend 900 already owns two helpers when the Bash generation opens; shell
+/// 910 then appears and is the unique new child; the SHELL exits leaving
+/// orphan 911 in the group it led, while **the backend and the instance stay
+/// alive**. Backend death is not part of the incident and must not be a
+/// precondition for attribution.
 fn recorded_world() -> (PathBuf, FakeOracle) {
     let home = tmp_home("recorded");
     let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(920, FakeProc::inherited(9_200).child_of(900))
+        .with(921, FakeProc::group_leader(921, 9_210).child_of(900));
 
-    let outcome = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7))], 0);
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
     assert_eq!(
         outcome.recorded.len(),
         1,
-        "the live tool-call shell must be recorded while it is samplable"
+        "the unique newly-observed child must be recorded"
     );
 
-    // The shell exits; its background job is reparented but keeps the session.
+    // Only the tool-call shell dies. 900 keeps running, exactly as in #3273.
     world.reap(910);
-    world.reap(900);
-    world.insert(911, FakeProc::follower(910, 9_110).orphan());
+    // The background job keeps the group its shell led.
+    world.insert(911, FakeProc::inherited(9_110).group(Some(910)).orphan());
     (home, world)
 }
 
 // ---------------------------------------------------------------------------
-// 1. Sampling records kernel-attested identity — and only for tool-call shells
+// 1. Selection is temporal, not shape-based
 // ---------------------------------------------------------------------------
 
 #[test]
-fn sampling_records_session_group_and_token_of_a_tool_call_shell() {
-    let home = tmp_home("sample");
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
+fn a_shell_inheriting_the_backend_session_and_group_is_still_recorded() {
+    let home = tmp_home("inherited");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
 
-    let outcome =
-        sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7))], 1_700);
+    // No setsid, no setpgid: the shell is indistinguishable from the backend by
+    // shape alone. Temporal attribution must still record it.
+    world.insert(910, FakeProc::inherited(9_100).child_of(900));
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
 
-    assert!(matches!(outcome.support, ProvenanceSupport::Supported));
-    assert!(matches!(outcome.persisted, PersistOutcome::Written));
-    let ledger = load_ledger(&home);
-    assert_eq!(ledger.len(), 1, "the sample must be durable, not in-memory");
-    let record = &ledger[0];
-    assert_eq!(record.instance, "dev-1");
+    assert_eq!(outcome.recorded.len(), 1);
+    let record = &outcome.recorded[0];
     assert_eq!(record.shell_pid, 910);
     assert_eq!(
-        record.sid, 910,
-        "the tool-call shell's OWN session is the attribution key; the backend's is not inherited"
+        record.sid, BACKEND_SESSION,
+        "the ACTUAL session is recorded, even when it is the backend's"
     );
     assert_eq!(
-        record.pgid, 910,
-        "the process group must be recorded too — consensus requires sid AND pgid where supported"
+        record.pgid, BACKEND_SESSION,
+        "the ACTUAL group is recorded, even when it is the backend's"
     );
-    assert_eq!(record.leader_start_token, 9_100);
+    assert_eq!(record.shell_start_token, 9_100);
+    assert_eq!(record.tool_generation, 7);
+    assert_eq!(record.first_seen_ms, 1_000);
+}
+
+#[test]
+fn a_pre_existing_helper_is_never_recorded() {
+    let home = tmp_home("preexisting");
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        // The MCP servers, bridge and plugin host the backend started at boot.
+        .with(920, FakeProc::inherited(9_200).child_of(900))
+        .with(921, FakeProc::group_leader(921, 9_210).child_of(900));
+
+    let baseline = baseline_tick(&home, &world, 0);
+    assert!(
+        baseline.recorded.is_empty(),
+        "children that pre-date the generation are not candidates"
+    );
+    assert_eq!(skip_reason(&baseline, 920), SampleSkip::PreExistingChild);
+    assert_eq!(skip_reason(&baseline, 921), SampleSkip::PreExistingChild);
+    assert_eq!(miss(&baseline, "dev-1"), SampleMiss::NoNewCandidate);
+
+    // A later tick in the SAME generation must not re-promote them.
+    let again = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        5_000,
+    );
+    assert!(again.recorded.is_empty());
+    assert!(load_ledger(&home).is_empty());
+}
+
+#[test]
+fn two_new_children_in_one_generation_are_ambiguous_and_record_nothing() {
+    let home = tmp_home("ambiguous");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+
+    // A tool shell and a helper appeared in the same window. Nothing in the
+    // kernel state says which is which, so authority must not be invented.
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    world.insert(930, FakeProc::inherited(9_300).child_of(900));
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert!(
+        outcome.recorded.is_empty(),
+        "ambiguity must produce no record at all, not a guess"
+    );
+    assert_eq!(miss(&outcome, "dev-1"), SampleMiss::Ambiguous);
+    assert_eq!(skip_reason(&outcome, 910), SampleSkip::AmbiguousCandidates);
+    assert_eq!(skip_reason(&outcome, 930), SampleSkip::AmbiguousCandidates);
+    assert!(load_ledger(&home).is_empty());
+}
+
+#[test]
+fn no_new_child_in_a_generation_is_a_visible_sampling_miss() {
+    let home = tmp_home("nocandidate");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert!(outcome.recorded.is_empty());
     assert_eq!(
-        record.tool_generation, 7,
-        "the record must name WHICH tool call it belongs to, so a later call cannot inherit it"
+        miss(&outcome, "dev-1"),
+        SampleMiss::NoNewCandidate,
+        "a generation whose shell was never observed must stay visible as a miss"
     );
-    assert_eq!(record.first_seen_ms, 1_700);
+}
+
+#[test]
+fn a_first_tick_while_a_generation_is_already_active_fails_closed() {
+    let home = tmp_home("nobaseline");
+    // The daemon restarted while a tool call was already in flight: 910 and 920
+    // are both simply "there", and nothing says which pre-dates the tool. With
+    // no inactive baseline the temporal contract has no input, so it must
+    // record nothing rather than fall back to shape.
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(910, FakeProc::session_leader(910, 9_100).child_of(900))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
+
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert!(
+        outcome.recorded.is_empty(),
+        "no baseline means no temporal evidence; a session-leader shape must not substitute for it"
+    );
+    assert_eq!(miss(&outcome, "dev-1"), SampleMiss::BaselineUnavailable);
+    assert!(load_ledger(&home).is_empty());
+}
+
+#[test]
+fn a_first_active_tick_with_exactly_one_child_is_still_unclassified() {
+    let home = tmp_home("nobaseline-single");
+    // The decisive case: one direct child and no inactive baseline. Nothing
+    // distinguishes "the tool shell" from "a helper that was already running",
+    // and there is no ambiguity for the ambiguity rule to catch — so only an
+    // explicit baseline requirement keeps this from being falsely attributed.
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
+
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert!(
+        outcome.recorded.is_empty(),
+        "a single already-running child must not be attributed just because it is alone"
+    );
+    assert_eq!(miss(&outcome, "dev-1"), SampleMiss::BaselineUnavailable);
+    assert!(load_ledger(&home).is_empty());
+}
+
+#[test]
+fn a_first_active_tick_with_zero_children_establishes_an_empty_baseline() {
+    let home = tmp_home("nobaseline-empty");
+    // An empty child set IS a usable baseline: there is nothing that could
+    // have pre-dated the generation, so the next new child is unambiguous.
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    let owners = [owner("dev-1", 900, bash_tool(7, 0))];
+
+    let first = sample_tool_call_shells(&home, &world, &owners, 1_000);
+    assert!(first.recorded.is_empty());
+    assert_eq!(miss(&first, "dev-1"), SampleMiss::NoNewCandidate);
+
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    let second = sample_tool_call_shells(&home, &world, &owners, 2_000);
+
+    assert_eq!(second.recorded.len(), 1);
+    assert_eq!(second.recorded[0].shell_pid, 910);
+    assert_eq!(second.recorded[0].tool_generation, 7);
+}
+
+#[test]
+fn a_known_child_pid_reused_by_a_new_process_is_a_fresh_candidate() {
+    let home = tmp_home("childreuse");
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
+    baseline_tick(&home, &world, 0);
+
+    // 920 died and the kernel handed its number to the tool shell. Known-child
+    // state is keyed by pid AND start token, so this is a NEW identity, not an
+    // inherited "already known" one.
+    world.insert(920, FakeProc::group_leader(920, 5_555).child_of(900));
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert_eq!(outcome.recorded.len(), 1);
+    assert_eq!(outcome.recorded[0].shell_pid, 920);
+    assert_eq!(
+        outcome.recorded[0].shell_start_token, 5_555,
+        "the record must carry the NEW identity's token, not the retired one"
+    );
+}
+
+#[test]
+fn a_backend_pid_reused_by_a_different_process_invalidates_the_baseline() {
+    let home = tmp_home("backendreuse");
+    let world = FakeOracle::supported()
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(920, FakeProc::inherited(9_200).child_of(900));
+    baseline_tick(&home, &world, 0);
+
+    // Same backend PID, different process: the baseline was taken against a
+    // backend that no longer exists, so its child set proves nothing about
+    // this one. Keyed by backend pid AND start token, not pid alone.
+    world.insert(900, FakeProc::session_leader(900, 4_242));
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+
+    assert!(outcome.recorded.is_empty());
+    assert_eq!(miss(&outcome, "dev-1"), SampleMiss::BaselineUnavailable);
+    assert!(load_ledger(&home).is_empty());
 }
 
 #[test]
 fn a_direct_backend_child_without_an_active_shell_tool_is_never_recorded() {
     let home = tmp_home("no-tool");
-    // Same process shape as a tool-call shell, but the instance is not running
-    // a shell-shaped tool call: this is a helper the backend started for its
-    // own reasons. Recording it would authorize killing backend machinery.
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 0);
 
-    let outcome = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 1_700);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    let outcome = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, None)], 1_000);
 
     assert!(
         outcome.recorded.is_empty(),
-        "no active shell tool means no tool-call shell to attribute"
+        "with no shell tool in flight there is no tool call to attribute to"
     );
     assert_eq!(skip_reason(&outcome, 910), SampleSkip::NoActiveShellTool);
     assert!(load_ledger(&home).is_empty());
 }
 
 #[test]
-fn a_transport_or_plugin_child_is_never_recorded_even_while_a_shell_tool_runs() {
-    let home = tmp_home("transport");
-    // 910 is the tool-call shell: the backend `setsid`s it, so it leads its own
-    // session. 920 is a transport/MCP/plugin helper started by the same backend
-    // in the SAME session. Both are direct children; only one is a tool call.
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900))
-        .with(920, FakeProc::follower(900, 9_200).child_of(900));
-
-    let outcome =
-        sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7))], 1_700);
-
-    let recorded: Vec<u32> = outcome.recorded.iter().map(|r| r.shell_pid).collect();
-    assert_eq!(
-        recorded,
-        vec![910],
-        "only the child that leads its own session may be recorded; got {recorded:?}"
+fn a_new_generation_does_not_inherit_the_previous_generations_child() {
+    let home = tmp_home("generation");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
     );
-    assert_eq!(skip_reason(&outcome, 920), SampleSkip::NotSessionLeader);
+
+    // Generation 8 opens back-to-back, with no intervening inactive tick: the
+    // frozen pre-tool baseline still applies, and 910 is already attributed to
+    // generation 7, so the only new candidate is 912.
+    world.insert(912, FakeProc::group_leader(912, 9_120).child_of(900));
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(8, 2_000))],
+        2_500,
+    );
+
+    assert_eq!(outcome.recorded.len(), 1);
+    assert_eq!(outcome.recorded[0].shell_pid, 912);
+    assert_eq!(outcome.recorded[0].tool_generation, 8);
+    assert_eq!(
+        skip_reason(&outcome, 910),
+        SampleSkip::AlreadyAttributed,
+        "a pid already carrying a record must not be re-attributed to a later generation"
+    );
+
+    let ledger = load_ledger(&home);
+    let gen_of_910 = ledger
+        .iter()
+        .find(|r| r.shell_pid == 910)
+        .expect("910's record survives")
+        .tool_generation;
+    assert_eq!(gen_of_910, 7, "910 stays attributed to generation 7 only");
 }
 
 #[test]
@@ -472,32 +751,33 @@ fn a_child_missing_any_kernel_fact_is_skipped_not_half_recorded() {
     for (tag, proc, expected) in [
         (
             "no-sid",
-            FakeProc::leader(910, 9_100).child_of(900).session(None),
+            FakeProc::group_leader(910, 9_100)
+                .child_of(900)
+                .session(None),
             SampleSkip::MissingSessionId,
         ),
         (
             "no-pgid",
-            FakeProc::leader(910, 9_100).child_of(900).group(None),
+            FakeProc::group_leader(910, 9_100).child_of(900).group(None),
             SampleSkip::MissingProcessGroup,
         ),
         (
             "no-token",
-            FakeProc::leader(910, 9_100).child_of(900).token(None),
+            FakeProc::group_leader(910, 9_100).child_of(900).token(None),
             SampleSkip::MissingStartToken,
-        ),
-        (
-            "group-follower",
-            FakeProc::leader(910, 9_100).child_of(900).group(Some(900)),
-            SampleSkip::NotProcessGroupLeader,
         ),
     ] {
         let home = tmp_home(tag);
-        let world = FakeOracle::supported()
-            .with(900, FakeProc::leader(900, 9_000))
-            .with(910, proc);
+        let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+        baseline_tick(&home, &world, 0);
+        world.insert(910, proc);
 
-        let outcome =
-            sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7))], 1_700);
+        let outcome = sample_tool_call_shells(
+            &home,
+            &world,
+            &[owner("dev-1", 900, bash_tool(7, 0))],
+            1_000,
+        );
 
         assert!(
             outcome.recorded.is_empty(),
@@ -511,10 +791,10 @@ fn a_child_missing_any_kernel_fact_is_skipped_not_half_recorded() {
 #[test]
 fn resampling_the_same_shell_preserves_first_seen_and_generation() {
     let home = tmp_home("resample");
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
-    let owners = [owner("dev-1", 900, bash_tool(7))];
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    let owners = [owner("dev-1", 900, bash_tool(7, 0))];
 
     sample_tool_call_shells(&home, &world, &owners, 1_000);
     sample_tool_call_shells(&home, &world, &owners, 5_000);
@@ -533,15 +813,17 @@ fn resampling_the_same_shell_preserves_first_seen_and_generation() {
 #[test]
 fn an_unwritable_ledger_is_reported_and_never_yields_authority() {
     let home = tmp_home("unwritable");
-    // A directory where the ledger file belongs: writing must fail, and the
-    // sampler must say so instead of reporting a record it did not persist.
     std::fs::create_dir_all(ledger_path(&home)).unwrap();
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
 
-    let outcome =
-        sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7))], 1_700);
+    let outcome = sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
 
     let PersistOutcome::Failed(detail) = &outcome.persisted else {
         panic!("a ledger that cannot be written must report PersistOutcome::Failed");
@@ -560,7 +842,7 @@ fn an_unwritable_ledger_is_reported_and_never_yields_authority() {
 fn a_non_regular_ledger_yields_no_proven_candidates() {
     let home = tmp_home("nonregular");
     std::fs::create_dir_all(ledger_path(&home)).unwrap();
-    let world = FakeOracle::supported().with(911, FakeProc::follower(910, 9_110).orphan());
+    let world = FakeOracle::supported().with(911, FakeProc::inherited(9_110).orphan());
 
     assert!(load_ledger(&home).is_empty());
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
@@ -574,12 +856,6 @@ fn a_non_regular_ledger_yields_no_proven_candidates() {
     );
 }
 
-/// The ledger's canonical location. Pinned here because the fail-closed tests
-/// above must be able to make it unwritable; a rename is a contract change.
-fn ledger_path(home: &Path) -> PathBuf {
-    home.join("state").join("tool_call_provenance.json")
-}
-
 // ---------------------------------------------------------------------------
 // 3. Sampling misses and heuristics stay UNPROVEN
 // ---------------------------------------------------------------------------
@@ -587,9 +863,7 @@ fn ledger_path(home: &Path) -> PathBuf {
 #[test]
 fn a_shell_that_died_between_samples_is_never_promoted_to_proven() {
     let home = tmp_home("miss");
-    // 800 was born and reaped between two ticks: nothing was ever recorded for
-    // it. Its orphan 801 inherits a session agend has no record of.
-    let world = FakeOracle::supported().with(801, FakeProc::follower(800, 8_010).orphan());
+    let world = FakeOracle::supported().with(801, FakeProc::inherited(8_010).orphan());
 
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
 
@@ -607,18 +881,14 @@ fn a_shell_that_died_between_samples_is_never_promoted_to_proven() {
 #[test]
 fn argv_and_cwd_under_the_agend_home_never_make_a_candidate_proven() {
     let home = tmp_home("heuristic");
-    // Exactly the shape the issue's rejected detector would have selected: an
-    // orphan whose argv and cwd both point inside the agend home.
     let world = FakeOracle::supported().with(
         700,
-        FakeProc::leader(700, 7_000)
-            .orphan()
-            .display(DisplayColumns {
-                argv: Some("bash /Users/x/.agend-terminal/workspace/dev-1/probe.sh".to_string()),
-                cwd: Some("/Users/x/.agend-terminal/workspace/dev-1".to_string()),
-                elapsed_secs: Some(40 * 3_600),
-                cpu_percent: Some(96.0),
-            }),
+        FakeProc::inherited(7_000).orphan().display(DisplayColumns {
+            argv: Some("bash /Users/x/.agend-terminal/workspace/dev-1/probe.sh".to_string()),
+            cwd: Some("/Users/x/.agend-terminal/workspace/dev-1".to_string()),
+            elapsed_secs: Some(40 * 3_600),
+            cpu_percent: Some(96.0),
+        }),
     );
 
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
@@ -634,28 +904,23 @@ fn argv_and_cwd_under_the_agend_home_never_make_a_candidate_proven() {
 fn age_and_cpu_are_display_columns_and_never_filter() {
     let home = tmp_home("age");
     // The census in the RCA: the leak was 40h old, the false positives were
-    // 7-44 DAYS old. Any age threshold that catches one catches the other, so
-    // there must be no threshold at all.
+    // 7-44 DAYS old. Any age threshold that catches one catches the other.
     let world = FakeOracle::supported()
         .with(
             601,
-            FakeProc::leader(601, 6_010)
-                .orphan()
-                .display(DisplayColumns {
-                    elapsed_secs: Some(40 * 3_600),
-                    cpu_percent: Some(96.0),
-                    ..DisplayColumns::default()
-                }),
+            FakeProc::inherited(6_010).orphan().display(DisplayColumns {
+                elapsed_secs: Some(40 * 3_600),
+                cpu_percent: Some(96.0),
+                ..DisplayColumns::default()
+            }),
         )
         .with(
             602,
-            FakeProc::leader(602, 6_020)
-                .orphan()
-                .display(DisplayColumns {
-                    elapsed_secs: Some(44 * 24 * 3_600),
-                    cpu_percent: Some(0.0),
-                    ..DisplayColumns::default()
-                }),
+            FakeProc::inherited(6_020).orphan().display(DisplayColumns {
+                elapsed_secs: Some(44 * 24 * 3_600),
+                cpu_percent: Some(0.0),
+                ..DisplayColumns::default()
+            }),
         );
 
     let report = classify(&home, &world, &policy(), 44 * 24 * HOUR_MS);
@@ -668,12 +933,23 @@ fn age_and_cpu_are_display_columns_and_never_filter() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Recorded provenance becomes PROVEN only once the owner and leader are gone
+// 4. Attribution — only through a container the recorded shell actually LED
 // ---------------------------------------------------------------------------
 
+/// THE INCIDENT. #3273's instance and backend never died — only the inner tool
+/// shell did, and its background jobs reparented to init. If a live backend
+/// erased attribution, the fix would miss the very leak it was filed for.
+/// PROVEN means "attributable to a recorded tool generation", not "definitely
+/// unwanted"; the safety against killing intentional detached work is the
+/// dry-run -> confirm_ids -> audit_reason round-trip, asserted here to send
+/// nothing on its own.
 #[test]
-fn recorded_provenance_with_owner_and_leader_gone_is_proven() {
+fn a_live_backend_does_not_erase_attribution_of_its_dead_shells_orphans() {
     let (home, world) = recorded_world();
+    assert!(
+        world.is_alive(900),
+        "fixture precondition: the backend is still running, as in the incident"
+    );
 
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
 
@@ -682,32 +958,84 @@ fn recorded_provenance_with_owner_and_leader_gone_is_proven() {
         panic!("911 must be PROVEN");
     };
     assert_eq!(evidence.instance, "dev-1");
-    assert_eq!(evidence.recorded_sid, 910);
+    assert_eq!(evidence.recorded_shell_pid, 910);
     assert_eq!(evidence.recorded_pgid, 910);
-    assert_eq!(evidence.leader_start_token, 9_100);
-}
+    assert_eq!(evidence.shell_start_token, 9_100);
 
-#[test]
-fn a_live_owner_keeps_its_descendants_unproven() {
-    let (home, world) = recorded_world();
-    // The backend is back (or never died): its work is not abandoned.
-    world.insert(900, FakeProc::leader(900, 9_000));
-
-    let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
-
-    assert!(proven_pids(&report).is_empty());
-    assert_eq!(
-        unproven_reason(&report, 911),
-        UnprovenReason::OwnerStillAlive
+    // Listed, but nothing happens without an explicit confirmed apply.
+    let signaller = WorldSignaller::new(&world);
+    let outcome = execute_cleanup(
+        &home,
+        &world,
+        &signaller,
+        &report,
+        &CleanupRequest {
+            apply: false,
+            confirm_ids: Vec::new(),
+            audit_reason: None,
+        },
+        &policy(),
+    );
+    assert!(matches!(outcome, CleanupOutcome::DryRun { .. }));
+    assert!(
+        signaller.log().is_empty(),
+        "attribution must never imply a signal"
     );
 }
 
 #[test]
-fn a_live_session_leader_keeps_its_descendants_unproven() {
+fn a_shell_that_led_neither_container_leaves_unattributable_orphans() {
+    let home = tmp_home("nocontainer");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    // Fully inherited: sid and pgid are the backend's, so nothing the shell
+    // leaves behind carries an id unique to the tool call.
+    world.insert(910, FakeProc::inherited(9_100).child_of(900));
+    sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    world.reap(910);
+    world.insert(911, FakeProc::inherited(9_110).orphan());
+
+    let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
+
+    assert!(
+        proven_pids(&report).is_empty(),
+        "an orphan sharing the backend's session and group could be anything below the backend"
+    );
+    assert_eq!(
+        unproven_reason(&report, 911),
+        UnprovenReason::NoDiscriminatingContainer
+    );
+}
+
+#[test]
+fn an_orphan_in_the_session_the_shell_led_is_proven() {
+    let home = tmp_home("sessioncontainer");
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    baseline_tick(&home, &world, 0);
+    world.insert(910, FakeProc::session_leader(910, 9_100).child_of(900));
+    sample_tool_call_shells(
+        &home,
+        &world,
+        &[owner("dev-1", 900, bash_tool(7, 0))],
+        1_000,
+    );
+    world.reap(910);
+    world.insert(911, FakeProc::inherited(9_110).session(Some(910)).orphan());
+
+    let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
+
+    assert_eq!(proven_pids(&report), vec![911]);
+}
+
+#[test]
+fn a_live_shell_keeps_its_descendants_unproven() {
     let (home, world) = recorded_world();
-    // The recorded leader pid is alive again with its ORIGINAL token: the
-    // session is still running, so nothing below it is abandoned.
-    world.insert(910, FakeProc::leader(910, 9_100));
+    world.insert(910, FakeProc::group_leader(910, 9_100));
 
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
 
@@ -719,22 +1047,60 @@ fn a_live_session_leader_keeps_its_descendants_unproven() {
 }
 
 #[test]
-fn a_recycled_leader_pid_does_not_revive_the_record() {
+/// A different process now holding the recorded shell's number PROVES the
+/// original shell is gone — which is the very condition attribution needs. Over
+/// a 40-hour-old incident PID reuse is plausible, so letting it erase durable
+/// attribution would defeat the fix in exactly the case it was written for.
+#[test]
+fn a_recycled_shell_pid_elsewhere_does_not_erase_durable_attribution() {
     let (home, world) = recorded_world();
-    // Same number, different process: the token proves it is not our leader.
-    // That must NOT read as "leader alive", and must NOT read as PROVEN either
-    // — the recorded session is unrecoverable, so the record is worthless.
-    world.insert(910, FakeProc::leader(910, 4_242));
+    // The number came back as an unrelated process in an unrelated container.
+    world.insert(910, FakeProc::inherited(4_242).group(Some(999)));
+
+    let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
+
+    assert_eq!(
+        proven_pids(&report),
+        vec![911],
+        "the orphan's recorded container attribution survives reuse of the shell's number"
+    );
+
+    // And the innocent squatter is never touched: it is not in the inventory,
+    // and the pre-signal identity check would refuse it anyway.
+    let signaller = WorldSignaller::new(&world);
+    let outcome = execute_cleanup(
+        &home,
+        &world,
+        &signaller,
+        &report,
+        &confirmed(&[911]),
+        &policy(),
+    );
+    assert!(matches!(outcome, CleanupOutcome::Applied { .. }));
+    assert!(
+        !signaller.log().iter().any(|(_, pid)| *pid == 910),
+        "the process that inherited the shell's number must never be signalled"
+    );
+}
+
+/// The separate, genuinely ambiguous case. A process group id IS the pid of its
+/// leader, so a recycled 910 that leads its own group produces a group also
+/// numbered 910 — the recorded container id no longer identifies one set of
+/// processes. Membership cannot be decided, so it fails closed.
+#[test]
+fn a_container_id_collision_makes_the_orphan_unproven() {
+    let (home, world) = recorded_world();
+    world.insert(910, FakeProc::group_leader(910, 4_242));
 
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
 
     assert!(
         proven_pids(&report).is_empty(),
-        "a recycled leader pid must never authorize a kill"
+        "an ambiguous container must not authorize a kill"
     );
     assert_eq!(
         unproven_reason(&report, 911),
-        UnprovenReason::IdentityChanged
+        UnprovenReason::ContainerIdCollision
     );
 }
 
@@ -856,7 +1222,7 @@ fn a_confirmed_id_outside_the_dry_run_inventory_is_skipped() {
 #[test]
 fn an_unproven_candidate_is_never_signalled_even_when_confirmed() {
     let home = tmp_home("unproven-confirmed");
-    let world = FakeOracle::supported().with(801, FakeProc::follower(800, 8_010).orphan());
+    let world = FakeOracle::supported().with(801, FakeProc::inherited(8_010).orphan());
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
     let signaller = WorldSignaller::new(&world);
 
@@ -885,7 +1251,10 @@ fn an_unproven_candidate_is_never_signalled_even_when_confirmed() {
 #[test]
 fn a_foreign_uid_is_never_signalled() {
     let (home, world) = recorded_world();
-    world.insert(911, FakeProc::follower(910, 9_110).orphan().uid(0));
+    world.insert(
+        911,
+        FakeProc::inherited(9_110).group(Some(910)).orphan().uid(0),
+    );
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
     let signaller = WorldSignaller::new(&world);
 
@@ -948,9 +1317,6 @@ fn daemon_and_transport_pids_are_excluded_even_when_confirmed() {
 fn a_pid_recycled_between_listing_and_term_is_dropped_unsignalled() {
     let (home, world) = recorded_world();
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
-    // Every read after classification returns a different token: between the
-    // operator seeing the list and confirming it, the kernel handed 911 to
-    // somebody else.
     world.recycle_after.borrow_mut().insert(911, (0, 1_234_567));
     let signaller = WorldSignaller::new(&world);
 
@@ -1062,10 +1428,10 @@ fn a_target_that_exits_on_term_is_not_killed() {
 fn an_unsupported_platform_reports_unsupported_and_never_signals() {
     let home = tmp_home("unsupported");
     let world = FakeOracle::unsupported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
+        .with(900, FakeProc::session_leader(900, 9_000))
+        .with(910, FakeProc::group_leader(910, 9_100).child_of(900));
 
-    let sample = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7))], 0);
+    let sample = sample_tool_call_shells(&home, &world, &[owner("dev-1", 900, bash_tool(7, 0))], 0);
     assert!(matches!(
         sample.support,
         ProvenanceSupport::Unsupported { .. }
@@ -1107,12 +1473,10 @@ fn the_rendered_report_separates_proven_from_unproven() {
     let (home, world) = recorded_world();
     world.insert(
         801,
-        FakeProc::follower(800, 8_010)
-            .orphan()
-            .display(DisplayColumns {
-                cwd: Some("/Users/x/.agend-terminal/workspace/dev-1".to_string()),
-                ..DisplayColumns::default()
-            }),
+        FakeProc::inherited(8_010).orphan().display(DisplayColumns {
+            cwd: Some("/Users/x/.agend-terminal/workspace/dev-1".to_string()),
+            ..DisplayColumns::default()
+        }),
     );
     let report = classify(&home, &world, &policy(), 40 * HOUR_MS);
 
@@ -1139,31 +1503,35 @@ fn the_rendered_report_separates_proven_from_unproven() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_daemon_tick_records_a_live_shell_with_no_metrics_subscriber() {
+fn the_real_per_tick_pipeline_records_a_live_shell_with_no_metrics_subscriber() {
     let home = tmp_home("headless");
-    let world = FakeOracle::supported()
-        .with(900, FakeProc::leader(900, 9_000))
-        .with(910, FakeProc::leader(910, 9_100).child_of(900));
-    // The owner service is the ONLY input besides the process oracle. Nothing
+    let world = FakeOracle::supported().with(900, FakeProc::session_leader(900, 9_000));
+    let owners = HeadlessOwners(vec![owner("dev-1", 900, bash_tool(7, 0))]);
+
+    // Driven through the REAL handler pipeline, not a helper: the same
+    // `run_handlers_with_panic_guard` the daemon loop calls each tick. Nothing
     // here reads, arms or depends on `instance_monitor::LAST_METRICS_READ`, so
     // a headless daemon — or a TUI parked on any pane but Monitor — samples
-    // exactly the same as a subscribed one.
-    let owners = HeadlessOwners(vec![owner("dev-1", 900, bash_tool(7))]);
-    let handler = ToolCallProvenanceHandler::new();
+    // exactly as a subscribed one does.
+    let mut handlers: Vec<Box<dyn PerTickHandler>> =
+        vec![Box::new(ToolCallProvenanceHandler::new(&world, &owners))];
+    run_handlers_with_panic_guard(&mut handlers, &home, 0);
 
-    let outcome = handler.tick(&home, &world, &owners, 1_700);
+    world.insert(910, FakeProc::group_leader(910, 9_100).child_of(900));
+    run_handlers_with_panic_guard(&mut handlers, &home, 1_000);
 
+    let ledger = load_ledger(&home);
     assert_eq!(
-        outcome.recorded.len(),
+        ledger.len(),
         1,
-        "provenance must be recorded on the daemon tick without any metrics subscriber"
+        "provenance must be recorded by the daemon tick with no metrics subscriber"
     );
-    assert_eq!(load_ledger(&home).len(), 1);
+    assert_eq!(ledger[0].shell_pid, 910);
 }
 
-/// Structural half of the same constraint. The behavioural test above proves
-/// the entry point works headless; this proves nobody can later re-hang it off
-/// the subscriber-gated sysinfo sweep without the gate failing loudly.
+/// Structural half of the same constraint. The pipeline test above proves the
+/// entry point works headless; this proves nobody can later re-hang it off the
+/// subscriber-gated sysinfo sweep without the gate failing loudly.
 #[test]
 fn provenance_sampling_never_references_the_metrics_subscriber_gate() {
     #[derive(Default)]
@@ -1240,5 +1608,78 @@ fn the_provenance_handler_is_wired_into_the_default_per_tick_handlers() {
         finder.found,
         "#3273: `build_default_handlers` must construct `ToolCallProvenanceHandler` — provenance \
          sampling belongs to the daemon's own tick, not to any UI subscription"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Prevention — incidence reduction only, never authority
+// ---------------------------------------------------------------------------
+
+/// #3273 fix 2. The `trap` idiom is the only proposal in the issue that stops
+/// this class of leak from being created, and it belongs in the instructions
+/// agents actually receive rather than in a doc nobody reads. It is NOT
+/// containment: nothing a shell installs on itself survives `SIGKILL`, so the
+/// text must say so and must never be cited as proof or as reaper authority.
+#[test]
+fn agent_instructions_carry_the_background_job_cleanup_trap_idiom() {
+    let text = background_process_guidance();
+
+    assert!(
+        text.contains("trap 'kill $LOAD 2>/dev/null' EXIT INT TERM"),
+        "the guidance must give the exact working idiom, not a description of one: {text}"
+    );
+    assert!(
+        text.contains("LOAD=$!"),
+        "the idiom is useless without capturing the job's pid first: {text}"
+    );
+    assert!(
+        text.contains("SIGKILL"),
+        "the guidance must state the limit it cannot cover, or it reads as a guarantee: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("guarantee"),
+        "incidence reduction must not be sold as containment: {text}"
+    );
+}
+
+/// The text is worthless if it is an orphan constant. Pin that the real
+/// instruction body — the one written into every agent's instructions file —
+/// actually calls it.
+#[test]
+fn the_background_job_guidance_is_wired_into_the_real_instruction_body() {
+    #[derive(Default)]
+    struct GuidanceFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for GuidanceFinder {
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if p.segments
+                .iter()
+                .any(|s| s.ident == "background_process_guidance")
+            {
+                self.found = true;
+            }
+            visit::visit_path(self, p);
+        }
+    }
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/instructions.rs");
+    let src = std::fs::read_to_string(&path).expect("read src/instructions.rs");
+    let file = syn::parse_file(&src).expect("parse src/instructions.rs");
+    let body = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Fn(f) if f.sig.ident == "build_instructions_body" => Some(f),
+            _ => None,
+        })
+        .expect("fn build_instructions_body not found in src/instructions.rs");
+
+    let mut finder = GuidanceFinder::default();
+    finder.visit_item_fn(body);
+    assert!(
+        finder.found,
+        "#3273: `build_instructions_body` must emit `background_process_guidance()` — prevention \
+         only reduces incidence if it reaches the instructions agents are actually given"
     );
 }
