@@ -41,6 +41,16 @@ fn default_episode_active() -> bool {
     true
 }
 
+/// Reclaim-facing interpretation of a persisted usage-limit record. Inactive
+/// is distinct from unknown so a recovered episode cannot select the long
+/// missing-reset fallback and get reclaimed before a new episode is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageLimitRemaining {
+    Inactive,
+    Known(Duration),
+    Unknown,
+}
+
 pub(crate) fn usage_limit_notify_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join("usage_limit_notify.json")
 }
@@ -96,31 +106,41 @@ pub(crate) fn unlock_deadline(
 }
 
 /// #2127 Phase 1: time until `name`'s usage-limit window unlocks, per the
-/// persisted notify record. `None` when there is no record, no parseable
-/// `unlock_at`, or an unparseable `notified_at` — the reclaim caller then falls
-/// back to a conservative long default (a missing reset time is treated as a long
-/// block). A past deadline clamps to `Duration::ZERO`. Lock-free read; reuses the
-/// same record + `unlock_deadline` math as the notify-suppression path so the two
-/// agree on what "this window" means.
+/// persisted notify record. `Inactive` means recovery closed the prior episode
+/// and is deliberately non-reclaimable until a current episode is durably
+/// recorded. `Unknown` means there is no record, no parseable `unlock_at`, or an
+/// unparseable `notified_at`; the reclaim caller then falls back to a
+/// conservative long default (a missing reset time is treated as a long block).
+/// A past deadline clamps to `Duration::ZERO`. Lock-free read; reuses the same
+/// record + `unlock_deadline` math as the notify-suppression path so the two agree
+/// on what "this window" means.
 pub(crate) fn usage_limit_remaining(
     home: &std::path::Path,
     name: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<std::time::Duration> {
+) -> UsageLimitRemaining {
     let map: std::collections::HashMap<String, UsageNotifyRecord> =
         std::fs::read_to_string(usage_limit_notify_path(home))
             .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())?;
-    let rec = map.get(name)?;
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+    let Some(rec) = map.get(name) else {
+        return UsageLimitRemaining::Unknown;
+    };
     if !rec.active {
-        return None;
+        return UsageLimitRemaining::Inactive;
     }
-    let unlock_at = rec.unlock_at.as_deref()?;
-    let notified_at = chrono::DateTime::parse_from_rfc3339(&rec.notified_at)
-        .ok()?
-        .with_timezone(&chrono::Utc);
-    let deadline = unlock_deadline(unlock_at, notified_at)?;
-    Some(
+    let Some(unlock_at) = rec.unlock_at.as_deref() else {
+        return UsageLimitRemaining::Unknown;
+    };
+    let Ok(notified_at) = chrono::DateTime::parse_from_rfc3339(&rec.notified_at) else {
+        return UsageLimitRemaining::Unknown;
+    };
+    let notified_at = notified_at.with_timezone(&chrono::Utc);
+    let Some(deadline) = unlock_deadline(unlock_at, notified_at) else {
+        return UsageLimitRemaining::Unknown;
+    };
+    UsageLimitRemaining::Known(
         (deadline - now)
             .to_std()
             .unwrap_or(std::time::Duration::ZERO),
@@ -228,5 +248,25 @@ pub(crate) fn mark_usage_limit_recovered(home: &std::path::Path, name: &str) -> 
             tracing::error!(%error, agent = %name, "usage_limit recovery marker write failed");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_record_defaults_to_active_episode() {
+        let legacy = serde_json::json!({
+            "unlock_at": "15:00",
+            "notified_at": "2026-06-09T14:00:00+00:00"
+        });
+        let record: UsageNotifyRecord =
+            serde_json::from_value(legacy).expect("legacy usage-limit record parses");
+        assert!(record.active, "legacy records remain in the open episode");
+        assert_eq!(
+            record.episode_nonce, 0,
+            "legacy records start with the key-only episode identity"
+        );
     }
 }

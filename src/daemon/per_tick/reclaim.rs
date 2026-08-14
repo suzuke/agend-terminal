@@ -156,8 +156,11 @@ fn reclaim_if_eligible(
     recovered: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> usize {
-    let remaining = crate::daemon::supervisor::usage_limit_remaining(home, agent, now)
-        .unwrap_or(USAGE_LIMIT_EXPIRY);
+    let remaining = match crate::daemon::supervisor::usage_limit_remaining(home, agent, now) {
+        crate::daemon::supervisor::UsageLimitRemaining::Inactive => return 0,
+        crate::daemon::supervisor::UsageLimitRemaining::Known(remaining) => remaining,
+        crate::daemon::supervisor::UsageLimitRemaining::Unknown => USAGE_LIMIT_EXPIRY,
+    };
     if !should_reclaim(state, quota_exceeded, recovered, remaining, RECLAIM_GRACE) {
         return 0;
     }
@@ -730,6 +733,47 @@ mod tests {
             task_status(&home, "t-c"),
             crate::task_events::TaskStatus::Claimed,
             "task must stay Claimed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn recovered_usage_limit_record_with_short_unlock_is_not_reclaimed() {
+        let now = chrono::Utc::now();
+        let home = tmp_home("inactive-short-window");
+        seed_claimed_task(&home, "t-inactive", "dev-inactive");
+        let unlock = (now + chrono::Duration::minutes(2))
+            .format("%H:%M")
+            .to_string();
+        let rec = serde_json::json!({
+            "dev-inactive": {
+                "unlock_at": unlock,
+                "notified_at": now.to_rfc3339(),
+                "active": false,
+                "episode_nonce": 1
+            }
+        });
+        std::fs::write(
+            home.join("usage_limit_notify.json"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        let latch = fresh_latch();
+
+        let n = reclaim_if_eligible(
+            &home,
+            &latch,
+            "dev-inactive",
+            AgentState::UsageLimit,
+            false,
+            false,
+            now,
+        );
+        assert_eq!(n, 0, "a recovered episode must not be reclaimed");
+        assert_eq!(
+            task_status(&home, "t-inactive"),
+            crate::task_events::TaskStatus::Claimed,
+            "a closed episode must leave the task claimed until a new episode is active"
         );
         std::fs::remove_dir_all(&home).ok();
     }
