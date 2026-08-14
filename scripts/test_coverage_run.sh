@@ -12,6 +12,15 @@ set -uo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 wrapper="$script_dir/coverage-run.sh"
+# A leading `set` anchor intentionally ignores comments. The first branch
+# catches any clustered short option containing `e` (for example `-eu` or
+# `-euo`), while the second preserves the long-form errexit spelling. Keep
+# `set -o pipefail` outside both branches: pipefail is required by the wrapper.
+errexit_guard_pattern='^[[:space:]]*set[[:space:]]+-[[:alpha:]]*e[[:alpha:]]*([[:space:]]|$)|^[[:space:]]*set[[:space:]]+-o[[:space:]]+errexit([[:space:]]|$)'
+
+errexit_enabled_in() {
+    grep -qE "$errexit_guard_pattern" "$1"
+}
 
 pass=0
 fail=0
@@ -534,11 +543,40 @@ test_writable_log_success_remains_success() {
 # The producer pipeline is intentionally classified after it fails; errexit
 # would bypass the real-failure, diagnostics, and retry contracts.
 test_set_e_is_not_enabled() {
-    if grep -qE '^[[:space:]]*set[[:space:]]+-e([[:space:]]|$)|^[[:space:]]*set[[:space:]]+-o[[:space:]]+errexit([[:space:]]|$)' "$wrapper"; then
+    if errexit_enabled_in "$wrapper"; then
         report 1 "coverage wrapper does not enable set -e" \
             "errexit would terminate before PIPESTATUS classification"
     else
         report 0 "coverage wrapper does not enable set -e"
+    fi
+}
+
+test_set_e_guard_handles_clustered_options() {
+    local fixture="$run_tmpdir/errexit-guard.fixture" bad=""
+
+    for option in 'set -eu' 'set -euo pipefail' 'set -ex'; do
+        printf '%s\n' "$option" >"$fixture"
+        if ! errexit_enabled_in "$fixture"; then
+            bad="$bad missing-$option"
+        fi
+    done
+
+    printf '%s\n' 'set -o pipefail' >"$fixture"
+    if errexit_enabled_in "$fixture"; then
+        bad="$bad pipefail-rejected"
+    fi
+
+    printf '%s\n' '# set -e' >"$fixture"
+    if errexit_enabled_in "$fixture"; then
+        bad="$bad comment-rejected"
+    fi
+
+    rm -f "$fixture"
+    if [ -n "$bad" ]; then
+        report 1 "errexit guard catches clustered options without overmatching" \
+            "issues:$bad"
+    else
+        report 0 "errexit guard catches clustered options without overmatching"
     fi
 }
 
@@ -4204,6 +4242,7 @@ test_sink_failure_preserves_producer_failure_without_classification
 test_large_output_sink_failure_is_truthful
 test_writable_log_success_remains_success
 test_set_e_is_not_enabled
+test_set_e_guard_handles_clustered_options
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
 test_corrupt_failure_emits_bounded_diagnostics
