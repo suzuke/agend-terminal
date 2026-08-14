@@ -25,6 +25,20 @@ pub(crate) struct UsageNotifyRecord {
     /// When we notified (rfc3339 UTC) — anchors the unlock deadline + the
     /// null-unlock fallback cooldown.
     notified_at: String,
+    /// Durable current-episode marker. Legacy records predate this field and
+    /// are treated as active so a restart in the same live episode remains
+    /// deduplicated.
+    #[serde(default = "default_episode_active")]
+    active: bool,
+    /// Monotonic identity for same-agent episodes. Recovery advances it rather
+    /// than deleting the notice ledger, so a new null-unlock episode is not
+    /// confused with the prior 24-hour timestamp window.
+    #[serde(default)]
+    episode_nonce: u64,
+}
+
+fn default_episode_active() -> bool {
+    true
 }
 
 pub(crate) fn usage_limit_notify_path(home: &std::path::Path) -> std::path::PathBuf {
@@ -98,6 +112,9 @@ pub(crate) fn usage_limit_remaining(
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())?;
     let rec = map.get(name)?;
+    if !rec.active {
+        return None;
+    }
     let unlock_at = rec.unlock_at.as_deref()?;
     let notified_at = chrono::DateTime::parse_from_rfc3339(&rec.notified_at)
         .ok()?
@@ -127,6 +144,9 @@ pub(crate) fn usage_limit_notify_suppressed(
     let Some(rec) = map.get(name) else {
         return false;
     };
+    if !rec.active {
+        return false;
+    }
     let Ok(notified_at) = chrono::DateTime::parse_from_rfc3339(&rec.notified_at) else {
         return false;
     };
@@ -159,20 +179,53 @@ pub(crate) fn record_usage_limit_notified(
     unlock_at: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let record = UsageNotifyRecord {
-        unlock_at: unlock_at.map(String::from),
-        notified_at: now.to_rfc3339(),
-    };
     match crate::store::with_json_state_or_create(
         &usage_limit_notify_path(home),
         std::collections::HashMap::<String, UsageNotifyRecord>::new,
         |map| {
-            map.insert(name.to_string(), record);
+            let episode_nonce = map.get(name).map_or(0, |record| record.episode_nonce);
+            map.insert(
+                name.to_string(),
+                UsageNotifyRecord {
+                    unlock_at: unlock_at.map(String::from),
+                    notified_at: now.to_rfc3339(),
+                    active: true,
+                    episode_nonce,
+                },
+            );
         },
     ) {
         Ok(()) => true,
         Err(error) => {
             tracing::error!(%error, agent = %name, "usage_limit notify ledger write failed");
+            false
+        }
+    }
+}
+
+/// Mark the current usage-limit episode recovered without deleting its notice
+/// history. The live state snapshot is the authority for deciding recovery;
+/// this ledger mutation only advances the durable episode boundary used by
+/// repeat-notice suppression.
+pub(crate) fn mark_usage_limit_recovered(home: &std::path::Path, name: &str) -> bool {
+    let path = usage_limit_notify_path(home);
+    if !path.exists() {
+        return true;
+    }
+    match crate::store::with_json_state::<std::collections::HashMap<String, UsageNotifyRecord>, _, _>(
+        &path,
+        |map| {
+            if let Some(record) = map.get_mut(name) {
+                if record.active {
+                    record.active = false;
+                    record.episode_nonce = record.episode_nonce.saturating_add(1);
+                }
+            }
+        },
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(%error, agent = %name, "usage_limit recovery marker write failed");
             false
         }
     }

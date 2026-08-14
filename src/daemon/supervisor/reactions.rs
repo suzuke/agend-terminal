@@ -1,8 +1,9 @@
 //! Member-state-change notify + reaction routing (split from supervisor.rs).
 
 use super::{
-    escalate_self_orch_autherror, parse_unlock_at, record_usage_limit_notified,
-    self_orchestrator_escalates, usage_limit_notify_suppressed, NotifyTrack, NOTIFY_COOLDOWN,
+    escalate_self_orch_autherror, mark_usage_limit_recovered, parse_unlock_at,
+    record_usage_limit_notified, self_orchestrator_escalates, usage_limit_notify_suppressed,
+    NotifyTrack, NOTIFY_COOLDOWN,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -17,6 +18,13 @@ pub(crate) fn maybe_notify_member_state_change(
     pane_tail: &str,
     tracks: &mut HashMap<String, NotifyTrack>,
 ) -> bool {
+    if prev_state == crate::state::AgentState::UsageLimit
+        && new_state != crate::state::AgentState::UsageLimit
+    {
+        // Preserve the notice ledger but close the live episode boundary. The
+        // next UsageLimit edge must be readable even when unlock_at is absent.
+        mark_usage_limit_recovered(home, name);
+    }
     if prev_state == new_state || !new_state.is_notify_error_class() {
         return false;
     }

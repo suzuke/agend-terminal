@@ -105,6 +105,15 @@ impl PerTickHandler for InboxStuckHandler {
             }
             (live, usage_blocked)
         };
+        // The snapshot is the only current-state authority. Persist a recovery
+        // boundary for every live agent absent from the blocked map, after the
+        // registry/core locks are dropped, so a later null-unlock episode gets
+        // a fresh readable notice without deleting prior ledger history.
+        for name in &live {
+            if !usage_blocked.contains_key(name) {
+                crate::daemon::supervisor::mark_usage_limit_recovered(ctx.home, name);
+            }
+        }
         let mut last = self.last_alerted.lock();
         crate::daemon::inbox_stuck_watchdog::scan_and_emit_with_blocked(
             ctx.home,
@@ -345,22 +354,96 @@ mod tests {
             "fallback identifies UsageLimit: {first:?}"
         );
 
-        let externals: crate::agent::ExternalRegistry =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let configs: std::sync::Arc<
-            parking_lot::Mutex<std::collections::HashMap<String, crate::daemon::AgentConfig>>,
-        > = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let ctx = TickContext {
-            home: &home,
-            registry: &registry,
-            externals: &externals,
-            configs: &configs,
-        };
-        handler.run(&ctx);
+        // Simulate a daemon restart: both the handler latch and live registry
+        // are reconstructed; only usage_limit_notify.json survives.
+        drop(registry);
+        drop(handler);
+        let restarted_handler = InboxStuckHandler::new_at(1, past_grace());
+        let _restarted_registry = run_with_agent(
+            &home,
+            &restarted_handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
         assert!(
             crate::inbox::drain(&home, "general").is_empty(),
-            "restart-stable fallback must not repeat within the same episode"
+            "fresh restart must not repeat within the same episode"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn recovered_null_unlock_gets_fresh_notice_after_restart() {
+        let home = tmp_home("usage-null-recovery");
+        write_fleet(
+            &home,
+            "instances:\n  worker:\n    backend: claude\n  general:\n    backend: claude\n",
+        );
+        seed_unread(&home, "worker");
+
+        // Episode one: a fresh daemon entry emits exactly one readable fallback.
+        let first_handler = InboxStuckHandler::new_at(1, past_grace());
+        let first_registry = run_with_agent(
+            &home,
+            &first_handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
+        let first = crate::inbox::drain(&home, "general");
+        assert_eq!(first.len(), 1, "first episode must notify once: {first:?}");
+        assert!(first[0].text.contains("usage_limit"));
+        drop(first_registry);
+        drop(first_handler);
+
+        // Recovery: clear the source pile so the recovery entry itself cannot
+        // emit an ordinary inbox-stuck alert; it must still persist the reset.
+        assert!(!crate::inbox::drain(&home, "worker").is_empty());
+        let recovery_handler = InboxStuckHandler::new_at(1, past_grace());
+        let recovery_registry = run_with_agent(
+            &home,
+            &recovery_handler,
+            "worker",
+            crate::state::AgentState::Idle,
+            None,
+        );
+        assert!(crate::inbox::drain(&home, "general").is_empty());
+        let recovered_record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::daemon::supervisor::usage_limit_notify_path(&home))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered_record["worker"]["active"], false);
+        assert_eq!(recovered_record["worker"]["episode_nonce"], 1);
+        drop(recovery_registry);
+        drop(recovery_handler);
+
+        // Episode two starts inside the old 24-hour null-unlock window. A
+        // fresh handler and fresh live registry must still emit its new notice.
+        seed_unread(&home, "worker");
+        let second_handler = InboxStuckHandler::new_at(1, past_grace());
+        let _second_registry = run_with_agent(
+            &home,
+            &second_handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
+        let second = crate::inbox::drain(&home, "general");
+        assert_eq!(
+            second.len(),
+            1,
+            "a recovered null-unlock episode must notify again: {second:?}"
+        );
+        assert!(second[0].text.contains("usage_limit"));
+        let reactivated_record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::daemon::supervisor::usage_limit_notify_path(&home))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reactivated_record["worker"]["active"], true);
+        assert_eq!(reactivated_record["worker"]["episode_nonce"], 1);
         std::fs::remove_dir_all(home).ok();
     }
 

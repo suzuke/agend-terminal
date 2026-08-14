@@ -1367,6 +1367,56 @@ fn usage_limit_null_unlock_long_window_1894() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A recovery edge is a durable episode boundary, not a ledger deletion. A
+/// second null-unlock UsageLimit edge inside the legacy 24-hour window must
+/// notify again through the supervisor's production entry point.
+#[test]
+fn usage_limit_null_unlock_recovery_starts_new_episode_3225() {
+    let home = tmp_home("3225-null-recovery");
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: claude\n  lead:\n    backend: claude\n\
+         teams:\n  t:\n    members: [dev, lead]\n    orchestrator: lead\n",
+    )
+    .expect("seed fleet");
+
+    let mut first_tracks = std::collections::HashMap::new();
+    assert!(super::maybe_notify_member_state_change(
+        &home,
+        "dev",
+        crate::state::AgentState::Idle,
+        crate::state::AgentState::UsageLimit,
+        "no parseable reset",
+        &mut first_tracks,
+    ));
+
+    // This edge closes the live episode while retaining usage_limit_notify.json.
+    let mut recovery_tracks = std::collections::HashMap::new();
+    assert!(!super::maybe_notify_member_state_change(
+        &home,
+        "dev",
+        crate::state::AgentState::UsageLimit,
+        crate::state::AgentState::Idle,
+        "",
+        &mut recovery_tracks,
+    ));
+
+    let mut second_tracks = std::collections::HashMap::new();
+    assert!(
+        super::maybe_notify_member_state_change(
+            &home,
+            "dev",
+            crate::state::AgentState::Idle,
+            crate::state::AgentState::UsageLimit,
+            "no parseable reset",
+            &mut second_tracks,
+        ),
+        "a recovered null-unlock episode must notify again within 24h"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #event-bus pattern #9: gate-ON emit→subscriber re-delivers the inbox half
 /// (A) BYTE-IDENTICALLY to the legacy `deliver_member_state_change`. The
 /// frozen `detected_at` is passed identically to both paths, so the structured
