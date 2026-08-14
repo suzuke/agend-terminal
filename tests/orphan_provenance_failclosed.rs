@@ -905,16 +905,38 @@ fn the_provenance_handler_is_wired_into_the_default_per_tick_handlers() {
 /// being created. It is NOT containment: nothing a shell installs on itself
 /// survives `SIGKILL`, so the text must say so.
 #[test]
-fn agent_instructions_carry_the_background_job_cleanup_trap_idiom() {
+fn agent_instructions_carry_a_multi_job_safe_cleanup_trap_idiom() {
     let text = background_process_guidance();
 
+    // The collection is initialised and the trap installed BEFORE anything is
+    // launched, so a job that starts and the shell that dies in between are
+    // still covered. A single-PID `LOAD=$!` idiom is unsafe: it remembers only
+    // the last job and leaks every earlier one.
+    let init_at = text
+        .find("LOAD=\"\"")
+        .expect("guidance must initialise the pid collection empty");
+    let trap_at = text.find("trap '").expect("guidance must install a trap");
+    let launch_at = text
+        .find(" & LOAD=")
+        .or_else(|| text.find("& LOAD="))
+        .expect("guidance must show appending each job's pid after launching it");
     assert!(
-        text.contains("trap 'kill $LOAD 2>/dev/null' EXIT INT TERM"),
-        "the guidance must give the exact working idiom, not a description of one: {text}"
+        init_at < trap_at && trap_at < launch_at,
+        "order matters: initialise, then trap, then launch. got init@{init_at} trap@{trap_at} \
+         launch@{launch_at} in: {text}"
+    );
+
+    assert!(
+        text.contains("LOAD=\"$LOAD $!\""),
+        "every job's pid must be APPENDED, not overwritten: {text}"
     );
     assert!(
-        text.contains("LOAD=$!"),
-        "the idiom is useless without capturing the job's pid first: {text}"
+        text.contains("test -z \"$LOAD\" || kill $LOAD 2>/dev/null"),
+        "the trap must be a no-op when nothing was launched, and must not word-split badly: {text}"
+    );
+    assert!(
+        text.contains("EXIT") && text.contains("INT") && text.contains("TERM"),
+        "the trap must cover normal exit, INT and TERM: {text}"
     );
     assert!(
         text.contains("SIGKILL"),
@@ -962,5 +984,150 @@ fn the_background_job_guidance_is_wired_into_the_real_instruction_body() {
         finder.found,
         "#3273: `build_instructions_body` must emit `background_process_guidance()` — prevention \
          only reduces incidence if it reaches the instructions agents are actually given"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. §3.9 real entry — the user-facing `doctor` command must actually show this
+// ---------------------------------------------------------------------------
+
+/// A module that samples and renders but is never reached by `doctor` is dead
+/// code with tests. This drives the REAL compiled binary through its real
+/// subcommand dispatch — no injected report, no mid-pipeline seam.
+#[test]
+fn the_doctor_command_emits_the_orphan_provenance_section() {
+    let home = tmp_home("doctor-entry");
+    let output = assert_cmd::Command::cargo_bin("agend-terminal")
+        .expect("binary must exist")
+        .arg("doctor")
+        .env("AGEND_HOME", &home)
+        .output()
+        .expect("doctor must run");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        stdout.contains("Orphaned agent-attributable processes"),
+        "`agend-terminal doctor` must emit the orphan section: {stdout}"
+    );
+    assert!(
+        stdout.contains("UNPROVEN"),
+        "the section must state the epistemic status at the real entry too: {stdout}"
+    );
+    assert!(
+        stdout.contains("display only"),
+        "the display-only label must survive to the real entry: {stdout}"
+    );
+    for forbidden in ["--kill", "--cleanup", "confirm_ids"] {
+        assert!(
+            !stdout.contains(forbidden),
+            "V1 must not advertise a cleanup affordance ({forbidden}) at the real entry: {stdout}"
+        );
+    }
+}
+
+/// Structural companion: the section the binary prints must come FROM this
+/// module, so a hard-coded placeholder cannot satisfy the test above.
+#[test]
+fn run_doctor_invokes_the_orphan_provenance_module() {
+    #[derive(Default)]
+    struct ProvenanceCallFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for ProvenanceCallFinder {
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if p.segments.iter().any(|s| s.ident == "orphan_provenance") {
+                self.found = true;
+            }
+            visit::visit_path(self, p);
+        }
+    }
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs");
+    let src = std::fs::read_to_string(&path).expect("read src/cli.rs");
+    let file = syn::parse_file(&src).expect("parse src/cli.rs");
+    let run_doctor = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Fn(f) if f.sig.ident == "run_doctor" => Some(f),
+            _ => None,
+        })
+        .expect("fn run_doctor not found in src/cli.rs");
+
+    let mut finder = ProvenanceCallFinder::default();
+    finder.visit_item_fn(run_doctor);
+    assert!(
+        finder.found,
+        "#3273 §3.9: `run_doctor` must call `admin::orphan_provenance` — a sampler that renders \
+         a report nothing reaches is not a reported orphan"
+    );
+}
+
+/// And the subcommand really is wired to `run_doctor`, so the AST pin above
+/// cannot be satisfied by an unreachable function.
+#[test]
+fn the_doctor_subcommand_dispatches_to_run_doctor() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let src = std::fs::read_to_string(&path).expect("read src/main.rs");
+    let file = syn::parse_file(&src).expect("parse src/main.rs");
+
+    #[derive(Default)]
+    struct DispatchFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for DispatchFinder {
+        fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
+            for arm in &m.arms {
+                let pattern = quote_pattern(&arm.pat);
+                if pattern.contains("Doctor") {
+                    let mut call = CallFinder::default();
+                    call.visit_expr(&arm.body);
+                    if call.found {
+                        self.found = true;
+                    }
+                }
+            }
+            visit::visit_expr_match(self, m);
+        }
+    }
+    #[derive(Default)]
+    struct CallFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for CallFinder {
+        fn visit_path(&mut self, p: &'ast syn::Path) {
+            if p.segments.iter().any(|s| s.ident == "run_doctor") {
+                self.found = true;
+            }
+            visit::visit_path(self, p);
+        }
+    }
+    fn quote_pattern(pat: &syn::Pat) -> String {
+        let mut out = String::new();
+        if let syn::Pat::TupleStruct(ts) = pat {
+            for seg in &ts.path.segments {
+                out.push_str(&seg.ident.to_string());
+            }
+            for inner in &ts.elems {
+                out.push_str(&quote_pattern(inner));
+            }
+        } else if let syn::Pat::Struct(s) = pat {
+            for seg in &s.path.segments {
+                out.push_str(&seg.ident.to_string());
+            }
+        } else if let syn::Pat::Path(p) = pat {
+            for seg in &p.path.segments {
+                out.push_str(&seg.ident.to_string());
+            }
+        }
+        out
+    }
+
+    let mut finder = DispatchFinder::default();
+    finder.visit_file(&file);
+    assert!(
+        finder.found,
+        "#3273 §3.9: the `Doctor` subcommand arm must call `run_doctor`, or the doctor entry pin \
+         proves nothing about what a user actually runs"
     );
 }
