@@ -94,6 +94,67 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-inboxstuck-3225-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_fleet(home: &std::path::Path, fleet: &str) {
+        std::fs::write(crate::fleet::fleet_yaml_path(home), fleet).unwrap();
+    }
+
+    fn seed_unread(home: &std::path::Path, agent: &str) {
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        for i in 0..4 {
+            let mut msg =
+                crate::inbox::InboxMessage::new_system("system:test", "task", format!("m{i}"));
+            msg.timestamp = (chrono::Utc::now() - chrono::Duration::minutes(45 - i)).to_rfc3339();
+            crate::inbox::enqueue(home, agent, msg).unwrap();
+        }
+    }
+
+    fn run_with_agent(
+        home: &std::path::Path,
+        handler: &InboxStuckHandler,
+        name: &str,
+        state: crate::state::AgentState,
+        reason: Option<crate::health::BlockedReason>,
+    ) -> crate::agent::AgentRegistry {
+        let registry: crate::agent::AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals: crate::agent::ExternalRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs: std::sync::Arc<
+            parking_lot::Mutex<std::collections::HashMap<String, crate::daemon::AgentConfig>>,
+        > = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (handle, _reader) = super::super::mock_live_agent_no_context(name);
+        {
+            let mut core = handle.core.lock();
+            core.state.current = state;
+            if let Some(reason) = reason {
+                core.health.set_blocked_reason(reason);
+            }
+        }
+        registry.lock().insert(handle.id, handle);
+        let ctx = TickContext {
+            home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        handler.run(&ctx);
+        registry
+    }
+
     fn past_grace() -> Instant {
         Instant::now() - super::super::NOTIFICATION_BOOT_GRACE - Duration::from_secs(1)
     }
@@ -195,5 +256,197 @@ mod tests {
             "a LIVE agent must KEEP its re-alert timer (retain against ALL live agents)"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn usage_limit_with_proven_notice_suppresses_inbox_alert_at_real_entry() {
+        let home = tmp_home("usage-suppressed");
+        write_fleet(
+            &home,
+            "instances:\n  worker:\n    backend: claude\n  lead:\n    backend: claude\n\
+             teams:\n  t:\n    members: [worker, lead]\n    orchestrator: lead\n",
+        );
+        seed_unread(&home, "worker");
+        crate::daemon::supervisor::record_usage_limit_notified(
+            &home,
+            "worker",
+            None,
+            chrono::Utc::now(),
+        );
+        let handler = InboxStuckHandler::new_at(1, past_grace());
+        let _registry = run_with_agent(
+            &home,
+            &handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.iter()
+                .all(|m| m.kind.as_deref() != Some("inbox_stuck_watchdog")),
+            "a proven readable UsageLimit notice suppresses the redundant inbox alert: {lead:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn no_team_usage_limit_gets_one_restart_stable_readable_fallback() {
+        let home = tmp_home("usage-fallback");
+        write_fleet(
+            &home,
+            "instances:\n  worker:\n    backend: claude\n  general:\n    backend: claude\n",
+        );
+        seed_unread(&home, "worker");
+        let handler = InboxStuckHandler::new_at(1, past_grace());
+        let registry = run_with_agent(
+            &home,
+            &handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
+        let first = crate::inbox::drain(&home, "general");
+        assert_eq!(
+            first.len(),
+            1,
+            "fallback must be readable exactly once: {first:?}"
+        );
+        assert!(
+            first[0].text.contains("usage_limit"),
+            "fallback identifies UsageLimit: {first:?}"
+        );
+
+        let externals: crate::agent::ExternalRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs: std::sync::Arc<
+            parking_lot::Mutex<std::collections::HashMap<String, crate::daemon::AgentConfig>>,
+        > = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        handler.run(&ctx);
+        assert!(
+            crate::inbox::drain(&home, "general").is_empty(),
+            "restart-stable fallback must not repeat within the same episode"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn self_orchestrator_usage_limit_falls_back_to_general_once() {
+        let home = tmp_home("usage-self-orch");
+        write_fleet(
+            &home,
+            "instances:\n  worker:\n    backend: claude\n  general:\n    backend: claude\n\
+             teams:\n  t:\n    members: [worker]\n    orchestrator: worker\n",
+        );
+        seed_unread(&home, "worker");
+        let handler = InboxStuckHandler::new_at(1, past_grace());
+        let _registry = run_with_agent(
+            &home,
+            &handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
+        let general = crate::inbox::drain(&home, "general");
+        assert_eq!(
+            general.len(),
+            1,
+            "self-orchestrator needs a readable peer fallback"
+        );
+        assert!(general[0].text.contains("usage_limit"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn clearing_usage_state_reenables_inbox_alert() {
+        let home = tmp_home("usage-recovery");
+        write_fleet(
+            &home,
+            "instances:\n  worker:\n    backend: claude\n  lead:\n    backend: claude\n\
+             teams:\n  t:\n    members: [worker, lead]\n    orchestrator: lead\n",
+        );
+        seed_unread(&home, "worker");
+        crate::daemon::supervisor::record_usage_limit_notified(
+            &home,
+            "worker",
+            None,
+            chrono::Utc::now(),
+        );
+        let handler = InboxStuckHandler::new_at(1, past_grace());
+        let registry = run_with_agent(
+            &home,
+            &handler,
+            "worker",
+            crate::state::AgentState::UsageLimit,
+            Some(crate::health::BlockedReason::QuotaExceeded),
+        );
+        assert!(crate::inbox::drain(&home, "lead").is_empty());
+        {
+            let registry_guard = registry.lock();
+            let handle = registry_guard.values().next().unwrap();
+            let mut core = handle.core.lock();
+            core.state.current = crate::state::AgentState::Idle;
+            core.health.clear_blocked_reason();
+        }
+        let externals: crate::agent::ExternalRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs: std::sync::Arc<
+            parking_lot::Mutex<std::collections::HashMap<String, crate::daemon::AgentConfig>>,
+        > = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        handler.run(&ctx);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.iter()
+                .any(|m| m.kind.as_deref() == Some("inbox_stuck_watchdog")),
+            "clearing live usage signals re-enables ordinary inbox alerts: {lead:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn stale_quota_reason_on_rate_limit_keeps_inbox_alert() {
+        for (tag, state) in [
+            ("rate-limit", crate::state::AgentState::RateLimit),
+            (
+                "server-rate-limit",
+                crate::state::AgentState::ServerRateLimit,
+            ),
+            ("api-error", crate::state::AgentState::ApiError),
+        ] {
+            let home = tmp_home(tag);
+            write_fleet(
+                &home,
+                "instances:\n  worker:\n    backend: claude\n  lead:\n    backend: claude\n\
+                 teams:\n  t:\n    members: [worker, lead]\n    orchestrator: lead\n",
+            );
+            seed_unread(&home, "worker");
+            let handler = InboxStuckHandler::new_at(1, past_grace());
+            let _registry = run_with_agent(
+                &home,
+                &handler,
+                "worker",
+                state,
+                Some(crate::health::BlockedReason::QuotaExceeded),
+            );
+            let lead = crate::inbox::drain(&home, "lead");
+            assert!(
+                lead.iter()
+                    .any(|m| m.kind.as_deref() == Some("inbox_stuck_watchdog")),
+                "{state:?} plus stale QuotaExceeded must preserve the ordinary alert: {lead:?}"
+            );
+            std::fs::remove_dir_all(home).ok();
+        }
     }
 }
