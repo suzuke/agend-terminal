@@ -1,7 +1,12 @@
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 
+fn normalized_ci_workflow() -> String {
+    CI_WORKFLOW.replace("\r\n", "\n")
+}
+
 fn canary_step() -> String {
-    let (_, check_job) = CI_WORKFLOW
+    let workflow = normalized_ci_workflow();
+    let (_, check_job) = workflow
         .split_once("\n  check:\n")
         .expect("CI workflow must contain the check job");
     let (check_job, _) = check_job
@@ -40,7 +45,8 @@ fn windows_canary_is_bounded_and_non_blocking() {
 
 #[test]
 fn canary_runs_before_blocking_contract_checks() {
-    let (_, check_job) = CI_WORKFLOW
+    let workflow = normalized_ci_workflow();
+    let (_, check_job) = workflow
         .split_once("\n  check:\n")
         .expect("CI workflow must contain the check job");
     let (check_job, _) = check_job
