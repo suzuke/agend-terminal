@@ -83,7 +83,20 @@ pub fn event(kind: &'static str, instance: &str, detail: String) -> Event {
 
 /// Append an event to the log file. Rotates when size exceeds MAX_LOG_SIZE.
 pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
-    log_many(home, &[event(kind, instance, detail.to_string())]);
+    if let Err(e) = try_log(home, kind, instance, detail) {
+        tracing::warn!(error = %e, "failed to write event log entry");
+    }
+}
+
+/// Append one event and surface durability failure to callers that perform a
+/// destructive action. Most advisory call sites should keep using [`log`].
+pub fn try_log(
+    home: &Path,
+    kind: &'static str,
+    instance: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    try_log_many(home, &[event(kind, instance, detail.to_string())])
 }
 
 /// Append a run of pre-built events in ONE lock + append + fsync cycle.
@@ -96,12 +109,20 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
 /// recovery data (e.g. `branch_sweep`'s `restore_hint`) must keep using [`log`]
 /// so each record is durable before the next destructive step runs.
 pub fn log_many(home: &Path, events: &[Event]) {
+    if let Err(e) = try_log_many(home, events) {
+        tracing::warn!(error = %e, count = events.len(), "failed to write event log entries");
+    }
+}
+
+/// Fallible counterpart to [`log_many`] for mutation paths whose response must
+/// distinguish a durable audit record from a best-effort warning.
+pub fn try_log_many(home: &Path, events: &[Event]) -> anyhow::Result<()> {
     if events.is_empty() {
-        return;
+        return Ok(());
     }
 
     // H4: size-check + rotation under lock to prevent TOCTOU race
-    if let Err(e) = append_lines_under_lock(home, "event-log", |path| {
+    append_lines_under_lock(home, "event-log", |path| {
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > MAX_LOG_SIZE {
                 rotate(path);
@@ -111,9 +132,7 @@ pub fn log_many(home: &Path, events: &[Event]) {
             .iter()
             .map(|e| Ok(serde_json::to_string(e)?))
             .collect()
-    }) {
-        tracing::warn!(error = %e, count = events.len(), "failed to write event log entries");
-    }
+    })
 }
 
 /// Lower-level primitive used by sister modules that need read access to

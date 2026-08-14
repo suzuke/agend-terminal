@@ -34,6 +34,14 @@ pub(super) fn handle_update_decision(home: &Path, args: &Value, instance_name: &
     crate::decisions::update(home, instance_name, args)
 }
 
+pub(super) fn handle_archive_batch_decisions(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+) -> Value {
+    crate::decisions::archive_batch(home, instance_name, args)
+}
+
 /// #2305: record an operator's answer to a pending decision, then notify the
 /// decision author (e.g. the lead who posted the question) so they unblock. The
 /// answerer is the calling identity (the TUI overlay passes `"operator"`; an

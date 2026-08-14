@@ -2,7 +2,54 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const DEFAULT_LIST_LIMIT: usize = 100;
+const MAX_LIST_LIMIT: usize = 500;
+const DEFAULT_SCAN_BUDGET: usize = 500;
+const MAX_SCAN_BUDGET: usize = 5_000;
+const MAX_BATCH_CANDIDATES: usize = 100;
+const BATCH_CONFIRM_TTL_SECS: i64 = 15 * 60;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DecisionCursor {
+    version: u8,
+    namespace: String,
+    physical_filename: String,
+    parsed_id: Option<String>,
+    consistency: String,
+    snapshot_digest: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BatchCandidateSnapshot {
+    id: String,
+    physical_filename: String,
+    content_digest: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchSourceSnapshot {
+    physical_filename: String,
+    content_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BatchConfirmation {
+    schema_version: u8,
+    actor: String,
+    created_at: String,
+    audit_reason: String,
+    policy_digest: String,
+    source_digest: String,
+    preview_digest: String,
+    #[serde(default)]
+    candidate_cap: usize,
+    #[serde(default)]
+    candidates_capped: bool,
+    sources: Vec<BatchSourceSnapshot>,
+    candidates: Vec<BatchCandidateSnapshot>,
+}
 
 /// #1990: on-disk schema version for a decision record (per-file store, so this
 /// follows the per-record `task_progress` pattern — a module const + an explicit
@@ -437,6 +484,169 @@ pub fn count_pending(home: &Path) -> PendingDecisionCounts {
     counts
 }
 
+fn cursor_encode(cursor: &DecisionCursor) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    let bytes = serde_json::to_vec(cursor)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn cursor_decode(raw: &str) -> anyhow::Result<DecisionCursor> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw)?;
+    let cursor: DecisionCursor = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(cursor.version == 1, "unsupported cursor version");
+    Ok(cursor)
+}
+
+fn decision_source_dir(home: &Path, namespace: &str) -> Option<PathBuf> {
+    match namespace {
+        "live" => Some(decisions_dir(home)),
+        "audit_history" => Some(decisions_dir(home).join(".archive")),
+        _ => None,
+    }
+}
+
+fn sorted_json_paths(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            anyhow::ensure!(
+                entry.file_type()?.is_file(),
+                "non-regular JSON source '{}'",
+                path.display()
+            );
+            paths.push(path);
+        }
+    }
+    // Decision IDs are timestamp-prefixed, so descending physical filename
+    // order preserves the historical newest-first default without parsing the
+    // whole store before returning the first bounded page.
+    paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(paths)
+}
+
+fn batch_sources_with_archived_candidates(
+    dir: &Path,
+    archive: &Path,
+    confirmation: &BatchConfirmation,
+) -> anyhow::Result<Vec<BatchSourceSnapshot>> {
+    let mut names = sorted_json_paths(dir)?
+        .into_iter()
+        .filter_map(|path| path.file_name()?.to_str().map(String::from))
+        .collect::<Vec<_>>();
+    for candidate in &confirmation.candidates {
+        if dir.join(&candidate.physical_filename).exists() {
+            continue;
+        }
+        let archived = archive.join(&candidate.physical_filename);
+        if let Ok(metadata) = std::fs::symlink_metadata(&archived) {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "non-regular archived JSON source '{}'",
+                archived.display()
+            );
+            names.push(candidate.physical_filename.clone());
+        }
+    }
+    names.sort_by(|left, right| right.cmp(left));
+    names.dedup();
+    names
+        .into_iter()
+        .take(confirmation.sources.len())
+        .map(|physical_filename| {
+            let live = dir.join(&physical_filename);
+            let path = if live.exists() {
+                live
+            } else {
+                archive.join(&physical_filename)
+            };
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "non-regular JSON source '{}'",
+                path.display()
+            );
+            let raw = std::fs::read(&path)?;
+            Ok(BatchSourceSnapshot {
+                physical_filename,
+                content_digest: crate::daemon::utils::sha256_hex(&raw),
+            })
+        })
+        .collect()
+}
+
+fn archive_would_orphan_question(decision: &Decision) -> bool {
+    decision.status == Some(DecisionStatus::Pending)
+        || (decision.needs_answer
+            && !matches!(
+                decision.status,
+                Some(DecisionStatus::Answered | DecisionStatus::Expired)
+            ))
+}
+
+fn source_digest(paths: &[PathBuf]) -> String {
+    let mut bytes = Vec::new();
+    for path in paths {
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+    }
+    crate::daemon::utils::sha256_hex(&bytes)
+}
+
+fn parse_bound(
+    value: &Value,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::FixedOffset>>, Value> {
+    let Some(raw) = value[key].as_str() else {
+        return Ok(None);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw).map(Some).map_err(
+        |e| serde_json::json!({"error": format!("invalid '{key}' RFC3339 timestamp: {e}")}),
+    )
+}
+
+fn decision_matches(
+    decision: &Decision,
+    include_archived: bool,
+    filter_tags: &[String],
+    author: Option<&str>,
+    status: Option<&str>,
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    until: Option<chrono::DateTime<chrono::FixedOffset>>,
+) -> bool {
+    if !include_archived && decision.archived {
+        return false;
+    }
+    if !filter_tags.is_empty() && !filter_tags.iter().any(|tag| decision.tags.contains(tag)) {
+        return false;
+    }
+    if author.is_some_and(|wanted| decision.author != wanted) {
+        return false;
+    }
+    let actual_status = decision.status.map(|value| match value {
+        DecisionStatus::Pending => "pending",
+        DecisionStatus::Answered => "answered",
+        DecisionStatus::Expired => "expired",
+    });
+    if status.is_some_and(|wanted| actual_status != Some(wanted)) {
+        return false;
+    }
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&decision.created_at) else {
+        return false;
+    };
+    if since.is_some_and(|bound| created < bound) || until.is_some_and(|bound| created > bound) {
+        return false;
+    }
+    true
+}
+
 pub fn list(home: &Path, args: &Value) -> Value {
     let include_archived = args["include_archived"].as_bool().unwrap_or(false);
     let filter_tags: Vec<String> = args["tags"]
@@ -447,15 +657,700 @@ pub fn list(home: &Path, args: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
+    let namespace = args["view"].as_str().unwrap_or("live");
+    let Some(dir) = decision_source_dir(home, namespace) else {
+        return serde_json::json!({"error": "'view' must be 'live' or 'audit_history'"});
+    };
+    let consistency = args["consistency"].as_str().unwrap_or("live");
+    if !matches!(consistency, "live" | "snapshot") {
+        return serde_json::json!({"error": "'consistency' must be 'live' or 'snapshot'"});
+    }
+    let limit = args["limit"]
+        .as_u64()
+        .unwrap_or(DEFAULT_LIST_LIMIT as u64)
+        .clamp(1, MAX_LIST_LIMIT as u64) as usize;
+    let scan_budget = args["scan_budget"]
+        .as_u64()
+        .unwrap_or(DEFAULT_SCAN_BUDGET as u64)
+        .clamp(1, MAX_SCAN_BUDGET as u64) as usize;
+    let since = match parse_bound(args, "since") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let until = match parse_bound(args, "until") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let status = args["status"].as_str();
+    if status.is_some_and(|value| !matches!(value, "pending" | "answered" | "expired")) {
+        return serde_json::json!({"error": "'status' must be pending, answered, or expired"});
+    }
 
-    let all = load_all(home);
-    let filtered: Vec<_> = all
+    let paths = match sorted_json_paths(&dir) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return serde_json::json!({"error": format!("decision source is unreadable: {error}")})
+        }
+    };
+    let digest = source_digest(&paths);
+    let cursor = match args["cursor"].as_str() {
+        Some(raw) => match cursor_decode(raw) {
+            Ok(cursor) => Some(cursor),
+            Err(e) => return serde_json::json!({"error": format!("invalid cursor: {e}")}),
+        },
+        None => None,
+    };
+    if let Some(cursor) = &cursor {
+        if cursor.namespace != namespace || cursor.consistency != consistency {
+            return serde_json::json!({"error": "cursor namespace/consistency does not match this query"});
+        }
+        if consistency == "snapshot" && cursor.snapshot_digest.as_deref() != Some(&digest) {
+            return serde_json::json!({"error": "snapshot changed; restart pagination without the cursor"});
+        }
+        if let Some(path) = paths.iter().find(|path| {
+            path.file_name().and_then(|value| value.to_str()) == Some(&cursor.physical_filename)
+        }) {
+            let current_id = std::fs::read(path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Decision>(&raw).ok())
+                .map(|decision| decision.id);
+            if cursor.parsed_id.is_some() && current_id != cursor.parsed_id {
+                return serde_json::json!({
+                    "error": "cursor physical record identity changed; restart pagination"
+                });
+            }
+        }
+    }
+
+    let start = cursor
+        .as_ref()
+        .map(|cursor| {
+            paths.partition_point(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|filename| filename >= cursor.physical_filename.as_str())
+            })
+        })
+        .unwrap_or(0);
+    let mut decisions = Vec::new();
+    let mut errors = Vec::new();
+    let mut scanned = 0usize;
+    let mut index = start;
+    let mut last_cursor = None;
+    while index < paths.len() && scanned < scan_budget && decisions.len() < limit {
+        let path = &paths[index];
+        index += 1;
+        scanned += 1;
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut parsed_id = None;
+        match std::fs::read_to_string(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| serde_json::from_str::<Decision>(&raw).map_err(anyhow::Error::from))
+        {
+            Ok(decision) if decision.schema_version <= SCHEMA_VERSION => {
+                parsed_id = Some(decision.id.clone());
+                if decision_matches(
+                    &decision,
+                    namespace == "audit_history" || include_archived,
+                    &filter_tags,
+                    args["author"].as_str(),
+                    status,
+                    since,
+                    until,
+                ) {
+                    decisions.push(decision);
+                }
+            }
+            Ok(decision) => errors.push(serde_json::json!({
+                "physical_filename": filename,
+                "code": "newer_schema",
+                "schema_version": decision.schema_version,
+            })),
+            Err(error) => errors.push(serde_json::json!({
+                "physical_filename": filename,
+                "code": "unreadable_or_malformed",
+                "error": error.to_string(),
+            })),
+        }
+        last_cursor = Some(DecisionCursor {
+            version: 1,
+            namespace: namespace.to_string(),
+            physical_filename: filename,
+            parsed_id,
+            consistency: consistency.to_string(),
+            snapshot_digest: (consistency == "snapshot").then(|| digest.clone()),
+        });
+    }
+    let has_more = index < paths.len();
+    let next_cursor = has_more
+        .then(|| {
+            last_cursor
+                .as_ref()
+                .and_then(|cursor| cursor_encode(cursor).ok())
+        })
+        .flatten();
+    serde_json::json!({
+        "decisions": decisions,
+        "source": namespace,
+        "consistency": consistency,
+        "snapshot_scope": (consistency == "snapshot").then_some("directory_membership; record contents are read live per page"),
+        "scanned": scanned,
+        "scan_budget": scan_budget,
+        "limit": limit,
+        "scan_exhausted": scanned == scan_budget && has_more,
+        "next_cursor": next_cursor,
+        "errors": errors,
+    })
+}
+
+fn protected_policy(home: &Path) -> anyhow::Result<(Vec<String>, String)> {
+    let path = crate::fleet::fleet_yaml_path(home);
+    if !path.exists() {
+        return Ok((Vec::new(), crate::daemon::utils::sha256_hex(b"absent")));
+    }
+    let raw = std::fs::read(&path)?;
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&raw)?;
+    let protected = doc
+        .get("retention")
+        .and_then(|retention| retention.get("protected_decision_tags"))
+        .map(|value| {
+            value
+                .as_sequence()
+                .ok_or_else(|| anyhow::anyhow!("retention.protected_decision_tags must be a list"))
+        })
+        .transpose()?
         .into_iter()
-        .filter(|d| include_archived || !d.archived)
-        .filter(|d| filter_tags.is_empty() || filter_tags.iter().any(|t| d.tags.contains(t)))
-        .collect();
+        .flatten()
+        .map(|value| {
+            value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("protected decision tags must be strings"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((protected, crate::daemon::utils::sha256_hex(&raw)))
+}
 
-    serde_json::json!({"decisions": filtered})
+fn confirmation_dir(home: &Path) -> PathBuf {
+    decisions_dir(home).join(".batch-confirmations")
+}
+
+fn confirmation_path(home: &Path, token: &str) -> Option<PathBuf> {
+    if token.len() == 36
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        Some(confirmation_dir(home).join(format!("{token}.json")))
+    } else {
+        None
+    }
+}
+
+fn durable_batch_audit_exists(home: &Path, token: &str, id: &str) -> bool {
+    let needle_token = format!("token={token}");
+    let needle_id = format!("id={id}");
+    (0..=5).any(|generation| {
+        let path = if generation == 0 {
+            home.join("event-log.jsonl")
+        } else {
+            home.join(format!("event-log.jsonl.{generation}"))
+        };
+        std::fs::read_to_string(path).is_ok_and(|raw| {
+            raw.lines().any(|line| {
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                if event["kind"] != "decision_batch_archived" {
+                    return false;
+                }
+                let Some(detail) = event["detail"].as_str() else {
+                    return false;
+                };
+                let mut fields = detail.split_whitespace();
+                fields.any(|field| field == needle_token)
+                    && detail.split_whitespace().any(|field| field == needle_id)
+            })
+        })
+    })
+}
+
+fn batch_audit_detail(
+    candidate: &BatchCandidateSnapshot,
+    token: &str,
+    confirmation: &BatchConfirmation,
+    audit_reason: &str,
+) -> String {
+    format!(
+        "id={} token={} preview_digest={} source_digest={} policy_digest={} audit_reason={}",
+        candidate.id,
+        token,
+        confirmation.preview_digest,
+        confirmation.source_digest,
+        confirmation.policy_digest,
+        audit_reason
+    )
+}
+
+fn write_batch_audit(
+    home: &Path,
+    caller: &str,
+    candidate: &BatchCandidateSnapshot,
+    token: &str,
+    confirmation: &BatchConfirmation,
+    audit_reason: &str,
+) -> anyhow::Result<()> {
+    crate::event_log::try_log(
+        home,
+        "decision_batch_archived",
+        caller,
+        &batch_audit_detail(candidate, token, confirmation, audit_reason),
+    )
+}
+
+fn read_stable_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let before = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        before.file_type().is_file(),
+        "non-regular file '{}'",
+        path.display()
+    );
+    let raw = std::fs::read(path)?;
+    let after = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        after.file_type().is_file(),
+        "non-regular file '{}'",
+        path.display()
+    );
+    anyhow::ensure!(
+        same_file_identity(&before, &after),
+        "file identity changed for '{}'",
+        path.display()
+    );
+    Ok(raw)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
+}
+
+fn selected_for_batch(
+    decision: &Decision,
+    args: &Value,
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    until: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    let tags = args["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    if !tags.is_empty()
+        && !tags
+            .iter()
+            .any(|tag| decision.tags.iter().any(|actual| actual == tag))
+    {
+        return false;
+    }
+    if args["author"]
+        .as_str()
+        .is_some_and(|author| decision.author != author)
+    {
+        return false;
+    }
+    let actual_status = decision.status.map(|value| match value {
+        DecisionStatus::Pending => "pending",
+        DecisionStatus::Answered => "answered",
+        DecisionStatus::Expired => "expired",
+    });
+    if args["status"]
+        .as_str()
+        .is_some_and(|wanted| actual_status != Some(wanted))
+    {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(&decision.created_at)
+        .is_ok_and(|created| since.is_none_or(|lower| created >= lower) && created <= until)
+}
+
+pub fn archive_batch(home: &Path, caller: &str, args: &Value) -> Value {
+    if caller.trim().is_empty() {
+        return serde_json::json!({"error": "archive_batch requires an authenticated caller"});
+    }
+    let apply = args["apply"].as_bool().unwrap_or(false);
+    let audit_reason = args["audit_reason"].as_str().unwrap_or("").trim();
+    if audit_reason.is_empty() {
+        return serde_json::json!({"error": "archive_batch requires non-empty 'audit_reason'"});
+    }
+    if apply {
+        return archive_batch_apply(home, caller, args, audit_reason);
+    }
+    archive_batch_preview(home, caller, args, audit_reason)
+}
+
+fn archive_batch_preview(home: &Path, caller: &str, args: &Value, audit_reason: &str) -> Value {
+    if let Some(status) = args["status"].as_str() {
+        if !matches!(status, "pending" | "answered" | "expired") {
+            return serde_json::json!({"error": format!("invalid status filter '{status}'")});
+        }
+    }
+    let until = match parse_bound(args, "until") {
+        Ok(Some(value)) => value,
+        Ok(None) => return serde_json::json!({"error": "archive_batch dry-run requires 'until'"}),
+        Err(error) => return error,
+    };
+    let since = match parse_bound(args, "since") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let (protected, policy_digest) = match protected_policy(home) {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({
+                "error": format!("protected decision policy is unreadable; refusing batch archive: {error}")
+            })
+        }
+    };
+    let scan_budget = args["scan_budget"]
+        .as_u64()
+        .unwrap_or(DEFAULT_SCAN_BUDGET as u64)
+        .clamp(1, MAX_SCAN_BUDGET as u64) as usize;
+    let paths = match sorted_json_paths(&decisions_dir(home)) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return serde_json::json!({"error": format!("decision source is unreadable; refusing batch archive: {error}")})
+        }
+    };
+    let mut scanned = 0usize;
+    let mut source_material = Vec::new();
+    let mut sources = Vec::new();
+    let mut candidates = Vec::new();
+    let mut protected_ids = Vec::new();
+    let mut candidates_capped = false;
+    for path in paths.iter().take(scan_budget) {
+        scanned += 1;
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return serde_json::json!({"error": format!("cannot read {filename}; refusing batch archive: {error}")})
+            }
+        };
+        let content_digest = crate::daemon::utils::sha256_hex(&raw);
+        source_material.extend_from_slice(filename.as_bytes());
+        source_material.push(0);
+        source_material.extend_from_slice(content_digest.as_bytes());
+        source_material.push(0);
+        sources.push(BatchSourceSnapshot {
+            physical_filename: filename.clone(),
+            content_digest: content_digest.clone(),
+        });
+        let decision: Decision = match serde_json::from_slice(&raw) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return serde_json::json!({"error": format!("malformed {filename}; refusing batch archive: {error}")})
+            }
+        };
+        if decision.schema_version > SCHEMA_VERSION {
+            return serde_json::json!({
+                "error": format!("{filename} uses newer schema {}; refusing batch archive", decision.schema_version)
+            });
+        }
+        if decision.archived || !selected_for_batch(&decision, args, since, until) {
+            continue;
+        }
+        if archive_would_orphan_question(&decision) {
+            return serde_json::json!({
+                "error": format!("unresolved question '{}' matched; refusing batch archive", decision.id)
+            });
+        }
+        if !can_mutate_decision(home, caller, &decision) {
+            return serde_json::json!({
+                "error": format!("decision '{}' owned by '{}'; caller '{caller}' not authorized", decision.id, decision.author)
+            });
+        }
+        if decision.tags.iter().any(|tag| protected.contains(tag)) {
+            protected_ids.push(decision.id);
+            continue;
+        }
+        if candidates.len() == MAX_BATCH_CANDIDATES {
+            candidates_capped = true;
+            break;
+        }
+        candidates.push(BatchCandidateSnapshot {
+            id: decision.id,
+            physical_filename: filename,
+            content_digest,
+        });
+    }
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<Vec<_>>();
+    let preview_digest = crate::daemon::utils::sha256_hex(ids.join("\0").as_bytes());
+    let source_digest = crate::daemon::utils::sha256_hex(&source_material);
+    let token = uuid::Uuid::new_v4().to_string();
+    let confirmation = BatchConfirmation {
+        schema_version: 1,
+        actor: caller.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        audit_reason: audit_reason.to_string(),
+        policy_digest: policy_digest.clone(),
+        source_digest: source_digest.clone(),
+        preview_digest: preview_digest.clone(),
+        candidate_cap: MAX_BATCH_CANDIDATES,
+        candidates_capped,
+        sources,
+        candidates,
+    };
+    let dir = confirmation_dir(home);
+    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|_| {
+        crate::store::save_atomic(&dir.join(format!("{token}.json")), &confirmation)
+            .map_err(std::io::Error::other)
+    }) {
+        return serde_json::json!({"error": format!("persist confirmation failed: {error}")});
+    }
+    serde_json::json!({
+        "apply": false,
+        "candidate_ids": confirmation.candidates.iter().map(|candidate| &candidate.id).collect::<Vec<_>>(),
+        "candidate_count": confirmation.candidates.len(),
+        "candidate_cap": confirmation.candidate_cap,
+        "candidates_capped": confirmation.candidates_capped,
+        "protected_ids": protected_ids,
+        "scanned": scanned,
+        "scan_budget": scan_budget,
+        "scan_exhausted": scanned == scan_budget && scanned < paths.len(),
+        "confirm_token": token,
+        "preview_digest": preview_digest,
+        "policy_digest": policy_digest,
+        "source_digest": source_digest,
+    })
+}
+
+fn archive_batch_apply(home: &Path, caller: &str, args: &Value, audit_reason: &str) -> Value {
+    let Some(token) = args["confirm_token"].as_str() else {
+        return serde_json::json!({"error": "apply=true requires 'confirm_token'"});
+    };
+    let Some(path) = confirmation_path(home, token) else {
+        return serde_json::json!({"error": "invalid confirm_token"});
+    };
+    let mut confirmation: BatchConfirmation = match std::fs::read(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|raw| serde_json::from_slice(&raw).map_err(anyhow::Error::from))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({"error": format!("confirmation unavailable: {error}")})
+        }
+    };
+    if confirmation.schema_version != 1
+        || confirmation.actor != caller
+        || confirmation.audit_reason != audit_reason
+    {
+        return serde_json::json!({"error": "confirmation actor/audit binding mismatch"});
+    }
+    let confirmation_age = chrono::DateTime::parse_from_rfc3339(&confirmation.created_at)
+        .map(|created| {
+            chrono::Utc::now()
+                .signed_duration_since(created)
+                .num_seconds()
+        })
+        .unwrap_or(BATCH_CONFIRM_TTL_SECS + 1);
+    if !(0..=BATCH_CONFIRM_TTL_SECS).contains(&confirmation_age) {
+        return serde_json::json!({"error": "confirmation expired; run dry-run again"});
+    }
+    let mut confirm_ids = args["confirm_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(String::from))
+        .collect::<Vec<_>>();
+    confirm_ids.sort();
+    confirm_ids.dedup();
+    let mut expected_ids = confirmation
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    expected_ids.sort();
+    if confirm_ids != expected_ids {
+        return serde_json::json!({"error": "confirm_ids must exactly match the dry-run preview"});
+    }
+    let (protected, policy_digest) = match protected_policy(home) {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({"error": format!("protected policy revalidation failed: {error}")})
+        }
+    };
+    if policy_digest != confirmation.policy_digest {
+        return serde_json::json!({"error": "protected decision policy changed; run dry-run again"});
+    }
+    let dir = decisions_dir(home);
+    let archive = dir.join(".archive");
+    let all_already_archived = confirmation.candidates.iter().all(|candidate| {
+        read_stable_regular_file(&archive.join(&candidate.physical_filename))
+            .ok()
+            .is_some_and(|raw| crate::daemon::utils::sha256_hex(&raw) == candidate.content_digest)
+            && std::fs::symlink_metadata(dir.join(&candidate.physical_filename))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+    if !all_already_archived {
+        let current_sources = match batch_sources_with_archived_candidates(
+            &dir,
+            &archive,
+            &confirmation,
+        ) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return serde_json::json!({"error": format!("decision source revalidation failed: {error}")})
+            }
+        };
+        if current_sources != confirmation.sources {
+            return serde_json::json!({"error": "decision source snapshot changed; run dry-run again"});
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(&archive) {
+        return serde_json::json!({"error": format!("create archive directory failed: {error}")});
+    }
+    let _sentinel = match crate::store::acquire_file_lock(&dir.join(".archive.lock")) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return serde_json::json!({"error": format!("archive sentinel lock failed: {error}")})
+        }
+    };
+    let mut ordered = std::mem::take(&mut confirmation.candidates);
+    ordered.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut outcomes = Vec::new();
+    let mut partial = false;
+    for candidate in ordered {
+        let outcome = with_decision_lock(home, &candidate.id, || {
+            let src = dir.join(&candidate.physical_filename);
+            let dst = archive.join(&candidate.physical_filename);
+            let src_metadata = match std::fs::symlink_metadata(&src) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if read_stable_regular_file(&dst).ok().is_some_and(|raw| {
+                        crate::daemon::utils::sha256_hex(&raw) == candidate.content_digest
+                    }) {
+                        if durable_batch_audit_exists(home, token, &candidate.id) {
+                            return serde_json::json!({"id": candidate.id, "outcome": "already_archived", "audit_durable": true});
+                        }
+                        return match write_batch_audit(
+                            home,
+                            caller,
+                            &candidate,
+                            token,
+                            &confirmation,
+                            audit_reason,
+                        ) {
+                            Ok(()) => {
+                                serde_json::json!({"id": candidate.id, "outcome": "audit_repaired", "audit_durable": true})
+                            }
+                            Err(error) => {
+                                serde_json::json!({"id": candidate.id, "outcome": "archived_audit_failed", "error": error.to_string(), "audit_durable": false})
+                            }
+                        };
+                    }
+                    return serde_json::json!({"id": candidate.id, "outcome": "source_missing", "audit_durable": false});
+                }
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "source_metadata_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if !src_metadata.file_type().is_file() {
+                return serde_json::json!({"id": candidate.id, "outcome": "revalidation_refused", "error": "source is not a regular file", "audit_durable": false});
+            }
+            match std::fs::symlink_metadata(&dst) {
+                Ok(_) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "archive_collision", "audit_durable": false});
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "archive_metadata_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            }
+            let raw = match read_stable_regular_file(&src) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "read_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if crate::daemon::utils::sha256_hex(&raw) != candidate.content_digest {
+                return serde_json::json!({"id": candidate.id, "outcome": "content_changed", "audit_durable": false});
+            }
+            let decision: Decision = match serde_json::from_slice(&raw) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "malformed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if decision.schema_version > SCHEMA_VERSION
+                || archive_would_orphan_question(&decision)
+                || decision.tags.iter().any(|tag| protected.contains(tag))
+                || !can_mutate_decision(home, caller, &decision)
+            {
+                return serde_json::json!({"id": candidate.id, "outcome": "revalidation_refused", "audit_durable": false});
+            }
+            let final_metadata = match std::fs::symlink_metadata(&src) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "source_metadata_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if !final_metadata.file_type().is_file()
+                || !same_file_identity(&src_metadata, &final_metadata)
+            {
+                return serde_json::json!({"id": candidate.id, "outcome": "revalidation_refused", "error": "source identity changed", "audit_durable": false});
+            }
+            if let Err(error) = std::fs::rename(&src, &dst) {
+                return serde_json::json!({"id": candidate.id, "outcome": "archive_failed", "error": error.to_string(), "audit_durable": false});
+            }
+            match write_batch_audit(home, caller, &candidate, token, &confirmation, audit_reason) {
+                Ok(()) => {
+                    serde_json::json!({"id": candidate.id, "outcome": "archived", "audit_durable": true})
+                }
+                Err(error) => {
+                    serde_json::json!({"id": candidate.id, "outcome": "archived_audit_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            }
+        });
+        let value = match outcome {
+            Ok(value) => value,
+            Err(error) => {
+                serde_json::json!({"id": candidate.id, "outcome": "lock_failed", "error": error.to_string(), "audit_durable": false})
+            }
+        };
+        partial |= !value["audit_durable"].as_bool().unwrap_or(false);
+        outcomes.push(value);
+    }
+    serde_json::json!({
+        "apply": true,
+        "partial": partial,
+        "outcomes": outcomes,
+        "preview_digest": confirmation.preview_digest,
+        "candidate_cap": confirmation.candidate_cap,
+        "candidates_capped": confirmation.candidates_capped,
+        "source_digest": confirmation.source_digest,
+        "policy_digest": confirmation.policy_digest,
+    })
 }
 
 pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
