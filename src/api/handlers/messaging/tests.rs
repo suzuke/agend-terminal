@@ -2908,8 +2908,8 @@ fn validated_review_bridge_rejects_reporter_identity_mismatch() {
     let home = tmp_home("validated-review-reporter-mismatch");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    seed_review_task(&home, "t-reviewer-mismatch", "reviewer-a");
-    record_review_dispatch(&home, "lead", "reviewer-a", "t-reviewer-mismatch");
+    seed_review_task(&home, "t-reviewer-mismatch", "reviewer-b");
+    record_review_dispatch(&home, "lead", "reviewer-b", "t-reviewer-mismatch");
 
     bridge_verdict_to_review_task(
         &home,
