@@ -2934,6 +2934,47 @@ fn validated_review_bridge_rejects_reporter_identity_mismatch() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn production_validated_review_bridge_rejects_reporter_identity_mismatch() {
+    let home = tmp_home("production-validated-review-reporter-mismatch");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    seed_review_task(&home, "t-production-reviewer-mismatch", "reviewer-b");
+    record_review_dispatch(
+        &home,
+        "lead",
+        "reviewer-b",
+        "t-production-reviewer-mismatch",
+    );
+    let msg = t127_verdict(
+        "VERIFIED spoofed production reporter",
+        "t-production-reviewer-mismatch",
+        "t-production-reviewer-mismatch",
+        "reviewer-a",
+    );
+    let request = api_params_to_send_request(&json!({
+        "from": "reviewer-b",
+        "target": "lead",
+        "kind": "report",
+        "correlation_id": "t-production-reviewer-mismatch",
+    }));
+
+    crate::agent_ops::messaging::track_dispatch(
+        &home,
+        &request,
+        "reviewer-b",
+        "lead",
+        &msg,
+    );
+
+    assert_eq!(
+        task_status_of(&home, "t-production-reviewer-mismatch"),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "production bridge must reject a reporter other than the validated reviewer"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Case (b) dual-2: display correlation may still be `repo@branch`, but the
 /// validated receipt carries the exact task id and no reverse lookup is needed.
 #[test]
