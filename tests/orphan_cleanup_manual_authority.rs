@@ -1164,7 +1164,7 @@ fn staged(tag: &str, script: &[(u32, Vec<Option<ProcIdentity>>)], self_uid: Opti
     }
 }
 
-fn run(
+fn run_apply(
     stage: &Stage,
     term_fails: Option<u32>,
     survives: &[u32],
@@ -1222,7 +1222,7 @@ fn run_scripted(
 #[test]
 fn apply_without_a_self_uid_refuses_3273() {
     let stage = staged("no-self-uid", &[(4242, vec![identity(111_000, 501)])], None);
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
     assert_eq!(
         outcome,
         ApplyOutcome::Refused(RefusalReason::MissingSelfUid)
@@ -1242,7 +1242,7 @@ fn apply_to_a_foreign_uid_refuses_3273() {
         &[(4242, vec![identity(111_000, 999)])],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ForeignUid));
     assert!(stage.log.events().is_empty());
     std::fs::remove_dir_all(&stage.home).ok();
@@ -1267,7 +1267,7 @@ fn a_single_stale_candidate_refuses_the_whole_batch_3273() {
         ],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::StaleBatch));
     assert!(
         stage.log.events().is_empty(),
@@ -1296,7 +1296,7 @@ fn pid_reuse_between_preflight_and_term_signals_nothing_3273() {
         )],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
     assert_eq!(
         outcome,
         ApplyOutcome::Applied(vec![(
@@ -1324,7 +1324,7 @@ fn unreadable_identity_before_term_signals_nothing_3273() {
         )],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
     assert_eq!(
         outcome,
         ApplyOutcome::Applied(vec![(
@@ -1351,7 +1351,7 @@ fn a_successful_term_audits_first_waits_bounded_and_never_kills_3273() {
         &[(4242, vec![identity(111_000, 501)])],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
 
     assert_eq!(
         outcome,
@@ -1391,7 +1391,7 @@ fn term_ignored_by_the_same_identity_earns_exactly_one_kill_after_the_grace_3273
         )],
         Some(501),
     );
-    let outcome = run(&stage, None, &[4242], false);
+    let outcome = run_apply(&stage, None, &[4242], false);
 
     assert_eq!(
         outcome,
@@ -1431,7 +1431,7 @@ fn pid_reuse_during_the_grace_window_cancels_the_kill_3273() {
         )],
         Some(501),
     );
-    let outcome = run(&stage, None, &[4242], false);
+    let outcome = run_apply(&stage, None, &[4242], false);
 
     assert_eq!(
         outcome,
@@ -1462,7 +1462,7 @@ fn an_undurable_pre_signal_audit_blocks_the_signal_3273() {
         &[(4242, vec![identity(111_000, 501)])],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], true);
+    let outcome = run_apply(&stage, None, &[], true);
 
     assert_eq!(
         outcome,
@@ -1492,7 +1492,7 @@ fn a_signal_failure_stops_the_batch_3273() {
         ],
         Some(501),
     );
-    let outcome = run(&stage, Some(4242), &[], false);
+    let outcome = run_apply(&stage, Some(4242), &[], false);
 
     match outcome {
         ApplyOutcome::Applied(results) => {
@@ -1550,7 +1550,7 @@ fn an_identity_change_before_term_stops_the_batch_3273() {
         ],
         Some(501),
     );
-    let outcome = run(&stage, None, &[], false);
+    let outcome = run_apply(&stage, None, &[], false);
 
     match outcome {
         ApplyOutcome::Applied(results) => {
@@ -1592,7 +1592,7 @@ fn an_identity_change_during_grace_stops_the_batch_3273() {
         ],
         Some(501),
     );
-    let outcome = run(&stage, None, &[4242], false);
+    let outcome = run_apply(&stage, None, &[4242], false);
 
     match outcome {
         ApplyOutcome::Applied(results) => {
@@ -1769,7 +1769,7 @@ fn a_sidecar_naming_an_unsignallable_pid_signals_nothing_3273() {
             ],
             Some(501),
         );
-        let outcome = run(&stage, None, &[], false);
+        let outcome = run_apply(&stage, None, &[], false);
         match outcome {
             ApplyOutcome::Applied(results) => {
                 assert_eq!(
