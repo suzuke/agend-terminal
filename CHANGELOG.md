@@ -7,6 +7,84 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-15
+
+112 commits since 0.11.3. This release makes restart recovery a structured,
+durable backend operation and closes the coordination, cleanup, notification,
+and cross-platform reliability gaps uncovered while exercising that path.
+
+### Added
+
+- **Structured backend transports** — Codex, OpenCode, and Claude Code can now
+  receive managed messages through backend-native sessions instead of relying
+  on composer keystrokes. The shared transport seam includes bounded delivery,
+  stable message identities, readiness admission, Claude ChannelBridge
+  acknowledgements, and explicit fallback behavior (#3190–#3191, #3194–#3199,
+  #3205, #3211, #3214, #3235).
+- **Durable zero-input restart recovery** — fresh restart self-kicks are
+  serialized through the selected backend transport, restore waits for runtime
+  registration, and an app restart resumes only its invoking instance
+  (#3202–#3206, #3212).
+- **Auditable manual orphan cleanup** — operators can inspect unproven process
+  candidates and clean an exact PID only with immutable confirmation authority;
+  uncertain ownership remains fail-closed (#3273–#3275).
+
+### Changed
+
+- **Remote notifications carry decisions, not terminal dumps** — Telegram and
+  Discord alerts summarize the state and requested action while suppressing
+  raw, oversized TUI prompt bodies (#3223).
+- **Lifecycle cleanup is more complete and conservative** — merged-task,
+  review-binding, local-branch, boot-orphan, and worktree-release paths now
+  preserve live leases, retire proven residue, and reject ambiguous or
+  still-surviving targets (#3125, #3137, #3148–#3149, #3158, #3184, #3216,
+  #3222, #3226, #3272).
+- **Bounded operational history** — decision listing and archival, recurring
+  schedule supersession, inbox diagnostics, CI diagnostics, and failure-time
+  evidence now have explicit bounds without hiding actionable state (#3213,
+  #3234, #3237, #3239, #3243, #3253, #3260–#3261, #3268).
+- **Dependencies refreshed** — updated async-trait, base64, clap,
+  clap_complete, ctor, libc, proc-macro2, serde, serial_test, socket2, syn,
+  tao, tokio, tray-icon, and uuid (#3129–#3133, #3185–#3189, #3217–#3221).
+
+### Fixed
+
+- **Review and CI continuation stays authoritative** — exact-head watches
+  survive failure, provisional subjects remain actionable, assignment reissue
+  retargets bindings, verdicts are deduplicated, completion receipts are
+  consumed honestly, and post-merge handoffs remain pollable (#3123, #3127,
+  #3139, #3143, #3149–#3150, #3155, #3157–#3158, #3162, #3167, #3169–#3171,
+  #3177, #3180–#3183, #3267).
+- **Inbox and channel delivery is recoverable** — generic Telegram replies
+  settle before drain, failed topic cleanup keeps recovery state, redelivery
+  history is durable, repeated usage-limit watchdog alerts are suppressed, and
+  empty notification-only callers fail before receipt lookup (#3174, #3215,
+  #3234, #3264, #3270).
+- **Backend startup and limits are classified correctly** — Grok trust,
+  readiness, and quota anchors, Kiro unavailable-model state, Fable 5 usage
+  limits, API-port publication, and the public Grok create schema now agree
+  with the live backends (#3134, #3136, #3151–#3153, #3161, #3172).
+- **Cross-platform CI failures are more truthful and reproducible** — coverage
+  isolates corrupt profiles and late writers, preserves bounded diagnostics,
+  and reports tee-sink failure; Windows crash, delayed bridge, external-delete,
+  temp-fixture, worktree-path, and native-symlink cases use deterministic or
+  fail-closed checks (#3138, #3140, #3231, #3237, #3239–#3243, #3250–#3265,
+  #3269, #3272).
+- **Git routing and configuration edge cases** — non-repository working
+  directories route through agentic-git correctly, origin is preferred as the
+  primary remote, top-level MCP schemas avoid unsupported unions, Telegram bot
+  token compatibility is symmetric, and branch-cleanup audit logs stay ignored
+  (#3118, #3120–#3121, #3144, #3147, #3154).
+
+### Migration and known caveats
+
+- Existing fleet configuration remains compatible; no mandatory migration is
+  required. Managed Codex, OpenCode, and Claude sessions prefer structured
+  transport when ready and retain an explicit bounded fallback path.
+- Cleanup remains intentionally fail-closed for unproven processes, missing
+  native symlinks, dirty worktrees, or ambiguous ownership. Use the structured
+  inspection and confirmation flow rather than deleting residue manually.
+
 ## [0.11.3] — 2026-07-27
 
 ### Added
@@ -730,7 +808,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1

@@ -7,6 +7,71 @@
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-15
+
+自 0.11.3 以來共 112 個 commits。本次版本把 restart recovery 提升為具結構、
+可持久化的 backend 操作，並補齊實際驗證該路徑時發現的協調、清理、通知與跨平台可靠性缺口。
+
+### Added
+
+- **結構化 backend transport** — Codex、OpenCode 與 Claude Code 現在可透過
+  backend 原生 session 接收受管訊息，不再依賴在 composer 模擬按鍵。共用 transport seam
+  提供有界 delivery、穩定 message identity、readiness admission、Claude ChannelBridge
+  acknowledgement，以及明確的 fallback 行為（#3190–#3191、#3194–#3199、#3205、
+  #3211、#3214、#3235）。
+- **可持久化的零輸入 restart recovery** — fresh-restart self-kick 會依序經由選定的
+  backend transport 送出，restore 會等待 runtime 完成註冊，app restart 也只 resume
+  發起它的 instance（#3202–#3206、#3212）。
+- **可稽核的 manual orphan cleanup** — operator 可檢視未證實的 process candidate，
+  且只有持有不可變 confirmation authority 時才能清理 exact PID；ownership 不確定時仍
+  fail-closed（#3273–#3275）。
+
+### Changed
+
+- **遠端通知傳達決策，而非傾倒 terminal** — Telegram 與 Discord alert 現在摘要狀態與
+  所需動作，並抑制原始且過長的 TUI prompt body（#3223）。
+- **生命週期清理更完整且更保守** — merged task、review binding、local branch、
+  boot orphan 與 worktree release 路徑現在會保留 live lease、淘汰已證實 residue，並拒絕
+  模糊或仍存活的 target（#3125、#3137、#3148–#3149、#3158、#3184、#3216、#3222、
+  #3226、#3272）。
+- **有界的操作歷史** — decision listing／archival、recurring schedule supersession、
+  inbox diagnostics、CI diagnostics 與 failure-time evidence 都有明確上限，同時不隱藏
+  actionable state（#3213、#3234、#3237、#3239、#3243、#3253、#3260–#3261、#3268）。
+- **更新 dependencies** — 更新 async-trait、base64、clap、clap_complete、ctor、
+  libc、proc-macro2、serde、serial_test、socket2、syn、tao、tokio、tray-icon 與 uuid
+  （#3129–#3133、#3185–#3189、#3217–#3221）。
+
+### Fixed
+
+- **Review 與 CI continuation 保持 authoritative** — exact-head watch 會跨 failure
+  保留，provisional subject 仍可處理，assignment reissue 會 retarget binding，verdict 不會
+  重複送達，completion receipt 會如實消耗，post-merge handoff 也保持可 poll
+  （#3123、#3127、#3139、#3143、#3149–#3150、#3155、#3157–#3158、#3162、#3167、
+  #3169–#3171、#3177、#3180–#3183、#3267）。
+- **Inbox 與 channel delivery 可恢復** — 一般 Telegram reply 會在 drain 前 settle，
+  topic cleanup 失敗時會保留 recovery state，redelivery history 可持久化，usage-limit
+  watchdog 不再重複提醒，空的 notification-only caller 也會在 receipt lookup 前失敗
+  （#3174、#3215、#3234、#3264、#3270）。
+- **正確分類 backend startup 與限制狀態** — Grok trust／readiness／quota anchor、
+  Kiro unavailable-model、Fable 5 usage limit、API port publication 與公開 Grok create schema
+  現在都與 live backend 一致（#3134、#3136、#3151–#3153、#3161、#3172）。
+- **跨平台 CI failure 更可信且可重現** — coverage 會隔離 corrupt profile 與 late writer、
+  保留有界 diagnostics，並如實回報 tee-sink failure；Windows crash、delayed bridge、
+  external delete、temp fixture、worktree path 與 native symlink 案例改用 deterministic 或
+  fail-closed 檢查（#3138、#3140、#3231、#3237、#3239–#3243、#3250–#3265、#3269、
+  #3272）。
+- **Git routing 與 configuration edge case** — 非 repository cwd 可正確經由 agentic-git
+  routing、優先選擇 origin remote、top-level MCP schema 避免不支援的 union、Telegram bot
+  token compatibility 維持對稱，branch-cleanup audit log 也會保持 ignored（#3118、#3120–
+  #3121、#3144、#3147、#3154）。
+
+### Migration and known caveats
+
+- 既有 fleet configuration 維持相容，不需要強制 migration。受管 Codex、OpenCode 與
+  Claude session 在 ready 時會優先使用 structured transport，並保留明確且有界的 fallback。
+- 對未證實 process、缺少 native symlink、dirty worktree 或 ownership 模糊的情況，cleanup
+  仍刻意 fail-closed。請使用結構化 inspection 與 confirmation flow，不要手動刪除 residue。
+
 ## [0.11.3] — 2026-07-27
 
 ### Added
@@ -652,7 +717,8 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
