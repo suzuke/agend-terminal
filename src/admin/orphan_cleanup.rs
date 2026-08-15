@@ -1306,13 +1306,26 @@ fn harden_private(_path: &Path, _mode: u32) -> std::io::Result<()> {
 }
 
 /// Guard holding the advisory lock for one confirmation.
+///
+/// #1629: this is a raw `fs4` flock rather than a `store::acquire_file_lock`
+/// call because this module is re-exported into the LIBRARY crate for the
+/// contract tests, where `store` does not exist. It therefore does the
+/// chokepoint's `FLOCK_DEPTH` bookkeeping itself — `sync_audit` IS lib-visible —
+/// so this site is TRACKED rather than exempt: the self-IPC deadlock guard
+/// (`assert_no_registry_lock_for_self_ipc`) still sees the flock tier while this
+/// lock is held. `tests/flock_depth_invariant.rs` exempts this file only while
+/// both bookkeeping calls are present.
 pub struct ConfirmationLock {
     file: std::fs::File,
 }
 
 impl Drop for ConfirmationLock {
     fn drop(&mut self) {
+        // Unlock explicitly before the depth decrement, so depth > 0 always
+        // implies the OS lock is still held — the same ordering `FileFlockGuard`
+        // uses, and the reason cloned descriptors cannot leave it held.
         let _ = fs4::FileExt::unlock(&self.file);
+        crate::sync_audit::flock_exited();
     }
 }
 
@@ -1340,6 +1353,10 @@ fn acquire_confirmation_lock(path: &Path) -> std::io::Result<ConfirmationLock> {
     // the same name, and selecting it would trip the MSRV gate (rust-version is
     // below that). Same reasoning as `store::acquire_file_lock`.
     fs4::FileExt::lock(&file)?;
+    // Bump AFTER the OS lock is held, so depth > 0 always implies "lock held" —
+    // the ordering `store::acquire_file_lock` uses, mirrored here because this
+    // module cannot reach that chokepoint from the library crate.
+    crate::sync_audit::flock_entered();
     Ok(ConfirmationLock { file })
 }
 

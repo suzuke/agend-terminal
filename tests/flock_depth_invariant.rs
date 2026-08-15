@@ -43,6 +43,22 @@ use std::path::{Path, PathBuf};
 
 const ALLOWED: [&str; 3] = ["store.rs", "bootstrap/mod.rs", "daemon/mod.rs"];
 
+/// #3273: files that carry a raw flock but do the chokepoint's `FLOCK_DEPTH`
+/// bookkeeping THEMSELVES, and are therefore tracked rather than exempt.
+///
+/// `admin/orphan_cleanup.rs` is re-exported into the LIBRARY crate (`#[path]` in
+/// `src/lib.rs`) so its contract tests exercise the identical code the CLI runs.
+/// `store` does not exist in that crate, so `store::acquire_file_lock` is
+/// unreachable from it — but `sync_audit`, which owns `FLOCK_DEPTH`, IS
+/// lib-visible, so the site calls `flock_entered`/`flock_exited` around its own
+/// lock. The self-IPC deadlock guard therefore still sees the flock tier, which
+/// is the property this invariant exists to protect.
+///
+/// The exemption is CONDITIONAL on that bookkeeping still being there — see
+/// `scan_file`. Delete either call and the file falls straight back under the
+/// scan, so this is not a standing licence to hold an untracked flock.
+const DEPTH_TRACKED: [&str; 1] = ["admin/orphan_cleanup.rs"];
+
 /// fs4 `FileExt` lock/unlock method names. `lock` / `try_lock` are the exclusive
 /// aliases the codebase uses; the `_shared` / `_exclusive` variants are included
 /// for forward-coverage.
@@ -96,6 +112,16 @@ fn imports_fs4_fileext(text: &str) -> bool {
 /// directions without touching the filesystem.
 fn scan_file(rel: &str, text: &str) -> Vec<String> {
     if ALLOWED.contains(&rel) {
+        return Vec::new();
+    }
+    // #3273: tracked-not-exempt, and only while it is actually tracked. Both
+    // halves are required — an `entered` without an `exited` would pin the depth
+    // above zero and false-trip every later self-IPC on that thread, which is a
+    // different bug of the same family.
+    if DEPTH_TRACKED.contains(&rel)
+        && text.contains("sync_audit::flock_entered()")
+        && text.contains("sync_audit::flock_exited()")
+    {
         return Vec::new();
     }
     let gated = imports_fs4_fileext(text);
@@ -158,7 +184,10 @@ fn acquire_file_lock_is_sole_flock_depth_bumper_1629() {
          store::acquire_file_lock's FLOCK_DEPTH tracking → reopens the flock-while-blocking \
          self-IPC deadlock blind spot (#1617 class). Route the lock through \
          `crate::store::acquire_file_lock` instead; or — if it is a deliberate lifetime-held \
-         singleton like `.daemon.lock` — add its file to the allowlist with rationale:\n{}",
+         singleton like `.daemon.lock` — add its file to the allowlist with rationale; or — if \
+         the file genuinely cannot reach the chokepoint (e.g. it is re-exported into the library \
+         crate) — do the `sync_audit::flock_entered`/`flock_exited` bookkeeping yourself and add \
+         it to DEPTH_TRACKED:\n{}",
         violations.join("\n")
     );
 }
@@ -211,5 +240,26 @@ fn scanner_catches_all_realistic_forms_and_spares_mutex() {
     assert!(
         scan_file("store.rs", single).is_empty(),
         "allowlisted files are exempt"
+    );
+
+    // #3273: the depth-TRACKED entry is conditional, and this proves both
+    // directions. Without it the entry would be an ordinary allowlist row and
+    // nothing would notice if the bookkeeping were later deleted.
+    let tracked = "use fs4::FileExt;\nfn f(file: std::fs::File) { let _ = file.try_lock(); \
+                   crate::sync_audit::flock_entered(); }\n\
+                   fn g() { crate::sync_audit::flock_exited(); }";
+    assert!(
+        scan_file("admin/orphan_cleanup.rs", tracked).is_empty(),
+        "a depth-tracked file that does the FLOCK_DEPTH bookkeeping is exempt"
+    );
+    assert!(
+        !scan_file("admin/orphan_cleanup.rs", single).is_empty(),
+        "the SAME file without the bookkeeping must fall back under the scan"
+    );
+    let half = "use fs4::FileExt;\nfn f(file: std::fs::File) { let _ = file.try_lock(); \
+                crate::sync_audit::flock_entered(); }";
+    assert!(
+        !scan_file("admin/orphan_cleanup.rs", half).is_empty(),
+        "an `entered` with no `exited` pins the depth above zero and must not be exempt"
     );
 }

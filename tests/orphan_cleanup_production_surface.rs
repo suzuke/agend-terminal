@@ -808,7 +808,7 @@ fn the_preview_handler_propagates_a_failure_3273() {
 /// safe to execute against our own pid.
 #[test]
 fn preview_end_to_end_emits_a_token_and_persists_its_sidecar_3273() {
-    let home = std::env::temp_dir().join(format!("agend-e2e-preview-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("agend-orphans-preview-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
 
     let out = agend()
@@ -870,7 +870,7 @@ fn preview_end_to_end_emits_a_token_and_persists_its_sidecar_3273() {
 /// dispatch path with no risk to any process.
 #[test]
 fn apply_end_to_end_refuses_an_unknown_confirmation_3273() {
-    let home = std::env::temp_dir().join(format!("agend-e2e-apply-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("agend-orphans-apply-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
 
     let out = agend()
