@@ -18,15 +18,20 @@ pub fn attach_registry(state: &Arc<Mutex<TelegramState>>, registry: AgentRegistr
     s.registry = Some(registry);
 }
 
-/// RED DECLARATION LIFT (#3232): declared so the sweep contract can be expressed. The
-/// ANSWER is main's — main's boot sweep never selects a tombstone for reaping. GREEN
-/// implements the predicate.
+/// Is this `topics.json` row an orphan the boot sweep should re-delete?
+///
+/// #3232: extracted from the sweep loop so the rule can be pinned directly.
+/// Two rows are exempt and neither is an instance: `topic_id == 1` is the
+/// forum's General topic, and [`FLEET_BINDING_SENTINEL`] pins the fleet
+/// binding across restarts. Everything else whose name is not a live
+/// `fleet.yaml` instance is an orphan — including a `__orphaned__:<name>`
+/// tombstone, which is exactly how a failed delete gets retried.
 pub(crate) fn is_sweepable_orphan(
-    _topic_id: i32,
-    _instance_name: &str,
-    _is_live_instance: bool,
+    topic_id: i32,
+    instance_name: &str,
+    is_live_instance: bool,
 ) -> bool {
-    false
+    topic_id != 1 && instance_name != FLEET_BINDING_SENTINEL && !is_live_instance
 }
 
 /// Initialize Telegram from fleet config.
@@ -114,11 +119,18 @@ pub fn init_from_config(
         .unwrap_or_default();
 
     // Clean up orphaned topics
+    //
+    // #3232: extracted so the selection rule is testable on the production
+    // predicate rather than on a copy of it. The `__orphaned__:` tombstone a
+    // failed delete leaves behind is deliberately NOT special-cased here — it is
+    // not a fleet.yaml instance name, so it falls into the ordinary orphan arm
+    // and the delete is retried on every boot, which is the whole point of
+    // retaining the row.
     let mut reg = load_topic_registry(home);
     let instance_names: std::collections::HashSet<&String> = config.instances.keys().collect();
     let mut orphan_count = 0;
     for (tid, inst_name) in reg.clone() {
-        if tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !instance_names.contains(&inst_name) {
+        if is_sweepable_orphan(tid, &inst_name, instance_names.contains(&inst_name)) {
             tracing::info!(topic_id = tid, instance = %inst_name, "orphaned topic, deleting");
             delete_topic(home, tid);
             orphan_count += 1;

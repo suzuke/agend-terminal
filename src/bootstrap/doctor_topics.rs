@@ -354,7 +354,7 @@ pub fn execute_cleanup(home: &Path, report: &TopicReport) -> Vec<CleanupAction> 
                 }
                 use crate::channel::telegram::topic_registry::{delete_topic, DeleteTopicOutcome};
                 match delete_topic(home, entry.topic_id) {
-                    DeleteTopicOutcome::Deleted => {
+                    DeleteTopicOutcome::Deleted | DeleteTopicOutcome::AlreadyGone => {
                         actions.push(CleanupAction::DeletedFromChatAndRegistry {
                             topic_id: entry.topic_id,
                             instance_name: entry.instance_name.clone(),
@@ -373,22 +373,22 @@ pub fn execute_cleanup(home: &Path, report: &TopicReport) -> Vec<CleanupAction> 
                             error: e,
                         });
                     }
-                    // RED: unreachable — main constructs neither variant. Routed to the
-                    // generic non-success arm so RED cannot accidentally treat either as a
-                    // successful deletion; GREEN gives them their real handling.
-                    DeleteTopicOutcome::AlreadyGone
-                    | DeleteTopicOutcome::RegistryPersistFailed(_) => {
-                        actions.push(CleanupAction::SkippedApiError {
-                            topic_id: entry.topic_id,
-                            instance_name: entry.instance_name.clone(),
-                            error: "unreachable in RED".to_string(),
-                        });
-                    }
                     DeleteTopicOutcome::ChannelUnavailable => {
                         actions.push(CleanupAction::SkippedApiError {
                             topic_id: entry.topic_id,
                             instance_name: entry.instance_name.clone(),
                             error: "channel unavailable".to_string(),
+                        });
+                    }
+                    // #3232: the topic is gone chat-side but topics.json still
+                    // carries the row, so this is NOT DeletedFromChatAndRegistry
+                    // — reporting it as a completed cleanup would tell an
+                    // operator the reusable mapping is gone when it is not.
+                    DeleteTopicOutcome::RegistryPersistFailed(e) => {
+                        actions.push(CleanupAction::SkippedApiError {
+                            topic_id: entry.topic_id,
+                            instance_name: entry.instance_name.clone(),
+                            error: format!("registry row persisted: {e}"),
                         });
                     }
                 }

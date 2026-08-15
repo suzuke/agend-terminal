@@ -171,29 +171,53 @@ pub(crate) fn full_delete_instance_with_runtime(
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
     }
     if let Some(tid) = topic_id {
-        // #2550 identity-confusion root cause: `delete_topic` only unregisters
-        // `topics.json` on its own `Deleted` outcome. A `PermissionDenied` /
-        // `ApiError` / `ChannelUnavailable` result left the mapping in place —
-        // our own bookkeeping said this instance still owned `tid` even though
-        // we'd already decided to tear it down. A LATER instance created under
-        // the same name then silently inherited that stale mapping via
-        // `create_topic_for_instance`'s reuse-if-found check, with no
-        // verification the topic still meant what the mapping claimed.
-        // Unregister unconditionally: our registry reflects our own intent
-        // (this instance is gone) regardless of whether the Telegram-side API
-        // call could complete. A Telegram-side topic left dangling after a
-        // failed delete becomes a genuine orphan (no daemon-side mapping to
-        // anything) for the existing orphan-sweep paths (`doctor_topics`,
-        // `bootstrap::init_from_config`) to reap later — not a landmine for
-        // the next same-name instance.
+        // #3232/#2550: remove the durable record only when the topic is known
+        // absent. On failure, preserve its id under a reserved orphan tombstone:
+        // doctor/bootstrap can retry it, while a later same-name instance cannot
+        // inherit the stale mapping.
         match telegram::delete_topic(home, tid) {
-            telegram::DeleteTopicOutcome::Deleted => {}
+            telegram::DeleteTopicOutcome::Deleted | telegram::DeleteTopicOutcome::AlreadyGone => {}
             other => {
-                let _ = telegram::unregister_topic(home, tid);
                 let detail = format!("telegram topic {tid} cleanup: {other:?}");
-                tracing::warn!(%name, topic_id = tid, %detail, "full_delete_instance: topic cleanup incomplete — registry unregistered anyway");
+                if let Err(error) = telegram::mark_topic_orphaned(home, tid, name) {
+                    step_errors.push(format!("telegram topic {tid} orphan tombstone: {error}"));
+                    // #3232 fail-safe: the tombstone is what makes the retained
+                    // row non-reusable. If it could not be written, the row is
+                    // still mapped to the LIVE name, which is precisely the
+                    // #2550 identity-confusion landmine — a later same-name
+                    // instance would inherit this topic through
+                    // `create_topic_for_instance`'s reuse-if-found check.
+                    //
+                    // Of the two remaining outcomes, an unrecoverable orphan (a
+                    // dangling chat-side topic with no record) is strictly less
+                    // harmful than misrouting a live instance's traffic into a
+                    // retired instance's topic, so we fall back to removing the
+                    // row. This is a second, SMALLER write of the same file —
+                    // dropping a key rather than adding a longer value — so it
+                    // can still land under the space/size failures that are the
+                    // plausible cause of the tombstone write failing.
+                    if let Err(removal) = telegram::unregister_topic(home, tid) {
+                        step_errors.push(format!(
+                            "telegram topic {tid} row removal also failed: {removal}"
+                        ));
+                    }
+                }
+                tracing::warn!(%name, topic_id = tid, %detail, "full_delete_instance: topic cleanup incomplete — durable orphan recovery retained");
                 step_errors.push(detail);
             }
+        }
+        // #3232 residual audit — topics.json is part of the truth this function
+        // reports, not an implementation detail beneath it. Every arm above,
+        // INCLUDING the `Deleted`/`AlreadyGone` success arm, is re-checked
+        // against the registry itself: `delete_topic` removes the row as a side
+        // effect, and a persistence failure there previously left this function
+        // returning success while the live-name mapping survived — the #2550
+        // reuse landmine, reached through the success path. Trust the observable
+        // state, not the reported outcome.
+        if telegram::lookup_topic_for_instance(home, name) == Some(tid) {
+            step_errors.push(format!(
+                "topics.json still maps '{name}' to topic {tid} — a later instance with this name would inherit it"
+            ));
         }
     } else {
         tracing::warn!(%name, "no topic_id found for full_delete_instance — possible orphan");

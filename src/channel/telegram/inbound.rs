@@ -250,7 +250,17 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             match instance_name {
                 Some(name) => {
                     tracing::info!(topic_id = tid, instance = %name, "topic closed, deleting instance");
-                    cleanup_deleted_topic(&home, &name, tid, Some(state));
+                    // #3232: there is no caller above to hand the outcome to on
+                    // this inbound path, so a residue is surfaced here rather
+                    // than discarded — an unremovable row still maps the live
+                    // name for the next same-name instance to inherit.
+                    if !cleanup_deleted_topic(&home, &name, tid, Some(state)) {
+                        tracing::error!(
+                            topic_id = tid,
+                            instance = %name,
+                            "topic-closed cleanup left the topics.json row in place"
+                        );
+                    }
                 }
                 None => tracing::warn!(topic_id = tid, "topic closed (no matching instance)"),
             }

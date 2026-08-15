@@ -12,14 +12,6 @@ use crate::channel::telegram::state::{block_on_value, lock_state, TelegramState}
 use crate::channel::telegram::topic_registry::{
     create_topic_for_instance, delete_topic, DeleteTopicOutcome,
 };
-
-/// RED DECLARATION LIFT (#3232): declared so the propagation contract can be expressed. The
-/// ANSWER is main's — main calls `delete_topic` and DISCARDS the outcome, so no failure is
-/// ever surfaced to a caller. GREEN maps each failing variant to an error.
-#[allow(dead_code)]
-fn delete_topic_outcome_to_result(_outcome: DeleteTopicOutcome) -> anyhow::Result<()> {
-    Ok(())
-}
 use parking_lot::Mutex;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -35,6 +27,27 @@ impl TelegramBindingPayload {
     pub(super) fn into_binding(self) -> crate::channel::BindingRef {
         let tag = format!("TG#{}", self.topic_id);
         crate::channel::BindingRef::new("telegram", Some(tag), self)
+    }
+}
+
+fn delete_topic_outcome_to_result(outcome: DeleteTopicOutcome) -> anyhow::Result<()> {
+    match outcome {
+        DeleteTopicOutcome::Deleted | DeleteTopicOutcome::AlreadyGone => Ok(()),
+        DeleteTopicOutcome::PermissionDenied => {
+            anyhow::bail!("telegram topic delete refused: bot lacks can_manage_topics")
+        }
+        DeleteTopicOutcome::ApiError(error) => {
+            anyhow::bail!("telegram topic delete failed: {error}")
+        }
+        DeleteTopicOutcome::ChannelUnavailable => {
+            anyhow::bail!("telegram topic delete failed: channel unavailable")
+        }
+        // #3232: chat side is settled but the durable row survived. Reporting
+        // Ok here would hand a caller a success while leaving the live-name
+        // mapping a later instance can inherit.
+        DeleteTopicOutcome::RegistryPersistFailed(error) => {
+            anyhow::bail!("telegram topic deleted but registry row persisted: {error}")
+        }
     }
 }
 
@@ -285,8 +298,7 @@ impl crate::channel::Channel for TelegramChannel {
             .downcast::<TelegramBindingPayload>()
             .ok_or_else(|| anyhow::anyhow!("non-telegram binding passed to remove_binding"))?;
         let home = lock_state(&self.state).home.clone();
-        delete_topic(&home, payload.topic_id);
-        Ok(())
+        delete_topic_outcome_to_result(delete_topic(&home, payload.topic_id))
     }
 
     fn has_binding(&self, instance: &str) -> bool {

@@ -25,6 +25,11 @@ pub(crate) fn is_topic_deleted_error(err: &anyhow::Error) -> bool {
 /// maps stale until the next state-aware send or process restart — acceptable
 /// because the MCP `delete_instance` handler's disk mutation (fleet.yaml
 /// removal + `cleanup_working_dir`) is the source of truth.
+/// Returns whether the durable `topics.json` row is PROVABLY gone. #3232: the
+/// in-memory teardown below always runs, but the caller must not report a
+/// completed self-heal when the row survived — that row still maps the live
+/// instance name, so the next same-name instance inherits the dead topic.
+#[must_use]
 pub(crate) fn cleanup_deleted_topic(
     home: &Path,
     instance_name: &str,
@@ -47,13 +52,18 @@ pub(crate) fn cleanup_deleted_topic(
     // Strip the stale topic-id entry from the local registry. Safe to call
     // even if the topic was already unregistered (HashMap::remove is a no-op
     // on missing keys).
-    //
-    // RED SIGNATURE LIFT (#3232): the bool exists so the contracts can be expressed. The
-    // ANSWER is main's — main returns nothing and every caller treats the cleanup as
-    // handled unconditionally, so RED says `true` whether or not the row actually went.
-    // The discarded `unregister_topic` result is main's swallow, kept verbatim.
-    let _ = unregister_topic(home, tid);
-    true
+    match unregister_topic(home, tid) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                instance = %instance_name,
+                topic_id = tid,
+                error = %e,
+                "stale topic row could not be removed — a later same-name instance could inherit it"
+            );
+            false
+        }
+    }
 }
 
 /// Cleanup path for a deleted `fleet_binding` topic. Unlike
@@ -65,19 +75,32 @@ pub(crate) fn cleanup_deleted_topic(
 /// Only clears `fleet_binding_topic_id` when it still points at `tid`
 /// (defensive — avoids clobbering a fresh binding if a stale error
 /// somehow arrives after re-resolution).
+/// Returns whether the durable `__fleet__` row is PROVABLY gone. The in-memory
+/// binding is cleared either way — this process must stop writing to a dead
+/// thread — but a surviving row is reused on the next daemon restart, so the
+/// caller may not call that a completed self-heal (#3232).
+#[must_use]
 pub(crate) fn cleanup_fleet_binding(
     home: &Path,
     state: &Arc<Mutex<TelegramState>>,
     tid: i32,
 ) -> bool {
-    // RED SIGNATURE LIFT (#3232): same shape and same answer as `cleanup_deleted_topic` —
-    // main returns nothing and the caller always treats the sentinel cleanup as handled.
-    let _ = unregister_topic(home, tid);
+    let cleared = match unregister_topic(home, tid) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                topic_id = tid,
+                error = %e,
+                "fleet-binding row could not be removed — the next restart would reuse the dead thread"
+            );
+            false
+        }
+    };
     let mut s = lock_state(state);
     if s.fleet_binding_topic_id == Some(tid) {
         s.fleet_binding_topic_id = None;
     }
-    true
+    cleared
 }
 
 /// Classify a fleet-binding send error and run [`cleanup_fleet_binding`]
@@ -104,8 +127,10 @@ pub(crate) fn handle_fleet_send_failure(
         topic_id = tid,
         "fleet send hit topic_deleted — clearing binding + unregistering sentinel"
     );
-    cleanup_fleet_binding(home, state, tid);
-    true
+    // #3232: "handled" means the self-heal COMPLETED. A surviving durable row
+    // leaves the stale `__fleet__` mapping for the next restart to reuse, so
+    // the outer send-failure log must not be silenced.
+    cleanup_fleet_binding(home, state, tid)
 }
 
 /// Classify a send error and run topic-delete cleanup if it matches.
@@ -129,8 +154,10 @@ pub(crate) fn handle_send_failure(
         topic_id = tid,
         "send hit topic_deleted — cleaning up"
     );
-    cleanup_deleted_topic(home, instance_name, tid, state);
-    true
+    // #3232: same rule as the fleet path — an unremovable row means cleanup did
+    // not complete, and reporting `handled` would hide exactly the residue that
+    // lets a later same-name instance inherit this topic.
+    cleanup_deleted_topic(home, instance_name, tid, state)
 }
 
 /// Classify a Telegram send error as "the bound chat was migrated to a
@@ -217,7 +244,12 @@ pub(crate) fn invalidate_and_recreate_topic(
         stale_topic_id = stale_tid,
         "invalidating stale topic and recreating"
     );
-    let _ = unregister_topic(home, stale_tid);
+    if let Err(e) = unregister_topic(home, stale_tid) {
+        // The reuse check below matches on NAME, so a surviving row would be
+        // handed straight back as "the existing topic" — refuse instead.
+        tracing::error!(stale_topic_id = stale_tid, error = %e, "stale topic row persisted; refusing to recreate");
+        return None;
+    }
     create_topic_for_instance(home, instance_name)
 }
 
