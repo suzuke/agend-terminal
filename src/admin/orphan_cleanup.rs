@@ -481,9 +481,13 @@ pub fn apply_with_barrier<
                 candidate.id.clone(),
                 CandidateOutcome::RefusedIdentityChanged,
             ));
-            // NOT fail-stop: nothing was mutated for this candidate, so the
-            // batch has not gone wrong — this one simply no longer exists as
-            // the thing that was confirmed.
+            // FAIL-STOP. Not because this candidate was mutated — it was not —
+            // but because every candidate in this batch was validated at the
+            // SAME preflight instant. Discovering that one pid was recycled
+            // means the picture of the remaining ones is stale too, and
+            // uncertainty about authority must stop the mutation widening
+            // rather than merely skip a row.
+            stop = true;
             continue;
         }
         match signaler.term(candidate.pid) {
@@ -520,6 +524,10 @@ pub fn apply_with_barrier<
                 candidate.id.clone(),
                 CandidateOutcome::RefusedIdentityChanged,
             ));
+            // Same rule as the pre-TERM re-read: the world moved under a batch
+            // that was validated all at once, so the rest of it is no longer
+            // trustworthy.
+            stop = true;
             continue;
         }
         match signaler.kill(candidate.pid) {
