@@ -216,6 +216,37 @@ mod tests {
         .expect("seed task");
     }
 
+    fn seed_claimed_branch_task(home: &Path, task_id: &str, assignee: &str, branch: &str) {
+        let emitter = InstanceName::from("test:seed");
+        let tid = TaskId(task_id.into());
+        crate::task_events::append_batch(
+            home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "branch task".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some(branch.into()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: tid,
+                    by: InstanceName::from(assignee),
+                },
+            ],
+        )
+        .expect("seed branch task");
+    }
+
     fn seed_done_task(home: &Path, task_id: &str, assignee: &str) {
         let emitter = InstanceName::from("test:seed");
         let tid = TaskId(task_id.into());
@@ -376,6 +407,67 @@ mod tests {
             crate::merge_receipt::find(&home, &receipt.repo, &receipt.merge_sha, &receipt.task_id)
                 .is_some(),
             "CI lifecycle must retain the underlying receipt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A typed review receipt reaches this entry only after assignment id, exact
+    /// task, reviewer identity, and reviewed head/evidence were validated. The
+    /// review task must therefore close even when its disposable worktree was
+    /// already released and the task names the PR subject branch rather than the
+    /// isolated review branch.
+    #[test]
+    fn validated_review_receipt_closes_after_review_binding_release() {
+        let home = tmp_home("validated_review_after_release");
+        let task_id = "t-validated-review-after-release";
+        seed_claimed_branch_task(&home, task_id, "reviewer", "feat/subject");
+
+        let closed = auto_close_on_validated_review(
+            &home,
+            task_id,
+            "reviewer",
+            "VERIFIED\n\n### Evidence\nran: cargo test → passed",
+        )
+        .unwrap();
+
+        assert!(
+            closed,
+            "an already-validated receipt is the exact review task's completion authority"
+        );
+        assert_eq!(
+            task_status(&home, task_id),
+            Some(crate::task_events::TaskStatus::Done)
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Ordinary reports remain on the strict completion path. When that guard
+    /// refuses, its existing actionable reason must not collapse to Ok(false).
+    #[test]
+    fn ordinary_report_preserves_completion_guard_reason() {
+        let home = tmp_home("ordinary_guard_reason");
+        let task_id = "t-ordinary-guard-reason";
+        seed_claimed_branch_task(&home, task_id, "dev-agent", "feat/unmerged");
+
+        let error = auto_close_on_report(
+            &home,
+            "report",
+            task_id,
+            "dev-agent",
+            "done",
+            true,
+        )
+        .expect_err("a branch task without binding or merge receipt must fail closed");
+
+        assert!(
+            error.to_string().contains(
+                "assignee completion requires an exact live binding or unconsumed merge receipt"
+            ),
+            "the caller must receive the completion guard's durable diagnostic: {error}"
+        );
+        assert_eq!(
+            task_status(&home, task_id),
+            Some(crate::task_events::TaskStatus::Claimed)
         );
         std::fs::remove_dir_all(&home).ok();
     }
