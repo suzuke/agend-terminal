@@ -113,6 +113,9 @@ fn bridge_verdict_to_review_task(
         return;
     };
     let summary = receipt.summary();
+    if summary.reviewer_name != reporter {
+        return;
+    }
     let task_id = &summary.task_id;
     let _ = crate::daemon::dispatch_idle::mark_resolved(home, task_id, reporter);
     if matches!(

@@ -2824,7 +2824,12 @@ fn sidecar_present(home: &std::path::Path, task_id: &str) -> bool {
         .any(|d| d.correlation_id.as_deref() == Some(task_id))
 }
 
-fn t127_verdict(verdict_text: &str, task_id: &str, corr: &str) -> crate::inbox::InboxMessage {
+fn t127_verdict(
+    verdict_text: &str,
+    task_id: &str,
+    corr: &str,
+    reviewer: &str,
+) -> crate::inbox::InboxMessage {
     let verdict = if verdict_text.starts_with("VERIFIED") {
         crate::review_receipt::ReviewVerdict::Verified
     } else if verdict_text.starts_with("REJECTED") {
@@ -2843,7 +2848,7 @@ fn t127_verdict(verdict_text: &str, task_id: &str, corr: &str) -> crate::inbox::
             evidence_digest: "a".repeat(64),
             assignment_id: uuid::Uuid::new_v4(),
             reviewer_instance_id: crate::types::InstanceId::new(),
-            reviewer_name: "reviewer".into(),
+            reviewer_name: reviewer.into(),
             repo: "owner/repo".into(),
             pr_number: 1,
             branch: "feat/x".into(),
@@ -2883,7 +2888,7 @@ fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED looks good", "t-rev-1", "t-rev-1"),
+        &t127_verdict("VERIFIED looks good", "t-rev-1", "t-rev-1", reviewer),
     );
 
     assert_eq!(
@@ -2894,6 +2899,37 @@ fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
     assert!(
         !sidecar_present(&home, "t-rev-1"),
         "the dispatch sidecar must be cleared"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn validated_review_bridge_rejects_reporter_identity_mismatch() {
+    let home = tmp_home("validated-review-reporter-mismatch");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    seed_review_task(&home, "t-reviewer-mismatch", "reviewer-a");
+    record_review_dispatch(&home, "lead", "reviewer-a", "t-reviewer-mismatch");
+
+    bridge_verdict_to_review_task(
+        &home,
+        "reviewer-b",
+        &t127_verdict(
+            "VERIFIED spoofed reporter",
+            "t-reviewer-mismatch",
+            "t-reviewer-mismatch",
+            "reviewer-a",
+        ),
+    );
+
+    assert_eq!(
+        task_status_of(&home, "t-reviewer-mismatch"),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "a reporter other than the validated reviewer must not close the task"
+    );
+    assert!(
+        sidecar_present(&home, "t-reviewer-mismatch"),
+        "a reporter identity mismatch must not resolve the validated review dispatch"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -2912,7 +2948,12 @@ fn verdict_dual2_repobranch_verified_bridges_via_reverse_lookup_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED diff clean", "t-rev-2", "owner/repo@feat/x"),
+        &t127_verdict(
+            "VERIFIED diff clean",
+            "t-rev-2",
+            "owner/repo@feat/x",
+            reviewer,
+        ),
     );
 
     assert_eq!(
@@ -2941,7 +2982,12 @@ fn verdict_rejected_clears_sidecar_but_keeps_task_open_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("REJECTED found a bug", "t-rev-3", "owner/repo@feat/x"),
+        &t127_verdict(
+            "REJECTED found a bug",
+            "t-rev-3",
+            "owner/repo@feat/x",
+            reviewer,
+        ),
     );
 
     assert!(
@@ -3084,7 +3130,12 @@ fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_diffe
             }),
         )
         .unwrap();
-        let msg = t127_verdict(verdict, "t-disposable-review", "owner/repo@feat/subject");
+        let msg = t127_verdict(
+            verdict,
+            "t-disposable-review",
+            "owner/repo@feat/subject",
+            "reviewer",
+        );
         let params = json!({
             "from": "reviewer",
             "target": "lead",
@@ -3143,6 +3194,7 @@ fn validated_review_receipt_closes_task_when_binding_repair_refuses() {
             "VERIFIED exact receipt remains authoritative",
             "t-current-review",
             "owner/repo@feat/subject",
+            "reviewer",
         ),
     );
 

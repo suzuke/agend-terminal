@@ -3346,11 +3346,27 @@ fn terminal_report_assignee_completion_provenance_controls_s1() {
     );
     std::fs::remove_dir_all(&home).ok();
 
-    for (name, mode) in [
-        ("s1-review-mismatch", "review-mismatch"),
-        ("s1-review-malformed", "review-malformed"),
-        ("s1-review-dirty", "review-dirty"),
-        ("s1-review-unpushed", "review-unpushed"),
+    for (name, mode, expected_reason) in [
+        (
+            "s1-review-mismatch",
+            "review-mismatch",
+            "assignee feature branch is ahead of the remote default",
+        ),
+        (
+            "s1-review-malformed",
+            "review-malformed",
+            "assignee feature branch is ahead of the remote default",
+        ),
+        (
+            "s1-review-dirty",
+            "review-dirty",
+            "assignee worktree has dirty or unpushed work",
+        ),
+        (
+            "s1-review-unpushed",
+            "review-unpushed",
+            "assignee worktree has dirty or unpushed work",
+        ),
     ] {
         let (home, id, _repo, _branch) = s1_fixture(name, mode);
         let error = crate::tasks::auto_close::auto_close_on_report(
@@ -3363,8 +3379,8 @@ fn terminal_report_assignee_completion_provenance_controls_s1() {
         )
         .expect_err("unsafe review provenance must preserve its guard reason");
         assert!(
-            !error.to_string().is_empty(),
-            "unsafe review provenance returned an empty reason for {mode}"
+            error.to_string().contains(expected_reason),
+            "unexpected completion guard reason for {mode}: {error}"
         );
         assert_eq!(
             read_task_record(&home, &id).expect("task").status,
