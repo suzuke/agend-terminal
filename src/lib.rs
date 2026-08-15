@@ -33,7 +33,13 @@ pub mod daemon {
 #[path = "admin/orphan_provenance.rs"]
 pub mod orphan_provenance_impl;
 
+/// #3273 V2: the manual cleanup executor, re-exported on the same terms as V1
+/// so the contract tests exercise the identical code the doctor surface runs.
+#[path = "admin/orphan_cleanup.rs"]
+pub mod orphan_cleanup_impl;
+
 pub mod admin {
+    pub use super::orphan_cleanup_impl as orphan_cleanup;
     pub use super::orphan_provenance_impl as orphan_provenance;
 }
 

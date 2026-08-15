@@ -7,6 +7,11 @@ pub mod cleanup_zombies;
 // library re-export by `tests/orphan_provenance_failclosed.rs`.
 #[allow(dead_code)]
 pub mod orphan_provenance;
+// #3273 V2 manual cleanup. Same dead-code rationale as V1: the binary uses the
+// doctor-facing subset while the full seam surface is exercised through the
+// library re-export by `tests/orphan_cleanup_manual_authority.rs`.
+#[allow(dead_code)]
+pub mod orphan_cleanup;
 
 use std::path::Path;
 
