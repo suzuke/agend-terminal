@@ -326,11 +326,11 @@ pub fn apply_with_barrier<
     audit_reason: &str,
     token: &str,
     confirm_ids: &[String],
-    _oracle: &O,
-    _signaler: &S,
+    oracle: &O,
+    signaler: &S,
     clock: &C,
-    _audit: &A,
-    _waiter: &W,
+    audit: &A,
+    waiter: &W,
     support: Support,
     barrier: &B,
 ) -> ApplyOutcome {
@@ -406,6 +406,28 @@ pub fn apply_with_barrier<
         return ApplyOutcome::Refused(RefusalReason::ConfirmIdsNotExact);
     }
 
+    // FULL-BATCH preflight, before the token is spent and before anything is
+    // written or signalled. Checking each candidate as we reach it would leave
+    // candidate 1 already dead when candidate 2 turns out to be stale — a
+    // partial mutation the all-or-nothing confirmation exists to prevent. The
+    // operator authorised a set, not a prefix of it.
+    let Some(self_uid) = oracle.self_uid() else {
+        // Without our own uid a foreign-uid target cannot be ruled out, and
+        // "probably mine" is not authority.
+        return ApplyOutcome::Refused(RefusalReason::MissingSelfUid);
+    };
+    for candidate in &stored.candidates {
+        let Some(live) = oracle.identity(candidate.pid) else {
+            return ApplyOutcome::Refused(RefusalReason::StaleBatch);
+        };
+        if live.start_token != candidate.start_token || live.uid != candidate.uid {
+            return ApplyOutcome::Refused(RefusalReason::StaleBatch);
+        }
+        if live.uid != self_uid {
+            return ApplyOutcome::Refused(RefusalReason::ForeignUid);
+        }
+    }
+
     // The exact point a non-CAS implementation would interleave. Production
     // passes NoBarrier, so this is a no-op outside the contracts.
     barrier.before_consume();
@@ -418,10 +440,120 @@ pub fn apply_with_barrier<
     if persist_confirmation(&path, &consumed).is_err() {
         return ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable);
     }
+    // The confirmation is spent and no longer readable as authority by anyone
+    // else, so the lock has done its job. Holding it across the signal path
+    // would serialise unrelated confirmations behind a grace window.
+    drop(_guard);
 
-    // Authority is fully established here. The executor stage lands next; until
-    // then this refuses rather than pretending to have acted.
-    ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable)
+    let mut results: Vec<(String, CandidateOutcome)> = Vec::new();
+    // Fail-stop: once the mutation path has failed in a way we cannot explain,
+    // later candidates are not attempted. Continuing would widen a blast radius
+    // nobody authorised on the strength of an operation that already went wrong.
+    let mut stop = false;
+    for candidate in &consumed.candidates {
+        if stop {
+            results.push((candidate.id.clone(), CandidateOutcome::NotAttempted));
+            continue;
+        }
+        // Durable record of intent FIRST. An action nobody can prove happened
+        // must not happen, so a failure here refuses the signal outright.
+        let record = PreSignalAudit {
+            token: token.to_string(),
+            actor: actor.to_string(),
+            audit_reason: audit_reason.to_string(),
+            candidate_id: candidate.id.clone(),
+            pid: candidate.pid,
+            start_token: candidate.start_token,
+            uid: candidate.uid,
+            at_ms: clock.now_ms(),
+        };
+        if audit.record_pre_signal(&record).is_err() {
+            results.push((candidate.id.clone(), CandidateOutcome::RefusedAuditFailed));
+            stop = true;
+            continue;
+        }
+        // Preflight is not authority at signal time. A pid can be recycled in
+        // the moment between the two, and this re-read is the only thing
+        // standing between that and signalling a stranger. `None` counts as
+        // changed: unknown is never "unchanged".
+        if !identity_matches(oracle, candidate) {
+            results.push((
+                candidate.id.clone(),
+                CandidateOutcome::RefusedIdentityChanged,
+            ));
+            // NOT fail-stop: nothing was mutated for this candidate, so the
+            // batch has not gone wrong — this one simply no longer exists as
+            // the thing that was confirmed.
+            continue;
+        }
+        match signaler.term(candidate.pid) {
+            SignalOutcome::Delivered => {}
+            // ESRCH: it exited between the re-read and the signal. That is the
+            // outcome we wanted, reached without us.
+            SignalOutcome::NoSuchProcess => {
+                results.push((candidate.id.clone(), CandidateOutcome::Terminated));
+                continue;
+            }
+            SignalOutcome::PermissionDenied => {
+                results.push((
+                    candidate.id.clone(),
+                    CandidateOutcome::SignalFailed("permission denied".to_string()),
+                ));
+                stop = true;
+                continue;
+            }
+            SignalOutcome::Failed(error) => {
+                results.push((candidate.id.clone(), CandidateOutcome::SignalFailed(error)));
+                stop = true;
+                continue;
+            }
+        }
+        if waiter.wait_for_exit(candidate.pid, GRACE_MS) {
+            results.push((candidate.id.clone(), CandidateOutcome::Terminated));
+            continue;
+        }
+        // Still alive after the bounded wait. Re-read AGAIN: the process that
+        // ignored TERM and the process alive now are not proven to be the same
+        // one, and a KILL cannot be taken back.
+        if !identity_matches(oracle, candidate) {
+            results.push((
+                candidate.id.clone(),
+                CandidateOutcome::RefusedIdentityChanged,
+            ));
+            continue;
+        }
+        match signaler.kill(candidate.pid) {
+            SignalOutcome::Delivered => {
+                results.push((candidate.id.clone(), CandidateOutcome::Killed));
+            }
+            SignalOutcome::NoSuchProcess => {
+                // It went during the re-read window; report what is true rather
+                // than claiming a kill that did nothing.
+                results.push((candidate.id.clone(), CandidateOutcome::Terminated));
+            }
+            SignalOutcome::PermissionDenied => {
+                results.push((
+                    candidate.id.clone(),
+                    CandidateOutcome::SignalFailed("permission denied".to_string()),
+                ));
+                stop = true;
+            }
+            SignalOutcome::Failed(error) => {
+                results.push((candidate.id.clone(), CandidateOutcome::SignalFailed(error)));
+                stop = true;
+            }
+        }
+    }
+    ApplyOutcome::Applied(results)
+}
+
+/// Does the live process at this pid still have the exact identity the operator
+/// confirmed? `None` — unreadable, gone, or unknowable — is a mismatch, never a
+/// pass.
+fn identity_matches<O: IdentityOracle>(oracle: &O, candidate: &CandidateSnapshot) -> bool {
+    oracle
+        .identity(candidate.pid)
+        .is_some_and(|live| live.start_token == candidate.start_token && live.uid == candidate.uid)
 }
 
 /// A confirmation token and its sidecar ARE authority material: anything that
@@ -565,7 +697,10 @@ pub fn preview<O: IdentityOracle, C: Clock>(
 fn persist_confirmation(path: &Path, confirmation: &Confirmation) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "confirmation path has no parent")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "confirmation path has no parent",
+        )
     })?;
     std::fs::create_dir_all(parent)?;
     harden_private(parent, 0o700)?;

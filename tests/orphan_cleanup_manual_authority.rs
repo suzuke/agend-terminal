@@ -17,8 +17,8 @@
 
 use agend_terminal::admin::orphan_cleanup::{
     apply, apply_with_barrier, candidate_id, confirmation_path, preview, ApplyOutcome,
-    CandidateOutcome, Clock, Confirmation, ConsumeBarrier, IdentityOracle, PreSignalAudit,
-    ExitWaiter, PreviewError, ProcIdentity, RefusalReason, SignalOutcome, Signaler, Support,
+    CandidateOutcome, Clock, Confirmation, ConsumeBarrier, ExitWaiter, IdentityOracle,
+    PreSignalAudit, PreviewError, ProcIdentity, RefusalReason, SignalOutcome, Signaler, Support,
     GRACE_MS,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -154,7 +154,8 @@ fn preview_emits_immutable_ids_and_signals_nothing_3273() {
         &clock,
         7,
         Support::Supported,
-    ).expect("preview must be issuable");
+    )
+    .expect("preview must be issuable");
 
     assert_eq!(
         signaler.total(),
@@ -190,7 +191,8 @@ fn preview_emits_immutable_ids_and_signals_nothing_3273() {
         &clock,
         7,
         Support::Supported,
-    ).expect("preview must be issuable");
+    )
+    .expect("preview must be issuable");
     let ids: Vec<_> = snapshot.candidates.iter().map(|c| &c.id).collect();
     let ids_again: Vec<_> = again.candidates.iter().map(|c| &c.id).collect();
     assert_eq!(ids, ids_again, "candidate ids must be reproducible");
@@ -206,14 +208,19 @@ fn preview_emits_immutable_ids_and_signals_nothing_3273() {
         &clock,
         8,
         Support::Supported,
-    ).expect("preview must be issuable");
+    )
+    .expect("preview must be issuable");
     let ids_next: Vec<_> = next_generation.candidates.iter().map(|c| &c.id).collect();
     assert_ne!(
         ids, ids_next,
         "a new snapshot generation must invalidate the previous ids"
     );
 
-    assert_eq!(signaler.total(), 0, "still zero signals after three previews");
+    assert_eq!(
+        signaler.total(),
+        0,
+        "still zero signals after three previews"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -237,7 +244,8 @@ fn preview_drops_unidentifiable_pids_3273() {
         &clock,
         1,
         Support::Supported,
-    ).expect("preview must be issuable");
+    )
+    .expect("preview must be issuable");
 
     assert_eq!(signaler.total(), 0);
     assert_eq!(
@@ -286,14 +294,30 @@ const ACTOR: &str = "operator";
 const REASON: &str = "two tool shells stuck after a crashed run";
 
 /// Preview two live candidates and hand back (home, snapshot).
-fn previewed(tag: &str, now_ms: i64) -> (std::path::PathBuf, FakeOracle, CountingSignaler,
-    agend_terminal::admin::orphan_cleanup::Preview) {
+fn previewed(
+    tag: &str,
+    now_ms: i64,
+) -> (
+    std::path::PathBuf,
+    FakeOracle,
+    CountingSignaler,
+    agend_terminal::admin::orphan_cleanup::Preview,
+) {
     let home = tmp_home(tag);
     let oracle = FakeOracle::new(&[(4242, 111_000, 501), (4343, 222_000, 501)], Some(501));
     let signaler = CountingSignaler::default();
     let clock = FixedClock(now_ms);
-    let snapshot = preview(&home, ACTOR, REASON, &[4242, 4343], &oracle, &clock, 3, Support::Supported)
-        .expect("preview must be issuable");
+    let snapshot = preview(
+        &home,
+        ACTOR,
+        REASON,
+        &[4242, 4343],
+        &oracle,
+        &clock,
+        3,
+        Support::Supported,
+    )
+    .expect("preview must be issuable");
     (home, oracle, signaler, snapshot)
 }
 
@@ -323,10 +347,24 @@ fn preview_persists_a_durable_unconsumed_confirmation_3273() {
     assert_eq!(stored.actor, ACTOR);
     assert_eq!(stored.audit_reason, REASON);
     assert_eq!(stored.generation, 3);
-    assert!(!stored.nonce.is_empty(), "the snapshot nonce must be stored, not only hashed into ids");
+    assert!(
+        !stored.nonce.is_empty(),
+        "the snapshot nonce must be stored, not only hashed into ids"
+    );
     assert!(!stored.consumed, "a fresh confirmation must be unconsumed");
-    assert_eq!(ids_of(&snapshot), stored.candidates.iter().map(|c| c.id.clone()).collect::<Vec<_>>());
-    assert_eq!(signaler.total(), 0, "persisting a confirmation must not signal");
+    assert_eq!(
+        ids_of(&snapshot),
+        stored
+            .candidates
+            .iter()
+            .map(|c| c.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        signaler.total(),
+        0,
+        "persisting a confirmation must not signal"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -344,7 +382,19 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     // --- no token at all -------------------------------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-missing-token", 1_700_000_000_000);
     let clock = FixedClock(1_700_000_000_000);
-    let outcome = apply(&home, ACTOR, REASON, "", &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        "",
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::MissingToken));
     assert_eq!(signaler.total(), 0);
     assert_eq!(
@@ -358,8 +408,25 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     // Includes a traversal attempt: the shape check is what stops a token
     // being spent as a path component.
     let (home, oracle, signaler, snapshot) = previewed("refuse-malformed", 1_700_000_000_000);
-    for bad in ["../../etc/passwd", "not-a-token", &"f".repeat(35), &"g".repeat(36)] {
-        let outcome = apply(&home, ACTOR, REASON, bad, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
+    for bad in [
+        "../../etc/passwd",
+        "not-a-token",
+        &"f".repeat(35),
+        &"g".repeat(36),
+    ] {
+        let outcome = apply(
+            &home,
+            ACTOR,
+            REASON,
+            bad,
+            &ids_of(&snapshot),
+            &oracle,
+            &signaler,
+            &clock,
+            &audit,
+            &NeverWaits::default(),
+            Support::Supported,
+        );
         assert_eq!(
             outcome,
             ApplyOutcome::Refused(RefusalReason::MalformedToken),
@@ -372,8 +439,23 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     // --- well-formed token with no sidecar behind it ----------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-no-sidecar", 1_700_000_000_000);
     let orphan_token = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    let outcome = apply(&home, ACTOR, REASON, orphan_token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
-    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable));
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        orphan_token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable)
+    );
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
@@ -381,29 +463,86 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     let (home, oracle, signaler, snapshot) = previewed("refuse-corrupt", 1_700_000_000_000);
     let path = confirmation_path(&home, &snapshot.token).unwrap();
     std::fs::write(&path, b"{ this is not json").unwrap();
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
-    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable));
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable)
+    );
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     // --- empty audit reason ----------------------------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-empty-reason", 1_700_000_000_000);
-    let outcome = apply(&home, ACTOR, "", &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
-    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::EmptyAuditReason));
+    let outcome = apply(
+        &home,
+        ACTOR,
+        "",
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::EmptyAuditReason)
+    );
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     // --- actor does not match the confirmation ----------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-actor", 1_700_000_000_000);
-    let outcome = apply(&home, "someone-else", REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
+    let outcome = apply(
+        &home,
+        "someone-else",
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ActorMismatch));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     // --- reason does not match the confirmation ---------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-reason", 1_700_000_000_000);
-    let outcome = apply(&home, ACTOR, "a different justification", &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
-    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::AuditReasonMismatch));
+    let outcome = apply(
+        &home,
+        ACTOR,
+        "a different justification",
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::AuditReasonMismatch)
+    );
     assert_eq!(signaler.total(), 0);
     assert_eq!(
         audit.writes(),
@@ -424,14 +563,38 @@ fn apply_outside_the_ttl_window_refuses_3273() {
 
     let (home, oracle, signaler, snapshot) = previewed("refuse-expired", created);
     let expired = FixedClock(created + agend_terminal::admin::orphan_cleanup::CONFIRM_TTL_MS + 1);
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &expired, &audit, &NeverWaits::default(), Support::Supported);
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &expired,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::Expired));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     let (home, oracle, signaler, snapshot) = previewed("refuse-backwards", created);
     let backwards = FixedClock(created - 1);
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &backwards, &audit, &NeverWaits::default(), Support::Supported);
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &backwards,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
     assert_eq!(
         outcome,
         ApplyOutcome::Refused(RefusalReason::Expired),
@@ -450,7 +613,11 @@ fn apply_with_non_exact_confirm_ids_refuses_3273() {
     let clock = FixedClock(1_700_000_000_000);
     let (home, oracle, signaler, snapshot) = previewed("refuse-ids", 1_700_000_000_000);
     let ids = ids_of(&snapshot);
-    assert_eq!(ids.len(), 2, "premise: the snapshot must offer two candidates");
+    assert_eq!(
+        ids.len(),
+        2,
+        "premise: the snapshot must offer two candidates"
+    );
 
     let subset = vec![ids[0].clone()];
     let superset = {
@@ -472,7 +639,19 @@ fn apply_with_non_exact_confirm_ids_refuses_3273() {
         ("empty", empty),
         ("duplicated id", duplicated),
     ] {
-        let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &set, &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
+        let outcome = apply(
+            &home,
+            ACTOR,
+            REASON,
+            &snapshot.token,
+            &set,
+            &oracle,
+            &signaler,
+            &clock,
+            &audit,
+            &NeverWaits::default(),
+            Support::Supported,
+        );
         assert_eq!(
             outcome,
             ApplyOutcome::Refused(RefusalReason::ConfirmIdsNotExact),
@@ -498,7 +677,19 @@ fn apply_with_a_consumed_confirmation_refuses_3273() {
     stored.consumed = true;
     std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
 
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::Replayed));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
@@ -514,7 +705,16 @@ fn apply_on_an_unsupported_platform_refuses_3273() {
     let (home, oracle, signaler, snapshot) = previewed("refuse-unsupported", 1_700_000_000_000);
 
     let outcome = apply(
-        &home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(),
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
         Support::Unsupported("no identity oracle on this platform".to_string()),
     );
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::Unsupported));
@@ -539,10 +739,29 @@ fn apply_with_an_unknown_sidecar_schema_refuses_3273() {
     stored.schema_version = 2;
     std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
 
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
-    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::SchemaMismatch));
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::SchemaMismatch)
+    );
     assert_eq!(signaler.total(), 0);
-    assert_eq!(audit.writes(), 0, "an unreadable confirmation must not produce a pre-signal audit");
+    assert_eq!(
+        audit.writes(),
+        0,
+        "an unreadable confirmation must not produce a pre-signal audit"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -561,7 +780,16 @@ fn preview_that_cannot_persist_issues_no_token_3273() {
     let signaler = CountingSignaler::default();
     let clock = FixedClock(1_700_000_000_000);
 
-    let issued = preview(&home, ACTOR, REASON, &[4242], &oracle, &clock, 1, Support::Supported);
+    let issued = preview(
+        &home,
+        ACTOR,
+        REASON,
+        &[4242],
+        &oracle,
+        &clock,
+        1,
+        Support::Supported,
+    );
 
     match issued {
         Err(PreviewError::PersistFailed(_)) => {}
@@ -632,26 +860,31 @@ fn concurrent_applies_consume_a_confirmation_exactly_once_3273() {
             let audit = RecordingAudit::default();
             let clock = FixedClock(1_700_000_000_000);
             let outcome = apply_with_barrier(
-                &home, ACTOR, REASON, &token, &ids, &oracle, &signaler, &clock, &audit, &NeverWaits::default(),
-                Support::Supported, &*barrier,
+                &home,
+                ACTOR,
+                REASON,
+                &token,
+                &ids,
+                &oracle,
+                &signaler,
+                &clock,
+                &audit,
+                &NeverWaits::default(),
+                Support::Supported,
+                &*barrier,
             );
             (outcome, signaler.total())
         }));
     }
 
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    // A "winner" is an apply that got past every gate to the executor stage —
+    // A "winner" is an apply that consumed the confirmation and went on to act —
     // not merely one that avoided the replay refusal. The distinction matters:
     // an unserialised implementation can also produce a TORN READ, and counting
     // that as a loser would let the race pass for the wrong reason.
     let winners = results
         .iter()
-        .filter(|(outcome, _)| {
-            matches!(
-                outcome,
-                ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable)
-            )
-        })
+        .filter(|(outcome, _)| matches!(outcome, ApplyOutcome::Applied(_)))
         .count();
     assert_eq!(
         winners, 1,
@@ -673,8 +906,19 @@ fn concurrent_applies_consume_a_confirmation_exactly_once_3273() {
         clean_losers, 1,
         "the loser must refuse as already-spent, not stumble over a half-written file: {results:?}"
     );
-    for (_, signals) in &results {
-        assert_eq!(*signals, 0, "no signal may be emitted in this slice");
+    // The loser must have signalled nothing at all: losing the CAS has to mean
+    // losing the authority to act, not merely losing the right to say so.
+    for (outcome, signals) in &results {
+        match outcome {
+            ApplyOutcome::Applied(_) => assert_eq!(
+                *signals, 2,
+                "the winner acts on exactly the confirmed set, once each"
+            ),
+            _ => assert_eq!(
+                *signals, 0,
+                "the loser must not signal anything: {outcome:?}"
+            ),
+        }
     }
 
     // And the durable record must agree with the outcome: consumed, once.
@@ -704,19 +948,45 @@ fn confirmation_material_is_private_to_the_owner_3273() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(dir_mode, 0o700, "confirmation dir must be owner-only, got {dir_mode:o}");
+    assert_eq!(
+        dir_mode, 0o700,
+        "confirmation dir must be owner-only, got {dir_mode:o}"
+    );
 
     // The lock is created by apply, and names a confirmation by token, so it is
-    // held to the same standard.
+    // held to the same standard. This apply is deliberately made to refuse
+    // before the executor — an oracle with no self uid — so the contract stays
+    // about file modes and cannot start depending on signal behaviour.
     let audit = RecordingAudit::default();
     let clock = FixedClock(1_700_000_000_000);
-    let _ = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
+    let uidless = FakeOracle::new(&[(4242, 111_000, 501), (4343, 222_000, 501)], None);
+    let refusal = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &ids_of(&snapshot),
+        &uidless,
+        &signaler,
+        &clock,
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+    assert_eq!(
+        refusal,
+        ApplyOutcome::Refused(RefusalReason::MissingSelfUid)
+    );
+    let _ = &oracle;
     let lock_mode = std::fs::metadata(path.with_extension("lock"))
         .unwrap()
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(lock_mode, 0o600, "lock must be owner-only, got {lock_mode:o}");
+    assert_eq!(
+        lock_mode, 0o600,
+        "lock must be owner-only, got {lock_mode:o}"
+    );
 
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
@@ -851,8 +1121,17 @@ fn staged(tag: &str, script: &[(u32, Vec<Option<ProcIdentity>>)], self_uid: Opti
     let pids: Vec<u32> = script.iter().map(|(pid, _)| *pid).collect();
     let oracle = ScriptedOracle::new(script, self_uid);
     let clock = FixedClock(1_700_000_000_000);
-    let snapshot = preview(&home, ACTOR, REASON, &pids, &oracle, &clock, 5, Support::Supported)
-        .expect("preview must be issuable");
+    let snapshot = preview(
+        &home,
+        ACTOR,
+        REASON,
+        &pids,
+        &oracle,
+        &clock,
+        5,
+        Support::Supported,
+    )
+    .expect("preview must be issuable");
     Stage {
         home,
         oracle,
@@ -861,7 +1140,12 @@ fn staged(tag: &str, script: &[(u32, Vec<Option<ProcIdentity>>)], self_uid: Opti
     }
 }
 
-fn run(stage: &Stage, term_fails: Option<u32>, survives: &[u32], audit_fails: bool) -> ApplyOutcome {
+fn run(
+    stage: &Stage,
+    term_fails: Option<u32>,
+    survives: &[u32],
+    audit_fails: bool,
+) -> ApplyOutcome {
     let signaler = LoggingSignaler {
         log: stage.log.clone(),
         term_fails,
@@ -898,14 +1182,25 @@ fn run(stage: &Stage, term_fails: Option<u32>, survives: &[u32], audit_fails: bo
 fn apply_without_a_self_uid_refuses_3273() {
     let stage = staged("no-self-uid", &[(4242, vec![identity(111_000, 501)])], None);
     let outcome = run(&stage, None, &[], false);
-    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::MissingSelfUid));
-    assert!(stage.log.events().is_empty(), "nothing may happen without proven ownership: {:?}", stage.log.events());
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::MissingSelfUid)
+    );
+    assert!(
+        stage.log.events().is_empty(),
+        "nothing may happen without proven ownership: {:?}",
+        stage.log.events()
+    );
     std::fs::remove_dir_all(&stage.home).ok();
 }
 
 #[test]
 fn apply_to_a_foreign_uid_refuses_3273() {
-    let stage = staged("foreign-uid", &[(4242, vec![identity(111_000, 999)])], Some(501));
+    let stage = staged(
+        "foreign-uid",
+        &[(4242, vec![identity(111_000, 999)])],
+        Some(501),
+    );
     let outcome = run(&stage, None, &[], false);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ForeignUid));
     assert!(stage.log.events().is_empty());
@@ -1010,7 +1305,11 @@ fn unreadable_identity_before_term_signals_nothing_3273() {
 /// the ordering the consensus forbids.
 #[test]
 fn a_successful_term_audits_first_waits_bounded_and_never_kills_3273() {
-    let stage = staged("term-works", &[(4242, vec![identity(111_000, 501)])], Some(501));
+    let stage = staged(
+        "term-works",
+        &[(4242, vec![identity(111_000, 501)])],
+        Some(501),
+    );
     let outcome = run(&stage, None, &[], false);
 
     assert_eq!(
@@ -1117,7 +1416,11 @@ fn pid_reuse_during_the_grace_window_cancels_the_kill_3273() {
 /// nothing followed it.
 #[test]
 fn an_undurable_pre_signal_audit_blocks_the_signal_3273() {
-    let stage = staged("audit-fails", &[(4242, vec![identity(111_000, 501)])], Some(501));
+    let stage = staged(
+        "audit-fails",
+        &[(4242, vec![identity(111_000, 501)])],
+        Some(501),
+    );
     let outcome = run(&stage, None, &[], true);
 
     assert_eq!(
@@ -1152,7 +1455,11 @@ fn a_signal_failure_stops_the_batch_3273() {
 
     match outcome {
         ApplyOutcome::Applied(results) => {
-            assert_eq!(results.len(), 2, "every confirmed candidate must be accounted for");
+            assert_eq!(
+                results.len(),
+                2,
+                "every confirmed candidate must be accounted for"
+            );
             assert!(
                 matches!(results[0].1, CandidateOutcome::SignalFailed(_)),
                 "first candidate must report the refused signal: {results:?}"
