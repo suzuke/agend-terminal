@@ -654,3 +654,144 @@ fn the_live_reader_identifies_this_process_3273() {
         "pid 0 is never a real tracked process"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The CLI handler seam. clap parsing can go green while the command is a no-op
+// or wired to the wrong authority, so what the handler FORWARDS is pinned, not
+// just that the subcommand exists.
+// ---------------------------------------------------------------------------
+
+use agend_terminal::admin::orphan_cleanup::{
+    handle_apply_command, handle_preview_command, ApplyOutcome, ApplyRequest, OrphanCleanupService,
+    Preview, PreviewError, PreviewRequest, RefusalReason,
+};
+
+/// Records exactly what it was asked to do, so "forwarded once, unchanged" is a
+/// measurement rather than a reading of the handler's source.
+/// (actor, audit_reason, proposed_pids)
+type PreviewCall = (String, String, Vec<u32>);
+/// (token, actor, audit_reason, confirm_ids)
+type ApplyCall = (String, String, String, Vec<String>);
+
+#[derive(Default)]
+struct RecordingService {
+    previews: std::sync::Mutex<Vec<PreviewCall>>,
+    applies: std::sync::Mutex<Vec<ApplyCall>>,
+    apply_outcome: Option<ApplyOutcome>,
+}
+
+impl OrphanCleanupService for RecordingService {
+    fn preview(&self, request: PreviewRequest<'_>) -> Result<Preview, PreviewError> {
+        self.previews.lock().unwrap().push((
+            request.actor.to_string(),
+            request.audit_reason.to_string(),
+            request.proposed_pids.to_vec(),
+        ));
+        Err(PreviewError::PersistFailed("stub".into()))
+    }
+    fn apply(&self, request: ApplyRequest<'_>) -> ApplyOutcome {
+        self.applies.lock().unwrap().push((
+            request.token.to_string(),
+            request.actor.to_string(),
+            request.audit_reason.to_string(),
+            request.confirm_ids.to_vec(),
+        ));
+        self.apply_outcome
+            .clone()
+            .unwrap_or(ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable))
+    }
+}
+
+/// The preview command must forward the operator's actor, a non-empty reason
+/// and the exact proposed pid list — once. Forwarding a subset, or twice, or a
+/// list the operator did not give, would mean the printed snapshot describes
+/// something other than what was asked for.
+#[test]
+fn the_preview_handler_forwards_the_operators_request_once_3273() {
+    let service = RecordingService::default();
+    let _ = handle_preview_command(&service, "operator", "two stuck tool shells", &[4242, 4343]);
+
+    let calls = service.previews.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the service must be called exactly once: {calls:?}"
+    );
+    assert_eq!(
+        calls[0],
+        (
+            "operator".to_string(),
+            "two stuck tool shells".to_string(),
+            vec![4242, 4343]
+        ),
+        "actor, reason and the exact pid list must arrive unchanged"
+    );
+}
+
+/// The apply command must forward the token, actor, reason and the EXACT
+/// confirm-id set. A handler that dropped or reordered an id would be asking
+/// the executor to act on a set the operator never confirmed.
+#[test]
+fn the_apply_handler_forwards_the_exact_confirmed_set_once_3273() {
+    let service = RecordingService::default();
+    let ids = vec!["id-a".to_string(), "id-b".to_string()];
+    let _ = handle_apply_command(
+        &service,
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "operator",
+        "two stuck tool shells",
+        &ids,
+    );
+
+    let calls = service.applies.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the service must be called exactly once: {calls:?}"
+    );
+    assert_eq!(
+        calls[0],
+        (
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+            "operator".to_string(),
+            "two stuck tool shells".to_string(),
+            ids
+        ),
+        "token, actor, reason and the exact confirm-id set must arrive unchanged"
+    );
+}
+
+/// A refusal must reach the operator AS a refusal. Reporting success for a
+/// confirmation that was rejected is the worst available outcome: the operator
+/// believes the processes are gone and stops looking.
+#[test]
+fn the_apply_handler_propagates_a_refusal_3273() {
+    let service = RecordingService {
+        apply_outcome: Some(ApplyOutcome::Refused(RefusalReason::Expired)),
+        ..Default::default()
+    };
+    let result = handle_apply_command(
+        &service,
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "operator",
+        "cleanup",
+        &["id-a".to_string()],
+    );
+    match result {
+        Err(message) => assert!(
+            message.to_lowercase().contains("expired"),
+            "the refusal must name its cause to the operator, got {message:?}"
+        ),
+        Ok(rendered) => panic!("a refused apply must not be reported as success: {rendered:?}"),
+    }
+}
+
+/// A preview that could not be issued must not print a token-shaped success.
+#[test]
+fn the_preview_handler_propagates_a_failure_3273() {
+    let service = RecordingService::default(); // its preview always fails
+    match handle_preview_command(&service, "operator", "cleanup", &[4242]) {
+        Err(_) => {}
+        Ok(rendered) => panic!("a failed preview must not be reported as success: {rendered:?}"),
+    }
+}

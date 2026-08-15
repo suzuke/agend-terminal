@@ -787,6 +787,64 @@ impl RawIdentityReader for LiveIdentityReader {
     }
 }
 
+/// What the operator asked for, as one value. Grouped so a handler cannot
+/// forward three of four fields and still typecheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRequest<'a> {
+    pub actor: &'a str,
+    pub audit_reason: &'a str,
+    pub proposed_pids: &'a [u32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyRequest<'a> {
+    pub token: &'a str,
+    pub actor: &'a str,
+    pub audit_reason: &'a str,
+    pub confirm_ids: &'a [String],
+}
+
+/// The seam between the CLI and the executor. The CLI's only job is to turn
+/// operator input into one of these calls and render what comes back; all
+/// authority lives behind this trait, so `cli.rs` can never grow a second,
+/// weaker copy of the rules.
+pub trait OrphanCleanupService {
+    fn preview(&self, request: PreviewRequest<'_>) -> Result<Preview, PreviewError>;
+    fn apply(&self, request: ApplyRequest<'_>) -> ApplyOutcome;
+}
+
+/// The manual command handlers. They live here, beside the seam, rather than in
+/// `cli.rs`: the CLI's whole job is to parse operator input and print what comes
+/// back, and keeping the forwarding here is what stops a second, weaker copy of
+/// the authority rules growing next to the argument parser.
+///
+/// `run_doctor` is untouched and remains a report.
+pub fn handle_preview_command<S: OrphanCleanupService>(
+    service: &S,
+    actor: &str,
+    audit_reason: &str,
+    proposed_pids: &[u32],
+) -> Result<String, String> {
+    // RED STUB (#3273): forwards nothing. A clap-only contract would pass here
+    // while the command did precisely nothing, which is the gap this seam
+    // exists to close.
+    let _ = (service, actor, audit_reason, proposed_pids);
+    Ok(String::new())
+}
+
+pub fn handle_apply_command<S: OrphanCleanupService>(
+    service: &S,
+    token: &str,
+    actor: &str,
+    audit_reason: &str,
+    confirm_ids: &[String],
+) -> Result<String, String> {
+    // RED STUB (#3273): and critically it returns Ok, so a refusal would reach
+    // the operator as success.
+    let _ = (service, token, actor, audit_reason, confirm_ids);
+    Ok(String::new())
+}
+
 /// A confirmation token and its sidecar ARE authority material: anything that
 /// can read them can name the exact triple an operator confirmed, and anything
 /// that can write them can forge one. On Unix `File::create` honours the
