@@ -100,8 +100,16 @@ jobs:
       # truthful cleanup, attempt isolation, bounded diagnostics). Runs here
       # rather than in the coverage job so a semantics regression is caught in
       # seconds on every platform instead of after a 30-minute producer run.
+      # #3249: raised from 5. windows-latest sets this budget — the suite is
+      # dominated by full wrapper invocations and every one is a process spawn,
+      # the operation MSYS is slowest at. The step had already grown 3m57s →
+      # 4m18s → 4m51s over three main commits before #3249's contracts crossed
+      # 5m, so the headroom was nine seconds, not a cliff this PR built. 10
+      # gives the curve room without hiding it: if the step approaches this
+      # budget again, split the suite instead of raising the number a second
+      # time.
       - name: Coverage wrapper contract test
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: bash
         env:
           COVERAGE_REQUIRE_NATIVE_SYMLINKS: ${{ runner.os == 'Windows' && '1' || '0' }}
