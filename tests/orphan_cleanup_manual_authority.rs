@@ -17,7 +17,7 @@
 
 use agend_terminal::admin::orphan_cleanup::{
     apply, apply_with_barrier, candidate_id, confirmation_path, preview, ApplyOutcome,
-    CandidateOutcome, Clock, Confirmation, ConsumeBarrier, ExitWaiter, IdentityOracle,
+    CandidateOutcome, Clock, Confirmation, ConsumeBarrier, ExactPid, ExitWaiter, IdentityOracle,
     PreSignalAudit, PreviewError, ProcIdentity, RefusalReason, SignalOutcome, Signaler, Support,
     GRACE_MS,
 };
@@ -81,11 +81,11 @@ impl CountingSignaler {
 }
 
 impl Signaler for CountingSignaler {
-    fn term(&self, _pid: u32) -> SignalOutcome {
+    fn term(&self, _pid: ExactPid) -> SignalOutcome {
         self.terms.fetch_add(1, Ordering::SeqCst);
         SignalOutcome::Delivered
     }
-    fn kill(&self, _pid: u32) -> SignalOutcome {
+    fn kill(&self, _pid: ExactPid) -> SignalOutcome {
         self.kills.fetch_add(1, Ordering::SeqCst);
         SignalOutcome::Delivered
     }
@@ -99,7 +99,7 @@ struct NeverWaits {
 }
 
 impl ExitWaiter for NeverWaits {
-    fn wait_for_exit(&self, _pid: u32, _timeout_ms: u64) -> bool {
+    fn wait_for_exit(&self, _pid: ExactPid, _timeout_ms: u64) -> bool {
         self.waits.fetch_add(1, Ordering::SeqCst);
         true
     }
@@ -1073,22 +1073,24 @@ struct LoggingSignaler {
 }
 
 impl Signaler for LoggingSignaler {
-    fn term(&self, pid: u32) -> SignalOutcome {
-        self.log.push(format!("TERM:{pid}"));
-        if self.script.term_fails == Some(pid) {
+    fn term(&self, pid: ExactPid) -> SignalOutcome {
+        let raw = pid.get() as u32;
+        self.log.push(format!("TERM:{raw}"));
+        if self.script.term_fails == Some(raw) {
             return SignalOutcome::PermissionDenied;
         }
-        if self.script.term_gone.contains(&pid) {
+        if self.script.term_gone.contains(&raw) {
             return SignalOutcome::NoSuchProcess;
         }
         SignalOutcome::Delivered
     }
-    fn kill(&self, pid: u32) -> SignalOutcome {
-        self.log.push(format!("KILL:{pid}"));
-        if self.script.kill_fails == Some(pid) {
+    fn kill(&self, pid: ExactPid) -> SignalOutcome {
+        let raw = pid.get() as u32;
+        self.log.push(format!("KILL:{raw}"));
+        if self.script.kill_fails == Some(raw) {
             return SignalOutcome::PermissionDenied;
         }
-        if self.script.kill_gone.contains(&pid) {
+        if self.script.kill_gone.contains(&raw) {
             return SignalOutcome::NoSuchProcess;
         }
         SignalOutcome::Delivered
@@ -1120,9 +1122,10 @@ struct LoggingWaiter {
 }
 
 impl ExitWaiter for LoggingWaiter {
-    fn wait_for_exit(&self, pid: u32, timeout_ms: u64) -> bool {
-        self.log.push(format!("wait:{pid}:{timeout_ms}"));
-        !self.survives.contains(&pid)
+    fn wait_for_exit(&self, pid: ExactPid, timeout_ms: u64) -> bool {
+        let raw = pid.get() as u32;
+        self.log.push(format!("wait:{raw}:{timeout_ms}"));
+        !self.survives.contains(&raw)
     }
 }
 
@@ -1747,4 +1750,46 @@ fn a_refused_kill_stops_the_batch_3273() {
         "the second candidate must leave no trace"
     );
     std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// A sidecar naming a pid that cannot be an exact, individually signallable
+/// target must produce ZERO syscalls. `0` would signal the caller's whole
+/// process group and anything above `i32::MAX` wraps negative into a group
+/// signal, so neither may reach the signaller — and since a snapshot this build
+/// produced could not contain one, its presence means the confirmation is not
+/// ours to act on at all.
+#[test]
+fn a_sidecar_naming_an_unsignallable_pid_signals_nothing_3273() {
+    for bad_pid in [0u32, u32::MAX, i32::MAX as u32 + 1] {
+        let stage = staged(
+            "unsafe-pid",
+            &[
+                (bad_pid, vec![identity(111_000, 501)]),
+                (4343, vec![identity(222_000, 501)]),
+            ],
+            Some(501),
+        );
+        let outcome = run(&stage, None, &[], false);
+        match outcome {
+            ApplyOutcome::Applied(results) => {
+                assert_eq!(
+                    results[0].1,
+                    CandidateOutcome::RefusedUnsafePid,
+                    "pid {bad_pid} must be refused as unsignallable: {results:?}"
+                );
+                assert_eq!(
+                    results[1].1,
+                    CandidateOutcome::NotAttempted,
+                    "and the batch must stop: a snapshot this build produced could not name it"
+                );
+            }
+            other => panic!("expected per-candidate results for pid {bad_pid}, got {other:?}"),
+        }
+        assert!(
+            stage.log.signals().is_empty(),
+            "pid {bad_pid} must never reach a syscall: {:?}",
+            stage.log.events()
+        );
+        std::fs::remove_dir_all(&stage.home).ok();
+    }
 }

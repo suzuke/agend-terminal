@@ -313,7 +313,7 @@ fn the_bounded_waiter_never_outstays_its_bound_3273() {
         sleeper: RecordingSleeper::default(),
         poll_ms: 50,
     };
-    let exited = waiter.wait_for_exit(4242, 200);
+    let exited = waiter.wait_for_exit(ExactPid::new(4242).unwrap(), 200);
     assert!(
         !exited,
         "a process that never exits must be reported as surviving"
@@ -341,7 +341,7 @@ fn the_bounded_waiter_returns_as_soon_as_the_process_exits_3273() {
         sleeper: RecordingSleeper::default(),
         poll_ms: 50,
     };
-    assert!(waiter.wait_for_exit(4242, 5_000));
+    assert!(waiter.wait_for_exit(ExactPid::new(4242).unwrap(), 5_000));
     assert!(
         waiter.probe.probes.load(Ordering::SeqCst) > 0,
         "returning true without ever asking whether the process is alive is not a wait"
@@ -538,4 +538,119 @@ fn bare_doctor_remains_report_only_3273() {
         );
     }
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// The concrete Unix adapters, around an injected syscall seam so the target and
+// signal number are observable without touching a real process.
+// ---------------------------------------------------------------------------
+
+use agend_terminal::admin::orphan_cleanup::{
+    signal_kill, signal_term, KillProbe, KillSyscall, Signaler as _, UnixSignaler,
+};
+
+#[derive(Default)]
+struct RecordingSyscall {
+    calls: std::sync::Mutex<Vec<(i32, i32)>>,
+    rc: i32,
+    errno: i32,
+}
+
+impl KillSyscall for RecordingSyscall {
+    fn kill(&self, pid: i32, signal: i32) -> (i32, i32) {
+        self.calls.lock().unwrap().push((pid, signal));
+        (self.rc, self.errno)
+    }
+}
+
+/// The target must be the exact positive pid. A NEGATIVE argument to `kill(2)`
+/// means "process group", which is precisely the blast radius the consensus
+/// forbids — and the mistake is invisible unless the target is asserted.
+#[test]
+fn the_unix_signaler_targets_one_exact_positive_pid_3273() {
+    let signaler = UnixSignaler {
+        syscall: RecordingSyscall::default(),
+    };
+    let pid = ExactPid::new(4242).expect("4242 is a valid exact pid");
+
+    let _ = signaler.term(pid);
+    let _ = signaler.kill(pid);
+
+    let calls = signaler.syscall.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![(4242, signal_term()), (4242, signal_kill())],
+        "TERM then KILL, each to the exact POSITIVE pid; a negative target is a process group"
+    );
+    for (target, _) in &calls {
+        assert!(
+            *target > 0,
+            "kill({target}, …) targets a process group, not a process"
+        );
+    }
+}
+
+/// EPERM means the process exists but is not ours. For a grace window that is
+/// "alive": treating it as gone would escalate against something we already
+/// know we cannot signal.
+#[cfg(unix)]
+#[test]
+fn the_liveness_probe_treats_eperm_as_alive_3273() {
+    let gone = KillProbe {
+        syscall: RecordingSyscall {
+            rc: -1,
+            errno: libc::ESRCH,
+            ..Default::default()
+        },
+    };
+    let forbidden = KillProbe {
+        syscall: RecordingSyscall {
+            rc: -1,
+            errno: libc::EPERM,
+            ..Default::default()
+        },
+    };
+    let alive = KillProbe {
+        syscall: RecordingSyscall::default(),
+    };
+    let pid = ExactPid::new(4242).unwrap();
+
+    assert!(!gone.is_alive(pid), "ESRCH is gone");
+    assert!(alive.is_alive(pid), "rc 0 is alive");
+    assert!(
+        forbidden.is_alive(pid),
+        "EPERM means it EXISTS and is not ours — reporting it dead would escalate blindly"
+    );
+    // And the probe must use signal 0, not a real signal.
+    let calls = alive.syscall.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![(4242, 0)],
+        "a liveness probe must not send a real signal"
+    );
+}
+
+/// The production reader must actually read. Our own process is the one pid we
+/// can assert about without racing anything.
+#[cfg(unix)]
+#[test]
+fn the_live_reader_identifies_this_process_3273() {
+    use agend_terminal::admin::orphan_cleanup::LiveIdentityReader;
+    let reader = LiveIdentityReader;
+
+    let uid = reader.self_uid().expect("our own uid must be readable");
+    let me = reader
+        .read(std::process::id())
+        .expect("our own process must be identifiable");
+    assert!(
+        me.start_token != 0,
+        "a start token of 0 is indistinguishable from 'unknown'"
+    );
+    assert_eq!(me.uid, uid, "our own process is owned by us");
+
+    assert_eq!(
+        reader.read(0),
+        None,
+        "pid 0 is never a real tracked process"
+    );
 }

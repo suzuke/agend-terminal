@@ -58,8 +58,8 @@ pub enum SignalOutcome {
 /// a session or a tree — the consensus forbids inferring a blast radius from an
 /// observation.
 pub trait Signaler {
-    fn term(&self, pid: u32) -> SignalOutcome;
-    fn kill(&self, pid: u32) -> SignalOutcome;
+    fn term(&self, pid: ExactPid) -> SignalOutcome;
+    fn kill(&self, pid: ExactPid) -> SignalOutcome;
 }
 
 /// Waits, with a hard bound, for one exact pid to exit after a TERM.
@@ -70,7 +70,7 @@ pub trait Signaler {
 /// later without changing this signature. Returns whether the pid exited within
 /// `timeout_ms`.
 pub trait ExitWaiter {
-    fn wait_for_exit(&self, pid: u32, timeout_ms: u64) -> bool;
+    fn wait_for_exit(&self, pid: ExactPid, timeout_ms: u64) -> bool;
 }
 
 /// How long a TERMed process is given before escalation is even considered.
@@ -247,6 +247,11 @@ pub enum CandidateOutcome {
     RefusedAuditFailed,
     /// A signal was attempted and the kernel refused it.
     SignalFailed(String),
+    /// The confirmed pid cannot be converted into an exact, individually
+    /// signallable target — 0, or above `i32::MAX`. Nothing was signalled, and
+    /// the batch stops: a sidecar naming such a pid is not a snapshot this
+    /// build produced.
+    RefusedUnsafePid,
     /// An earlier candidate hit a mutation-path failure, so this one was never
     /// attempted. Fail-stop is deliberate: continuing after an unexplained
     /// failure would widen a blast radius nobody authorised.
@@ -472,6 +477,15 @@ pub fn apply_with_barrier<
             stop = true;
             continue;
         }
+        // The authority type is constructed HERE, once, and every syscall below
+        // takes it. A pid that cannot become an ExactPid never reaches a
+        // signal — the check cannot be skipped by an adapter that casts
+        // internally, because there is no u32 path into `Signaler`.
+        let Some(target) = ExactPid::new(candidate.pid) else {
+            results.push((candidate.id.clone(), CandidateOutcome::RefusedUnsafePid));
+            stop = true;
+            continue;
+        };
         // Preflight is not authority at signal time. A pid can be recycled in
         // the moment between the two, and this re-read is the only thing
         // standing between that and signalling a stranger. `None` counts as
@@ -490,7 +504,7 @@ pub fn apply_with_barrier<
             stop = true;
             continue;
         }
-        match signaler.term(candidate.pid) {
+        match signaler.term(target) {
             SignalOutcome::Delivered => {}
             // ESRCH: it exited between the re-read and the signal. That is the
             // outcome we wanted, reached without us.
@@ -512,7 +526,7 @@ pub fn apply_with_barrier<
                 continue;
             }
         }
-        if waiter.wait_for_exit(candidate.pid, GRACE_MS) {
+        if waiter.wait_for_exit(target, GRACE_MS) {
             results.push((candidate.id.clone(), CandidateOutcome::Terminated));
             continue;
         }
@@ -530,7 +544,7 @@ pub fn apply_with_barrier<
             stop = true;
             continue;
         }
-        match signaler.kill(candidate.pid) {
+        match signaler.kill(target) {
             SignalOutcome::Delivered => {
                 results.push((candidate.id.clone(), CandidateOutcome::Killed));
             }
@@ -670,7 +684,7 @@ pub struct BoundedWaiter<P: LivenessProbe, S: Sleeper> {
 }
 
 impl<P: LivenessProbe, S: Sleeper> ExitWaiter for BoundedWaiter<P, S> {
-    fn wait_for_exit(&self, pid: u32, timeout_ms: u64) -> bool {
+    fn wait_for_exit(&self, pid: ExactPid, timeout_ms: u64) -> bool {
         // RED STUB (#3273): answers immediately, without waiting and without
         // asking. GREEN polls under the bound.
         let _ = (pid, timeout_ms, self.poll_ms);
@@ -687,6 +701,89 @@ impl AuditStore for JsonlAuditStore {
     fn record_pre_signal(&self, _record: &PreSignalAudit) -> anyhow::Result<()> {
         // RED STUB (#3273): reports durability it never established.
         Ok(())
+    }
+}
+
+/// The raw `kill(2)` seam. Injected so the concrete Unix signaler's target and
+/// signal number are observable without sending anything to a real process.
+/// Returns `(rc, errno)`.
+pub trait KillSyscall {
+    fn kill(&self, pid: i32, signal: i32) -> (i32, i32);
+}
+
+/// The production Unix signaler. Every target comes from an [`ExactPid`], and
+/// the pid is passed through POSITIVE — a negative argument to `kill(2)` means
+/// "the process group", which is the blast radius the consensus forbids.
+pub struct UnixSignaler<K: KillSyscall> {
+    pub syscall: K,
+}
+
+impl<K: KillSyscall> Signaler for UnixSignaler<K> {
+    fn term(&self, pid: ExactPid) -> SignalOutcome {
+        // RED STUB (#3273): negates the target, which is what copying the shape
+        // of `process::kill_process_tree` (`kill(-pgid, …)`) into this module
+        // would produce. It is the realistic mistake, not a contrived one.
+        let (rc, errno) = self.syscall.kill(-pid.get(), signal_term());
+        signal_outcome_from_syscall(rc, errno)
+    }
+    fn kill(&self, pid: ExactPid) -> SignalOutcome {
+        let (rc, errno) = self.syscall.kill(-pid.get(), signal_kill());
+        signal_outcome_from_syscall(rc, errno)
+    }
+}
+
+/// SIGTERM for this platform.
+pub fn signal_term() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::SIGTERM
+    }
+    #[cfg(not(unix))]
+    {
+        15
+    }
+}
+
+/// SIGKILL for this platform.
+pub fn signal_kill() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::SIGKILL
+    }
+    #[cfg(not(unix))]
+    {
+        9
+    }
+}
+
+/// Liveness by `kill(pid, 0)`. EPERM means the process EXISTS but is not ours,
+/// which is "alive" for the purpose of a grace window — treating it as gone
+/// would escalate against something we already know we cannot touch.
+pub struct KillProbe<K: KillSyscall> {
+    pub syscall: K,
+}
+
+impl<K: KillSyscall> LivenessProbe for KillProbe<K> {
+    fn is_alive(&self, pid: ExactPid) -> bool {
+        // RED STUB (#3273): ignores errno entirely, so EPERM reads as dead.
+        let (rc, _errno) = self.syscall.kill(pid.get(), 0);
+        rc == 0
+    }
+}
+
+/// The production reader: asks the OS on every call.
+#[cfg(unix)]
+pub struct LiveIdentityReader;
+
+#[cfg(unix)]
+impl RawIdentityReader for LiveIdentityReader {
+    fn read(&self, _pid: u32) -> Option<ProcIdentity> {
+        // RED STUB (#3273): reports nothing readable, so a live process cannot
+        // be identified at all.
+        None
+    }
+    fn self_uid(&self) -> Option<u32> {
+        None
     }
 }
 
