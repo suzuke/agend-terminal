@@ -2253,6 +2253,321 @@ PRODUCER
     fi
 }
 
+# ── #3249: one captured object, or the block can contradict itself ──────────
+#
+# The membership walk, the `lines=` count and the `response_line=` fragments
+# used to open the response list separately, so one block could describe THREE
+# different versions of the same file. The shim keys on a REGULAR-FILE stdin,
+# not on "the second awk call": `count_parsed_warnings` pipes into awk while the
+# list count redirects a file, so the discriminator survives someone adding
+# another `END{print NR}` — an ordinal would silently retarget and the test
+# would then pass for the wrong reason.
+test_response_snapshot_is_coherent_across_reads() {
+    local sandbox out block bad="" lines shown
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/shim"
+    cat >"$sandbox/shim/awk" <<SHIM
+#!/usr/bin/env bash
+# Swap the list AFTER its count has been taken and BEFORE the fragments are
+# read. Only the count invocation reads a regular file.
+if [ "\$1" = 'END{print NR}' ] && [ -f /dev/stdin ] && [ ! -f "$sandbox/swapped" ]; then
+    out="\$(/usr/bin/awk "\$@")"
+    printf '%s\n' "\$out"
+    : >"$sandbox/swapped"
+    printf '%s/REPLACEMENT-A.profraw\n%s/REPLACEMENT-B.profraw\n' \
+        "$sandbox/profiles" "$sandbox/profiles" \
+        >"$sandbox/profiles/agend-terminal-profraw-list.new"
+    mv -f "$sandbox/profiles/agend-terminal-profraw-list.new" \
+        "$sandbox/profiles/agend-terminal-profraw-list"
+    exit 0
+fi
+exec /usr/bin/awk "\$@"
+SHIM
+    chmod +x "$sandbox/shim/awk"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+printf '%s/named-1-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$sandbox/shim:$PATH" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    # Premise: the swap must actually have happened, or the case proves nothing.
+    echo "$block" | grep -q 'in_response=' || bad="$bad premise-no-membership"
+    # The captured object is the pre-swap list. Fragments from the replacement
+    # mean the block mixed versions.
+    echo "$block" | grep -q 'response_line=.*REPLACEMENT-' && bad="$bad fragments-from-replacement"
+    # `lines=` and the rendered fragments must describe the same object.
+    lines="$(echo "$block" | sed -nE 's/^response_file=.* lines=([0-9]+)$/\1/p' | head -n 1)"
+    shown="$(echo "$block" | grep -c 'response_line=')"
+    if [ -n "$lines" ] && [ "$lines" != "$shown" ]; then
+        bad="$bad count-$lines-disagrees-with-$shown-fragments"
+    fi
+    if [ -n "$bad" ]; then
+        report 1 "membership, count and fragments come from one captured list" \
+            "issues:$bad; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
+    else
+        report 0 "membership, count and fragments come from one captured list"
+    fi
+}
+
+# The SET is part of the captured object, not just each file's bytes. Membership
+# globbed the profile directory and the survey globbed it AGAIN, so a list that
+# appeared between the two was invisible to membership and visible to the
+# survey: the block asserted `in_response=no` and then disclosed, a few lines
+# later, the very list holding that exact path. `no` is the strongest claim in
+# this record and it requires that every present list was read to its end.
+test_response_snapshot_freezes_the_list_set() {
+    local sandbox out block bad="" membership
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/shim"
+    # Fires on the warning-count invocation (a PIPE), which runs AFTER the
+    # named-path membership walk and BEFORE the survey's own glob.
+    cat >"$sandbox/shim/awk" <<SHIM
+#!/usr/bin/env bash
+if [ "\$1" = 'END{print NR}' ] && [ ! -f /dev/stdin ] && [ ! -f "$sandbox/late" ]; then
+    : >"$sandbox/late"
+    printf '%s/named-1-1_0.profraw\n' "$sandbox/profiles" \
+        >"$sandbox/profiles/zzz-profraw-list"
+fi
+exec /usr/bin/awk "\$@"
+SHIM
+    chmod +x "$sandbox/shim/awk"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+printf '%s/unrelated.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/aaa-profraw-list"
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$sandbox/shim:$PATH" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z]+).*/\1/p' | head -n 1)"
+    [ -n "$membership" ] || bad="$bad premise-no-membership"
+    # A list that appeared after the snapshot is not part of the captured set,
+    # so it must not be disclosed in this block at all.
+    echo "$block" | grep -q 'zzz-profraw-list' && bad="$bad post-snapshot-list-disclosed"
+    # And absence must never be asserted while such a list exists unexamined.
+    if [ "$membership" = "no" ] && echo "$block" | grep -q 'zzz-profraw-list'; then
+        bad="$bad false-no-contradicted-in-same-block"
+    fi
+    if [ -n "$bad" ]; then
+        report 1 "the response-list SET is frozen with the snapshot" \
+            "issues:$bad; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
+    else
+        report 0 "the response-list SET is frozen with the snapshot"
+    fi
+}
+
+# Truncation weakens ABSENCE ONLY. Running out of captured prefix says nothing
+# about the bytes beyond it, so membership degrades to `unknown` — never `no` —
+# and the total line count becomes `n/a` rather than the prefix's own count,
+# which would be a fabricated fact.
+test_snapshot_truncation_degrades_absence_not_presence() {
+    local sandbox out block bad="" membership
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+i=1
+: >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+while [ "$i" -le 40 ]; do
+  printf '%s/unrelated-padding-entry-%s-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" "$i" \
+      >>"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+  i=$((i + 1))
+done
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        COVERAGE_SNAPSHOT_MAX_BYTES=200 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z/]+).*/\1/p' | head -n 1)"
+    [ "$membership" = "unknown" ] || bad="$bad membership-$membership-not-unknown"
+    echo "$block" | grep -qE '^response_file=.* lines=n/a$' || bad="$bad lines-not-na"
+    echo "$block" | grep -q 'exceeded the 200-byte capture cap' || bad="$bad no-truncation-disclosure"
+    if [ -n "$bad" ]; then
+        report 1 "snapshot truncation degrades absence, not presence" \
+            "issues:$bad; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
+    else
+        report 0 "snapshot truncation degrades absence, not presence"
+    fi
+}
+
+# The other half of the same rule: a match found INSIDE the captured prefix is
+# still proof of membership, so truncation must not collapse `yes` to `unknown`.
+test_snapshot_truncation_preserves_a_prefix_match() {
+    local sandbox out block bad="" membership
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+# The named path is the FIRST entry, well inside the cap; the padding that
+# follows pushes the list past it.
+printf '%s/named-1-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+i=1
+while [ "$i" -le 40 ]; do
+  printf '%s/padding-entry-%s-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" "$i" \
+      >>"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+  i=$((i + 1))
+done
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        COVERAGE_SNAPSHOT_MAX_BYTES=200 "$wrapper" 2>&1)"
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox"
+    membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z/]+).*/\1/p' | head -n 1)"
+    [ "$membership" = "yes" ] || bad="$bad membership-$membership-not-yes"
+    # Premise: the capture really was truncated, or this proves nothing.
+    echo "$block" | grep -q 'exceeded the 200-byte capture cap' || bad="$bad premise-not-truncated"
+    if [ -n "$bad" ]; then
+        report 1 "a prefix match survives snapshot truncation" \
+            "issues:$bad; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
+    else
+        report 0 "a prefix match survives snapshot truncation"
+    fi
+}
+
+# The producer's exit code is the one fact this wrapper must never overwrite.
+# Scratch cleanup is observability: it may complain, it may not become the
+# status.
+test_snapshot_cleanup_failure_does_not_replace_producer_exit() {
+    local sandbox out rc bad=""
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/shim"
+    printf '#!/usr/bin/env bash\nexit 1\n' >"$sandbox/shim/rm"
+    chmod +x "$sandbox/shim/rm"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+printf '%s/named-1-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exit 17
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$sandbox/shim:$PATH" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rc=$?
+    rm -rf "$sandbox" 2>/dev/null
+    [ "$rc" -eq 17 ] || bad="$bad exit-$rc-not-17"
+    echo "$out" | grep -q 'could not remove its diagnostic scratch' \
+        || bad="$bad no-cleanup-warning"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "snapshot cleanup failure never replaces the producer exit" \
+            "issues:$bad; rc=$rc"
+    else
+        report 0 "snapshot cleanup failure never replaces the producer exit"
+    fi
+}
+
+# The scratch directory is OURS. Failing to allocate it is a fact about this
+# wrapper's temp space and says nothing whatever about the producer's response
+# lists — so the lists must not vanish from the record because our own mktemp
+# failed. The captured NAME set therefore has to be taken BEFORE the allocation:
+# every name already present stays disclosed as `lines=n/a`, membership degrades
+# to `unknown` (never `no`, which would assert absence from a read that never
+# happened), and a list that appears DURING the failure is still not part of the
+# captured set and is not disclosed. Without storage there are no captured bytes,
+# so no fragment may be rendered at all.
+test_snapshot_allocation_failure_keeps_captured_names() {
+    local sandbox out block rc bad="" membership aaa bbb real_mktemp
+    sandbox="$(new_sandbox)"
+    real_mktemp="$(command -v mktemp)"
+    mkdir -p "$sandbox/shim"
+    # Delegates every other allocation (the wrapper also mktemps its diagnostic
+    # scratch). On the snapshot template it moves one pre-existing list out from
+    # under the wrapper, removes another, creates a LATE one, and then fails the
+    # way a real mktemp does: on stderr, unframed.
+    cat >"$sandbox/shim/mktemp" <<SHIM
+#!/usr/bin/env bash
+for arg in "\$@"; do
+    case "\$arg" in
+        *coverage-snap.XXXXXX)
+            mv -f "$sandbox/profiles/aaa-profraw-list" "$sandbox/moved-aaa" 2>/dev/null
+            rm -f "$sandbox/profiles/bbb-profraw-list" 2>/dev/null
+            printf '%s/named-1-1_0.profraw\n' "$sandbox/profiles" \
+                >"$sandbox/profiles/zzz-late-profraw-list"
+            printf 'mktemp: failed to create directory via template %s: No space left on device\n' "\$arg" >&2
+            exit 1
+            ;;
+    esac
+done
+exec "$real_mktemp" "\$@"
+SHIM
+    chmod +x "$sandbox/shim/mktemp"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/named-1-1_0.profraw"
+printf '%s/named-1-1_0.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/aaa-profraw-list"
+printf '%s/unrelated.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/bbb-profraw-list"
+printf 'warning: %s/named-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exit 9
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$sandbox/shim:$PATH" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rc=$?
+    block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
+    rm -rf "$sandbox" 2>/dev/null
+    # Premise: a diagnostic block with a membership verdict was produced at all.
+    echo "$block" | grep -q 'in_response=' || bad="$bad premise-no-membership"
+    # Every name captured before the allocation is still disclosed, exactly once
+    # and without a fabricated count.
+    aaa="$(echo "$block" | grep -c 'response_file=.*aaa-profraw-list lines=n/a')"
+    bbb="$(echo "$block" | grep -c 'response_file=.*bbb-profraw-list lines=n/a')"
+    [ "$aaa" -eq 1 ] || bad="$bad aaa-disclosed-$aaa-times-not-once"
+    [ "$bbb" -eq 1 ] || bad="$bad bbb-disclosed-$bbb-times-not-once"
+    membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z/]+).*/\1/p' | head -n 1)"
+    [ "$membership" = "unknown" ] || bad="$bad membership-$membership-not-unknown"
+    # A list created during the failed allocation is outside the captured set.
+    echo "$block" | grep -q 'zzz-late-profraw-list' && bad="$bad late-list-disclosed"
+    # No storage means no captured bytes; a fragment here could only come from a
+    # read this wrapper never made.
+    echo "$block" | grep -q 'response_line=' && bad="$bad fragments-without-storage"
+    # The producer's exit stays authoritative and the failure stays framed.
+    [ "$rc" -eq 9 ] || bad="$bad exit-$rc-not-9"
+    echo "$out" | grep -q 'failed to create directory via template' \
+        && bad="$bad raw-mktemp-error-leaked"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "a failed scratch allocation never erases the captured lists" \
+            "issues:$bad; rc=$rc; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
+    else
+        report 0 "a failed scratch allocation never erases the captured lists"
+    fi
+}
+
 # A control byte the escaper cannot name must not be rendered as a character a
 # real path can also contain: `?` for ESC is indistinguishable from a literal
 # `?`. Backslash is escaped first, so `\?` can only mean "a control byte was
@@ -4550,6 +4865,12 @@ test_unreadable_profraw_emits_no_raw_shell_error
 test_unreadable_response_file_emits_no_raw_shell_error
 test_isolation_counts_files_not_lines
 test_response_truncation_is_disclosed
+test_response_snapshot_is_coherent_across_reads
+test_response_snapshot_freezes_the_list_set
+test_snapshot_truncation_degrades_absence_not_presence
+test_snapshot_truncation_preserves_a_prefix_match
+test_snapshot_cleanup_failure_does_not_replace_producer_exit
+test_snapshot_allocation_failure_keeps_captured_names
 test_residual_control_byte_is_unambiguous
 test_newline_field_cannot_forge_records
 test_response_count_is_labelled_by_lines
