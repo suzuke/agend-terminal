@@ -671,3 +671,41 @@ fn concurrent_applies_consume_a_confirmation_exactly_once_3273() {
     assert!(stored.consumed, "the winner's consumption must be durable");
     std::fs::remove_dir_all(&*home).ok();
 }
+
+/// A confirmation token and its sidecar are authority material: whatever can
+/// read them learns the exact triple an operator confirmed, and whatever can
+/// write them can forge one. `File::create` honours the umask, so on a
+/// permissive umask these would be group- or world-readable by default.
+#[cfg(unix)]
+#[test]
+fn confirmation_material_is_private_to_the_owner_3273() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, oracle, signaler, snapshot) = previewed("private-modes", 1_700_000_000_000);
+    let path = confirmation_path(&home, &snapshot.token).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "sidecar must be owner-only, got {mode:o}");
+
+    let dir_mode = std::fs::metadata(path.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dir_mode, 0o700, "confirmation dir must be owner-only, got {dir_mode:o}");
+
+    // The lock is created by apply, and names a confirmation by token, so it is
+    // held to the same standard.
+    let audit = RecordingAudit::default();
+    let clock = FixedClock(1_700_000_000_000);
+    let _ = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let lock_mode = std::fs::metadata(path.with_extension("lock"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(lock_mode, 0o600, "lock must be owner-only, got {lock_mode:o}");
+
+    assert_eq!(signaler.total(), 0);
+    std::fs::remove_dir_all(&home).ok();
+}

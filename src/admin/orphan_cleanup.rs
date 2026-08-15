@@ -360,6 +360,27 @@ pub fn apply_with_barrier<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStor
     ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable)
 }
 
+/// A confirmation token and its sidecar ARE authority material: anything that
+/// can read them can name the exact triple an operator confirmed, and anything
+/// that can write them can forge one. On Unix `File::create` honours the
+/// process umask, which on a permissive umask leaves them group- or
+/// world-readable, so the modes are set explicitly rather than inherited.
+///
+/// Failing to tighten is fail-closed, not a warning: an authority file we could
+/// not make private is one we should not have written.
+#[cfg(unix)]
+fn harden_private(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn harden_private(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    // Windows ACLs are inherited from the parent directory, which the daemon's
+    // own home already constrains; there is no umask equivalent to correct.
+    Ok(())
+}
+
 /// Guard holding the advisory lock for one confirmation.
 pub struct ConfirmationLock {
     file: std::fs::File,
@@ -381,11 +402,16 @@ fn acquire_confirmation_lock(path: &Path) -> std::io::Result<ConfirmationLock> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
+    harden_private(parent, 0o700)?;
+    let lock_path = path.with_extension("lock");
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path.with_extension("lock"))?;
+        .open(&lock_path)?;
+    // The lock names a confirmation by token; keep it as private as the
+    // confirmation itself.
+    harden_private(&lock_path, 0o600)?;
     // Explicit trait syntax: Rust 1.89 stabilised an inherent `File::lock` with
     // the same name, and selecting it would trip the MSRV gate (rust-version is
     // below that). Same reasoning as `store::acquire_file_lock`.
@@ -477,6 +503,7 @@ fn persist_confirmation(path: &Path, confirmation: &Confirmation) -> std::io::Re
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "confirmation path has no parent")
     })?;
     std::fs::create_dir_all(parent)?;
+    harden_private(parent, 0o700)?;
     let bytes = serde_json::to_vec_pretty(confirmation)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let tmp = parent.join(format!(
@@ -487,10 +514,17 @@ fn persist_confirmation(path: &Path, confirmation: &Confirmation) -> std::io::Re
     ));
     {
         let mut file = std::fs::File::create(&tmp)?;
+        // Tighten BEFORE the bytes land: a window in which the confirmation is
+        // both complete and world-readable is exactly the window that matters.
+        harden_private(&tmp, 0o600)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // The rename carries the temp file's mode, but re-assert it: an existing
+    // target replaced by rename must not be able to donate looser modes, and a
+    // second write over a hand-loosened file must retighten it.
+    harden_private(path, 0o600)?;
     // Directory fsync is best-effort by platform, but a failure to OPEN the
     // directory is not: that means we cannot establish durability at all.
     std::fs::File::open(parent)?.sync_all().or_else(|error| {
