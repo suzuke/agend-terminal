@@ -16,9 +16,10 @@
 //! symbol.
 
 use agend_terminal::admin::orphan_cleanup::{
-    apply, apply_with_barrier, candidate_id, confirmation_path, preview, ApplyOutcome, Clock,
-    Confirmation, ConsumeBarrier, IdentityOracle, PreSignalAudit, PreviewError, ProcIdentity,
-    RefusalReason, SignalOutcome, Signaler, Support,
+    apply, apply_with_barrier, candidate_id, confirmation_path, preview, ApplyOutcome,
+    CandidateOutcome, Clock, Confirmation, ConsumeBarrier, IdentityOracle, PreSignalAudit,
+    ExitWaiter, PreviewError, ProcIdentity, RefusalReason, SignalOutcome, Signaler, Support,
+    GRACE_MS,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -88,8 +89,19 @@ impl Signaler for CountingSignaler {
         self.kills.fetch_add(1, Ordering::SeqCst);
         SignalOutcome::Delivered
     }
-    fn is_alive(&self, _pid: u32) -> bool {
-        false
+}
+
+/// The waiter used by the authority-slice contracts, which never reach a
+/// signal. Recorded anyway so an accidental wait would show up.
+#[derive(Default)]
+struct NeverWaits {
+    waits: AtomicU32,
+}
+
+impl ExitWaiter for NeverWaits {
+    fn wait_for_exit(&self, _pid: u32, _timeout_ms: u64) -> bool {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        true
     }
 }
 
@@ -332,7 +344,7 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     // --- no token at all -------------------------------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-missing-token", 1_700_000_000_000);
     let clock = FixedClock(1_700_000_000_000);
-    let outcome = apply(&home, ACTOR, REASON, "", &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, "", &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::MissingToken));
     assert_eq!(signaler.total(), 0);
     assert_eq!(
@@ -347,7 +359,7 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     // being spent as a path component.
     let (home, oracle, signaler, snapshot) = previewed("refuse-malformed", 1_700_000_000_000);
     for bad in ["../../etc/passwd", "not-a-token", &"f".repeat(35), &"g".repeat(36)] {
-        let outcome = apply(&home, ACTOR, REASON, bad, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+        let outcome = apply(&home, ACTOR, REASON, bad, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
         assert_eq!(
             outcome,
             ApplyOutcome::Refused(RefusalReason::MalformedToken),
@@ -360,7 +372,7 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     // --- well-formed token with no sidecar behind it ----------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-no-sidecar", 1_700_000_000_000);
     let orphan_token = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    let outcome = apply(&home, ACTOR, REASON, orphan_token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, orphan_token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
@@ -369,28 +381,28 @@ fn apply_refusals_name_their_cause_and_signal_nothing_3273() {
     let (home, oracle, signaler, snapshot) = previewed("refuse-corrupt", 1_700_000_000_000);
     let path = confirmation_path(&home, &snapshot.token).unwrap();
     std::fs::write(&path, b"{ this is not json").unwrap();
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     // --- empty audit reason ----------------------------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-empty-reason", 1_700_000_000_000);
-    let outcome = apply(&home, ACTOR, "", &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, "", &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::EmptyAuditReason));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     // --- actor does not match the confirmation ----------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-actor", 1_700_000_000_000);
-    let outcome = apply(&home, "someone-else", REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, "someone-else", REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ActorMismatch));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     // --- reason does not match the confirmation ---------------------------
     let (home, oracle, signaler, snapshot) = previewed("refuse-reason", 1_700_000_000_000);
-    let outcome = apply(&home, ACTOR, "a different justification", &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, "a different justification", &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::AuditReasonMismatch));
     assert_eq!(signaler.total(), 0);
     assert_eq!(
@@ -412,14 +424,14 @@ fn apply_outside_the_ttl_window_refuses_3273() {
 
     let (home, oracle, signaler, snapshot) = previewed("refuse-expired", created);
     let expired = FixedClock(created + agend_terminal::admin::orphan_cleanup::CONFIRM_TTL_MS + 1);
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &expired, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &expired, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::Expired));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
 
     let (home, oracle, signaler, snapshot) = previewed("refuse-backwards", created);
     let backwards = FixedClock(created - 1);
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &backwards, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &backwards, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(
         outcome,
         ApplyOutcome::Refused(RefusalReason::Expired),
@@ -460,7 +472,7 @@ fn apply_with_non_exact_confirm_ids_refuses_3273() {
         ("empty", empty),
         ("duplicated id", duplicated),
     ] {
-        let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &set, &oracle, &signaler, &clock, &audit, Support::Supported);
+        let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &set, &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
         assert_eq!(
             outcome,
             ApplyOutcome::Refused(RefusalReason::ConfirmIdsNotExact),
@@ -486,7 +498,7 @@ fn apply_with_a_consumed_confirmation_refuses_3273() {
     stored.consumed = true;
     std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
 
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::Replayed));
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
@@ -502,7 +514,7 @@ fn apply_on_an_unsupported_platform_refuses_3273() {
     let (home, oracle, signaler, snapshot) = previewed("refuse-unsupported", 1_700_000_000_000);
 
     let outcome = apply(
-        &home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit,
+        &home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(),
         Support::Unsupported("no identity oracle on this platform".to_string()),
     );
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::Unsupported));
@@ -527,7 +539,7 @@ fn apply_with_an_unknown_sidecar_schema_refuses_3273() {
     stored.schema_version = 2;
     std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
 
-    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let outcome = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::SchemaMismatch));
     assert_eq!(signaler.total(), 0);
     assert_eq!(audit.writes(), 0, "an unreadable confirmation must not produce a pre-signal audit");
@@ -620,7 +632,7 @@ fn concurrent_applies_consume_a_confirmation_exactly_once_3273() {
             let audit = RecordingAudit::default();
             let clock = FixedClock(1_700_000_000_000);
             let outcome = apply_with_barrier(
-                &home, ACTOR, REASON, &token, &ids, &oracle, &signaler, &clock, &audit,
+                &home, ACTOR, REASON, &token, &ids, &oracle, &signaler, &clock, &audit, &NeverWaits::default(),
                 Support::Supported, &*barrier,
             );
             (outcome, signaler.total())
@@ -698,7 +710,7 @@ fn confirmation_material_is_private_to_the_owner_3273() {
     // held to the same standard.
     let audit = RecordingAudit::default();
     let clock = FixedClock(1_700_000_000_000);
-    let _ = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, Support::Supported);
+    let _ = apply(&home, ACTOR, REASON, &snapshot.token, &ids_of(&snapshot), &oracle, &signaler, &clock, &audit, &NeverWaits::default(), Support::Supported);
     let lock_mode = std::fs::metadata(path.with_extension("lock"))
         .unwrap()
         .permissions()
@@ -708,4 +720,456 @@ fn confirmation_material_is_private_to_the_owner_3273() {
 
     assert_eq!(signaler.total(), 0);
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Executor seams — ONE ordered event log shared by every seam.
+//
+// Counters cannot express ordering, and ordering is most of what these
+// contracts are about: "the audit was written" and "the audit was written
+// BEFORE the TERM" are different claims, and only the second one is the
+// consensus's requirement. Everything the executor does against the outside
+// world therefore appends to a single log, and the contracts compare that log
+// literally.
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Default)]
+struct EventLog(Arc<Mutex<Vec<String>>>);
+
+impl EventLog {
+    fn push(&self, event: String) {
+        self.0.lock().unwrap().push(event);
+    }
+    fn events(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn signals(&self) -> Vec<String> {
+        self.events()
+            .into_iter()
+            .filter(|e| e.starts_with("TERM:") || e.starts_with("KILL:"))
+            .collect()
+    }
+}
+
+/// An oracle whose answers change between reads, so a contract can model a
+/// process exiting, a PID being recycled, or an identity becoming unreadable at
+/// the exact read the executor depends on. The last scripted answer repeats.
+struct ScriptedOracle {
+    script: Mutex<Vec<(u32, Vec<Option<ProcIdentity>>)>>,
+    self_uid: Option<u32>,
+}
+
+impl ScriptedOracle {
+    fn new(script: &[(u32, Vec<Option<ProcIdentity>>)], self_uid: Option<u32>) -> Self {
+        Self {
+            script: Mutex::new(script.to_vec()),
+            self_uid,
+        }
+    }
+}
+
+impl IdentityOracle for ScriptedOracle {
+    fn identity(&self, pid: u32) -> Option<ProcIdentity> {
+        let mut script = self.script.lock().unwrap();
+        let row = script.iter_mut().find(|(candidate, _)| *candidate == pid)?;
+        if row.1.len() > 1 {
+            row.1.remove(0)
+        } else {
+            *row.1.first()?
+        }
+    }
+    fn self_uid(&self) -> Option<u32> {
+        self.self_uid
+    }
+}
+
+struct LoggingSignaler {
+    log: EventLog,
+    term_fails: Option<u32>,
+}
+
+impl Signaler for LoggingSignaler {
+    fn term(&self, pid: u32) -> SignalOutcome {
+        self.log.push(format!("TERM:{pid}"));
+        if self.term_fails == Some(pid) {
+            return SignalOutcome::PermissionDenied;
+        }
+        SignalOutcome::Delivered
+    }
+    fn kill(&self, pid: u32) -> SignalOutcome {
+        self.log.push(format!("KILL:{pid}"));
+        SignalOutcome::Delivered
+    }
+}
+
+struct LoggingAudit {
+    log: EventLog,
+    fail: bool,
+}
+
+impl agend_terminal::admin::orphan_cleanup::AuditStore for LoggingAudit {
+    fn record_pre_signal(&self, record: &PreSignalAudit) -> anyhow::Result<()> {
+        // Logged BEFORE the failure branch: an attempt that failed still
+        // happened, and the ordering contract is about when it was attempted.
+        self.log.push(format!("audit:{}", record.pid));
+        if self.fail {
+            anyhow::bail!("forced audit failure");
+        }
+        Ok(())
+    }
+}
+
+/// Records the exact bound it was asked to wait for, and whether the pid
+/// exited. `survives` lists pids that outlive the grace window.
+struct LoggingWaiter {
+    log: EventLog,
+    survives: Vec<u32>,
+}
+
+impl ExitWaiter for LoggingWaiter {
+    fn wait_for_exit(&self, pid: u32, timeout_ms: u64) -> bool {
+        self.log.push(format!("wait:{pid}:{timeout_ms}"));
+        !self.survives.contains(&pid)
+    }
+}
+
+fn identity(start_token: u64, uid: u32) -> Option<ProcIdentity> {
+    Some(ProcIdentity { start_token, uid })
+}
+
+struct Stage {
+    home: std::path::PathBuf,
+    oracle: ScriptedOracle,
+    snapshot: agend_terminal::admin::orphan_cleanup::Preview,
+    log: EventLog,
+}
+
+fn staged(tag: &str, script: &[(u32, Vec<Option<ProcIdentity>>)], self_uid: Option<u32>) -> Stage {
+    let home = tmp_home(tag);
+    let pids: Vec<u32> = script.iter().map(|(pid, _)| *pid).collect();
+    let oracle = ScriptedOracle::new(script, self_uid);
+    let clock = FixedClock(1_700_000_000_000);
+    let snapshot = preview(&home, ACTOR, REASON, &pids, &oracle, &clock, 5, Support::Supported)
+        .expect("preview must be issuable");
+    Stage {
+        home,
+        oracle,
+        snapshot,
+        log: EventLog::default(),
+    }
+}
+
+fn run(stage: &Stage, term_fails: Option<u32>, survives: &[u32], audit_fails: bool) -> ApplyOutcome {
+    let signaler = LoggingSignaler {
+        log: stage.log.clone(),
+        term_fails,
+    };
+    let audit = LoggingAudit {
+        log: stage.log.clone(),
+        fail: audit_fails,
+    };
+    let waiter = LoggingWaiter {
+        log: stage.log.clone(),
+        survives: survives.to_vec(),
+    };
+    let clock = FixedClock(1_700_000_000_000);
+    apply(
+        &stage.home,
+        ACTOR,
+        REASON,
+        &stage.snapshot.token,
+        &ids_of(&stage.snapshot),
+        &stage.oracle,
+        &signaler,
+        &clock,
+        &audit,
+        &waiter,
+        Support::Supported,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Contract 5 — ownership. Unknown ownership is never own.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_without_a_self_uid_refuses_3273() {
+    let stage = staged("no-self-uid", &[(4242, vec![identity(111_000, 501)])], None);
+    let outcome = run(&stage, None, &[], false);
+    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::MissingSelfUid));
+    assert!(stage.log.events().is_empty(), "nothing may happen without proven ownership: {:?}", stage.log.events());
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+#[test]
+fn apply_to_a_foreign_uid_refuses_3273() {
+    let stage = staged("foreign-uid", &[(4242, vec![identity(111_000, 999)])], Some(501));
+    let outcome = run(&stage, None, &[], false);
+    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::ForeignUid));
+    assert!(stage.log.events().is_empty());
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Contract 6 — full-batch preflight, and the re-read that preflight does not
+// replace.
+// ---------------------------------------------------------------------------
+
+/// One stale candidate refuses the WHOLE batch, before any signal. Signalling
+/// the still-valid ones first would leave the partial mutation the
+/// all-or-nothing confirmation exists to prevent: the operator authorised a
+/// set, not a prefix of it.
+#[test]
+fn a_single_stale_candidate_refuses_the_whole_batch_3273() {
+    let stage = staged(
+        "stale-batch",
+        &[
+            (4242, vec![identity(111_000, 501)]),
+            (4343, vec![identity(222_000, 501), identity(999_999, 501)]),
+        ],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[], false);
+    assert_eq!(outcome, ApplyOutcome::Refused(RefusalReason::StaleBatch));
+    assert!(
+        stage.log.events().is_empty(),
+        "the valid candidate must not be signalled ahead of the stale one, and no audit may be written: {:?}",
+        stage.log.events()
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// Preflight is NOT authority at signal time. A candidate that passed preview
+/// and passed the full-batch preflight can still be recycled in the moment
+/// before TERM, and the immediate re-read is the only thing standing between
+/// that and signalling a stranger.
+#[test]
+fn pid_reuse_between_preflight_and_term_signals_nothing_3273() {
+    // Reads: preview, preflight, immediate pre-TERM — the third differs.
+    let stage = staged(
+        "reuse-before-term",
+        &[(
+            4242,
+            vec![
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(888_888, 501),
+            ],
+        )],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[], false);
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::RefusedIdentityChanged
+        )])
+    );
+    assert!(
+        stage.log.signals().is_empty(),
+        "a recycled pid must never be signalled: {:?}",
+        stage.log.events()
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// Same shape, but the identity becomes unreadable rather than different.
+/// Unknown is not "unchanged".
+#[test]
+fn unreadable_identity_before_term_signals_nothing_3273() {
+    let stage = staged(
+        "unknown-before-term",
+        &[(
+            4242,
+            vec![identity(111_000, 501), identity(111_000, 501), None],
+        )],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[], false);
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::RefusedIdentityChanged
+        )])
+    );
+    assert!(stage.log.signals().is_empty(), "{:?}", stage.log.events());
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Contract 7 — the signal path, asserted as an ORDERED sequence.
+// ---------------------------------------------------------------------------
+
+/// TERM delivered, the process gone within a bounded wait, no KILL. The
+/// sequence is asserted whole: `writes() == 1` would not have ruled out an
+/// implementation that signalled first and audited afterwards, which is exactly
+/// the ordering the consensus forbids.
+#[test]
+fn a_successful_term_audits_first_waits_bounded_and_never_kills_3273() {
+    let stage = staged("term-works", &[(4242, vec![identity(111_000, 501)])], Some(501));
+    let outcome = run(&stage, None, &[], false);
+
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::Terminated
+        )])
+    );
+    assert_eq!(
+        stage.log.events(),
+        vec![
+            "audit:4242".to_string(),
+            "TERM:4242".to_string(),
+            format!("wait:4242:{GRACE_MS}"),
+        ],
+        "durable audit strictly before TERM, then one bounded wait, and no KILL"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// A process that ignores TERM and is still the SAME identity after the bounded
+/// wait earns exactly one KILL. The wait must appear in the log with the
+/// declared bound: without it, an implementation could escalate instantly and
+/// still satisfy a "one KILL" count.
+#[test]
+fn term_ignored_by_the_same_identity_earns_exactly_one_kill_after_the_grace_3273() {
+    let stage = staged(
+        "term-ignored",
+        &[(
+            4242,
+            vec![
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(111_000, 501),
+            ],
+        )],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[4242], false);
+
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::Killed
+        )])
+    );
+    assert_eq!(
+        stage.log.events(),
+        vec![
+            "audit:4242".to_string(),
+            "TERM:4242".to_string(),
+            format!("wait:4242:{GRACE_MS}"),
+            "KILL:4242".to_string(),
+        ],
+        "the KILL must come after a bounded wait, not instead of one"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// If the PID is recycled DURING the grace window, escalation stops. The thing
+/// that ignored TERM and the thing alive now are not proven to be the same
+/// process, and a KILL cannot be taken back.
+#[test]
+fn pid_reuse_during_the_grace_window_cancels_the_kill_3273() {
+    let stage = staged(
+        "reuse-in-grace",
+        &[(
+            4242,
+            vec![
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(777_777, 501),
+            ],
+        )],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[4242], false);
+
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::RefusedIdentityChanged
+        )])
+    );
+    assert_eq!(
+        stage.log.events(),
+        vec![
+            "audit:4242".to_string(),
+            "TERM:4242".to_string(),
+            format!("wait:4242:{GRACE_MS}"),
+        ],
+        "no KILL may follow an identity that changed under us"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// An action nobody can prove happened must not happen: an undurable pre-signal
+/// audit blocks the signal. The log proves the audit was ATTEMPTED and that
+/// nothing followed it.
+#[test]
+fn an_undurable_pre_signal_audit_blocks_the_signal_3273() {
+    let stage = staged("audit-fails", &[(4242, vec![identity(111_000, 501)])], Some(501));
+    let outcome = run(&stage, None, &[], true);
+
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::RefusedAuditFailed
+        )])
+    );
+    assert_eq!(
+        stage.log.events(),
+        vec!["audit:4242".to_string()],
+        "the audit was attempted and nothing followed it"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// Fail-stop. A refused signal ends the batch; later candidates are never
+/// attempted, because continuing past an unexplained failure widens a blast
+/// radius nobody authorised.
+#[test]
+fn a_signal_failure_stops_the_batch_3273() {
+    let stage = staged(
+        "fail-stop",
+        &[
+            (4242, vec![identity(111_000, 501)]),
+            (4343, vec![identity(222_000, 501)]),
+        ],
+        Some(501),
+    );
+    let outcome = run(&stage, Some(4242), &[], false);
+
+    match outcome {
+        ApplyOutcome::Applied(results) => {
+            assert_eq!(results.len(), 2, "every confirmed candidate must be accounted for");
+            assert!(
+                matches!(results[0].1, CandidateOutcome::SignalFailed(_)),
+                "first candidate must report the refused signal: {results:?}"
+            );
+            assert_eq!(
+                results[1].1,
+                CandidateOutcome::NotAttempted,
+                "the batch must stop, not carry on to the next process"
+            );
+        }
+        other => panic!("expected per-candidate results, got {other:?}"),
+    }
+    assert_eq!(
+        stage.log.events(),
+        vec!["audit:4242".to_string(), "TERM:4242".to_string()],
+        "the second candidate must leave no trace at all: {:?}",
+        stage.log.events()
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
 }

@@ -60,9 +60,23 @@ pub enum SignalOutcome {
 pub trait Signaler {
     fn term(&self, pid: u32) -> SignalOutcome;
     fn kill(&self, pid: u32) -> SignalOutcome;
-    /// Liveness probe used to bound the grace window.
-    fn is_alive(&self, pid: u32) -> bool;
 }
+
+/// Waits, with a hard bound, for one exact pid to exit after a TERM.
+///
+/// This is a seam rather than a sleep-and-poll loop inside the executor for two
+/// reasons: a contract can then prove the wait actually happened and that it
+/// carried the declared bound, and an unbounded wait cannot be introduced
+/// later without changing this signature. Returns whether the pid exited within
+/// `timeout_ms`.
+pub trait ExitWaiter {
+    fn wait_for_exit(&self, pid: u32, timeout_ms: u64) -> bool;
+}
+
+/// How long a TERMed process is given before escalation is even considered.
+/// Bounded and declared here so the contracts can assert the exact value that
+/// reaches the waiter.
+pub const GRACE_MS: u64 = 2_000;
 
 /// Injected clock so TTL and grace windows are deterministic under test.
 pub trait Clock {
@@ -171,6 +185,17 @@ pub enum RefusalReason {
     Replayed,
     ConfirmIdsNotExact,
     Unsupported,
+    /// This process could not determine its own uid, so a foreign-uid process
+    /// cannot be ruled out. Unknown ownership is never treated as own.
+    MissingSelfUid,
+    /// A confirmed candidate belongs to another user. Signalling it would be
+    /// acting outside the operator's own authority.
+    ForeignUid,
+    /// The full-batch preflight found at least one confirmed candidate whose
+    /// live identity no longer matches the snapshot. The WHOLE batch refuses:
+    /// signalling the still-valid ones first would leave a partial mutation
+    /// that the all-or-nothing confirmation was meant to prevent.
+    StaleBatch,
     /// Lost the race for a single-use confirmation. Distinct from `Replayed`
     /// only in provenance — both mean "this confirmation is already spent" —
     /// but a contended loser has not yet observed the winner's write, so the
@@ -202,9 +227,38 @@ pub trait ConsumeBarrier {
 pub struct NoBarrier;
 impl ConsumeBarrier for NoBarrier {}
 
+/// What happened to one confirmed candidate. Reported per candidate because a
+/// batch is not atomic at the kernel: the operator needs to know which exact
+/// process was signalled and which was refused, not a single aggregate verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateOutcome {
+    /// TERM delivered and the exact identity was gone within the grace window.
+    /// No KILL was sent.
+    Terminated,
+    /// TERM delivered, the SAME identity was still alive after the grace
+    /// window, and exactly one KILL followed.
+    Killed,
+    /// The identity re-read immediately before signalling did not match the
+    /// snapshot — PID reuse, a changed start token, or an unreadable process.
+    /// Nothing was signalled.
+    RefusedIdentityChanged,
+    /// The pre-signal audit could not be made durable. Nothing was signalled:
+    /// an action nobody can prove happened is one that must not happen.
+    RefusedAuditFailed,
+    /// A signal was attempted and the kernel refused it.
+    SignalFailed(String),
+    /// An earlier candidate hit a mutation-path failure, so this one was never
+    /// attempted. Fail-stop is deliberate: continuing after an unexplained
+    /// failure would widen a blast radius nobody authorised.
+    NotAttempted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
     Refused(RefusalReason),
+    /// Authority was fully established and each confirmed candidate has an
+    /// outcome, in confirmation order.
+    Applied(Vec<(String, CandidateOutcome)>),
 }
 
 /// Path of the confirmation sidecar for `token`, or `None` when the token is
@@ -227,7 +281,7 @@ pub fn confirmation_path(home: &Path, token: &str) -> Option<std::path::PathBuf>
 /// Every authority check runs BEFORE anything is signalled, and each refusal
 /// names its own cause.
 #[allow(clippy::too_many_arguments)]
-pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore>(
+pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore, W: ExitWaiter>(
     home: &Path,
     actor: &str,
     audit_reason: &str,
@@ -237,6 +291,7 @@ pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore>(
     signaler: &S,
     clock: &C,
     audit: &A,
+    waiter: &W,
     support: Support,
 ) -> ApplyOutcome {
     apply_with_barrier(
@@ -249,6 +304,7 @@ pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore>(
         signaler,
         clock,
         audit,
+        waiter,
         support,
         &NoBarrier,
     )
@@ -257,7 +313,14 @@ pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore>(
 /// [`apply`] with an injected barrier. Only the contracts pass anything other
 /// than [`NoBarrier`].
 #[allow(clippy::too_many_arguments)]
-pub fn apply_with_barrier<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore, B: ConsumeBarrier>(
+pub fn apply_with_barrier<
+    O: IdentityOracle,
+    S: Signaler,
+    C: Clock,
+    A: AuditStore,
+    W: ExitWaiter,
+    B: ConsumeBarrier,
+>(
     home: &Path,
     actor: &str,
     audit_reason: &str,
@@ -267,6 +330,7 @@ pub fn apply_with_barrier<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStor
     _signaler: &S,
     clock: &C,
     _audit: &A,
+    _waiter: &W,
     support: Support,
     barrier: &B,
 ) -> ApplyOutcome {
@@ -424,6 +488,7 @@ fn acquire_confirmation_lock(path: &Path) -> std::io::Result<ConfirmationLock> {
 /// A pid whose identity cannot be resolved is dropped from the snapshot rather
 /// than carried as a partially-known candidate — an unidentifiable process can
 /// never become a confirmable one.
+#[allow(clippy::too_many_arguments)]
 pub fn preview<O: IdentityOracle, C: Clock>(
     home: &Path,
     actor: &str,
