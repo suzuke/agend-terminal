@@ -818,16 +818,8 @@ impl AuditStore for JsonlAuditStore {
         // false in exactly the crash this ordering exists for.
         file.sync_all()?;
         // The first record also creates the directory entry, which needs its own
-        // fsync to survive. Same tolerance as `persist_confirmation`: some
-        // filesystems refuse fsync on a directory handle, but a failure to OPEN
-        // the directory means durability cannot be established at all.
-        std::fs::File::open(parent)?.sync_all().or_else(|error| {
-            if error.kind() == std::io::ErrorKind::InvalidInput {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })?;
+        // fsync to survive.
+        fsync_dir(parent)?;
         Ok(())
     }
 }
@@ -1338,6 +1330,35 @@ fn harden_private(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// fsync a DIRECTORY so a rename or a file creation inside it is itself
+/// durable — the step most often skipped, without which the dirent can be lost
+/// even though the file's own bytes were synced.
+///
+/// Unix-only by necessity, mirroring `store::fsync_parent_dir_checked`: on
+/// Windows a directory cannot be opened through `File::open` at all (it needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`), so the call fails with "Access is denied.
+/// (os error 5)" and would turn every confirmation write into a refusal. There
+/// is no clean std equivalent there, and `MoveFileEx` already orders the
+/// rename, so the non-Unix arm is an honest no-op rather than a false promise.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    // A failure to OPEN the directory is fatal — that means durability cannot be
+    // established at all. Some filesystems merely refuse fsync ON a directory
+    // handle; treat only that specific refusal as tolerable.
+    std::fs::File::open(dir)?.sync_all().or_else(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Guard holding the advisory lock for one confirmation.
 ///
 /// #1629: this is a raw `fs4` flock rather than a `store::acquire_file_lock`
@@ -1503,16 +1524,5 @@ fn persist_confirmation(path: &Path, confirmation: &Confirmation) -> std::io::Re
     // target replaced by rename must not be able to donate looser modes, and a
     // second write over a hand-loosened file must retighten it.
     harden_private(path, 0o600)?;
-    // Directory fsync is best-effort by platform, but a failure to OPEN the
-    // directory is not: that means we cannot establish durability at all.
-    std::fs::File::open(parent)?.sync_all().or_else(|error| {
-        // Some filesystems refuse fsync on a directory handle. The rename is
-        // still ordered on every platform this runs on; treat only that
-        // specific refusal as tolerable.
-        if error.kind() == std::io::ErrorKind::InvalidInput {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    })
+    fsync_dir(parent)
 }
