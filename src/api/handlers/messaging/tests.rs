@@ -3101,6 +3101,66 @@ fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_diffe
     }
 }
 
+#[test]
+fn validated_review_receipt_closes_task_when_binding_repair_refuses() {
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(output.status.success(), "git {:?} failed", args);
+    }
+
+    let home = tmp_home("validated-review-binding-repair-refusal");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = home.join("review-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "user.name", "test"]);
+    std::fs::write(repo.join("README"), "fixture\n").unwrap();
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-m", "fixture"]);
+
+    seed_review_task(&home, "t-current-review", "reviewer");
+    crate::binding::bind_full(
+        &home,
+        "reviewer",
+        "t-stale-review",
+        "review/pr-1",
+        &repo,
+        &repo,
+        false,
+    )
+    .unwrap();
+
+    bridge_verdict_to_review_task(
+        &home,
+        "reviewer",
+        &t127_verdict(
+            "VERIFIED exact receipt remains authoritative",
+            "t-current-review",
+            "owner/repo@feat/subject",
+        ),
+    );
+
+    assert_eq!(
+        task_status_of(&home, "t-current-review"),
+        Some(crate::task_events::TaskStatus::Done),
+        "binding repair refusal must not invalidate an already-validated exact receipt"
+    );
+    assert_eq!(
+        crate::binding::read(&home, "reviewer")
+            .and_then(|binding| binding["task_id"].as_str().map(str::to_owned))
+            .as_deref(),
+        Some("t-stale-review"),
+        "binding repair remains independently fail-closed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// F1 real-entry (spike t-…19288-1): a terminal correlated report driven through
 /// the REAL report handler (`track_dispatch`, the fn `handle_send` invokes) must
 /// end with the report body in the task's replayed `result`. Complements the
