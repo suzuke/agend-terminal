@@ -1055,21 +1055,42 @@ impl IdentityOracle for ScriptedOracle {
     }
 }
 
+#[derive(Default)]
+struct SignalScript {
+    /// TERM is refused for this pid.
+    term_fails: Option<u32>,
+    /// TERM finds the process already gone (ESRCH).
+    term_gone: Vec<u32>,
+    /// KILL is refused for this pid.
+    kill_fails: Option<u32>,
+    /// KILL finds the process already gone.
+    kill_gone: Vec<u32>,
+}
+
 struct LoggingSignaler {
     log: EventLog,
-    term_fails: Option<u32>,
+    script: SignalScript,
 }
 
 impl Signaler for LoggingSignaler {
     fn term(&self, pid: u32) -> SignalOutcome {
         self.log.push(format!("TERM:{pid}"));
-        if self.term_fails == Some(pid) {
+        if self.script.term_fails == Some(pid) {
             return SignalOutcome::PermissionDenied;
+        }
+        if self.script.term_gone.contains(&pid) {
+            return SignalOutcome::NoSuchProcess;
         }
         SignalOutcome::Delivered
     }
     fn kill(&self, pid: u32) -> SignalOutcome {
         self.log.push(format!("KILL:{pid}"));
+        if self.script.kill_fails == Some(pid) {
+            return SignalOutcome::PermissionDenied;
+        }
+        if self.script.kill_gone.contains(&pid) {
+            return SignalOutcome::NoSuchProcess;
+        }
         SignalOutcome::Delivered
     }
 }
@@ -1146,9 +1167,26 @@ fn run(
     survives: &[u32],
     audit_fails: bool,
 ) -> ApplyOutcome {
+    run_scripted(
+        stage,
+        SignalScript {
+            term_fails,
+            ..Default::default()
+        },
+        survives,
+        audit_fails,
+    )
+}
+
+fn run_scripted(
+    stage: &Stage,
+    script: SignalScript,
+    survives: &[u32],
+    audit_fails: bool,
+) -> ApplyOutcome {
     let signaler = LoggingSignaler {
         log: stage.log.clone(),
-        term_fails,
+        script,
     };
     let audit = LoggingAudit {
         log: stage.log.clone(),
@@ -1477,6 +1515,236 @@ fn a_signal_failure_stops_the_batch_3273() {
         vec!["audit:4242".to_string(), "TERM:4242".to_string()],
         "the second candidate must leave no trace at all: {:?}",
         stage.log.events()
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Contract 8 — authority uncertainty stops the batch, and the signal mapping
+// is pinned rather than merely documented.
+// ---------------------------------------------------------------------------
+
+/// An identity that changed under us is not just a fact about ONE candidate.
+/// Every candidate in this batch was validated at the same preflight instant,
+/// so discovering that the world moved means our picture of the remaining ones
+/// is stale too. Uncertainty about authority must stop the batch widening, not
+/// merely skip a row.
+#[test]
+fn an_identity_change_before_term_stops_the_batch_3273() {
+    let stage = staged(
+        "identity-change-stops",
+        &[
+            // preview, preflight, then recycled at the pre-TERM re-read
+            (
+                4242,
+                vec![
+                    identity(111_000, 501),
+                    identity(111_000, 501),
+                    identity(888_888, 501),
+                ],
+            ),
+            (4343, vec![identity(222_000, 501)]),
+        ],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[], false);
+
+    match outcome {
+        ApplyOutcome::Applied(results) => {
+            assert_eq!(results[0].1, CandidateOutcome::RefusedIdentityChanged);
+            assert_eq!(
+                results[1].1,
+                CandidateOutcome::NotAttempted,
+                "a stale picture of one candidate makes the rest of the batch unsafe: {results:?}"
+            );
+        }
+        other => panic!("expected per-candidate results, got {other:?}"),
+    }
+    assert!(
+        stage.log.signals().is_empty(),
+        "nothing may be signalled once authority is uncertain: {:?}",
+        stage.log.events()
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// Same rule when the identity changes DURING the grace window: the first
+/// candidate has already been TERMed, but the discovery still invalidates our
+/// picture of the rest.
+#[test]
+fn an_identity_change_during_grace_stops_the_batch_3273() {
+    let stage = staged(
+        "grace-change-stops",
+        &[
+            (
+                4242,
+                vec![
+                    identity(111_000, 501),
+                    identity(111_000, 501),
+                    identity(111_000, 501),
+                    identity(777_777, 501),
+                ],
+            ),
+            (4343, vec![identity(222_000, 501)]),
+        ],
+        Some(501),
+    );
+    let outcome = run(&stage, None, &[4242], false);
+
+    match outcome {
+        ApplyOutcome::Applied(results) => {
+            assert_eq!(results[0].1, CandidateOutcome::RefusedIdentityChanged);
+            assert_eq!(results[1].1, CandidateOutcome::NotAttempted);
+        }
+        other => panic!("expected per-candidate results, got {other:?}"),
+    }
+    assert_eq!(
+        stage.log.events(),
+        vec![
+            "audit:4242".to_string(),
+            "TERM:4242".to_string(),
+            format!("wait:4242:{GRACE_MS}"),
+        ],
+        "no KILL, and the second candidate must leave no trace"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// A TERM that finds the process already gone reached the outcome we wanted
+/// without us. It is not a failure, so the batch continues — and there is
+/// nothing to wait for, so no wait is issued.
+#[test]
+fn term_on_an_already_gone_process_needs_no_wait_3273() {
+    let stage = staged(
+        "term-esrch",
+        &[
+            (4242, vec![identity(111_000, 501)]),
+            (4343, vec![identity(222_000, 501)]),
+        ],
+        Some(501),
+    );
+    let outcome = run_scripted(
+        &stage,
+        SignalScript {
+            term_gone: vec![4242],
+            ..Default::default()
+        },
+        &[],
+        false,
+    );
+
+    match outcome {
+        ApplyOutcome::Applied(results) => {
+            assert_eq!(results[0].1, CandidateOutcome::Terminated);
+            assert_eq!(
+                results[1].1,
+                CandidateOutcome::Terminated,
+                "an already-gone process is not a failure; the batch continues: {results:?}"
+            );
+        }
+        other => panic!("expected per-candidate results, got {other:?}"),
+    }
+    assert_eq!(
+        stage.log.events(),
+        vec![
+            "audit:4242".to_string(),
+            "TERM:4242".to_string(),
+            "audit:4343".to_string(),
+            "TERM:4343".to_string(),
+            format!("wait:4343:{GRACE_MS}"),
+        ],
+        "no wait may be issued for a process that was already gone"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// A KILL that finds the process already gone reports Terminated, not Killed.
+/// Claiming a kill that did nothing would misreport what happened.
+#[test]
+fn kill_on_an_already_gone_process_reports_termination_3273() {
+    let stage = staged(
+        "kill-esrch",
+        &[(
+            4242,
+            vec![
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(111_000, 501),
+                identity(111_000, 501),
+            ],
+        )],
+        Some(501),
+    );
+    let outcome = run_scripted(
+        &stage,
+        SignalScript {
+            kill_gone: vec![4242],
+            ..Default::default()
+        },
+        &[4242],
+        false,
+    );
+
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied(vec![(
+            stage.snapshot.candidates[0].id.clone(),
+            CandidateOutcome::Terminated
+        )]),
+        "a kill that found nothing to kill did not kill anything"
+    );
+    std::fs::remove_dir_all(&stage.home).ok();
+}
+
+/// A refused KILL is a mutation-path failure exactly as a refused TERM is, and
+/// stops the batch.
+#[test]
+fn a_refused_kill_stops_the_batch_3273() {
+    let stage = staged(
+        "kill-refused",
+        &[
+            (
+                4242,
+                vec![
+                    identity(111_000, 501),
+                    identity(111_000, 501),
+                    identity(111_000, 501),
+                    identity(111_000, 501),
+                ],
+            ),
+            (4343, vec![identity(222_000, 501)]),
+        ],
+        Some(501),
+    );
+    let outcome = run_scripted(
+        &stage,
+        SignalScript {
+            kill_fails: Some(4242),
+            ..Default::default()
+        },
+        &[4242],
+        false,
+    );
+
+    match outcome {
+        ApplyOutcome::Applied(results) => {
+            assert!(
+                matches!(results[0].1, CandidateOutcome::SignalFailed(_)),
+                "{results:?}"
+            );
+            assert_eq!(results[1].1, CandidateOutcome::NotAttempted);
+        }
+        other => panic!("expected per-candidate results, got {other:?}"),
+    }
+    assert_eq!(
+        stage.log.events(),
+        vec![
+            "audit:4242".to_string(),
+            "TERM:4242".to_string(),
+            format!("wait:4242:{GRACE_MS}"),
+            "KILL:4242".to_string(),
+        ],
+        "the second candidate must leave no trace"
     );
     std::fs::remove_dir_all(&stage.home).ok();
 }
