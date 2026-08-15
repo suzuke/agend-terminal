@@ -2959,13 +2959,7 @@ fn production_validated_review_bridge_rejects_reporter_identity_mismatch() {
         "correlation_id": "t-production-reviewer-mismatch",
     }));
 
-    crate::agent_ops::messaging::track_dispatch(
-        &home,
-        &request,
-        "reviewer-b",
-        "lead",
-        &msg,
-    );
+    crate::agent_ops::messaging::track_dispatch(&home, &request, "reviewer-b", "lead", &msg);
 
     assert_eq!(
         task_status_of(&home, "t-production-reviewer-mismatch"),
