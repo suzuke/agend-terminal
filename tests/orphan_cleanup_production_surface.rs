@@ -546,7 +546,7 @@ fn bare_doctor_remains_report_only_3273() {
 // ---------------------------------------------------------------------------
 
 use agend_terminal::admin::orphan_cleanup::{
-    signal_kill, signal_term, KillProbe, KillSyscall, Signaler as _, UnixSignaler,
+    signal_kill, signal_term, KillSyscall, Signaler as _, UnixSignaler,
 };
 
 #[derive(Default)]
@@ -596,6 +596,11 @@ fn the_unix_signaler_targets_one_exact_positive_pid_3273() {
 #[cfg(unix)]
 #[test]
 fn the_liveness_probe_treats_eperm_as_alive_3273() {
+    // Imported here rather than at module scope: this contract is Unix-only, so
+    // a top-level import would be an unused one off Unix and `-D warnings`
+    // rejects it. Same placement as `LiveIdentityReader` below.
+    use agend_terminal::admin::orphan_cleanup::KillProbe;
+
     let gone = KillProbe {
         syscall: RecordingSyscall {
             rc: -1,
