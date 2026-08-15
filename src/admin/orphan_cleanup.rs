@@ -258,23 +258,139 @@ pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore>(
 /// than [`NoBarrier`].
 #[allow(clippy::too_many_arguments)]
 pub fn apply_with_barrier<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore, B: ConsumeBarrier>(
-    _home: &Path,
-    _actor: &str,
-    _audit_reason: &str,
-    _token: &str,
-    _confirm_ids: &[String],
+    home: &Path,
+    actor: &str,
+    audit_reason: &str,
+    token: &str,
+    confirm_ids: &[String],
     _oracle: &O,
     _signaler: &S,
-    _clock: &C,
+    clock: &C,
     _audit: &A,
-    _support: Support,
-    _barrier: &B,
+    support: Support,
+    barrier: &B,
 ) -> ApplyOutcome {
-    // RED STUB (#3273): no gate is implemented yet, so every call lands on the
-    // staging refusal. It signals nothing — which is why the contracts assert
-    // the exact reason: a stub that merely "refuses" would otherwise satisfy
-    // every refusal contract without a single gate existing.
+    // An unsupported platform or backend stays report-only however correct the
+    // confirmation is: there is no identity oracle to revalidate against, and
+    // without that a signal would rest on the snapshot's word alone.
+    if matches!(support, Support::Unsupported(_)) {
+        return ApplyOutcome::Refused(RefusalReason::Unsupported);
+    }
+    // Pure input checks first — they need no disk and no lock.
+    if audit_reason.trim().is_empty() {
+        return ApplyOutcome::Refused(RefusalReason::EmptyAuditReason);
+    }
+    if token.is_empty() {
+        return ApplyOutcome::Refused(RefusalReason::MissingToken);
+    }
+    let Some(path) = confirmation_path(home, token) else {
+        // Shape alone, before the token is ever used to address a file. This is
+        // what stops a token being spent as a path component.
+        return ApplyOutcome::Refused(RefusalReason::MalformedToken);
+    };
+
+    // EVERYTHING below happens under one advisory lock on this confirmation.
+    // A read of `consumed == false` followed by a later write of `true` is not
+    // a compare-and-swap: two applies can both read `false` and both proceed.
+    // Holding the lock across read → validate → durable consume is what makes
+    // "single use" true under concurrency rather than only in sequence.
+    let _guard = match acquire_confirmation_lock(&path) {
+        Ok(guard) => guard,
+        Err(_) => return ApplyOutcome::Refused(RefusalReason::Contended),
+    };
+
+    let Ok(raw) = std::fs::read(&path) else {
+        return ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable);
+    };
+    let Ok(stored) = serde_json::from_slice::<Confirmation>(&raw) else {
+        return ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable);
+    };
+    if stored.schema_version != 1 {
+        // Not a weaker confirmation — an unreadable one.
+        return ApplyOutcome::Refused(RefusalReason::SchemaMismatch);
+    }
+    if stored.actor != actor {
+        return ApplyOutcome::Refused(RefusalReason::ActorMismatch);
+    }
+    if stored.audit_reason != audit_reason {
+        return ApplyOutcome::Refused(RefusalReason::AuditReasonMismatch);
+    }
+    // A confirmation asserts a liveness fact and liveness decays, so the window
+    // is closed on BOTH sides: a negative age means the clock moved backwards
+    // relative to the record, and a confirmation from the future is not fresh,
+    // it is unusable.
+    let age_ms = clock.now_ms().saturating_sub(stored.created_ms);
+    if !(0..=CONFIRM_TTL_MS).contains(&age_ms) {
+        return ApplyOutcome::Refused(RefusalReason::Expired);
+    }
+    if stored.consumed {
+        return ApplyOutcome::Refused(RefusalReason::Replayed);
+    }
+    // All-or-nothing, and deliberately NOT deduplicated: a repeated id is not a
+    // second confirmation of the same candidate, it is a set that does not equal
+    // the snapshot's. Sorting makes the comparison order-insensitive, which is a
+    // property of the comparison rather than a licence to accept a different set.
+    let mut confirmed: Vec<&str> = confirm_ids.iter().map(String::as_str).collect();
+    confirmed.sort_unstable();
+    let mut expected: Vec<&str> = stored
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    expected.sort_unstable();
+    if confirmed != expected {
+        return ApplyOutcome::Refused(RefusalReason::ConfirmIdsNotExact);
+    }
+
+    // The exact point a non-CAS implementation would interleave. Production
+    // passes NoBarrier, so this is a no-op outside the contracts.
+    barrier.before_consume();
+
+    // Durable consumption BEFORE anything downstream can act. Consuming and
+    // then failing later is acceptable fail-closed; acting on a confirmation
+    // whose consumption never reached disk is not.
+    let mut consumed = stored;
+    consumed.consumed = true;
+    if persist_confirmation(&path, &consumed).is_err() {
+        return ApplyOutcome::Refused(RefusalReason::ConfirmationUnavailable);
+    }
+
+    // Authority is fully established here. The executor stage lands next; until
+    // then this refuses rather than pretending to have acted.
     ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable)
+}
+
+/// Guard holding the advisory lock for one confirmation.
+pub struct ConfirmationLock {
+    file: std::fs::File,
+}
+
+impl Drop for ConfirmationLock {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
+/// Take the advisory lock for one confirmation. Keyed on the confirmation's own
+/// path so two different tokens never serialise against each other.
+fn acquire_confirmation_lock(path: &Path) -> std::io::Result<ConfirmationLock> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "confirmation path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    // Explicit trait syntax: Rust 1.89 stabilised an inherent `File::lock` with
+    // the same name, and selecting it would trip the MSRV gate (rust-version is
+    // below that). Same reasoning as `store::acquire_file_lock`.
+    fs4::FileExt::lock(&file)?;
+    Ok(ConfirmationLock { file })
 }
 
 /// Dry run: resolve each proposed pid's exact identity and emit immutable ids.

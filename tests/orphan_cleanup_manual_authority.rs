@@ -628,10 +628,29 @@ fn concurrent_applies_consume_a_confirmation_exactly_once_3273() {
     }
 
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    // A "winner" is an apply that got past every gate to the executor stage —
+    // not merely one that avoided the replay refusal. The distinction matters:
+    // an unserialised implementation can also produce a TORN READ, and counting
+    // that as a loser would let the race pass for the wrong reason.
     let winners = results
         .iter()
         .filter(|(outcome, _)| {
-            !matches!(
+            matches!(
+                outcome,
+                ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable)
+            )
+        })
+        .count();
+    assert_eq!(
+        winners, 1,
+        "exactly one apply may consume a single-use confirmation: {results:?}"
+    );
+    // And the other one must have lost cleanly — a torn read or an unreadable
+    // confirmation is a serialization failure wearing a refusal's clothes.
+    let clean_losers = results
+        .iter()
+        .filter(|(outcome, _)| {
+            matches!(
                 outcome,
                 ApplyOutcome::Refused(RefusalReason::Replayed)
                     | ApplyOutcome::Refused(RefusalReason::Contended)
@@ -639,8 +658,8 @@ fn concurrent_applies_consume_a_confirmation_exactly_once_3273() {
         })
         .count();
     assert_eq!(
-        winners, 1,
-        "exactly one apply may consume a single-use confirmation: {results:?}"
+        clean_losers, 1,
+        "the loser must refuse as already-spent, not stumble over a half-written file: {results:?}"
     );
     for (_, signals) in &results {
         assert_eq!(*signals, 0, "no signal may be emitted in this slice");
