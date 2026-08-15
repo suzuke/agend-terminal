@@ -64,28 +64,6 @@ pub(crate) fn assignee_completion_guard(
     caller: &str,
     record: &crate::task_events::TaskRecord,
 ) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
-    assignee_completion_guard_with_review_branch(home, task_id, caller, record, false)
-}
-
-/// Completion proof used only after a validated review receipt has been accepted.
-/// Disposable review worktrees intentionally use an isolated branch, so their
-/// binding branch is not required to equal the subject task's PR branch.
-pub(crate) fn validated_review_completion_guard(
-    home: &Path,
-    task_id: &str,
-    caller: &str,
-    record: &crate::task_events::TaskRecord,
-) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
-    assignee_completion_guard_with_review_branch(home, task_id, caller, record, true)
-}
-
-fn assignee_completion_guard_with_review_branch(
-    home: &Path,
-    task_id: &str,
-    caller: &str,
-    record: &crate::task_events::TaskRecord,
-    allow_disposable_review_branch_mismatch: bool,
-) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
     let Some(branch) = record.branch.as_deref() else {
         return Ok(None);
     };
@@ -114,11 +92,9 @@ fn assignee_completion_guard_with_review_branch(
         (Some("disposable_review"), Some("DaemonProvisionedReview"), Some(head)) => Some(head),
         _ => None,
     };
-    let branch_matches_task = binding_branch == Some(branch)
-        || (allow_disposable_review_branch_mismatch && provisioned_head.is_some());
     if binding_agent != Some(caller)
         || binding_task != Some(task_id)
-        || !branch_matches_task
+        || binding_branch != Some(branch)
         || source_repo.is_empty()
         || worktree.is_empty()
     {
@@ -134,13 +110,10 @@ fn assignee_completion_guard_with_review_branch(
         return Err("assignee worktree has dirty or unpushed work".to_string());
     }
 
-    if !allow_disposable_review_branch_mismatch || provisioned_head.is_none() {
-        let actual_branch =
-            crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
-                .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
-        if actual_branch != branch {
-            return Err("assignee worktree branch does not match the task".to_string());
-        }
+    let actual_branch = crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
+        .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
+    if actual_branch != branch {
+        return Err("assignee worktree branch does not match the task".to_string());
     }
     let disposable_review_at_provisioned_head = if let Some(expected_head) = provisioned_head {
         let actual_head = crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"])

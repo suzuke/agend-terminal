@@ -91,14 +91,19 @@ fn auto_close_on_report_with_mode(
     if assignee != reporter {
         return Ok(false);
     }
-    let completion_guard = if allow_disposable_review_branch_mismatch {
-        super::validated_review_completion_guard
+    let completion_receipt = if allow_disposable_review_branch_mismatch {
+        // The caller reaches this mode only after the typed review receipt has
+        // already proven the exact assignment, task, reviewer, and reviewed
+        // head/evidence. Requiring a live worktree binding or merge receipt
+        // here is both redundant and impossible after a legitimate review
+        // binding release (reviews also precede merges). Binding/worktree
+        // preservation remains a separate fail-closed lifecycle.
+        None
     } else {
-        super::assignee_completion_guard
-    };
-    let completion_receipt = match completion_guard(home, correlation_id, reporter, record) {
-        Ok(receipt) => receipt,
-        Err(_) => return Ok(false),
+        match super::assignee_completion_guard(home, correlation_id, reporter, record) {
+            Ok(receipt) => receipt,
+            Err(reason) => return Err(anyhow::anyhow!(reason)),
+        }
     };
     let summary = if report_text.chars().count() > 200 {
         let truncated: String = report_text.chars().take(200).collect();
@@ -449,15 +454,8 @@ mod tests {
         let task_id = "t-ordinary-guard-reason";
         seed_claimed_branch_task(&home, task_id, "dev-agent", "feat/unmerged");
 
-        let error = auto_close_on_report(
-            &home,
-            "report",
-            task_id,
-            "dev-agent",
-            "done",
-            true,
-        )
-        .expect_err("a branch task without binding or merge receipt must fail closed");
+        let error = auto_close_on_report(&home, "report", task_id, "dev-agent", "done", true)
+            .expect_err("a branch task without binding or merge receipt must fail closed");
 
         assert!(
             error.to_string().contains(

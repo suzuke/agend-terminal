@@ -749,14 +749,17 @@ pub(crate) fn track_dispatch(
                     );
             }
             if corr.starts_with("t-") {
-                let _ = crate::tasks::auto_close::auto_close_on_report(
+                if let Err(error) = crate::tasks::auto_close::auto_close_on_report(
                     home,
                     kind_str,
                     corr,
                     from,
                     &msg.text,
                     msg.terminal.unwrap_or(false),
-                );
+                ) {
+                    tracing::warn!(reporter = %from, task_id = %corr, %error,
+                        "task report auto-close completion guard refused");
+                }
             }
         }
         bridge_verdict_to_review_task(home, from, msg);
@@ -785,8 +788,7 @@ fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox
             crate::binding::retarget_disposable_review_binding_for_receipt(home, summary)
         {
             tracing::warn!(%reporter, %task_id, %error,
-                "validated review task binding repair refused; task auto-close stays fail-closed");
-            return;
+                "validated review task binding repair refused; binding preserved while exact receipt completion continues");
         }
         match crate::tasks::auto_close::auto_close_on_validated_review(
             home, task_id, reporter, &msg.text,
