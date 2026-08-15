@@ -274,17 +274,12 @@ fn full_delete_instance_removes_usage_limit_notify_1906() {
     std::fs::remove_dir_all(home).ok();
 }
 
-/// #2550 telegram-topic-lifecycle (identity-confusion root cause): when
-/// `telegram::delete_topic` can't reach Telegram (no channel configured here
-/// → `ChannelUnavailable`, the same "topic-side cleanup failed" shape as a
-/// live `PermissionDenied`/`ApiError`), `full_delete_instance` must STILL
-/// unregister the topic_id from `topics.json` — leaving it mapped is exactly
-/// what let a LATER same-name instance silently inherit a stale/foreign
-/// topic_id via `create_topic_for_instance`'s reuse-if-found check, which
-/// could then have its own first genuine topic-closed event tear down the
-/// wrong (new) instance.
+/// #3232 crash-safe deletion: when Telegram deletion cannot be attempted, the
+/// durable registry row is the only recovery handle. It must survive until the
+/// topic is known absent chat-side; otherwise the Bot API offers no enumeration
+/// path that can rediscover the orphan.
 #[test]
-fn full_delete_instance_unregisters_topic_even_when_telegram_delete_fails_2550() {
+fn full_delete_instance_retains_topic_when_telegram_delete_fails_3232() {
     let home = tmp_home("topic_unregister_on_fail");
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
@@ -301,14 +296,101 @@ fn full_delete_instance_unregisters_topic_even_when_telegram_delete_fails_2550()
         "pre: topic mapping must exist"
     );
 
-    let _ = super::full_delete_instance(&home, "doomed");
+    let result = super::full_delete_instance(&home, "doomed");
 
+    let registry = crate::channel::telegram::load_topic_registry(&home);
+    assert!(
+        registry
+            .get(&501)
+            .is_some_and(|name| name.starts_with("__orphaned__:")),
+        "topics.json must retain a non-reusable recovery tombstone: {registry:?}"
+    );
     assert_eq!(
         crate::channel::telegram::lookup_topic_for_instance(&home, "doomed"),
         None,
-        "topics.json must be unregistered even when the Telegram-side delete \
-         couldn't run — a stale mapping left behind is what a later same-name \
-         instance would silently (and wrongly) inherit"
+        "a later same-name instance must not reuse the failed-delete topic"
+    );
+    assert!(result.is_err(), "retained cleanup residue must be surfaced");
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #3232 residual audit: `full_delete_instance` must never report a clean
+/// teardown while `topics.json` still maps the LIVE instance name — that row is
+/// what a later same-name instance inherits via `create_topic_for_instance`.
+/// The audit reads the registry itself rather than trusting `delete_topic`'s
+/// outcome, which is the gap that let a swallowed unregister failure surface as
+/// success.
+///
+/// Forced write failure with reads intact: the home directory is made
+/// read-only, so the atomic write cannot create its temp file while the seeded
+/// row is still readable. Skipped when the mode bits do not bite (e.g. root).
+#[test]
+#[cfg(unix)]
+fn full_delete_instance_audits_surviving_live_name_row_3232() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp_home("topic_residual_audit");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  doomed:\n    backend: claude\n    topic_id: 501\n",
+    )
+    .unwrap();
+    std::fs::write(home.join("topics.json"), "{\"501\":\"doomed\"}").unwrap();
+
+    let original = std::fs::metadata(&home).unwrap().permissions();
+    let mut readonly = original.clone();
+    readonly.set_mode(0o555);
+    std::fs::set_permissions(&home, readonly).unwrap();
+    // Premise: writes must actually be blocked, or this proves nothing.
+    let writes_blocked = std::fs::write(home.join(".probe"), b"x").is_err();
+    if !writes_blocked {
+        std::fs::set_permissions(&home, original).ok();
+        std::fs::remove_dir_all(&home).ok();
+        eprintln!("SKIP: this user can write a mode-555 directory; premise unavailable");
+        return;
+    }
+
+    let result = super::full_delete_instance(&home, "doomed");
+    let rendered = format!("{result:?}");
+
+    std::fs::set_permissions(&home, original).ok();
+    assert!(
+        rendered.contains("topics.json still maps"),
+        "a surviving live-name row must be audited, not reported as a clean teardown: {rendered}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3232 fail-safe: the tombstone is what makes a retained row non-reusable, so
+/// a tombstone that could not be WRITTEN must never pass silently — that is the
+/// state in which a later same-name instance could still inherit the topic
+/// (the #2550 identity confusion). `topic_id` is resolved from fleet.yaml, not
+/// from `topics.json`, so an unwritable registry still reaches the cleanup arm.
+///
+/// This pins the disclosure, not the fallback's success: when the registry file
+/// itself cannot be written, the fallback `unregister_topic` cannot land either,
+/// and the honest outcome is a surfaced error rather than a silent one.
+#[test]
+fn full_delete_instance_surfaces_unwritable_orphan_tombstone_3232() {
+    let home = tmp_home("topic_tombstone_unwritable");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  doomed:\n    backend: claude\n    topic_id: 501\n",
+    )
+    .unwrap();
+    // A directory where the registry file belongs: every read-modify-write of
+    // topics.json fails, so both the tombstone and the fallback unregister do.
+    std::fs::create_dir_all(home.join("topics.json")).unwrap();
+
+    let result = super::full_delete_instance(&home, "doomed");
+
+    let rendered = format!("{result:?}");
+    assert!(
+        rendered.contains("orphan tombstone"),
+        "an unwritable recovery tombstone must be reported, not swallowed: {rendered}"
+    );
+    assert!(
+        crate::channel::telegram::lookup_topic_for_instance(&home, "doomed").is_none(),
+        "no reusable live-name mapping may survive a failed cleanup"
     );
     std::fs::remove_dir_all(home).ok();
 }

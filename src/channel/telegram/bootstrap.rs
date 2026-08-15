@@ -18,6 +18,17 @@ pub fn attach_registry(state: &Arc<Mutex<TelegramState>>, registry: AgentRegistr
     s.registry = Some(registry);
 }
 
+/// RED DECLARATION LIFT (#3232): declared so the sweep contract can be expressed. The
+/// ANSWER is main's — main's boot sweep never selects a tombstone for reaping. GREEN
+/// implements the predicate.
+pub(crate) fn is_sweepable_orphan(
+    _topic_id: i32,
+    _instance_name: &str,
+    _is_live_instance: bool,
+) -> bool {
+    false
+}
+
 /// Initialize Telegram from fleet config.
 pub fn init_from_config(
     config: &crate::fleet::FleetConfig,
@@ -251,6 +262,37 @@ pub(super) fn resolve_fleet_binding(
 mod tests {
     use super::*;
     use crate::fleet::FleetConfig;
+
+    /// #3232: the boot sweep is the retry path for a failed topic delete. The
+    /// `__orphaned__:<name>` tombstone `full_delete_instance` leaves behind must
+    /// therefore be SELECTED here — it is not a fleet.yaml instance, so it takes
+    /// the ordinary orphan arm and the delete is attempted again on every boot.
+    /// If this stopped selecting the tombstone, the retained row would become
+    /// permanent litter instead of a recovery handle, and the Bot API offers no
+    /// enumeration to find it another way.
+    #[test]
+    fn boot_sweep_selects_orphan_tombstones_3232() {
+        assert!(
+            is_sweepable_orphan(77, "__orphaned__:doomed", false),
+            "a failed-delete tombstone must be retried by the boot sweep"
+        );
+        assert!(
+            is_sweepable_orphan(77, "retired", false),
+            "an ordinary retired instance stays sweepable"
+        );
+        assert!(
+            !is_sweepable_orphan(77, "alive", true),
+            "a live fleet.yaml instance must never be swept"
+        );
+        assert!(
+            !is_sweepable_orphan(77, FLEET_BINDING_SENTINEL, false),
+            "the fleet-binding sentinel is not an instance and must survive"
+        );
+        assert!(
+            !is_sweepable_orphan(1, "anything", false),
+            "topic_id 1 is the forum General topic, never ours to delete"
+        );
+    }
 
     /// #2005 left the symmetric fallback in `creds.rs` only; this site kept a
     /// legacy-ward literal, so a fleet pinning `bot_token_env: AGEND_BOT_TOKEN`

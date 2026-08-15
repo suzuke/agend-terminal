@@ -9,7 +9,17 @@ use crate::channel::telegram::send::{
     needs_separate_text, resolve_caption, send_media, send_with_topic, send_with_topic_capturing_id,
 };
 use crate::channel::telegram::state::{block_on_value, lock_state, TelegramState};
-use crate::channel::telegram::topic_registry::{create_topic_for_instance, delete_topic};
+use crate::channel::telegram::topic_registry::{
+    create_topic_for_instance, delete_topic, DeleteTopicOutcome,
+};
+
+/// RED DECLARATION LIFT (#3232): declared so the propagation contract can be expressed. The
+/// ANSWER is main's — main calls `delete_topic` and DISCARDS the outcome, so no failure is
+/// ever surfaced to a caller. GREEN maps each failing variant to an error.
+#[allow(dead_code)]
+fn delete_topic_outcome_to_result(_outcome: DeleteTopicOutcome) -> anyhow::Result<()> {
+    Ok(())
+}
 use parking_lot::Mutex;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -572,6 +582,26 @@ mod tests {
         };
         let err = channel.delete(&msg_ref).expect_err("must Err");
         assert!(err.to_string().contains("bot not initialized"));
+    }
+
+    #[test]
+    fn remove_binding_outcome_propagates_delete_failure_3232() {
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::Deleted).is_ok());
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::AlreadyGone).is_ok());
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::PermissionDenied).is_err());
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::ChannelUnavailable).is_err());
+        assert!(
+            delete_topic_outcome_to_result(DeleteTopicOutcome::ApiError("boom".into())).is_err()
+        );
+        // #3232: chat side settled, durable row survived — the adapter must not
+        // hand back Ok, or the caller records a clean teardown while the
+        // live-name mapping is still inheritable.
+        assert!(
+            delete_topic_outcome_to_result(DeleteTopicOutcome::RegistryPersistFailed(
+                "row persisted".into()
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -59,7 +59,10 @@ pub(crate) fn register_topic(
     Ok(())
 }
 
-pub(crate) fn unregister_topic(home: &Path, topic_id: i32) {
+pub(crate) fn unregister_topic(home: &Path, topic_id: i32) -> anyhow::Result<()> {
+    // RED SIGNATURE LIFT (#3232): the return type exists so the contracts below can be
+    // expressed at all. The BEHAVIOUR is main's, unchanged — the persistence error is still
+    // swallowed and success is still reported unconditionally. GREEN propagates it.
     // #1886 C1: same locked-RMW discipline as register_topic.
     let _ = crate::store::with_json_state_or_create::<HashMap<String, String>, _, _, _>(
         &topic_registry_path(home),
@@ -68,6 +71,7 @@ pub(crate) fn unregister_topic(home: &Path, topic_id: i32) {
             reg.remove(&topic_id.to_string());
         },
     );
+    Ok(())
 }
 
 /// Reverse-lookup a topic_id for an instance from `topics.json`.
@@ -248,6 +252,19 @@ pub enum DeleteTopicOutcome {
     /// or bot token missing). Topic remains in registry; no chat-
     /// side attempt was made.
     ChannelUnavailable,
+    /// RED DECLARATION LIFT (#3232): named so the contracts can reference it. Nothing in
+    /// RED ever constructs it — main has no already-gone classification.
+    AlreadyGone,
+    /// RED DECLARATION LIFT (#3232): named so the contracts can reference it. Nothing in
+    /// RED ever constructs it — main folds a surviving row into `Deleted`.
+    RegistryPersistFailed(String),
+}
+
+/// RED DECLARATION LIFT (#3232): declared so the classification contract can be expressed.
+/// The ANSWER is main's — main has no already-gone classification at all, so every error,
+/// TOPIC_ID_INVALID included, stays a generic failure. GREEN implements the match.
+fn is_topic_already_gone_error(_error: &str) -> bool {
+    false
 }
 
 /// Delete a forum topic.
@@ -296,7 +313,7 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) -> DeleteTopicOutcome
     });
     match result {
         Ok(_) => {
-            unregister_topic(home, topic_id);
+            let _ = unregister_topic(home, topic_id);
             tracing::info!(topic_id, "delete_topic: deleted topic + unregistered");
             DeleteTopicOutcome::Deleted
         }
@@ -379,10 +396,46 @@ mod tests {
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&1).map(String::as_str), Some("alpha"));
         assert_eq!(reg.get(&2).map(String::as_str), Some("beta"));
-        unregister_topic(&home, 1);
+        unregister_topic(&home, 1).unwrap();
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&1), None);
         assert_eq!(reg.get(&2).map(String::as_str), Some("beta"));
+    }
+
+    /// #3232: a forced atomic-write failure must make `unregister_topic` fail
+    /// LOUDLY. This is the single propagation that keeps `delete_topic` from
+    /// returning `Deleted`/`AlreadyGone` while the row survives — the discarded
+    /// result used to turn a persistence failure into a reported success, with
+    /// the live-name mapping still there for the next same-name instance.
+    #[test]
+    fn unregister_topic_fails_closed_when_registry_unwritable_3232() {
+        let home = tmp_home("unregister-unwritable-3232");
+        // A directory where the registry file belongs: the locked
+        // read-modify-write cannot complete.
+        std::fs::create_dir_all(topic_registry_path(&home)).unwrap();
+        let result = unregister_topic(&home, 42);
+        assert!(
+            result.is_err(),
+            "an unwritable registry must surface, never report a clean removal"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The same failure, seen through `delete_topic`'s contract: whatever the
+    /// chat side reported, a surviving row may not be dressed up as success.
+    /// Driven at the outcome level because the chat-side call needs a live bot.
+    #[test]
+    fn registry_persist_failure_is_not_a_success_outcome_3232() {
+        let deleted = DeleteTopicOutcome::Deleted;
+        let persisted = DeleteTopicOutcome::RegistryPersistFailed("boom".into());
+        assert_ne!(
+            deleted, persisted,
+            "a persistence failure must not compare equal to a clean delete"
+        );
+        assert!(
+            matches!(persisted, DeleteTopicOutcome::RegistryPersistFailed(ref e) if e == "boom"),
+            "the persistence error must be carried for the operator"
+        );
     }
 
     #[test]
@@ -514,7 +567,7 @@ mod tests {
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&100), Some(&"alice".to_string()));
         assert_eq!(reg.get(&200), Some(&"bob".to_string()));
-        unregister_topic(&home, 100);
+        unregister_topic(&home, 100).unwrap();
         let reg = load_topic_registry(&home);
         assert!(!reg.contains_key(&100));
         assert_eq!(reg.get(&200), Some(&"bob".to_string()));
@@ -555,6 +608,17 @@ mod tests {
         let home = tmp_home("delete-topic-home-scope");
         delete_topic(&home, 999_999);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn topic_id_invalid_is_terminal_already_gone_3232() {
+        assert!(is_topic_already_gone_error("Bad Request: TOPIC_ID_INVALID"));
+        assert!(is_topic_already_gone_error(
+            "Telegram API error: topic_id_invalid"
+        ));
+        assert!(!is_topic_already_gone_error(
+            "Too Many Requests: retry after 10"
+        ));
     }
 
     #[test]

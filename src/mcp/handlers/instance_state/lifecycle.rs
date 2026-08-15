@@ -189,7 +189,7 @@ pub(crate) fn full_delete_instance_with_runtime(
         match telegram::delete_topic(home, tid) {
             telegram::DeleteTopicOutcome::Deleted => {}
             other => {
-                telegram::unregister_topic(home, tid);
+                let _ = telegram::unregister_topic(home, tid);
                 let detail = format!("telegram topic {tid} cleanup: {other:?}");
                 tracing::warn!(%name, topic_id = tid, %detail, "full_delete_instance: topic cleanup incomplete — registry unregistered anyway");
                 step_errors.push(detail);
