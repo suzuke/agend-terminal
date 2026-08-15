@@ -564,6 +564,39 @@ fn identity_matches<O: IdentityOracle>(oracle: &O, candidate: &CandidateSnapshot
         .is_some_and(|live| live.start_token == candidate.start_token && live.uid == candidate.uid)
 }
 
+/// A pid proven safe to signal INDIVIDUALLY.
+///
+/// The whole consensus rests on "one exact PID, never a group, a session or a
+/// tree", and on Unix the naive `pid as i32` quietly breaks that in two ways:
+///
+/// * `0` — `kill(0, sig)` signals every process in the CALLER's process group.
+/// * `> i32::MAX` — the cast wraps NEGATIVE, and `kill(-n, sig)` signals process
+///   group `n`.
+///
+/// Both turn an exact-pid contract into a blast radius, and neither is visible
+/// at the call site. Constructing this type is the only way to reach a signal,
+/// so the conversion cannot be skipped by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactPid(i32);
+
+impl ExactPid {
+    pub fn new(pid: u32) -> Option<Self> {
+        // RED STUB (#3273): the naive cast, exactly as it would be written by
+        // someone who had not thought about kill(2)'s sign convention.
+        Some(ExactPid(pid as i32))
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Whether this build can support manual cleanup at all.
+pub fn platform_support() -> Support {
+    // RED STUB (#3273): unconditional, so the non-Unix arm does not yet exist.
+    Support::Supported
+}
+
 /// A confirmation token and its sidecar ARE authority material: anything that
 /// can read them can name the exact triple an operator confirmed, and anything
 /// that can write them can forge one. On Unix `File::create` honours the
