@@ -399,6 +399,64 @@ pub(crate) fn check_helper_staleness(home: &Path) -> String {
 // ─────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────
+// #3273 V2: `agend-terminal doctor orphans preview|apply` — the ONLY
+// surface from which a manual cleanup signal can originate. Both
+// functions are deliberately thin: they build the live service and
+// forward through the handlers in `admin::orphan_cleanup`, which own
+// the forwarding contract. No authority rule lives here — `cli.rs` is
+// bin-only, so a rule placed here could not be reached by a contract.
+// `run_doctor` above is untouched and remains a report.
+// ─────────────────────────────────────────────────────────────────
+
+/// `doctor orphans preview` — the dry run. Signals nothing by construction.
+pub fn run_doctor_orphans_preview(
+    home: &Path,
+    actor: &str,
+    audit_reason: &str,
+    pids: &[u32],
+) -> anyhow::Result<()> {
+    let service = crate::admin::orphan_cleanup::LiveOrphanCleanupService {
+        home: home.to_path_buf(),
+    };
+    match crate::admin::orphan_cleanup::handle_preview_command(&service, actor, audit_reason, pids)
+    {
+        Ok(rendered) => {
+            print!("{rendered}");
+            Ok(())
+        }
+        Err(message) => Err(anyhow::anyhow!(message)),
+    }
+}
+
+/// `doctor orphans apply` — consume one confirmation. A refusal is an `Err`, so
+/// it leaves through a non-zero exit: a script must be able to tell a refusal
+/// from a completed cleanup.
+pub fn run_doctor_orphans_apply(
+    home: &Path,
+    token: &str,
+    actor: &str,
+    audit_reason: &str,
+    confirm_ids: &[String],
+) -> anyhow::Result<()> {
+    let service = crate::admin::orphan_cleanup::LiveOrphanCleanupService {
+        home: home.to_path_buf(),
+    };
+    match crate::admin::orphan_cleanup::handle_apply_command(
+        &service,
+        token,
+        actor,
+        audit_reason,
+        confirm_ids,
+    ) {
+        Ok(rendered) => {
+            print!("{rendered}");
+            Ok(())
+        }
+        Err(message) => Err(anyhow::anyhow!(message)),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Sprint 59 Wave 2 PR-IMPL (F2 — γ): `agend-terminal doctor topics`
 // — operator-callable diagnostic for telegram topic state.
 // Backed by `crate::bootstrap::doctor_topics`.

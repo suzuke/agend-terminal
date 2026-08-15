@@ -235,6 +235,12 @@ junction = "2"
 embed-resource = "3"
 
 [dev-dependencies]
+# #3273: `tests/orphan_cleanup_production_surface.rs` asserts the errno mapping
+# (`ESRCH` fail-forward vs `EPERM` fail-stop) on EVERY platform, because that
+# distinction is what stops "the signal was sent" from being an assumption. The
+# normal `libc` dependency is `cfg(unix)`-only, so the constants are named here
+# unconditionally rather than cfg-ing the contract away on Windows.
+libc = "0.2"
 proc-macro2 = "1"
 # #event-bus Step 2 (legacy-zero): a `#[ctor] #[cfg(test)]` fn registers the bus
 # subscribers ONCE at test-binary load — before any test — so the integration

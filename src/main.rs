@@ -714,6 +714,51 @@ enum DoctorAction {
         #[arg(long)]
         yes: bool,
     },
+    /// #3273 V2: manual cleanup of orphaned processes. Two explicit steps —
+    /// `preview` mints a single-use confirmation over an immutable snapshot,
+    /// `apply` consumes it. Nothing here is automatic: the default `doctor`
+    /// report can describe an orphan but can never act on one.
+    Orphans {
+        #[command(subcommand)]
+        action: OrphansAction,
+    },
+}
+
+/// Subcommands for `agend-terminal doctor orphans`.
+#[derive(Subcommand)]
+enum OrphansAction {
+    /// Dry run: re-derive each proposed pid's exact identity and mint a
+    /// single-use confirmation for it. Signals nothing, ever.
+    Preview {
+        /// Who is asking. Recorded in the confirmation and in the audit, and
+        /// `apply` must present the same value.
+        #[arg(long)]
+        actor: String,
+        /// Why. Recorded alongside the actor; `apply` must present it verbatim.
+        #[arg(long)]
+        audit_reason: String,
+        /// Propose a pid for the snapshot. Repeat for more than one.
+        #[arg(long = "pid", required = true)]
+        pid: Vec<u32>,
+    },
+    /// Consume one confirmation and act on EXACTLY the confirmed set. Every
+    /// argument is required at the parser: there is then no code path in which
+    /// authority material can be absent.
+    Apply {
+        /// The token `preview` printed.
+        #[arg(long, required = true)]
+        token: String,
+        /// Must equal the actor the confirmation records.
+        #[arg(long, required = true)]
+        actor: String,
+        /// Must equal the audit reason the confirmation records.
+        #[arg(long, required = true)]
+        audit_reason: String,
+        /// A candidate id to act on. The set must equal the snapshot's exactly;
+        /// a subset is refused rather than partially applied.
+        #[arg(long = "confirm-id", required = true)]
+        confirm_id: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1530,6 +1575,21 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
         }
+        Some(Commands::Doctor {
+            action: Some(DoctorAction::Orphans { action }),
+        }) => match action {
+            OrphansAction::Preview {
+                actor,
+                audit_reason,
+                pid,
+            } => cli::run_doctor_orphans_preview(&home, &actor, &audit_reason, &pid)?,
+            OrphansAction::Apply {
+                token,
+                actor,
+                audit_reason,
+                confirm_id,
+            } => cli::run_doctor_orphans_apply(&home, &token, &actor, &audit_reason, &confirm_id)?,
+        },
         Some(Commands::Skills { action }) => match action {
             SkillsAction::Add { source } => cli::run_skills_add(&home, &source)?,
             SkillsAction::Remove { name } => cli::run_skills_remove(&home, &name)?,
