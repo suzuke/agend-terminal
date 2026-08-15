@@ -34,6 +34,7 @@
 #   COVERAGE_DIAG_MAX_FILES  profraw files described on failure [10]
 #   COVERAGE_DIAG_GRACE_SECS post-cleanup grace before final inventory [2]
 #   COVERAGE_DIAG_PROC_ROOT  /proc to consult for PID visibility          [/proc]
+#   COVERAGE_SNAPSHOT_MAX_BYTES  bytes captured per response list    [1048576]
 set -o pipefail
 
 # `all` keeps every valid profile when one killed process leaves a partial raw
@@ -130,6 +131,17 @@ fi
 if [ "$diag_max_files" -lt 1 ]; then
     echo "::warning::COVERAGE_DIAG_MAX_FILES=$(escape_field "${COVERAGE_DIAG_MAX_FILES-}") is not a positive integer; using 10"
     diag_max_files=10
+fi
+# #3249: how many bytes of each response list are captured. Validated exactly
+# like the file cap — a non-integer here would reach `head -c` and `[ … -gt … ]`
+# and print bash's own errors, unframed, into the evidence block.
+snapshot_max_bytes="${COVERAGE_SNAPSHOT_MAX_BYTES:-1048576}"
+case "$snapshot_max_bytes" in
+    '' | *[!0-9]*) snapshot_max_bytes=0 ;;
+esac
+if [ "${#snapshot_max_bytes}" -gt 9 ] || [ "$snapshot_max_bytes" -lt 1 ]; then
+    echo "::warning::COVERAGE_SNAPSHOT_MAX_BYTES=$(escape_field "${COVERAGE_SNAPSHOT_MAX_BYTES-}") is not a positive integer under 10 digits; using 1048576"
+    snapshot_max_bytes=1048576
 fi
 
 # Lexical path normalization: collapse empty and `.` components and resolve a
@@ -693,6 +705,126 @@ module_token() {
     printf '%s' "$1" | sed -nE 's/.*-([0-9]+)_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
 }
 
+# ── #3249: ONE captured object per diagnostic block ─────────────────────────
+# Membership, the `lines=` count and the rendered fragments each opened the
+# response list separately, and the membership walk re-globbed the profile
+# directory independently of the survey. One block could therefore mix byte
+# VERSIONS and file SETS: with a list swapped mid-block it reported
+# `in_response=yes` and `lines=1` from the old bytes beside two fragments from
+# the new ones, and with a list appearing mid-block it asserted `in_response=no`
+# and then disclosed, a few lines later, the very list holding that exact path.
+# Both were reproduced deterministically against the unmodified wrapper.
+#
+# The SET and each eligible list's bounded bytes are captured ONCE, before the
+# named-corrupt loop; every consumer below reads only that capture. A list that
+# appears afterwards is deliberately NOT disclosed — showing it while answering
+# membership from the captured set would reintroduce the same contradiction.
+#
+# The SET is captured before the scratch allocation, not after: a failure to
+# allocate OUR OWN temp directory is not evidence about the producer's lists,
+# so it degrades every entry to `lines=n/a` / `unknown` instead of erasing the
+# lists from the block entirely.
+#
+# BOUND, NOT ATOMICITY. This guarantees the block describes one captured byte
+# stream. It does not promise a same-inode point-in-time filesystem snapshot,
+# for exactly the reasons the pinned-facts TRUTH CLAIM above already documents.
+SNAP_READY=0
+SNAP_NAMES=()
+SNAP_COPIES=()
+SNAP_STATES=()
+SNAP_DIR=""
+
+snapshot_response_lists() {
+    local list copy i n=0 total size
+    SNAP_READY=0
+    SNAP_NAMES=()
+    SNAP_COPIES=()
+    SNAP_STATES=()
+    SNAP_DIR=""
+    # The NAME SET is captured BEFORE the scratch allocation, and this is the
+    # ONLY glob the block performs. Allocating scratch is a fact about OUR temp
+    # space: learning it failed cannot be allowed to delete the producer's lists
+    # from the record, which is precisely what allocating first did — the
+    # function returned with an empty set and the survey below had nothing left
+    # to disclose. Re-globbing after a failure would be the opposite error,
+    # disclosing a set no consumer answered membership from.
+    for list in "$profile_dir"/*-profraw-list; do
+        # An unmatched glob leaves the pattern itself, and neither test matches
+        # it. `-e` alone also drops a DANGLING symlink — it follows the link —
+        # so the entry is widened in, then refused below. Never followed.
+        [ -e "$list" ] || [ -L "$list" ] || continue
+        SNAP_NAMES[n]="$list"
+        SNAP_COPIES[n]=""
+        # Nothing has been captured yet, so every entry starts in exactly the
+        # state an uncapturable list keeps for good: disclosed by name, no
+        # bytes, no membership authority. Only a successful copy upgrades it.
+        SNAP_STATES[n]="unusable"
+        n=$((n + 1))
+    done
+    total="$n"
+    SNAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/coverage-snap.XXXXXX" 2>/dev/null)"
+    if [ -z "$SNAP_DIR" ] || [ ! -d "$SNAP_DIR" ]; then
+        # OUR scratch failed. That says nothing whatever about the lists, so
+        # every consumer degrades to `unknown`/`n/a` rather than inventing a
+        # fact from a read that never happened. The names captured above are
+        # still disclosed — they were observed, and an unread list is reported
+        # as `lines=n/a`, never omitted.
+        SNAP_DIR=""
+        return 1
+    fi
+    i=0
+    while [ "$i" -lt "$total" ]; do
+        list="${SNAP_NAMES[i]}"
+        # A SYMLINKED LIST IS REFUSED OUTRIGHT, in scope or not: the name is
+        # producer-controlled by glob, cargo-llvm-cov writes this file with
+        # `fs::write`, and a legitimate producer never presents a link here.
+        # `-f` also keeps a FIFO from blocking the capture forever.
+        if [ -L "$list" ] || [ ! -f "$list" ]; then
+            i=$((i + 1))
+            continue
+        fi
+        copy="$SNAP_DIR/list-$i"
+        # cap+1 bytes in ONE open: capturing exactly the cap cannot distinguish
+        # a list that just fits from one that was cut.
+        if ! { head -c "$((snapshot_max_bytes + 1))" <"$list" >"$copy"; } 2>/dev/null; then
+            rm -f "$copy"
+            i=$((i + 1))
+            continue
+        fi
+        size="$( { wc -c <"$copy"; } 2>/dev/null | tr -d ' ')"
+        case "$size" in
+            '' | *[!0-9]*)
+                rm -f "$copy"
+                ;;
+            *)
+                SNAP_COPIES[i]="$copy"
+                if [ "$size" -gt "$snapshot_max_bytes" ]; then
+                    SNAP_STATES[i]="truncated"
+                else
+                    SNAP_STATES[i]="ok"
+                fi
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    SNAP_READY=1
+    return 0
+}
+
+# Scratch removal is best-effort and DELIBERATELY status-neutral. The producer's
+# exit code is the one fact this wrapper must never overwrite, and an
+# observability cleanup is not permitted to become it.
+cleanup_response_snapshot() {
+    [ -n "$SNAP_DIR" ] || return 0
+    if ! rm -rf "$SNAP_DIR" 2>/dev/null; then
+        printf '::warning::coverage could not remove its diagnostic scratch %s\n' \
+            "$(escape_field "$SNAP_DIR")"
+    fi
+    SNAP_DIR=""
+    SNAP_READY=0
+    return 0
+}
+
 # Membership is exact and by NORMALIZED FULL PATH: a same-named file in another
 # directory is a different member, and a substring test would call foo.profraw a
 # member because the list happens to hold otherfoo.profraw.
@@ -712,68 +844,47 @@ module_token() {
 # site: a query that did not answer is not a `no`. Membership was the last field
 # in the record without a third state.
 response_contains_path() {
-    local want="$1" list entry examined=0 unexamined=0
-    for list in "$profile_dir"/*-profraw-list; do
-        # An unmatched glob leaves the pattern itself, and neither test matches
-        # it. `-e` alone also dropped a DANGLING symlink — it follows the link,
-        # so a broken one was skipped before the refusal below could class it
-        # as unexamined. Widened so the entry reaches that refusal; the link is
-        # still never followed.
-        [ -e "$list" ] || [ -L "$list" ] || continue
-        # A SYMLINKED LIST IS REFUSED OUTRIGHT, in scope or not. The name is
-        # producer-controlled by glob, and cargo-llvm-cov writes this file with
-        # `fs::write` — a legitimate producer never presents a link here, so
-        # supporting one buys nothing and costs a resolved second path, which is
-        # the validate-one/open-another shape this script has already been bitten
-        # by. Judging the SHAPE needs no resolution at all.
-        #
-        # HONEST BOUND: this does not eliminate TOCTOU. `[ -L ]` and the open
-        # below are separate syscalls and nothing anchors the object between
-        # them; refusing outright removes the resolved detour and fails closed,
-        # nothing more. A HARD link to an outside file defeats this test and the
-        # resolving alternative alike — `-L` is false and the path genuinely is
-        # inside the directory — and that requires same-UID write access to the
-        # profile directory, which this block already declares out of scope.
-        if [ -L "$list" ]; then
+    local want="$1" entry i n examined=0 unexamined=0 state copy
+    [ "$SNAP_READY" -eq 1 ] || { printf 'unknown'; return; }
+    n="${#SNAP_NAMES[@]}"
+    # An empty captured set is `unknown` too — no list to read is not a list
+    # that excludes us, and it is indistinguishable from a profile directory
+    # that could not be enumerated.
+    [ "$n" -gt 0 ] || { printf 'unknown'; return; }
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        state="${SNAP_STATES[i]}"
+        copy="${SNAP_COPIES[i]}"
+        # Symlinked, non-regular, unreadable, or our own capture failed. A list
+        # we could not examine is exactly the case that must not become `no`.
+        if [ "$state" = "unusable" ] || [ -z "$copy" ] || [ ! -r "$copy" ]; then
             unexamined=1
+            i=$((i + 1))
             continue
         fi
-        # `-f`, not `-e`: a FIFO response file would block this read forever.
-        # Refusing to read it is exactly why membership cannot then be denied.
-        if [ ! -f "$list" ]; then
+        # A TRUNCATED capture is read for a POSITIVE match only. Finding the
+        # path inside the captured prefix still proves membership; running out
+        # of prefix proves nothing about the bytes beyond it. The trailing
+        # fragment of a truncated capture is not a complete entry, so the read
+        # deliberately drops an unterminated final line there — `|| [ -n … ]`
+        # applies to a whole file only.
+        while IFS= read -r entry || { [ "$state" = "ok" ] && [ -n "$entry" ]; }; do
+            entry="$(clean_token "$entry")"
+            [ -n "$entry" ] || continue
+            resolve_in_profile_dir "$entry" || continue
+            # Compare the NAMED path: membership is about the path the response
+            # file refers to, not the target a link happens to point at.
+            if [ "$RESOLVED_NAMED" = "$want" ]; then
+                printf 'yes'
+                return 0
+            fi
+        done <"$copy"
+        if [ "$state" = "truncated" ]; then
             unexamined=1
-            continue
-        fi
-        # The open we TEST is the open we READ FROM. A separate `: <"$list"`
-        # probe would validate one open and consume another — the
-        # validate-one-path-open-another gap this script has already closed
-        # once. The loop's own status is that of its last body command, so `:`
-        # forces zero; a non-zero status here can then ONLY mean the redirection
-        # itself failed, which is the difference between a list that omits us
-        # and a list we never read.
-        #
-        # `2>/dev/null` BEFORE `<"$list"`: redirections apply left to right, so
-        # ordering them the other way lets a failed open print bash's own
-        # message — carrying the path, unframed — into the evidence block.
-        if { while IFS= read -r entry || [ -n "$entry" ]; do
-                 # `|| [ -n "$entry" ]` above so a final entry without a
-                 # trailing newline is still read.
-                 entry="$(clean_token "$entry")"
-                 [ -n "$entry" ] || continue
-                 resolve_in_profile_dir "$entry" || continue
-                 # Compare the NAMED path: membership is about the path the
-                 # response file refers to, not the target a link happens to
-                 # point at.
-                 if [ "$RESOLVED_NAMED" = "$want" ]; then
-                     printf 'yes'
-                     return 0
-                 fi
-             done
-             :; } 2>/dev/null <"$list"; then
-            examined=1
         else
-            unexamined=1
+            examined=1
         fi
+        i=$((i + 1))
     done
     if [ "$unexamined" -eq 1 ] || [ "$examined" -eq 0 ]; then
         printf 'unknown'
@@ -885,6 +996,10 @@ emit_diagnostics() {
     local attempt="$1"
     NAMED_WRITER_PIDS=""
     profile_dir_abs="$(resolve_profile_dir_abs)"
+    # #3249: BEFORE the named-corrupt loop, which is the first consumer — the
+    # membership walk runs once per named path, so capturing any later would
+    # still leave those reads racing the survey.
+    snapshot_response_lists
     echo "::group::coverage corruption evidence (attempt $attempt)"
     # `printf`, not `echo`, wherever an escaped field is emitted: the escaped
     # form contains backslashes by construction, and `echo` re-interprets them
@@ -951,36 +1066,45 @@ EOF
     # the path unframed — the `exec` defect, repeated once per read command.
     # And a read that did not happen reports `n/a`: an empty field is a
     # fabricated fact, which is the rule the named route already follows.
-    local list line count
-    for list in "$profile_dir"/*-profraw-list; do
-        # Widened for the same reason as membership: a dangling list symlink is
-        # a present entry, and dropping it left the block silent about a file
-        # the producer created. It falls into the `lines=n/a` branch below,
-        # disclosed by name and never opened.
-        [ -e "$list" ] || [ -L "$list" ] || continue
-        # The response file's NAME is producer-controlled by glob, so it can be
-        # a FIFO too — and the count, the listing and the membership read all
-        # open it. Disclosed, never read, never dropped.
-        #
-        # `-L` first, and for the same reason membership refuses it: a symlink
-        # under this name is not a shape any legitimate producer creates, and
-        # following one disclosed the CONTENT of a file outside the profile
-        # directory as `response_line=` records. The NAME is producer-controlled
-        # data this block already prints; the bytes behind a link are not ours.
-        if [ -L "$list" ] || [ ! -f "$list" ]; then
-            printf 'response_file=%s lines=n/a\n' "$(escape_field "$list")"
+    # #3249: the SAME capture the membership walk above answered from. The
+    # directory is not re-globbed here — a list that appeared since is not part
+    # of the captured set and is deliberately not disclosed.
+    local line count i lists state copy
+    lists="${#SNAP_NAMES[@]}"
+    i=0
+    while [ "$i" -lt "$lists" ]; do
+        state="${SNAP_STATES[i]}"
+        copy="${SNAP_COPIES[i]}"
+        # Symlinked, non-regular, unreadable, or our own capture failed:
+        # disclosed by NAME, never opened, and no fact invented for it.
+        if [ "$state" = "unusable" ] || [ -z "$copy" ] || [ ! -r "$copy" ]; then
+            printf 'response_file=%s lines=n/a\n' "$(escape_field "${SNAP_NAMES[i]}")"
+            i=$((i + 1))
             continue
         fi
-        count="$( { awk 'END{print NR}' <"$list"; } 2>/dev/null )"
-        case "$count" in
-            '' | *[!0-9]*) count=n/a ;;
-        esac
-        printf 'response_file=%s lines=%s\n' "$(escape_field "$list")" "$count"
+        if [ "$state" = "truncated" ]; then
+            # The total is not knowable from a prefix, and reporting the
+            # captured prefix's line count as the list's would be a fabricated
+            # fact of exactly the kind `n/a` exists to prevent.
+            count=n/a
+        else
+            count="$( { awk 'END{print NR}' <"$copy"; } 2>/dev/null )"
+            case "$count" in
+                '' | *[!0-9]*) count=n/a ;;
+            esac
+        fi
+        printf 'response_file=%s lines=%s\n' "$(escape_field "${SNAP_NAMES[i]}")" "$count"
+        if [ "$state" = "truncated" ]; then
+            printf '  … response list exceeded the %s-byte capture cap; total lines and absence are not knowable\n' \
+                "$snapshot_max_bytes"
+        fi
         # A pipeline, not process substitution: nothing here mutates state that
         # has to survive the subshell, and `< <(…)` needs a working /dev/fd,
         # which is exactly what this script has already been bitten by.
-        { head -n "$diag_max_files" <"$list"; } 2>/dev/null |
-            while IFS= read -r line || [ -n "$line" ]; do
+        # The `|| [ -n … ]` fallback is `ok`-only: a truncated capture's final
+        # fragment is not a complete entry and must not be rendered as one.
+        { head -n "$diag_max_files" <"$copy"; } 2>/dev/null |
+            while IFS= read -r line || { [ "$state" = "ok" ] && [ -n "$line" ]; }; do
                 printf '  response_line=%s\n' "$(escape_field "$line")"
             done
         # The profraw survey discloses its cap; this must too, or `lines=` and
@@ -988,6 +1112,7 @@ EOF
         if [ "$count" != "n/a" ] && [ "$count" -gt "$diag_max_files" ]; then
             printf '  … more response lines not shown (cap=%s)\n' "$diag_max_files"
         fi
+        i=$((i + 1))
     done
     local shown=0 f fbase fsize fheader
     for f in "$profile_dir"/*.profraw; do
@@ -1023,6 +1148,9 @@ EOF
         shown=$((shown + 1))
     done
     [ "$shown" -eq 0 ] && echo "  (no .profraw files present)"
+    # Inside the group, so a cleanup complaint stays framed like every other
+    # field. Status-neutral by construction — see cleanup_response_snapshot.
+    cleanup_response_snapshot
     echo "::endgroup::"
 }
 
