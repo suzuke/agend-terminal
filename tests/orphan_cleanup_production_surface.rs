@@ -906,8 +906,18 @@ fn apply_end_to_end_refuses_an_unknown_confirmation_3273() {
         String::from_utf8_lossy(&out.stderr)
     )
     .to_lowercase();
+    // What must hold on EVERY platform is that the refusal names its cause
+    // rather than exiting non-zero in silence. The cause itself is legitimately
+    // platform-dependent: off Unix `platform_support` is `Unsupported` and
+    // `apply` refuses on that BEFORE it ever looks at the token — an
+    // unsupported platform stays report-only however correct the confirmation
+    // is — which `apply_is_unsupported_off_unix_3273` pins directly.
+    #[cfg(unix)]
+    let expected: &[&str] = &["confirmation", "unavailable"];
+    #[cfg(not(unix))]
+    let expected: &[&str] = &["report-only", "unsupported"];
     assert!(
-        combined.contains("confirmation") || combined.contains("unavailable"),
+        expected.iter().any(|needle| combined.contains(needle)),
         "the refusal must name its cause to the operator; output: {combined}"
     );
     std::fs::remove_dir_all(&home).ok();
