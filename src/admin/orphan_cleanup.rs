@@ -102,7 +102,7 @@ pub enum Support {
 
 /// One immutable candidate. `id` binds the snapshot generation to the exact
 /// identity triple, so an id cannot be replayed against a different process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CandidateSnapshot {
     pub id: String,
     pub pid: u32,
@@ -139,6 +139,144 @@ pub fn candidate_id(generation: u64, pid: u32, start_token: u64, uid: u32) -> St
     hex::encode(hasher.finalize())
 }
 
+/// The durable confirmation sidecar. Written by `preview`, consumed once by
+/// `apply`. `nonce` is stored, not merely folded into the candidate ids, so a
+/// snapshot can be identified even when its candidate list is empty.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Confirmation {
+    pub schema_version: u8,
+    pub actor: String,
+    pub audit_reason: String,
+    pub created_ms: i64,
+    pub generation: u64,
+    pub nonce: String,
+    pub consumed: bool,
+    pub candidates: Vec<CandidateSnapshot>,
+}
+
+/// Why an apply refused. The contracts assert the EXACT reason rather than
+/// "something refused": a gate that fires for the wrong cause is a gate whose
+/// evidence cannot be trusted, and a blanket refusal would let a stub pass
+/// every refusal contract at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusalReason {
+    MissingToken,
+    MalformedToken,
+    ConfirmationUnavailable,
+    SchemaMismatch,
+    ActorMismatch,
+    EmptyAuditReason,
+    AuditReasonMismatch,
+    Expired,
+    Replayed,
+    ConfirmIdsNotExact,
+    Unsupported,
+    /// Lost the race for a single-use confirmation. Distinct from `Replayed`
+    /// only in provenance — both mean "this confirmation is already spent" —
+    /// but a contended loser has not yet observed the winner's write, so the
+    /// two are reported separately rather than guessed at.
+    Contended,
+    /// Staging placeholder: every authority check passed but the executor stage
+    /// is not implemented yet, so nothing was signalled. The TERM/KILL slice
+    /// removes this variant.
+    ExecutorUnavailable,
+}
+
+/// Why a preview could not be issued. A preview that cannot be persisted must
+/// NOT hand back a token: the token would name a confirmation that apply can
+/// never revalidate, which is an authority artefact with no authority behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewError {
+    PersistFailed(String),
+}
+
+/// Test seam that lets a contract interleave two applies at exactly the point a
+/// non-CAS implementation would race. Production uses [`NoBarrier`]; a
+/// read-then-write sequence without serialization is not a CAS, and this is
+/// what makes that difference observable rather than a matter of timing luck.
+pub trait ConsumeBarrier {
+    fn before_consume(&self) {}
+}
+
+/// The production barrier: does nothing.
+pub struct NoBarrier;
+impl ConsumeBarrier for NoBarrier {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Refused(RefusalReason),
+}
+
+/// Path of the confirmation sidecar for `token`, or `None` when the token is
+/// not of the exact accepted shape. Mirrors `decisions.rs::confirmation_path`:
+/// the shape check is what stops a token being spent as a path component.
+pub fn confirmation_path(home: &Path, token: &str) -> Option<std::path::PathBuf> {
+    if token.len() == 36
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        Some(home.join("orphan-cleanup").join(format!("{token}.json")))
+    } else {
+        None
+    }
+}
+
+/// Consume an operator confirmation and act on it.
+///
+/// Every authority check runs BEFORE anything is signalled, and each refusal
+/// names its own cause.
+#[allow(clippy::too_many_arguments)]
+pub fn apply<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore>(
+    home: &Path,
+    actor: &str,
+    audit_reason: &str,
+    token: &str,
+    confirm_ids: &[String],
+    oracle: &O,
+    signaler: &S,
+    clock: &C,
+    audit: &A,
+    support: Support,
+) -> ApplyOutcome {
+    apply_with_barrier(
+        home,
+        actor,
+        audit_reason,
+        token,
+        confirm_ids,
+        oracle,
+        signaler,
+        clock,
+        audit,
+        support,
+        &NoBarrier,
+    )
+}
+
+/// [`apply`] with an injected barrier. Only the contracts pass anything other
+/// than [`NoBarrier`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_with_barrier<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStore, B: ConsumeBarrier>(
+    _home: &Path,
+    _actor: &str,
+    _audit_reason: &str,
+    _token: &str,
+    _confirm_ids: &[String],
+    _oracle: &O,
+    _signaler: &S,
+    _clock: &C,
+    _audit: &A,
+    _support: Support,
+    _barrier: &B,
+) -> ApplyOutcome {
+    // RED STUB (#3273): no gate is implemented yet, so every call lands on the
+    // staging refusal. It signals nothing — which is why the contracts assert
+    // the exact reason: a stub that merely "refuses" would otherwise satisfy
+    // every refusal contract without a single gate existing.
+    ApplyOutcome::Refused(RefusalReason::ExecutorUnavailable)
+}
+
 /// Dry run: resolve each proposed pid's exact identity and emit immutable ids.
 ///
 /// A pid whose identity cannot be resolved is dropped from the snapshot rather
@@ -158,7 +296,7 @@ pub fn preview<O: IdentityOracle, C: Clock>(
     clock: &C,
     generation: u64,
     support: Support,
-) -> Preview {
+) -> Result<Preview, PreviewError> {
     let mut candidates = Vec::new();
     for pid in proposed_pids {
         // Identity is re-derived HERE, from this module's own oracle — never
@@ -176,7 +314,10 @@ pub fn preview<O: IdentityOracle, C: Clock>(
             uid: identity.uid,
         });
     }
-    Preview {
+    // RED STUB (#3273): the sidecar is not persisted yet, so this still hands
+    // back a token unconditionally. The durability contract fails here. GREEN
+    // persists first and only then issues the token.
+    Ok(Preview {
         support,
         // The token names this snapshot; the apply slice binds the sidecar to
         // it. Shaped to pass the same 36-char hex/dash validation
@@ -186,5 +327,5 @@ pub fn preview<O: IdentityOracle, C: Clock>(
         generation,
         created_ms: clock.now_ms(),
         candidates,
-    }
+    })
 }
