@@ -795,3 +795,127 @@ fn the_preview_handler_propagates_a_failure_3273() {
         Ok(rendered) => panic!("a failed preview must not be reported as success: {rendered:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// End to end: parser → handler → concrete service. clap and the handler can
+// each pass in isolation while dispatch never connects them, so the wiring
+// itself gets a contract.
+// ---------------------------------------------------------------------------
+
+/// `preview` must run the real path and leave the real artefact: a token and at
+/// least one candidate id on stdout, and the matching private sidecar on disk.
+/// Preview signals nothing by construction — it is the dry run — so this is
+/// safe to execute against our own pid.
+#[test]
+fn preview_end_to_end_emits_a_token_and_persists_its_sidecar_3273() {
+    let home = std::env::temp_dir().join(format!("agend-e2e-preview-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = agend()
+        .args([
+            "doctor",
+            "orphans",
+            "preview",
+            "--actor",
+            "operator",
+            "--audit-reason",
+            "end to end contract",
+            "--pid",
+            &std::process::id().to_string(),
+        ])
+        .env("AGEND_HOME", &home)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "preview must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // A token, in the exact shape apply will accept.
+    let token = stdout
+        .split_whitespace()
+        .find(|word| word.len() == 36 && word.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        .unwrap_or_else(|| panic!("preview must print a confirmation token; stdout: {stdout}"));
+
+    // And the sidecar it names must actually exist, privately.
+    let sidecar = home.join("orphan-cleanup").join(format!("{token}.json"));
+    assert!(
+        sidecar.exists(),
+        "the printed token must name a persisted confirmation at {}",
+        sidecar.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the sidecar is authority material; got {mode:o}"
+        );
+    }
+
+    // At least one candidate id, or the operator has nothing to confirm.
+    assert!(
+        stdout.contains("candidate"),
+        "preview must name its candidates; stdout: {stdout}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `apply` must reach the executor and refuse. A well-shaped token with no
+/// confirmation behind it can never signal anything, so this exercises the real
+/// dispatch path with no risk to any process.
+#[test]
+fn apply_end_to_end_refuses_an_unknown_confirmation_3273() {
+    let home = std::env::temp_dir().join(format!("agend-e2e-apply-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = agend()
+        .args([
+            "doctor",
+            "orphans",
+            "apply",
+            "--token",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--actor",
+            "operator",
+            "--audit-reason",
+            "end to end contract",
+            "--confirm-id",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ])
+        .env("AGEND_HOME", &home)
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "a refusal must be a non-zero exit, or a script cannot tell it from success"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        combined.contains("confirmation") || combined.contains("unavailable"),
+        "the refusal must name its cause to the operator; output: {combined}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Off Unix there is no identity oracle and no signal adapter, so the manual
+/// path is report-only. Only Windows CI executes this; it is named so its
+/// absence from a local run is visible rather than assumed.
+#[cfg(not(unix))]
+#[test]
+fn apply_is_unsupported_off_unix_3273() {
+    assert!(
+        matches!(platform_support(), Support::Unsupported(_)),
+        "a non-Unix build must be explicitly unsupported"
+    );
+}
