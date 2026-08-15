@@ -3308,7 +3308,7 @@ fn task_done_rejects_pushed_ahead_assignee_s1() {
 #[test]
 fn terminal_report_rejects_pushed_ahead_assignee_s1() {
     let (home, id, _repo, _branch) = s1_fixture("s1-pushed-report", "pushed");
-    let closed = crate::tasks::auto_close::auto_close_on_report(
+    let error = crate::tasks::auto_close::auto_close_on_report(
         &home,
         "report",
         &id,
@@ -3316,9 +3316,14 @@ fn terminal_report_rejects_pushed_ahead_assignee_s1() {
         "terminal report",
         true,
     )
-    .expect("auto-close");
+    .expect_err("pushed-ahead completion must preserve its guard reason");
     let status = read_task_record(&home, &id).expect("task").status;
-    assert!(!closed, "RED: terminal report currently returns true");
+    assert!(
+        error
+            .to_string()
+            .contains("assignee feature branch is ahead of the remote default"),
+        "unexpected completion guard reason: {error}"
+    );
     assert_eq!(status, crate::task_events::TaskStatus::Claimed);
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3348,7 +3353,7 @@ fn terminal_report_assignee_completion_provenance_controls_s1() {
         ("s1-review-unpushed", "review-unpushed"),
     ] {
         let (home, id, _repo, _branch) = s1_fixture(name, mode);
-        let closed = crate::tasks::auto_close::auto_close_on_report(
+        let error = crate::tasks::auto_close::auto_close_on_report(
             &home,
             "report",
             &id,
@@ -3356,8 +3361,11 @@ fn terminal_report_assignee_completion_provenance_controls_s1() {
             "terminal review report",
             true,
         )
-        .expect("auto-close");
-        assert!(!closed, "unsafe review provenance allowed for {mode}");
+        .expect_err("unsafe review provenance must preserve its guard reason");
+        assert!(
+            !error.to_string().is_empty(),
+            "unsafe review provenance returned an empty reason for {mode}"
+        );
         assert_eq!(
             read_task_record(&home, &id).expect("task").status,
             crate::task_events::TaskStatus::Claimed,
