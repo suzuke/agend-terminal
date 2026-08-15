@@ -283,14 +283,9 @@ pub fn apply_with_barrier<O: IdentityOracle, S: Signaler, C: Clock, A: AuditStor
 /// than carried as a partially-known candidate — an unidentifiable process can
 /// never become a confirmable one.
 pub fn preview<O: IdentityOracle, C: Clock>(
-    // Unused until the apply/CAS slice: the sidecar this snapshot will be
-    // persisted into is bound to `home`/`actor`/`audit_reason`, and persisting
-    // it before any contract pins that behaviour would be shipping unreviewed
-    // durability. The parameters stay on the signature so the call sites do not
-    // churn when that slice lands.
-    _home: &Path,
-    _actor: &str,
-    _audit_reason: &str,
+    home: &Path,
+    actor: &str,
+    audit_reason: &str,
     proposed_pids: &[u32],
     oracle: &O,
     clock: &C,
@@ -314,18 +309,82 @@ pub fn preview<O: IdentityOracle, C: Clock>(
             uid: identity.uid,
         });
     }
-    // RED STUB (#3273): the sidecar is not persisted yet, so this still hands
-    // back a token unconditionally. The durability contract fails here. GREEN
-    // persists first and only then issues the token.
+    // The token names this snapshot; apply binds the sidecar to it. Shaped to
+    // pass the same 36-char hex/dash validation `decisions.rs::confirmation_path`
+    // uses, so a token can never be spent as a path component.
+    let token = uuid::Uuid::new_v4().to_string();
+    let created_ms = clock.now_ms();
+    let confirmation = Confirmation {
+        schema_version: 1,
+        actor: actor.to_string(),
+        audit_reason: audit_reason.to_string(),
+        created_ms,
+        generation,
+        // Stored, not merely folded into the candidate ids: a snapshot must
+        // remain identifiable even when its candidate list is empty.
+        nonce: uuid::Uuid::new_v4().to_string(),
+        consumed: false,
+        candidates: candidates.clone(),
+    };
+    let Some(path) = confirmation_path(home, &token) else {
+        return Err(PreviewError::PersistFailed(
+            "minted token is not path-safe".to_string(),
+        ));
+    };
+    // Durable BEFORE the token is handed out. The ordering is the whole point:
+    // a token whose sidecar never reached disk names a confirmation `apply` can
+    // never revalidate, and the operator has no way to tell it from a real one.
+    if let Err(error) = persist_confirmation(&path, &confirmation) {
+        return Err(PreviewError::PersistFailed(error.to_string()));
+    }
     Ok(Preview {
         support,
-        // The token names this snapshot; the apply slice binds the sidecar to
-        // it. Shaped to pass the same 36-char hex/dash validation
-        // `decisions.rs::confirmation_path` uses, so a token can never be
-        // spent as a path component.
-        token: uuid::Uuid::new_v4().to_string(),
+        token,
         generation,
-        created_ms: clock.now_ms(),
+        created_ms,
         candidates,
+    })
+}
+
+/// Write a confirmation so that a crash cannot leave a half-written one behind:
+/// same-directory temp file, fsync the file, rename over the target, then fsync
+/// the directory so the rename itself is durable. The last step is the one most
+/// often skipped — without it the rename can be lost even though the file's own
+/// bytes were synced.
+///
+/// Self-contained on std for the same reason `candidate_id` is: this module is
+/// re-exported into the library crate for the contract tests, where the
+/// binary's store helpers do not exist.
+fn persist_confirmation(path: &Path, confirmation: &Confirmation) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "confirmation path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let bytes = serde_json::to_vec_pretty(confirmation)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("confirmation")
+    ));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Directory fsync is best-effort by platform, but a failure to OPEN the
+    // directory is not: that means we cannot establish durability at all.
+    std::fs::File::open(parent)?.sync_all().or_else(|error| {
+        // Some filesystems refuse fsync on a directory handle. The rename is
+        // still ordered on every platform this runs on; treat only that
+        // specific refusal as tolerable.
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            Ok(())
+        } else {
+            Err(error)
+        }
     })
 }
