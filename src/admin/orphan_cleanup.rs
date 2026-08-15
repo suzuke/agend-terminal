@@ -401,6 +401,28 @@ pub fn apply_with_barrier<
     if stored.consumed {
         return ApplyOutcome::Refused(RefusalReason::Replayed);
     }
+    // RE-DERIVE every id from the fields stored beside it, BEFORE the ids are
+    // compared against the operator's and before anything is consumed or
+    // signalled.
+    //
+    // Without this the id is merely CARRIED: `confirm_ids` would be checked
+    // against a string in the sidecar, and editing `pid`/`start_token`/`uid`
+    // while leaving `id` alone would let a confirmed id ride onto a process the
+    // operator never saw. Everything downstream would then behave correctly on
+    // the wrong target — the preflight matches the edited triple, the pre-signal
+    // audit records it, and the TERM lands on it. The id only binds an identity
+    // if it is recomputed from that identity.
+    for candidate in &stored.candidates {
+        let derived = candidate_id(
+            stored.generation,
+            candidate.pid,
+            candidate.start_token,
+            candidate.uid,
+        );
+        if derived != candidate.id {
+            return ApplyOutcome::Refused(RefusalReason::CandidateIdMismatch);
+        }
+    }
     // All-or-nothing, and deliberately NOT deduplicated: a repeated id is not a
     // second confirmation of the same candidate, it is a set that does not equal
     // the snapshot's. Sorting makes the comparison order-insensitive, which is a
