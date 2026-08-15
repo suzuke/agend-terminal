@@ -1793,3 +1793,87 @@ fn a_sidecar_naming_an_unsignallable_pid_signals_nothing_3273() {
         std::fs::remove_dir_all(&stage.home).ok();
     }
 }
+
+/// The candidate id is authority material, so `apply` must RE-DERIVE it from
+/// the sidecar's own immutable fields rather than trust it as a carried string.
+///
+/// Without that, the id and the triple it claims to describe can be separated:
+/// edit `pid` (and the `start_token`/`uid` needed to satisfy the preflight)
+/// while leaving `id` untouched, and the operator's confirmed id rides onto a
+/// process they never saw. Everything downstream then behaves correctly on the
+/// WRONG target — the preflight matches, the pre-signal audit records the new
+/// pid, and the TERM lands on it — which is the failure mode the module's own
+/// promise ("an id cannot be replayed against a different process") exists to
+/// exclude.
+///
+/// The sidecar is owner-only, so the editor is already the same uid. That is a
+/// narrow threat model and deliberately not the point: this feature's contract
+/// is that corrupt or tampered authority material REFUSES, and accidental
+/// corruption arrives at exactly the same place as deliberate edits.
+#[test]
+fn a_tampered_sidecar_pid_cannot_ride_a_confirmed_id_3273() {
+    const NOW: i64 = 1_700_000_000_000;
+    let (home, _oracle, signaler, snapshot) = previewed("tampered-pid", NOW);
+    // The ids the operator actually saw and confirmed. Never re-typed below:
+    // the whole point is that these exact strings stay valid-looking.
+    let confirmed = ids_of(&snapshot);
+
+    // Tamper: point the first candidate at a DIFFERENT process, keeping its id.
+    let path = confirmation_path(&home, &snapshot.token).unwrap();
+    let mut stored: Confirmation = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored.candidates[0].pid, 4242, "fixture precondition");
+    let victim_id = stored.candidates[0].id.clone();
+    stored.candidates[0].pid = 9999;
+    stored.candidates[0].start_token = 777_000;
+    stored.candidates[0].uid = 501;
+    std::fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    assert_eq!(
+        victim_id, stored.candidates[0].id,
+        "the tamper must keep the confirmed id — that is what makes it a replay"
+    );
+
+    // An oracle for which the TAMPERED triple is perfectly live and ours, so
+    // nothing downstream of the id check has any reason to object.
+    let oracle = FakeOracle::new(&[(9999, 777_000, 501), (4343, 222_000, 501)], Some(501));
+    let audit = RecordingAudit::default();
+    let outcome = apply(
+        &home,
+        ACTOR,
+        REASON,
+        &snapshot.token,
+        &confirmed,
+        &oracle,
+        &signaler,
+        &FixedClock(NOW),
+        &audit,
+        &NeverWaits::default(),
+        Support::Supported,
+    );
+
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Refused(RefusalReason::CandidateIdMismatch),
+        "an id that does not hash to the triple beside it must refuse by that exact cause"
+    );
+    assert_eq!(
+        signaler.total(),
+        0,
+        "a tampered snapshot must never reach a signal"
+    );
+    assert_eq!(
+        audit.writes(),
+        0,
+        "and must be refused BEFORE the pre-signal audit records an intent"
+    );
+
+    // The refusal must also not have spent the confirmation: a tampered file is
+    // not a used one, and burning it would turn corruption into a denial of the
+    // operator's real snapshot.
+    let after: Confirmation = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        !after.consumed,
+        "refusing a tampered sidecar must not consume it"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

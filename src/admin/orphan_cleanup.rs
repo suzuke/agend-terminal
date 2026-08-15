@@ -201,6 +201,12 @@ pub enum RefusalReason {
     /// but a contended loser has not yet observed the winner's write, so the
     /// two are reported separately rather than guessed at.
     Contended,
+    /// A stored candidate's `id` does not hash to the identity triple stored
+    /// beside it. The id is authority material, so it must be RE-DERIVED from
+    /// the sidecar's own fields rather than trusted as a carried string:
+    /// without that, editing `pid`/`start_token`/`uid` while leaving `id` alone
+    /// lets a confirmed id ride onto a process the operator never saw.
+    CandidateIdMismatch,
     /// Staging placeholder: every authority check passed but the executor stage
     /// is not implemented yet, so nothing was signalled. The TERM/KILL slice
     /// removes this variant.
@@ -1130,6 +1136,11 @@ fn refusal_message(reason: &RefusalReason) -> String {
                 .to_string()
         }
         RefusalReason::Contended => "another apply is consuming this confirmation".to_string(),
+        RefusalReason::CandidateIdMismatch => {
+            "a confirmed candidate's id does not match the identity recorded beside it; \
+             the confirmation has been altered since it was issued"
+                .to_string()
+        }
         RefusalReason::ExecutorUnavailable => "the executor is unavailable".to_string(),
     }
 }
