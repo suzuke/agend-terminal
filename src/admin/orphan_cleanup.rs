@@ -87,7 +87,7 @@ pub trait Clock {
 /// the machine dies mid-operation the record of intent must already be on disk,
 /// which is the one ordering `decisions.rs::archive_batch` deliberately does
 /// not model (it audits after the rename).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreSignalAudit {
     pub token: String,
     pub actor: String,
@@ -595,6 +595,99 @@ impl ExactPid {
 pub fn platform_support() -> Support {
     // RED STUB (#3273): unconditional, so the non-Unix arm does not yet exist.
     Support::Supported
+}
+
+/// Raw per-process facts, read straight from the OS. Split out from
+/// [`IdentityOracle`] so the freshness rule — every question is answered by a
+/// NEW read — is testable without a live process to recycle.
+pub trait RawIdentityReader {
+    fn read(&self, pid: u32) -> Option<ProcIdentity>;
+    fn self_uid(&self) -> Option<u32>;
+}
+
+/// The production oracle: never caches. A cached identity is a stale identity,
+/// and the entire re-read discipline exists because the answer can change
+/// between two adjacent instants.
+pub struct FreshIdentityOracle<R: RawIdentityReader> {
+    reader: R,
+    // RED STUB (#3273): a cache, which is exactly the thing this type must not
+    // have. GREEN deletes it.
+    cached: std::cell::RefCell<Option<(u32, Option<ProcIdentity>)>>,
+}
+
+impl<R: RawIdentityReader> FreshIdentityOracle<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            cached: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl<R: RawIdentityReader> IdentityOracle for FreshIdentityOracle<R> {
+    fn identity(&self, pid: u32) -> Option<ProcIdentity> {
+        // RED STUB: answers a repeat question from memory.
+        if let Some((cached_pid, cached)) = *self.cached.borrow() {
+            if cached_pid == pid {
+                return cached;
+            }
+        }
+        let fresh = self.reader.read(pid);
+        *self.cached.borrow_mut() = Some((pid, fresh));
+        fresh
+    }
+    fn self_uid(&self) -> Option<u32> {
+        self.reader.self_uid()
+    }
+}
+
+/// Translate a raw `kill(2)` return into an outcome. A pure function so the
+/// mapping is testable without sending a real signal.
+pub fn signal_outcome_from_syscall(rc: i32, errno: i32) -> SignalOutcome {
+    // RED STUB (#3273): claims success unconditionally, which is precisely the
+    // "assume it worked" behaviour the result-bearing Signaler exists to end.
+    let _ = (rc, errno);
+    SignalOutcome::Delivered
+}
+
+/// Injected sleep so a bounded wait is testable without spending the bound.
+pub trait Sleeper {
+    fn sleep_ms(&self, ms: u64);
+}
+
+/// Injected liveness probe. Takes an [`ExactPid`] so an unchecked pid cannot
+/// reach a syscall through this path either.
+pub trait LivenessProbe {
+    fn is_alive(&self, pid: ExactPid) -> bool;
+}
+
+/// The production waiter: polls until the pid is gone or the bound is spent,
+/// whichever comes first, and never longer.
+pub struct BoundedWaiter<P: LivenessProbe, S: Sleeper> {
+    pub probe: P,
+    pub sleeper: S,
+    pub poll_ms: u64,
+}
+
+impl<P: LivenessProbe, S: Sleeper> ExitWaiter for BoundedWaiter<P, S> {
+    fn wait_for_exit(&self, pid: u32, timeout_ms: u64) -> bool {
+        // RED STUB (#3273): answers immediately, without waiting and without
+        // asking. GREEN polls under the bound.
+        let _ = (pid, timeout_ms, self.poll_ms);
+        true
+    }
+}
+
+/// Append-only JSONL audit, one record per line, fsynced before it returns.
+pub struct JsonlAuditStore {
+    pub path: std::path::PathBuf,
+}
+
+impl AuditStore for JsonlAuditStore {
+    fn record_pre_signal(&self, _record: &PreSignalAudit) -> anyhow::Result<()> {
+        // RED STUB (#3273): reports durability it never established.
+        Ok(())
+    }
 }
 
 /// A confirmation token and its sidecar ARE authority material: anything that

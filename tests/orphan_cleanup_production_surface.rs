@@ -8,7 +8,12 @@
 //! injected seams; these prove that the real adapters cannot widen the blast
 //! radius, and that nothing outside the explicit manual surface can reach them.
 
-use agend_terminal::admin::orphan_cleanup::{platform_support, ExactPid, Support};
+use agend_terminal::admin::orphan_cleanup::{
+    platform_support, signal_outcome_from_syscall, AuditStore, BoundedWaiter, ExactPid, ExitWaiter,
+    FreshIdentityOracle, IdentityOracle, JsonlAuditStore, LivenessProbe, PreSignalAudit,
+    ProcIdentity, RawIdentityReader, SignalOutcome, Sleeper, Support,
+};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use syn::visit::{self, Visit};
 
 // ---------------------------------------------------------------------------
@@ -54,7 +59,10 @@ fn ordinary_pids_convert_exactly_3273() {
     for pid in [1u32, 2, 4242, 99_999, i32::MAX as u32] {
         let exact = ExactPid::new(pid).unwrap_or_else(|| panic!("pid {pid} must be accepted"));
         assert_eq!(exact.get(), pid as i32, "the value must survive unchanged");
-        assert!(exact.get() > 0, "an exact target is always strictly positive");
+        assert!(
+            exact.get() > 0,
+            "an exact target is always strictly positive"
+        );
     }
 }
 
@@ -153,4 +161,381 @@ fn default_doctor_stays_report_only_3273() {
         !collector.segments.iter().any(|s| s == "orphan_cleanup"),
         "the default doctor report must not reach the manual executor"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Production adapters, exercised through injected seams rather than asserted
+// about with a source-text guard. A guard can only say the code mentions the
+// right names; these say it behaves.
+// ---------------------------------------------------------------------------
+
+/// Counts raw reads so "never cached" is a measurement, not a claim.
+struct CountingReader {
+    /// Shared, because the oracle takes the reader BY VALUE. Counting through a
+    /// field the test no longer owns is how the first version of this contract
+    /// passed while the stub was still caching.
+    reads: std::sync::Arc<AtomicU32>,
+    answer: Option<ProcIdentity>,
+    uid: Option<u32>,
+}
+
+impl RawIdentityReader for CountingReader {
+    fn read(&self, _pid: u32) -> Option<ProcIdentity> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.answer
+    }
+    fn self_uid(&self) -> Option<u32> {
+        self.uid
+    }
+}
+
+/// Every question must be answered by a NEW read. A cached identity is a stale
+/// identity, and the whole re-read discipline — preflight, immediate pre-TERM,
+/// again before KILL — is worthless if the second and third reads are served
+/// from the first.
+#[test]
+fn the_production_oracle_never_answers_from_memory_3273() {
+    let reads = std::sync::Arc::new(AtomicU32::new(0));
+    let oracle = FreshIdentityOracle::new(CountingReader {
+        reads: std::sync::Arc::clone(&reads),
+        answer: Some(ProcIdentity {
+            start_token: 111_000,
+            uid: 501,
+        }),
+        uid: Some(501),
+    });
+
+    let _ = oracle.identity(4242);
+    let _ = oracle.identity(4242);
+    let _ = oracle.identity(4242);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "three questions must mean three reads: a cached identity is a stale identity, \
+         and the preflight/pre-TERM/pre-KILL re-reads are worthless if served from the first"
+    );
+
+    // An unreadable identity must propagate as None every time, never be
+    // remembered as "already answered".
+    let unknown_reads = std::sync::Arc::new(AtomicU32::new(0));
+    let unknown = FreshIdentityOracle::new(CountingReader {
+        reads: std::sync::Arc::clone(&unknown_reads),
+        answer: None,
+        uid: None,
+    });
+    assert_eq!(unknown.identity(4242), None);
+    assert_eq!(unknown.identity(4242), None);
+    assert_eq!(
+        unknown_reads.load(Ordering::SeqCst),
+        2,
+        "an unknown answer must be re-asked, not cached as known-unknown"
+    );
+}
+
+/// An unknown uid fails closed at the source: the oracle reports what the OS
+/// said, and `None` is never smoothed into a value.
+#[test]
+fn an_unknown_self_uid_propagates_as_none_3273() {
+    let oracle = FreshIdentityOracle::new(CountingReader {
+        reads: std::sync::Arc::new(AtomicU32::new(0)),
+        answer: None,
+        uid: None,
+    });
+    assert_eq!(oracle.self_uid(), None);
+}
+
+/// The errno mapping is where "the signal was sent" stops being an assumption.
+/// `process::terminate` returns `()`, which is exactly why this exists.
+#[test]
+fn the_syscall_mapping_reports_what_the_kernel_said_3273() {
+    assert_eq!(
+        signal_outcome_from_syscall(0, 0),
+        SignalOutcome::Delivered,
+        "rc 0 is the only success"
+    );
+    assert_eq!(
+        signal_outcome_from_syscall(-1, libc::ESRCH),
+        SignalOutcome::NoSuchProcess,
+        "ESRCH is 'already gone', which is success-equivalent but NOT delivery"
+    );
+    assert_eq!(
+        signal_outcome_from_syscall(-1, libc::EPERM),
+        SignalOutcome::PermissionDenied,
+        "EPERM must be distinguishable: it is a fail-stop, ESRCH is not"
+    );
+    match signal_outcome_from_syscall(-1, libc::EINVAL) {
+        SignalOutcome::Failed(_) => {}
+        other => panic!("an unexpected errno must surface as Failed, got {other:?}"),
+    }
+}
+
+#[derive(Default)]
+struct RecordingSleeper {
+    total_ms: AtomicU64,
+}
+
+impl Sleeper for RecordingSleeper {
+    fn sleep_ms(&self, ms: u64) {
+        self.total_ms.fetch_add(ms, Ordering::SeqCst);
+    }
+}
+
+struct ScriptedProbe {
+    /// number of probes before the process is reported gone; u32::MAX = never
+    exits_after: AtomicU32,
+    probes: AtomicU32,
+}
+
+impl LivenessProbe for ScriptedProbe {
+    fn is_alive(&self, _pid: ExactPid) -> bool {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        let remaining = self.exits_after.load(Ordering::SeqCst);
+        if remaining == 0 {
+            return false;
+        }
+        if remaining != u32::MAX {
+            self.exits_after.store(remaining - 1, Ordering::SeqCst);
+        }
+        true
+    }
+}
+
+/// A process that never exits must not extend the wait past its bound. The
+/// grace window is a promise to the operator about how long `apply` can block,
+/// and an unbounded poll would quietly break it.
+#[test]
+fn the_bounded_waiter_never_outstays_its_bound_3273() {
+    let waiter = BoundedWaiter {
+        probe: ScriptedProbe {
+            exits_after: AtomicU32::new(u32::MAX),
+            probes: AtomicU32::new(0),
+        },
+        sleeper: RecordingSleeper::default(),
+        poll_ms: 50,
+    };
+    let exited = waiter.wait_for_exit(4242, 200);
+    assert!(
+        !exited,
+        "a process that never exits must be reported as surviving"
+    );
+    assert!(
+        waiter.sleeper.total_ms.load(Ordering::SeqCst) <= 200,
+        "slept {}ms against a 200ms bound",
+        waiter.sleeper.total_ms.load(Ordering::SeqCst)
+    );
+    assert!(
+        waiter.sleeper.total_ms.load(Ordering::SeqCst) > 0,
+        "a bounded wait must actually wait; returning instantly is not a grace window"
+    );
+}
+
+/// And it must return as soon as the process is gone, rather than always
+/// spending the whole bound.
+#[test]
+fn the_bounded_waiter_returns_as_soon_as_the_process_exits_3273() {
+    let waiter = BoundedWaiter {
+        probe: ScriptedProbe {
+            exits_after: AtomicU32::new(1),
+            probes: AtomicU32::new(0),
+        },
+        sleeper: RecordingSleeper::default(),
+        poll_ms: 50,
+    };
+    assert!(waiter.wait_for_exit(4242, 5_000));
+    assert!(
+        waiter.probe.probes.load(Ordering::SeqCst) > 0,
+        "returning true without ever asking whether the process is alive is not a wait"
+    );
+    assert!(
+        waiter.sleeper.total_ms.load(Ordering::SeqCst) < 5_000,
+        "an early exit must not still burn the full grace window"
+    );
+}
+
+/// The audit is the record of intent that licenses a signal. If it is not on
+/// disk, the signal must not happen — so the store reports durability only when
+/// it has actually established it.
+#[test]
+fn the_audit_store_appends_durably_and_privately_3273() {
+    let dir = std::env::temp_dir().join(format!("agend-audit-{}-ok", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("orphan-cleanup-audit.jsonl");
+    let store = JsonlAuditStore { path: path.clone() };
+
+    let record = |pid: u32| PreSignalAudit {
+        token: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        actor: "operator".to_string(),
+        audit_reason: "manual cleanup".to_string(),
+        candidate_id: format!("id-{pid}"),
+        pid,
+        start_token: 111_000,
+        uid: 501,
+        at_ms: 1_700_000_000_000,
+    };
+
+    store
+        .record_pre_signal(&record(4242))
+        .expect("first record must persist");
+    store
+        .record_pre_signal(&record(4343))
+        .expect("second record must persist");
+
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("audit must exist at {}: {e}", path.display()));
+    let lines: Vec<_> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "append-only: one line per record, got {lines:?}"
+    );
+    let first: PreSignalAudit = serde_json::from_str(lines[0]).expect("line 1 must be a record");
+    assert_eq!(
+        first.pid, 4242,
+        "the first record must survive the second write"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the audit names exact pids; keep it owner-only, got {mode:o}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A store that cannot write must SAY so. Reporting success it never achieved
+/// is the one failure that turns the whole pre-signal audit into decoration.
+#[test]
+fn an_unwritable_audit_store_reports_failure_3273() {
+    let dir = std::env::temp_dir().join(format!("agend-audit-{}-fail", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Occupy the audit's own parent path with a regular file: deterministic,
+    // and no permissions assumptions.
+    let occupied = dir.join("blocked");
+    std::fs::write(&occupied, b"not a directory").unwrap();
+    let store = JsonlAuditStore {
+        path: occupied.join("orphan-cleanup-audit.jsonl"),
+    };
+
+    let record = PreSignalAudit {
+        token: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        actor: "operator".to_string(),
+        audit_reason: "manual cleanup".to_string(),
+        candidate_id: "id".to_string(),
+        pid: 4242,
+        start_token: 111_000,
+        uid: 501,
+        at_ms: 1_700_000_000_000,
+    };
+    assert!(
+        store.record_pre_signal(&record).is_err(),
+        "a store that cannot write must not report durability"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// The CLI surface. Manual means an operator typed something explicit; these
+// contracts run the real binary so the clap wiring itself is the thing pinned,
+// not a helper that happens to exist beside it.
+// ---------------------------------------------------------------------------
+
+fn agend() -> assert_cmd::Command {
+    assert_cmd::Command::cargo_bin("agend-terminal").expect("binary must exist")
+}
+
+/// `doctor orphans preview` must exist as an explicit subcommand. The manual
+/// surface is the whole safety story: cleanup that can only be reached by
+/// typing it cannot happen by accident.
+#[test]
+fn doctor_orphans_preview_is_an_explicit_subcommand_3273() {
+    let out = agend()
+        .args(["doctor", "orphans", "preview", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`doctor orphans preview` must parse; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `apply` must refuse to parse without its authority arguments. Making them
+/// required at the parser is a cheaper guarantee than checking them later:
+/// there is no code path in which they can be absent.
+#[test]
+fn doctor_orphans_apply_requires_its_authority_arguments_3273() {
+    let help = agend()
+        .args(["doctor", "orphans", "apply", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        help.status.success(),
+        "`doctor orphans apply` must parse; stderr: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+
+    // Nothing supplied at all.
+    let bare = agend()
+        .args(["doctor", "orphans", "apply"])
+        .output()
+        .unwrap();
+    assert!(
+        !bare.status.success(),
+        "apply with no token, reason or confirm-id must refuse"
+    );
+
+    // Each argument missing in turn.
+    for missing in [
+        vec!["--audit-reason", "cleanup", "--confirm-id", "abc"],
+        vec![
+            "--token",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--confirm-id",
+            "abc",
+        ],
+        vec![
+            "--token",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "--audit-reason",
+            "cleanup",
+        ],
+    ] {
+        let mut args = vec!["doctor", "orphans", "apply"];
+        args.extend(missing.iter().copied());
+        let out = agend().args(&args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "apply must refuse when an authority argument is missing: {args:?}"
+        );
+    }
+}
+
+/// `doctor` with no subcommand stays a report. It must not prompt, must not
+/// consume a confirmation, and must not signal — so it must not even mention
+/// the manual surface in its output.
+#[test]
+fn bare_doctor_remains_report_only_3273() {
+    let home = std::env::temp_dir().join(format!("agend-doctor-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let out = agend()
+        .args(["doctor"])
+        .env("AGEND_HOME", &home)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for forbidden in ["confirm_token", "confirm-id", "SIGTERM", "SIGKILL"] {
+        assert!(
+            !combined.contains(forbidden),
+            "the default doctor report must not mention `{forbidden}`: it reports, it does not act"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
 }
