@@ -145,24 +145,46 @@ pub fn candidate_id(generation: u64, pid: u32, start_token: u64, uid: u32) -> St
 /// than carried as a partially-known candidate — an unidentifiable process can
 /// never become a confirmable one.
 pub fn preview<O: IdentityOracle, C: Clock>(
+    // Unused until the apply/CAS slice: the sidecar this snapshot will be
+    // persisted into is bound to `home`/`actor`/`audit_reason`, and persisting
+    // it before any contract pins that behaviour would be shipping unreviewed
+    // durability. The parameters stay on the signature so the call sites do not
+    // churn when that slice lands.
     _home: &Path,
     _actor: &str,
     _audit_reason: &str,
-    _proposed_pids: &[u32],
-    _oracle: &O,
+    proposed_pids: &[u32],
+    oracle: &O,
     clock: &C,
     generation: u64,
     support: Support,
 ) -> Preview {
-    // RED STUB (#3273): the executor does not exist yet, so the snapshot is
-    // empty and no id is ever emitted. `tests/orphan_cleanup_manual_authority.rs`
-    // fails on the missing ids; it does NOT fail on a missing symbol. GREEN
-    // replaces this body.
+    let mut candidates = Vec::new();
+    for pid in proposed_pids {
+        // Identity is re-derived HERE, from this module's own oracle — never
+        // read out of a V1 report. A pid whose identity is unobtainable is
+        // dropped outright: a partially-known row could be confirmed by an
+        // operator but could never be safely revalidated at signal time, and
+        // offering it would be offering authority over an unknown process.
+        let Some(identity) = oracle.identity(*pid) else {
+            continue;
+        };
+        candidates.push(CandidateSnapshot {
+            id: candidate_id(generation, *pid, identity.start_token, identity.uid),
+            pid: *pid,
+            start_token: identity.start_token,
+            uid: identity.uid,
+        });
+    }
     Preview {
         support,
-        token: String::new(),
+        // The token names this snapshot; the apply slice binds the sidecar to
+        // it. Shaped to pass the same 36-char hex/dash validation
+        // `decisions.rs::confirmation_path` uses, so a token can never be
+        // spent as a path component.
+        token: uuid::Uuid::new_v4().to_string(),
         generation,
         created_ms: clock.now_ms(),
-        candidates: Vec::new(),
+        candidates,
     }
 }
