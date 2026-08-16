@@ -1029,6 +1029,14 @@ pub fn gc_disabled_schedules(home: &Path) -> usize {
 }
 
 fn gc_disabled_schedules_at(home: &Path, now: chrono::DateTime<chrono::Utc>) -> usize {
+    gc_disabled_schedules_at_before_delete(home, now, || {})
+}
+
+fn gc_disabled_schedules_at_before_delete(
+    home: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    before_delete: impl FnOnce(),
+) -> usize {
     let cutoff = now - chrono::Duration::days(DISABLED_SCHEDULE_RETENTION_DAYS);
     let candidates: Vec<Schedule> = load(home)
         .schedules
@@ -1075,6 +1083,7 @@ fn gc_disabled_schedules_at(home: &Path, now: chrono::DateTime<chrono::Utc>) -> 
         return 0;
     }
     archived.extend(missing);
+    before_delete();
 
     let mut removed_ids = Vec::new();
     let result = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
@@ -1389,6 +1398,48 @@ mod tests {
         let archived = read_schedule_archive(&home.join("schedules-archive.jsonl"));
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].schedule.id, "eligible");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn gc_exact_row_cas_preserves_concurrently_reenabled_schedule() {
+        let home = tmp_home("typed-gc-concurrent-reenable");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut eligible = cron_row("eligible", "lead", false);
+        eligible["disabled_reason"] =
+            serde_json::json!({"kind": "superseded", "successor_id": "new"});
+        eligible["disabled_at"] = serde_json::json!("2026-08-01T00:00:00Z");
+        seed_schedule_rows(&home, serde_json::json!([eligible]));
+
+        let removed = gc_disabled_schedules_at_before_delete(&home, now, || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        assert_eq!(
+                            update(
+                                &home,
+                                &serde_json::json!({"id": "eligible", "enabled": true})
+                            )["status"],
+                            "updated"
+                        );
+                    })
+                    .join()
+                    .unwrap();
+            });
+        });
+
+        assert_eq!(removed, 0);
+        let schedules = load(&home).schedules;
+        assert_eq!(schedules.len(), 1);
+        assert!(schedules[0].enabled);
+        assert!(schedules[0].disabled_reason.is_none());
+        assert!(schedules[0].disabled_at.is_none());
+        assert_eq!(
+            read_schedule_archive(&home.join("schedules-archive.jsonl")).len(),
+            1
+        );
         std::fs::remove_dir_all(home).ok();
     }
 

@@ -195,4 +195,48 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn hourly_gc_entry_archives_eligible_disabled_schedule() {
+        let home = tmp_home("schedule-retention-entry");
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 3,
+                "schedules": [{
+                    "id": "spent",
+                    "message": "m",
+                    "target": "lead",
+                    "trigger": {"kind": "once", "at": "2026-07-01T00:00:00Z"},
+                    "enabled": false,
+                    "timezone": "UTC",
+                    "created_at": "2026-07-01T00:00:00Z",
+                    "updated_at": "2026-07-01T00:00:00Z",
+                    "run_history": [],
+                    "disabled_reason": {"kind": "one_shot_fired"},
+                    "disabled_at": "2026-07-01T00:00:00Z"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        GcTickHandler::new(1).run(&ctx);
+
+        let live = crate::schedules::list(&home, &serde_json::json!({}));
+        assert!(live["schedules"].as_array().unwrap().is_empty());
+        let archive = std::fs::read_to_string(home.join("schedules-archive.jsonl")).unwrap();
+        assert!(archive.contains("\"id\":\"spent\""));
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
