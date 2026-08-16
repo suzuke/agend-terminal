@@ -7,6 +7,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-08-16
+
+### Fixed
+
+- **Validated review receipts finalize their exact tasks** — an already-validated
+  exact-head review receipt is now authoritative for task completion even when
+  independent review-binding repair or release remains fail-closed. Ordinary
+  reports continue to preserve completion-guard refusal reasons (#3277).
+
 ## [0.12.0] — 2026-08-15
 
 112 commits since 0.11.3. This release makes restart recovery a structured,

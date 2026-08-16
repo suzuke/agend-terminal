@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-08-16
+
+### Fixed
+
+- **已驗證的 review receipt 會完成其 exact task** — 已通過驗證的 exact-head
+  review receipt 現在可作為 task completion 的 authoritative 證據，即使獨立的
+  review-binding repair 或 release 仍因 fail-closed 而拒絕，也不會阻擋完成 task；
+  一般 report 仍會保留 completion guard 的拒絕原因（#3277）。
+
 ## [0.12.0] — 2026-08-15
 
 自 0.11.3 以來共 112 個 commits。本次版本把 restart recovery 提升為具結構、
