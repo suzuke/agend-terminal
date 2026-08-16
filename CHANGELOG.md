@@ -20,7 +20,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
   eligible rows and preserves operator-paused, repairable, or ambiguous state
   (#3280, #3283).
 - **Coverage runs are isolated and diagnostics stay bounded** — CI coverage now
-  uses the dedicated nextest profile, attributes implausible git common-dir
+  uses the shared CI nextest profile, attributes implausible git common-dir
   output without dumping unbounded evidence, and guards production-read
   environment mutations (#3281, #3284).
 
@@ -834,7 +834,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/suzuke/agend-terminal/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/suzuke/agend-terminal/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3

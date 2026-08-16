@@ -17,8 +17,8 @@
 - **停用排程清理會保留 provenance** — 所有 terminal path 現在都會記錄具型別的
   disable provenance；保守 retention 只 archive 符合條件的 rows，並保留 operator
   pause、可修復或狀態不明確的資料（#3280、#3283）。
-- **Coverage run 彼此隔離且 diagnostics 有界** — CI coverage 現在使用專用的
-  nextest profile，對異常 git common-dir output 只記錄 attribution 而不傾倒無界
+- **Coverage run 彼此隔離且 diagnostics 有界** — CI coverage 現在使用共用的
+  CI nextest profile，對異常 git common-dir output 只記錄 attribution 而不傾倒無界
   evidence，並守護 production-read environment mutation（#3281、#3284）。
 
 ## [0.12.1] — 2026-08-16
@@ -740,7 +740,8 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/suzuke/agend-terminal/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/suzuke/agend-terminal/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3
