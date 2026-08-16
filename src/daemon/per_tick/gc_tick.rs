@@ -63,6 +63,14 @@ impl GcTickHandler {
             tracing::info!(stale_locks, "gc_tick: stale ci-watch locks cleaned");
         }
 
+        let archived_schedules = crate::schedules::gc_disabled_schedules(home);
+        if archived_schedules > 0 {
+            tracing::info!(
+                archived_schedules,
+                "gc_tick: disabled historical schedules durably archived and removed"
+            );
+        }
+
         // t-…50793-9: reclaim stale managed-worktree `target/` build dirs (the
         // dominant fleet disk consumer) without deleting the worktrees. Gated on
         // marker + confinement + mtime-staleness; honors AGEND_TARGET_GC_DISABLE.

@@ -115,7 +115,13 @@ pub fn check_schedules(home: &Path) {
                         "#1521: until_success linked task missing — disabling schedule"
                     );
                     crate::schedules::record_run(home, sched.id.as_str(), "target_task_missing");
-                    crate::schedules::set_enabled(home, sched.id.as_str(), false);
+                    crate::schedules::disable(
+                        home,
+                        sched.id.as_str(),
+                        crate::schedules::DisabledReason::LinkedTaskMissing {
+                            task_id: sched.linked_task_id.clone(),
+                        },
+                    );
                     continue;
                 }
                 // Pending (task exists, not done) OR ReadError (transient/
@@ -336,7 +342,15 @@ fn deliver_cron_fire(
         // Even on inject_failed we disable: one-shots are not retry-
         // safe (the window already rolled forward). The user can
         // re-create with a new run_at if they want another attempt.
-        crate::schedules::set_enabled(home, sched_id, false);
+        crate::schedules::disable(
+            home,
+            sched_id,
+            if missed {
+                crate::schedules::DisabledReason::OneShotMissed
+            } else {
+                crate::schedules::DisabledReason::OneShotFired
+            },
+        );
     }
 }
 
@@ -858,6 +872,36 @@ mod tests {
             !home.join("inbox").join("ghost.jsonl").exists(),
             "no orphan inbox file may be created for a ghost target"
         );
+        let schedule = sched0(&home);
+        assert_eq!(
+            schedule.disabled_reason,
+            Some(crate::schedules::DisabledReason::OneShotFired)
+        );
+        assert!(schedule.disabled_at.is_some());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn missed_one_shot_records_distinct_typed_disable_reason() {
+        let home = cron_tmp_home("typed-missed");
+        seed_oneshot(&home, "ghost");
+        deliver_cron_fire(
+            &home,
+            &empty_registry(),
+            "s-1488",
+            "ghost",
+            "ping",
+            "t",
+            &FireDecision {
+                one_shot: true,
+                missed: true,
+            },
+        );
+        assert_eq!(last_status(&home), "missed");
+        assert_eq!(
+            sched0(&home).disabled_reason,
+            Some(crate::schedules::DisabledReason::OneShotMissed)
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -1240,6 +1284,12 @@ mod tests {
         let s = sched0(&home);
         assert_eq!(last_status(&home), "target_task_missing");
         assert!(!s.enabled, "missing linked task must disable the schedule");
+        assert_eq!(
+            s.disabled_reason,
+            Some(crate::schedules::DisabledReason::LinkedTaskMissing {
+                task_id: Some("t-gone".to_string())
+            })
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -1296,7 +1346,7 @@ mod tests {
     }
 
     /// #1608b: a replay ERROR (corrupt event log) → ReadError → fail-open
-    /// (fire), never the destructive `Missing` → `set_enabled(false)`.
+    /// (fire), never the destructive `Missing` → typed disable path.
     #[test]
     fn linked_task_gate_replay_error_fails_open() {
         let home = cron_tmp_home("gate-err");
