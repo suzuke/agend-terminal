@@ -879,6 +879,13 @@ pub fn delete(home: &Path, args: &Value) -> Value {
     }
 }
 
+// #3280 RED seam: the production implementation replaces this test-only stub
+// after the retention contracts below are proven failing against current code.
+#[cfg(test)]
+fn gc_disabled_schedules_at(_home: &Path, _now: chrono::DateTime<chrono::Utc>) -> usize {
+    0
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -900,6 +907,218 @@ mod tests {
 
     fn future_iso() -> String {
         (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+    }
+
+    fn seed_schedule_rows(home: &Path, rows: Value) {
+        let store = serde_json::json!({"schema_version": 2, "schedules": rows});
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_vec_pretty(&store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn cron_row(id: &str, target: &str, enabled: bool) -> Value {
+        serde_json::json!({
+            "id": id,
+            "message": "m",
+            "target": target,
+            "trigger": {"kind": "cron", "expr": "0 9 * * *"},
+            "enabled": enabled,
+            "timezone": "UTC",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "run_history": []
+        })
+    }
+
+    #[test]
+    fn manual_disable_and_reenable_have_typed_provenance() {
+        let home = tmp_home("typed-manual-disable");
+        let created = create(
+            &home,
+            "lead",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "m"}),
+        );
+        let id = created["id"].as_str().unwrap();
+
+        assert_eq!(
+            update(&home, &serde_json::json!({"id": id, "enabled": false}))["status"],
+            "updated"
+        );
+        let disabled = list(&home, &serde_json::json!({}));
+        assert_eq!(
+            disabled["schedules"][0]["disabled_reason"]["kind"],
+            "operator_paused"
+        );
+        assert!(disabled["schedules"][0]["disabled_at"].is_string());
+
+        assert_eq!(
+            update(&home, &serde_json::json!({"id": id, "enabled": true}))["status"],
+            "updated"
+        );
+        let enabled = list(&home, &serde_json::json!({}));
+        assert!(enabled["schedules"][0].get("disabled_reason").is_none());
+        assert!(enabled["schedules"][0].get("disabled_at").is_none());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn replay_and_stale_drop_have_distinct_typed_provenance() {
+        let home = tmp_home("typed-replay-disable");
+        let now = chrono::Utc::now();
+        seed_schedule_rows(
+            &home,
+            serde_json::json!([
+                {
+                    "id": "replay", "message": "m", "target": "lead",
+                    "trigger": {"kind": "once", "at": (now - chrono::Duration::hours(1)).to_rfc3339()},
+                    "enabled": true, "timezone": "UTC", "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z", "run_history": []
+                },
+                {
+                    "id": "stale", "message": "m", "target": "lead",
+                    "trigger": {"kind": "once", "at": (now - chrono::Duration::hours(48)).to_rfc3339()},
+                    "enabled": true, "timezone": "UTC", "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z", "run_history": []
+                }
+            ]),
+        );
+        assert_eq!(replay_missed_oneshots(&home).len(), 1);
+        let listed = list(&home, &serde_json::json!({"full_history": true}));
+        let rows = listed["schedules"].as_array().unwrap();
+        let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(
+            row("replay")["disabled_reason"]["kind"],
+            "one_shot_replayed"
+        );
+        assert_eq!(
+            row("stale")["disabled_reason"]["kind"],
+            "one_shot_stale_dropped"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn later_target_deletion_updates_already_disabled_provenance_idempotently() {
+        let home = tmp_home("typed-orphan-after-pause");
+        let mut row = cron_row("paused", "doomed", false);
+        row["disabled_reason"] = serde_json::json!({"kind": "operator_paused"});
+        row["disabled_at"] = serde_json::json!("2026-01-01T00:00:00Z");
+        seed_schedule_rows(&home, serde_json::json!([row]));
+
+        assert_eq!(orphan_schedules_for_target(&home, "doomed"), 1);
+        assert_eq!(orphan_schedules_for_target(&home, "doomed"), 0);
+        let listed = list(&home, &serde_json::json!({"full_history": true}));
+        assert_eq!(
+            listed["schedules"][0]["disabled_reason"],
+            serde_json::json!({"kind": "target_orphaned", "target": "doomed"})
+        );
+        assert_eq!(
+            listed["schedules"][0]["run_history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn supersession_records_typed_successor_identity() {
+        let home = tmp_home("typed-supersession");
+        let first = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 9 * * *", "message": "old", "replacement_key": "singleton"
+            }),
+        );
+        let second = create(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "cron": "0 9 * * *", "message": "new", "replacement_key": "singleton"
+            }),
+        );
+        let listed = list(&home, &serde_json::json!({}));
+        let rows = listed["schedules"].as_array().unwrap();
+        let old = rows.iter().find(|row| row["id"] == first["id"]).unwrap();
+        assert_eq!(
+            old["disabled_reason"],
+            serde_json::json!({"kind": "superseded", "successor_id": second["id"]})
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn gc_archives_only_eligible_rows_at_seven_day_boundary() {
+        let home = tmp_home("typed-gc-boundary");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let old = "2026-08-09T00:00:00Z";
+        let fresh = "2026-08-09T00:00:01Z";
+        let mut eligible = cron_row("superseded-old", "lead", false);
+        eligible["disabled_reason"] =
+            serde_json::json!({"kind": "superseded", "successor_id": "new"});
+        eligible["disabled_at"] = serde_json::json!(old);
+        let mut before_boundary = cron_row("superseded-fresh", "lead", false);
+        before_boundary["disabled_reason"] =
+            serde_json::json!({"kind": "superseded", "successor_id": "new"});
+        before_boundary["disabled_at"] = serde_json::json!(fresh);
+        let mut paused = cron_row("paused", "lead", false);
+        paused["disabled_reason"] = serde_json::json!({"kind": "operator_paused"});
+        paused["disabled_at"] = serde_json::json!(old);
+        let mut orphaned = cron_row("orphaned-recurring", "gone", false);
+        orphaned["disabled_reason"] =
+            serde_json::json!({"kind": "target_orphaned", "target": "gone"});
+        orphaned["disabled_at"] = serde_json::json!(old);
+        let mut legacy = cron_row("legacy-unknown", "lead", false);
+        legacy["updated_at"] = serde_json::json!(old);
+        seed_schedule_rows(
+            &home,
+            serde_json::json!([eligible, before_boundary, paused, orphaned, legacy]),
+        );
+
+        assert_eq!(gc_disabled_schedules_at(&home, now), 1);
+        let store = load(&home);
+        let ids: std::collections::HashSet<_> =
+            store.schedules.iter().map(|row| row.id.as_str()).collect();
+        assert!(!ids.contains("superseded-old"));
+        assert!(ids.contains("superseded-fresh"));
+        assert!(ids.contains("paused"));
+        assert!(ids.contains("orphaned-recurring"));
+        assert!(ids.contains("legacy-unknown"));
+
+        let archive = std::fs::read_to_string(home.join("schedules-archive.jsonl")).unwrap();
+        let entry: Value = serde_json::from_str(archive.trim()).unwrap();
+        assert_eq!(entry["schedule"]["id"], "superseded-old");
+        assert_eq!(entry["schedule"]["disabled_reason"]["kind"], "superseded");
+        assert_eq!(gc_disabled_schedules_at(&home, now), 0, "GC is idempotent");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn gc_archive_failure_preserves_live_store_row() {
+        let home = tmp_home("typed-gc-archive-failure");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut eligible = cron_row("eligible", "lead", false);
+        eligible["disabled_reason"] =
+            serde_json::json!({"kind": "superseded", "successor_id": "new"});
+        eligible["disabled_at"] = serde_json::json!("2026-08-01T00:00:00Z");
+        seed_schedule_rows(&home, serde_json::json!([eligible]));
+        std::fs::create_dir(home.join("schedules-archive.jsonl")).unwrap();
+
+        assert_eq!(gc_disabled_schedules_at(&home, now), 0);
+        assert_eq!(
+            load(&home).schedules.len(),
+            1,
+            "archive failure must fail closed"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
