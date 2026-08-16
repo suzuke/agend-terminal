@@ -421,7 +421,10 @@ fn census_detects_a_new_unserialized_mutation() {
 
 #[test]
 fn census_accepts_a_standard_serial_group() {
-    let root = std::env::temp_dir().join(format!("agend-env-census-serial-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "agend-env-serialized-census-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(root.join("src")).expect("create synthetic src");
     std::fs::create_dir_all(root.join("tests")).expect("create synthetic tests");
     std::fs::write(
