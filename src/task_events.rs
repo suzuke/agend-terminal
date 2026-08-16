@@ -565,6 +565,12 @@ impl std::fmt::Display for TaskPriority {
 }
 
 impl TaskStatus {
+    /// Terminal lifecycle states. Keep this as the single source of truth so a
+    /// newly added terminal variant cannot be omitted by daemon consumers.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled | Self::Superseded)
+    }
+
     /// Parse a status string (MCP-facing).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -588,7 +594,7 @@ impl TaskStatus {
         use TaskStatus::*;
         // Cancelled and Blocked are reachable from any non-terminal state.
         if target == Cancelled {
-            return !matches!(self, Done | Cancelled | Superseded);
+            return !self.is_terminal();
         }
         if target == Blocked {
             return !matches!(self, Done | Cancelled | Superseded | Blocked);

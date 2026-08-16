@@ -1192,12 +1192,8 @@ pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> Option<bool> 
     let tasks = crate::tasks::list_all_strict(home).ok()?;
     Some(tasks.iter().any(|task| {
         task.branch.as_deref() == Some(branch)
-            && !matches!(
-                task.status,
-                crate::task_events::TaskStatus::Done
-                    | crate::task_events::TaskStatus::Cancelled
-                    | crate::task_events::TaskStatus::Verified
-            )
+            && !(task.status.is_terminal()
+                || task.status == crate::task_events::TaskStatus::Verified)
     }))
 }
 

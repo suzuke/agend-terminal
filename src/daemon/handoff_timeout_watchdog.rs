@@ -195,11 +195,7 @@ pub(crate) fn scan_and_emit_with<F, G>(
                     );
                 } else if let Some(ref task_id) = track.wake_task_id {
                     if let Ok(rt) = crate::tasks::load_routed(home, task_id) {
-                        if matches!(
-                            rt.record().status,
-                            crate::task_events::TaskStatus::Done
-                                | crate::task_events::TaskStatus::Cancelled
-                        ) {
+                        if rt.record().status.is_terminal() {
                             crate::daemon::ci_handoff_track::reactivate_track(
                                 home,
                                 target,

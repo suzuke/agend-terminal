@@ -648,12 +648,8 @@ fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bo
     }
     match crate::tasks::load_routed(home, task_id) {
         Ok(routed) => {
-            let active = !matches!(
-                routed.task.status,
-                crate::task_events::TaskStatus::Done
-                    | crate::task_events::TaskStatus::Cancelled
-                    | crate::task_events::TaskStatus::Verified
-            );
+            let active = !(routed.task.status.is_terminal()
+                || routed.task.status == crate::task_events::TaskStatus::Verified);
             // A live task with no branch metadata is still an unresolved
             // holder for this binding; preserve rather than guessing.
             let branch_matches = routed
@@ -707,12 +703,10 @@ fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
         return None;
     }
     match crate::tasks::load_routed(home, task_id) {
-        Ok(routed) => Some(matches!(
-            routed.task.status,
-            crate::task_events::TaskStatus::Done
-                | crate::task_events::TaskStatus::Cancelled
-                | crate::task_events::TaskStatus::Verified
-        )),
+        Ok(routed) => Some(
+            routed.task.status.is_terminal()
+                || routed.task.status == crate::task_events::TaskStatus::Verified,
+        ),
         Err(crate::tasks::TaskRouteError::NotFound)
         | Err(crate::tasks::TaskRouteError::Unreadable { .. })
         | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,

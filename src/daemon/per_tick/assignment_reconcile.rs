@@ -229,10 +229,7 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Reconci
         // valid review — retire the assignment instead of re-nudging it.
         // Fail-closed: route error or unknown task_id → preserve.
         if let Ok(routed) = crate::tasks::load_routed(home, &record.task_id) {
-            if matches!(
-                routed.task.status,
-                crate::task_events::TaskStatus::Cancelled | crate::task_events::TaskStatus::Done
-            ) {
+            if routed.task.status.is_terminal() {
                 if store::retire_if_id_matches(
                     home,
                     repo,

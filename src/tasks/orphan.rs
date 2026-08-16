@@ -1,3 +1,4 @@
+use crate::task_events::TaskStatus;
 use serde_json::Value;
 use std::path::Path;
 
@@ -136,7 +137,6 @@ pub fn scan_inprogress_orphans(
     state: &crate::task_events::TaskBoardState,
     live: &std::collections::HashSet<String>,
 ) -> Vec<crate::task_events::TaskId> {
-    use crate::task_events::TaskStatus;
     state
         .tasks
         .values()
@@ -452,13 +452,9 @@ pub fn scan_orphan_candidates(
     live: &std::collections::HashSet<String>,
     fleet_instances: &std::collections::HashSet<String>,
 ) -> OrphanScanResult {
-    use crate::task_events::TaskStatus;
     let mut result = OrphanScanResult::default();
     for record in state.tasks.values() {
-        if matches!(
-            record.status,
-            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
-        ) {
+        if record.status.is_terminal() {
             continue;
         }
         let Some(owner) = record.owner.as_ref() else {
@@ -524,10 +520,7 @@ pub fn build_health_response(
             TaskStatus::Superseded => "superseded",
         };
         *by_status.entry(key).or_insert(0) += 1;
-        if !matches!(
-            record.status,
-            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
-        ) {
+        if !record.status.is_terminal() {
             if let Ok(dt) = DateTime::parse_from_rfc3339(&record.created_at) {
                 let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
                 non_terminal_ages_days.push(age.num_days());

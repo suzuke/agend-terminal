@@ -34,6 +34,36 @@ fn sample_event(id: &str) -> TaskEvent {
     }
 }
 
+/// #3279: compile-visible terminality guard. Adding a TaskStatus variant makes
+/// this exhaustive match fail to compile until its lifecycle class is chosen.
+#[test]
+fn task_status_terminality_is_exhaustive_3279() {
+    for status in [
+        TaskStatus::Backlog,
+        TaskStatus::Open,
+        TaskStatus::Claimed,
+        TaskStatus::InProgress,
+        TaskStatus::InReview,
+        TaskStatus::Verified,
+        TaskStatus::Done,
+        TaskStatus::Cancelled,
+        TaskStatus::Superseded,
+        TaskStatus::Blocked,
+    ] {
+        let expected = match status {
+            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded => true,
+            TaskStatus::Backlog
+            | TaskStatus::Open
+            | TaskStatus::Claimed
+            | TaskStatus::InProgress
+            | TaskStatus::InReview
+            | TaskStatus::Verified
+            | TaskStatus::Blocked => false,
+        };
+        assert_eq!(status.is_terminal(), expected, "{status}");
+    }
+}
+
 #[test]
 fn append_assigns_monotonic_seq_per_instance() {
     let home = tmp_home("seq");

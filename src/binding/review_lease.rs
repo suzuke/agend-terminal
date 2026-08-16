@@ -74,17 +74,20 @@ pub(crate) fn retarget_disposable_review_binding_for_receipt(
 
     let predecessor = crate::tasks::load_routed(home, &predecessor_task)
         .map_err(|e| format!("predecessor review task is not uniquely routed: {e}"))?;
-    if predecessor.record().status != crate::task_events::TaskStatus::Cancelled
-        || predecessor
-            .record()
-            .owner
-            .as_ref()
-            .map(|owner| owner.0.as_str())
-            != Some(agent)
+    if !matches!(
+        predecessor.record().status,
+        crate::task_events::TaskStatus::Cancelled | crate::task_events::TaskStatus::Superseded
+    ) || predecessor
+        .record()
+        .owner
+        .as_ref()
+        .map(|owner| owner.0.as_str())
+        != Some(agent)
         || predecessor.record().branch.as_deref() != Some(summary.branch.as_str())
     {
         return Err(
-            "stale binding predecessor is not a cancelled task owned by the reviewer".to_string(),
+            "stale binding predecessor is not a cancelled or superseded task owned by the reviewer"
+                .to_string(),
         );
     }
     let successor = crate::tasks::load_routed(home, &summary.task_id)

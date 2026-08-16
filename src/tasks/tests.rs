@@ -2811,6 +2811,44 @@ fn create_with_supersedes_atomically_terminates_predecessor_3279() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3279 review B1: daemon-side review-assignment retirement must not demote a
+/// typed Superseded predecessor back to Cancelled.
+#[test]
+fn superseded_review_assignment_cancellation_is_terminal_noop_3279() {
+    let home = tmp_home("3279-assignment-terminal");
+    let predecessor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"old", "assignee":"reviewer"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let successor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"new", "supersedes": predecessor}),
+    );
+    assert_eq!(successor["event"], "created", "{successor}");
+
+    let cancelled =
+        super::cancel_review_assignment_task(&home, &predecessor, "reviewer", "stale assignment")
+            .unwrap();
+    assert!(!cancelled, "terminal supersession must be a daemon no-op");
+    let old = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"get", "id": predecessor}),
+    );
+    assert_eq!(old["task"]["status"], "superseded", "{old}");
+    assert_eq!(
+        old["task"]["result"],
+        format!("Superseded by {}", successor["id"].as_str().unwrap()),
+        "{old}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3279: a lost create response may be retried. The predecessor's typed
 /// supersession relation is the idempotency key: retry returns the original
 /// successor and appends no second Created/Superseded pair.

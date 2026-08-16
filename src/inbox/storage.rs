@@ -1864,15 +1864,7 @@ pub fn obligation_reason(home: &Path, msg: &InboxMessage) -> Option<String> {
                 // (NotFound/Unreadable/Ambiguous) is uncertainty → KEEP (failure
                 // mode = noise, never hidden work), matching this fn's contract.
                 Some(id) => match crate::tasks::load_routed(home, id) {
-                    Ok(rt)
-                        if matches!(
-                            rt.task.status,
-                            crate::task_events::TaskStatus::Done
-                                | crate::task_events::TaskStatus::Cancelled
-                        ) =>
-                    {
-                        None
-                    }
+                    Ok(rt) if rt.task.status.is_terminal() => None,
                     Ok(rt) => Some(format!(
                         "task {id} not terminal (status={})",
                         rt.task.status

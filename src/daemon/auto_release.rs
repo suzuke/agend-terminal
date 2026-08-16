@@ -242,7 +242,6 @@ fn close_grace_passed(closed_at: &str) -> bool {
 /// confirmed in a DIFFERENT repo does not block; an UNresolvable pending
 /// task (owner unbound) blocks (conservative — never mis-release).
 fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
-    use crate::task_events::TaskStatus;
     let all_tasks = match crate::tasks::list_all_strict(home) {
         Ok(tasks) => tasks,
         Err(e) => {
@@ -266,12 +265,7 @@ fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
     }
     branch_tasks
         .iter()
-        .filter(|t| {
-            !matches!(
-                t.status,
-                TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
-            )
-        })
+        .filter(|t| !t.status.is_terminal())
         .all(|t| {
             let owner_repo = t
                 .assignee
@@ -378,14 +372,10 @@ fn reviewer_binding_release_bypass(
     assignee: &str,
     sender_role: Option<&str>,
 ) -> bool {
-    use crate::task_events::TaskStatus;
     intent.event_kind.as_deref() == Some("verdict")
         && intent.reviewer == assignee
         && is_reviewer_role(sender_role)
-        && matches!(
-            task.map(|t| &t.status),
-            Some(TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded)
-        )
+        && task.is_some_and(|task| task.status.is_terminal())
 }
 
 /// Outcome of [`decide_release`] — pure helper unit-tested without

@@ -421,12 +421,7 @@ pub(crate) struct ReconcileResult {
 }
 
 fn review_task_terminal(status: &crate::task_events::TaskStatus) -> bool {
-    matches!(
-        status,
-        crate::task_events::TaskStatus::Done
-            | crate::task_events::TaskStatus::Cancelled
-            | crate::task_events::TaskStatus::Verified
-    )
+    status.is_terminal() || *status == crate::task_events::TaskStatus::Verified
 }
 
 fn is_branch_checked_out(repo: &Path, branch: &str) -> bool {

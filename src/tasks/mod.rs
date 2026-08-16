@@ -1,11 +1,13 @@
 //! Task board — fleet-wide task tracking via JSON file.
 
 mod acl;
+mod activity;
 pub mod auto_close;
 mod board_router;
 mod handler;
 pub mod lifecycle;
 mod orphan;
+mod supersession;
 mod sweep;
 
 #[cfg(test)]
@@ -204,10 +206,7 @@ pub(crate) fn cancel_review_assignment_task(
                     "review-assignment task '{task_id_owned}' disappeared during write-time revalidation"
                 ));
             };
-            if matches!(
-                record.status,
-                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
-            ) {
+            if record.status.is_terminal() {
                 return Ok(Vec::new());
             }
             let task_owned_by_target = record

@@ -148,12 +148,7 @@ pub(super) fn scan_categories(
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
     let mut issue_cache: HashMap<u32, IssueState> = HashMap::new();
     for t in &tasks {
-        if matches!(
-            t.status,
-            crate::task_events::TaskStatus::Done
-                | crate::task_events::TaskStatus::Cancelled
-                | crate::task_events::TaskStatus::Verified
-        ) {
+        if t.status.is_terminal() || t.status == crate::task_events::TaskStatus::Verified {
             continue;
         }
         let age = chrono::DateTime::parse_from_rfc3339(&t.updated_at)

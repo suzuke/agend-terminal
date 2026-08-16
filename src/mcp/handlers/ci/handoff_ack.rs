@@ -219,10 +219,7 @@ pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) ->
     };
     match crate::tasks::load_routed(home, wake_task_id) {
         Ok(rt) => {
-            if matches!(
-                rt.record().status,
-                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
-            ) {
+            if rt.record().status.is_terminal() {
                 return json!({
                     "error": format!("wake_task_id '{wake_task_id}' is already terminal"),
                     "code": "wake_task_terminal"
