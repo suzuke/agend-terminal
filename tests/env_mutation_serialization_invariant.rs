@@ -2,9 +2,11 @@
 //!
 //! Coverage now runs each test in a nextest process, but plain `cargo test`
 //! remains supported. Process-global env mutations in the same test binary can
-//! race there. This invariant records the current unprotected `(file, key)`
-//! debt exactly: new rows fail, and removing a row also fails until the baseline
-//! is shrunk. Files using an explicit shared mutex are separately audited.
+//! race there. This invariant ratchets the literal-key mutation and production
+//! reader shapes it recognizes: new rows fail, and removing a row also fails
+//! until the baseline is shrunk. Direct env reads plus the repository's
+//! `has_env`, `env_parse`, and `env_parse_min` helpers are covered. Files
+//! using an explicit shared mutex are separately audited.
 
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +42,11 @@ const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
     (
         "src/daemon/retention/worktrees.rs",
         "AGEND_WORKTREE_ARCHIVE_FALLBACK",
+        "GC_TRASH_ENV_LOCK / gc_trash_env_guard serializes the env tests",
+    ),
+    (
+        "src/daemon/retention/worktrees.rs",
+        "AGEND_WORKTREE_GC_TRASH_DAYS",
         "GC_TRASH_ENV_LOCK / gc_trash_env_guard serializes the env tests",
     ),
     (
@@ -365,6 +372,8 @@ fn census(root: &Path, serialized: &BTreeSet<(String, String)>) -> BTreeSet<(Str
         let production = production_text(&path_rel, &body);
         production_keys.extend(env_args(production, "var", &consts));
         production_keys.extend(named_call_args(production, "has_env", &consts));
+        production_keys.extend(named_call_args(production, "env_parse", &consts));
+        production_keys.extend(named_call_args(production, "env_parse_min", &consts));
         bodies.push((path_rel, body, consts));
     }
 
@@ -407,6 +416,27 @@ fn census_detects_a_new_unserialized_mutation() {
     std::fs::write(
         root.join("src/lib.rs"),
         "pub fn enabled() -> bool { std::env::var(\"AGEND_DEMO\").is_ok() }\n",
+    )
+    .expect("write synthetic production source");
+    std::fs::write(
+        root.join("tests/racy.rs"),
+        "#[test]\nfn racy() { std::env::set_var(\"AGEND_DEMO\", \"1\"); }\n",
+    )
+    .expect("write synthetic racy test");
+    let rows = census(&root, &BTreeSet::new());
+    assert!(rows.contains(&("tests/racy.rs".into(), "AGEND_DEMO".into())));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn census_detects_a_key_read_through_env_parse() {
+    let root = std::env::temp_dir().join(format!("agend-env-helper-census-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).expect("create synthetic src");
+    std::fs::create_dir_all(root.join("tests")).expect("create synthetic tests");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn env_parse<T>(_: &str, default: T) -> T { default }\n\
+         pub fn enabled() -> bool { env_parse(\"AGEND_DEMO\", false) }\n",
     )
     .expect("write synthetic production source");
     std::fs::write(

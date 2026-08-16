@@ -4,7 +4,20 @@ fn coverage_job(workflow: &str) -> &str {
     let (_, coverage) = workflow
         .split_once("\n  coverage:\n")
         .expect("CI workflow must contain the coverage job");
-    coverage
+    let end = coverage
+        .match_indices("\n  ")
+        .find_map(|(at, _)| {
+            let line = coverage[at + 3..].lines().next()?;
+            (!line.starts_with(' ') && !line.starts_with('#') && line.ends_with(':')).then_some(at)
+        })
+        .unwrap_or(coverage.len());
+    &coverage[..end]
+}
+
+#[test]
+fn coverage_job_is_bounded_before_the_next_job() {
+    let workflow = "jobs:\n  coverage:\n    steps: []\n  later-job:\n    marker: later\n";
+    assert_eq!(coverage_job(workflow), "    steps: []");
 }
 
 #[test]

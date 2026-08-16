@@ -40,9 +40,9 @@ set -o pipefail
 # `all` keeps every valid profile when one killed process leaves a partial raw
 # file. Missing counters can only lower measured coverage; real test failures
 # still make cargo-llvm-cov fail, and llvm-profdata still fails when every input
-# is unusable. `--profile` belongs to cargo-llvm-cov before its nextest
-# passthrough, so select nextest's isolation profile through its unambiguous
-# environment variable instead.
+# is unusable. cargo-llvm-cov 0.8.5 forwards `--profile ci` to nextest, but its
+# own help also defines `--profile`; use nextest's environment variable so
+# profile selection stays explicit and unambiguous across tool versions.
 if [ -n "${COVERAGE_PRODUCER:-}" ]; then
     producer="$COVERAGE_PRODUCER"
 else
