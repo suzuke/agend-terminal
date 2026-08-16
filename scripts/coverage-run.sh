@@ -126,7 +126,11 @@ emit_git_common_dir_diagnostic() {
         echo 'git_common_dir=unavailable reason=snapshot-allocation-failed'
         return
     fi
-    git rev-parse --path-format=absolute --git-common-dir >"$tmp" 2>&1
+    # The exit status is sufficient to classify a failed probe.  Never copy
+    # the shell's own command-not-found diagnostics back into the structured
+    # evidence block (notably when Git is absent from Git Bash's narrowed
+    # PATH), where a raw `: line N:` fragment would break framing.
+    git rev-parse --path-format=absolute --git-common-dir >"$tmp" 2>/dev/null
     rc=$?
     bytes="$(wc -c <"$tmp" 2>/dev/null | tr -d '[:space:]')"
     case "$bytes" in '' | *[!0-9]*) bytes=unknown ;; esac

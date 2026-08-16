@@ -4260,6 +4260,15 @@ test_absent_tools_degrade_to_unavailable() {
     # shellcheck disable=SC2016  # this is the shim's SOURCE; $1 must reach it unexpanded
     printf '#!/usr/bin/env bash\ncase "$1" in --print) printf "%%s\\n" "/nonexistent/lib";; *) printf "rustc 9.9.9 (shim)\\n";; esac\n' >"$shim/rustc"
     chmod +x "$shim/rustc"
+    # Pin the Git-Bash failure mode even on hosts where /usr/bin/git exists:
+    # a failed provenance probe may emit shell-shaped stderr, but that text
+    # must never be copied into the structured evidence block.
+    cat >"$shim/git" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$0: line 99: git unavailable" >&2
+exit 127
+SHIM
+    chmod +x "$shim/git"
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
 printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4250-787_0.profraw"
@@ -4427,6 +4436,21 @@ printf 'called\n' >>"$sandbox/ps-called"
 exit 1
 SHIM
     chmod +x "$shim/ps"
+    # Keep the unrelated git-common-dir provenance probe outside this spy's
+    # measurement boundary.  This test is about PID consumers: letting the
+    # host's git implementation (or a site-local wrapper around it) run here
+    # makes any process inspection it performs indistinguishable from a PID
+    # lookup in coverage-run.sh.
+    cat >"$shim/git" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$#" -eq 3 ] && [ "$1" = "rev-parse" ] && \
+        [ "$2" = "--path-format=absolute" ] && [ "$3" = "--git-common-dir" ]; then
+    printf '/coverage-test/.git\n'
+    exit 0
+fi
+exit 2
+SHIM
+    chmod +x "$shim/git"
     cat >"$sandbox/producer.sh" <<PRODUCER
 #!/usr/bin/env bash
 printf 'partial' >"\$COVERAGE_PROFILE_DIR/agend-terminal-$token-795_0.profraw"
