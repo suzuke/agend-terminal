@@ -389,12 +389,14 @@ test_default_producer_contains_partial_profiles() {
     cat >"$sandbox/bin/cargo" <<'CARGO'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$COV_TEST_ARGS"
+printf '%s' "${NEXTEST_PROFILE:-}" >"$COV_TEST_PROFILE"
 exit 0
 CARGO
     chmod +x "$sandbox/bin/cargo"
 
     out="$(cd "$sandbox" && PATH="$sandbox/bin:$PATH" \
         COV_TEST_ARGS="$sandbox/args" \
+        COV_TEST_PROFILE="$sandbox/profile" \
         COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" \
         "$wrapper" 2>&1)"
@@ -404,14 +406,16 @@ CARGO
     if [ "$rc" -ne 0 ]; then
         report 1 "default producer uses llvm-profdata failure-mode all" "wrapper exited $rc: $out"
     elif ! awk 'previous == "--failure-mode" && $0 == "all" { failure_mode = 1 }
-        previous == "--profile" && $0 == "ci" { ci_profile = 1 }
+        $0 == "--profile" { ambiguous_profile = 1 }
         $0 == "nextest" { nextest = 1 }
         $0 == "--tests" { legacy_tests = 1 }
         { previous = $0 }
-        END { exit !(failure_mode && ci_profile && nextest && !legacy_tests) }' "$sandbox/args"; then
-        report 1 "default producer uses llvm-profdata failure-mode all" "cargo args: $args"
+        END { exit !(failure_mode && nextest && !ambiguous_profile && !legacy_tests) }' "$sandbox/args" ||
+        [ "$(cat "$sandbox/profile")" != "ci" ]; then
+        report 1 "default producer selects nextest isolation and llvm-profdata failure-mode all" \
+            "cargo args: $args; NEXTEST_PROFILE=$(cat "$sandbox/profile")"
     else
-        report 0 "default producer uses llvm-profdata failure-mode all"
+        report 0 "default producer selects nextest isolation and llvm-profdata failure-mode all"
     fi
     rm -rf "$sandbox"
 }

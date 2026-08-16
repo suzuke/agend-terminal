@@ -414,6 +414,10 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install nextest for coverage isolation (#3281)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: Run coverage
         timeout-minutes: 35
         env:
