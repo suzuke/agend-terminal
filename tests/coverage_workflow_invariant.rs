@@ -30,8 +30,7 @@ fn coverage_job_is_bounded_before_the_next_job() {
 
 #[test]
 fn coverage_job_accepts_windows_checkout_line_endings() {
-    let workflow =
-        "jobs:\r\n  coverage:\r\n    steps: []\r\n  later-job:\r\n    marker: later\r\n";
+    let workflow = "jobs:\r\n  coverage:\r\n    steps: []\r\n  later-job:\r\n    marker: later\r\n";
     assert_eq!(coverage_job(workflow), "    steps: []");
 }
 
