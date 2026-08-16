@@ -7,6 +7,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-08-17
+
+### Fixed
+
+- **Task supersession is typed, atomic, and terminal** — superseding a task now
+  records the exact successor on the same board, refuses cross-board mutation,
+  keeps terminal predecessors closed, and makes retries idempotent (#3279,
+  #3282).
+- **Disabled schedule cleanup preserves provenance** — every terminal path now
+  records typed disable provenance, while conservative retention archives only
+  eligible rows and preserves operator-paused, repairable, or ambiguous state
+  (#3280, #3283).
+- **Coverage runs are isolated and diagnostics stay bounded** — CI coverage now
+  uses the dedicated nextest profile, attributes implausible git common-dir
+  output without dumping unbounded evidence, and guards production-read
+  environment mutations (#3281, #3284).
+
 ## [0.12.1] — 2026-08-16
 
 ### Fixed

@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-08-17
+
+### Fixed
+
+- **Task supersession 具型別、原子性且保持終態** — supersede task 現在會在同一
+  board 記錄精確 successor、拒絕跨 board mutation、維持 predecessor 的 terminal
+  狀態，且 retry 具 idempotency（#3279、#3282）。
+- **停用排程清理會保留 provenance** — 所有 terminal path 現在都會記錄具型別的
+  disable provenance；保守 retention 只 archive 符合條件的 rows，並保留 operator
+  pause、可修復或狀態不明確的資料（#3280、#3283）。
+- **Coverage run 彼此隔離且 diagnostics 有界** — CI coverage 現在使用專用的
+  nextest profile，對異常 git common-dir output 只記錄 attribution 而不傾倒無界
+  evidence，並守護 production-read environment mutation（#3281、#3284）。
+
 ## [0.12.1] — 2026-08-16
 
 ### Fixed
