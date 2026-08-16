@@ -41,7 +41,7 @@ set -o pipefail
 # file. Missing counters can only lower measured coverage; real test failures
 # still make cargo-llvm-cov fail, and llvm-profdata still fails when every input
 # is unusable.
-producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --failure-mode all --lcov --output-path coverage.lcov}"
+producer="${COVERAGE_PRODUCER:-cargo llvm-cov nextest --profile ci -p agend-terminal --features tray --failure-mode all --lcov --output-path coverage.lcov}"
 clean_cmd="${COVERAGE_CLEAN:-cargo llvm-cov clean --workspace}"
 profile_dir="${COVERAGE_PROFILE_DIR:-target/llvm-cov-target}"
 max_attempts="${COVERAGE_MAX_ATTEMPTS:-3}"
@@ -103,6 +103,48 @@ escape_field() {
         *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C sed 's/[[:cntrl:]]/\\?/g')" ;;
     esac
     printf '%s' "$s"
+}
+
+# #3281: the Coverage incident included an implausible `git rev-parse
+# --git-common-dir` value. This is attribution evidence only: it neither changes
+# producer classification nor claims the unresolved writer root cause. Keep the
+# rendered prefix small so a corrupt 32 KiB response cannot become a 32 KiB CI
+# notification.
+emit_git_common_dir_diagnostic() {
+    local tmp rc bytes lines value reason prefix
+    tmp="$(mktemp "${TMPDIR:-/tmp}/coverage-git-common-dir.XXXXXX" 2>/dev/null)"
+    if [ -z "$tmp" ] || [ -L "$tmp" ] || [ ! -f "$tmp" ]; then
+        [ -n "$tmp" ] && [ ! -L "$tmp" ] && rm -f "$tmp"
+        echo 'git_common_dir=unavailable reason=snapshot-allocation-failed'
+        return
+    fi
+    git rev-parse --path-format=absolute --git-common-dir >"$tmp" 2>&1
+    rc=$?
+    bytes="$(wc -c <"$tmp" 2>/dev/null | tr -d '[:space:]')"
+    case "$bytes" in '' | *[!0-9]*) bytes=unknown ;; esac
+    lines="$(awk 'END { print NR }' <"$tmp" 2>/dev/null)"
+    case "$lines" in '' | *[!0-9]*) lines=unknown ;; esac
+
+    reason=""
+    if [ "$rc" -ne 0 ]; then
+        reason=command-failed
+    elif [ "$bytes" = "0" ]; then
+        reason=empty
+    elif [ "$bytes" = "unknown" ] || [ "$bytes" -gt 4097 ]; then
+        reason=oversized
+    elif [ "$lines" != "1" ]; then
+        reason=multiline
+    else
+        value="$(sed -n '1p' <"$tmp")"
+        case "$value" in /*) ;; *) reason=not-absolute ;; esac
+    fi
+
+    if [ -n "$reason" ]; then
+        prefix="$(head -c 160 <"$tmp" 2>/dev/null)"
+        printf 'git_common_dir=implausible reason=%s bytes=%s lines=%s exit=%s prefix=%s\n' \
+            "$reason" "$bytes" "$lines" "$rc" "$(escape_field "$prefix")"
+    fi
+    rm -f "$tmp"
 }
 
 # `diag_max_files` is used bare as an integer (`[ … -ge … ]`) and as `head -n`,
@@ -1008,6 +1050,7 @@ emit_diagnostics() {
     # anything reachable here; the invariant simply should not rest on it.
     printf 'profile_dir=%s\n' "$(escape_field "$profile_dir")"
     emit_toolchain
+    emit_git_common_dir_diagnostic
     # Collect every named-corrupt basename FIRST, so the exemplar search below
     # can exclude all of them rather than only the file being described.
     local ncb
