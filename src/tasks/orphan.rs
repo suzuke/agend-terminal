@@ -455,7 +455,10 @@ pub fn scan_orphan_candidates(
     use crate::task_events::TaskStatus;
     let mut result = OrphanScanResult::default();
     for record in state.tasks.values() {
-        if matches!(record.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        if matches!(
+            record.status,
+            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
+        ) {
             continue;
         }
         let Some(owner) = record.owner.as_ref() else {
@@ -518,9 +521,13 @@ pub fn build_health_response(
             TaskStatus::Done => "done",
             TaskStatus::Cancelled => "cancelled",
             TaskStatus::Verified => "verified",
+            TaskStatus::Superseded => "superseded",
         };
         *by_status.entry(key).or_insert(0) += 1;
-        if !matches!(record.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        if !matches!(
+            record.status,
+            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
+        ) {
             if let Ok(dt) = DateTime::parse_from_rfc3339(&record.created_at) {
                 let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
                 non_terminal_ages_days.push(age.num_days());

@@ -134,6 +134,7 @@ fn make_record(
         depends_on: Vec::new(),
         routed_to: None,
         result: None,
+        superseded_by: None,
         branch: None,
         bind: None,
         started_at: None,
@@ -193,7 +194,7 @@ fn scan_orphan_candidates_handles_empty_state() {
     assert!(result.soft.is_empty(), "empty state → empty soft");
 }
 
-/// #829 C3 GREEN: terminal-status tasks (Done / Cancelled) are
+/// #829 C3 GREEN: terminal-status tasks (Done / Cancelled / Superseded) are
 /// excluded even when their owner is a ghost. The ACL is already
 /// disabled at the event-log layer for terminal records, so
 /// re-orphaning is noise. Locks the skip behavior.
@@ -207,6 +208,7 @@ fn scan_orphan_candidates_excludes_terminal_status() {
         make_record("t-claimed", TaskStatus::Claimed, Some("ghost829")),
         make_record("t-done", TaskStatus::Done, Some("ghost829")),
         make_record("t-cancel", TaskStatus::Cancelled, Some("ghost829")),
+        make_record("t-superseded", TaskStatus::Superseded, Some("ghost829")),
     ]);
     let live = make_set(&[]);
     let fleet = make_set(&[]);
@@ -216,7 +218,7 @@ fn scan_orphan_candidates_excludes_terminal_status() {
     assert_eq!(
         ids,
         vec!["t-claimed".to_string(), "t-open".to_string()],
-        "Done + Cancelled must be excluded; non-terminal must surface (BTreeMap order is by TaskId)"
+        "all terminal statuses must be excluded; non-terminal must surface (BTreeMap order is by TaskId)"
     );
 }
 
@@ -2750,6 +2752,217 @@ fn cross_project_parent_id_rejected_at_create_2117_p3a() {
         "same-project subtask must be allowed: {ok}"
     );
 
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3279: successor creation is one typed same-board transaction. The
+/// predecessor becomes a distinct terminal `superseded` state and its result
+/// identifies the successor; the successor itself is created normally.
+#[test]
+fn create_with_supersedes_atomically_terminates_predecessor_3279() {
+    let home = tmp_home("3279-same-board");
+    let predecessor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"old"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let successor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({
+            "action":"create", "title":"new", "supersedes": predecessor
+        }),
+    );
+    let successor_id = successor["id"].as_str().unwrap();
+    assert_eq!(successor["event"], "created");
+
+    let old = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"get", "id": predecessor}),
+    );
+    assert_eq!(old["task"]["status"], "superseded", "{old}");
+    assert_eq!(
+        old["task"]["result"],
+        format!("Superseded by {successor_id}"),
+        "{old}"
+    );
+    let new = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"get", "id": successor_id}),
+    );
+    assert_eq!(new["task"]["status"], "open", "{new}");
+    let reopen = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"update", "id": predecessor, "status":"open"}),
+    );
+    assert!(
+        reopen["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("illegal transition")),
+        "typed supersession must remain terminal: {reopen}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3279: a lost create response may be retried. The predecessor's typed
+/// supersession relation is the idempotency key: retry returns the original
+/// successor and appends no second Created/Superseded pair.
+#[test]
+fn create_with_supersedes_retry_returns_existing_successor_3279() {
+    let home = tmp_home("3279-retry");
+    let predecessor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"old"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"new", "supersedes": predecessor}),
+    );
+    let before = std::fs::read_to_string(home.join("task_events.jsonl"))
+        .unwrap()
+        .lines()
+        .count();
+    let retry = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"new", "supersedes": predecessor}),
+    );
+    let after = std::fs::read_to_string(home.join("task_events.jsonl"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(retry["event"], "already_superseded", "{retry}");
+    assert_eq!(retry["id"], first["id"], "{retry}");
+    assert_eq!(after, before, "retry must append zero task events");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3279: terminal races fail closed. A predecessor that reached Done before
+/// the checked batch stays Done and no successor is created.
+#[test]
+fn create_with_supersedes_refuses_terminal_race_without_successor_3279() {
+    let home = tmp_home("3279-terminal-race");
+    let predecessor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"old"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let done = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"done", "id": predecessor, "result":"finished"}),
+    );
+    assert_eq!(done["event"], "done", "{done}");
+
+    let refused = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"new", "supersedes": predecessor}),
+    );
+    assert_eq!(refused["code"], "supersession_refused", "{refused}");
+    let fleet = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"list", "scope":"fleet", "include_history":true}),
+    );
+    assert_eq!(fleet["tasks"].as_array().unwrap().len(), 1, "{fleet}");
+    assert_eq!(fleet["tasks"][0]["status"], "done", "{fleet}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3279: supersession is a same-board composition operation. An exact task on
+/// another board is rejected before the new task or any predecessor mutation is
+/// appended.
+#[test]
+fn create_with_supersedes_refuses_cross_board_with_zero_task_mutation_3279() {
+    let home = tmp_home("3279-cross-board");
+    let predecessor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"old", "project":"proj-a"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = std::fs::read_to_string(
+        crate::task_events::board_root(&home, "proj-a").join("task_events.jsonl"),
+    )
+    .unwrap();
+    let refused = handle(
+        &home,
+        "dev",
+        &serde_json::json!({
+            "action":"create", "title":"new", "project":"proj-b",
+            "supersedes": predecessor
+        }),
+    );
+    assert_eq!(refused["code"], "cross_board_supersession", "{refused}");
+    assert!(
+        super::list_all_at(&home, &crate::task_events::board_root(&home, "proj-b")).is_empty(),
+        "cross-board refusal must not create the successor"
+    );
+    let after = std::fs::read_to_string(
+        crate::task_events::board_root(&home, "proj-a").join("task_events.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "cross-board refusal must not mutate predecessor"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3279 source guard: the historical free-form metadata convention is inert.
+/// Only the typed `supersedes` create argument may drive a terminal transition.
+#[test]
+fn finalization_successor_metadata_cannot_transition_task_3279() {
+    let home = tmp_home("3279-metadata-inert");
+    let predecessor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"old"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let successor = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"create", "title":"new"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let set = handle(
+        &home,
+        "dev",
+        &serde_json::json!({
+            "action":"metadata_set", "id": predecessor,
+            "metadata_key":"finalization_successor_task", "metadata_value": successor
+        }),
+    );
+    assert!(set.get("error").is_none(), "{set}");
+    let old = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action":"get", "id": predecessor}),
+    );
+    assert_eq!(old["task"]["status"], "open", "{old}");
     std::fs::remove_dir_all(&home).ok();
 }
 

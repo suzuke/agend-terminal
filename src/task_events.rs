@@ -50,7 +50,9 @@ use std::path::{Path, PathBuf};
 /// v1 readers fail-closed on v2 envelopes via the `schema_version >
 /// SCHEMA_VERSION` check in [`replay`]. v2 readers accept v1 envelopes
 /// (the new `Created` fields default to `None` / `Vec::new()`).
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3 (#3279) adds the typed [`TaskEvent::Superseded`] terminal transition.
+/// Older readers must reject rather than silently fold it as an active task.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Hot-file event count [`compact`] trims the hot log back down to.
 pub const COMPACTION_KEEP: usize = 10_000;
@@ -219,7 +221,7 @@ pub enum LinkSource {
     SweepDiscovery { sweep_id: String },
 }
 
-// ── TaskEvent — 10 variants, exhaustive match enforces forward audit ─
+// ── TaskEvent — exhaustive matches enforce forward audit ──────────
 
 /// One state transition on a task. `kind` tag at the top level; inner
 /// `via` tags on `DoneSource` / `LinkSource` keep the sub-provenance
@@ -296,6 +298,14 @@ pub enum TaskEvent {
         task_id: TaskId,
         by: InstanceName,
         reason: String,
+    },
+    /// #3279: terminal predecessor relation created atomically with its
+    /// successor on the same board. Distinct from Cancelled so replay and
+    /// operators retain why the work item ended and the exact successor ID.
+    Superseded {
+        task_id: TaskId,
+        by: InstanceName,
+        successor_id: TaskId,
     },
     Linked {
         task_id: TaskId,
@@ -424,6 +434,7 @@ impl TaskEvent {
             | TaskEvent::Verified { task_id, .. }
             | TaskEvent::Done { task_id, .. }
             | TaskEvent::Cancelled { task_id, .. }
+            | TaskEvent::Superseded { task_id, .. }
             | TaskEvent::Linked { task_id, .. }
             | TaskEvent::Blocked { task_id, .. }
             | TaskEvent::Unblocked { task_id }
@@ -450,6 +461,7 @@ impl TaskEvent {
             TaskEvent::Verified { .. } => "verified",
             TaskEvent::Done { .. } => "done",
             TaskEvent::Cancelled { .. } => "cancelled",
+            TaskEvent::Superseded { .. } => "superseded",
             TaskEvent::Linked { .. } => "linked",
             TaskEvent::Blocked { .. } => "blocked",
             TaskEvent::Unblocked { .. } => "unblocked",
@@ -504,6 +516,7 @@ pub enum TaskStatus {
     Verified,
     Done,
     Cancelled,
+    Superseded,
     Blocked,
 }
 
@@ -518,6 +531,7 @@ impl std::fmt::Display for TaskStatus {
             Self::Verified => write!(f, "verified"),
             Self::Done => write!(f, "done"),
             Self::Cancelled => write!(f, "cancelled"),
+            Self::Superseded => write!(f, "superseded"),
             Self::Blocked => write!(f, "blocked"),
         }
     }
@@ -562,6 +576,7 @@ impl TaskStatus {
             "verified" => Some(Self::Verified),
             "done" => Some(Self::Done),
             "cancelled" => Some(Self::Cancelled),
+            "superseded" => Some(Self::Superseded),
             "blocked" => Some(Self::Blocked),
             _ => None,
         }
@@ -573,10 +588,10 @@ impl TaskStatus {
         use TaskStatus::*;
         // Cancelled and Blocked are reachable from any non-terminal state.
         if target == Cancelled {
-            return self != Done && self != Cancelled;
+            return !matches!(self, Done | Cancelled | Superseded);
         }
         if target == Blocked {
-            return !matches!(self, Done | Cancelled | Blocked);
+            return !matches!(self, Done | Cancelled | Superseded | Blocked);
         }
         matches!(
             (self, target),
@@ -641,6 +656,9 @@ pub struct TaskRecord {
     pub depends_on: Vec<TaskId>,
     pub routed_to: Option<InstanceName>,
     pub result: Option<String>,
+    /// #3279: exact typed successor for a terminal Superseded predecessor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<TaskId>,
     pub branch: Option<String>,
     /// Sprint 55 P0-C — opt-out flag for daemon auto-bind on dispatch.
     /// `Some(false)` means RCA/audit/design class; auto-bind was skipped.
@@ -786,6 +804,9 @@ impl TaskBoardState {
             }
             TaskEvent::Done { source, .. } => self.apply_done(task_id, touch_at, source),
             TaskEvent::Cancelled { .. } => self.apply_cancelled(task_id, touch_at),
+            TaskEvent::Superseded { successor_id, .. } => {
+                self.apply_superseded(task_id, touch_at, successor_id)
+            }
             TaskEvent::Linked { pr_id, .. } => self.apply_linked(task_id, touch_at, *pr_id),
             TaskEvent::Blocked { reason, .. } => self.apply_blocked(task_id, touch_at, reason),
             TaskEvent::Unblocked { .. } => self.apply_unblocked(task_id, touch_at),
@@ -882,6 +903,7 @@ impl TaskBoardState {
                 depends_on: depends_on.to_vec(),
                 routed_to: routed_to.clone(),
                 result: None,
+                superseded_by: None,
                 branch: branch.clone(),
                 bind: *bind,
                 started_at: None,
@@ -965,6 +987,15 @@ impl TaskBoardState {
                 child.status = TaskStatus::Cancelled;
                 child.updated_at = touch_at.to_string();
             }
+        }
+    }
+
+    fn apply_superseded(&mut self, task_id: &TaskId, touch_at: &str, successor_id: &TaskId) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::Superseded;
+            t.result = Some(format!("Superseded by {}", successor_id.0));
+            t.superseded_by = Some(successor_id.clone());
+            t.updated_at = touch_at.to_string();
         }
     }
 

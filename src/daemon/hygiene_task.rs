@@ -42,11 +42,14 @@ impl HygieneUpsert {
     }
 }
 
-/// Find the ACTIVE (not Done/Cancelled) task carrying `key` in
+/// Find the ACTIVE (not Done/Cancelled/Superseded) task carrying `key` in
 /// `system_alert_key` metadata, plus its current occurrence count.
 fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
     state.tasks.values().find_map(|t| {
-        if matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        if matches!(
+            t.status,
+            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
+        ) {
             return None;
         }
         (t.metadata.get(ALERT_KEY_META)? == key).then(|| {

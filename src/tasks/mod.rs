@@ -632,6 +632,7 @@ pub(super) fn status_to_legacy_str(s: crate::task_events::TaskStatus) -> &'stati
         TaskStatus::Done => "done",
         TaskStatus::Cancelled => "cancelled",
         TaskStatus::Blocked => "blocked",
+        TaskStatus::Superseded => "superseded",
     }
 }
 

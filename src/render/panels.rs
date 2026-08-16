@@ -625,7 +625,7 @@ pub fn task_board_columns_viewport(
             TaskStatus::InProgress => working.push(t),
             TaskStatus::InReview | TaskStatus::Verified => review.push(t),
             TaskStatus::Blocked => blocked.push(t),
-            TaskStatus::Done => done.push(t),
+            TaskStatus::Done | TaskStatus::Superseded => done.push(t),
         }
     }
 

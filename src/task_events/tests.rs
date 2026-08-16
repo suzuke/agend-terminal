@@ -1189,6 +1189,11 @@ fn state_machine_exhaustive_transitions() {
                 by: inst.clone(),
                 reason: "test".into(),
             }],
+            TaskStatus::Superseded => vec![TaskEvent::Superseded {
+                task_id: tid.clone(),
+                by: inst.clone(),
+                successor_id: TaskId::from("t-successor"),
+            }],
             TaskStatus::Blocked => vec![TaskEvent::Blocked {
                 task_id: tid.clone(),
                 reason: "test".into(),

@@ -290,6 +290,7 @@ fn cleanup_orchestrator_tasks_for_team(home: &Path, team_name: &str) {
                 .starts_with(&format!("Team '{}' needs new orchestrator", team_name))
             && task.status != crate::task_events::TaskStatus::Done
             && task.status != crate::task_events::TaskStatus::Cancelled
+            && task.status != crate::task_events::TaskStatus::Superseded
         {
             crate::tasks::handle(
                 home,
