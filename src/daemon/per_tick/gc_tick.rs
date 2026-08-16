@@ -202,7 +202,7 @@ mod tests {
         std::fs::write(
             home.join("schedules.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 3,
+                "schema_version": 2,
                 "schedules": [{
                     "id": "spent",
                     "message": "m",

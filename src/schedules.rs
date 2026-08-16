@@ -348,9 +348,12 @@ pub(crate) struct ScheduleStore {
 impl crate::store::SchemaVersioned for ScheduleStore {
     /// v1: `{cron: String}` on each row.
     /// v2: `{trigger: {kind, ...}}` on each row, with `Once` variant.
-    /// v3: typed `disabled_reason` + `disabled_at` provenance.
-    /// v1/v2 rows are transparently upgraded on load via `ScheduleRaw::From`.
-    const CURRENT: u32 = 3;
+    /// Typed `disabled_reason` + `disabled_at` are optional additive v2 fields.
+    /// Keeping v2 preserves rollback safety: an older v2 binary ignores these
+    /// fields instead of treating the store as a future schema and overwriting
+    /// it with an empty default on its next mutation.
+    /// v1 rows are transparently upgraded on load via `ScheduleRaw::From`.
+    const CURRENT: u32 = 2;
     fn version_mut(&mut self) -> &mut u32 {
         &mut self.schema_version
     }
@@ -2185,8 +2188,8 @@ mod tests {
         assert_eq!(upd["status"], "updated");
         let on_disk = std::fs::read_to_string(home.join("schedules.json")).expect("read");
         assert!(
-            on_disk.contains("\"schema_version\": 3"),
-            "migrated file must stamp v3; got: {on_disk}"
+            on_disk.contains("\"schema_version\": 2"),
+            "migrated file must stamp v2; got: {on_disk}"
         );
         // And the `cron` field must be gone / `trigger` present.
         assert!(on_disk.contains("\"trigger\""), "post-save: {on_disk}");
