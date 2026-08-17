@@ -1511,7 +1511,7 @@ PRODUCER
 # soft deadline. The failure must be explicit, but it must not turn ordinary
 # slow completion into a hard timeout.
 test_failed_rescue_is_distinct_from_slow_success() {
-    local sandbox deadline_status diagnostics elapsed bad=""
+    local sandbox deadline_status diagnostics elapsed waited deadline bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -1535,6 +1535,8 @@ PRODUCER
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
         "synthetic failed rescue" "deadline control")"
     elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    waited="$(echo "$deadline_status" | sed -n 's/^waited_seconds=//p')"
+    deadline="$(echo "$deadline_status" | sed -n 's/^deadline_seconds=//p')"
     cleanup_deadline_producer "$sandbox" \
         || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
@@ -1548,8 +1550,12 @@ PRODUCER
     echo "$diagnostics" | grep '^deadline_rescue_completion=bounded$' >/dev/null || bad="$bad diagnostic-completion"
     case "$elapsed" in
         '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
-        *) [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 4 ] \
-            || bad="$bad elapsed($elapsed)" ;;
+        *) [ "$elapsed" -ge 1 ] || bad="$bad elapsed-too-short" ;;
+    esac
+    case "$waited:$deadline" in
+        *[!0-9:]* | :* | *: | *:*:*) bad="$bad deadline-invalid" ;;
+        *) [ "$waited" -le "$((deadline * 4))" ] \
+            || bad="$bad waited($waited/$deadline)" ;;
     esac
     if [ -n "$bad" ]; then
         report 1 "a failed rescue is distinct from slow success" "issues:$bad"
