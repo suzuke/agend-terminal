@@ -434,7 +434,9 @@ Use `send` for all inter-agent messaging:
 2. **CI all-green** — every CI gate the PR runs has reported success. The `[ci-pass]` watch broadcast does NOT substitute — confirm via your own update so the dispatcher's loop closer fires regardless of their channel state.
 3. **Reviewer verdict received** — VERIFIED / REJECTED / UNVERIFIED, with the reviewer's identity and key finding summary.
 
-Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher relies on these as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
+Milestone 3 remains the default. A dispatcher MAY explicitly waive it for exactly one named, assignment-backed typed `report_purpose: "code_review"` dispatch and one review round by declaring that report to be the round's loop closer. The waiver declaration MUST identify the assignment (or its task, reviewed head, and round) and be visible to the implementer. It never applies to legacy, untyped, or unassigned review lanes; never carries into a later re-review round; and lapses if the owning team's orchestrator changes. Daemon best-effort fan-out to the implementer is not the implementer's milestone update. `↳ 緣由 A-§6.1`
+
+Absent that explicit waiver, re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher relies on these as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
 
 For analysis, spike, review, or operational tasks that do not produce a PR, report the requested artifact/result and mark the PR-specific milestones not applicable; do not invent a PR lifecycle.
 
@@ -871,6 +873,9 @@ The bar for SOP 3 — fixup-reviewer's #882 verdict, verbatim: "Checked out pre-
 
 ### A-§3.22 — Spike-First Planning Gate
 Distilled from the 2026-06-18 governance batch (operator D1–D5). Recurring failure mode: a combined spike+impl dispatch pre-commits to an impl scope the spike then refutes — e.g. #2325's "copy key is broken" framing and D1's "parse `Closes #N`" approach both inverted once the spike actually read the code / checked native platform behavior, so any impl approved up front would have built the wrong thing. Separating the dispatches and gating impl on a decision-manifest makes the premise-check load-bearing rather than decorative, and stops batch-approval from blessing an unknown scope.
+
+### A-§6.1 — Typed Review Verdict Loop Closer
+An assignment-backed typed `code_review` report is durably delivered to the recorded assignment issuer before verdict processing or best-effort fan-out to the implementer. Requiring the implementer to relay the same verdict can therefore be a redundant hop. The exemption is explicit and round-scoped because receipt validation does not recheck that the assignment issuer remains the owning team's current orchestrator; legacy and unassigned lanes also lack the same delivery proof. This boundary was established by the adversarial RCA for #3286.
 
 ### A-§7.1 — CI Tool Identity & Cache Hygiene
 Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` exit check missed pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
