@@ -436,7 +436,7 @@ Impl 推送 PR 後立即開始下一項任務。Reviewer 發出裁決後立即�
 2. **CI 全綠**——該 PR 執行的每個 CI 閘門皆已回報成功。`[ci-pass]` watch 廣播不能取代此更新——請透過你自己的更新確認，讓派送者的閉環器無論其 channel 狀態如何都會觸發。
 3. **已收到審查者裁決**——VERIFIED / REJECTED / UNVERIFIED，並附上審查者身分與關鍵發現摘要。
 
-里程碑 3 仍是預設要求。派送者可以明示豁免恰好一個具名、由 assignment 支持的 typed `report_purpose: "code_review"` 派送，且只限一個審查輪次；派送者必須宣告該 report 是該輪的閉環器。豁免宣告必須識別該 assignment（或其 task、reviewed head 與輪次），且 implementer 必須能看見。豁免絕不適用於 legacy、untyped 或未指派的審查路徑；絕不延續至後續重新審查輪次；若所屬 team 的 orchestrator 更換，豁免即失效。Daemon 對 implementer 的 best-effort fan-out 不等同 implementer 自己的里程碑更新。`↳ 緣由 A-§6.1`
+里程碑 3 仍是預設要求。派送者可以明示豁免恰好一個具名、由 assignment 支持的 typed `report_purpose: "code_review"` 派送，且只限一個審查輪次；派送者必須宣告該 report 是該輪的閉環器。豁免宣告必須識別該 assignment（或其 task、reviewed head 與輪次），且 implementer 必須能看見。豁免絕不適用於 legacy、untyped 或未指派的審查路徑；絕不延續至後續重新審查輪次；若所屬 team 的 orchestrator 更換，豁免即失效。Implementer 在裁決抵達、準備依賴豁免前，必須確認宣告豁免的派送者仍是所屬 team 當前的 orchestrator；若無法確認，就傳送里程碑 3。Daemon 對 implementer 的 best-effort fan-out 不等同 implementer 自己的里程碑更新。`↳ 緣由 A-§6.1`
 
 重新審查循環（r1、r2、……）會重複相同的三個里程碑。里程碑 1 與 2 一律重複；里程碑 3 的明示豁免只適用於具名輪次。若無該豁免，派送者依賴全部三項來完成閉環；缺少任何一項都會迫使他們輪詢，而那是反模式（請參閱 §7）。
 
@@ -874,7 +874,7 @@ SOP 3 的門檻——fixup-reviewer 對 #882 的 verdict 原文：「Checked out
 此 rule 源自 2026-06-18 governance batch（operator D1–D5）。反覆出現的 failure mode：合併 spike+impl 的 dispatch，會先承諾一個之後被 spike 推翻的 impl scope——例如 #2325 的「copy key is broken」framing，與 D1 的「parse `Closes #N`」approach，都在 spike 真正閱讀 code／檢查 native platform behavior 後反轉；因此，任何預先核准的 impl 都會建置錯誤項目。分開 dispatch 並用 decision-manifest gate impl，能讓 premise check 成為真正必要條件，而不是裝飾，也能避免 batch approval 核准 unknown scope。
 
 ### A-§6.1——Typed Review Verdict Loop Closer
-由 assignment 支持的 typed `code_review` report，會在裁決處理或對 implementer 的 best-effort fan-out 之前，先 durable delivery 給記錄中的 assignment issuer。因此，要求 implementer 再轉述相同裁決可能是多餘的一跳。這項豁免必須明示且限於單一輪次，因為 receipt 驗證不會重新確認 assignment issuer 仍是所屬 team 當前的 orchestrator；legacy 與未指派路徑也沒有相同的 delivery 證據。此邊界由 #3286 的對抗式 RCA 建立。
+由 assignment 支持的 typed `code_review` report，會在裁決處理或對 implementer 的 best-effort fan-out 之前，先 durable delivery 給記錄中的 assignment issuer。因此，要求 implementer 再轉述相同裁決可能是多餘的一跳。這項豁免必須明示且限於單一輪次，因為 receipt 驗證不會重新確認 assignment issuer 仍是所屬 team 當前的 orchestrator；legacy 與未指派路徑也沒有相同的 delivery 證據。Implementer 在裁決抵達時檢查 ownership，可讓輪次中途的 orchestrator 重新指派回退到預設更新。此邊界由 #3286 的對抗式 RCA 建立。
 
 ### A-§7.1——CI Tool Identity 與 Cache Hygiene
 此 pattern 在 2026-05-14 PR #772 v1 → v3 演進中被捕捉；v1 的 `cargo --version` exit check 漏掉 pollution；v2 detection-recover 失敗；v3 的 `cache-bin: false` prevention 交付成功。
