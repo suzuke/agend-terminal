@@ -436,7 +436,7 @@ Use `send` for all inter-agent messaging:
 
 Milestone 3 remains the default. A dispatcher MAY explicitly waive it for exactly one named, assignment-backed typed `report_purpose: "code_review"` dispatch and one review round by declaring that report to be the round's loop closer. The waiver declaration MUST identify the assignment (or its task, reviewed head, and round) and be visible to the implementer. It never applies to legacy, untyped, or unassigned review lanes; never carries into a later re-review round; and lapses if the owning team's orchestrator changes. Daemon best-effort fan-out to the implementer is not the implementer's milestone update. `↳ 緣由 A-§6.1`
 
-Absent that explicit waiver, re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher relies on these as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
+Re-review cycles (r1, r2, …) repeat the same three milestones. Milestones 1 and 2 always repeat; an explicit milestone 3 waiver applies only in its named round. Absent that waiver, the dispatcher relies on all three as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
 
 For analysis, spike, review, or operational tasks that do not produce a PR, report the requested artifact/result and mark the PR-specific milestones not applicable; do not invent a PR lifecycle.
 
