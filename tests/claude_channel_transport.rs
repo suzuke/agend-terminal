@@ -503,7 +503,12 @@ fn channel_bridge_production_entry_self_kick_ack_is_correlated_and_non_replying(
         }),
     );
     let _ = read_mcp(&mut stdout);
-    let _ = wait_for_health(endpoint, token);
+    write_mcp(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    let health = wait_for_health(endpoint, token);
+    assert_eq!(health["ready"], true);
     let (status, _) = http_request(
         endpoint,
         token,
