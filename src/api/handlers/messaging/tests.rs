@@ -4886,3 +4886,234 @@ fn cross_team_plain_report_still_blocked_2957() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #3293: terminal-report settlement outcome must be disclosed ──
+//
+// `send.terminal` documents an unconditional auto-close, but settlement runs
+// behind `assignee_completion_guard`. When that guard refuses, the report is
+// still delivered and the task correctly stays open — the defect is that the
+// caller was told nothing, so an assignee believed the task was settled and
+// only the board disagreed. These drive the REAL send entry (`handle_send`),
+// not the `auto_close` helper, because the whole defect lives in what the
+// response does or does not carry.
+
+fn seed_claimed_task_3293(
+    home: &std::path::Path,
+    task_id: &str,
+    assignee: &str,
+    branch: Option<&str>,
+) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let tid = TaskId(task_id.into());
+    crate::task_events::append_batch(
+        home,
+        &InstanceName::from("test:seed"),
+        vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "3293 fixture".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: branch.map(String::from),
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::Claimed {
+                task_id: tid,
+                by: InstanceName::from(assignee),
+            },
+        ],
+    )
+    .expect("seed 3293 task");
+}
+
+fn task_status_3293(
+    home: &std::path::Path,
+    task_id: &str,
+) -> Option<crate::task_events::TaskStatus> {
+    let state = crate::task_events::replay_at(home).expect("replay board");
+    state
+        .tasks
+        .get(&crate::task_events::TaskId(task_id.into()))
+        .map(|record| record.status)
+}
+
+fn fleet_with_pair_3293(home: &std::path::Path) {
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(home),
+        "instances:\n  dev-agent:\n    backend: claude\n  lead:\n    backend: claude\n",
+    )
+    .expect("write fleet");
+}
+
+/// A refused settlement must be reported to the caller, not only to the log.
+/// Delivery still succeeds and the task correctly stays open.
+#[test]
+fn terminal_report_settlement_refusal_is_disclosed_3293() {
+    let home = tmp_home("3293-refusal");
+    fleet_with_pair_3293(&home);
+    let task_id = "t-3293-refusal";
+    seed_claimed_task_3293(&home, task_id, "dev-agent", Some("feat/unmerged-3293"));
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "dev-agent",
+            "target": "lead",
+            "text": "PR is up",
+            "kind": "report",
+            "terminal": true,
+            "correlation_id": task_id,
+        }),
+        &ctx,
+    );
+
+    assert_eq!(
+        result["ok"], true,
+        "settlement refusal must not fail the report delivery: {result}"
+    );
+    let outcome = &result["auto_close"];
+    assert!(
+        outcome.is_object(),
+        "a terminal report must disclose its settlement outcome: {result}"
+    );
+    assert_eq!(
+        outcome["closed"], false,
+        "the guard refused, so the task was not closed: {result}"
+    );
+    assert_eq!(
+        outcome["code"].as_str(),
+        Some("assignee_completion_blocked"),
+        "the refusal must carry a machine-readable code: {result}"
+    );
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("binding or unconsumed merge receipt"),
+        "the guard's own diagnostic must reach the caller verbatim: {result}"
+    );
+    assert!(
+        !outcome["closure_condition"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the caller must be told what would permit closure: {result}"
+    );
+    assert_eq!(
+        task_status_3293(&home, task_id),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "the completion guard's decision is preserved exactly"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The positive outcome is disclosed too, so a caller never has to read the
+/// board to tell "settled" from "silently refused".
+#[test]
+fn terminal_report_settlement_success_is_disclosed_3293() {
+    let home = tmp_home("3293-success");
+    fleet_with_pair_3293(&home);
+    let task_id = "t-3293-success";
+    seed_claimed_task_3293(&home, task_id, "dev-agent", None);
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "dev-agent",
+            "target": "lead",
+            "text": "analysis delivered",
+            "kind": "report",
+            "terminal": true,
+            "correlation_id": task_id,
+        }),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        result["auto_close"]["closed"], true,
+        "a branchless task settles, and that must be visible: {result}"
+    );
+    assert_eq!(
+        task_status_3293(&home, task_id),
+        Some(crate::task_events::TaskStatus::Done)
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A terminal report from someone who is not the assignee is skipped by
+/// `auto_close`, not refused by the guard. That distinction is deliberate and
+/// must remain visible in the response.
+#[test]
+fn terminal_report_by_non_assignee_is_disclosed_not_applicable_3293() {
+    let home = tmp_home("3293-nonassignee");
+    fleet_with_pair_3293(&home);
+    let task_id = "t-3293-nonassignee";
+    seed_claimed_task_3293(&home, task_id, "lead", None);
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "dev-agent",
+            "target": "lead",
+            "text": "not my task",
+            "kind": "report",
+            "terminal": true,
+            "correlation_id": task_id,
+        }),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["auto_close"]["closed"], false, "{result}");
+    assert_eq!(
+        result["auto_close"]["code"].as_str(),
+        Some("settlement_not_applicable"),
+        "a skip is not a guard refusal and must not borrow its code: {result}"
+    );
+    assert_eq!(
+        task_status_3293(&home, task_id),
+        Some(crate::task_events::TaskStatus::Claimed)
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Control (green before and after): a report that does not request settlement
+/// carries no settlement outcome, so the field's presence stays meaningful.
+#[test]
+fn non_terminal_report_omits_settlement_outcome_3293() {
+    let home = tmp_home("3293-nonterminal");
+    fleet_with_pair_3293(&home);
+    let task_id = "t-3293-nonterminal";
+    seed_claimed_task_3293(&home, task_id, "dev-agent", None);
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "dev-agent",
+            "target": "lead",
+            "text": "progress",
+            "kind": "report",
+            "correlation_id": task_id,
+        }),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert!(
+        result.get("auto_close").is_none(),
+        "no settlement was requested, so none may be reported: {result}"
+    );
+    assert_eq!(
+        task_status_3293(&home, task_id),
+        Some(crate::task_events::TaskStatus::Claimed)
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
