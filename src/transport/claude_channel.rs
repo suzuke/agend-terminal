@@ -2370,6 +2370,71 @@ mod tests {
     }
 
     #[test]
+    fn channel_initialize_does_not_claim_consumer_readiness_before_initialized_notification() {
+        let home = home("consumer-readiness");
+        let locator = test_published_locator(&home, "claude-agent");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+
+        let response = mcp_message(
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"initialize",
+                "params":{
+                    "protocolVersion":"2025-06-18",
+                    "clientInfo":{"name":"claude-code","version":"2.1.80"}
+                }
+            }),
+            &runtime,
+        )
+        .expect("initialize response");
+        assert!(response.get("result").is_some());
+        assert!(
+            !runtime.is_ready(),
+            "initialize response proves protocol compatibility, not that the consumer installed its notification handler"
+        );
+
+        assert!(
+            mcp_message(
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"notifications/initialized"
+                }),
+                &runtime,
+            )
+            .is_none()
+        );
+        assert!(
+            runtime.is_ready(),
+            "the standard initialized notification is the consumer-readiness boundary"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn initialized_notification_without_supported_initialize_stays_unready() {
+        let home = home("initialized-without-handshake");
+        let locator = test_published_locator(&home, "claude-agent");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+
+        assert!(
+            mcp_message(
+                json!({
+                    "jsonrpc":"2.0",
+                    "method":"notifications/initialized"
+                }),
+                &runtime,
+            )
+            .is_none()
+        );
+        assert!(
+            !runtime.is_ready(),
+            "an uncorrelated initialized notification must not open the delivery lane"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn reply_requires_delivery_and_chat_correlation() {
         let home = home("correlation");
         let locator = test_published_locator(&home, "claude-agent");
