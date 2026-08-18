@@ -152,7 +152,19 @@ fn load_latches_for_epoch(
 ) -> Option<Vec<DurableLatch>> {
     #[cfg(test)]
     test_support::run_load_before_lock_hook(home, agent, transport_epoch);
-    let _lock = crate::store::acquire_file_lock(&latch_lock_path(home, agent)).ok()?;
+    let lock_path = latch_lock_path(home, agent);
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(
+                agent = %agent,
+                path = %lock_path.display(),
+                error = %error,
+                "#2044 durable verification latch lock unavailable; refusing to re-arm"
+            );
+            return None;
+        }
+    };
     if crate::daemon::delivery_worker::current_transport_epoch(home, agent) != transport_epoch {
         return None;
     }
@@ -1666,6 +1678,64 @@ mod tests {
             "latch lock failure must be visible in tracing output"
         );
         std::fs::remove_file(&home).ok();
+    }
+
+    /// #3303 blocker 12: durable persistence is authoritative even when a
+    /// prompt confirmation or cleanup removes the process-local reservation
+    /// before its final CAS. Pin the tri-state outcome so callers do not
+    /// requeue a physically accepted pointer after the budget is already 1.
+    #[test]
+    fn durable_committed_outcome_survives_process_cas_loss() {
+        let _g = test_guard();
+        let home = tmp_home("durable-committed-cas-loss");
+        let agent = "durable-committed-cas-loss-2044";
+        let row_id = "m-durable-committed-cas-loss";
+        forget(agent);
+        remove_durable_latches(&home, agent).expect("clean latches");
+        let epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, agent);
+        store().lock().insert(
+            row_id.to_string(),
+            Pending {
+                agent: agent.to_string(),
+                injected_at_ms: now_ms(),
+                text: format!("[AGEND-MSG-PENDING] id={row_id} kind=task"),
+                redelivered: false,
+                transport_epoch: epoch,
+                transport_mode: crate::transport::TransportMode::ChannelBridge,
+                gave_up: false,
+                rearm_count: 0,
+                rearm_reserved: true,
+                rearm_pending: true,
+            },
+        );
+        let reservation = RearmReservation {
+            agent: agent.to_string(),
+            row_id: row_id.to_string(),
+            transport_epoch: epoch,
+            deferred: true,
+        };
+        let _persist_guard = test_support::persist_after_write_hook_guard();
+        test_support::set_persist_after_write_hook(Some(std::sync::Arc::new(
+            move |_, hook_agent, _| {
+                forget(hook_agent);
+            },
+        )));
+
+        assert_eq!(
+            commit_rearm_after_reclaim_outcome(&home, &reservation),
+            RearmCommitOutcome::DurableCommitted
+        );
+        let latches = load_latches_for_epoch(&home, agent, epoch).expect("durable latch");
+        let latch = latches
+            .iter()
+            .find(|latch| latch.row_id == row_id)
+            .expect("committed row latch");
+        assert_eq!(latch.rearm_count, 1);
+        assert!(!latch.gave_up);
+        assert!(!latch.rearm_pending);
+        assert!(rearm_state_for_test(agent, row_id).is_none());
+        forget(agent);
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// Helper: re-stamp an armed inject so the verify window has elapsed.
