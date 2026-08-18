@@ -5,6 +5,10 @@
 //! home: the low-level API must make the home an explicit argument, and its
 //! implementation must not consult the ambient environment.
 
+use std::collections::HashSet;
+
+use syn::visit::{self, Visit};
+
 fn read_source(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{path}: {error}"))
 }
@@ -29,8 +33,88 @@ fn has_explicit_path_parameter(source: &str, function: &str) -> bool {
     })
 }
 
+fn collect_home_dir_aliases(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    aliases: &mut HashSet<String>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_home_dir_aliases(&path.tree, prefix, aliases);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            if prefix.len() == 1 && prefix[0] == "crate" && name.ident == "home_dir" {
+                aliases.insert(name.ident.to_string());
+            }
+        }
+        syn::UseTree::Rename(rename) => {
+            if prefix.len() == 1 && prefix[0] == "crate" && rename.ident == "home_dir" {
+                aliases.insert(rename.rename.to_string());
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_home_dir_aliases(item, prefix, aliases);
+            }
+        }
+        syn::UseTree::Glob(_) => {
+            if prefix.len() == 1 && prefix[0] == "crate" {
+                aliases.insert("*".to_string());
+            }
+        }
+    }
+}
+
+struct HomeDirAliasCollector<'a> {
+    aliases: &'a mut HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for HomeDirAliasCollector<'_> {
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        collect_home_dir_aliases(&item.tree, &mut Vec::new(), self.aliases);
+        visit::visit_item_use(self, item);
+    }
+}
+
+struct AmbientHomeCallFinder<'a> {
+    aliases: &'a HashSet<String>,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for AmbientHomeCallFinder<'_> {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            let direct = segments == ["crate", "home_dir"];
+            let imported = segments.len() == 1
+                && (self.aliases.contains(&segments[0]) || self.aliases.contains("*"));
+            self.found |= direct || imported;
+        }
+        visit::visit_expr_call(self, call);
+    }
+}
+
 fn has_ambient_home_lookup(source: &str) -> bool {
-    source.contains("crate::home_dir()")
+    let file = syn::parse_file(source).expect("parse source");
+    let mut aliases = HashSet::new();
+    HomeDirAliasCollector {
+        aliases: &mut aliases,
+    }
+    .visit_file(&file);
+
+    let mut finder = AmbientHomeCallFinder {
+        aliases: &aliases,
+        found: false,
+    };
+    finder.visit_file(&file);
+    finder.found
 }
 
 #[test]
@@ -59,7 +143,7 @@ fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
         );
     }
     assert!(
-        !instructions.contains("crate::home_dir()"),
+        !has_ambient_home_lookup(&instructions),
         "instructions provisioning must not resolve ambient AGEND_HOME"
     );
 
@@ -69,7 +153,7 @@ fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
         "mcp_config::configure must receive `home: &Path`"
     );
     assert!(
-        !mcp_config.contains("crate::home_dir()"),
+        !has_ambient_home_lookup(&mcp_config),
         "MCP provisioning must not resolve ambient AGEND_HOME"
     );
 }
