@@ -4201,3 +4201,32 @@ fn pane_input_uses_precomputed_timestamps_not_disk_reread() {
     );
     std::fs::remove_dir_all(home).ok();
 }
+
+/// #3294 r3: the whole notification story of the dev-channel startup episode
+/// rests on this reduction — an episode that opens AND closes inside one drain
+/// window nets to a non-error transition and raises no member reaction, while a
+/// prompt that survives to the tick stays normally loud. Pinned here because the
+/// state-side fast release (`state::prompt_latch`) is only safe if this holds.
+#[test]
+fn intra_tick_prompt_release_raises_no_member_reaction_3294() {
+    use crate::state::AgentState;
+    let released = reactions_from_transitions(&[
+        tr(AgentState::Starting, AgentState::PermissionPrompt),
+        tr(AgentState::PermissionPrompt, AgentState::Starting),
+    ]);
+    assert!(
+        released.is_empty(),
+        "#3294 r3: a prompt opened and released within one drain window must not notify: {released:?}"
+    );
+
+    let surviving =
+        reactions_from_transitions(&[tr(AgentState::Starting, AgentState::PermissionPrompt)]);
+    assert_eq!(
+        surviving,
+        vec![ReactionDecision {
+            from: AgentState::Starting,
+            to: AgentState::PermissionPrompt
+        }],
+        "#3294 r3: a prompt still latched at the tick must raise exactly one normal reaction"
+    );
+}

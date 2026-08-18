@@ -219,6 +219,7 @@ impl AgentState {
 }
 
 pub(crate) mod patterns;
+mod prompt_latch;
 
 use crate::vterm::CellFg;
 use patterns::is_generic_startup_prompt;
@@ -279,6 +280,9 @@ pub struct StateTracker {
     /// Silence baseline for an agent that has not yet produced
     /// (`last_productive_output == None`): the tracker's creation instant.
     pub(crate) created_at: Instant,
+    /// #3294 r3: state to restore when a dev-shaped prompt episode ends; `Some`
+    /// IS the tag (see the `prompt_episode` module).
+    prompt_episode: Option<AgentState>,
     /// #685 PR-2: hash of the matched-marker substring on the most-recent
     /// productive refresh. Used to suppress re-firing
     /// `last_productive_output = now()` when the same marker text remains
@@ -1040,6 +1044,7 @@ impl StateTracker {
                 .and_then(|p| regex::Regex::new(p).ok()),
             context_pct: None,
             interactive_prompt_pending_notice: false,
+            prompt_episode: None,
             interactive_recovery_pending_notice: false,
             blocked_since: None,
             blocked_notice_sent: false,
@@ -1332,6 +1337,8 @@ impl StateTracker {
         self.last_output = Instant::now();
 
         if let Some(patterns) = self.patterns {
+            let prior = self.current; // #3294 r3: baseline for the prompt-episode tag
+
             // #1450: detect_with_match returns the matched substring so we
             // can locate its rendered grid cells and check their foreground
             // color. For HIGH_FP states, require at least one red cell across
@@ -1365,6 +1372,9 @@ impl StateTracker {
                     let _ = matched;
                 }
                 Some((detected, matched)) => {
+                    if detected != AgentState::PermissionPrompt {
+                        self.release_dev_prompt_latch();
+                    }
                     let high_fp = is_high_fp_state(detected);
                     let usage_limit = matches!(detected, AgentState::UsageLimit);
                     // Suppression gates — run BEFORE the landing pipeline. A
@@ -1413,9 +1423,13 @@ impl StateTracker {
                         );
                         let gated = self.gate_on_heartbeat(landed);
                         self.transition(gated);
+                        self.note_prompt_episode(prior, screen_text);
                     }
                 }
-                None => self.handle_no_raw_match(patterns, screen_text),
+                None => {
+                    self.release_dev_prompt_latch();
+                    self.handle_no_raw_match(patterns, screen_text);
+                }
             }
 
             // #1808-probe0-phantom (instrumentation-only): record that the tracker
@@ -2125,80 +2139,6 @@ impl StateTracker {
         );
     }
 
-    /// Fallback when the screen changed but no pattern matched.
-    ///
-    /// Active-state markers (Thinking "esc to cancel", ToolUse tool banners)
-    /// can stop rendering while the CLI still shows on-screen content that
-    /// happens not to match the backend's Idle pattern either — e.g. a
-    /// mid-scroll render between the spinner clearing and the prompt
-    /// re-appearing. Without a fallback the tracker would stay latched on
-    /// the prior active state indefinitely.
-    ///
-    /// If the current state is a self-expiring active state
-    /// (Thinking / ToolUse) and it has been held longer than
-    /// `LATCHED_STATE_EXPIRY`, drop to Idle. Everything else is excluded:
-    /// InteractivePrompt / PermissionPrompt need explicit operator action,
-    /// errors transition instantly on the next matching screen, and
-    /// Starting / AwaitingOperator / Hang are driven by their own
-    /// supervisors (see `daemon::supervisor`).
-    fn maybe_expire_latched_state(&mut self) {
-        // F39: scrollback re-detection (Scenarios A/B) preserved by
-        // transition() same-state early-return + feed() hash-dedup; Scenario C
-        // priority oscillation between Thinking and other states resets `since`
-        // per bounce and is the unaddressed bug surface. See
-        // docs/HUNG-STATE-TRANSITIONS.md §F39.3.
-        // Active states (Thinking / ToolUse) expire on the short window —
-        // their trigger patterns (spinners, tool-call banners) commonly
-        // stop rendering mid-operation even when the agent is still
-        // working, so a brief latch is fine but holding beyond
-        // LATCHED_STATE_EXPIRY is almost always stale.
-        let short_expiring = matches!(self.current, AgentState::Active);
-        if short_expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
-            self.transition(AgentState::Idle);
-            return;
-        }
-        // RateLimit expires on its own 5-minute window. Real rate limits
-        // clear in seconds-to-minutes; stuck for hours is a false positive.
-        let rate_limit_expiring = matches!(self.current, AgentState::RateLimit);
-        if rate_limit_expiring && self.since.elapsed() >= Self::RATE_LIMIT_EXPIRY {
-            self.transition(AgentState::Idle);
-            return;
-        }
-        // #1955: UsageLimit expires on its release deadline (anchored on the
-        // banner's own unlock hint at latch time, else the conservative
-        // window). This arm covers the banner-scrolled-away case (detection
-        // returns None); a still-visible banner releases at the detection
-        // override instead (the level-triggered re-match never reaches here).
-        // A pre-#1955 latch carries no deadline → conservative window from
-        // `since`.
-        if matches!(self.current, AgentState::UsageLimit) {
-            let deadline_passed = self
-                .usage_limit_release_at
-                .map_or(self.since.elapsed() >= Self::USAGE_LIMIT_EXPIRY, |at| {
-                    Instant::now() >= at
-                });
-            if deadline_passed {
-                self.usage_limit_release_at = None;
-                self.transition(AgentState::Idle);
-                return;
-            }
-        }
-        // Prompt states (InteractivePrompt / PermissionPrompt) expire on
-        // the longer window. When the screen goes stable after the
-        // operator dismisses the dialog, feed()'s hash-dedup skips
-        // `detect()` and the state never re-evaluates — which is how
-        // `dev-reviewer` stayed flagged as "卡在互動 prompt" long after
-        // the prompt was gone. The 2-minute bound gives a real operator
-        // reaction window while still guaranteeing self-recovery.
-        let long_expiring = matches!(
-            self.current,
-            AgentState::InteractivePrompt | AgentState::PermissionPrompt
-        );
-        if long_expiring && self.since.elapsed() >= Self::INTERACTIVE_EXPIRY {
-            self.transition(AgentState::Idle);
-        }
-    }
-
     /// Get current state.
     pub fn get_state(&self) -> AgentState {
         self.current
@@ -2341,6 +2281,7 @@ impl StateTracker {
         if new_state == self.current {
             return;
         }
+        self.clear_prompt_episode_on_exit(new_state);
         if self.pending_transitions.len() >= Self::PENDING_TRANSITIONS_CAP {
             self.pending_transitions.remove(0); // drop oldest
             self.dropped_transition_count = self.dropped_transition_count.saturating_add(1);

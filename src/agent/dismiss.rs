@@ -356,6 +356,33 @@ mod tests {
         }
     }
 
+    /// #3294: the dev-channel startup modal IS classified as `PermissionPrompt`,
+    /// honestly, like any other matching frame (`state::prompt_latch` changes only
+    /// when that latch releases, never the classification). This test pins the two
+    /// facts that make the auto-dismiss independent of that classification either
+    /// way, so a future change to prompt state cannot silently break dismissal:
+    /// the scan is armed by the state-INDEPENDENT startup latch, and this pattern
+    /// is not in the post-latch re-arm class, so `prompt_blocked` is not its
+    /// delivery path.
+    #[test]
+    fn dev_channel_modal_dismissal_does_not_depend_on_prompt_state_3294() {
+        assert!(
+            dismiss_scan_armed(true, false, true),
+            "#3294: a new frame inside the startup latch must arm the scan with no dismissible state"
+        );
+        let hint = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|pattern| dismiss_literal_hint(pattern.label))
+            .find(|hint| hint.starts_with("WARNING: Loading development channels"))
+            .expect("claude ships the dev-channel dismiss pattern");
+        assert!(
+            !is_rearm_past_latch_hint(hint),
+            "#3294: the dev-channel pattern is startup-window-only, so its dismissal does not ride the PermissionPrompt classification"
+        );
+    }
+
     #[test]
     fn claude_development_channel_modal_matches_and_sends_one_enter() {
         let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
