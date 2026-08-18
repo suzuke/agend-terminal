@@ -6090,6 +6090,78 @@ fn dev_shaped_plus_real_generic_chrome_does_not_release_3294() {
         "#3297 r3: while a prompt is still detected the latch must not release"
     );
 }
+/// #3297 r1 (secondary reviewer), restored under the r3 contract. The marker
+/// string circulates as ORDINARY TRANSCRIPT TEXT — issue bodies, PR text, this
+/// fix's own source — so a bare echoed line must never cost a real dialog its
+/// classification. r1 rejected a suppression rule that this exact shape
+/// satisfied; the suppression is gone, but the property it violated is the part
+/// worth keeping executable, so this pins the SHAPE rather than the deleted
+/// mechanism. Both entry states matter: the modal is quoted while Starting, and
+/// the same text can be scrolled back into view long after the agent is Idle.
+#[test]
+fn bare_marker_transcript_does_not_blind_a_later_generic_dialog_3294() {
+    let screen = "\
+WARNING: Loading development channels
+
+  Delete every file in this directory?
+
+  ❯ 1. Yes
+    2. No
+
+  Enter to confirm · Esc to cancel
+";
+    for prior in [AgentState::Starting, AgentState::Idle] {
+        let mut st = tracker_at(&Backend::ClaudeCode, prior, 0);
+        st.feed(screen);
+        assert_eq!(
+            st.get_state(),
+            AgentState::PermissionPrompt,
+            "#3297 r3: a quoted marker line must not cost a real dialog its classification (prior state {prior:?})"
+        );
+        assert!(
+            st.get_state().is_notify_error_class(),
+            "#3297 r3: the blocked operator must still be told (prior state {prior:?})"
+        );
+    }
+}
+
+/// #3297 r2 (secondary reviewer), restored under the r3 contract. The startup
+/// modal's top rows can survive a repaint that overwrites its own footer, so
+/// "the marker sits inside the lowest footer's block" — the boundary the r1 fix
+/// leaned on — simply does not hold in this shape, and a real dialog owns the
+/// footer. Kept for the same reason as the fixture above: the r3 rewrite made
+/// the mechanism obsolete, not the shape.
+#[test]
+fn partially_overwritten_modal_does_not_blind_a_later_generic_dialog_3294() {
+    let screen = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Channels:   server:agend-claude-channel
+
+  Delete every file in this directory?
+
+  ❯ 1. Yes
+    2. No
+
+  Enter to confirm · Esc to cancel
+";
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(screen);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3297 r3: a real dialog owning the footer must classify even when the modal's body survives above it"
+    );
+    assert!(
+        st.get_state().is_notify_error_class(),
+        "#3297 r3: a real dialog under a surviving modal body must remain notification-eligible"
+    );
+}
 
 /// Generic prompts are untouched: a no-prompt frame does NOT release them, so
 /// #1546/#1523's operator reaction window survives exactly as before.
