@@ -6177,6 +6177,52 @@ fn generic_permission_prompt_keeps_its_latch_3294() {
         "#3297 r3: a Generic prompt keeps the 120s latch — only the dev-tagged episode releases early"
     );
 }
+/// Secondary-reviewer blocker (archfix-codex-dev, e8f709ae): the tag must not
+/// survive an exit that leaves `PermissionPrompt` WITHOUT going through `feed`.
+/// `set_awaiting_operator` is such a path (#1527/#1552). Sequence: a dev-shaped
+/// modal tags the episode, an external call exits the prompt, then a GENUINE
+/// generic permission prompt re-enters — it is untagged, so its 120s latch must
+/// hold. Without the exit clear the stale `Starting` tag is still parked, and
+/// the next no-prompt frame spends it on the generic prompt, releasing a dialog
+/// that is still on screen: #3294 inverted, an operator blocked and unreported.
+/// `record_set` clears the tag before `current` moves, which is what makes the
+/// re-entry untagged; this pins that guard, which was previously mutation-blind.
+#[test]
+fn external_exit_clears_the_dev_tag_before_a_generic_prompt_reenters_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: the dev-shaped frame must classify and tag the episode"
+    );
+
+    // External exit — not a `feed`, so only `record_set`'s clear can drop the tag.
+    st.set_awaiting_operator();
+    assert_eq!(
+        st.get_state(),
+        AgentState::AwaitingOperator,
+        "#3294: set_awaiting_operator must leave PermissionPrompt"
+    );
+
+    // A genuine generic dialog re-enters. It is NOT dev-shaped, so it must not
+    // acquire the fast-release tag.
+    st.feed("  Requesting permission for: rm -rf /\n\n  Esc to cancel · Tab to amend\n");
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: the generic dialog must classify honestly after the external exit"
+    );
+
+    // The dialog is still on screen in reality; a frame that detects no prompt
+    // must NOT release it, because this episode was never tagged.
+    st.feed(IDLE_AFTER_DISMISS_3294);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: a stale dev tag must not release a genuine generic prompt after an external exit"
+    );
+}
 
 /// P1 backstop: with no later frame there is no evidence of disappearance, so
 /// the tagged episode keeps the existing `INTERACTIVE_EXPIRY` behaviour rather
