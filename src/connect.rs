@@ -76,7 +76,7 @@ pub fn run(
     std::fs::create_dir_all(&work_dir)?;
 
     // 6. Generate MCP config
-    crate::instructions::generate_for_owner(&work_dir, &command, name)
+    crate::instructions::generate_for_owner(home, &work_dir, &command, name)
         .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     tracing::info!(dir = %work_dir.display(), "MCP config written");
 

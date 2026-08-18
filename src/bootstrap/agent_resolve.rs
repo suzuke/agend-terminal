@@ -110,7 +110,7 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
 
     if let Some(ref dir) = resolved.working_directory {
         let extra_instructions = crate::instructions::resolve_extra_for(&resolved, ctx.fleet_dir);
-        let ctx = crate::instructions::AgentContext {
+        let agent_ctx = crate::instructions::AgentContext {
             name,
             role: resolved.role.as_deref(),
             fleet_peers: &ctx.peers,
@@ -118,9 +118,12 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
             extra_instructions: extra_instructions.as_deref(),
         };
         let behavior_command = resolved.backend.command_string();
-        if let Err(e) =
-            crate::instructions::generate_with_context(dir, &behavior_command, Some(&ctx))
-        {
+        if let Err(e) = crate::instructions::generate_with_context(
+            ctx.home,
+            dir,
+            &behavior_command,
+            Some(&agent_ctx),
+        ) {
             tracing::error!(instance = name, error = %e, "provisioning refused; skipping instance boot");
             return None;
         }

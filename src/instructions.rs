@@ -532,6 +532,7 @@ pub(crate) fn merge_agend_block(existing: &str, body: &str) -> String {
 /// Shared files (AGENTS.md, GEMINI.md) use marker-merge; agend-owned files
 /// (.claude/agend.md, .kiro/steering/agend.md) are rewritten in full.
 fn generate_agent_instructions(
+    home: &Path,
     working_dir: &Path,
     command: &str,
     ctx: Option<&AgentContext>,
@@ -544,7 +545,6 @@ fn generate_agent_instructions(
     let preset = backend.preset();
     let instr_path = working_dir.join(preset.instructions_path);
 
-    let home = crate::home_dir();
     let protocol = crate::protocol::resolve_protocol(&home)
         .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
     if protocol.state != "ready" {
@@ -649,8 +649,8 @@ fn generate_agent_instructions(
 /// `Err` (so the caller ABORTS the spawn) when provisioning is refused — a
 /// workspace-identity conflict or an I/O failure — so an agent never starts
 /// against partially or foreign-provisioned state.
-pub fn generate(working_dir: &Path, command: &str) -> Result<(), String> {
-    generate_with_context(working_dir, command, None)
+pub fn generate(home: &Path, working_dir: &Path, command: &str) -> Result<(), String> {
+    generate_with_context(home, working_dir, command, None)
 }
 
 /// Pre-spawn provision for callers that know the instance name but have no
@@ -658,14 +658,18 @@ pub fn generate(working_dir: &Path, command: &str) -> Result<(), String> {
 /// `connect::run`). Runs the identity preflight and passes the owner
 /// through to every artifact writer so r6's opaque-owner guard accepts
 /// same-owner restarts.
-pub fn generate_for_owner(working_dir: &Path, command: &str, owner: &str) -> Result<(), String> {
+pub fn generate_for_owner(
+    home: &Path,
+    working_dir: &Path,
+    command: &str,
+    owner: &str,
+) -> Result<(), String> {
     let backend = crate::backend::Backend::from_command(command);
-    let home = crate::home_dir();
 
-    let _id_lock = crate::store::acquire_workspace_identity_lock(&home, working_dir)
+    let _id_lock = crate::store::acquire_workspace_identity_lock(home, working_dir)
         .map_err(|e| format!("provision: could not acquire workspace-identity lock: {e}"))?;
 
-    workspace_provision_preflight(working_dir, backend.as_ref(), owner)?;
+    workspace_provision_preflight(home, working_dir, backend.as_ref(), owner)?;
 
     if backend.is_some() {
         ensure_project_root(working_dir)?;
@@ -673,9 +677,9 @@ pub fn generate_for_owner(working_dir: &Path, command: &str, owner: &str) -> Res
     if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
         migrate_claude_old_rules_file(working_dir)?;
     }
-    crate::mcp_config::configure(working_dir, command, Some(owner))
+    crate::mcp_config::configure(home, working_dir, command, Some(owner))
         .map_err(|e| format!("provision: MCP config: {e}"))?;
-    generate_agent_instructions(working_dir, command, None, Some(owner))?;
+    generate_agent_instructions(home, working_dir, command, None, Some(owner))?;
     Ok(())
 }
 
@@ -689,23 +693,22 @@ pub fn generate_for_owner(working_dir: &Path, command: &str, owner: &str) -> Res
 /// 3. only then mutate: project-root scoping, MCP config, instructions — each
 ///    propagating its own I/O error so nothing is silently discarded.
 pub fn generate_with_context(
+    home: &Path,
     working_dir: &Path,
     command: &str,
     ctx: Option<&AgentContext>,
 ) -> Result<(), String> {
     let backend = crate::backend::Backend::from_command(command);
-    let home = crate::home_dir();
-
     // (1) One workspace-identity lock across preflight + writes. A lock-acquire
     // failure is itself fail-closed — refuse rather than provision unguarded.
-    let _id_lock = crate::store::acquire_workspace_identity_lock(&home, working_dir)
+    let _id_lock = crate::store::acquire_workspace_identity_lock(home, working_dir)
         .map_err(|e| format!("provision: could not acquire workspace-identity lock: {e}"))?;
 
     // (2) Preflight BEFORE any mutation, so a refusal leaves the dir untouched.
     if let Some(ctx) = ctx {
-        workspace_provision_preflight(working_dir, backend.as_ref(), ctx.name)?;
+        workspace_provision_preflight(home, working_dir, backend.as_ref(), ctx.name)?;
     } else if backend.is_some() {
-        let protocol = crate::protocol::resolve_protocol(&home)
+        let protocol = crate::protocol::resolve_protocol(home)
             .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
         if protocol.state != "ready" {
             return Err(format!(
@@ -726,9 +729,9 @@ pub fn generate_with_context(
     if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
         migrate_claude_old_rules_file(working_dir)?;
     }
-    crate::mcp_config::configure(working_dir, command, ctx.map(|c| c.name))
+    crate::mcp_config::configure(home, working_dir, command, ctx.map(|c| c.name))
         .map_err(|e| format!("provision: MCP config: {e}"))?;
-    generate_agent_instructions(working_dir, command, ctx, ctx.map(|c| c.name))?;
+    generate_agent_instructions(home, working_dir, command, ctx, ctx.map(|c| c.name))?;
     Ok(())
 }
 
@@ -739,6 +742,7 @@ pub fn generate_with_context(
 /// artifacts: the shared instructions file (AGENTS.md/GEMINI.md) and the
 /// codex/grok `AGEND_INSTANCE_NAME` config stamp.
 fn workspace_provision_preflight(
+    home: &Path,
     working_dir: &Path,
     backend: Option<&crate::backend::Backend>,
     name: &str,
@@ -746,7 +750,7 @@ fn workspace_provision_preflight(
     let Some(backend) = backend else {
         return Ok(());
     };
-    let protocol = crate::protocol::resolve_protocol(&crate::home_dir())
+    let protocol = crate::protocol::resolve_protocol(home)
         .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
     if protocol.state != "ready" {
         return Err(format!(
@@ -843,8 +847,13 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         // Provisioning must REFUSE an unreadable identity artifact (fail-closed),
         // never collapse the read error to "empty" and overwrite it.
-        let res =
-            generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"));
+        let res = generate_agent_instructions(
+            &dir,
+            &dir,
+            "codex",
+            Some(&codex_ctx("alice")),
+            Some("alice"),
+        );
         assert!(
             res.is_err(),
             "unreadable AGENTS.md must refuse, not overwrite"
@@ -896,8 +905,13 @@ mod tests {
         let path = dir.join("AGENTS.md");
         std::fs::write(&path, &foreign).unwrap();
         // Provisioning as "alice" into bob's directory must REFUSE, bytes intact.
-        let res =
-            generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"));
+        let res = generate_agent_instructions(
+            &dir,
+            &dir,
+            "codex",
+            Some(&codex_ctx("alice")),
+            Some("alice"),
+        );
         assert!(res.is_err(), "foreign-owned AGENTS.md must refuse");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -914,8 +928,13 @@ mod tests {
         let path = dir.join("AGENTS.md");
         let corrupt = "<!-- agend:start -->\ngarbage, no name line\n<!-- agend:end -->\n";
         std::fs::write(&path, corrupt).unwrap();
-        let res =
-            generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"));
+        let res = generate_agent_instructions(
+            &dir,
+            &dir,
+            "codex",
+            Some(&codex_ctx("alice")),
+            Some("alice"),
+        );
         assert!(res.is_err(), "corrupt identity block must refuse");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -932,15 +951,27 @@ mod tests {
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         let path = dir.join("AGENTS.md");
         // Absent block → adopt (writes).
-        generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"))
-            .expect("adopt absent");
+        generate_agent_instructions(
+            &dir,
+            &dir,
+            "codex",
+            Some(&codex_ctx("alice")),
+            Some("alice"),
+        )
+        .expect("adopt absent");
         assert_eq!(
             agend_block_owner(&std::fs::read_to_string(&path).unwrap()),
             DirIdentity::Owner("alice".to_string())
         );
         // Same owner → refresh (Ok, still alice).
-        generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"))
-            .expect("refresh same");
+        generate_agent_instructions(
+            &dir,
+            &dir,
+            "codex",
+            Some(&codex_ctx("alice")),
+            Some("alice"),
+        )
+        .expect("refresh same");
         assert_eq!(
             agend_block_owner(&std::fs::read_to_string(&path).unwrap()),
             DirIdentity::Owner("alice".to_string())
@@ -952,7 +983,7 @@ mod tests {
     fn generate_claude_writes_instructions_and_mcp_config() {
         let dir = tmp_dir("gen_claude");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate(&dir, "claude").expect("provision");
+        generate(&dir, &dir, "claude").expect("provision");
         assert!(dir.join(".claude").join("agend.md").exists());
         assert!(dir.join("mcp-config.json").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -962,7 +993,7 @@ mod tests {
     fn generate_unknown_backend_no_crash() {
         let dir = tmp_dir("gen_unknown");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate(&dir, "unknown-tool").expect("provision");
+        generate(&dir, &dir, "unknown-tool").expect("provision");
         // The scoped home receives the workspace lock; no backend artifact
         // should be created for an unknown command.
         let entries = std::fs::read_dir(&dir)
@@ -988,7 +1019,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        generate_with_context(&dir, "claude", Some(&ctx)).expect("provision");
+        generate_with_context(&dir, &dir, "claude", Some(&ctx)).expect("provision");
         let path = dir.join(".claude").join("agend.md");
         assert!(path.exists(), "missing agend.md at {}", path.display());
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1009,7 +1040,7 @@ mod tests {
         let stale = dir.join(".claude").join("rules").join("agend.md");
         std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
         std::fs::write(&stale, "# old content from pre-migration agend").unwrap();
-        generate(&dir, "claude").expect("provision");
+        generate(&dir, &dir, "claude").expect("provision");
         assert!(
             !stale.exists(),
             "stale .claude/rules/agend.md was not removed"
@@ -1028,7 +1059,7 @@ mod tests {
         let user_rule = dir.join(".claude").join("rules").join("my-rule.md");
         std::fs::create_dir_all(user_rule.parent().unwrap()).unwrap();
         std::fs::write(&user_rule, "user-owned rule").unwrap();
-        generate(&dir, "claude").expect("provision");
+        generate(&dir, &dir, "claude").expect("provision");
         assert!(
             user_rule.exists(),
             "migration must not touch user's other .claude/rules/*.md files"
@@ -1079,7 +1110,7 @@ mod tests {
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         let user_content = "# Existing project AGENTS\n\nImportant user rules.\n";
         std::fs::write(dir.join("AGENTS.md"), user_content).unwrap();
-        generate(&dir, "codex").expect("provision");
+        generate(&dir, &dir, "codex").expect("provision");
         let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             after.contains("Important user rules."),
@@ -1095,9 +1126,9 @@ mod tests {
         let dir = tmp_dir("gen_shared_idempotent");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         std::fs::write(dir.join("AGENTS.md"), "# user head\n").unwrap();
-        generate(&dir, "codex").expect("provision");
+        generate(&dir, &dir, "codex").expect("provision");
         let once = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        generate(&dir, "codex").expect("provision");
+        generate(&dir, &dir, "codex").expect("provision");
         let twice = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         // Compare with protocol path lines stripped — the path is
         // home_dir()-derived and can vary across parallel tests.
@@ -1168,7 +1199,7 @@ mod tests {
         // gemini; re-pointed to agy (gemini-cli's successor) after retirement.
         let dir = tmp_dir("gen_agy_stops_here");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate(&dir, "agy").expect("provision");
+        generate(&dir, &dir, "agy").expect("provision");
         assert!(
             dir.join(".git").exists(),
             "working_dir should be a git repo after generate() for agy"
@@ -1486,7 +1517,7 @@ mod tests {
     fn generate_kiro_instructions_basic() {
         let dir = tmp_dir("gen_kiro_instr");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate(&dir, "kiro-cli").expect("provision");
+        generate(&dir, &dir, "kiro-cli").expect("provision");
         let path = dir.join(".kiro").join("steering").join("agend.md");
         assert!(path.exists(), "missing kiro agend.md");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1635,7 +1666,7 @@ mod tests {
         for backend_cmd in ["claude", "kiro-cli", "codex"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
-            generate(&work, backend_cmd).expect("provision");
+            generate(&dir, &work, backend_cmd).expect("provision");
             let backend = crate::backend::Backend::from_command(backend_cmd).unwrap();
             let preset = backend.preset();
             let instr_path = work.join(preset.instructions_path);
@@ -1661,7 +1692,7 @@ mod tests {
         for backend_cmd in ["claude", "kiro-cli", "codex"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
-            generate(&work, backend_cmd).expect("provision");
+            generate(&dir, &work, backend_cmd).expect("provision");
             let backend = crate::backend::Backend::from_command(backend_cmd).unwrap();
             let preset = backend.preset();
             let instr_path = work.join(preset.instructions_path);
@@ -1697,7 +1728,7 @@ mod tests {
         for backend_cmd in ["claude", "kiro-cli", "codex", "opencode"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
-            generate(&work, backend_cmd).expect("provision");
+            generate(&dir, &work, backend_cmd).expect("provision");
             let backend = crate::backend::Backend::from_command(backend_cmd)
                 .unwrap_or_else(|| panic!("backend `{backend_cmd}` must resolve"));
             let preset = backend.preset();
@@ -1876,7 +1907,7 @@ mod tests {
             team: None,
             extra_instructions: Some(extra),
         };
-        generate_with_context(&dir, "claude", Some(&ctx)).expect("provision");
+        generate_with_context(&dir, &dir, "claude", Some(&ctx)).expect("provision");
         let content =
             std::fs::read_to_string(dir.join(".kiro/steering/agend.md")).unwrap_or_default();
         // Claude uses .kiro/steering/agend.md — check if extra is appended
@@ -1909,7 +1940,7 @@ mod tests {
             team: None,
             extra_instructions: None, // No file → no append
         };
-        generate_with_context(&dir, "claude", Some(&ctx)).expect("provision");
+        generate_with_context(&dir, &dir, "claude", Some(&ctx)).expect("provision");
         // Should not panic — just generates without extra.
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1950,8 +1981,8 @@ mod tests {
     fn r7_managed_same_owner_restart_succeeds() {
         let dir = tmp_dir("r7-same-owner");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate_with_context(&dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
-        generate_for_owner(&dir, "codex", "alpha")
+        generate_with_context(&dir, &dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
+        generate_for_owner(&dir, &dir, "codex", "alpha")
             .expect("same-owner managed restart must succeed — r6 contextless path refuses this");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1962,7 +1993,7 @@ mod tests {
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         seed_agents_md(&dir, "alpha");
         let original = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        let result = generate_for_owner(&dir, "codex", "beta");
+        let result = generate_for_owner(&dir, &dir, "codex", "beta");
         assert!(
             result.is_err(),
             "must refuse foreign AGENTS.md identity before spawn"
@@ -1976,10 +2007,10 @@ mod tests {
     fn r7_foreign_config_refuses_preserves_bytes() {
         let dir = tmp_dir("r7-foreign-config");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate_with_context(&dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
+        generate_with_context(&dir, &dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
         let config_path = dir.join(".codex").join("config.toml");
         let original = std::fs::read_to_string(&config_path).unwrap();
-        let result = generate_for_owner(&dir, "codex", "beta");
+        let result = generate_for_owner(&dir, &dir, "codex", "beta");
         assert!(
             result.is_err(),
             "must refuse foreign config identity before spawn"
@@ -1993,7 +2024,7 @@ mod tests {
     fn r7_unmanaged_first_provision_succeeds() {
         let dir = tmp_dir("r7-unmanaged");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate(&dir, "codex").expect("unmanaged first provision must succeed");
+        generate(&dir, &dir, "codex").expect("unmanaged first provision must succeed");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2025,13 +2056,13 @@ mod tests {
             team: Some(&team_ctx),
             extra_instructions: None,
         };
-        generate_with_context(&dir, "codex", Some(&full_ctx)).unwrap();
+        generate_with_context(&dir, &dir, "codex", Some(&full_ctx)).unwrap();
         let after_boot = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             !after_boot.contains("SOLO-PROFILE"),
             "full-context boot must not write solo paragraph"
         );
-        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        generate_for_owner(&dir, &dir, "codex", "alpha").unwrap();
         let pre_spawn = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             !pre_spawn.contains("SOLO-PROFILE"),
@@ -2046,7 +2077,7 @@ mod tests {
     fn r8_connect_entry_no_false_solo() {
         let dir = tmp_dir("r8-connect-solo");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        generate_for_owner(&dir, &dir, "codex", "alpha").unwrap();
         let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             !content.contains("SOLO-PROFILE"),
@@ -2063,13 +2094,13 @@ mod tests {
     fn root_review_r8_repeated_owner_only_provision_stays_restartable() {
         let dir = tmp_dir("r9-repeat-owner");
         let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        generate_for_owner(&dir, &dir, "codex", "alpha").unwrap();
         let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             content.contains("- **Name**: `alpha`"),
             "owner-only provision must write durable owner stamp — got:\n{content}"
         );
-        generate_for_owner(&dir, "codex", "alpha")
+        generate_for_owner(&dir, &dir, "codex", "alpha")
             .expect("repeated same-owner provision must succeed (idempotent)");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2079,10 +2110,10 @@ mod tests {
         // Claude
         let dir = tmp_dir("r9-nonshared-claude");
         let claude_home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate_with_context(&dir, "claude", Some(&codex_ctx("alpha"))).unwrap();
+        generate_with_context(&dir, &dir, "claude", Some(&codex_ctx("alpha"))).unwrap();
         let claude_path = dir.join(".claude").join("agend.md");
         let original = std::fs::read_to_string(&claude_path).unwrap();
-        let result = generate_for_owner(&dir, "claude", "beta");
+        let result = generate_for_owner(&dir, &dir, "claude", "beta");
         assert!(
             result.is_err(),
             "Claude: must refuse foreign non-shared identity before provision"
@@ -2095,10 +2126,10 @@ mod tests {
         // Kiro
         let dir = tmp_dir("r9-nonshared-kiro");
         let _kiro_home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
-        generate_with_context(&dir, "kiro-cli", Some(&codex_ctx("alpha"))).unwrap();
+        generate_with_context(&dir, &dir, "kiro-cli", Some(&codex_ctx("alpha"))).unwrap();
         let kiro_path = dir.join(".kiro").join("steering").join("agend.md");
         let original = std::fs::read_to_string(&kiro_path).unwrap();
-        let result = generate_for_owner(&dir, "kiro-cli", "beta");
+        let result = generate_for_owner(&dir, &dir, "kiro-cli", "beta");
         assert!(
             result.is_err(),
             "Kiro: must refuse foreign non-shared identity before provision"

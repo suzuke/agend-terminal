@@ -274,7 +274,7 @@ pub(crate) fn prepare_instructions(
                 team: team_ctx.as_ref(),
                 extra_instructions: extra_instr.as_deref(),
             };
-            crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
+            crate::instructions::generate_with_context(home, work_dir, command, Some(&ctx))
         }
         Err(e) => match std::fs::metadata(&fleet_path) {
             Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
@@ -291,7 +291,7 @@ pub(crate) fn prepare_instructions(
                     team: team_ctx.as_ref(),
                     extra_instructions: None,
                 };
-                crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
+                crate::instructions::generate_with_context(home, work_dir, command, Some(&ctx))
             }
             _ => Err(format!(
                 "fleet.yaml unreadable/malformed — refusing provisioning: {e}"

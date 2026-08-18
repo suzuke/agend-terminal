@@ -817,7 +817,7 @@ fn r6_configure_codex_opaque_read_must_refuse_and_preserve() {
     let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
     std::fs::write(&config_path, invalid_bytes).unwrap();
 
-    let result = crate::mcp_config::configure(&dir, "codex", Some("alice"));
+    let result = crate::mcp_config::configure(&dir, &dir, "codex", Some("alice"));
 
     assert!(
         result.is_err(),
@@ -848,7 +848,7 @@ fn r6_configure_grok_opaque_read_must_refuse_and_preserve() {
     let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
     std::fs::write(&config_path, invalid_bytes).unwrap();
 
-    let result = crate::mcp_config::configure(&dir, "grok", Some("alice"));
+    let result = crate::mcp_config::configure(&dir, &dir, "grok", Some("alice"));
 
     assert!(
         result.is_err(),
@@ -890,7 +890,7 @@ fn r6_contextless_provision_overwrites_foreign_codex() {
                    AGEND_INSTANCE_NAME = 'bob'\n";
     std::fs::write(&config_path, foreign).unwrap();
 
-    let result = crate::instructions::generate(&ws, "codex");
+    let result = crate::instructions::generate(&dir, &ws, "codex");
 
     assert!(
         result.is_err(),
@@ -925,7 +925,7 @@ fn r6_contextless_provision_overwrites_foreign_grok() {
                    AGEND_INSTANCE_NAME = 'bob'\n";
     std::fs::write(&config_path, foreign).unwrap();
 
-    let result = crate::instructions::generate(&ws, "grok");
+    let result = crate::instructions::generate(&dir, &ws, "grok");
 
     assert!(
         result.is_err(),
@@ -961,7 +961,7 @@ fn provisioning_heals_only_isolated_protocol_default() {
     let home = crate::review_repro_test_util::ScopedAgendHome::new(&ambient);
     home.set_home(&isolated);
     let ws = isolated.join("workspace").join("agent");
-    let result = crate::instructions::generate(&ws, "codex");
+    let result = crate::instructions::generate(&isolated, &ws, "codex");
     assert!(
         result.is_ok(),
         "isolated provisioning should succeed: {result:?}"

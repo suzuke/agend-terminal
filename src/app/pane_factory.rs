@@ -356,10 +356,10 @@ fn spawn_and_subscribe(
     {
         match identity {
             SpawnIdentity::Managed => {
-                crate::instructions::generate_for_owner(work_dir, &behavior_command, name)
+                crate::instructions::generate_for_owner(home, work_dir, &behavior_command, name)
             }
             SpawnIdentity::UnmanagedLocalShell => {
-                crate::instructions::generate(work_dir, &behavior_command)
+                crate::instructions::generate(home, work_dir, &behavior_command)
             }
         }
         .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
@@ -905,6 +905,7 @@ pub(super) fn run_attach(
                     };
                     let behavior_command = resolved.backend.command_string();
                     if let Err(e) = crate::instructions::generate_with_context(
+                        home,
                         &work_dir,
                         &behavior_command,
                         Some(&ctx),
@@ -1197,7 +1198,7 @@ pub(super) fn create_pane_from_resolved(
     // Overwrite basic instructions with fleet-aware version
     if let Some(ref wd) = pane.working_dir {
         let behavior_command = resolved.backend.command_string();
-        crate::instructions::generate_with_context(wd, &behavior_command, Some(&ctx))
+        crate::instructions::generate_with_context(home, wd, &behavior_command, Some(&ctx))
             .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
     pane.fleet_instance_name = Some(fleet_name.to_string());
