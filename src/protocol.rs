@@ -774,6 +774,44 @@ mod tests {
     }
 
     #[test]
+    fn parallel_stale_default_heal_capture_is_deterministic() {
+        for iteration in 0..20 {
+            let installed = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let audit_home = tmp_home(&format!("parallel-audit-{iteration}"));
+            let audit_path = default_path(&audit_home);
+            std::fs::create_dir_all(audit_path.parent().expect("audit parent")).unwrap();
+            std::fs::write(&audit_path, b"historically stale protocol").unwrap();
+            let installed_for_thread = installed.clone();
+            let release_for_thread = release.clone();
+            let audit_thread = std::thread::spawn(move || {
+                let (_, events) = capture_default_healed_audit(|| {
+                    installed_for_thread.wait();
+                    release_for_thread.wait();
+                    resolve_protocol(&audit_home).expect("stale default is healed")
+                });
+                std::fs::remove_dir_all(&audit_home).ok();
+                events.len()
+            });
+
+            installed.wait();
+            let stale_home = tmp_home(&format!("parallel-stale-{iteration}"));
+            let stale_path = default_path(&stale_home);
+            std::fs::create_dir_all(stale_path.parent().expect("stale parent")).unwrap();
+            std::fs::write(&stale_path, b"historically stale protocol").unwrap();
+            resolve_protocol(&stale_home).expect("stale default is healed");
+            std::fs::remove_dir_all(&stale_home).ok();
+            release.wait();
+
+            assert_eq!(
+                audit_thread.join().expect("parallel audit thread"),
+                1,
+                "parallel capture missed iteration {iteration}"
+            );
+        }
+    }
+
+    #[test]
     fn structural_override_artifacts_are_refused() {
         let home = tmp_home("override-structural");
         extract_default(&home).expect("extract");
