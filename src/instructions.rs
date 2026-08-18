@@ -544,15 +544,24 @@ fn generate_agent_instructions(
     let preset = backend.preset();
     let instr_path = working_dir.join(preset.instructions_path);
 
+    let home = crate::home_dir();
+    let protocol = crate::protocol::resolve_protocol(&home)
+        .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
+    let proto_str = protocol.path.display().to_string();
+    let body = build_instructions_body(ctx, Some(&proto_str));
+    let body = format!(
+        "{body}\n\nProtocol delivery identity:\n- source_kind: `{}`\n- path: `{}`\n- content_sha256: `{}`\n- embedded_sha256: `{}`\n- build_sha: `{}`",
+        protocol.source_kind,
+        protocol.path.display(),
+        protocol.content_sha256,
+        protocol.embedded_sha256,
+        protocol.build_sha,
+    );
+
     if let Some(parent) = instr_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("provision: create dir {} failed: {e}", parent.display()))?;
     }
-
-    let home = crate::home_dir();
-    let proto = crate::protocol::protocol_path(&home);
-    let proto_str = proto.display().to_string();
-    let body = build_instructions_body(ctx, Some(&proto_str));
 
     // Preserve durable owner stamp even without full fleet context:
     // write ONLY the Name identity line so the next provision sees
@@ -684,6 +693,9 @@ pub fn generate_with_context(
     // (2) Preflight BEFORE any mutation, so a refusal leaves the dir untouched.
     if let Some(ctx) = ctx {
         workspace_provision_preflight(working_dir, backend.as_ref(), ctx.name)?;
+    } else if backend.is_some() {
+        crate::protocol::resolve_protocol(&home)
+            .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
     }
 
     // (3) Mutations, under the lock, only after a clean preflight.
@@ -715,6 +727,8 @@ fn workspace_provision_preflight(
     let Some(backend) = backend else {
         return Ok(());
     };
+    crate::protocol::resolve_protocol(&crate::home_dir())
+        .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
     let preset = backend.preset();
     let path = working_dir.join(preset.instructions_path);
     if preset.instructions_shared {

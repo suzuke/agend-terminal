@@ -4,6 +4,9 @@
 //! lives in `AGEND_HOME/protocol/.default/`. User overrides go in the parent
 //! `AGEND_HOME/protocol/` directory and are never touched by the daemon.
 
+use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const FILENAME: &str = "FLEET-DEV-PROTOCOL.md";
@@ -11,27 +14,212 @@ const FILENAME: &str = "FLEET-DEV-PROTOCOL.md";
 /// Embedded default protocol (compile-time).
 const DEFAULT_PROTOCOL: &str = include_str!("../docs/FLEET-DEV-PROTOCOL.md");
 
-/// Extract embedded protocol to `AGEND_HOME/protocol/.default/`.
-/// Always overwrites — `.default/` is daemon-owned.
-pub fn extract_default(home: &Path) {
-    let dir = home.join("protocol").join(".default");
-    std::fs::create_dir_all(&dir).ok();
-    let _ = std::fs::write(dir.join(FILENAME), DEFAULT_PROTOCOL);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProtocolIdentity {
+    pub source_kind: String,
+    pub path: PathBuf,
+    pub content_sha256: String,
+    pub embedded_sha256: String,
+    pub build_sha: String,
 }
 
-/// Return the best available protocol file path.
-/// Priority: override > extracted default. Extracts if neither exists.
-pub fn protocol_path(home: &Path) -> PathBuf {
+#[derive(Debug, Clone, Serialize)]
+pub struct ProtocolStatus {
+    pub state: String,
+    pub source_kind: Option<String>,
+    pub path: Option<PathBuf>,
+    pub content_sha256: Option<String>,
+    pub embedded_sha256: String,
+    pub build_sha: String,
+    pub error: Option<String>,
+}
+
+fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn embedded_sha256() -> String {
+    digest(DEFAULT_PROTOCOL.as_bytes())
+}
+
+fn build_sha() -> String {
+    option_env!("AGEND_BUILD_SHA")
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn identity_from_bytes(source_kind: &str, path: &Path, bytes: &[u8]) -> Result<ProtocolIdentity> {
+    if bytes.is_empty() {
+        bail!("protocol artifact {} is empty", path.display());
+    }
+    std::str::from_utf8(bytes)
+        .with_context(|| format!("protocol artifact {} is not valid UTF-8", path.display()))?;
+    Ok(ProtocolIdentity {
+        source_kind: source_kind.to_owned(),
+        path: path.to_path_buf(),
+        content_sha256: digest(bytes),
+        embedded_sha256: embedded_sha256(),
+        build_sha: build_sha(),
+    })
+}
+
+fn read_identity(path: &Path, source_kind: &str) -> Result<ProtocolIdentity> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat protocol artifact {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "protocol artifact {} is not a regular file (symlinks and directories are refused)",
+            path.display()
+        );
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read protocol artifact {}", path.display()))?;
+    identity_from_bytes(source_kind, path, &bytes)
+}
+
+fn default_path(home: &Path) -> PathBuf {
+    home.join("protocol").join(".default").join(FILENAME)
+}
+
+/// Extract embedded protocol to `AGEND_HOME/protocol/.default/`.
+/// Always overwrites — `.default/` is daemon-owned. Replacement is atomic and
+/// fallible, so a failed write cannot leave a partial protocol artifact.
+pub fn extract_default(home: &Path) -> anyhow::Result<ProtocolIdentity> {
+    let dir = home.join("protocol").join(".default");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create protocol directory {}", dir.display()))?;
+    let path = dir.join(FILENAME);
+    crate::store::atomic_write(&path, DEFAULT_PROTOCOL.as_bytes())
+        .with_context(|| format!("atomically extract protocol to {}", path.display()))?;
+    identity_from_bytes("default", &path, DEFAULT_PROTOCOL.as_bytes())
+}
+
+/// Resolve the artifact that may be relied on by a provisioned agent.
+/// Explicit overrides are authoritative but must be structurally valid. The
+/// daemon-owned default is repaired to the exact embedded bytes before it is
+/// returned, including when an older complete artifact is present.
+pub fn resolve_protocol(home: &Path) -> Result<ProtocolIdentity> {
     let override_path = home.join("protocol").join(FILENAME);
-    if override_path.exists() {
-        return override_path;
+    match std::fs::symlink_metadata(&override_path) {
+        Ok(_) => return read_identity(&override_path, "override"),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("stat {}", override_path.display()));
+        }
+        Err(_) => {}
     }
-    let default_path = home.join("protocol").join(".default").join(FILENAME);
-    if default_path.exists() {
-        return default_path;
+
+    let default = default_path(home);
+    match std::fs::symlink_metadata(&default) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => extract_default(home),
+        Err(error) => Err(error).with_context(|| format!("stat {}", default.display())),
+        Ok(metadata) if !metadata.file_type().is_file() => bail!(
+            "protocol default {} is not a regular file (directories and symlinks are refused)",
+            default.display()
+        ),
+        Ok(_) => {
+            let bytes = std::fs::read(&default)
+                .with_context(|| format!("read protocol default {}", default.display()))?;
+            if bytes == DEFAULT_PROTOCOL.as_bytes() {
+                identity_from_bytes("default", &default, &bytes)
+            } else {
+                extract_default(home)
+            }
+        }
     }
-    extract_default(home);
-    default_path
+}
+
+/// Return the best available protocol file path for legacy callers. New
+/// reliance-sensitive callers use [`resolve_protocol`] so they can surface
+/// the error rather than silently proceeding.
+#[allow(dead_code)]
+pub fn protocol_path(home: &Path) -> PathBuf {
+    resolve_protocol(home)
+        .map(|identity| identity.path)
+        .unwrap_or_else(|_| default_path(home))
+}
+
+fn status_for_identity(identity: ProtocolIdentity, state: &str) -> ProtocolStatus {
+    ProtocolStatus {
+        state: state.to_owned(),
+        source_kind: Some(identity.source_kind),
+        path: Some(identity.path),
+        content_sha256: Some(identity.content_sha256),
+        embedded_sha256: identity.embedded_sha256,
+        build_sha: identity.build_sha,
+        error: None,
+    }
+}
+
+fn invalid_status(state: &str, path: Option<PathBuf>, error: impl Into<String>) -> ProtocolStatus {
+    ProtocolStatus {
+        state: state.to_owned(),
+        source_kind: None,
+        path,
+        content_sha256: None,
+        embedded_sha256: embedded_sha256(),
+        build_sha: build_sha(),
+        error: Some(error.into()),
+    }
+}
+
+/// Return human- and machine-readable protocol delivery state without
+/// mutating the workspace. This deliberately ignores temporary siblings and
+/// reports the exact named override/default artifact only.
+pub fn status(home: &Path) -> ProtocolStatus {
+    let override_path = home.join("protocol").join(FILENAME);
+    match std::fs::symlink_metadata(&override_path) {
+        Ok(_) => {
+            return match read_identity(&override_path, "override") {
+                Ok(identity) => status_for_identity(identity, "ready"),
+                Err(error) => {
+                    invalid_status("invalid_override", Some(override_path), error.to_string())
+                }
+            };
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return invalid_status("invalid_override", Some(override_path), error.to_string());
+        }
+        Err(_) => {}
+    }
+
+    let default = default_path(home);
+    let metadata = match std::fs::symlink_metadata(&default) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProtocolStatus {
+                state: "absent".into(),
+                source_kind: None,
+                path: Some(default),
+                content_sha256: None,
+                embedded_sha256: embedded_sha256(),
+                build_sha: build_sha(),
+                error: None,
+            };
+        }
+        Err(error) => {
+            return invalid_status("invalid_default", Some(default), error.to_string());
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return invalid_status(
+            "invalid_default",
+            Some(default),
+            "artifact is not a regular file (directories and symlinks are refused)",
+        );
+    }
+    match std::fs::read(&default) {
+        Ok(bytes) if bytes.is_empty() => {
+            invalid_status("invalid_default", Some(default), "artifact is empty")
+        }
+        Ok(bytes) => match identity_from_bytes("default", &default, &bytes) {
+            Ok(identity) if identity.content_sha256 == identity.embedded_sha256 => {
+                status_for_identity(identity, "ready")
+            }
+            Ok(identity) => status_for_identity(identity, "degraded_serviceable"),
+            Err(error) => invalid_status("invalid_default", Some(default), error.to_string()),
+        },
+        Err(error) => invalid_status("invalid_default", Some(default), error.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -55,7 +243,7 @@ mod tests {
     #[test]
     fn extract_default_creates_file() {
         let home = tmp_home("extract");
-        extract_default(&home);
+        extract_default(&home).expect("extract");
         let path = home.join("protocol/.default").join(FILENAME);
         assert!(path.exists(), ".default/ file must exist after extract");
         let content = std::fs::read_to_string(&path).expect("read");
@@ -69,7 +257,7 @@ mod tests {
     #[test]
     fn override_wins_over_default() {
         let home = tmp_home("override");
-        extract_default(&home);
+        extract_default(&home).expect("extract");
         let override_dir = home.join("protocol");
         std::fs::write(override_dir.join(FILENAME), "custom protocol").expect("write override");
         let path = protocol_path(&home);
@@ -80,7 +268,7 @@ mod tests {
     #[test]
     fn missing_override_falls_back_to_default() {
         let home = tmp_home("fallback");
-        extract_default(&home);
+        extract_default(&home).expect("extract");
         let path = protocol_path(&home);
         assert_eq!(
             path,
@@ -121,7 +309,7 @@ mod tests {
     #[test]
     fn structural_override_artifacts_are_not_selected() {
         let home = tmp_home("override-structural");
-        extract_default(&home);
+        extract_default(&home).expect("extract");
         let override_path = home.join("protocol").join(FILENAME);
         std::fs::create_dir(&override_path).unwrap();
 
@@ -138,7 +326,7 @@ mod tests {
     #[test]
     fn symlink_override_is_not_selected() {
         let home = tmp_home("override-symlink");
-        extract_default(&home);
+        extract_default(&home).expect("extract");
         let override_path = home.join("protocol").join(FILENAME);
         let target = home.join("outside-protocol.md");
         std::fs::write(&target, "outside").unwrap();
@@ -156,7 +344,7 @@ mod tests {
     #[test]
     fn failed_atomic_replacement_preserves_complete_default() {
         let home = tmp_home("atomic-failure");
-        extract_default(&home);
+        extract_default(&home).expect("extract");
         let default_path = home.join("protocol/.default").join(FILENAME);
         let before = std::fs::read(&default_path).unwrap();
         crate::store::fail_next_atomic_write_for_test(&default_path);

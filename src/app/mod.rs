@@ -79,8 +79,12 @@ pub fn run(
     // Must happen before main.rs's tracing init — caller should skip init for App.
     let home = crate::home_dir();
 
-    // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/
-    crate::protocol::extract_default(&home);
+    // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/.
+    // App boot remains available when the daemon-owned delivery cannot be
+    // refreshed, but the failure is explicit for doctor/status follow-up.
+    if let Err(error) = crate::protocol::extract_default(&home) {
+        tracing::error!(%error, "protocol default extraction failed during app boot");
+    }
 
     // #927 PR-A: was a raw `OpenOptions::truncate(true)` write on
     // `app.log` with hardcoded `debug` filter — long sessions hit

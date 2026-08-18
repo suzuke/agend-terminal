@@ -441,7 +441,9 @@ pub(crate) fn resolve_fleet_and_reconcile(
 
     // agend-git-shim init (shared by daemon + app mode).
     time_step("protocol::extract_default", || {
-        crate::protocol::extract_default(home);
+        if let Err(error) = crate::protocol::extract_default(home) {
+            tracing::error!(%error, "protocol default extraction failed during bootstrap");
+        }
     });
     // #restart-freeze: hook installation only matters at COMMIT time, never
     // before the render loop — running the worktree walk inline blocked boot

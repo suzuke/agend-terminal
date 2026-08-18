@@ -119,6 +119,43 @@ pub fn capture_backend(home: &Path, b: &backend::Backend, seconds: u64) -> anyho
 // duplicated the equivalents in `verify.rs`; callers now use
 // `verify --quick` which runs the same 4 probes from the verify module.
 
+fn print_protocol_human(home: &Path) {
+    let report = crate::protocol::status(home);
+    println!("  state: {}", report.state);
+    println!(
+        "  source_kind: {}",
+        report.source_kind.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  path: {}",
+        report
+            .path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "  content_sha256: {}",
+        report.content_sha256.as_deref().unwrap_or("none")
+    );
+    println!("  embedded_sha256: {}", report.embedded_sha256);
+    println!("  build_sha: {}", report.build_sha);
+    if let Some(error) = report.error {
+        println!("  error: {error}");
+    }
+}
+
+pub fn run_doctor_protocol(home: &Path, format: &str) -> anyhow::Result<()> {
+    let report = crate::protocol::status(home);
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Protocol delivery");
+        print_protocol_human(home);
+    }
+    Ok(())
+}
+
 pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     println!("AgEnD Terminal Doctor\n");
 
@@ -128,6 +165,9 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     };
     check("Home directory", home, " ✗ (not found)");
     check(".env file", &home.join(".env"), " - (optional)");
+
+    println!("\n  Protocol:");
+    print_protocol_human(home);
 
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     print!("  fleet.yaml: {}", fleet_path.display());

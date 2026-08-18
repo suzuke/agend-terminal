@@ -22,11 +22,13 @@ pub(crate) fn list_response(
 }
 
 pub(crate) fn handle_status(_params: &Value, ctx: &HandlerCtx) -> Value {
+    let protocol = crate::protocol::status(ctx.home);
     match crate::snapshot::load(ctx.home) {
         Some(snapshot) => {
             json!({"ok": true, "result": {
                 "protocol_version": crate::framing::PROTOCOL_VERSION,
                 "timestamp": snapshot.timestamp,
+                "protocol": protocol,
                 "agents": snapshot.agents.iter().map(|a| {
                     json!({
                         "name": a.name,
@@ -40,6 +42,9 @@ pub(crate) fn handle_status(_params: &Value, ctx: &HandlerCtx) -> Value {
                 }).collect::<Vec<_>>()
             }})
         }
-        None => json!({"ok": true, "result": {"agents": [], "timestamp": null}}),
+        None => json!({
+            "ok": true,
+            "result": {"agents": [], "timestamp": null, "protocol": protocol}
+        }),
     }
 }
