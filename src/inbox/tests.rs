@@ -1911,7 +1911,10 @@ fn deferred_structured_flush_commits_once_without_requeue() {
     let arms = std::sync::Arc::new(AtomicUsize::new(0));
     let arms_hook = std::sync::Arc::clone(&arms);
     crate::daemon::inject_delivery::test_support::set_arm_hook(Some(std::sync::Arc::new(
-        move |_| {
+        move |hook_agent| {
+            if hook_agent != name {
+                return;
+            }
             arms_hook.fetch_add(1, Ordering::SeqCst);
         },
     )));

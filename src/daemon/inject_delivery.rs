@@ -1713,14 +1713,19 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
         let release_rx_hook = std::sync::Arc::clone(&release_rx);
-        test_support::set_load_before_lock_hook(Some(std::sync::Arc::new(move |_, _, _| {
-            ready_tx.send(()).expect("load hook ready receiver");
-            release_rx_hook
-                .lock()
-                .expect("load hook mutex")
-                .recv()
-                .expect("load hook release");
-        })));
+        test_support::set_load_before_lock_hook(Some(std::sync::Arc::new(
+            move |_, hook_agent, _| {
+                if hook_agent != agent {
+                    return;
+                }
+                ready_tx.send(()).expect("load hook ready receiver");
+                release_rx_hook
+                    .lock()
+                    .expect("load hook mutex")
+                    .recv()
+                    .expect("load hook release");
+            },
+        )));
         let load_home = home.clone();
         let loader = std::thread::spawn(move || {
             prepare_arm(
@@ -1772,6 +1777,7 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn latch_lock_failure_logs_before_fail_closed_arm() {
+        let _g = test_guard();
         let home = tmp_home("latch-lock-failure-log");
         std::fs::remove_dir_all(&home).expect("remove fixture directory");
         std::fs::write(&home, b"not a directory").expect("create invalid home path");
