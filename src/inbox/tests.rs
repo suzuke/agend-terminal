@@ -1796,6 +1796,7 @@ fn reclaim_busy_gate_engages_on_uuid_keyed_production_topology() {
 fn reclaim_uuid_topology_forgets_human_dedup_for_one_structured_rearm() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let _test_guard = crate::daemon::inject_delivery::test_support::test_guard();
     let home = tmp_home("3303-uuid-rearm");
     let name = "rearm-general-3303";
     let uuid = "cccccccc-dddd-4eee-8fff-111111111111";
@@ -1904,6 +1905,7 @@ fn deferred_structured_flush_commits_once_without_requeue() {
     let home = tmp_home("3303-deferred-flush-success");
     let name = "deferred-flush-success-3303";
     let id = "m-3303-deferred-success";
+    let _test_guard = crate::daemon::inject_delivery::test_support::test_guard();
     seed_deferred_structured_rearm(&home, name, id);
     write_agent_state_snapshot(&home, name, "idle");
 
@@ -1950,6 +1952,7 @@ fn deferred_flush_cleanup_before_arm_does_not_requeue_or_arm_successor() {
     let home = tmp_home("3303-deferred-flush-fenced");
     let name = "deferred-flush-fenced-3303";
     let id = "m-3303-deferred-fenced";
+    let _test_guard = crate::daemon::inject_delivery::test_support::test_guard();
     seed_deferred_structured_rearm(&home, name, id);
     write_agent_state_snapshot(&home, name, "idle");
 
@@ -1997,6 +2000,7 @@ fn deferred_flush_post_persist_row_loss_is_not_requeued() {
     let home = tmp_home("3303-deferred-flush-post-persist");
     let name = "deferred-flush-post-persist-3303";
     let id = "m-3303-deferred-post-persist";
+    let _test_guard = crate::daemon::inject_delivery::test_support::test_guard();
     seed_deferred_structured_rearm(&home, name, id);
     write_agent_state_snapshot(&home, name, "idle");
 

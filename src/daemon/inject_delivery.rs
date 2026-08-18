@@ -802,6 +802,11 @@ pub(crate) mod test_support {
     static LOAD_BEFORE_LOCK_HOOK: OnceLock<parking_lot::Mutex<Option<LoadBeforeLockHook>>> =
         OnceLock::new();
     static LOAD_BEFORE_LOCK_HOOK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static TEST_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    pub(crate) fn test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        TEST_GUARD.lock()
+    }
 
     pub(crate) struct ArmHookGuard {
         _lock: parking_lot::MutexGuard<'static, ()>,
@@ -1099,9 +1104,8 @@ mod tests {
     /// other's entries → the flaky `left:None right:Some(true)`. A unique
     /// agent name per test is NOT enough (verify_pass touches all agents), so
     /// serialize the whole group; nextest is unaffected (per-test process).
-    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static G: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        G.lock().unwrap_or_else(|e| e.into_inner())
+    fn test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        test_support::test_guard()
     }
 
     /// Remove ONLY this test's own agent (never a global wipe that would nuke
@@ -1547,14 +1551,19 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
         let release_rx_hook = std::sync::Arc::clone(&release_rx);
-        test_support::set_persist_before_lock_hook(Some(std::sync::Arc::new(move |_, _, _| {
-            ready_tx.send(()).expect("persist hook ready receiver");
-            release_rx_hook
-                .lock()
-                .expect("persist hook mutex")
-                .recv()
-                .expect("persist hook release");
-        })));
+        test_support::set_persist_before_lock_hook(Some(std::sync::Arc::new(
+            move |_, hook_agent, _| {
+                if hook_agent != agent {
+                    return;
+                }
+                ready_tx.send(()).expect("persist hook ready receiver");
+                release_rx_hook
+                    .lock()
+                    .expect("persist hook mutex")
+                    .recv()
+                    .expect("persist hook release");
+            },
+        )));
         let verify_home = home.clone();
         let verifier = std::thread::spawn(move || verify_pass(&verify_home));
         ready_rx
@@ -1624,9 +1633,13 @@ mod tests {
         let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook_called_by_hook = std::sync::Arc::clone(&hook_called);
         let _persist_guard = test_support::persist_before_lock_hook_guard();
-        test_support::set_persist_before_lock_hook(Some(std::sync::Arc::new(move |_, _, _| {
-            hook_called_by_hook.store(true, std::sync::atomic::Ordering::SeqCst);
-        })));
+        test_support::set_persist_before_lock_hook(Some(std::sync::Arc::new(
+            move |_, hook_agent, _| {
+                if hook_agent == agent {
+                    hook_called_by_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )));
 
         assert!(matches!(
             persist_latch(&home, "m-stale-before-lock", &pending),
