@@ -2483,6 +2483,22 @@ mod tests {
         )
         .expect("initialize response");
         assert!(!runtime.is_ready());
+
+        let after_initialize_runtime = Arc::clone(&runtime);
+        let after_initialize_listener = listener.try_clone().expect("clone listener");
+        let after_initialize = thread::spawn(move || {
+            let (stream, _) = after_initialize_listener
+                .accept()
+                .expect("post-initialize accept");
+            handle_http(stream, after_initialize_runtime).expect("post-initialize response");
+        });
+        let rejected_after_initialize =
+            client_request(&locator, "POST", HTTP_PATH, &payload, "application/json")
+                .expect("post-initialize request");
+        after_initialize.join().expect("post-initialize server");
+        assert_eq!(rejected_after_initialize.status, 503);
+        assert!(receiver.try_recv().is_err());
+
         assert!(mcp_message(
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
             &runtime,
