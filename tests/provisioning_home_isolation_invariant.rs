@@ -137,8 +137,7 @@ fn is_env_lookup_path(path: &syn::Path, aliases: &AmbientAliases) -> bool {
         && aliases.env_modules.contains(&segments[0])
         && is_env_lookup_name(&segments[1]);
     let imported = segments.len() == 1
-        && (aliases.env_functions.contains(&segments[0])
-            || aliases.env_functions.contains("*"));
+        && (aliases.env_functions.contains(&segments[0]) || aliases.env_functions.contains("*"));
     let pointer = segments.len() == 1 && aliases.function_pointers.contains(&segments[0]);
     direct || module_alias || imported || pointer
 }
