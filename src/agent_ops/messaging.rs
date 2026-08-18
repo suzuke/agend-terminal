@@ -78,20 +78,6 @@ impl SettlementOutcome {
             closure_condition: Some(SETTLEMENT_CLOSURE_CONDITION),
         }
     }
-
-    pub(crate) fn to_json(&self) -> serde_json::Value {
-        let mut value = serde_json::json!({"closed": self.closed});
-        if let Some(code) = self.code {
-            value["code"] = serde_json::json!(code);
-        }
-        if let Some(reason) = &self.reason {
-            value["reason"] = serde_json::json!(reason);
-        }
-        if let Some(condition) = self.closure_condition {
-            value["closure_condition"] = serde_json::json!(condition);
-        }
-        value
-    }
 }
 
 pub(crate) enum SendOutcome {

@@ -139,6 +139,24 @@ pub(super) fn handle_send_to_instance(
 
 /// #3293: one place that renders a successful send, so the settlement outcome
 /// cannot be exposed on some send paths and silently dropped on others.
+/// #3293: project the neutral service's typed settlement outcome into this
+/// adapter's JSON envelope. The projection lives here, not in the service:
+/// `src/agent_ops/messaging.rs` is below both adapters and must stay free of
+/// raw-`Value` entry points (pinned by `send_typed_shared_service_boundary_guard_2454`).
+fn settlement_json(settlement: &crate::agent_ops::messaging::SettlementOutcome) -> Value {
+    let mut value = json!({"closed": settlement.closed});
+    if let Some(code) = settlement.code {
+        value["code"] = json!(code);
+    }
+    if let Some(reason) = &settlement.reason {
+        value["reason"] = json!(reason);
+    }
+    if let Some(condition) = settlement.closure_condition {
+        value["closure_condition"] = json!(condition);
+    }
+    value
+}
+
 fn send_success_response(
     target: &str,
     delivery_mode: &str,
@@ -146,7 +164,7 @@ fn send_success_response(
 ) -> Value {
     let mut result = json!({"target": target, "delivery_mode": delivery_mode});
     if let Some(settlement) = settlement {
-        result["auto_close"] = settlement.to_json();
+        result["auto_close"] = settlement_json(settlement);
     }
     result
 }
