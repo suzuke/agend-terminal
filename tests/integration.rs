@@ -218,6 +218,8 @@ fn test_daemon_list_and_status() {
         "content_sha256",
         "embedded_sha256",
         "build_sha",
+        "build_dirty",
+        "workspaces",
     ] {
         assert!(
             protocol.contains_key(key),

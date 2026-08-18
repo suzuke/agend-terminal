@@ -29,12 +29,11 @@ fn protocol_markdown_is_lf_pinned_and_translation_is_non_normative() {
         ".gitattributes must pin protocol markdown to LF"
     );
 
-    let translation = fs::read_to_string("docs/FLEET-DEV-PROTOCOL.zh-TW.md")
-        .expect("zh-TW protocol");
+    let translation =
+        fs::read_to_string("docs/FLEET-DEV-PROTOCOL.zh-TW.md").expect("zh-TW protocol");
     let header = translation.lines().take(8).collect::<Vec<_>>().join("\n");
     assert!(
-        header.to_ascii_lowercase().contains("non-normative")
-            || header.contains("非規範"),
+        header.to_ascii_lowercase().contains("non-normative") || header.contains("非規範"),
         "zh-TW protocol must identify itself as non-normative: {header}"
     );
 }
@@ -48,6 +47,7 @@ fn protocol_source_declares_exact_identity_and_atomic_result_contract() {
         "content_sha256",
         "embedded_sha256",
         "build_sha",
+        "build_dirty",
         "pub fn extract_default(home: &Path) -> anyhow::Result",
         "crate::store::atomic_write",
     ] {

@@ -140,6 +140,17 @@ fn print_protocol_human(home: &Path) {
     );
     println!("  embedded_sha256: {}", report.embedded_sha256);
     println!("  build_sha: {}", report.build_sha);
+    println!("  build_dirty: {}", report.build_dirty);
+    println!("  workspaces: {}", report.workspaces.len());
+    for workspace in &report.workspaces {
+        println!(
+            "    {}: state={} delivery={} consumption={}",
+            workspace.workspace.display(),
+            workspace.state,
+            workspace.delivery_state,
+            workspace.consumption_state
+        );
+    }
     if let Some(error) = report.error {
         println!("  error: {error}");
     }

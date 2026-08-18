@@ -4,8 +4,8 @@
 //! lives in `AGEND_HOME/protocol/.default/`. User overrides go in the parent
 //! `AGEND_HOME/protocol/` directory and are never touched by the daemon.
 
-use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,12 @@ pub struct ProtocolIdentity {
     pub content_sha256: String,
     pub embedded_sha256: String,
     pub build_sha: String,
+    pub build_dirty: bool,
+    /// `ready` means the bytes equal the current embedded protocol. A stale
+    /// but complete daemon-owned artifact is `degraded_serviceable`: it can
+    /// still be inspected, but provisioning remains fail-closed.
+    pub state: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +37,31 @@ pub struct ProtocolStatus {
     pub content_sha256: Option<String>,
     pub embedded_sha256: String,
     pub build_sha: String,
+    pub build_dirty: bool,
+    pub error: Option<String>,
+    pub workspaces: Vec<WorkspaceProtocolStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolDeliveryStamp {
+    pub source_kind: String,
+    pub path: PathBuf,
+    pub content_sha256: String,
+    pub embedded_sha256: String,
+    pub build_sha: String,
+    pub build_dirty: bool,
+    pub delivery_state: String,
+    pub consumption_state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceProtocolStatus {
+    pub workspace: PathBuf,
+    pub instruction_path: Option<PathBuf>,
+    pub state: String,
+    pub delivery_state: String,
+    pub consumption_state: String,
+    pub stamp: Option<ProtocolDeliveryStamp>,
     pub error: Option<String>,
 }
 
@@ -48,7 +79,17 @@ fn build_sha() -> String {
         .to_owned()
 }
 
-fn identity_from_bytes(source_kind: &str, path: &Path, bytes: &[u8]) -> Result<ProtocolIdentity> {
+fn build_dirty() -> bool {
+    option_env!("AGEND_BUILD_DIRTY") == Some("1")
+}
+
+fn identity_from_bytes_with_state(
+    source_kind: &str,
+    path: &Path,
+    bytes: &[u8],
+    state: &str,
+    error: Option<String>,
+) -> Result<ProtocolIdentity> {
     if bytes.is_empty() {
         bail!("protocol artifact {} is empty", path.display());
     }
@@ -60,7 +101,33 @@ fn identity_from_bytes(source_kind: &str, path: &Path, bytes: &[u8]) -> Result<P
         content_sha256: digest(bytes),
         embedded_sha256: embedded_sha256(),
         build_sha: build_sha(),
+        build_dirty: build_dirty(),
+        state: state.to_owned(),
+        error,
     })
+}
+
+fn identity_from_bytes(source_kind: &str, path: &Path, bytes: &[u8]) -> Result<ProtocolIdentity> {
+    identity_from_bytes_with_state(source_kind, path, bytes, "ready", None)
+}
+
+fn repair_hint(home: &Path, path: &Path) -> String {
+    let override_path = home.join("protocol").join(FILENAME);
+    if path == override_path {
+        format!(
+            "repair with `agend-terminal doctor protocol --format json`; operator action: remove or replace the invalid override at {} with a regular non-empty UTF-8 file, then restart agend-terminal",
+            path.display()
+        )
+    } else {
+        format!(
+            "repair with `agend-terminal doctor protocol --format json`; operator action: restart agend-terminal to retry atomic extraction of the daemon-owned default at {} (or restore it as a regular non-empty UTF-8 file)",
+            path.display()
+        )
+    }
+}
+
+fn protocol_error(home: &Path, path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("{error}; {}", repair_hint(home, path))
 }
 
 fn read_identity(path: &Path, source_kind: &str) -> Result<ProtocolIdentity> {
@@ -101,41 +168,78 @@ pub fn extract_default(home: &Path) -> anyhow::Result<ProtocolIdentity> {
 pub fn resolve_protocol(home: &Path) -> Result<ProtocolIdentity> {
     let override_path = home.join("protocol").join(FILENAME);
     match std::fs::symlink_metadata(&override_path) {
-        Ok(_) => return read_identity(&override_path, "override"),
+        Ok(_) => {
+            return read_identity(&override_path, "override")
+                .map_err(|error| protocol_error(home, &override_path, error));
+        }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(error).with_context(|| format!("stat {}", override_path.display()));
+            return Err(protocol_error(
+                home,
+                &override_path,
+                format_args!("stat {}: {error}", override_path.display()),
+            ));
         }
         Err(_) => {}
     }
 
     let default = default_path(home);
     match std::fs::symlink_metadata(&default) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => extract_default(home),
-        Err(error) => Err(error).with_context(|| format!("stat {}", default.display())),
-        Ok(metadata) if !metadata.file_type().is_file() => bail!(
-            "protocol default {} is not a regular file (directories and symlinks are refused)",
-            default.display()
-        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            extract_default(home).map_err(|error| protocol_error(home, &default, error))
+        }
+        Err(error) => Err(protocol_error(
+            home,
+            &default,
+            format_args!("stat {}: {error}", default.display()),
+        )),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(protocol_error(
+            home,
+            &default,
+            format_args!(
+                "protocol default {} is not a regular file (directories and symlinks are refused)",
+                default.display()
+            ),
+        )),
         Ok(_) => {
-            let bytes = std::fs::read(&default)
-                .with_context(|| format!("read protocol default {}", default.display()))?;
+            let bytes = std::fs::read(&default).map_err(|error| {
+                protocol_error(
+                    home,
+                    &default,
+                    format_args!("read protocol default {}: {error}", default.display()),
+                )
+            })?;
             if bytes == DEFAULT_PROTOCOL.as_bytes() {
                 identity_from_bytes("default", &default, &bytes)
             } else {
-                extract_default(home)
+                match extract_default(home) {
+                    Ok(_) => match read_identity(&default, "default") {
+                        Ok(identity) if identity.content_sha256 == embedded_sha256() => Ok(identity),
+                        Ok(identity) => Err(protocol_error(
+                            home,
+                            &default,
+                            format_args!(
+                                "protocol default {} remains mismatched after refresh (sha {})",
+                                default.display(),
+                                identity.content_sha256
+                            ),
+                        )),
+                        Err(error) => Err(protocol_error(
+                            home,
+                            &default,
+                            format_args!("re-read after protocol refresh failed: {error}"),
+                        )),
+                    },
+                    Err(refresh_error) => Err(protocol_error(
+                        home,
+                        &default,
+                        format_args!(
+                            "default refresh failed: {refresh_error}; existing complete artifact is degraded_serviceable but new provisioning is refused"
+                        ),
+                    )),
+                }
             }
         }
     }
-}
-
-/// Return the best available protocol file path for legacy callers. New
-/// reliance-sensitive callers use [`resolve_protocol`] so they can surface
-/// the error rather than silently proceeding.
-#[allow(dead_code)]
-pub fn protocol_path(home: &Path) -> PathBuf {
-    resolve_protocol(home)
-        .map(|identity| identity.path)
-        .unwrap_or_else(|_| default_path(home))
 }
 
 fn status_for_identity(identity: ProtocolIdentity, state: &str) -> ProtocolStatus {
@@ -146,7 +250,9 @@ fn status_for_identity(identity: ProtocolIdentity, state: &str) -> ProtocolStatu
         content_sha256: Some(identity.content_sha256),
         embedded_sha256: identity.embedded_sha256,
         build_sha: identity.build_sha,
-        error: None,
+        build_dirty: identity.build_dirty,
+        error: identity.error,
+        workspaces: Vec::new(),
     }
 }
 
@@ -158,8 +264,210 @@ fn invalid_status(state: &str, path: Option<PathBuf>, error: impl Into<String>) 
         content_sha256: None,
         embedded_sha256: embedded_sha256(),
         build_sha: build_sha(),
+        build_dirty: build_dirty(),
         error: Some(error.into()),
+        workspaces: Vec::new(),
     }
+}
+
+fn status_absent(default: PathBuf) -> ProtocolStatus {
+    ProtocolStatus {
+        state: "absent".into(),
+        source_kind: None,
+        path: Some(default),
+        content_sha256: None,
+        embedded_sha256: embedded_sha256(),
+        build_sha: build_sha(),
+        build_dirty: build_dirty(),
+        error: None,
+        workspaces: Vec::new(),
+    }
+}
+
+const DELIVERY_STAMP_START: &str = "<!-- agend:protocol-delivery -->";
+const DELIVERY_STAMP_END: &str = "<!-- /agend:protocol-delivery -->";
+
+pub fn delivery_stamp(identity: &ProtocolIdentity) -> ProtocolDeliveryStamp {
+    ProtocolDeliveryStamp {
+        source_kind: identity.source_kind.clone(),
+        path: identity.path.clone(),
+        content_sha256: identity.content_sha256.clone(),
+        embedded_sha256: identity.embedded_sha256.clone(),
+        build_sha: identity.build_sha.clone(),
+        build_dirty: identity.build_dirty,
+        delivery_state: "delivered".into(),
+        // A file being written proves delivery only. The agent's later read or
+        // acknowledgement is a separate protocol and is deliberately not
+        // inferred here.
+        consumption_state: "not_proven".into(),
+    }
+}
+
+pub fn format_delivery_stamp(identity: &ProtocolIdentity) -> Result<String> {
+    Ok(format!(
+        "{DELIVERY_STAMP_START}\n{}\n{DELIVERY_STAMP_END}",
+        serde_json::to_string(&delivery_stamp(identity))?
+    ))
+}
+
+/// Parse the machine-readable stamp embedded in an agend-managed instruction
+/// file. The explicit markers keep status independent of human prose wording.
+pub fn parse_delivery_stamp(content: &str) -> Result<ProtocolDeliveryStamp> {
+    if content.matches(DELIVERY_STAMP_START).count() != 1
+        || content.matches(DELIVERY_STAMP_END).count() != 1
+    {
+        bail!("protocol delivery stamp must contain exactly one marked block")
+    }
+    let start = content
+        .find(DELIVERY_STAMP_START)
+        .ok_or_else(|| anyhow!("protocol delivery stamp is absent"))?;
+    let body_start = start + DELIVERY_STAMP_START.len();
+    let end = content[body_start..]
+        .find(DELIVERY_STAMP_END)
+        .ok_or_else(|| anyhow!("protocol delivery stamp is unterminated"))?
+        + body_start;
+    let body = content[body_start..end].trim();
+    let stamp: ProtocolDeliveryStamp =
+        serde_json::from_str(body).with_context(|| "protocol delivery stamp is not valid JSON")?;
+    if stamp.delivery_state != "delivered" {
+        bail!("protocol delivery stamp has invalid delivery_state")
+    }
+    if stamp.consumption_state != "not_proven" {
+        bail!("protocol delivery stamp has invalid consumption_state")
+    }
+    Ok(stamp)
+}
+
+fn workspace_candidates(home: &Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+    let mut candidates = Vec::new();
+    if let Ok(config) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        for name in config.instance_names() {
+            let Some(resolved) = config.resolve_instance(&name) else {
+                continue;
+            };
+            let relative = resolved.backend.preset().instructions_path;
+            if relative.is_empty() {
+                continue;
+            }
+            let workspace = resolved
+                .working_directory
+                .unwrap_or_else(|| home.join("workspace").join(&name));
+            candidates.push((workspace.clone(), Some(workspace.join(relative))));
+        }
+    }
+
+    // A fleet can be absent or temporarily unparseable during setup. Include
+    // existing workspace directories as a read-only fallback, and inspect all
+    // known instruction locations so status still exposes stale delivery.
+    if candidates.is_empty() {
+        let root = home.join("workspace");
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            let relative_paths = [
+                ".claude/agend.md",
+                ".kiro/steering/agend.md",
+                "AGENTS.md",
+                ".agents/AGENTS.md",
+            ];
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let workspace = entry.path();
+                let existing: Vec<PathBuf> = relative_paths
+                    .iter()
+                    .map(|relative| workspace.join(relative))
+                    .filter(|path| path.exists())
+                    .collect();
+                if existing.is_empty() {
+                    candidates.push((workspace.clone(), None));
+                } else {
+                    candidates.extend(
+                        existing
+                            .into_iter()
+                            .map(|path| (workspace.clone(), Some(path))),
+                    );
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| left.cmp(right));
+    candidates.dedup();
+    candidates
+}
+
+fn workspace_statuses(home: &Path, current: &ProtocolStatus) -> Vec<WorkspaceProtocolStatus> {
+    workspace_candidates(home)
+        .into_iter()
+        .map(|(workspace, instruction_path)| {
+            let Some(path) = instruction_path.clone() else {
+                return WorkspaceProtocolStatus {
+                    workspace,
+                    instruction_path: None,
+                    state: "not_delivered".into(),
+                    delivery_state: "not_delivered".into(),
+                    consumption_state: "not_proven".into(),
+                    stamp: None,
+                    error: None,
+                };
+            };
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return WorkspaceProtocolStatus {
+                        workspace,
+                        instruction_path: Some(path),
+                        state: "not_delivered".into(),
+                        delivery_state: "not_delivered".into(),
+                        consumption_state: "not_proven".into(),
+                        stamp: None,
+                        error: None,
+                    };
+                }
+                Err(error) => {
+                    return WorkspaceProtocolStatus {
+                        workspace,
+                        instruction_path: Some(path),
+                        state: "invalid_stamp".into(),
+                        delivery_state: "unknown".into(),
+                        consumption_state: "not_proven".into(),
+                        stamp: None,
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
+            let stamp = match parse_delivery_stamp(&content) {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    return WorkspaceProtocolStatus {
+                        workspace,
+                        instruction_path: Some(path),
+                        state: "invalid_stamp".into(),
+                        delivery_state: "unknown".into(),
+                        consumption_state: "not_proven".into(),
+                        stamp: None,
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
+            let current_matches = current.source_kind.as_deref()
+                == Some(stamp.source_kind.as_str())
+                && current.path.as_ref() == Some(&stamp.path)
+                && current.content_sha256.as_deref() == Some(stamp.content_sha256.as_str())
+                && current.embedded_sha256 == stamp.embedded_sha256
+                && current.build_sha == stamp.build_sha
+                && current.build_dirty == stamp.build_dirty;
+            WorkspaceProtocolStatus {
+                workspace,
+                instruction_path: Some(path),
+                state: if current_matches { "current" } else { "stale" }.into(),
+                delivery_state: stamp.delivery_state.clone(),
+                consumption_state: stamp.consumption_state.clone(),
+                stamp: Some(stamp),
+                error: None,
+            }
+        })
+        .collect()
 }
 
 /// Return human- and machine-readable protocol delivery state without
@@ -167,59 +475,74 @@ fn invalid_status(state: &str, path: Option<PathBuf>, error: impl Into<String>) 
 /// reports the exact named override/default artifact only.
 pub fn status(home: &Path) -> ProtocolStatus {
     let override_path = home.join("protocol").join(FILENAME);
-    match std::fs::symlink_metadata(&override_path) {
-        Ok(_) => {
-            return match read_identity(&override_path, "override") {
-                Ok(identity) => status_for_identity(identity, "ready"),
-                Err(error) => {
-                    invalid_status("invalid_override", Some(override_path), error.to_string())
+    let mut result = match std::fs::symlink_metadata(&override_path) {
+        Ok(_) => match read_identity(&override_path, "override") {
+            Ok(identity) => status_for_identity(identity, "ready"),
+            Err(error) => invalid_status(
+                "invalid_override",
+                Some(override_path.clone()),
+                format!("{error}; {}", repair_hint(home, &override_path)),
+            ),
+        },
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => invalid_status(
+            "invalid_override",
+            Some(override_path.clone()),
+            format!("{error}; {}", repair_hint(home, &override_path)),
+        ),
+        Err(_) => {
+            let default = default_path(home);
+            match std::fs::symlink_metadata(&default) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    status_absent(default)
                 }
-            };
-        }
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return invalid_status("invalid_override", Some(override_path), error.to_string());
-        }
-        Err(_) => {}
-    }
-
-    let default = default_path(home);
-    let metadata = match std::fs::symlink_metadata(&default) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ProtocolStatus {
-                state: "absent".into(),
-                source_kind: None,
-                path: Some(default),
-                content_sha256: None,
-                embedded_sha256: embedded_sha256(),
-                build_sha: build_sha(),
-                error: None,
-            };
-        }
-        Err(error) => {
-            return invalid_status("invalid_default", Some(default), error.to_string());
+                Err(error) => invalid_status(
+                    "invalid_default",
+                    Some(default.clone()),
+                    format!("{error}; {}", repair_hint(home, &default)),
+                ),
+                Ok(metadata) if !metadata.file_type().is_file() => invalid_status(
+                    "invalid_default",
+                    Some(default.clone()),
+                    format!(
+                        "artifact is not a regular file (directories and symlinks are refused); {}",
+                        repair_hint(home, &default)
+                    ),
+                ),
+                Ok(_) => match std::fs::read(&default) {
+                    Ok(bytes) if bytes.is_empty() => invalid_status(
+                        "invalid_default",
+                        Some(default.clone()),
+                        format!("artifact is empty; {}", repair_hint(home, &default)),
+                    ),
+                    Ok(bytes) => match identity_from_bytes("default", &default, &bytes) {
+                        Ok(identity) if identity.content_sha256 == identity.embedded_sha256 => {
+                            status_for_identity(identity, "ready")
+                        }
+                        Ok(identity) => {
+                            let mut status = status_for_identity(identity, "degraded_serviceable");
+                            status.error = Some(format!(
+                                "degraded_serviceable: default artifact digest differs from embedded protocol; {}",
+                                repair_hint(home, &default)
+                            ));
+                            status
+                        }
+                        Err(error) => invalid_status(
+                            "invalid_default",
+                            Some(default.clone()),
+                            format!("{error}; {}", repair_hint(home, &default)),
+                        ),
+                    },
+                    Err(error) => invalid_status(
+                        "invalid_default",
+                        Some(default.clone()),
+                        format!("{error}; {}", repair_hint(home, &default)),
+                    ),
+                },
+            }
         }
     };
-    if !metadata.file_type().is_file() {
-        return invalid_status(
-            "invalid_default",
-            Some(default),
-            "artifact is not a regular file (directories and symlinks are refused)",
-        );
-    }
-    match std::fs::read(&default) {
-        Ok(bytes) if bytes.is_empty() => {
-            invalid_status("invalid_default", Some(default), "artifact is empty")
-        }
-        Ok(bytes) => match identity_from_bytes("default", &default, &bytes) {
-            Ok(identity) if identity.content_sha256 == identity.embedded_sha256 => {
-                status_for_identity(identity, "ready")
-            }
-            Ok(identity) => status_for_identity(identity, "degraded_serviceable"),
-            Err(error) => invalid_status("invalid_default", Some(default), error.to_string()),
-        },
-        Err(error) => invalid_status("invalid_default", Some(default), error.to_string()),
-    }
+    result.workspaces = workspace_statuses(home, &result);
+    result
 }
 
 #[cfg(test)]
@@ -260,7 +583,7 @@ mod tests {
         extract_default(&home).expect("extract");
         let override_dir = home.join("protocol");
         std::fs::write(override_dir.join(FILENAME), "custom protocol").expect("write override");
-        let path = protocol_path(&home);
+        let path = resolve_protocol(&home).expect("valid override").path;
         assert_eq!(path, override_dir.join(FILENAME));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -269,7 +592,7 @@ mod tests {
     fn missing_override_falls_back_to_default() {
         let home = tmp_home("fallback");
         extract_default(&home).expect("extract");
-        let path = protocol_path(&home);
+        let path = resolve_protocol(&home).expect("valid default").path;
         assert_eq!(
             path,
             home.join("protocol/.default").join(FILENAME),
@@ -281,8 +604,10 @@ mod tests {
     #[test]
     fn missing_both_extracts_and_returns() {
         let home = tmp_home("empty");
-        // Neither exists — protocol_path should extract and return .default/
-        let path = protocol_path(&home);
+        // Neither exists — resolve_protocol should extract and return .default/.
+        let path = resolve_protocol(&home)
+            .expect("missing protocol is extracted")
+            .path;
         assert_eq!(path, home.join("protocol/.default").join(FILENAME));
         assert!(path.exists(), "must auto-extract when both missing");
         std::fs::remove_dir_all(&home).ok();
@@ -295,7 +620,9 @@ mod tests {
         std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
         std::fs::write(&default_path, "historically stale protocol").unwrap();
 
-        let selected = protocol_path(&home);
+        let selected = resolve_protocol(&home)
+            .expect("stale default is healed")
+            .path;
 
         assert_eq!(selected, default_path);
         assert_eq!(
@@ -313,12 +640,8 @@ mod tests {
         let override_path = home.join("protocol").join(FILENAME);
         std::fs::create_dir(&override_path).unwrap();
 
-        let selected = protocol_path(&home);
-
-        assert_ne!(
-            selected, override_path,
-            "a directory must never become the effective protocol artifact"
-        );
+        let error = resolve_protocol(&home).expect_err("directory override must be refused");
+        assert!(error.to_string().contains("doctor protocol"));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -332,12 +655,8 @@ mod tests {
         std::fs::write(&target, "outside").unwrap();
         std::os::unix::fs::symlink(&target, &override_path).unwrap();
 
-        let selected = protocol_path(&home);
-
-        assert_ne!(
-            selected, override_path,
-            "a symlink must not provide ambiguous override provenance"
-        );
+        let error = resolve_protocol(&home).expect_err("symlink override must be refused");
+        assert!(error.to_string().contains("doctor protocol"));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -359,6 +678,102 @@ mod tests {
         assert!(
             crate::store::atomic_write(&default_path, b"probe").is_ok(),
             "extract_default must consume the deterministic failure seam"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn failed_refresh_refuses_provision_but_reports_degraded_serviceable() {
+        let home = tmp_home("degraded-serviceable");
+        let default_path = home.join("protocol/.default").join(FILENAME);
+        std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
+        let old = b"historically stale but complete protocol";
+        std::fs::write(&default_path, old).unwrap();
+        crate::store::fail_next_atomic_write_for_test(&default_path);
+
+        let error = resolve_protocol(&home).expect_err("stale default must refuse reliance");
+        assert_eq!(std::fs::read(&default_path).unwrap(), old);
+        assert!(error.to_string().contains("doctor protocol"));
+        assert_eq!(status(&home).state, "degraded_serviceable");
+        assert!(status(&home)
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("degraded_serviceable"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delivery_stamp_parser_rejects_malformed_duplicate_and_unterminated_blocks() {
+        let identity = ProtocolIdentity {
+            source_kind: "default".into(),
+            path: PathBuf::from("protocol/FLEET-DEV-PROTOCOL.md"),
+            content_sha256: "content".into(),
+            embedded_sha256: "embedded".into(),
+            build_sha: "build".into(),
+            build_dirty: false,
+            state: "ready".into(),
+            error: None,
+        };
+        let stamp = format_delivery_stamp(&identity).expect("stamp");
+        assert!(parse_delivery_stamp("not a stamp").is_err());
+        assert!(parse_delivery_stamp(&format!("{stamp}\n{stamp}")).is_err());
+        assert!(parse_delivery_stamp(&stamp.replace(DELIVERY_STAMP_END, "")).is_err());
+        assert!(parse_delivery_stamp(&stamp.replace("\"delivered\"", "\"unknown\"")).is_err());
+    }
+
+    #[test]
+    fn workspace_status_distinguishes_current_stale_and_consumption() {
+        let home = tmp_home("workspace-status");
+        let identity = extract_default(&home).expect("extract");
+        let workspace = home.join("workspace").join("agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join("workspace").join("undelivered")).unwrap();
+        let instruction_path = workspace.join("AGENTS.md");
+        let mut current = delivery_stamp(&identity);
+        let content = format_delivery_stamp(&identity).expect("stamp");
+        std::fs::write(&instruction_path, content).unwrap();
+
+        let report = status(&home);
+        assert_eq!(report.workspaces.len(), 2);
+        let current_status = report
+            .workspaces
+            .iter()
+            .find(|status| status.workspace.ends_with("agent"))
+            .expect("current workspace status");
+        assert_eq!(current_status.state, "current");
+        assert_eq!(current_status.delivery_state, "delivered");
+        assert_eq!(current_status.consumption_state, "not_proven");
+
+        current.content_sha256 = "stale".into();
+        std::fs::write(
+            &instruction_path,
+            format!(
+                "{}\n{}\n{}",
+                DELIVERY_STAMP_START,
+                serde_json::to_string(&current).unwrap(),
+                DELIVERY_STAMP_END
+            ),
+        )
+        .unwrap();
+        let report = status(&home);
+        assert_eq!(
+            report
+                .workspaces
+                .iter()
+                .find(|status| status.workspace.ends_with("agent"))
+                .expect("stale workspace status")
+                .state,
+            "stale"
+        );
+        assert_eq!(
+            report
+                .workspaces
+                .iter()
+                .find(|status| status.workspace.ends_with("undelivered"))
+                .expect("undelivered workspace status")
+                .state,
+            "not_delivered"
         );
         std::fs::remove_dir_all(&home).ok();
     }

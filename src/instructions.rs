@@ -547,15 +547,26 @@ fn generate_agent_instructions(
     let home = crate::home_dir();
     let protocol = crate::protocol::resolve_protocol(&home)
         .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
+    if protocol.state != "ready" {
+        return Err(format!(
+            "provision: protocol unavailable ({}): {}; repair with `agend-terminal doctor protocol --format json` and inspect {}",
+            protocol.state,
+            protocol.error.as_deref().unwrap_or("protocol is not current"),
+            protocol.path.display()
+        ));
+    }
     let proto_str = protocol.path.display().to_string();
     let body = build_instructions_body(ctx, Some(&proto_str));
     let body = format!(
-        "{body}\n\nProtocol delivery identity:\n- source_kind: `{}`\n- path: `{}`\n- content_sha256: `{}`\n- embedded_sha256: `{}`\n- build_sha: `{}`",
+        "{body}\n\nProtocol delivery identity:\n- delivery_state: `delivered`\n- consumption_state: `not_proven`\n- source_kind: `{}`\n- path: `{}`\n- content_sha256: `{}`\n- embedded_sha256: `{}`\n- build_sha: `{}`\n- build_dirty: `{}`\n\n{}",
         protocol.source_kind,
         protocol.path.display(),
         protocol.content_sha256,
         protocol.embedded_sha256,
         protocol.build_sha,
+        protocol.build_dirty,
+        crate::protocol::format_delivery_stamp(&protocol)
+            .map_err(|e| format!("provision: format protocol delivery stamp: {e}"))?,
     );
 
     if let Some(parent) = instr_path.parent() {
@@ -694,8 +705,16 @@ pub fn generate_with_context(
     if let Some(ctx) = ctx {
         workspace_provision_preflight(working_dir, backend.as_ref(), ctx.name)?;
     } else if backend.is_some() {
-        crate::protocol::resolve_protocol(&home)
+        let protocol = crate::protocol::resolve_protocol(&home)
             .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
+        if protocol.state != "ready" {
+            return Err(format!(
+                "provision: protocol unavailable ({}): {}; repair with `agend-terminal doctor protocol --format json` and inspect {}",
+                protocol.state,
+                protocol.error.as_deref().unwrap_or("protocol is not current"),
+                protocol.path.display()
+            ));
+        }
     }
 
     // (3) Mutations, under the lock, only after a clean preflight.
@@ -727,8 +746,16 @@ fn workspace_provision_preflight(
     let Some(backend) = backend else {
         return Ok(());
     };
-    crate::protocol::resolve_protocol(&crate::home_dir())
+    let protocol = crate::protocol::resolve_protocol(&crate::home_dir())
         .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
+    if protocol.state != "ready" {
+        return Err(format!(
+            "provision: protocol unavailable ({}): {}; repair with `agend-terminal doctor protocol --format json` and inspect {}",
+            protocol.state,
+            protocol.error.as_deref().unwrap_or("protocol is not current"),
+            protocol.path.display()
+        ));
+    }
     let preset = backend.preset();
     let path = working_dir.join(preset.instructions_path);
     if preset.instructions_shared {
