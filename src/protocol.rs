@@ -237,11 +237,19 @@ where
 fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHealedAudit>) {
     use tracing_subscriber::prelude::*;
 
+    static CAPTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _capture_guard = CAPTURE_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("default healed audit capture lock");
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(DefaultHealedAuditLayer {
         events: events.clone(),
     });
-    let result = tracing::subscriber::with_default(subscriber, f);
+    let result = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
     let events = std::sync::Arc::try_unwrap(events)
         .expect("default healed audit capture still referenced")
         .into_inner()
@@ -250,6 +258,7 @@ fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHeal
 }
 
 fn emit_default_healed_audit(path: &Path, from_digest: &str, identity: &ProtocolIdentity) {
+    tracing::callsite::rebuild_interest_cache();
     tracing::info!(
         target: "agend_terminal::protocol",
         path = %path.display(),
@@ -730,6 +739,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(protocol_default_heal)]
     #[test]
     fn stale_default_is_healed_before_selection() {
         let home = tmp_home("stale");
@@ -750,6 +760,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(protocol_default_heal)]
     #[test]
     fn stale_default_heal_emits_audit_fields() {
         let home = tmp_home("stale-audit");
