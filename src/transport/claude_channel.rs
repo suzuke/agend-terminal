@@ -234,15 +234,23 @@ impl ChannelRuntime {
 
     fn clear_sender(&self) {
         *self.mcp_sender.lock() = None;
+        self.ready.store(false, Ordering::Release);
     }
 
     fn set_client_version(&self, version: String) {
         *self.client_version.lock() = Some(version);
-        self.ready.store(true, Ordering::Release);
+        self.ready.store(false, Ordering::Release);
+    }
+
+    fn mark_initialized(&self) {
+        if self.client_version.lock().is_some() {
+            self.ready.store(true, Ordering::Release);
+        }
     }
 
     fn mark_unready(&self) {
         self.ready.store(false, Ordering::Release);
+        *self.client_version.lock() = None;
     }
 
     fn is_ready(&self) -> bool {
@@ -629,7 +637,10 @@ fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     match method {
         "initialize" => Some(mcp_initialize(&message, runtime)),
-        "notifications/initialized" => None,
+        "notifications/initialized" => {
+            runtime.mark_initialized();
+            None
+        }
         "ping" => Some(json!({
             "jsonrpc":"2.0",
             "id": message.get("id").cloned().unwrap_or(Value::Null),
@@ -2394,16 +2405,14 @@ mod tests {
             "initialize response proves protocol compatibility, not that the consumer installed its notification handler"
         );
 
-        assert!(
-            mcp_message(
-                json!({
-                    "jsonrpc":"2.0",
-                    "method":"notifications/initialized"
-                }),
-                &runtime,
-            )
-            .is_none()
-        );
+        assert!(mcp_message(
+            json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/initialized"
+            }),
+            &runtime,
+        )
+        .is_none());
         assert!(
             runtime.is_ready(),
             "the standard initialized notification is the consumer-readiness boundary"
@@ -2417,20 +2426,94 @@ mod tests {
         let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
 
-        assert!(
-            mcp_message(
-                json!({
-                    "jsonrpc":"2.0",
-                    "method":"notifications/initialized"
-                }),
-                &runtime,
-            )
-            .is_none()
-        );
+        assert!(mcp_message(
+            json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/initialized"
+            }),
+            &runtime,
+        )
+        .is_none());
         assert!(
             !runtime.is_ready(),
             "an uncorrelated initialized notification must not open the delivery lane"
         );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn late_consumer_readiness_admits_exactly_one_same_id_notification() {
+        let home = home("late-consumer-readiness");
+        let (locator, listener) =
+            bind_and_publish_channel(&home, "claude-agent").expect("channel listener");
+        let runtime = Arc::new(
+            ChannelRuntime::new(&home, "claude-agent", &locator).expect("channel runtime"),
+        );
+        let (sender, receiver) = mpsc::sync_channel(4);
+        runtime.set_sender(sender);
+        let delivery_id = Uuid::new_v4();
+        let payload = serde_json::to_vec(&json!({
+            "delivery_id":delivery_id,
+            "chat_id":"self-kick-late-ready",
+            "sender_id":"agend-terminal",
+            "text":"[AGEND-RESUME]"
+        }))
+        .expect("payload");
+
+        let before_runtime = Arc::clone(&runtime);
+        let before_listener = listener.try_clone().expect("clone listener");
+        let before = thread::spawn(move || {
+            let (stream, _) = before_listener.accept().expect("pre-ready accept");
+            handle_http(stream, before_runtime).expect("pre-ready response");
+        });
+        let rejected = client_request(&locator, "POST", HTTP_PATH, &payload, "application/json")
+            .expect("pre-ready request");
+        before.join().expect("pre-ready server");
+        assert_eq!(rejected.status, 503);
+        assert!(receiver.try_recv().is_err());
+
+        mcp_message(
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"initialize",
+                "params":{"clientInfo":{"version":"2.1.80"}}
+            }),
+            &runtime,
+        )
+        .expect("initialize response");
+        assert!(!runtime.is_ready());
+        assert!(mcp_message(
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            &runtime,
+        )
+        .is_none());
+
+        let ready_runtime = Arc::clone(&runtime);
+        let ready_listener = listener.try_clone().expect("clone listener");
+        let ready = thread::spawn(move || {
+            let (stream, _) = ready_listener.accept().expect("ready accept");
+            handle_http(stream, ready_runtime).expect("ready response");
+        });
+        let accepted = client_request(&locator, "POST", HTTP_PATH, &payload, "application/json")
+            .expect("ready request");
+        ready.join().expect("ready server");
+        assert_eq!(accepted.status, 202);
+        let notification = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("one channel notification");
+        assert_eq!(
+            notification.pointer("/params/meta/delivery_id"),
+            Some(&Value::String(delivery_id.to_string()))
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "the rejected pre-ready attempt must not leave a duplicate notification"
+        );
+
+        runtime.clear_sender();
+        assert!(!runtime.is_ready());
+        drop(listener);
         let _ = fs::remove_dir_all(home);
     }
 
