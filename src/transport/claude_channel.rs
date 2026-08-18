@@ -233,7 +233,9 @@ impl ChannelRuntime {
     }
 
     fn clear_sender(&self) {
+        let mut client_version = self.client_version.lock();
         *self.mcp_sender.lock() = None;
+        *client_version = None;
         self.ready.store(false, Ordering::Release);
     }
 
@@ -243,7 +245,8 @@ impl ChannelRuntime {
     }
 
     fn mark_initialized(&self) {
-        if self.client_version.lock().is_some() {
+        let client_version = self.client_version.lock();
+        if client_version.is_some() && self.mcp_sender.lock().is_some() {
             self.ready.store(true, Ordering::Release);
         }
     }
@@ -2385,6 +2388,8 @@ mod tests {
         let home = home("consumer-readiness");
         let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        runtime.set_sender(sender);
 
         let response = mcp_message(
             json!({
@@ -2425,6 +2430,8 @@ mod tests {
         let home = home("initialized-without-handshake");
         let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        runtime.set_sender(sender);
 
         assert!(mcp_message(
             json!({
@@ -2438,6 +2445,39 @@ mod tests {
             !runtime.is_ready(),
             "an uncorrelated initialized notification must not open the delivery lane"
         );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn late_initialized_notification_cannot_revive_a_disconnected_generation() {
+        let home = home("initialized-after-disconnect");
+        let locator = test_published_locator(&home, "claude-agent");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        runtime.set_sender(sender);
+
+        mcp_message(
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"initialize",
+                "params":{"clientInfo":{"version":"2.1.80"}}
+            }),
+            &runtime,
+        )
+        .expect("initialize response");
+        runtime.clear_sender();
+
+        assert!(mcp_message(
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            &runtime,
+        )
+        .is_none());
+        assert!(
+            !runtime.is_ready(),
+            "a disconnected generation must not be revived by a late initialized notification"
+        );
+        assert_eq!(runtime.client_version(), None);
         let _ = fs::remove_dir_all(home);
     }
 
