@@ -5955,23 +5955,26 @@ fn context_source_stays_pattern_while_context_provider_is_statusline() {
     );
 }
 
-// ── #3294: the daemon's OWN startup modal is not a permission prompt ────────
+// ── #3294 / #3297 r3: honest classification, evidence-driven latch release ──
 //
-// Managed Claude is launched with `--dangerously-load-development-channels`, so
-// every start renders the dev-channel warning modal. Its footer is the GENERIC
-// confirm chrome `Enter to confirm · Esc to cancel` — the third alternative of
-// the claude `PermissionPrompt` pattern — so the modal classified as
-// `PermissionPrompt` on the FIRST sample, before `gate_on_heartbeat` (which needs
-// a fresh heartbeat a just-spawned process cannot have) could suppress it. That
-// state is in `is_notify_error_class`, so the supervisor pushed a
-// `starting → permission` notification to the orchestrator, and nothing ever
-// retracts it: `maybe_notify_member_state_change` only notifies on entering an
-// error-class state, and the recovery-notice predicate `wants_raw_keystrokes`
-// excludes `PermissionPrompt`. Live on 2026-08-18 that produced 8/8 SessionStart
-// samples reporting PermissionPrompt with `agree=false`, and 2 member-state-change
-// notifications — both `starting->permission`, none leaving.
+// Consensus d-20260818164919002149-7, after r1/r2 adversarial counterexamples
+// proved every form of pre-classification suppression unsafe: the pane is a
+// REPLAY surface (Claude restarts with `--continue`), so any rule over rendered
+// rows can be satisfied by quoted or restored text. Suppression therefore let a
+// genuinely blocked agent land a non-error-class state — #3294 inverted, and
+// silent.
 //
-// Grid provenance: copied from `agent::dismiss`'s
+// The contract these tests pin instead:
+//   * every matching frame classifies `PermissionPrompt`, dev modal included;
+//   * a content-derived "expected dev startup" tag changes LATCH RELEASE only —
+//     never classification, notification, health, or injection;
+//   * the first later frame that detects no prompt releases the tagged latch
+//     immediately, through the REAL no-match pipeline, instead of waiting out
+//     `INTERACTIVE_EXPIRY`;
+//   * `INTERACTIVE_EXPIRY` remains the no-evidence backstop, and Generic
+//     prompts keep today's behaviour byte-for-byte.
+//
+// Grid provenance: `agent::dismiss`'s
 // `claude_development_channel_modal_matches_and_sends_one_enter`, captured from
 // Claude Code v2.1.224.
 const DEV_CHANNEL_STARTUP_MODAL_3294: &str = "\
@@ -5992,136 +5995,187 @@ const DEV_CHANNEL_STARTUP_MODAL_3294: &str = "\
   Enter to confirm · Esc to cancel
 ";
 
+/// The idle composer a dismissed modal leaves behind: no prompt chrome at all.
+const IDLE_AFTER_DISMISS_3294: &str = "\
+  ❯ try \"write a haiku\"
+
+  ? for shortcuts
+";
+
+/// Anti-suppression pin. Every frame that matches is classified honestly,
+/// including the daemon's own startup modal — visibility is never traded for
+/// quiet, because a rule that hides state cannot tell our modal from a quote of
+/// it.
 #[test]
-fn claude_dev_channel_startup_modal_is_not_permission_prompt_3294() {
+fn dev_channel_startup_modal_is_honestly_permission_prompt_3294() {
     let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
     st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3297 r3: the startup modal must classify honestly — suppression is what made a real dialog invisible"
+    );
+}
+
+/// The #3294 headline: once the dialog is gone, the state must follow on the
+/// frame that proves it, not 120s later.
+#[test]
+fn dev_tagged_latch_releases_on_first_no_prompt_frame_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert_eq!(st.get_state(), AgentState::PermissionPrompt);
+    st.feed(IDLE_AFTER_DISMISS_3294);
     assert_ne!(
         st.get_state(),
         AgentState::PermissionPrompt,
-        "#3294: the daemon's own dev-channel startup modal must not be classified as a permission prompt"
+        "#3294: a frame that detects no prompt must release the dev-tagged latch immediately"
     );
 }
 
+/// The release must beat the hysteresis min-hold. A priority-DOWN transition
+/// normally needs the current state held for 2s (`transition`'s `min_hold`), but
+/// the real sequence is sub-second: modal, dismiss keystroke ~300ms later, then
+/// the repaint. A release routed through plain `transition` is silently dropped,
+/// so this pins the bypass explicitly.
 #[test]
-fn dev_channel_startup_modal_never_notifies_an_error_class_state_3294() {
+fn dev_tagged_release_beats_hysteresis_min_hold_3294() {
     let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
     st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    // No elapsed time is faked: `since` is now ~0, i.e. far below `min_hold`.
+    st.feed(IDLE_AFTER_DISMISS_3294);
+    assert_ne!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: the fast release must not be rejected by the priority-down min-hold"
+    );
+}
+
+/// A dialog that is still on screen keeps the state, and stays notification
+/// eligible — the loud direction. Nothing about the tag makes a persistent
+/// prompt quiet.
+#[test]
+fn repeated_dev_frame_stays_permission_prompt_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    // A changed frame (spinner tick) so the hash-dedup gate misses and detection
+    // re-runs on a screen that still carries the modal.
+    let mut redrawn = String::from(DEV_CHANNEL_STARTUP_MODAL_3294);
+    redrawn.push_str("  ·\n");
+    st.feed(&redrawn);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3297 r3: a still-visible dialog keeps Prompt"
+    );
     assert!(
-        !st.get_state().is_notify_error_class(),
-        "#3294: the startup modal must not land a state the supervisor reports to the orchestrator, got {:?}",
-        st.get_state()
+        st.get_state().is_notify_error_class(),
+        "#3297 r3: a surviving prompt must remain notification-eligible"
     );
 }
 
+/// Restored/quoted modal text plus a real dialog: the frame classifies Prompt,
+/// and a later frame where the real chrome is still visible does NOT release —
+/// the release needs "no prompt detected", not "the modal stopped matching".
 #[test]
-fn generic_confirm_chrome_without_dev_channel_marker_stays_permission_3294() {
-    // The suppression is keyed to the KNOWN modal, not to the chrome: any other
-    // dialog wearing the same footer must still be detected. Narrowness pin —
-    // without it the fix would blind the third alternative entirely.
-    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
-    st.feed("  Do something dangerous?\n\n  ❯ 1. Yes\n    2. No\n\n  Enter to confirm · Esc to cancel\n");
-    assert_eq!(
-        st.get_state(),
-        AgentState::PermissionPrompt,
-        "#3294: only the dev-channel modal is excluded — the generic confirm chrome still classifies"
-    );
-}
-
-#[test]
-fn dev_channel_marker_does_not_blind_a_real_permission_prompt_3294() {
-    // The modal's text can still sit in the scrolled-back rows when a REAL
-    // permission prompt renders below it. Suppression must key on the modal's own
-    // chrome pairing, so the real prompt (a different alternative) still wins.
+fn dev_shaped_plus_real_generic_chrome_does_not_release_3294() {
     let mut screen = String::from(DEV_CHANNEL_STARTUP_MODAL_3294);
-    screen.push_str("\n  Requesting permission…\n  Esc to cancel · Tab to amend\n");
+    screen.push_str("\n  Delete every file in this directory?\n\n  ❯ 1. Yes\n    2. No\n\n  Enter to confirm · Esc to cancel\n");
     let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
     st.feed(&screen);
+    assert_eq!(st.get_state(), AgentState::PermissionPrompt);
+    st.feed("  Delete every file in this directory?\n\n  ❯ 1. Yes\n\n  Enter to confirm · Esc to cancel\n");
     assert_eq!(
         st.get_state(),
         AgentState::PermissionPrompt,
-        "#3294: a real permission prompt below the leftover modal text must still be detected"
+        "#3297 r3: while a prompt is still detected the latch must not release"
     );
 }
 
+/// Generic prompts are untouched: a no-prompt frame does NOT release them, so
+/// #1546/#1523's operator reaction window survives exactly as before.
 #[test]
-fn residual_dev_channel_marker_does_not_blind_a_later_generic_dialog_3294() {
-    // Reviewer-raised edge: the startup modal's text can still sit in the
-    // scrolled-back rows when a LATER, real dialog renders below wearing the SAME
-    // generic confirm chrome (not the permission-specific chrome that
-    // `dev_channel_marker_does_not_blind_a_real_permission_prompt_3294` covers).
-    // The suppression must key on the dialog that OWNS the screen — the lowest
-    // footer's own block — not on "the marker is somewhere on screen".
-    let mut screen = String::from(DEV_CHANNEL_STARTUP_MODAL_3294);
-    screen.push_str(
-        "\n  Delete every file in this directory?\n\n  ❯ 1. Yes\n    2. No\n\n  Enter to confirm · Esc to cancel\n",
-    );
+fn generic_permission_prompt_keeps_its_latch_3294() {
     let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
-    st.feed(&screen);
+    st.feed("  Requesting permission for: rm -rf /\n\n  Esc to cancel · Tab to amend\n");
+    assert_eq!(st.get_state(), AgentState::PermissionPrompt);
+    st.feed(IDLE_AFTER_DISMISS_3294);
     assert_eq!(
         st.get_state(),
         AgentState::PermissionPrompt,
-        "#3294: a later dialog wearing the same generic chrome must still classify, even with the startup modal left in scrollback"
+        "#3297 r3: a Generic prompt keeps the 120s latch — only the dev-tagged episode releases early"
     );
 }
 
-/// #3297 r1 (secondary reviewer): the suppression's trigger must not be
-/// satisfiable by ORDINARY TRANSCRIPT TEXT. The marker string circulates in
-/// agent panes (issue text, PR bodies, this very fix's own source), so a bare
-/// echoed line must never blind a real dialog rendered below it — that would be
-/// #3294 inverted: a genuinely blocked agent classified non-error-class, so the
-/// supervisor never notifies and the operator is never told.
+/// P1 backstop: with no later frame there is no evidence of disappearance, so
+/// the tagged episode keeps the existing `INTERACTIVE_EXPIRY` behaviour rather
+/// than latching forever or expiring early.
 #[test]
-fn bare_marker_transcript_does_not_blind_a_later_generic_dialog_3297() {
-    let screen = "\
-WARNING: Loading development channels
-
-  Delete every file in this directory?
-
-  ❯ 1. Yes
-    2. No
-
-  Enter to confirm · Esc to cancel
-";
-    for prior in [AgentState::Starting, AgentState::Idle] {
-        let mut st = tracker_at(&Backend::ClaudeCode, prior, 0);
-        st.feed(screen);
-        assert_eq!(
-            st.get_state(),
-            AgentState::PermissionPrompt,
-            "#3297: a quoted marker line must not suppress a real dialog (prior state {prior:?})"
-        );
-    }
-}
-
-/// #3297 r1: the startup modal's top rows can survive a repaint that overwrites
-/// its own footer row, so "the marker is in the lowest footer's block" is not
-/// enough — the block boundary the r1 fix relied on is gone in this shape and a
-/// real dialog owns the footer.
-#[test]
-fn partially_overwritten_modal_does_not_blind_a_later_generic_dialog_3297() {
-    let screen = "\
-────────────────────────────────────────────────────────────────────────────────
-  WARNING: Loading development channels
-
-  --dangerously-load-development-channels is for local channel development
-  only. Do not use this option to run channels you have downloaded off the
-  internet.
-
-  Channels:   server:agend-claude-channel
-
-  Delete every file in this directory?
-
-  ❯ 1. Yes
-    2. No
-
-  Enter to confirm · Esc to cancel
-";
+fn tagged_latch_with_no_later_frame_keeps_the_existing_backstop_3294() {
     let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
-    st.feed(screen);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    st.tick();
     assert_eq!(
         st.get_state(),
         AgentState::PermissionPrompt,
-        "#3297: a real dialog owning the footer must classify even when the modal's body survives above it"
+        "#3297 r3: no later frame means no evidence — the prompt is held, not cleared early"
+    );
+    st.since = Instant::now() - Duration::from_secs(121);
+    st.tick();
+    assert_eq!(
+        st.get_state(),
+        AgentState::Idle,
+        "#3297 r3: the existing 120s backstop must still fire for the no-evidence case"
+    );
+}
+
+/// P2: the release must go THROUGH the existing no-match pipeline, not hard-land
+/// Idle — otherwise a genuine structural startup prompt on the releasing frame
+/// would be silently downgraded, recreating the class we are removing.
+#[test]
+fn release_runs_the_real_no_match_pipeline_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    st.feed("  Do you want to continue? (y/n)\n");
+    assert_eq!(
+        st.get_state(),
+        AgentState::InteractivePrompt,
+        "#3297 r3: releasing must let the Starting structural fallback land its own state"
+    );
+}
+
+/// No re-latch after a fast release.
+#[test]
+fn tick_after_fast_release_does_not_relatch_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    st.feed(IDLE_AFTER_DISMISS_3294);
+    let released = st.get_state();
+    st.tick();
+    assert_eq!(
+        st.get_state(),
+        released,
+        "#3297 r3: a tick after the release must not re-enter the prompt"
+    );
+}
+
+/// G1 (reviewer-requested): a first frame that is dev-shaped AND could be a real
+/// dialog, followed by genuine non-prompt content, releases fast. That is
+/// intentional, and it is safe precisely because visibility was honoured on
+/// every matching frame — the operator was never told the pane was clear while a
+/// dialog was up.
+#[test]
+fn dev_shaped_first_frame_then_real_content_releases_by_design_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "the ambiguous frame is still reported as a prompt"
+    );
+    st.feed("  Running tests…\n  ⎿ 42 passed\n");
+    assert_ne!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "G1: once the pane shows genuine non-prompt content, fast release is the intended behaviour"
     );
 }
