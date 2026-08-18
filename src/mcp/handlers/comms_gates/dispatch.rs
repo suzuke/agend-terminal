@@ -116,6 +116,9 @@ pub(crate) fn run_dispatch_pre_checks(
 ) -> Result<DispatchPreChecks, Value> {
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let force_reason = args.get("force_reason").and_then(|v| v.as_str());
+    if force && force_reason.is_none_or(str::is_empty) {
+        return Err(json!({"error": "force=true requires a non-empty 'force_reason'"}));
+    }
     // #3141: dispatch auto-create routes a target's task to that target's
     // project board, while the legacy default-board list hides it.  Use the
     // strict all-board authority view so sequential retries see the same
@@ -176,9 +179,13 @@ pub(crate) fn run_dispatch_pre_checks(
     // an active task on the same branch (more specific than generic busy).
     if !force && !enriching_active {
         if let Some(branch) = args["branch"].as_str() {
+            let requested_task_id = args["task_id"].as_str().filter(|s| !s.is_empty());
             if let Some(dup) = dedup_candidates
                 .iter()
-                .find(|t| t.branch.as_deref() == Some(branch))
+                .find(|t| {
+                    t.branch.as_deref() == Some(branch)
+                        && requested_task_id != Some(t.id.as_str())
+                })
             {
                 return Err(json!({
                     "error": format!(
