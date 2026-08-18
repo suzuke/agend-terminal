@@ -356,12 +356,14 @@ mod tests {
         }
     }
 
-    /// #3294: the dev-channel startup modal is no longer classified as a
-    /// dismissible prompt state (it is not a permission prompt — see
-    /// `state::patterns::is_dev_channel_startup_modal`), so this pins the two
-    /// facts that keep its auto-dismiss working regardless: the scan is armed by
-    /// the state-INDEPENDENT startup latch, and this pattern was never in the
-    /// post-latch re-arm class, so `prompt_blocked` was never its delivery path.
+    /// #3294: the dev-channel startup modal IS classified as `PermissionPrompt`,
+    /// honestly, like any other matching frame (`state::prompt_latch` changes only
+    /// when that latch releases, never the classification). This test pins the two
+    /// facts that make the auto-dismiss independent of that classification either
+    /// way, so a future change to prompt state cannot silently break dismissal:
+    /// the scan is armed by the state-INDEPENDENT startup latch, and this pattern
+    /// is not in the post-latch re-arm class, so `prompt_blocked` is not its
+    /// delivery path.
     #[test]
     fn dev_channel_modal_dismissal_does_not_depend_on_prompt_state_3294() {
         assert!(
@@ -377,7 +379,7 @@ mod tests {
             .expect("claude ships the dev-channel dismiss pattern");
         assert!(
             !is_rearm_past_latch_hint(hint),
-            "#3294: the dev-channel pattern is startup-window-only, so its dismissal never depended on the PermissionPrompt classification"
+            "#3294: the dev-channel pattern is startup-window-only, so its dismissal does not ride the PermissionPrompt classification"
         );
     }
 
