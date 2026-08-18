@@ -270,6 +270,45 @@ fn run_app_keeps_orchestration_skeleton_2453s2() {
     }
 }
 
+/// B2 regression: app boot must install its file-backed subscriber before the
+/// protocol extraction error is emitted, so a failed extraction is retained in
+/// app.log while boot continues. This source-order pin avoids launching a
+/// competing TUI/daemon from the test process.
+#[test]
+fn app_boot_logs_protocol_extraction_failures_3290() {
+    let source = std::fs::read_to_string("src/app/mod.rs")
+        .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+        .expect("app source must be readable from test cwd");
+    let start = source.find("pub fn run(").expect("app::run must exist");
+    let end = source[start..]
+        .find("\n    let fleet_path = fleet_path_override.map(PathBuf::from);")
+        .map(|offset| start + offset)
+        .expect("app boot setup must precede fleet path construction");
+    let boot = &source[start..end];
+
+    let logging = boot
+        .find("crate::logging::setup_rolling_tracing(")
+        .expect("app boot must install the rolling subscriber");
+    let extraction = boot
+        .find("crate::protocol::extract_default(")
+        .expect("app boot must attempt protocol extraction");
+    assert!(
+        logging < extraction,
+        "protocol extraction diagnostics must be emitted after app logging setup"
+    );
+    let extraction_error = boot[extraction..]
+        .find("tracing::error!(%error, \"protocol default extraction failed during app boot\"")
+        .expect("protocol extraction failure must be logged");
+    assert!(
+        extraction_error > 0,
+        "extraction failure log must remain in the post-subscriber boot path"
+    );
+    assert!(
+        boot[logging..extraction].contains("\"app\""),
+        "the ordering pin must cover the app.log subscriber, not another logger"
+    );
+}
+
 /// #2453 control (green today, pins GREEN): ownership must move by real
 /// restructuring — RefCell/mem::take evasion may not enter the production
 /// region (both are absent today).

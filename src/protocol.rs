@@ -635,6 +635,61 @@ mod tests {
     }
 
     #[test]
+    fn stale_default_heal_emits_audit_fields() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let home = tmp_home("stale-audit");
+        let default_path = home.join("protocol/.default").join(FILENAME);
+        std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
+        let stale = b"historically stale protocol";
+        std::fs::write(&default_path, stale).unwrap();
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Buf(output.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .finish();
+        let identity = tracing::subscriber::with_default(subscriber, || {
+            resolve_protocol(&home).expect("stale default is healed")
+        });
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+        assert!(output.contains("protocol default healed"));
+        assert!(output.contains(&format!("path={}", default_path.display())));
+        assert!(output.contains(&format!("from_digest={}", digest(stale))));
+        assert!(output.contains(&format!("to_digest={}", identity.content_sha256)));
+        assert!(output.contains(&format!("build_sha={}", identity.build_sha)));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn structural_override_artifacts_are_refused() {
         let home = tmp_home("override-structural");
         extract_default(&home).expect("extract");

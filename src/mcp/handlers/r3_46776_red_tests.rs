@@ -29,6 +29,45 @@ fn tmp_home(slug: &str) -> PathBuf {
     dir
 }
 
+/// Scope AGEND_HOME for provisioning tests while holding the crate-wide env
+/// lock. `instructions::generate` resolves the home internally, so passing a
+/// temp home as an argument alone is not sufficient isolation.
+struct ScopedAgendHome {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedAgendHome {
+    fn new(home: &Path) -> Self {
+        let lock = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGEND_HOME");
+        // SAFETY: all environment access in this scope is serialized by the
+        // crate-wide test lock, including restoration in Drop.
+        unsafe {
+            std::env::set_var("AGEND_HOME", home);
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ScopedAgendHome {
+    fn drop(&mut self) {
+        // SAFETY: the guard remains held until after the environment is
+        // restored, so no other env-mutating test can race this transition.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("AGEND_HOME", value),
+                None => std::env::remove_var("AGEND_HOME"),
+            }
+        }
+    }
+}
+
 fn seed_agents_owned_by(dir: &Path, owner: &str) {
     std::fs::write(
         dir.join("AGENTS.md"),
@@ -67,6 +106,7 @@ fn fleet_with_instances(home: &Path, yaml: &str) {
 #[test]
 fn g1_prepare_instructions_contextless_fallback_refuses_foreign_identity() {
     let home = tmp_home("g1-ctx");
+    let _home = ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("new-agent");
     std::fs::create_dir_all(&ws).unwrap();
 
@@ -470,6 +510,7 @@ fn r4_unreadable_fleet_refuses_boot_admission() {
 #[test]
 fn r4_malformed_fleet_refuses_prepare_instructions() {
     let home = tmp_home("r4-fleet-malformed");
+    let _home = ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
 
@@ -501,6 +542,7 @@ fn r4_malformed_fleet_refuses_prepare_instructions() {
 #[test]
 fn r4_ensure_project_root_failure_propagates() {
     let home = tmp_home("r4-projroot");
+    let _home = ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
 
@@ -530,6 +572,7 @@ fn r4_ensure_project_root_failure_propagates() {
 #[test]
 fn r4_migrate_claude_old_rules_failure_propagates() {
     let home = tmp_home("r4-migrate");
+    let _home = ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     let old_rules = ws.join(".claude").join("rules").join("agend.md");
     // Make agend.md a directory → `remove_file` will fail (IsADirectory).
@@ -706,6 +749,7 @@ fn r5_wrong_shape_instances_refuses_boot() {
 #[test]
 fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
     let home = tmp_home("r5-premutate");
+    let _home = ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     assert!(
         !ws.exists(),
@@ -742,6 +786,7 @@ fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
 #[test]
 fn r5_claude_migration_opaque_io_propagates() {
     let home = tmp_home("r5-migrate-opaque");
+    let _home = ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     let rules_dir = ws.join(".claude").join("rules");
     std::fs::create_dir_all(&rules_dir).unwrap();
@@ -852,6 +897,7 @@ fn r6_configure_grok_opaque_read_must_refuse_and_preserve() {
 #[test]
 fn r6_contextless_provision_overwrites_foreign_codex() {
     let dir = tmp_home("r6-ctxless-codex");
+    let _home = ScopedAgendHome::new(&dir);
     let ws = dir.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
     let codex_dir = ws.join(".codex");
@@ -886,6 +932,7 @@ fn r6_contextless_provision_overwrites_foreign_codex() {
 #[test]
 fn r6_contextless_provision_overwrites_foreign_grok() {
     let dir = tmp_home("r6-ctxless-grok");
+    let _home = ScopedAgendHome::new(&dir);
     let ws = dir.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
     let grok_dir = ws.join(".grok");
@@ -910,4 +957,42 @@ fn r6_contextless_provision_overwrites_foreign_grok() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// B1 regression: protocol healing reached through the contextless
+/// provisioning path must use the isolated test home, never the operator's
+/// real/default sentinel.
+#[test]
+fn provisioning_heals_only_isolated_protocol_default() {
+    let real_home = crate::home_dir();
+    let real_default = real_home.join("protocol/.default/FLEET-DEV-PROTOCOL.md");
+    let real_before = std::fs::read(&real_default).ok();
+
+    let home = tmp_home("b1-isolated-default");
+    let default_path = home.join("protocol/.default/FLEET-DEV-PROTOCOL.md");
+    std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
+    let stale = b"stale test protocol";
+    std::fs::write(&default_path, stale).unwrap();
+
+    let _home = ScopedAgendHome::new(&home);
+    let ws = home.join("workspace").join("agent");
+    let result = crate::instructions::generate(&ws, "codex");
+    assert!(
+        result.is_ok(),
+        "isolated provisioning should succeed: {result:?}"
+    );
+
+    let selected = crate::protocol::resolve_protocol(&home).expect("isolated protocol");
+    assert_eq!(selected.path, default_path);
+    assert_eq!(selected.content_sha256, selected.embedded_sha256);
+    assert_ne!(std::fs::read(&default_path).unwrap(), stale);
+
+    drop(_home);
+    assert_eq!(
+        std::fs::read(&real_default).ok(),
+        real_before,
+        "provisioning tests must not heal or overwrite the operator's protocol default"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
 }
