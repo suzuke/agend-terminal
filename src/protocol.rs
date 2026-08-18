@@ -99,4 +99,79 @@ mod tests {
         assert!(path.exists(), "must auto-extract when both missing");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn stale_default_is_healed_before_selection() {
+        let home = tmp_home("stale");
+        let default_path = home.join("protocol/.default").join(FILENAME);
+        std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
+        std::fs::write(&default_path, "historically stale protocol").unwrap();
+
+        let selected = protocol_path(&home);
+
+        assert_eq!(selected, default_path);
+        assert_eq!(
+            std::fs::read_to_string(&selected).unwrap(),
+            DEFAULT_PROTOCOL,
+            "a stale daemon-owned default must self-heal before reliance"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn structural_override_artifacts_are_not_selected() {
+        let home = tmp_home("override-structural");
+        extract_default(&home);
+        let override_path = home.join("protocol").join(FILENAME);
+        std::fs::create_dir(&override_path).unwrap();
+
+        let selected = protocol_path(&home);
+
+        assert_ne!(
+            selected, override_path,
+            "a directory must never become the effective protocol artifact"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_override_is_not_selected() {
+        let home = tmp_home("override-symlink");
+        extract_default(&home);
+        let override_path = home.join("protocol").join(FILENAME);
+        let target = home.join("outside-protocol.md");
+        std::fs::write(&target, "outside").unwrap();
+        std::os::unix::fs::symlink(&target, &override_path).unwrap();
+
+        let selected = protocol_path(&home);
+
+        assert_ne!(
+            selected, override_path,
+            "a symlink must not provide ambiguous override provenance"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn failed_atomic_replacement_preserves_complete_default() {
+        let home = tmp_home("atomic-failure");
+        extract_default(&home);
+        let default_path = home.join("protocol/.default").join(FILENAME);
+        let before = std::fs::read(&default_path).unwrap();
+        crate::store::fail_next_atomic_write_for_test(&default_path);
+
+        let _ = extract_default(&home);
+
+        assert_eq!(
+            std::fs::read(&default_path).unwrap(),
+            before,
+            "failed replacement must preserve the prior complete artifact"
+        );
+        assert!(
+            crate::store::atomic_write(&default_path, b"probe").is_ok(),
+            "extract_default must consume the deterministic failure seam"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
