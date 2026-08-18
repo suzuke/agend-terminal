@@ -252,8 +252,9 @@ impl ChannelRuntime {
     }
 
     fn mark_unready(&self) {
+        let mut client_version = self.client_version.lock();
+        *client_version = None;
         self.ready.store(false, Ordering::Release);
-        *self.client_version.lock() = None;
     }
 
     fn is_ready(&self) -> bool {
@@ -2373,13 +2374,23 @@ mod tests {
         let home = home("version");
         let locator = test_published_locator(&home, "claude-agent");
         let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        runtime.set_sender(sender);
         let missing = mcp_initialize(&json!({"jsonrpc":"2.0","id":1,"params":{}}), &runtime);
         assert_eq!(missing["error"]["code"], -32001);
+        mcp_initialize(
+            &json!({"jsonrpc":"2.0","id":2,"params":{"clientInfo":{"version":"2.1.80"}}}),
+            &runtime,
+        );
+        runtime.mark_initialized();
+        assert!(runtime.is_ready());
         let old = mcp_initialize(
-            &json!({"jsonrpc":"2.0","id":2,"params":{"clientInfo":{"version":"2.1.79"}}}),
+            &json!({"jsonrpc":"2.0","id":3,"params":{"clientInfo":{"version":"2.1.79"}}}),
             &runtime,
         );
         assert_eq!(old["error"]["code"], -32001);
+        assert!(!runtime.is_ready());
+        assert_eq!(runtime.client_version(), None);
         let _ = fs::remove_dir_all(home);
     }
 
