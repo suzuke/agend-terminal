@@ -964,7 +964,12 @@ fn r6_contextless_provision_overwrites_foreign_grok() {
 /// real/default sentinel.
 #[test]
 fn provisioning_heals_only_isolated_protocol_default() {
-    let real_home = crate::home_dir();
+    let real_home = {
+        let _lock = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::home_dir()
+    };
     let real_default = real_home.join("protocol/.default/FLEET-DEV-PROTOCOL.md");
     let real_before = std::fs::read(&real_default).ok();
 
