@@ -211,9 +211,20 @@ pub fn resolve_protocol(home: &Path) -> Result<ProtocolIdentity> {
             if bytes == DEFAULT_PROTOCOL.as_bytes() {
                 identity_from_bytes("default", &default, &bytes)
             } else {
+                let from_digest = digest(&bytes);
                 match extract_default(home) {
                     Ok(_) => match read_identity(&default, "default") {
-                        Ok(identity) if identity.content_sha256 == embedded_sha256() => Ok(identity),
+                        Ok(identity) if identity.content_sha256 == embedded_sha256() => {
+                            tracing::info!(
+                                target: "agend_terminal::protocol",
+                                path = %default.display(),
+                                from_digest = %from_digest,
+                                to_digest = %identity.content_sha256,
+                                build_sha = %identity.build_sha,
+                                "protocol default healed"
+                            );
+                            Ok(identity)
+                        }
                         Ok(identity) => Err(protocol_error(
                             home,
                             &default,
