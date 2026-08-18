@@ -894,6 +894,25 @@ mod tests {
     }
 
     #[test]
+    fn absent_default_extract_failure_is_propagated() {
+        let home = tmp_home("absent-atomic-failure");
+        let default_path = default_path(&home);
+        crate::store::fail_next_atomic_write_for_test(&default_path);
+
+        let error = resolve_protocol(&home)
+            .expect_err("an absent default must fail closed when extraction cannot persist");
+        assert!(
+            error.to_string().contains("atomically extract protocol"),
+            "the persistence failure must remain visible to the provisioning boundary: {error}"
+        );
+        assert!(
+            !default_path.exists(),
+            "a failed absent-default extraction must not claim a durable artifact"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn failed_refresh_refuses_provision_but_reports_degraded_serviceable() {
         let home = tmp_home("degraded-serviceable");
         let default_path = default_path(&home);

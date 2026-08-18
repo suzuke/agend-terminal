@@ -63,6 +63,20 @@ fn protocol_source_declares_exact_identity_and_atomic_result_contract() {
 }
 
 #[test]
+fn production_heal_audit_does_not_rebuild_global_interest_cache() {
+    let source = fs::read_to_string("src/protocol.rs").expect("protocol source");
+    let body = source
+        .split("fn emit_default_healed_audit")
+        .nth(1)
+        .and_then(|rest| rest.split("fn status_for_identity").next())
+        .expect("default-heal audit function body");
+    assert!(
+        !body.contains("rebuild_interest_cache"),
+        "production audit logging must not mutate the process-wide tracing callsite cache; keep that test-capture seam test-only"
+    );
+}
+
+#[test]
 fn doctor_reports_protocol_identity_and_resolution_state() {
     let home = isolated_home("doctor");
     cmd()

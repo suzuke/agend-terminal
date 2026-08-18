@@ -134,6 +134,63 @@ fn aliased_ambient_home_lookup_is_rejected() {
 }
 
 #[test]
+fn direct_ambient_env_lookup_is_rejected() {
+    for source in [
+        r#"
+            fn generate(home: &Path) {
+                let _ = home;
+                let _ = std::env::var("AGEND_HOME");
+            }
+        "#,
+        r#"
+            fn generate(home: &Path) {
+                let _ = home;
+                let _ = std::env::var_os("AGEND_HOME");
+            }
+        "#,
+    ] {
+        assert!(
+            has_ambient_home_lookup(source),
+            "direct std::env AGEND_HOME lookups must be rejected"
+        );
+    }
+}
+
+#[test]
+fn aliased_ambient_env_lookup_is_rejected() {
+    let source = r#"
+        use std::env as ambient_env;
+        use std::env::{var as read_home, var_os as read_home_os};
+
+        fn generate(home: &Path) {
+            let _ = home;
+            let _ = ambient_env::var("AGEND_HOME");
+            let _ = read_home("AGEND_HOME");
+            let _ = read_home_os("AGEND_HOME");
+        }
+    "#;
+    assert!(
+        has_ambient_home_lookup(source),
+        "aliased std::env AGEND_HOME lookups must be rejected"
+    );
+}
+
+#[test]
+fn function_pointer_ambient_env_lookup_is_rejected() {
+    let source = r#"
+        fn generate(home: &Path) {
+            let _ = home;
+            let lookup = std::env::var;
+            let _ = lookup("AGEND_HOME");
+        }
+    "#;
+    assert!(
+        has_ambient_home_lookup(source),
+        "function-pointer std::env AGEND_HOME lookups must be rejected"
+    );
+}
+
+#[test]
 fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
     let instructions = read_source("src/instructions.rs");
     for function in ["generate", "generate_for_owner", "generate_with_context"] {
