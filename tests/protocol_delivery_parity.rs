@@ -29,6 +29,12 @@ fn protocol_markdown_is_lf_pinned_and_translation_is_non_normative() {
         ".gitattributes must pin protocol markdown to LF"
     );
 
+    let embedded_default: &str = include_str!("../docs/FLEET-DEV-PROTOCOL.md");
+    assert!(
+        !embedded_default.contains('\r'),
+        "embedded DEFAULT_PROTOCOL must be CR-free"
+    );
+
     let translation =
         fs::read_to_string("docs/FLEET-DEV-PROTOCOL.zh-TW.md").expect("zh-TW protocol");
     let header = translation.lines().take(8).collect::<Vec<_>>().join("\n");

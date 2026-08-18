@@ -280,6 +280,41 @@ fn function_pointer_ambient_env_lookup_is_rejected() {
 }
 
 #[test]
+fn cfg_filter_only_skips_positive_test_modules() {
+    for (label, source) in [
+        (
+            "cfg(not(test))",
+            r#"
+                #[cfg(not(test))]
+                mod production {
+                    fn generate(home: &Path) {
+                        let _ = home;
+                        let _ = std::env::var("AGEND_HOME");
+                    }
+                }
+            "#,
+        ),
+        (
+            "cfg(feature = \"test-mode\")",
+            r#"
+                #[cfg(feature = "test-mode")]
+                mod production {
+                    fn generate(home: &Path) {
+                        let _ = home;
+                        let _ = std::env::var("AGEND_HOME");
+                    }
+                }
+            "#,
+        ),
+    ] {
+        assert!(
+            has_ambient_home_lookup(source),
+            "{label} must not hide an ambient-home lookup from the production invariant"
+        );
+    }
+}
+
+#[test]
 fn structural_ambient_env_reference_matrix_is_rejected() {
     for source in [
         r#"
