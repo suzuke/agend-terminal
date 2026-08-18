@@ -78,14 +78,14 @@ fn bridge_binary_path() -> (String, Vec<&'static str>) {
 }
 
 /// Get the AGEND_HOME value.
-fn home_path() -> String {
-    crate::home_dir().display().to_string()
+fn home_path(home: &Path) -> String {
+    home.display().to_string()
 }
 
 /// Standard MCP server entry with env vars.
-fn mcp_server_entry(instance_name: Option<&str>) -> serde_json::Value {
+fn mcp_server_entry(home: &Path, instance_name: Option<&str>) -> serde_json::Value {
     let mut env = json!({
-        "AGEND_HOME": home_path()
+        "AGEND_HOME": home_path(home)
     });
     if let Some(name) = instance_name {
         env["AGEND_INSTANCE_NAME"] = json!(name);
@@ -117,8 +117,12 @@ fn config_lock_path(path: &Path) -> PathBuf {
 /// Flock-serialised + atomic write. Prior implementation `fs::write`'d
 /// directly with no lock, so two concurrent `create_instance` calls
 /// targeting the same working_directory could drop one of their edits.
-fn upsert_mcp_servers(path: &Path, instance_name: Option<&str>) -> Result<()> {
-    upsert_mcp_server(path, "agend-terminal", mcp_server_entry(instance_name))
+fn upsert_mcp_servers(home: &Path, path: &Path, instance_name: Option<&str>) -> Result<()> {
+    upsert_mcp_server(
+        path,
+        "agend-terminal",
+        mcp_server_entry(home, instance_name),
+    )
 }
 
 /// Upsert one named MCP server while preserving every unrelated server and
@@ -181,7 +185,7 @@ fn upsert_mcp_server(path: &Path, server_name: &str, server: serde_json::Value) 
 }
 
 /// Claude Code: .claude/settings.local.json + project `.mcp.json` + mcp-config.json
-fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+fn configure_claude(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
     let git_dir = working_dir.join(".git");
     if !git_dir.exists() {
@@ -195,7 +199,7 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
 
     // Write project-local MCP config
     let path = working_dir.join(".claude").join("settings.local.json");
-    upsert_mcp_servers(&path, instance_name)?;
+    upsert_mcp_servers(home, &path, instance_name)?;
 
     // #hook-state-poc (shadow-mode, flag-gated — default OFF, zero behavior
     // change): inject lifecycle-hook reporters into the SAME per-workspace
@@ -205,9 +209,7 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     // preserves pre-existing keys.
     // #hook-state-poc OR #2413 Shadow Observer (local plane): either flag wants the
     // lifecycle hooks wired into the per-workspace settings (still NEVER ~/.claude).
-    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
-        || crate::daemon::shadow::enabled()
-    {
+    if crate::daemon::hook_shadow::hook_state_poc_enabled() || crate::daemon::shadow::enabled() {
         if let Some(name) = instance_name {
             upsert_state_hooks(&path, name)?;
         }
@@ -216,17 +218,16 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     // Write standalone mcp-config.json for --mcp-config flag
     let standalone = working_dir.join("mcp-config.json");
     let project_mcp = working_dir.join(".mcp.json");
-    upsert_mcp_servers(&standalone, instance_name)?;
+    upsert_mcp_servers(home, &standalone, instance_name)?;
     if let Some(instance_name) = instance_name {
-        let home = PathBuf::from(home_path());
-        if crate::transport::claude_channel::legacy_pty_opt_in(&home, instance_name) {
+        if crate::transport::claude_channel::legacy_pty_opt_in(home, instance_name) {
             // An explicit LegacyPty instance must not advertise a structured
             // channel to Claude; this keeps the fallback visible and opt-in.
             remove_mcp_server(&standalone, "agend-claude-channel")?;
             remove_mcp_server(&project_mcp, "agend-claude-channel")?;
         } else {
             let channel =
-                crate::transport::claude_channel::channel_server_entry(&home, instance_name)?;
+                crate::transport::claude_channel::channel_server_entry(home, instance_name)?;
             upsert_mcp_server(&standalone, "agend-claude-channel", channel.clone())?;
             upsert_mcp_server(&project_mcp, "agend-claude-channel", channel)?;
         }
@@ -375,11 +376,11 @@ fn upsert_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
 /// All edits run under a per-path flock + atomic write so two concurrent
 /// `create_instance` calls sharing a working_directory can't interleave
 /// their read→mutate→write cycles into a corrupt mcp.json.
-fn configure_kiro(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+fn configure_kiro(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     let path = working_dir.join(".kiro").join("settings").join("mcp.json");
 
     let (cmd, args) = bridge_binary_path();
-    let mut env = json!({ "AGEND_HOME": home_path() });
+    let mut env = json!({ "AGEND_HOME": home_path(home) });
     if let Some(name) = instance_name {
         env["AGEND_INSTANCE_NAME"] = json!(name);
     }
@@ -440,7 +441,7 @@ fn configure_kiro(working_dir: &Path, instance_name: Option<&str>) -> Result<()>
 /// next boot, and (2) verifies the write landed + warns (never silent) on
 /// write/clear failure. The respawn path also calls `configure()` so recovery
 /// re-runs both steps.
-fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+fn configure_agy(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     let path = working_dir.join(".agents").join("mcp_config.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -448,7 +449,7 @@ fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> 
     // Flock + atomic write so concurrent spawns can't interleave their writes.
     let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
 
-    let mut server = mcp_server_entry(instance_name);
+    let mut server = mcp_server_entry(home, instance_name);
     server["trust"] = json!(true);
     let config = json!({ "mcpServers": { "agend-terminal": server } });
     let body = serde_json::to_string_pretty(&config)?;
@@ -474,9 +475,7 @@ fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> 
     // (`configure_claude`); needs an instance name for the session↔agent
     // attribution embedded in the hook command. RE-spike (t-…39100-6) proved these
     // per-workspace hooks fire live mid-turn.
-    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
-        || crate::daemon::shadow::enabled()
-    {
+    if crate::daemon::hook_shadow::hook_state_poc_enabled() || crate::daemon::shadow::enabled() {
         if let Some(name) = instance_name {
             let hooks_path = working_dir.join(".agents").join("hooks.json");
             upsert_agy_state_hooks(&hooks_path, name)?;
@@ -648,7 +647,7 @@ fn clear_agy_mcp_cache() {
 /// agent will hit (edit / bash / webfetch / external_directory). Each instance
 /// has its own working_dir/opencode.json so this does not bleed into the
 /// user's manual opencode usage.
-fn configure_opencode(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+fn configure_opencode(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     let path = working_dir.join("opencode.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -673,7 +672,7 @@ fn configure_opencode(working_dir: &Path, instance_name: Option<&str>) -> Result
         config["mcp"] = json!({});
     }
     let mut oc_env = json!({
-        "AGEND_HOME": home_path()
+        "AGEND_HOME": home_path(home)
     });
     if let Some(name) = instance_name {
         oc_env["AGEND_INSTANCE_NAME"] = json!(name);
@@ -783,8 +782,8 @@ fn decode_toml_string(v: &str) -> Option<String> {
     None
 }
 
-fn configure_codex(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
-    configure_codex_with_home(working_dir, &home_path(), instance_name)
+fn configure_codex(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+    configure_codex_with_home(working_dir, &home_path(home), instance_name)
 }
 
 /// Split out so tests can drive a scratch `home` without mutating
@@ -958,8 +957,8 @@ fn strip_agend_mcp_sections(content: &str) -> String {
 /// Grok Build: write project-scoped `<workdir>/.grok/config.toml` with
 /// `[mcp_servers.agend-terminal]`. Grok loads project MCP from that path
 /// (see `grok mcp add --scope project`). Scope rule: never write `~/.grok`.
-fn configure_grok(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
-    configure_grok_with_home(working_dir, &home_path(), instance_name)
+fn configure_grok(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+    configure_grok_with_home(working_dir, &home_path(home), instance_name)
 }
 
 fn configure_grok_with_home(
@@ -1061,6 +1060,7 @@ AGEND_HOME = {home_lit}
 
 /// Detect backend from command name and configure MCP.
 pub fn configure(
+    home: &Path,
     working_dir: &Path,
     command: &str,
     instance_name: Option<&str>,
@@ -1069,12 +1069,16 @@ pub fn configure(
     // so a provisioning failure ABORTS the spawn instead of being logged and
     // discarded — the discard let an agent start against half-written config.
     match crate::backend::Backend::from_command(command) {
-        Some(crate::backend::Backend::ClaudeCode) => configure_claude(working_dir, instance_name),
-        Some(crate::backend::Backend::KiroCli) => configure_kiro(working_dir, instance_name),
-        Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
-        Some(crate::backend::Backend::OpenCode) => configure_opencode(working_dir, instance_name),
-        Some(crate::backend::Backend::Codex) => configure_codex(working_dir, instance_name),
-        Some(crate::backend::Backend::Grok) => configure_grok(working_dir, instance_name),
+        Some(crate::backend::Backend::ClaudeCode) => {
+            configure_claude(home, working_dir, instance_name)
+        }
+        Some(crate::backend::Backend::KiroCli) => configure_kiro(home, working_dir, instance_name),
+        Some(crate::backend::Backend::Agy) => configure_agy(home, working_dir, instance_name),
+        Some(crate::backend::Backend::OpenCode) => {
+            configure_opencode(home, working_dir, instance_name)
+        }
+        Some(crate::backend::Backend::Codex) => configure_codex(home, working_dir, instance_name),
+        Some(crate::backend::Backend::Grok) => configure_grok(home, working_dir, instance_name),
         // Non-preset backends (Shell, Raw) have no MCP wiring.
         Some(crate::backend::Backend::Shell) | Some(crate::backend::Backend::Raw(_)) | None => {
             Ok(())
@@ -1200,7 +1204,7 @@ mod tests {
     #[test]
     fn opencode_uses_mcp_key() {
         let dir = tmp_dir("oc_key");
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         assert!(config.get("mcp").is_some(), "must have 'mcp' key");
@@ -1214,7 +1218,7 @@ mod tests {
     #[test]
     fn opencode_command_is_array() {
         let dir = tmp_dir("oc_cmd");
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let cmd = &config["mcp"]["agend-terminal"]["command"];
@@ -1225,7 +1229,7 @@ mod tests {
     #[test]
     fn opencode_has_type_local() {
         let dir = tmp_dir("oc_type");
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         assert_eq!(config["mcp"]["agend-terminal"]["type"], "local");
@@ -1235,7 +1239,7 @@ mod tests {
     #[test]
     fn opencode_sets_permission_allow_for_autonomous_actions() {
         let dir = tmp_dir("oc_perm");
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let perm = &config["permission"];
@@ -1266,7 +1270,7 @@ mod tests {
             serde_json::to_string(&pre).expect("s"),
         )
         .ok();
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         assert!(
@@ -1286,7 +1290,7 @@ mod tests {
             serde_json::to_string(&pre).expect("s"),
         )
         .ok();
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         // Our managed keys overwrite (autonomous context demands "allow").
@@ -1299,7 +1303,7 @@ mod tests {
     #[test]
     fn kiro_mcp_server_has_autoapprove_wildcard() {
         let dir = tmp_dir("kiro_autoapprove");
-        configure_kiro(&dir, None).expect("configure");
+        configure_kiro(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let entry = &config["mcpServers"]["agend-terminal"];
@@ -1316,8 +1320,8 @@ mod tests {
     #[test]
     fn kiro_autoapprove_idempotent_across_runs() {
         let dir = tmp_dir("kiro_autoapprove_idem");
-        configure_kiro(&dir, None).expect("first configure");
-        configure_kiro(&dir, None).expect("second configure");
+        configure_kiro(&dir, &dir, None).expect("first configure");
+        configure_kiro(&dir, &dir, None).expect("second configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let auto = config["mcpServers"]["agend-terminal"]["autoApprove"]
@@ -1330,7 +1334,7 @@ mod tests {
     #[test]
     fn opencode_uses_environment_not_env() {
         let dir = tmp_dir("oc_env");
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let entry = &config["mcp"]["agend-terminal"];
@@ -1352,7 +1356,7 @@ mod tests {
             serde_json::to_string(&old).expect("s"),
         )
         .ok();
-        configure_opencode(&dir, None).expect("configure");
+        configure_opencode(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         assert!(
@@ -1368,7 +1372,7 @@ mod tests {
     #[test]
     fn kiro_creates_wrapper_script() {
         let dir = tmp_dir("kiro_env");
-        configure_kiro(&dir, Some("dev")).expect("configure");
+        configure_kiro(&dir, &dir, Some("dev")).expect("configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let entry = &config["mcpServers"]["agend-terminal"];
@@ -1395,7 +1399,7 @@ mod tests {
     #[test]
     fn kiro_mcp_json_uses_bridge_command() {
         let dir = tmp_dir("kiro_bridge");
-        configure_kiro(&dir, None).expect("configure");
+        configure_kiro(&dir, &dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let cmd = config["mcpServers"]["agend-terminal"]["command"]
@@ -1422,7 +1426,7 @@ mod tests {
     #[test]
     fn kiro_no_wrapper_script_created() {
         let dir = tmp_dir("kiro_nowrapper");
-        configure_kiro(&dir, None).expect("configure");
+        configure_kiro(&dir, &dir, None).expect("configure");
         let ext = if cfg!(windows) { "cmd" } else { "sh" };
         let wrapper = dir.join(format!(".kiro/settings/agend-mcp-wrapper.{ext}"));
         assert!(
@@ -1443,7 +1447,7 @@ mod tests {
             .current_dir(&dir)
             .output()
             .ok();
-        configure_claude(&dir, None).expect("configure");
+        configure_claude(&dir, &dir, None).expect("configure");
         assert!(dir.join("mcp-config.json").exists());
         assert!(dir.join(".claude/settings.local.json").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -1452,7 +1456,7 @@ mod tests {
     #[test]
     fn claude_instance_configures_authenticated_channel_server() {
         let dir = tmp_dir("claude_channel");
-        configure_claude(&dir, Some("agent-channel")).expect("configure");
+        configure_claude(&dir, &dir, Some("agent-channel")).expect("configure");
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("mcp-config.json")).unwrap())
                 .unwrap();
@@ -1506,7 +1510,7 @@ mod tests {
     #[test]
     fn configure_dispatches_opencode() {
         let dir = tmp_dir("dispatch_oc");
-        configure(&dir, "opencode", None).expect("provision");
+        configure(&dir, &dir, "opencode", None).expect("provision");
         assert!(dir.join("opencode.json").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1565,7 +1569,7 @@ mod tests {
     #[test]
     fn configure_dispatches_agy_writes_agents_mcp() {
         let dir = tmp_dir("dispatch_agy");
-        configure(&dir, "agy", Some("agy-1")).expect("provision");
+        configure(&dir, &dir, "agy", Some("agy-1")).expect("provision");
 
         let cfg = dir.join(".agents").join("mcp_config.json");
         assert!(
@@ -1604,7 +1608,7 @@ mod tests {
     #[test]
     fn configure_unknown_backend_no_crash() {
         let dir = tmp_dir("dispatch_unknown");
-        configure(&dir, "unknown-tool", None).expect("provision");
+        configure(&dir, &dir, "unknown-tool", None).expect("provision");
         // Should not create any config files
         assert!(!dir.join("opencode.json").exists());
         assert!(!dir.join(".gemini").exists());
@@ -1645,7 +1649,7 @@ mod tests {
             .map(|_| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    configure_opencode(&dir, None).expect("configure_opencode");
+                    configure_opencode(&dir, &dir, None).expect("configure_opencode");
                 })
             })
             .collect();
@@ -1730,7 +1734,7 @@ mod tests {
         )
         .expect("seed stale");
 
-        configure_codex(&dir, None).expect("configure");
+        configure_codex(&dir, &dir, None).expect("configure");
 
         let content = std::fs::read_to_string(&config_path).expect("read");
         assert!(
@@ -1777,7 +1781,7 @@ mod tests {
         )
         .expect("seed");
 
-        configure_codex(&dir, None).expect("configure");
+        configure_codex(&dir, &dir, None).expect("configure");
 
         let content = std::fs::read_to_string(&config_path).expect("read");
         let parsed: toml::Value = toml::from_str(&content).expect("valid TOML");
@@ -1908,13 +1912,13 @@ mod tests {
 
     #[test]
     fn json_backends_include_instance_name() {
-        let entry = mcp_server_entry(Some("dev-2"));
+        let entry = mcp_server_entry(Path::new("/fake/home"), Some("dev-2"));
         assert_eq!(
             entry["env"]["AGEND_INSTANCE_NAME"], "dev-2",
             "mcp_server_entry must include AGEND_INSTANCE_NAME in env"
         );
         // None case: no AGEND_INSTANCE_NAME key
-        let entry_none = mcp_server_entry(None);
+        let entry_none = mcp_server_entry(Path::new("/fake/home"), None);
         assert!(
             entry_none["env"].get("AGEND_INSTANCE_NAME").is_none(),
             "mcp_server_entry(None) must not include AGEND_INSTANCE_NAME"
@@ -2137,7 +2141,7 @@ mod hook_state_poc_tests {
 
         let dir = tmp("flag-off");
         // configure_claude needs a git repo; it git-inits itself.
-        let result = configure_claude(&dir, Some("agent-y"));
+        let result = configure_claude(&dir, &dir, Some("agent-y"));
         if let Some(v) = prev {
             std::env::set_var("AGEND_HOOK_STATE_POC", v);
         }

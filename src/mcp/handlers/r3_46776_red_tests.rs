@@ -47,6 +47,27 @@ fn seed_agy_agents_owned_by(dir: &Path, owner: &str) {
     .unwrap();
 }
 
+fn file_identity(path: &Path) -> (u64, std::time::SystemTime, u64) {
+    let metadata = std::fs::metadata(path).expect("sentinel metadata");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.len(),
+            metadata.modified().expect("sentinel mtime"),
+            metadata.ino(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        (
+            metadata.len(),
+            metadata.modified().expect("sentinel mtime"),
+            0,
+        )
+    }
+}
+
 fn fleet_with_instances(home: &Path, yaml: &str) {
     std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
 }
@@ -67,6 +88,7 @@ fn fleet_with_instances(home: &Path, yaml: &str) {
 #[test]
 fn g1_prepare_instructions_contextless_fallback_refuses_foreign_identity() {
     let home = tmp_home("g1-ctx");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("new-agent");
     std::fs::create_dir_all(&ws).unwrap();
 
@@ -470,6 +492,7 @@ fn r4_unreadable_fleet_refuses_boot_admission() {
 #[test]
 fn r4_malformed_fleet_refuses_prepare_instructions() {
     let home = tmp_home("r4-fleet-malformed");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
 
@@ -501,6 +524,7 @@ fn r4_malformed_fleet_refuses_prepare_instructions() {
 #[test]
 fn r4_ensure_project_root_failure_propagates() {
     let home = tmp_home("r4-projroot");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
 
@@ -530,6 +554,7 @@ fn r4_ensure_project_root_failure_propagates() {
 #[test]
 fn r4_migrate_claude_old_rules_failure_propagates() {
     let home = tmp_home("r4-migrate");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     let old_rules = ws.join(".claude").join("rules").join("agend.md");
     // Make agend.md a directory → `remove_file` will fail (IsADirectory).
@@ -706,6 +731,7 @@ fn r5_wrong_shape_instances_refuses_boot() {
 #[test]
 fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
     let home = tmp_home("r5-premutate");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     assert!(
         !ws.exists(),
@@ -742,6 +768,7 @@ fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
 #[test]
 fn r5_claude_migration_opaque_io_propagates() {
     let home = tmp_home("r5-migrate-opaque");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
     let ws = home.join("workspace").join("agent");
     let rules_dir = ws.join(".claude").join("rules");
     std::fs::create_dir_all(&rules_dir).unwrap();
@@ -790,7 +817,7 @@ fn r6_configure_codex_opaque_read_must_refuse_and_preserve() {
     let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
     std::fs::write(&config_path, invalid_bytes).unwrap();
 
-    let result = crate::mcp_config::configure(&dir, "codex", Some("alice"));
+    let result = crate::mcp_config::configure(&dir, &dir, "codex", Some("alice"));
 
     assert!(
         result.is_err(),
@@ -821,7 +848,7 @@ fn r6_configure_grok_opaque_read_must_refuse_and_preserve() {
     let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
     std::fs::write(&config_path, invalid_bytes).unwrap();
 
-    let result = crate::mcp_config::configure(&dir, "grok", Some("alice"));
+    let result = crate::mcp_config::configure(&dir, &dir, "grok", Some("alice"));
 
     assert!(
         result.is_err(),
@@ -852,6 +879,7 @@ fn r6_configure_grok_opaque_read_must_refuse_and_preserve() {
 #[test]
 fn r6_contextless_provision_overwrites_foreign_codex() {
     let dir = tmp_home("r6-ctxless-codex");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
     let ws = dir.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
     let codex_dir = ws.join(".codex");
@@ -862,7 +890,7 @@ fn r6_contextless_provision_overwrites_foreign_codex() {
                    AGEND_INSTANCE_NAME = 'bob'\n";
     std::fs::write(&config_path, foreign).unwrap();
 
-    let result = crate::instructions::generate(&ws, "codex");
+    let result = crate::instructions::generate(&dir, &ws, "codex");
 
     assert!(
         result.is_err(),
@@ -886,6 +914,7 @@ fn r6_contextless_provision_overwrites_foreign_codex() {
 #[test]
 fn r6_contextless_provision_overwrites_foreign_grok() {
     let dir = tmp_home("r6-ctxless-grok");
+    let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
     let ws = dir.join("workspace").join("agent");
     std::fs::create_dir_all(&ws).unwrap();
     let grok_dir = ws.join(".grok");
@@ -896,7 +925,7 @@ fn r6_contextless_provision_overwrites_foreign_grok() {
                    AGEND_INSTANCE_NAME = 'bob'\n";
     std::fs::write(&config_path, foreign).unwrap();
 
-    let result = crate::instructions::generate(&ws, "grok");
+    let result = crate::instructions::generate(&dir, &ws, "grok");
 
     assert!(
         result.is_err(),
@@ -910,4 +939,47 @@ fn r6_contextless_provision_overwrites_foreign_grok() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// B1 regression: protocol healing reached through the contextless
+/// provisioning path must use the isolated test home, never the operator's
+/// real/default sentinel.
+#[test]
+fn provisioning_heals_only_isolated_protocol_default() {
+    let ambient = tmp_home("b1-ambient-sentinel");
+    let ambient_default = ambient.join("protocol/.default/FLEET-DEV-PROTOCOL.md");
+    std::fs::create_dir_all(ambient_default.parent().expect("ambient default parent")).unwrap();
+    std::fs::write(&ambient_default, b"ambient stale sentinel").unwrap();
+    let ambient_before = file_identity(&ambient_default);
+
+    let isolated = tmp_home("b1-isolated-default");
+    let isolated_default = isolated.join("protocol/.default/FLEET-DEV-PROTOCOL.md");
+    std::fs::create_dir_all(isolated_default.parent().expect("isolated default parent")).unwrap();
+    let stale = b"stale isolated protocol";
+    std::fs::write(&isolated_default, stale).unwrap();
+
+    let home = crate::review_repro_test_util::ScopedAgendHome::new(&ambient);
+    home.set_home(&isolated);
+    let ws = isolated.join("workspace").join("agent");
+    let result = crate::instructions::generate(&isolated, &ws, "codex");
+    assert!(
+        result.is_ok(),
+        "isolated provisioning should succeed: {result:?}"
+    );
+
+    let selected = crate::protocol::resolve_protocol(&isolated).expect("isolated protocol");
+    assert_eq!(selected.path, isolated_default);
+    assert_eq!(selected.content_sha256, selected.embedded_sha256);
+    assert_ne!(std::fs::read(&isolated_default).unwrap(), stale);
+
+    home.set_home(&ambient);
+    assert_eq!(
+        file_identity(&ambient_default),
+        ambient_before,
+        "provisioning must not heal or overwrite the ambient protocol sentinel"
+    );
+    drop(home);
+
+    std::fs::remove_dir_all(&ambient).ok();
+    std::fs::remove_dir_all(&isolated).ok();
 }

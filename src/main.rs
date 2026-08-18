@@ -688,6 +688,12 @@ enum SkillsAction {
 /// topic state diagnostic + optional cleanup.
 #[derive(Subcommand)]
 enum DoctorAction {
+    /// Report canonical protocol delivery identity.
+    Protocol {
+        /// Output format: `human` (default) or `json`.
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
     /// Diagnose Fugu/Sakana provider availability for the codex harness.
     Providers {
         /// Output format: `human` (default) or `json`.
@@ -1555,6 +1561,9 @@ fn main() -> anyhow::Result<()> {
             },
         },
         Some(Commands::Doctor { action: None }) => cli::run_doctor(&home)?,
+        Some(Commands::Doctor {
+            action: Some(DoctorAction::Protocol { format }),
+        }) => cli::run_doctor_protocol(&home, &format)?,
         Some(Commands::Doctor {
             action: Some(DoctorAction::Providers { format, probe }),
         }) => cli::run_doctor_providers(&format, probe)?,

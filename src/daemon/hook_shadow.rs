@@ -245,8 +245,12 @@ pub fn latest_hook_seq(name: &str) -> u64 {
 
 /// #1523: is the hook→authoritative promotion enabled? Gated on the same flag
 /// that injects the hooks, so promotion can never read hooks that aren't wired.
-fn promotion_enabled() -> bool {
+pub(crate) fn hook_state_poc_enabled() -> bool {
     std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
+}
+
+fn promotion_enabled() -> bool {
+    hook_state_poc_enabled()
 }
 
 /// #2016: is THIS backend's snapshot state currently DRIVEN by hooks (promoted),

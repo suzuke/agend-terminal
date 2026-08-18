@@ -209,6 +209,23 @@ fn test_daemon_list_and_status() {
     let agents = resp["result"]["agents"].as_array().expect("agents");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["name"], "shell");
+    let status = daemon.api_call(&serde_json::json!({"method": "status"}));
+    assert_eq!(status["ok"], true);
+    let protocol = status["result"]["protocol"].as_object().expect("protocol");
+    for key in [
+        "source_kind",
+        "path",
+        "content_sha256",
+        "embedded_sha256",
+        "build_sha",
+        "build_dirty",
+        "workspaces",
+    ] {
+        assert!(
+            protocol.contains_key(key),
+            "status missing protocol.{key}: {status}"
+        );
+    }
     daemon.stop();
 }
 
