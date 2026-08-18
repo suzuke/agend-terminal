@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use syn::parse::Parser;
 use syn::visit::{self, Visit};
 
 fn read_source(path: &str) -> String {
@@ -142,16 +143,39 @@ fn is_env_lookup_path(path: &syn::Path, aliases: &AmbientAliases) -> bool {
     direct || module_alias || imported || pointer
 }
 
+fn cfg_is_test_only(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) => {
+            let Ok(children) =
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                    .parse2(list.tokens.clone())
+            else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                !children.is_empty() && children.iter().any(cfg_is_test_only)
+            } else if list.path.is_ident("any") {
+                !children.is_empty() && children.iter().all(cfg_is_test_only)
+            } else {
+                false
+            }
+        }
+        syn::Meta::NameValue(_) => false,
+    }
+}
+
 fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attribute| {
         if !attribute.path().is_ident("cfg") {
             return false;
         }
-        match &attribute.meta {
-            syn::Meta::List(list) => list.tokens.to_string().contains("test"),
-            syn::Meta::Path(path) => path.is_ident("test"),
-            syn::Meta::NameValue(_) => false,
-        }
+        let syn::Meta::List(list) = &attribute.meta else {
+            return false;
+        };
+        syn::parse2::<syn::Meta>(list.tokens.clone())
+            .map(|meta| cfg_is_test_only(&meta))
+            .unwrap_or(false)
     })
 }
 
