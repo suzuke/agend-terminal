@@ -137,8 +137,6 @@ pub(super) fn handle_send_to_instance(
     result
 }
 
-/// #3293: one place that renders a successful send, so the settlement outcome
-/// cannot be exposed on some send paths and silently dropped on others.
 /// #3293: project the neutral service's typed settlement outcome into this
 /// adapter's JSON envelope. The projection lives here, not in the service:
 /// `src/agent_ops/messaging.rs` is below both adapters and must stay free of
@@ -157,6 +155,8 @@ fn settlement_json(settlement: &crate::agent_ops::messaging::SettlementOutcome) 
     value
 }
 
+/// #3293: one place that renders a successful send, so the settlement outcome
+/// cannot be exposed on some send paths and silently dropped on others.
 fn send_success_response(
     target: &str,
     delivery_mode: &str,

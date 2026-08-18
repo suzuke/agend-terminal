@@ -5352,3 +5352,105 @@ fn reply_no_message_nor_file() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3295 r1 (reviewer-caught): the four #3293 disclosure tests all drove the
+/// API adapter, so the MCP renderer — the path behind the `send` tool that
+/// every agent in this fleet actually calls — was pinned by nothing. A
+/// mutation dropping the settlement field from the MCP response left the whole
+/// `mcp::handlers::comms` group green. This drives the real MCP report path
+/// (`request_kind: "report"` → `handle_report_result` → `execute_send` →
+/// `send_success_response`) and asserts the same envelope the API test asserts,
+/// so the contract is pinned on both adapters without touching their boundary.
+///
+/// The behaviour is already correct at this head, so this test is green on
+/// arrival by construction — the gap it repairs is coverage, not conduct. Its
+/// load-bearing-ness is proven by re-applying the reviewer's mutation: with the
+/// MCP renderer dropping `settlement`, this test fails while everything else in
+/// the group still passes.
+#[test]
+fn mcp_terminal_report_settlement_refusal_is_disclosed_3295() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("mcp_settlement_refusal");
+    let task_id = "t-3295-mcp-refusal";
+
+    // A branch-carrying task claimed by the reporter: the completion guard
+    // refuses (no binding, no merge receipt) exactly as it does at PR_READY.
+    let emitter = crate::task_events::InstanceName::from("test:seed");
+    let tid = crate::task_events::TaskId(task_id.into());
+    crate::task_events::append_batch(
+        &home,
+        &emitter,
+        vec![
+            crate::task_events::TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "3295 mcp fixture".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some("feat/unmerged-3295".into()),
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            crate::task_events::TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: crate::task_events::InstanceName::from("sender"),
+            },
+        ],
+    )
+    .expect("seed 3295 mcp task");
+
+    let result = handle_tool_rt(
+        "send",
+        &json!({
+            "instance": "target",
+            "message": "PR is up",
+            "request_kind": "report",
+            "terminal": true,
+            "correlation_id": task_id,
+        }),
+        "sender",
+    );
+
+    assert!(
+        result.get("error").is_none(),
+        "a refused settlement must not fail the report delivery: {result}"
+    );
+    let outcome = &result["auto_close"];
+    assert!(
+        outcome.is_object(),
+        "the MCP adapter must disclose the settlement outcome too: {result}"
+    );
+    assert_eq!(outcome["closed"], false, "{result}");
+    assert_eq!(
+        outcome["code"].as_str(),
+        Some("assignee_completion_blocked"),
+        "{result}"
+    );
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("binding or unconsumed merge receipt"),
+        "the guard's own diagnostic must reach the MCP caller verbatim: {result}"
+    );
+    assert!(
+        !outcome["closure_condition"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "{result}"
+    );
+
+    let state = crate::task_events::replay_at(&home).expect("replay board");
+    assert_eq!(
+        state.tasks.get(&tid).map(|record| record.status),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "the completion guard's decision is preserved exactly"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
