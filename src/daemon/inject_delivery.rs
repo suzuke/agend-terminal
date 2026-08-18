@@ -1578,6 +1578,11 @@ mod tests {
 
         release_tx.send(()).expect("release old persist");
         verifier.join().expect("verifier thread");
+        let stale_latch_bytes = std::fs::read(latch_path(&home, agent)).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&stale_latch_bytes).contains("m-stale-latch"),
+            "post-lock epoch fence must prevent an old persist from recreating its latch"
+        );
         assert!(
             prepare_arm(
                 &home,
@@ -1590,6 +1595,104 @@ mod tests {
             "a delayed predecessor persist must not recreate a terminal latch"
         );
         forget(agent);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn stale_generation_persist_rejects_before_lock_and_has_no_lock_side_effect() {
+        let _g = test_guard();
+        let home = tmp_home("stale-persist-before-lock");
+        let agent = "stale-persist-before-lock-2044";
+        forget(agent);
+        remove_durable_latches(&home, agent).expect("clean latches");
+        let old_epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, agent);
+        let pending = Pending {
+            agent: agent.to_string(),
+            injected_at_ms: now_ms(),
+            text: "wake id=m-stale-before-lock".to_string(),
+            redelivered: true,
+            transport_epoch: old_epoch,
+            transport_mode: crate::transport::TransportMode::ChannelBridge,
+            gave_up: true,
+            rearm_count: 0,
+            rearm_reserved: false,
+            rearm_pending: false,
+        };
+        let cleanup = crate::daemon::delivery_worker::begin_transport_cleanup(&home, agent);
+        drop(cleanup);
+
+        let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_called_by_hook = std::sync::Arc::clone(&hook_called);
+        let _persist_guard = test_support::persist_before_lock_hook_guard();
+        test_support::set_persist_before_lock_hook(Some(std::sync::Arc::new(move |_, _, _| {
+            hook_called_by_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        assert!(matches!(
+            persist_latch(&home, "m-stale-before-lock", &pending),
+            Ok(false)
+        ));
+        assert!(
+            !hook_called.load(std::sync::atomic::Ordering::SeqCst),
+            "stale persistence must reject before entering the pre-lock seam"
+        );
+        assert!(
+            !latch_lock_path(&home, agent).exists(),
+            "stale persistence must not create a lock side effect"
+        );
+        forget(agent);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cancel_rearm_arm_rejects_wrong_agent_and_epoch() {
+        let _g = test_guard();
+        let home = tmp_home("cancel-rearm-identity");
+        let agent = "cancel-rearm-identity-2044";
+        let row_id = "m-cancel-rearm-identity";
+        forget(agent);
+        let epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, agent);
+        store().lock().insert(
+            row_id.to_string(),
+            Pending {
+                agent: agent.to_string(),
+                injected_at_ms: now_ms(),
+                text: format!("wake id={row_id}"),
+                redelivered: false,
+                transport_epoch: epoch,
+                transport_mode: crate::transport::TransportMode::ChannelBridge,
+                gave_up: true,
+                rearm_count: 0,
+                rearm_reserved: true,
+                rearm_pending: true,
+            },
+        );
+        let wrong_agent = RearmReservation {
+            agent: "successor-agent".to_string(),
+            row_id: row_id.to_string(),
+            transport_epoch: epoch,
+            deferred: true,
+        };
+        assert!(!cancel_rearm_arm(&wrong_agent));
+        assert!(rearm_state_for_test(agent, row_id).is_some());
+
+        let wrong_epoch = RearmReservation {
+            agent: agent.to_string(),
+            row_id: row_id.to_string(),
+            transport_epoch: epoch.saturating_add(1),
+            deferred: true,
+        };
+        assert!(!cancel_rearm_arm(&wrong_epoch));
+        assert!(rearm_state_for_test(agent, row_id).is_some());
+
+        let correct = RearmReservation {
+            agent: agent.to_string(),
+            row_id: row_id.to_string(),
+            transport_epoch: epoch,
+            deferred: true,
+        };
+        assert!(cancel_rearm_arm(&correct));
+        assert!(rearm_state_for_test(agent, row_id).is_none());
         std::fs::remove_dir_all(&home).ok();
     }
 
