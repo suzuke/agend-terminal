@@ -500,9 +500,14 @@ mod tests {
             .expect("record");
         assert_eq!(latest.state, DeliveryState::ProtocolAccepted);
         assert_eq!(latest.payload_digest, envelope.payload_digest);
-        assert!(std::fs::read_to_string(store.path())
-            .expect("read")
-            .contains("secret body"));
+        let durable = std::fs::read_to_string(store.path()).expect("read");
+        assert!(durable.contains("secret body"));
+        assert!(durable.contains("\"route\""), "receipt must retain route evidence");
+        assert!(durable.contains("\"attempt\""), "receipt must retain attempt evidence");
+        assert!(
+            durable.contains("\"outcome\":\"queued\""),
+            "receipt must retain the queued outcome before backend acceptance"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 

@@ -396,6 +396,31 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// RED for #3303: verification state must follow the durable inbox row,
+    /// not collapse every outstanding wake for an agent into one slot.
+    #[test]
+    fn distinct_durable_rows_have_independent_verification_latches() {
+        let _g = test_guard();
+        let agent = "row-keyed-2044";
+        forget(agent);
+        let now = now_ms();
+        arm_at(
+            agent,
+            "[AGEND-MSG-PENDING] id=row-a kind=task from=lead inbox=1",
+            now,
+        );
+        arm_at(
+            agent,
+            "[AGEND-MSG-PENDING] id=row-b kind=task from=lead inbox=1",
+            now,
+        );
+        let guard = store().lock();
+        assert!(guard.contains_key("row-a"), "row-a must have its own latch");
+        assert!(guard.contains_key("row-b"), "row-b must have its own latch");
+        drop(guard);
+        forget(agent);
+    }
+
     /// A UserPromptSubmit that PRE-dates the inject does NOT count as delivery
     /// (a stale earlier submit must not mask a swallowed new inject).
     #[test]
