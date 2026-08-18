@@ -439,9 +439,10 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
         .iter()
         .filter_map(crate::inbox::InboxMessage::redelivery_history)
         .collect();
+    let mut processed_msg_ids: Vec<String> = Vec::new();
+    let mut telegram_pickup_ids: Vec<String> = Vec::new();
     if !messages.is_empty() {
         let meta_path = crate::agent_ops::metadata_path_resolved(home, instance_name);
-        let mut processed_msg_ids: Vec<String> = Vec::new();
         if let Some(meta) = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<Value>(&c).ok())
@@ -463,6 +464,9 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
                         continue;
                     }
                     processed_msg_ids.push(msg_id.to_string());
+                    if kind == "telegram" {
+                        telegram_pickup_ids.push(msg_id.to_string());
+                    }
                     let origin_msg = MsgRef {
                         binding: BindingRef::new(kind, Some(instance_name.to_string()), ()),
                         id: msg_id.to_string(),
@@ -502,7 +506,22 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
             );
         }
     }
-    json!({"messages": messages, "redelivery_history": redelivery_history})
+    let telegram_pickups = messages
+        .iter()
+        .filter(|message| {
+            message
+                .id
+                .as_deref()
+                .is_some_and(|id| telegram_pickup_ids.iter().any(|pickup| pickup == id))
+        })
+        .count();
+    let inbox_backlog = messages.len().saturating_sub(telegram_pickups);
+    json!({
+        "messages": messages,
+        "redelivery_history": redelivery_history,
+        "telegram_pickups": telegram_pickups,
+        "inbox_backlog": inbox_backlog
+    })
 }
 
 // #1286: inbox describe handlers extracted to stay under file_size_invariant.

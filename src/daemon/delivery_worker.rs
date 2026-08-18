@@ -601,22 +601,34 @@ pub(crate) fn record_queue_full_drop_if_current(
 }
 
 /// Arm actionable delivery verification only while the accepted enqueue's
-/// epoch is still current. Delete/transition and this arm linearize on the
-/// same per-key state mutex, so a delayed caller cannot arm a stale wake after
-/// teardown completes.
+/// epoch is still current. Filesystem/configuration reads happen before the
+/// per-key state mutex; only the epoch check and memory-only commit are inside
+/// the linearization section, so a delayed caller cannot arm a stale wake
+/// after teardown completes.
 pub(crate) fn arm_transport_verification_if_current(
     home: &Path,
     agent: &str,
     epoch: u64,
     notification: &str,
 ) -> bool {
-    let state = transport_epoch_state(home, agent);
-    let state_guard = state.state.lock();
-    if state_guard.cleanup_active || state_guard.epoch != epoch {
+    let mode = crate::transport::mode_for_instance(home, agent);
+    let Some(prepared) =
+        crate::daemon::inject_delivery::prepare_arm(home, agent, notification, mode, epoch)
+    else {
         return false;
+    };
+    let committed = {
+        let state = transport_epoch_state(home, agent);
+        let state_guard = state.state.lock();
+        if state_guard.cleanup_active || state_guard.epoch != epoch {
+            return false;
+        }
+        crate::daemon::inject_delivery::commit_prepared_arm(prepared, epoch)
+    };
+    if committed {
+        crate::daemon::inject_delivery::notify_arm_committed(agent);
     }
-    crate::daemon::inject_delivery::arm_with_transport_epoch(agent, notification, epoch);
-    true
+    committed
 }
 
 impl Drop for TransportGenerationGuard {

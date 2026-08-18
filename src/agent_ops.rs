@@ -19,6 +19,15 @@ pub(crate) mod cleanup_admission;
 pub(crate) mod messaging;
 pub(crate) mod spawn;
 
+const UNVERIFIED_DELIVERY_MODE: &str = "transport_queued_unverified";
+
+fn api_bridge_delivery_mode(resp: &Value) -> &str {
+    resp["delivery_mode"]
+        .as_str()
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or(UNVERIFIED_DELIVERY_MODE)
+}
+
 // ---------------------------------------------------------------------------
 // Messaging
 // ---------------------------------------------------------------------------
@@ -104,7 +113,7 @@ pub(crate) fn send_via_api_bridge(home: &Path, request: &messaging::SendRequest)
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
+            let dm = api_bridge_delivery_mode(&resp);
             let mut result = json!({"target": request.target, "delivery_mode": dm});
             if let Some(tid) = resp["task_id"].as_str() {
                 result["auto_created_task_id"] = json!(tid);
@@ -2257,6 +2266,19 @@ mod tests {
         // Length assertion is intentionally weak — the resolution path is
         // tested in `runtime::tests::*`; here we only pin the signature.
         let _ = result.len();
+    }
+
+    #[test]
+    fn api_bridge_missing_delivery_mode_is_not_legacy_pty() {
+        let missing = json!({"ok": true});
+        assert_eq!(api_bridge_delivery_mode(&missing), UNVERIFIED_DELIVERY_MODE);
+        assert_ne!(api_bridge_delivery_mode(&missing), "pty");
+
+        let malformed = json!({"ok": true, "delivery_mode": null});
+        assert_eq!(
+            api_bridge_delivery_mode(&malformed),
+            UNVERIFIED_DELIVERY_MODE
+        );
     }
 }
 

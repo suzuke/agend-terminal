@@ -309,7 +309,23 @@ pub fn notify_agent_with_attachments(
 /// operator draft (preserves #1473).
 const TYPING_QUIET_WINDOW_MS: i64 = 1_500;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposeInjectOutcome {
+    Deferred,
+    TransportAccepted,
+    Suppressed,
+    Failed,
+}
+
 pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
+    let _ = compose_aware_inject_result(home, agent_name, notification);
+}
+
+pub(crate) fn compose_aware_inject_result(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+) -> ComposeInjectOutcome {
     // #911 dedup gate
     if should_suppress_911_reinject_with_ledger(
         home,
@@ -317,7 +333,7 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
         notification,
         crate::daemon::notification_dedup::global(),
     ) {
-        return;
+        return ComposeInjectOutcome::Suppressed;
     }
     let actionable = notification_is_actionable_wake(notification);
     // #1513: busy-gate BEFORE the actionable split so every path is covered.
@@ -331,23 +347,28 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
         crate::snapshot::agent_state_of(home, agent_name).as_deref(),
         actionable,
     ) {
-        persist_or_log!(
-            crate::notification_queue::enqueue_classified(
-                home,
-                agent_name,
-                notification,
-                actionable,
-            ),
-            "compose_aware_inject",
-            agent_name
-        );
-        return;
+        return match crate::notification_queue::enqueue_classified(
+            home,
+            agent_name,
+            notification,
+            actionable,
+        ) {
+            Ok(()) => ComposeInjectOutcome::Deferred,
+            Err(error) => {
+                tracing::warn!(
+                    agent = %agent_name,
+                    error = %error,
+                    "compose_aware_inject deferred notification could not be persisted"
+                );
+                ComposeInjectOutcome::Failed
+            }
+        };
     }
     // #1473: actionable work-delivery (ci-ready / task dispatch / query) wakes
     // the PTY regardless of an operator DRAFT — only the busy/typing gate above
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
-        match inject_with_submit_admitted(home, agent_name, notification) {
+        return match inject_with_submit_admitted(home, agent_name, notification) {
             Ok(epoch) => {
                 // #2044: arm delivery-verification only after admission succeeds,
                 // and linearize it against delete/transition on the captured
@@ -368,6 +389,7 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
                         "accepted actionable inject became stale before verification arm"
                     );
                 }
+                ComposeInjectOutcome::TransportAccepted
             }
             Err(error) => {
                 tracing::debug!(
@@ -375,13 +397,26 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
                     error = %error,
                     "actionable notification inject was not admitted"
                 );
+                ComposeInjectOutcome::Failed
             }
-        }
-        return;
+        };
     }
-    let _ = route_notification(home, agent_name, notification, |msg| {
+    let deferred = crate::notification_queue::draft_state(home, agent_name)
+        != crate::notification_queue::DraftState::None;
+    match route_notification(home, agent_name, notification, |msg| {
         inject_with_submit(home, agent_name, msg)
-    });
+    }) {
+        Ok(()) if deferred => ComposeInjectOutcome::Deferred,
+        Ok(()) => ComposeInjectOutcome::TransportAccepted,
+        Err(error) => {
+            tracing::debug!(
+                agent = %agent_name,
+                error = %error,
+                "ambient notification inject was not admitted"
+            );
+            ComposeInjectOutcome::Failed
+        }
+    }
 }
 
 /// #1513: should this notification be DEFERRED (enqueued) rather than injected
@@ -707,6 +742,22 @@ pub fn wake_persisted_pointer(
         .map_err(|e| anyhow::anyhow!("pointer wake dropped: {e}"))
 }
 
+/// Re-arm the compose-aware path for one already-persisted inbox row. This is
+/// deliberately a pointer-only wake: reclaim owns the row, while the
+/// row-keyed #2044 verifier owns the bounded structured re-arm latch.
+pub(crate) fn rearm_persisted_pointer(
+    home: &Path,
+    target: &str,
+    id: &str,
+    kind: &str,
+    from: &str,
+) -> ComposeInjectOutcome {
+    let (unread, _) = storage::unread_count(home, target);
+    let from_short = from.strip_prefix("from:").unwrap_or(from);
+    let pointer = build_pending_pointer(id, kind, from_short, unread, &operator_now_field());
+    compose_aware_inject_result(home, target, &pointer)
+}
+
 #[cfg(test)]
 thread_local! {
     static WAKE_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
@@ -906,7 +957,63 @@ pub fn inject_notification_with_submit(
     agent_name: &str,
     notification: &str,
 ) -> anyhow::Result<()> {
-    inject_with_submit(home, agent_name, notification)
+    let deferred_rearm = crate::daemon::notification_dedup::extract_msg_id_from_header(
+        notification,
+    )
+    .and_then(|row_id| {
+        crate::daemon::inject_delivery::take_deferred_rearm_for_flush(home, agent_name, &row_id)
+    });
+    let Some(reservation) = deferred_rearm else {
+        return inject_with_submit(home, agent_name, notification);
+    };
+    match inject_with_submit_admitted(home, agent_name, notification) {
+        Ok(epoch) => {
+            #[cfg(test)]
+            crate::daemon::delivery_worker::test_support::run_transport_accepted_before_arm_hook(
+                home, agent_name, epoch,
+            );
+            if !crate::daemon::delivery_worker::arm_transport_verification_if_current(
+                home,
+                agent_name,
+                epoch,
+                notification,
+            ) {
+                let _ = crate::daemon::inject_delivery::rollback_rearm_after_reclaim(
+                    home,
+                    &reservation,
+                );
+                tracing::warn!(
+                    agent = %agent_name,
+                    "deferred structured re-arm was transport-accepted but fenced before verifier arm; budget retained"
+                );
+                // The pointer is already admitted to the transport scheduler;
+                // returning Err here would make the queue flusher requeue the
+                // same pointer while the old-generation job is being fenced.
+                return Ok(());
+            }
+            match crate::daemon::inject_delivery::commit_rearm_after_reclaim_outcome(
+                home,
+                &reservation,
+            ) {
+                crate::daemon::inject_delivery::RearmCommitOutcome::Committed
+                | crate::daemon::inject_delivery::RearmCommitOutcome::DurableCommitted => {}
+                crate::daemon::inject_delivery::RearmCommitOutcome::NotCommitted => {
+                    let _ = crate::daemon::inject_delivery::cancel_rearm_arm(&reservation);
+                    anyhow::bail!(
+                        "deferred structured re-arm commit failed after transport admission"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ =
+                crate::daemon::inject_delivery::rollback_rearm_after_reclaim(home, &reservation);
+            Err(anyhow::anyhow!(
+                "deferred structured re-arm admission failed: {error}"
+            ))
+        }
+    }
 }
 
 /// #1513: MAX_DEFER anti-starvation caps — once an item has been deferred this
@@ -1668,6 +1775,9 @@ mod structured_transport_delivery_tests {
         let body = std::fs::read_to_string(store.path()).expect("receipt log");
         assert!(body.contains(&format!("\"state\":\"{:?}\"", DeliveryState::Failed)));
         assert!(body.contains("bounded transport delivery queue full"));
+        assert!(body.contains("\"route\":\""));
+        assert!(body.contains("\"attempt\":1"));
+        assert!(body.contains("\"outcome\":\"failed\""));
     }
 
     #[test]

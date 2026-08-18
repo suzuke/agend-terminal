@@ -16,6 +16,7 @@
 mod disk;
 pub mod message;
 pub mod notify;
+pub(crate) mod reclaim;
 pub mod storage;
 
 // Re-export public API surface so callers using `crate::inbox::X` continue to work.

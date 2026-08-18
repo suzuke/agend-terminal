@@ -1,5 +1,66 @@
 use super::*;
 
+#[test]
+fn channel_bridge_queue_without_turn_start_is_truthfully_overdue() {
+    let _delivery_hook_guard = super::super::super::registry::test_support::delivery_hook_guard();
+    let home = home("queue-without-turn-start");
+    let mut channel = FakeChannel::spawn(1);
+    let port = channel.port;
+    let mut locator = SessionLocator::claude(
+        format!("http://127.0.0.1:{port}"),
+        "claude-registry-session".to_string(),
+        "registry-token".to_string(),
+    );
+    locator.managed = true;
+    locator.server_pid = Some(std::process::id());
+    locator.server_start_token = crate::process::process_start_token(std::process::id());
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n",
+    )
+    .expect("fleet");
+    super::super::super::registry::save_session_locator(&home, "claude-agent", &locator)
+        .expect("locator publication");
+    let legacy_called = Arc::new(AtomicBool::new(false));
+    let legacy_called_by_closure = Arc::clone(&legacy_called);
+    let accepted = super::super::super::registry::deliver_self_kick_notification(
+        &home,
+        "claude-agent",
+        "[AGEND-RESUME] id=queue-without-turn-start",
+        move |_, _, _| {
+            legacy_called_by_closure.store(true, Ordering::Release);
+            Ok(())
+        },
+    )
+    .expect("ChannelBridge webhook queue admission");
+    assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = accepted.clone();
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 1))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(accepted.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now()).expect("watchdog"),
+        1
+    );
+    assert_eq!(
+        store
+            .latest(accepted.delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .state,
+        DeliveryState::AckOverdue,
+        "queue admission without a consumer turn start must not be reported as TurnStarted"
+    );
+    assert!(!legacy_called.load(Ordering::Acquire));
+    stop_instance_state(&home, "claude-agent");
+    assert_eq!(channel.stop_and_join(), FakeChannelExit::StopRequested);
+    let _ = fs::remove_dir_all(home);
+}
+
 fn self_kick_fixture(
     tag: &str,
 ) -> (

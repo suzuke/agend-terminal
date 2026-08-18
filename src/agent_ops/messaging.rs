@@ -556,7 +556,7 @@ fn route_and_deliver(
     from: &str,
     target: &str,
     req: &SendRequest,
-    msg: crate::inbox::InboxMessage,
+    mut msg: crate::inbox::InboxMessage,
 ) -> anyhow::Result<String> {
     let reg = agent::lock_registry(registry);
     let target_id = crate::fleet::resolve_uuid(home, target);
@@ -597,9 +597,11 @@ fn route_and_deliver(
             });
 
     if !target_in_registry {
+        msg.delivery_mode = Some("inbox_only".to_string());
         crate::inbox::enqueue(home, target, msg)?;
         Ok("inbox_only".into())
     } else if skip_inject {
+        msg.delivery_mode = Some("inbox_only".to_string());
         crate::inbox::enqueue(home, target, msg)?;
         crate::event_log::log(
             home,
@@ -609,8 +611,13 @@ fn route_and_deliver(
         );
         Ok("inbox_only".into())
     } else {
+        // The registry can change between this synchronous inbox enqueue and
+        // the worker's adapter dispatch. Keep the row/response generic; the
+        // durable worker receipt is the source of truth for the actual route.
+        let delivery_mode = "transport_queued_unverified".to_string();
+        msg.delivery_mode = Some(delivery_mode.clone());
         crate::inbox::enqueue_with_idle_hint(home, target, msg)?;
-        Ok("pty".into())
+        Ok(delivery_mode)
     }
 }
 

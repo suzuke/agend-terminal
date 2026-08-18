@@ -380,10 +380,60 @@ mod tests {
         );
         assert_eq!(response["redelivery_history"][0]["delivery_count"], 2);
         assert!(response["redelivery_history"][0]["first_delivered_at"].is_string());
+        assert_eq!(response["telegram_pickups"], 0);
+        assert_eq!(response["inbox_backlog"], 1);
 
         let stored = crate::inbox::find_message(&home, "m-3228-response").unwrap();
         assert_eq!(stored.id.as_deref(), Some("m-3228-response"));
         assert_eq!(stored.text, "canonical response text");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn inbox_response_separates_telegram_pickup_from_backlog() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3228-inbox-source-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let agent = "agent1";
+        crate::agent_ops::save_metadata(
+            &home,
+            agent,
+            "pending_pickup_ids",
+            json!([
+                {"kind": "telegram", "msg_id": "m-telegram"},
+                {"kind": "discord", "msg_id": "m-discord"}
+            ]),
+        );
+        for (id, text) in [
+            ("m-telegram", "picked up from Telegram"),
+            ("m-discord", "picked up from Discord"),
+            ("m-backlog", "ordinary inbox row"),
+        ] {
+            crate::inbox::enqueue(
+                &home,
+                agent,
+                crate::inbox::InboxMessage {
+                    schema_version: 1,
+                    id: Some(id.into()),
+                    from: "source".into(),
+                    text: text.into(),
+                    kind: Some("task".into()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let response = super::super::handle_inbox(&home, agent);
+        assert_eq!(response["telegram_pickups"], 1);
+        assert_eq!(response["inbox_backlog"], 2);
+        assert_eq!(response["messages"].as_array().map(Vec::len), Some(3));
         std::fs::remove_dir_all(&home).ok();
     }
 }

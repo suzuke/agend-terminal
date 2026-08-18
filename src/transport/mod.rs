@@ -40,6 +40,7 @@ pub(crate) fn remove_instance_delivery_state(
     opencode_server::stop_instance_server(home, instance);
     opencode_server::remove_instance_rollover_state(home, instance)?;
     claude_channel::stop_instance_state(home, instance);
+    crate::daemon::inject_delivery::remove_durable_latches(home, instance)?;
     receipt::remove_instance_delivery_state(home, instance)
 }
 
@@ -51,6 +52,18 @@ pub(crate) enum TransportMode {
     ManagedHeadless,
     ManualRequired,
     LegacyPty,
+}
+
+impl TransportMode {
+    pub(crate) fn receipt_route(self) -> &'static str {
+        match self {
+            Self::NativeShared => "native_shared",
+            Self::ChannelBridge => "channel_bridge",
+            Self::ManagedHeadless => "managed_headless",
+            Self::ManualRequired => "manual_required",
+            Self::LegacyPty => "legacy_pty",
+        }
+    }
 }
 
 /// Capability and readiness summary.  It intentionally contains no prompt,

@@ -422,13 +422,12 @@ fn envelope_for_mode(
     } else {
         locator_for_instance(home, instance, backend.as_ref(), mode)?
     };
-    Ok(DeliveryEnvelope::new(
-        instance,
-        locator,
-        DeliveryKind::Notification,
-        body,
-        None,
-    ))
+    let mut envelope =
+        DeliveryEnvelope::new(instance, locator, DeliveryKind::Notification, body, None);
+    envelope.transport_mode = Some(mode.receipt_route().to_string());
+    envelope.logical_delivery_id =
+        crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    Ok(envelope)
 }
 
 fn self_kick_envelope_for_mode(
@@ -443,7 +442,11 @@ fn self_kick_envelope_for_mode(
     } else {
         locator_for_instance(home, instance, backend.as_ref(), mode)?
     };
-    Ok(DeliveryEnvelope::self_kick(instance, locator, body))
+    let mut envelope = DeliveryEnvelope::self_kick(instance, locator, body);
+    envelope.transport_mode = Some(mode.receipt_route().to_string());
+    envelope.logical_delivery_id =
+        crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    Ok(envelope)
 }
 
 /// Wait only for the fresh-spawn ChannelBridge publication/health window.

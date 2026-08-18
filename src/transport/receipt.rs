@@ -30,6 +30,21 @@ pub(crate) enum DeliveryState {
 }
 
 impl DeliveryState {
+    pub(crate) fn outcome_name(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::ProtocolAccepted => "accepted",
+            Self::ObservedInSession => "observed_in_session",
+            Self::TurnStarted => "turn_started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Ambiguous => "ambiguous",
+            Self::AckOverdue => "ack_overdue",
+        }
+    }
+}
+
+impl DeliveryState {
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Ambiguous)
     }
@@ -49,6 +64,14 @@ pub(crate) struct DeliveryReceipt {
     pub backend_event: Option<String>,
     pub tui_visibility: Option<String>,
     pub detail: Option<String>,
+    /// Route and attempt outcome are durable audit fields. They deliberately
+    /// remain separate from `state`: a queued row is not backend acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     pub recorded_at: String,
 }
 
@@ -67,9 +90,26 @@ impl DeliveryReceipt {
             backend_event: None,
             tui_visibility: None,
             detail: None,
+            route: envelope.transport_mode.clone(),
+            attempt: 1,
+            outcome: Some(state.outcome_name().to_string()),
             recorded_at: Utc::now().to_rfc3339(),
         }
     }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Retries receive a fresh envelope UUID, so only the explicit durable row
+/// identity is used to number attempts across process restarts. Independent
+/// deliveries never become retries merely because their payloads match.
+fn attempt_key(envelope: &DeliveryEnvelope) -> String {
+    envelope.logical_delivery_id.as_deref().map_or_else(
+        || format!("delivery:{}", envelope.delivery_id),
+        |id| format!("row:{id}"),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,16 +161,27 @@ impl ReceiptStore {
         &self,
         envelope: &DeliveryEnvelope,
     ) -> anyhow::Result<DeliveryReceipt> {
-        let receipt = DeliveryReceipt::queued(envelope);
-        self.append(DurableRecord {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        let mut receipt = DeliveryReceipt::queued(envelope);
+        receipt.attempt = self.next_attempt_locked(envelope)?;
+        self.append_locked(DurableRecord {
             envelope: Some(envelope.clone()),
             receipt: receipt.clone(),
         })?;
         Ok(receipt)
     }
 
-    pub(crate) fn record(&self, receipt: DeliveryReceipt) -> anyhow::Result<()> {
-        self.append(DurableRecord {
+    pub(crate) fn record(&self, mut receipt: DeliveryReceipt) -> anyhow::Result<()> {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        if let Some(previous) = self.latest_locked(receipt.delivery_id)? {
+            receipt.attempt = previous.attempt;
+            if receipt.route.is_none() {
+                receipt.route = previous.route;
+            }
+        }
+        self.append_locked(DurableRecord {
             envelope: None,
             receipt,
         })
@@ -155,11 +206,38 @@ impl ReceiptStore {
         if latest.as_ref().map(|receipt| receipt.state) != Some(expected) {
             return Ok(false);
         }
+        let mut next = next;
+        if let Some(previous) = latest {
+            next.attempt = previous.attempt;
+            if next.route.is_none() {
+                next.route = previous.route;
+            }
+        }
         self.append_locked(DurableRecord {
             envelope: None,
             receipt: next,
         })?;
         Ok(true)
+    }
+
+    fn next_attempt_locked(&self, envelope: &DeliveryEnvelope) -> anyhow::Result<u32> {
+        let key = attempt_key(envelope);
+        if !self.path.exists() {
+            return Ok(1);
+        }
+        restrict_permissions(&self.path, 0o600)?;
+        let file = File::open(&self.path)?;
+        let mut latest = 0_u32;
+        for line in BufReader::new(file).lines() {
+            let record: DurableRecord = serde_json::from_str(&line?)?;
+            let Some(previous) = record.envelope.as_ref() else {
+                continue;
+            };
+            if attempt_key(previous) == key {
+                latest = latest.max(record.receipt.attempt.max(1));
+            }
+        }
+        Ok(latest.saturating_add(1))
     }
 
     pub(crate) fn latest(&self, delivery_id: Uuid) -> anyhow::Result<Option<DeliveryReceipt>> {
@@ -299,12 +377,6 @@ impl ReceiptStore {
             }
         }
         Ok(latest)
-    }
-
-    fn append(&self, record: DurableRecord) -> anyhow::Result<()> {
-        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
-        restrict_permissions(&self.lock_path(), 0o600)?;
-        self.append_locked(record)
     }
 
     fn append_locked(&self, record: DurableRecord) -> anyhow::Result<()> {
@@ -483,13 +555,15 @@ mod tests {
     fn receipt_store_survives_and_reconciles_state_transitions() {
         let home = std::env::temp_dir().join(format!("agend-transport-receipt-{}", Uuid::new_v4()));
         let store = ReceiptStore::for_instance(&home, "agent/one").expect("store");
-        let envelope = DeliveryEnvelope::new(
+        let mut envelope = DeliveryEnvelope::new(
             "agent/one",
             SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
             DeliveryKind::Prompt,
             "secret body",
             None,
         );
+        envelope.transport_mode = Some("native_shared".to_string());
+        envelope.logical_delivery_id = Some("row-retry".to_string());
         store.record_queued(&envelope).expect("queued");
         let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
         accepted.protocol_request_id = Some("7".to_string());
@@ -502,11 +576,69 @@ mod tests {
         assert_eq!(latest.payload_digest, envelope.payload_digest);
         let durable = std::fs::read_to_string(store.path()).expect("read");
         assert!(durable.contains("secret body"));
-        assert!(durable.contains("\"route\""), "receipt must retain route evidence");
-        assert!(durable.contains("\"attempt\""), "receipt must retain attempt evidence");
+        assert!(
+            durable.contains("\"route\""),
+            "receipt must retain route evidence"
+        );
+        assert!(
+            durable.contains("\"attempt\""),
+            "receipt must retain attempt evidence"
+        );
         assert!(
             durable.contains("\"outcome\":\"queued\""),
             "receipt must retain the queued outcome before backend acceptance"
+        );
+
+        let mut retry = envelope.clone();
+        retry.delivery_id = Uuid::new_v4();
+        let retry_queued = store.record_queued(&retry).expect("retry queued");
+        assert_eq!(retry_queued.attempt, 2);
+        store
+            .record(DeliveryReceipt::for_state(&retry, DeliveryState::Completed))
+            .expect("retry completed");
+        assert_eq!(
+            store
+                .latest(retry.delivery_id)
+                .expect("retry latest")
+                .expect("retry receipt")
+                .attempt,
+            2
+        );
+
+        let independent = DeliveryEnvelope::new(
+            "agent/one",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            "secret body",
+            None,
+        );
+        assert_eq!(
+            store
+                .record_queued(&independent)
+                .expect("independent queued")
+                .attempt,
+            1
+        );
+        let mut same_thread_a = independent.clone();
+        same_thread_a.delivery_id = Uuid::new_v4();
+        same_thread_a.correlation_id = Some("same-thread".to_string());
+        same_thread_a.logical_delivery_id = Some("row-a".to_string());
+        let mut same_thread_b = same_thread_a.clone();
+        same_thread_b.delivery_id = Uuid::new_v4();
+        same_thread_b.logical_delivery_id = Some("row-b".to_string());
+        assert_eq!(
+            store
+                .record_queued(&same_thread_a)
+                .expect("row-a queued")
+                .attempt,
+            1
+        );
+        assert_eq!(
+            store
+                .record_queued(&same_thread_b)
+                .expect("row-b queued")
+                .attempt,
+            1
         );
         let _ = std::fs::remove_dir_all(home);
     }

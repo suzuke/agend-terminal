@@ -2415,7 +2415,14 @@ pub fn reclaim_stale_delivering(home: &Path) {
         // daemon's re-inject of the now-unread message isn't suppressed.
         for m in &reverted {
             if let Some(id) = &m.id {
-                crate::daemon::notification_dedup::global().forget(&agent_name, id);
+                crate::inbox::reclaim::forget_reclaim_dedup(&busy_check_name, &agent_name, id);
+                crate::inbox::reclaim::rearm_reclaimed_message(
+                    home,
+                    &busy_check_name,
+                    id,
+                    m.kind.as_deref().unwrap_or("task"),
+                    &m.from,
+                );
             }
         }
         // #t-98760-9 (#2299 regression): also reset this agent's poll-reminder

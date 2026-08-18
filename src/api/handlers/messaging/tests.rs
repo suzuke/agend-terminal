@@ -176,8 +176,8 @@ fn test_send_to_fleet_defined_instance_succeeds() {
 }
 
 #[test]
-fn test_send_to_active_registry_target_returns_pty() {
-    let home = tmp_home("active-pty");
+fn test_send_to_active_registry_target_returns_channel_bridge_route() {
+    let home = tmp_home("active-channel-bridge");
     std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             "instances:\n  active-agent:\n    backend: claude\n    id: 0a0a0a0a-0000-4000-8000-000000000001\n  sender:\n    backend: claude\n",
@@ -234,8 +234,8 @@ fn test_send_to_active_registry_target_returns_pty() {
     assert_eq!(result["ok"], true);
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
-        "active agent must get pty delivery: {result}"
+        Some("transport_queued_unverified"),
+        "active Claude agent must expose generic queued/unverified admission: {result}"
     );
     // Cleanup
     let reg = agent::lock_registry(registry);
@@ -889,7 +889,7 @@ fn noncodex_update_skips_blocker_scan_2977() {
 
 /// #2977 positive control: gating the lookup must not weaken the #982 override.
 /// A Codex target that already received a blocking `query` on this correlation
-/// still gets the reply INJECTED (`pty`), not absorbed — and the lookup is still
+/// still gets the reply routed, not absorbed — and the lookup is still
 /// reached exactly once on that path.
 #[test]
 fn codex_drained_blocker_still_overrides_absorption_2977() {
@@ -973,7 +973,7 @@ fn codex_drained_blocker_still_overrides_absorption_2977() {
     assert_eq!(result["ok"], true, "send must succeed: {result}");
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
+        Some("transport_queued_unverified"),
         "a reply on a delivered blocking query must override Codex ack-absorption: {result}"
     );
     assert_eq!(
@@ -1059,7 +1059,7 @@ fn cross_team_message_not_absorbed() {
     );
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
+        Some("transport_queued_unverified"),
         "cross-team message must NOT be absorbed: {result}"
     );
     let reg = agent::lock_registry(registry);
@@ -1128,7 +1128,7 @@ fn same_team_codex_update_orchestrator_not_skipped() {
     assert_eq!(result["ok"], true);
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
+        Some("transport_queued_unverified"),
         "orchestrator must NOT be skipped even for same-team codex update: {result}"
     );
     let reg = agent::lock_registry(registry);
@@ -1267,7 +1267,7 @@ fn cross_team_codex_update_orchestrator_not_skipped() {
     assert_eq!(result["ok"], true);
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
+        Some("transport_queued_unverified"),
         "cross-team message must NOT be absorbed regardless of orchestrator: {result}"
     );
     let reg = agent::lock_registry(registry);
@@ -2027,8 +2027,8 @@ fn b1_codex_report_overrides_absorption_when_query_drained() {
     assert_eq!(result["ok"], true);
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
-        "B-narrow: report to codex must PTY-surface when matching drained query: {result}"
+        Some("transport_queued_unverified"),
+        "B-narrow: report to codex must expose generic queued/unverified admission when matching drained query: {result}"
     );
     cleanup_registry(registry, "codex-agent");
     std::fs::remove_dir_all(&home).ok();
@@ -2053,8 +2053,8 @@ fn b2_codex_update_overrides_absorption_when_task_drained() {
     assert_eq!(result["ok"], true);
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
-        "B-narrow: update to codex must PTY-surface when matching drained task: {result}"
+        Some("transport_queued_unverified"),
+        "B-narrow: update to codex must expose generic queued/unverified admission when matching drained task: {result}"
     );
     cleanup_registry(registry, "codex-agent");
     std::fs::remove_dir_all(&home).ok();
@@ -2181,8 +2181,8 @@ fn b5_codex_report_keeps_absorption_when_correlation_id_absent() {
 }
 
 #[test]
-fn b6_non_codex_backend_pty_path_unchanged_by_override() {
-    // Sanity invariant: non-codex backends always PTY today (no absorption);
+fn b6_non_codex_backend_route_unchanged_by_override() {
+    // Sanity invariant: Claude uses ChannelBridge today (no absorption);
     // the override predicate must not redirect them through inbox_only.
     let home = tmp_home("982-b6");
     // Use the default claude-flavored spawn from setup_team_env.
@@ -2242,8 +2242,8 @@ fn b6_non_codex_backend_pty_path_unchanged_by_override() {
     assert_eq!(result["ok"], true);
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
-        "non-codex backend always PTY regardless of correlation predicate: {result}"
+        Some("transport_queued_unverified"),
+        "Claude backend must expose generic queued/unverified admission regardless of correlation predicate: {result}"
     );
     cleanup_registry(registry, "claude-agent");
     std::fs::remove_dir_all(&home).ok();
@@ -2362,7 +2362,7 @@ fn kind_update_codex_same_team_remains_ack_absorbed() {
 }
 
 /// T4 (#1065 + #612 preservation): codex kind=report from "general"
-/// bus to a different-team codex target still injects (delivery_mode=pty).
+/// bus to a different-team codex target still injects through NativeShared.
 /// Cross-team unicast is blocked at Rule 3 (line 78+) so the only way
 /// to exercise the cross-team-codex-not-absorbed semantics is via the
 /// general bus (Rule 2). The #612 invariant must survive the routing
@@ -2433,8 +2433,8 @@ fn kind_report_cross_team_codex_via_general_still_injects() {
     assert_eq!(result["ok"], true, "general → cross-team send: {result}");
     assert_eq!(
         result["delivery_mode"].as_str(),
-        Some("pty"),
-        "cross-team codex kind=report must still inject (#612): {result}"
+        Some("transport_queued_unverified"),
+        "cross-team codex kind=report must still expose queued/unverified admission (#612): {result}"
     );
     assert!(
         !audit_log_contains(&home, "ack_absorbed"),

@@ -1721,6 +1721,11 @@ fn write_fleet_with_id(home: &Path, name: &str, uuid: &str) {
     fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("write fleet.yaml");
 }
 
+fn write_fleet_with_id_and_backend(home: &Path, name: &str, uuid: &str, backend: &str) {
+    let yaml = format!("instances:\n  {name}:\n    id: {uuid}\n    backend: {backend}\n");
+    fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("write fleet.yaml");
+}
+
 /// #2622 (lead pre-vet finding): the busy gate must engage on the
 /// PRODUCTION-DEFAULT UUID-keyed inbox topology, not just the legacy
 /// name-keyed one the earlier tests in this file used (which incidentally
@@ -1780,6 +1785,238 @@ fn reclaim_busy_gate_engages_on_uuid_keyed_production_topology() {
         drain(&home, name).is_empty(),
         "a busy agent's in-flight row on a UUID-keyed inbox must not be re-delivered"
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #3303: the UUID-keyed reclaim path must forget the canonical human dedup
+/// identity before routing the one structured re-arm. Otherwise `drain(name)`
+/// marks `(name,id)` consumed, reclaim forgets only `(uuid,id)`, and the
+/// compose-aware re-arm is suppressed and rolled back forever.
+#[test]
+fn reclaim_uuid_topology_forgets_human_dedup_for_one_structured_rearm() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = tmp_home("3303-uuid-rearm");
+    let name = "rearm-general-3303";
+    let uuid = "cccccccc-dddd-4eee-8fff-111111111111";
+    let id = "m-3303-uuid-rearm";
+    let pointer_text = format!("[AGEND-MSG] id={id} kind=task");
+    write_fleet_with_id_and_backend(&home, name, uuid, "claude");
+    enqueue(
+        &home,
+        name,
+        msg()
+            .sender("from:lead")
+            .text("structured reclaim")
+            .kind("task")
+            .id(id)
+            .build(),
+    )
+    .unwrap();
+    crate::daemon::notification_dedup::global().record_inject(name, id);
+    assert_eq!(drain(&home, name).len(), 1);
+    assert!(
+        crate::daemon::notification_dedup::global().should_suppress_reinject(name, id),
+        "drain must consume the canonical human identity"
+    );
+    set_row_delivering_at_for_test(&home, name, id, &secs_ago(660));
+    crate::daemon::inject_delivery::seed_structured_terminal_for_test(
+        &home,
+        name,
+        id,
+        &pointer_text,
+    );
+    crate::daemon::hook_shadow::record_event(name, "UserPromptSubmit", None);
+
+    let _accepted_hook_guard =
+        crate::daemon::delivery_worker::test_support::transport_accepted_before_arm_hook_guard();
+    let admissions = std::sync::Arc::new(AtomicUsize::new(0));
+    let admissions_hook = std::sync::Arc::clone(&admissions);
+    crate::daemon::delivery_worker::test_support::set_transport_accepted_before_arm_hook(Some(
+        std::sync::Arc::new(move |_, agent, _| {
+            assert_eq!(agent, name);
+            admissions_hook.fetch_add(1, Ordering::SeqCst);
+        }),
+    ));
+
+    reclaim_stale_delivering(&home);
+
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    let latch_path = home
+        .join("transport")
+        .join("verification")
+        .join(format!("{name}.json"));
+    let latches: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&latch_path).expect("re-arm latch"))
+            .expect("parse re-arm latch");
+    let latch = latches
+        .iter()
+        .find(|latch| latch["row_id"] == id)
+        .expect("re-armed row latch");
+    assert_eq!(latch["gave_up"], false);
+    assert_eq!(latch["rearm_count"], 1);
+    crate::daemon::notification_dedup::global().forget(name, id);
+    crate::daemon::inject_delivery::forget(name);
+    fs::remove_dir_all(&home).ok();
+}
+
+fn seed_deferred_structured_rearm(home: &Path, name: &str, id: &str) {
+    let uuid = format!("dddddddd-eeee-4fff-8aaa-{id:0>12}");
+    write_fleet_with_id_and_backend(home, name, &uuid, "claude");
+    write_agent_state_snapshot(home, name, "active");
+    crate::daemon::hook_shadow::record_event(name, "UserPromptSubmit", None);
+    let pointer = format!("[AGEND-MSG] id={id} kind=task from=lead inbox=1");
+    crate::daemon::inject_delivery::seed_structured_terminal_for_test(home, name, id, &pointer);
+    crate::inbox::reclaim::rearm_reclaimed_message(home, name, id, "task", "from:lead");
+    assert_eq!(
+        crate::notification_queue::pending_count(home, name),
+        1,
+        "structured reclaim must leave a deferred pointer queued while active"
+    );
+    assert_eq!(
+        crate::daemon::inject_delivery::rearm_state_for_test(name, id),
+        Some((true, false, true, 0))
+    );
+}
+
+fn read_rearm_latch(home: &Path, name: &str, id: &str) -> serde_json::Value {
+    let path = home
+        .join("transport")
+        .join("verification")
+        .join(format!("{name}.json"));
+    let latches: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(path).expect("verification latch"))
+            .expect("parse verification latch");
+    latches
+        .into_iter()
+        .find(|latch| latch["row_id"] == id)
+        .expect("row latch")
+}
+
+/// #3303 blocker 9/11: a deferred structured re-arm must become one physical
+/// admission, one verifier arm, and one durable budget commit through the
+/// daemon's production flush entry. The reservation survives ordinary arm
+/// commit and is not requeued after success.
+#[test]
+fn deferred_structured_flush_commits_once_without_requeue() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = tmp_home("3303-deferred-flush-success");
+    let name = "deferred-flush-success-3303";
+    let id = "m-3303-deferred-success";
+    seed_deferred_structured_rearm(&home, name, id);
+    write_agent_state_snapshot(&home, name, "idle");
+
+    let _arm_guard = crate::daemon::inject_delivery::test_support::arm_hook_guard();
+    let arms = std::sync::Arc::new(AtomicUsize::new(0));
+    let arms_hook = std::sync::Arc::clone(&arms);
+    crate::daemon::inject_delivery::test_support::set_arm_hook(Some(std::sync::Arc::new(
+        move |_| {
+            arms_hook.fetch_add(1, Ordering::SeqCst);
+        },
+    )));
+    crate::daemon::per_tick::notification_flush::flush_all(&home);
+
+    assert_eq!(crate::notification_queue::pending_count(&home, name), 0);
+    assert_eq!(arms.load(Ordering::SeqCst), 1);
+    assert!(crate::daemon::inject_delivery::is_armed_for_test(name));
+    assert_eq!(
+        crate::daemon::inject_delivery::rearm_state_for_test(name, id),
+        Some((false, false, false, 1)),
+        "successful flush must clear the reservation and consume exactly one budget"
+    );
+    let latch = read_rearm_latch(&home, name, id);
+    assert_eq!(latch["gave_up"], false);
+    assert_eq!(latch["rearm_pending"], false);
+    assert_eq!(latch["rearm_count"], 1);
+
+    // A second daemon tick has no queue residue to deliver again.
+    crate::daemon::per_tick::notification_flush::flush_all(&home);
+    assert_eq!(crate::notification_queue::pending_count(&home, name), 0);
+    assert_eq!(arms.load(Ordering::SeqCst), 1);
+    crate::daemon::inject_delivery::forget(name);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #3303 blocker 10: if cleanup wins after deferred transport admission but
+/// before verifier arm, the accepted old-generation pointer is not requeued,
+/// no structured budget is consumed, and no latch survives for a same-name
+/// successor.
+#[test]
+fn deferred_flush_cleanup_before_arm_does_not_requeue_or_arm_successor() {
+    let home = tmp_home("3303-deferred-flush-fenced");
+    let name = "deferred-flush-fenced-3303";
+    let id = "m-3303-deferred-fenced";
+    seed_deferred_structured_rearm(&home, name, id);
+    write_agent_state_snapshot(&home, name, "idle");
+
+    let _accepted_guard =
+        crate::daemon::delivery_worker::test_support::transport_accepted_before_arm_hook_guard();
+    let expected_home = home.clone();
+    crate::daemon::delivery_worker::test_support::set_transport_accepted_before_arm_hook(Some(
+        std::sync::Arc::new(move |hook_home, hook_agent, _| {
+            if hook_home == expected_home.as_path() && hook_agent == name {
+                let fence = crate::daemon::lifecycle::DeleteFence::new(hook_home, hook_agent, true);
+                crate::transport::remove_instance_delivery_state(hook_home, hook_agent)
+                    .expect("remove stale-generation latch");
+                drop(fence);
+            }
+        }),
+    ));
+    crate::daemon::per_tick::notification_flush::flush_all(&home);
+
+    assert_eq!(
+        crate::notification_queue::pending_count(&home, name),
+        0,
+        "an accepted but fenced pointer must not be requeued by the flush"
+    );
+    assert!(!crate::daemon::inject_delivery::is_armed_for_test(name));
+    assert!(!home
+        .join("transport")
+        .join("verification")
+        .join(format!("{name}.json"))
+        .exists());
+
+    // The cleanup epoch is now successor-admissible, but the old row has no
+    // queue residue or latch capable of arming the successor.
+    write_agent_state_snapshot(&home, name, "idle");
+    crate::daemon::per_tick::notification_flush::flush_all(&home);
+    assert!(!crate::daemon::inject_delivery::is_armed_for_test(name));
+    crate::daemon::inject_delivery::forget(name);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #3303 blocker 12: if a durable re-arm commit succeeds and the process-local
+/// reservation disappears before its final CAS, physical acceptance remains a
+/// success. The queue must not requeue a pointer whose budget is already 1.
+#[test]
+fn deferred_flush_post_persist_row_loss_is_not_requeued() {
+    let home = tmp_home("3303-deferred-flush-post-persist");
+    let name = "deferred-flush-post-persist-3303";
+    let id = "m-3303-deferred-post-persist";
+    seed_deferred_structured_rearm(&home, name, id);
+    write_agent_state_snapshot(&home, name, "idle");
+
+    let _persist_guard =
+        crate::daemon::inject_delivery::test_support::persist_after_write_hook_guard();
+    let expected_home = home.clone();
+    crate::daemon::inject_delivery::test_support::set_persist_after_write_hook(Some(
+        std::sync::Arc::new(move |hook_home, hook_agent, _| {
+            if hook_home == expected_home.as_path() && hook_agent == name {
+                crate::daemon::inject_delivery::forget(hook_agent);
+            }
+        }),
+    ));
+    crate::daemon::per_tick::notification_flush::flush_all(&home);
+
+    assert_eq!(crate::notification_queue::pending_count(&home, name), 0);
+    assert!(!crate::daemon::inject_delivery::is_armed_for_test(name));
+    let latch = read_rearm_latch(&home, name, id);
+    assert_eq!(latch["gave_up"], false);
+    assert_eq!(latch["rearm_pending"], false);
+    assert_eq!(latch["rearm_count"], 1);
+    crate::daemon::per_tick::notification_flush::flush_all(&home);
+    assert_eq!(crate::notification_queue::pending_count(&home, name), 0);
     fs::remove_dir_all(&home).ok();
 }
 

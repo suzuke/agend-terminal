@@ -139,6 +139,14 @@ pub(crate) struct DeliveryEnvelope {
     /// Digest of the exact structured payload.  This is persisted with the
     /// receipt so reconnect/reconcile never has to compare prompt text.
     pub payload_digest: String,
+    /// Actual registry-selected route. This is persisted with the envelope so
+    /// every receipt can explain which adapter was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
+    /// Explicit durable inbox row identity used to number retries. Absent for
+    /// independent internal deliveries, which must each remain attempt 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_delivery_id: Option<String>,
 }
 
 impl DeliveryEnvelope {
@@ -161,6 +169,8 @@ impl DeliveryEnvelope {
             self_kick: false,
             created_at: Utc::now().to_rfc3339(),
             payload_digest,
+            transport_mode: None,
+            logical_delivery_id: None,
         }
     }
 
