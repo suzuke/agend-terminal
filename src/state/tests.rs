@@ -6072,6 +6072,52 @@ fn repeated_dev_frame_stays_permission_prompt_3294() {
         "#3297 r3: a surviving prompt must remain notification-eligible"
     );
 }
+/// Secondary-reviewer finding (claude-aef7c0, 041431e7): `note_prompt_episode`'s
+/// `prior != PermissionPrompt` condition was mutation-blind — deleting it left
+/// every suite green, because the nearest test stops at "the state is still
+/// Prompt" and never feeds the dismissal that would exercise the tag afterwards.
+///
+/// The condition's real job is narrower than its old comment claimed: never
+/// overwrite a LIVE tag with a self-referential one. Without it, a redrawn
+/// dev-shaped frame that still detects Prompt re-tags the episode with
+/// `prior = PermissionPrompt`; the later release then calls
+/// `record_set(PermissionPrompt)`, which no-ops on the same-state guard, so the
+/// dev-tagged fast release silently degrades to the 120s backstop — #3294
+/// quietly un-fixed rather than mis-fixed. Milder than an early release of a
+/// genuine dialog, which is why it is a coverage gap and not a defect, but the
+/// guard is load-bearing and now has a test that says so.
+#[test]
+fn repeated_dev_frame_does_not_retag_and_release_still_fires_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: the first dev-shaped frame tags the episode with prior=Starting"
+    );
+
+    // A changed frame (spinner tick) so the hash-dedup gate misses and detection
+    // re-runs on a screen that still carries the modal. The episode must NOT be
+    // re-tagged: `prior` is now PermissionPrompt itself.
+    let mut redrawn = String::from(DEV_CHANNEL_STARTUP_MODAL_3294);
+    redrawn.push_str("  ·\n");
+    st.feed(&redrawn);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: a still-visible dialog keeps Prompt across the redraw"
+    );
+
+    // The dismissal. The release must still fire off the ORIGINAL tag; if the
+    // redraw overwrote it with PermissionPrompt, record_set no-ops and the state
+    // stays latched.
+    st.feed(IDLE_AFTER_DISMISS_3294);
+    assert_ne!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: a redrawn dev frame must not overwrite the tag and strand the release"
+    );
+}
 
 /// Restored/quoted modal text plus a real dialog: the frame classifies Prompt,
 /// and a later frame where the real chrome is still visible does NOT release —
