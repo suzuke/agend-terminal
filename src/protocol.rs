@@ -258,7 +258,6 @@ fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHeal
 }
 
 fn emit_default_healed_audit(path: &Path, from_digest: &str, identity: &ProtocolIdentity) {
-    tracing::callsite::rebuild_interest_cache();
     tracing::info!(
         target: "agend_terminal::protocol",
         path = %path.display(),

@@ -33,69 +33,153 @@ fn has_explicit_path_parameter(source: &str, function: &str) -> bool {
     })
 }
 
-fn collect_home_dir_aliases(
+#[derive(Default)]
+struct AmbientAliases {
+    home_dir: HashSet<String>,
+    env_modules: HashSet<String>,
+    env_functions: HashSet<String>,
+    function_pointers: HashSet<String>,
+}
+
+fn is_env_lookup_name(name: &str) -> bool {
+    matches!(name, "var" | "var_os")
+}
+
+fn collect_ambient_aliases(
     tree: &syn::UseTree,
     prefix: &mut Vec<String>,
-    aliases: &mut HashSet<String>,
+    aliases: &mut AmbientAliases,
 ) {
     match tree {
         syn::UseTree::Path(path) => {
             prefix.push(path.ident.to_string());
-            collect_home_dir_aliases(&path.tree, prefix, aliases);
+            collect_ambient_aliases(&path.tree, prefix, aliases);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
             if prefix.len() == 1 && prefix[0] == "crate" && name.ident == "home_dir" {
-                aliases.insert(name.ident.to_string());
+                aliases.home_dir.insert(name.ident.to_string());
+            }
+            if prefix.len() == 1 && prefix[0] == "std" && name.ident == "env" {
+                aliases.env_modules.insert(name.ident.to_string());
+            }
+            if prefix.len() == 2
+                && prefix[0] == "std"
+                && prefix[1] == "env"
+                && is_env_lookup_name(&name.ident.to_string())
+            {
+                aliases.env_functions.insert(name.ident.to_string());
             }
         }
         syn::UseTree::Rename(rename) => {
             if prefix.len() == 1 && prefix[0] == "crate" && rename.ident == "home_dir" {
-                aliases.insert(rename.rename.to_string());
+                aliases.home_dir.insert(rename.rename.to_string());
+            }
+            if prefix.len() == 1 && prefix[0] == "std" && rename.ident == "env" {
+                aliases.env_modules.insert(rename.rename.to_string());
+            }
+            if prefix.len() == 2
+                && prefix[0] == "std"
+                && prefix[1] == "env"
+                && is_env_lookup_name(&rename.ident.to_string())
+            {
+                aliases.env_functions.insert(rename.rename.to_string());
             }
         }
         syn::UseTree::Group(group) => {
             for item in &group.items {
-                collect_home_dir_aliases(item, prefix, aliases);
+                collect_ambient_aliases(item, prefix, aliases);
             }
         }
         syn::UseTree::Glob(_) => {
             if prefix.len() == 1 && prefix[0] == "crate" {
-                aliases.insert("*".to_string());
+                aliases.home_dir.insert("*".to_string());
+            }
+            if prefix.len() == 2 && prefix[0] == "std" && prefix[1] == "env" {
+                aliases.env_functions.insert("*".to_string());
             }
         }
     }
 }
 
 struct HomeDirAliasCollector<'a> {
-    aliases: &'a mut HashSet<String>,
+    aliases: &'a mut AmbientAliases,
 }
 
 impl<'ast> Visit<'ast> for HomeDirAliasCollector<'_> {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        collect_home_dir_aliases(&item.tree, &mut Vec::new(), self.aliases);
+        collect_ambient_aliases(&item.tree, &mut Vec::new(), self.aliases);
         visit::visit_item_use(self, item);
     }
 }
 
+fn path_segments(path: &syn::Path) -> Vec<String> {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect()
+}
+
+fn is_home_dir_path(path: &syn::Path, aliases: &AmbientAliases) -> bool {
+    let segments = path_segments(path);
+    segments == ["crate", "home_dir"]
+        || (segments.len() == 1
+            && (aliases.home_dir.contains(&segments[0]) || aliases.home_dir.contains("*")))
+}
+
+fn is_env_lookup_path(path: &syn::Path, aliases: &AmbientAliases) -> bool {
+    let segments = path_segments(path);
+    let direct = segments.len() == 3
+        && segments[0] == "std"
+        && segments[1] == "env"
+        && is_env_lookup_name(&segments[2]);
+    let module_alias = segments.len() == 2
+        && aliases.env_modules.contains(&segments[0])
+        && is_env_lookup_name(&segments[1]);
+    let imported = segments.len() == 1
+        && (aliases.env_functions.contains(&segments[0])
+            || aliases.env_functions.contains("*"));
+    let pointer = segments.len() == 1 && aliases.function_pointers.contains(&segments[0]);
+    direct || module_alias || imported || pointer
+}
+
+fn is_agend_home_argument(argument: &syn::Expr) -> bool {
+    matches!(
+        argument,
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(value),
+            ..
+        }) if value.value() == "AGEND_HOME"
+    )
+}
+
 struct AmbientHomeCallFinder<'a> {
-    aliases: &'a HashSet<String>,
+    aliases: &'a mut AmbientAliases,
     found: bool,
 }
 
 impl<'ast> Visit<'ast> for AmbientHomeCallFinder<'_> {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let Some(init) = &local.init {
+            if let syn::Expr::Path(path) = init.expr.as_ref() {
+                if is_env_lookup_path(&path.path, self.aliases) {
+                    if let syn::Pat::Ident(pattern) = &local.pat {
+                        self.aliases
+                            .function_pointers
+                            .insert(pattern.ident.to_string());
+                    }
+                }
+            }
+        }
+        visit::visit_local(self, local);
+    }
+
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = call.func.as_ref() {
-            let segments: Vec<_> = path
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect();
-            let direct = segments == ["crate", "home_dir"];
-            let imported = segments.len() == 1
-                && (self.aliases.contains(&segments[0]) || self.aliases.contains("*"));
-            self.found |= direct || imported;
+            let direct = is_home_dir_path(&path.path, self.aliases);
+            let env_lookup = is_env_lookup_path(&path.path, self.aliases)
+                && call.args.first().is_some_and(is_agend_home_argument);
+            self.found |= direct || env_lookup;
         }
         visit::visit_expr_call(self, call);
     }
@@ -103,14 +187,14 @@ impl<'ast> Visit<'ast> for AmbientHomeCallFinder<'_> {
 
 fn has_ambient_home_lookup(source: &str) -> bool {
     let file = syn::parse_file(source).expect("parse source");
-    let mut aliases = HashSet::new();
+    let mut aliases = AmbientAliases::default();
     HomeDirAliasCollector {
         aliases: &mut aliases,
     }
     .visit_file(&file);
 
     let mut finder = AmbientHomeCallFinder {
-        aliases: &aliases,
+        aliases: &mut aliases,
         found: false,
     };
     finder.visit_file(&file);
