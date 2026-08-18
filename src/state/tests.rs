@@ -5954,3 +5954,92 @@ fn context_source_stays_pattern_while_context_provider_is_statusline() {
         "the new typed capability coexists with the unchanged context_source"
     );
 }
+
+// ── #3294: the daemon's OWN startup modal is not a permission prompt ────────
+//
+// Managed Claude is launched with `--dangerously-load-development-channels`, so
+// every start renders the dev-channel warning modal. Its footer is the GENERIC
+// confirm chrome `Enter to confirm · Esc to cancel` — the third alternative of
+// the claude `PermissionPrompt` pattern — so the modal classified as
+// `PermissionPrompt` on the FIRST sample, before `gate_on_heartbeat` (which needs
+// a fresh heartbeat a just-spawned process cannot have) could suppress it. That
+// state is in `is_notify_error_class`, so the supervisor pushed a
+// `starting → permission` notification to the orchestrator, and nothing ever
+// retracts it: `maybe_notify_member_state_change` only notifies on entering an
+// error-class state, and the recovery-notice predicate `wants_raw_keystrokes`
+// excludes `PermissionPrompt`. Live on 2026-08-18 that produced 8/8 SessionStart
+// samples reporting PermissionPrompt with `agree=false`, and 2 member-state-change
+// notifications — both `starting->permission`, none leaving.
+//
+// Grid provenance: copied from `agent::dismiss`'s
+// `claude_development_channel_modal_matches_and_sends_one_enter`, captured from
+// Claude Code v2.1.224.
+const DEV_CHANNEL_STARTUP_MODAL_3294: &str = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels:   server:agend-claude-channel
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+";
+
+#[test]
+fn claude_dev_channel_startup_modal_is_not_permission_prompt_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert_ne!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: the daemon's own dev-channel startup modal must not be classified as a permission prompt"
+    );
+}
+
+#[test]
+fn dev_channel_startup_modal_never_notifies_an_error_class_state_3294() {
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3294);
+    assert!(
+        !st.get_state().is_notify_error_class(),
+        "#3294: the startup modal must not land a state the supervisor reports to the orchestrator, got {:?}",
+        st.get_state()
+    );
+}
+
+#[test]
+fn generic_confirm_chrome_without_dev_channel_marker_stays_permission_3294() {
+    // The suppression is keyed to the KNOWN modal, not to the chrome: any other
+    // dialog wearing the same footer must still be detected. Narrowness pin —
+    // without it the fix would blind the third alternative entirely.
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed("  Do something dangerous?\n\n  ❯ 1. Yes\n    2. No\n\n  Enter to confirm · Esc to cancel\n");
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: only the dev-channel modal is excluded — the generic confirm chrome still classifies"
+    );
+}
+
+#[test]
+fn dev_channel_marker_does_not_blind_a_real_permission_prompt_3294() {
+    // The modal's text can still sit in the scrolled-back rows when a REAL
+    // permission prompt renders below it. Suppression must key on the modal's own
+    // chrome pairing, so the real prompt (a different alternative) still wins.
+    let mut screen = String::from(DEV_CHANNEL_STARTUP_MODAL_3294);
+    screen.push_str("\n  Requesting permission…\n  Esc to cancel · Tab to amend\n");
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(&screen);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: a real permission prompt below the leftover modal text must still be detected"
+    );
+}

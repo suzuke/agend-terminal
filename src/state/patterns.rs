@@ -365,6 +365,53 @@ pub fn classify_pty_output(
 /// ate it, covering the model-picker and every future operator dialog at once.
 /// Per-dialog pattern-chasing is strictly weaker. If a recognized picker state
 /// is ever wanted in the badge, capture the real grid first (replay fixture).
+/// #3294: the daemon launches managed Claude with
+/// `--dangerously-load-development-channels`, so EVERY start renders Claude's
+/// dev-channel warning modal, whose footer is the GENERIC confirm chrome
+/// `Enter to confirm · Esc to cancel` — the third alternative of the claude
+/// `PermissionPrompt` pattern. Classifying the daemon's own startup modal as a
+/// permission prompt is wrong at the first sample, and it is not self-correcting:
+/// `gate_on_heartbeat` cannot suppress it (a just-spawned process has no fresh
+/// heartbeat), `PermissionPrompt` is in `is_notify_error_class`, and nothing
+/// retracts the resulting `starting → permission` notification — the recovery
+/// predicate `wants_raw_keystrokes` excludes `PermissionPrompt`.
+///
+/// Deliberately narrow: all three conditions must hold.
+///   1. the detection landed on the GENERIC confirm chrome. The permission-specific
+///      alternatives are untouched — #1518's `modal_prompt_above_live_tail_still_detected_1518`
+///      exercises the first one and keeps full-screen scanning.
+///   2. the modal's own anchored marker is on screen — the same anchor the dismiss
+///      pattern uses (`backend.rs`), so this adds no new false-positive surface.
+///   3. no permission-specific chrome is on screen. The modal's text can still sit
+///      in the scrolled-back rows when a real prompt renders below it, and `find`
+///      returns the LEFTMOST match, so the modal footer would otherwise mask it.
+///
+/// Auto-dismiss is unaffected by construction: the dev-channel dismiss pattern is
+/// not in `REARM_PAST_LATCH_TRUST_HINTS`, so it only ever fires while the startup
+/// latch is on, and `dismiss_scan_armed`'s latch input is state-independent.
+pub(super) fn is_dev_channel_startup_modal(matched: &str, screen: &str) -> bool {
+    const GENERIC_CONFIRM_CHROME: &str = "Enter to confirm · Esc to cancel";
+    // The permission-specific alternatives of the same pattern.
+    const PERMISSION_CHROME: &[&str] = &[
+        "Esc to cancel · Tab to amend",
+        "allow all edits during this session",
+    ];
+    if matched != GENERIC_CONFIRM_CHROME
+        || PERMISSION_CHROME
+            .iter()
+            .any(|chrome| screen.contains(chrome))
+    {
+        return false;
+    }
+    static MARKER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| {
+            Regex::new(r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels")
+                .expect("dev-channel startup modal regex compiles")
+        })
+        .is_match(screen)
+}
+
 pub(super) fn is_generic_startup_prompt(text: &str) -> bool {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {

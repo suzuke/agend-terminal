@@ -221,8 +221,8 @@ impl AgentState {
 pub(crate) mod patterns;
 
 use crate::vterm::CellFg;
-use patterns::is_generic_startup_prompt;
 pub use patterns::{classify_pty_output, StatePatterns};
+use patterns::{is_dev_channel_startup_modal, is_generic_startup_prompt};
 
 /// #2033: gate inputs for the "recovered from blocked state" Telegram notice,
 /// captured when a blocked episode (InteractivePrompt / AwaitingOperator) ends.
@@ -1363,6 +1363,23 @@ impl StateTracker {
                     // tail under its own structural guard and transitioned
                     // (overriding the idle-prompt chrome). `matched` is unused here.
                     let _ = matched;
+                }
+                Some((AgentState::PermissionPrompt, matched))
+                    if is_dev_channel_startup_modal(matched, screen_text) =>
+                {
+                    // #3294: the daemon's OWN startup modal
+                    // (`--dangerously-load-development-channels`) wears the generic
+                    // confirm chrome, so the third `PermissionPrompt` alternative
+                    // matched a dialog that is not a permission prompt. Suppress the
+                    // detection — same fall-through the anchor / position gates use —
+                    // so the startup edge never lands an error-class state the
+                    // supervisor reports and never retracts.
+                    tracing::debug!(
+                        target: "state_detection",
+                        agent = %self.instance_name,
+                        "#3294: dev-channel startup modal — suppressing PermissionPrompt classification"
+                    );
+                    self.maybe_expire_latched_state();
                 }
                 Some((detected, matched)) => {
                     let high_fp = is_high_fp_state(detected);
