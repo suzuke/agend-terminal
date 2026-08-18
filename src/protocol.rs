@@ -148,6 +148,61 @@ fn default_path(home: &Path) -> PathBuf {
     home.join("protocol").join(".default").join(FILENAME)
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DefaultHealedAudit {
+    target: &'static str,
+    message: &'static str,
+    path: PathBuf,
+    from_digest: String,
+    to_digest: String,
+    build_sha: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEFAULT_HEALED_AUDIT: std::cell::RefCell<Option<Vec<DefaultHealedAudit>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn emit_default_healed_audit(path: &Path, from_digest: &str, identity: &ProtocolIdentity) {
+    tracing::info!(
+        target: "agend_terminal::protocol",
+        path = %path.display(),
+        from_digest = %from_digest,
+        to_digest = %identity.content_sha256,
+        build_sha = %identity.build_sha,
+        "protocol default healed"
+    );
+
+    #[cfg(test)]
+    TEST_DEFAULT_HEALED_AUDIT.with(|capture| {
+        if let Some(events) = capture.borrow_mut().as_mut() {
+            events.push(DefaultHealedAudit {
+                target: "agend_terminal::protocol",
+                message: "protocol default healed",
+                path: path.to_path_buf(),
+                from_digest: from_digest.to_owned(),
+                to_digest: identity.content_sha256.clone(),
+                build_sha: identity.build_sha.clone(),
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHealedAudit>) {
+    TEST_DEFAULT_HEALED_AUDIT.with(|capture| {
+        *capture.borrow_mut() = Some(Vec::new());
+        let result = f();
+        let events = capture
+            .borrow_mut()
+            .take()
+            .expect("default healed audit capture was not initialized");
+        (result, events)
+    })
+}
+
 /// Extract embedded protocol to `AGEND_HOME/protocol/.default/`.
 /// Always overwrites — `.default/` is daemon-owned. Replacement is atomic and
 /// fallible, so a failed write cannot leave a partial protocol artifact.
@@ -215,14 +270,7 @@ pub fn resolve_protocol(home: &Path) -> Result<ProtocolIdentity> {
                 match extract_default(home) {
                     Ok(_) => match read_identity(&default, "default") {
                         Ok(identity) if identity.content_sha256 == embedded_sha256() => {
-                            tracing::info!(
-                                target: "agend_terminal::protocol",
-                                path = %default.display(),
-                                from_digest = %from_digest,
-                                to_digest = %identity.content_sha256,
-                                build_sha = %identity.build_sha,
-                                "protocol default healed"
-                            );
+                            emit_default_healed_audit(&default, &from_digest, &identity);
                             Ok(identity)
                         }
                         Ok(identity) => Err(protocol_error(
@@ -560,68 +608,7 @@ pub fn status(home: &Path) -> ProtocolStatus {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::fmt;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex};
-    use tracing::Subscriber;
-    use tracing_subscriber::layer::{Context, Layer};
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::registry::LookupSpan;
-
-    #[derive(Clone, Debug, Default)]
-    struct AuditCapture {
-        events: Arc<Mutex<Vec<AuditEvent>>>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct AuditEvent {
-        target: &'static str,
-        fields: BTreeMap<String, String>,
-    }
-
-    #[derive(Default)]
-    struct AuditVisitor {
-        fields: BTreeMap<String, String>,
-    }
-
-    impl tracing::field::Visit for AuditVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-            let rendered = format!("{value:?}");
-            let rendered = rendered
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-                .unwrap_or(&rendered)
-                .to_owned();
-            self.fields.insert(field.name().to_owned(), rendered);
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.fields
-                .insert(field.name().to_owned(), value.to_owned());
-        }
-    }
-
-    struct AuditLayer {
-        capture: AuditCapture,
-    }
-
-    impl<S> Layer<S> for AuditLayer
-    where
-        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-    {
-        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-            if event.metadata().target() != "agend_terminal::protocol" {
-                return;
-            }
-            let mut visitor = AuditVisitor::default();
-            event.record(&mut visitor);
-            self.capture.events.lock().unwrap().push(AuditEvent {
-                target: event.metadata().target(),
-                fields: visitor.fields,
-            });
-        }
-    }
 
     fn tmp_home(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -640,7 +627,7 @@ mod tests {
     fn extract_default_creates_file() {
         let home = tmp_home("extract");
         extract_default(&home).expect("extract");
-        let path = home.join("protocol/.default").join(FILENAME);
+        let path = default_path(&home);
         assert!(path.exists(), ".default/ file must exist after extract");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(
@@ -668,7 +655,7 @@ mod tests {
         let path = resolve_protocol(&home).expect("valid default").path;
         assert_eq!(
             path,
-            home.join("protocol/.default").join(FILENAME),
+            default_path(&home),
             "must fall back to .default/ when no override"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -681,7 +668,7 @@ mod tests {
         let path = resolve_protocol(&home)
             .expect("missing protocol is extracted")
             .path;
-        assert_eq!(path, home.join("protocol/.default").join(FILENAME));
+        assert_eq!(path, default_path(&home));
         assert!(path.exists(), "must auto-extract when both missing");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -689,7 +676,7 @@ mod tests {
     #[test]
     fn stale_default_is_healed_before_selection() {
         let home = tmp_home("stale");
-        let default_path = home.join("protocol/.default").join(FILENAME);
+        let default_path = default_path(&home);
         std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
         std::fs::write(&default_path, "historically stale protocol").unwrap();
 
@@ -709,36 +696,22 @@ mod tests {
     #[test]
     fn stale_default_heal_emits_audit_fields() {
         let home = tmp_home("stale-audit");
-        let default_path = home.join("protocol/.default").join(FILENAME);
+        let default_path = default_path(&home);
         std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
         let stale = b"historically stale protocol";
         std::fs::write(&default_path, stale).unwrap();
 
-        let capture = AuditCapture::default();
-        let subscriber = tracing_subscriber::registry().with(AuditLayer {
-            capture: capture.clone(),
-        });
-        let identity = tracing::subscriber::with_default(subscriber, || {
+        let (identity, events) = capture_default_healed_audit(|| {
             resolve_protocol(&home).expect("stale default is healed")
         });
-        let events = capture.events.lock().unwrap();
-        let event = events
-            .iter()
-            .find(|event| {
-                event.fields.get("message").map(String::as_str) == Some("protocol default healed")
-            })
-            .expect("protocol default healed event");
+        assert_eq!(events.len(), 1, "protocol default healed event");
+        let event = &events[0];
         assert_eq!(event.target, "agend_terminal::protocol");
-        assert_eq!(
-            event.fields.get("path"),
-            Some(&default_path.display().to_string())
-        );
-        assert_eq!(event.fields.get("from_digest"), Some(&digest(stale)));
-        assert_eq!(
-            event.fields.get("to_digest"),
-            Some(&identity.content_sha256)
-        );
-        assert_eq!(event.fields.get("build_sha"), Some(&identity.build_sha));
+        assert_eq!(event.message, "protocol default healed");
+        assert_eq!(event.path, default_path);
+        assert_eq!(event.from_digest, digest(stale));
+        assert_eq!(event.to_digest, identity.content_sha256);
+        assert_eq!(event.build_sha, identity.build_sha);
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -796,7 +769,7 @@ mod tests {
     fn failed_atomic_replacement_preserves_complete_default() {
         let home = tmp_home("atomic-failure");
         extract_default(&home).expect("extract");
-        let default_path = home.join("protocol/.default").join(FILENAME);
+        let default_path = default_path(&home);
         let before = std::fs::read(&default_path).unwrap();
         crate::store::fail_next_atomic_write_for_test(&default_path);
 
@@ -817,7 +790,7 @@ mod tests {
     #[test]
     fn failed_refresh_refuses_provision_but_reports_degraded_serviceable() {
         let home = tmp_home("degraded-serviceable");
-        let default_path = home.join("protocol/.default").join(FILENAME);
+        let default_path = default_path(&home);
         std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
         let old = b"historically stale but complete protocol";
         std::fs::write(&default_path, old).unwrap();
@@ -839,7 +812,7 @@ mod tests {
     fn delivery_stamp_parser_rejects_malformed_duplicate_and_unterminated_blocks() {
         let identity = ProtocolIdentity {
             source_kind: "default".into(),
-            path: PathBuf::from("protocol/FLEET-DEV-PROTOCOL.md"),
+            path: PathBuf::from("protocol").join(FILENAME),
             content_sha256: "content".into(),
             embedded_sha256: "embedded".into(),
             build_sha: "build".into(),
