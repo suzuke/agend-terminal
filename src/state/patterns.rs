@@ -403,13 +403,27 @@ pub(super) fn is_dev_channel_startup_modal(matched: &str, screen: &str) -> bool 
     {
         return false;
     }
+    // A terminal appends downward, so the dialog that OWNS the screen is the one
+    // whose chrome sits LOWEST — a later dialog renders below whatever the startup
+    // modal left in the scrolled-back rows, and it may wear this same generic
+    // chrome. `detect_with_match` hands us the LEFTMOST match, so decide on the
+    // lowest footer's own block: the rows between the previous chrome line (of any
+    // kind) and that footer. Suppress only when the marker is in THAT block.
+    let Some(footer) = screen.rfind(GENERIC_CONFIRM_CHROME) else {
+        return false;
+    };
+    let block_start = std::iter::once(GENERIC_CONFIRM_CHROME)
+        .chain(PERMISSION_CHROME.iter().copied())
+        .filter_map(|chrome| screen[..footer].rfind(chrome).map(|at| at + chrome.len()))
+        .max()
+        .unwrap_or(0);
     static MARKER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     MARKER
         .get_or_init(|| {
             Regex::new(r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels")
                 .expect("dev-channel startup modal regex compiles")
         })
-        .is_match(screen)
+        .is_match(&screen[block_start..footer])
 }
 
 pub(super) fn is_generic_startup_prompt(text: &str) -> bool {

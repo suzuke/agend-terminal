@@ -6043,3 +6043,24 @@ fn dev_channel_marker_does_not_blind_a_real_permission_prompt_3294() {
         "#3294: a real permission prompt below the leftover modal text must still be detected"
     );
 }
+
+#[test]
+fn residual_dev_channel_marker_does_not_blind_a_later_generic_dialog_3294() {
+    // Reviewer-raised edge: the startup modal's text can still sit in the
+    // scrolled-back rows when a LATER, real dialog renders below wearing the SAME
+    // generic confirm chrome (not the permission-specific chrome that
+    // `dev_channel_marker_does_not_blind_a_real_permission_prompt_3294` covers).
+    // The suppression must key on the dialog that OWNS the screen — the lowest
+    // footer's own block — not on "the marker is somewhere on screen".
+    let mut screen = String::from(DEV_CHANNEL_STARTUP_MODAL_3294);
+    screen.push_str(
+        "\n  Delete every file in this directory?\n\n  ❯ 1. Yes\n    2. No\n\n  Enter to confirm · Esc to cancel\n",
+    );
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(&screen);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3294: a later dialog wearing the same generic chrome must still classify, even with the startup modal left in scrollback"
+    );
+}
