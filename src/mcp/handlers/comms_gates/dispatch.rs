@@ -317,6 +317,40 @@ mod tests {
         tid
     }
 
+    fn seed_open_task(home: &std::path::Path, target: &str, branch: &str) -> String {
+        let created = crate::tasks::handle(
+            home,
+            target,
+            &json!({
+                "action": "create",
+                "title": "fresh branch task",
+                "assignee": target,
+                "branch": branch,
+            }),
+        );
+        created["id"]
+            .as_str()
+            .expect("fresh task id")
+            .to_string()
+    }
+
+    fn advance_task(home: &std::path::Path, target: &str, task_id: &str, status: &str) {
+        let claim = crate::tasks::handle(
+            home,
+            target,
+            &json!({"action": "claim", "id": task_id}),
+        );
+        assert_eq!(claim["status"], "claimed", "claim must succeed: {claim}");
+        if status == "in_progress" {
+            let update = crate::tasks::handle(
+                home,
+                target,
+                &json!({"action": "update", "id": task_id, "status": status}),
+            );
+            assert_eq!(update["task"]["status"], status, "update must succeed: {update}");
+        }
+    }
+
     fn run(home: &std::path::Path, args: &serde_json::Value) -> Result<DispatchPreChecks, Value> {
         let sender = Sender::new("sender").expect("valid sender");
         run_dispatch_pre_checks(home, &sender, args, "target", "do the thing")
@@ -420,6 +454,109 @@ mod tests {
                 .contains("already has active task"),
             "{err}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3292 A-H: only the exact task being sent may self-match the branch
+    /// dedup candidate. Open different/absent ids remain pre-claim retry
+    /// conflicts, and Claimed/InProgress competing work remains rejected.
+    #[test]
+    fn branch_dedup_exact_task_matrix_a_h() {
+        let cases = [
+            ("A-open-self", "open", Some("self"), true),
+            ("B-open-different", "open", Some("different"), false),
+            ("C-open-absent", "open", None, false),
+            ("D-claimed-self", "claimed", Some("self"), true),
+            ("E-claimed-different", "claimed", Some("different"), false),
+            ("F-claimed-absent", "claimed", None, false),
+            ("G-in-progress-self", "in_progress", Some("self"), true),
+            ("H-in-progress-different", "in_progress", Some("different"), false),
+        ];
+
+        for (label, status, requested_id, expected_pass) in cases {
+            let home = gate_home(label);
+            let task_id = seed_open_task(&home, "target", "feat/x");
+            if status != "open" {
+                advance_task(&home, "target", &task_id, status);
+            }
+            let mut args = json!({"instance": "target", "branch": "feat/x"});
+            if let Some(requested_id) = requested_id {
+                args["task_id"] = json!(if requested_id == "self" {
+                    task_id.as_str()
+                } else {
+                    "t-other"
+                });
+            }
+            let result = run(&home, &args);
+            if expected_pass {
+                result.unwrap_or_else(|err| panic!("{label} must pass: {err}"));
+            } else {
+                let err = result.expect_err(&format!("{label} must reject"));
+                assert!(
+                    err["error"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("already has active task"),
+                    "{label} must preserve branch dedup rejection: {err}"
+                );
+            }
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    #[test]
+    fn force_without_reason_rejected_for_open_self_match() {
+        let home = gate_home("force-open-self-no-reason");
+        let task_id = seed_open_task(&home, "target", "feat/x");
+        let err = run(
+            &home,
+            &json!({
+                "instance": "target",
+                "task_id": task_id,
+                "branch": "feat/x",
+                "force": true,
+            }),
+        )
+        .expect_err("force=true must require a reason even for an Open self-match");
+        assert!(
+            err["error"].as_str().unwrap_or("").contains("force_reason"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn force_without_reason_rejected_when_target_idle() {
+        let home = gate_home("force-idle-no-reason");
+        let err = run(
+            &home,
+            &json!({"instance": "target", "force": true}),
+        )
+        .expect_err("force=true must require a reason even when target is idle");
+        assert!(
+            err["error"].as_str().unwrap_or("").contains("force_reason"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn force_with_reason_bypasses_open_branch_dedup() {
+        let home = gate_home("force-open-branch");
+        let _task_id = seed_open_task(&home, "target", "feat/x");
+        let out = run(
+            &home,
+            &json!({
+                "instance": "target",
+                "task_id": "t-other",
+                "branch": "feat/x",
+                "force": true,
+                "force_reason": "operator-approved retry",
+            }),
+        )
+        .expect("force=true with reason must bypass Open branch dedup");
+        assert!(out.force);
+        assert_eq!(out.force_reason.as_deref(), Some("operator-approved retry"));
         std::fs::remove_dir_all(&home).ok();
     }
 
