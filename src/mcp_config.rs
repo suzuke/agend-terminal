@@ -209,9 +209,7 @@ fn configure_claude(home: &Path, working_dir: &Path, instance_name: Option<&str>
     // preserves pre-existing keys.
     // #hook-state-poc OR #2413 Shadow Observer (local plane): either flag wants the
     // lifecycle hooks wired into the per-workspace settings (still NEVER ~/.claude).
-    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
-        || crate::daemon::shadow::enabled()
-    {
+    if crate::daemon::hook_shadow::hook_state_poc_enabled() || crate::daemon::shadow::enabled() {
         if let Some(name) = instance_name {
             upsert_state_hooks(&path, name)?;
         }
@@ -477,9 +475,7 @@ fn configure_agy(home: &Path, working_dir: &Path, instance_name: Option<&str>) -
     // (`configure_claude`); needs an instance name for the session↔agent
     // attribution embedded in the hook command. RE-spike (t-…39100-6) proved these
     // per-workspace hooks fire live mid-turn.
-    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
-        || crate::daemon::shadow::enabled()
-    {
+    if crate::daemon::hook_shadow::hook_state_poc_enabled() || crate::daemon::shadow::enabled() {
         if let Some(name) = instance_name {
             let hooks_path = working_dir.join(".agents").join("hooks.json");
             upsert_agy_state_hooks(&hooks_path, name)?;

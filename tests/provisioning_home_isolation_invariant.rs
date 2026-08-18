@@ -42,7 +42,7 @@ struct AmbientAliases {
 }
 
 fn is_env_lookup_name(name: &str) -> bool {
-    matches!(name, "var" | "var_os")
+    matches!(name, "var" | "var_os" | "vars" | "vars_os")
 }
 
 fn collect_ambient_aliases(
@@ -142,14 +142,17 @@ fn is_env_lookup_path(path: &syn::Path, aliases: &AmbientAliases) -> bool {
     direct || module_alias || imported || pointer
 }
 
-fn is_agend_home_argument(argument: &syn::Expr) -> bool {
-    matches!(
-        argument,
-        syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Str(value),
-            ..
-        }) if value.value() == "AGEND_HOME"
-    )
+fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        if !attribute.path().is_ident("cfg") {
+            return false;
+        }
+        match &attribute.meta {
+            syn::Meta::List(list) => list.tokens.to_string().contains("test"),
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::NameValue(_) => false,
+        }
+    })
 }
 
 struct AmbientHomeCallFinder<'a> {
@@ -158,6 +161,13 @@ struct AmbientHomeCallFinder<'a> {
 }
 
 impl<'ast> Visit<'ast> for AmbientHomeCallFinder<'_> {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        if has_test_cfg(&module.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, module);
+    }
+
     fn visit_local(&mut self, local: &'ast syn::Local) {
         if let Some(init) = &local.init {
             if let syn::Expr::Path(path) = init.expr.as_ref() {
@@ -173,14 +183,10 @@ impl<'ast> Visit<'ast> for AmbientHomeCallFinder<'_> {
         visit::visit_local(self, local);
     }
 
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = call.func.as_ref() {
-            let direct = is_home_dir_path(&path.path, self.aliases);
-            let env_lookup = is_env_lookup_path(&path.path, self.aliases)
-                && call.args.first().is_some_and(is_agend_home_argument);
-            self.found |= direct || env_lookup;
-        }
-        visit::visit_expr_call(self, call);
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        self.found |= is_home_dir_path(&expression.path, self.aliases)
+            || is_env_lookup_path(&expression.path, self.aliases);
+        visit::visit_expr_path(self, expression);
     }
 }
 
