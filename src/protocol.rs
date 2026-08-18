@@ -391,7 +391,7 @@ fn workspace_candidates(home: &Path) -> Vec<(PathBuf, Option<PathBuf>)> {
         }
     }
 
-    candidates.sort_by(|left, right| left.cmp(right));
+    candidates.sort();
     candidates.dedup();
     candidates
 }
@@ -546,6 +546,7 @@ pub fn status(home: &Path) -> ProtocolStatus {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
