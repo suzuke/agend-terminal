@@ -258,6 +258,11 @@ fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHeal
 }
 
 fn emit_default_healed_audit(path: &Path, from_digest: &str, identity: &ProtocolIdentity) {
+    // A scoped subscriber can be installed after this callsite's interest was
+    // cached on another thread. Refresh the tracing cache at the emission site
+    // so the audit event is not silently suppressed; this is tracing-only and
+    // does not alter protocol state or delivery semantics.
+    tracing::callsite::rebuild_interest_cache();
     tracing::info!(
         target: "agend_terminal::protocol",
         path = %path.display(),
