@@ -180,13 +180,9 @@ pub(crate) fn run_dispatch_pre_checks(
     if !force && !enriching_active {
         if let Some(branch) = args["branch"].as_str() {
             let requested_task_id = args["task_id"].as_str().filter(|s| !s.is_empty());
-            if let Some(dup) = dedup_candidates
-                .iter()
-                .find(|t| {
-                    t.branch.as_deref() == Some(branch)
-                        && requested_task_id != Some(t.id.as_str())
-                })
-            {
+            if let Some(dup) = dedup_candidates.iter().find(|t| {
+                t.branch.as_deref() == Some(branch) && requested_task_id != Some(t.id.as_str())
+            }) {
                 return Err(json!({
                     "error": format!(
                         "dispatch rejected: {} already has active task {} on branch {}",
@@ -335,18 +331,11 @@ mod tests {
                 "branch": branch,
             }),
         );
-        created["id"]
-            .as_str()
-            .expect("fresh task id")
-            .to_string()
+        created["id"].as_str().expect("fresh task id").to_string()
     }
 
     fn advance_task(home: &std::path::Path, target: &str, task_id: &str, status: &str) {
-        let claim = crate::tasks::handle(
-            home,
-            target,
-            &json!({"action": "claim", "id": task_id}),
-        );
+        let claim = crate::tasks::handle(home, target, &json!({"action": "claim", "id": task_id}));
         assert_eq!(claim["status"], "claimed", "claim must succeed: {claim}");
         if status == "in_progress" {
             let update = crate::tasks::handle(
@@ -354,7 +343,10 @@ mod tests {
                 target,
                 &json!({"action": "update", "id": task_id, "status": status}),
             );
-            assert_eq!(update["task"]["status"], status, "update must succeed: {update}");
+            assert_eq!(
+                update["task"]["status"], status,
+                "update must succeed: {update}"
+            );
         }
     }
 
@@ -477,7 +469,12 @@ mod tests {
             ("E-claimed-different", "claimed", Some("different"), false),
             ("F-claimed-absent", "claimed", None, false),
             ("G-in-progress-self", "in_progress", Some("self"), true),
-            ("H-in-progress-different", "in_progress", Some("different"), false),
+            (
+                "H-in-progress-different",
+                "in_progress",
+                Some("different"),
+                false,
+            ),
         ];
 
         for (label, status, requested_id, expected_pass) in cases {
@@ -535,11 +532,8 @@ mod tests {
     #[test]
     fn force_without_reason_rejected_when_target_idle() {
         let home = gate_home("force-idle-no-reason");
-        let err = run(
-            &home,
-            &json!({"instance": "target", "force": true}),
-        )
-        .expect_err("force=true must require a reason even when target is idle");
+        let err = run(&home, &json!({"instance": "target", "force": true}))
+            .expect_err("force=true must require a reason even when target is idle");
         assert!(
             err["error"].as_str().unwrap_or("").contains("force_reason"),
             "{err}"
