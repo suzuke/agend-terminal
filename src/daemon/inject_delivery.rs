@@ -1637,6 +1637,37 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #3303 review regression: a production arm attempt that cannot open its
+    /// latch lock must fail closed with an operator-visible diagnostic rather
+    /// than silently disabling structured verification.
+    #[test]
+    #[tracing_test::traced_test]
+    fn latch_lock_failure_logs_before_fail_closed_arm() {
+        let home = tmp_home("latch-lock-failure-log");
+        std::fs::remove_dir_all(&home).expect("remove fixture directory");
+        std::fs::write(&home, b"not a directory").expect("create invalid home path");
+        let agent = "latch-lock-failure-log-2044";
+        let text = "wake id=m-latch-lock-failure";
+        crate::daemon::hook_shadow::record_event(agent, "UserPromptSubmit", None);
+
+        assert!(
+            prepare_arm(
+                &home,
+                agent,
+                text,
+                crate::transport::TransportMode::ChannelBridge,
+                0,
+            )
+            .is_none(),
+            "unavailable latch lock must fail closed"
+        );
+        assert!(
+            logs_contain("#2044 durable verification latch lock unavailable"),
+            "latch lock failure must be visible in tracing output"
+        );
+        std::fs::remove_file(&home).ok();
+    }
+
     /// Helper: re-stamp an armed inject so the verify window has elapsed.
     fn arm_at_elapsed(agent: &str, _text: &str) {
         if let Some(p) = store()
