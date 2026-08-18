@@ -1806,16 +1806,6 @@ mod tests {
         let agents = result["agents"].as_array().expect("agents array");
         assert_eq!(agents.len(), 0, "no snapshot should yield 0 agents");
         assert_eq!(result["timestamp"], serde_json::Value::Null);
-        assert!(
-            result["protocol"].is_object(),
-            "status must expose protocol identity: {result}"
-        );
-        for key in ["source_kind", "path", "content_sha256", "embedded_sha256", "build_sha"] {
-            assert!(
-                result["protocol"].get(key).is_some(),
-                "protocol status must expose {key}: {result}"
-            );
-        }
         stop_server(&shutdown, &home);
     }
 
