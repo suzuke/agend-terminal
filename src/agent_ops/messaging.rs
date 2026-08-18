@@ -27,11 +27,83 @@ pub(crate) struct SendRequest {
     pub priority: Option<String>,
 }
 
+/// #3293: what the `terminal: true` settlement request actually did.
+///
+/// `send.terminal` asks the daemon to close the correlated task, but the close
+/// runs behind `assignee_completion_guard`. The guard is deliberately strict —
+/// a PR-producing task stays open until the merge — and its refusal used to
+/// reach only a `tracing::warn!`, so the reporter could not tell a settled task
+/// from a refused one without reading the board. This carries the decision back
+/// to the caller; it never changes the decision itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettlementOutcome {
+    pub(crate) closed: bool,
+    pub(crate) code: Option<&'static str>,
+    pub(crate) reason: Option<String>,
+    pub(crate) closure_condition: Option<&'static str>,
+}
+
+/// What would permit closure after the completion guard refused. Kept as one
+/// sentence so an agent can act on it without consulting the protocol.
+const SETTLEMENT_CLOSURE_CONDITION: &str =
+    "close after the PR merges (a merge receipt or a squash-merge is proof), or ask the task's orchestrator to close it";
+
+impl SettlementOutcome {
+    fn closed() -> Self {
+        Self {
+            closed: true,
+            code: None,
+            reason: None,
+            closure_condition: None,
+        }
+    }
+
+    /// The report never reached the completion guard: not the assignee, not an
+    /// eligible status, or an unroutable correlation id. Deliberately distinct
+    /// from a guard refusal — the causes and the remedies differ.
+    fn not_applicable() -> Self {
+        Self {
+            closed: false,
+            code: Some("settlement_not_applicable"),
+            reason: None,
+            closure_condition: None,
+        }
+    }
+
+    fn blocked(reason: String) -> Self {
+        Self {
+            closed: false,
+            code: Some("assignee_completion_blocked"),
+            reason: Some(reason),
+            closure_condition: Some(SETTLEMENT_CLOSURE_CONDITION),
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({"closed": self.closed});
+        if let Some(code) = self.code {
+            value["code"] = serde_json::json!(code);
+        }
+        if let Some(reason) = &self.reason {
+            value["reason"] = serde_json::json!(reason);
+        }
+        if let Some(condition) = self.closure_condition {
+            value["closure_condition"] = serde_json::json!(condition);
+        }
+        value
+    }
+}
+
 pub(crate) enum SendOutcome {
     Success {
         delivery_mode: String,
         branch_checked_out: Option<String>,
         auto_task_id: Option<String>,
+        /// #3293: present only when the caller asked for settlement
+        /// (`terminal: true` on a report with a task correlation id). Boxed so
+        /// the success variant does not widen `SendOutcome`, which several
+        /// functions return inside a `Result` (clippy::result_large_err).
+        settlement: Option<Box<SettlementOutcome>>,
     },
     Error {
         error: String,
@@ -199,18 +271,19 @@ pub(crate) fn execute_send(
         .unwrap_or(target);
     let receipt_applied =
         process_verdicts_with_report_recipient(home, &msg, Some(report_recipient));
-    if receipt_applied || msg.validated_code_review.is_none() {
-        track_dispatch(home, &request, from, target, &msg);
+    let settlement = if receipt_applied || msg.validated_code_review.is_none() {
+        track_dispatch(home, &request, from, target, &msg)
     } else {
         let mut inert = msg.clone();
         inert.validated_code_review = None;
-        track_dispatch(home, &request, from, target, &inert);
-    }
+        track_dispatch(home, &request, from, target, &inert)
+    };
 
     SendOutcome::Success {
         delivery_mode,
         branch_checked_out: branch_checked_out.map(String::from),
         auto_task_id,
+        settlement: settlement.map(Box::new),
     }
 }
 
@@ -665,7 +738,8 @@ pub(crate) fn track_dispatch(
     from: &str,
     target: &str,
     msg: &crate::inbox::InboxMessage,
-) {
+) -> Option<SettlementOutcome> {
+    let mut settlement: Option<SettlementOutcome> = None;
     let kind_str = msg.kind.as_deref().unwrap_or("");
     if matches!(kind_str, "task" | "query") {
         let outbound_corr = if kind_str == "task" {
@@ -749,16 +823,29 @@ pub(crate) fn track_dispatch(
                     );
             }
             if corr.starts_with("t-") {
-                if let Err(error) = crate::tasks::auto_close::auto_close_on_report(
+                let requested_settlement = msg.terminal.unwrap_or(false);
+                let result = crate::tasks::auto_close::auto_close_on_report(
                     home,
                     kind_str,
                     corr,
                     from,
                     &msg.text,
-                    msg.terminal.unwrap_or(false),
-                ) {
-                    tracing::warn!(reporter = %from, task_id = %corr, %error,
-                        "task report auto-close completion guard refused");
+                    requested_settlement,
+                );
+                let outcome = match result {
+                    Ok(true) => SettlementOutcome::closed(),
+                    Ok(false) => SettlementOutcome::not_applicable(),
+                    Err(error) => {
+                        tracing::warn!(reporter = %from, task_id = %corr, %error,
+                            "task report auto-close completion guard refused");
+                        SettlementOutcome::blocked(error.to_string())
+                    }
+                };
+                // #3293: only a caller who asked for settlement gets an answer
+                // about it, so an ordinary progress report's response shape is
+                // unchanged and the field's presence stays meaningful.
+                if requested_settlement {
+                    settlement = Some(outcome);
                 }
             }
         }
@@ -768,6 +855,7 @@ pub(crate) fn track_dispatch(
             let _ = crate::daemon::dispatch_idle::refresh_issued_at(home, corr, from);
         }
     }
+    settlement
 }
 
 fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox::InboxMessage) {

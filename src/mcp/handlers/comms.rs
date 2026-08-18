@@ -115,9 +115,11 @@ pub(super) fn handle_send_to_instance(
     let req = send_request_from_args(sender.as_str(), target, text, kind, args);
     let result = if let Some(rt) = runtime {
         match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
-            crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
-                json!({"target": target, "delivery_mode": delivery_mode})
-            }
+            crate::agent_ops::messaging::SendOutcome::Success {
+                delivery_mode,
+                settlement,
+                ..
+            } => send_success_response(target, &delivery_mode, settlement.as_deref()),
             crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
                 json!({"error": error})
             }
@@ -131,6 +133,20 @@ pub(super) fn handle_send_to_instance(
     }
     if is_ok_result(&result) {
         record_triaged_if_present(home, sender.as_str(), triaged);
+    }
+    result
+}
+
+/// #3293: one place that renders a successful send, so the settlement outcome
+/// cannot be exposed on some send paths and silently dropped on others.
+fn send_success_response(
+    target: &str,
+    delivery_mode: &str,
+    settlement: Option<&crate::agent_ops::messaging::SettlementOutcome>,
+) -> Value {
+    let mut result = json!({"target": target, "delivery_mode": delivery_mode});
+    if let Some(settlement) = settlement {
+        result["auto_close"] = settlement.to_json();
     }
     result
 }
@@ -236,9 +252,11 @@ pub(super) fn handle_report_result(
         let req = send_request_from_args(sender.as_str(), target, &msg, Some("report"), args);
         if let Some(rt) = runtime {
             match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
-                crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
-                    json!({"target": target, "delivery_mode": delivery_mode})
-                }
+                crate::agent_ops::messaging::SendOutcome::Success {
+                    delivery_mode,
+                    settlement,
+                    ..
+                } => send_success_response(target, &delivery_mode, settlement.as_deref()),
                 crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
                     json!({"error": error})
                 }
@@ -305,9 +323,11 @@ pub(super) fn handle_request_information(
     let req = send_request_from_args(sender.as_str(), target, &msg, Some("query"), args);
     if let Some(rt) = runtime {
         match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
-            crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
-                json!({"target": target, "delivery_mode": delivery_mode})
-            }
+            crate::agent_ops::messaging::SendOutcome::Success {
+                delivery_mode,
+                settlement,
+                ..
+            } => send_success_response(target, &delivery_mode, settlement.as_deref()),
             crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
                 json!({"error": error})
             }
@@ -363,9 +383,11 @@ pub(super) fn handle_broadcast(
         req.broadcast_context = Some(broadcast_ctx.clone());
         let result = if let Some(rt) = runtime {
             match crate::agent_ops::messaging::execute_send(home, &rt.registry, req) {
-                crate::agent_ops::messaging::SendOutcome::Success { delivery_mode, .. } => {
-                    json!({"target": target, "delivery_mode": delivery_mode})
-                }
+                crate::agent_ops::messaging::SendOutcome::Success {
+                    delivery_mode,
+                    settlement,
+                    ..
+                } => send_success_response(target, &delivery_mode, settlement.as_deref()),
                 crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
                     json!({"error": error})
                 }
