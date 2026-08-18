@@ -593,6 +593,9 @@ pub(crate) fn name_residual_anywhere(
     if delivery_path.exists() || delivery_path.with_extension("jsonl.lock").exists() {
         sources.push("transport/deliveries");
     }
+    if crate::daemon::inject_delivery::durable_latch_state_exists(home, name) {
+        sources.push("transport/verification");
+    }
     // #1907: the daemon-created default workspace dir (`workspace/<name>`). Only a
     // residual when the entry had no explicit `working_directory` AND the cleanup
     // above failed — a user-provided working dir resolves elsewhere and never

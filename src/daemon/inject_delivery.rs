@@ -102,13 +102,27 @@ fn latch_lock_path(home: &Path, agent: &str) -> PathBuf {
 /// must not inherit a predecessor's bounded re-arm budget.
 pub(crate) fn remove_durable_latches(home: &Path, agent: &str) -> anyhow::Result<()> {
     let path = latch_path(home, agent);
-    let _lock = crate::store::acquire_file_lock(&latch_lock_path(home, agent))?;
-    match std::fs::remove_file(&path) {
+    let lock_path = latch_lock_path(home, agent);
+    {
+        let _lock = crate::store::acquire_file_lock(&lock_path)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Keep the lock held while removing the data, then drop it before
+        // unlinking the sidecar. Windows rejects removing an open lock file.
+    }
+    match std::fs::remove_file(&lock_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+pub(crate) fn durable_latch_state_exists(home: &Path, agent: &str) -> bool {
+    latch_path(home, agent).exists() || latch_lock_path(home, agent).exists()
 }
 
 fn load_latches_unlocked(home: &Path, agent: &str) -> Option<Vec<DurableLatch>> {

@@ -232,6 +232,23 @@ fn name_residual_anywhere_detects_usage_limit_notify_residual_1906() {
 }
 
 #[test]
+fn name_residual_anywhere_detects_transport_verification_residual_3303() {
+    let home = tmp_home("transport_verification_audit");
+    let lock_path = home
+        .join("transport")
+        .join("verification")
+        .join("zombie.json.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    std::fs::write(&lock_path, "").unwrap();
+    let sources = name_residual_anywhere(&home, "zombie", None);
+    assert!(
+        sources.contains(&"transport/verification"),
+        "transport verification residual must be detected, got {sources:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn name_residual_anywhere_detects_worktree_residual_1906() {
     // #1906 Leak 1: a leftover physical worktree (`worktrees/<name>/`) must be
     // flagged — the audit previously only saw runtime/<name>/binding.json.
