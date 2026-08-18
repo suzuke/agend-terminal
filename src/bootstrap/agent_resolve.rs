@@ -159,6 +159,7 @@ mod tests {
     #[test]
     fn resolve_routes_model_through_capability_chokepoint_2744() {
         let dir = tmp_dir("model-chokepoint-2744");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         let d1 = dir.join("shell-seat");
         let d2 = dir.join("wrapper-seat");
         let d3 = dir.join("dedupe-seat");
@@ -266,6 +267,7 @@ mod tests {
     #[test]
     fn resolve_one_worktree_false_skips_worktree_creation() {
         let dir = tmp_dir("wt-false-skip");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         init_git_repo(&dir);
         let config = make_config(&dir, Some(false));
         let peers: Vec<(String, Option<String>)> = config
@@ -305,6 +307,7 @@ mod tests {
     #[test]
     fn resolve_one_creates_worktree_when_source_repo_set() {
         let dir = tmp_dir("wt-source-repo");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         init_git_repo(&dir);
         // #888: explicit source_repo signals dev/reviewer intent so
         // the gate fires.
@@ -369,6 +372,7 @@ mod tests {
     #[test]
     fn resolve_one_skips_worktree_for_orchestrator_without_source_repo() {
         let dir = tmp_dir("888-orch");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         let work_dir = dir.join("workspace").join("orch");
         std::fs::create_dir_all(&work_dir).unwrap();
         // Simulate the "second launch" state from #888: a prior pass
@@ -456,6 +460,7 @@ mod tests {
     #[test]
     fn resolve_one_source_repo_in_default_workspace_no_drift_1858() {
         let dir = tmp_dir("1858-a-nodrift");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         // A real source_repo so the #888 opt-in signal points at something valid.
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -581,6 +586,7 @@ mod tests {
     #[test]
     fn resolve_one_worktree_false_prunes_clean_existing_worktree() {
         let dir = tmp_dir("wt-false-prune");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         init_git_repo(&dir);
         // Sprint 57 Wave 4 (#546 Item 4): worktrees live external at
         // `$AGEND_HOME/worktrees/<agent>/<branch>/`. Set up the new
@@ -630,6 +636,7 @@ mod tests {
     #[test]
     fn resolve_one_appends_instance_extra_instructions() {
         let dir = tmp_dir("extra-instructions");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&dir);
         let work_dir = dir.join("work");
         std::fs::create_dir_all(dir.join("instructions")).unwrap();
         std::fs::write(

@@ -560,7 +560,68 @@ pub fn status(home: &Path) -> ProtocolStatus {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::fmt;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Clone, Debug, Default)]
+    struct AuditCapture {
+        events: Arc<Mutex<Vec<AuditEvent>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuditEvent {
+        target: &'static str,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct AuditVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for AuditVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            let rendered = format!("{value:?}");
+            let rendered = rendered
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(&rendered)
+                .to_owned();
+            self.fields.insert(field.name().to_owned(), rendered);
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    struct AuditLayer {
+        capture: AuditCapture,
+    }
+
+    impl<S> Layer<S> for AuditLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() != "agend_terminal::protocol" {
+                return;
+            }
+            let mut visitor = AuditVisitor::default();
+            event.record(&mut visitor);
+            self.capture.events.lock().unwrap().push(AuditEvent {
+                target: event.metadata().target(),
+                fields: visitor.fields,
+            });
+        }
+    }
 
     fn tmp_home(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -647,55 +708,37 @@ mod tests {
 
     #[test]
     fn stale_default_heal_emits_audit_fields() {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-            type Writer = Buf;
-
-            fn make_writer(&'a self) -> Buf {
-                self.clone()
-            }
-        }
-
         let home = tmp_home("stale-audit");
         let default_path = home.join("protocol/.default").join(FILENAME);
         std::fs::create_dir_all(default_path.parent().expect("default parent")).unwrap();
         let stale = b"historically stale protocol";
         std::fs::write(&default_path, stale).unwrap();
 
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(Buf(output.clone()))
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .finish();
+        let capture = AuditCapture::default();
+        let subscriber = tracing_subscriber::registry().with(AuditLayer {
+            capture: capture.clone(),
+        });
         let identity = tracing::subscriber::with_default(subscriber, || {
             resolve_protocol(&home).expect("stale default is healed")
         });
-        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-
-        assert!(output.contains("protocol default healed"));
-        assert!(output.contains(&format!("path={}", default_path.display())));
-        assert!(output.contains(&format!("from_digest={}", digest(stale))));
-        assert!(output.contains(&format!("to_digest={}", identity.content_sha256)));
-        assert!(output.contains(&format!("build_sha={}", identity.build_sha)));
+        let events = capture.events.lock().unwrap();
+        let event = events
+            .iter()
+            .find(|event| {
+                event.fields.get("message").map(String::as_str) == Some("protocol default healed")
+            })
+            .expect("protocol default healed event");
+        assert_eq!(event.target, "agend_terminal::protocol");
+        assert_eq!(
+            event.fields.get("path"),
+            Some(&default_path.display().to_string())
+        );
+        assert_eq!(event.fields.get("from_digest"), Some(&digest(stale)));
+        assert_eq!(
+            event.fields.get("to_digest"),
+            Some(&identity.content_sha256)
+        );
+        assert_eq!(event.fields.get("build_sha"), Some(&identity.build_sha));
 
         std::fs::remove_dir_all(&home).ok();
     }

@@ -690,6 +690,7 @@ mod tests {
     #[test]
     fn prepare_owned_issues_cookie_and_lock() {
         let home = tmp_home("owned");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
@@ -741,6 +742,7 @@ mod tests {
     #[test]
     fn daemon_lock_contention_carries_incumbent_identity() {
         let home = tmp_home("lock-identity");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
@@ -806,6 +808,7 @@ mod tests {
     #[test]
     fn prepare_surfaces_typed_conflict_when_lock_already_held() {
         let home = tmp_home("prepare-conflict");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         let _held = acquire_daemon_lock(&home).expect("pre-hold the lock");
 
@@ -838,6 +841,7 @@ mod tests {
     #[test]
     fn owned_cookie_is_readable_for_api_serve() {
         let home = tmp_home("api_cookie");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
@@ -868,6 +872,7 @@ mod tests {
     #[test]
     fn attach_fails_when_cookie_missing() {
         let home = tmp_home("no_cookie");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         let run = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&run).expect("mkdir run");
@@ -898,6 +903,7 @@ mod tests {
     fn prepare_attaches_when_run_dir_alive() {
         // Simulate a live daemon: current PID + cookie + bound api port.
         let home = tmp_home("attached");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         let run = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&run).expect("mkdir run");
@@ -938,6 +944,7 @@ mod tests {
     #[test]
     fn prepare_sweeps_run_dir_with_dead_api() {
         let home = tmp_home("dead_api");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         // Use a dir name = current pid so is_pid_alive returns true, but
         // never open a listener — probe_api must fail.
@@ -990,6 +997,9 @@ mod tests {
             init_discord: false,
             resolve_agents: true,
         };
+        // `prepare` receives the explicit fixture home, and every provisioning
+        // read must follow that same home rather than the operator environment.
+        _ambient_home.set_home(&home);
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
         let BootstrapOutcome::Owned(_owned) = outcome else {
             panic!("expected Owned for fresh temp home");
@@ -1000,6 +1010,7 @@ mod tests {
             generated.contains("Always include rollout checklist."),
             "generated instructions must include extra file content"
         );
+        _ambient_home.set_home(&ambient);
         assert_eq!(
             std::fs::read(&ambient_default).expect("read ambient sentinel"),
             sentinel,
@@ -1128,6 +1139,7 @@ mod tests {
     #[test]
     fn prepare_emits_bootstrap_step_lines_for_every_instrumented_site() {
         let home = tmp_home("945-bootstrap-steps");
+        let _home = crate::review_repro_test_util::ScopedAgendHome::new(&home);
         let fleet = write_minimal_fleet(&home);
         // resolve_agents=false keeps the test fast (no agent worktree
         // creation) while still exercising every other step.
