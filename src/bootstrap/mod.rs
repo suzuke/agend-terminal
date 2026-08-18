@@ -974,6 +974,15 @@ mod tests {
     #[test]
     fn prepare_resolve_agents_applies_extra_instructions_to_generated_file() {
         let home = tmp_home("resolve_extra_instructions");
+        let ambient = tmp_home("resolve_extra_instructions_ambient");
+        let ambient_default = ambient
+            .join("protocol/.default")
+            .join("FLEET-DEV-PROTOCOL.md");
+        std::fs::create_dir_all(ambient_default.parent().expect("ambient default parent"))
+            .expect("mkdir ambient protocol");
+        let sentinel = b"01234567890123456789012345678901";
+        std::fs::write(&ambient_default, sentinel).expect("write ambient sentinel");
+        let _ambient_home = crate::review_repro_test_util::ScopedAgendHome::new(&ambient);
         let fleet = write_fleet_with_extra_instructions(&home);
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
@@ -991,7 +1000,13 @@ mod tests {
             generated.contains("Always include rollout checklist."),
             "generated instructions must include extra file content"
         );
+        assert_eq!(
+            std::fs::read(&ambient_default).expect("read ambient sentinel"),
+            sentinel,
+            "bootstrap provisioning must not heal or overwrite the ambient test home"
+        );
         std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&ambient).ok();
     }
 
     /// Sweep removes a pid-named dir whose `api.port` has no listener, even
