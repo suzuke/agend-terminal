@@ -6064,3 +6064,64 @@ fn residual_dev_channel_marker_does_not_blind_a_later_generic_dialog_3294() {
         "#3294: a later dialog wearing the same generic chrome must still classify, even with the startup modal left in scrollback"
     );
 }
+
+/// #3297 r1 (secondary reviewer): the suppression's trigger must not be
+/// satisfiable by ORDINARY TRANSCRIPT TEXT. The marker string circulates in
+/// agent panes (issue text, PR bodies, this very fix's own source), so a bare
+/// echoed line must never blind a real dialog rendered below it — that would be
+/// #3294 inverted: a genuinely blocked agent classified non-error-class, so the
+/// supervisor never notifies and the operator is never told.
+#[test]
+fn bare_marker_transcript_does_not_blind_a_later_generic_dialog_3297() {
+    let screen = "\
+WARNING: Loading development channels
+
+  Delete every file in this directory?
+
+  ❯ 1. Yes
+    2. No
+
+  Enter to confirm · Esc to cancel
+";
+    for prior in [AgentState::Starting, AgentState::Idle] {
+        let mut st = tracker_at(&Backend::ClaudeCode, prior, 0);
+        st.feed(screen);
+        assert_eq!(
+            st.get_state(),
+            AgentState::PermissionPrompt,
+            "#3297: a quoted marker line must not suppress a real dialog (prior state {prior:?})"
+        );
+    }
+}
+
+/// #3297 r1: the startup modal's top rows can survive a repaint that overwrites
+/// its own footer row, so "the marker is in the lowest footer's block" is not
+/// enough — the block boundary the r1 fix relied on is gone in this shape and a
+/// real dialog owns the footer.
+#[test]
+fn partially_overwritten_modal_does_not_blind_a_later_generic_dialog_3297() {
+    let screen = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Channels:   server:agend-claude-channel
+
+  Delete every file in this directory?
+
+  ❯ 1. Yes
+    2. No
+
+  Enter to confirm · Esc to cancel
+";
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+    st.feed(screen);
+    assert_eq!(
+        st.get_state(),
+        AgentState::PermissionPrompt,
+        "#3297: a real dialog owning the footer must classify even when the modal's body survives above it"
+    );
+}
