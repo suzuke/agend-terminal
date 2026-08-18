@@ -8,6 +8,55 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Scope AGEND_HOME for tests that reach provisioning code while holding the
+/// crate-wide environment lock. `home_dir()` reads the process environment on
+/// every call, so an explicit home argument alone does not isolate a test.
+pub(crate) struct ScopedAgendHome {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedAgendHome {
+    pub(crate) fn new(home: &Path) -> Self {
+        let lock = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGEND_HOME");
+        // SAFETY: all environment access in this scope is serialized by the
+        // crate-wide test lock, including restoration in Drop.
+        unsafe {
+            std::env::set_var("AGEND_HOME", home);
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+
+    /// Change the scoped value without releasing the process-wide lock. This
+    /// lets a regression test compare an ambient sentinel before restoring the
+    /// caller's original environment.
+    pub(crate) fn set_home(&self, home: &Path) {
+        // SAFETY: the guard is held for the lifetime of this value.
+        unsafe {
+            std::env::set_var("AGEND_HOME", home);
+        }
+    }
+}
+
+impl Drop for ScopedAgendHome {
+    fn drop(&mut self) {
+        // SAFETY: the guard remains held until after the environment is
+        // restored, so no other env-mutating test can race this transition.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("AGEND_HOME", value),
+                None => std::env::remove_var("AGEND_HOME"),
+            }
+        }
+    }
+}
+
 /// Unique scratch dir under the system temp, namespaced by `prefix` (so two
 /// callers' temp dirs never collide) and `tag` (per-test identification).
 pub(crate) fn scratch(prefix: &str, tag: &str) -> PathBuf {
