@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_override_artifacts_are_not_selected() {
+    fn structural_override_artifacts_are_refused() {
         let home = tmp_home("override-structural");
         extract_default(&home).expect("extract");
         let override_path = home.join("protocol").join(FILENAME);
@@ -647,7 +647,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_override_is_not_selected() {
+    fn symlink_override_is_refused() {
         let home = tmp_home("override-symlink");
         extract_default(&home).expect("extract");
         let override_path = home.join("protocol").join(FILENAME);
@@ -657,6 +657,28 @@ mod tests {
 
         let error = resolve_protocol(&home).expect_err("symlink override must be refused");
         assert!(error.to_string().contains("doctor protocol"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn empty_and_invalid_utf8_overrides_are_refused_and_reported() {
+        let home = tmp_home("override-content-invalid");
+        extract_default(&home).expect("extract");
+        let override_path = home.join("protocol").join(FILENAME);
+
+        std::fs::write(&override_path, []).unwrap();
+        assert!(
+            resolve_protocol(&home).is_err(),
+            "empty override must refuse"
+        );
+        assert_eq!(status(&home).state, "invalid_override");
+
+        std::fs::write(&override_path, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(
+            resolve_protocol(&home).is_err(),
+            "invalid UTF-8 override must refuse"
+        );
+        assert_eq!(status(&home).state, "invalid_override");
         std::fs::remove_dir_all(&home).ok();
     }
 
