@@ -545,7 +545,7 @@ fn generate_agent_instructions(
     let preset = backend.preset();
     let instr_path = working_dir.join(preset.instructions_path);
 
-    let protocol = crate::protocol::resolve_protocol(&home)
+    let protocol = crate::protocol::resolve_protocol(home)
         .map_err(|e| format!("provision: protocol unavailable: {e}"))?;
     if protocol.state != "ready" {
         return Err(format!(

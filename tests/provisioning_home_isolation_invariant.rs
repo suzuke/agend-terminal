@@ -5,7 +5,7 @@
 //! home: the low-level API must make the home an explicit argument, and its
 //! implementation must not consult the ambient environment.
 
-fn read(path: &str) -> String {
+fn read_source(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{path}: {error}"))
 }
 
@@ -31,7 +31,7 @@ fn has_explicit_path_parameter(source: &str, function: &str) -> bool {
 
 #[test]
 fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
-    let instructions = read("src/instructions.rs");
+    let instructions = read_source("src/instructions.rs");
     for function in ["generate", "generate_for_owner", "generate_with_context"] {
         assert!(
             has_explicit_path_parameter(&instructions, function),
@@ -43,7 +43,7 @@ fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
         "instructions provisioning must not resolve ambient AGEND_HOME"
     );
 
-    let mcp_config = read("src/mcp_config.rs");
+    let mcp_config = read_source("src/mcp_config.rs");
     assert!(
         has_explicit_path_parameter(&mcp_config, "configure"),
         "mcp_config::configure must receive `home: &Path`"
