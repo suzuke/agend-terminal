@@ -274,6 +274,52 @@ fn function_pointer_ambient_env_lookup_is_rejected() {
 }
 
 #[test]
+fn structural_ambient_env_reference_matrix_is_rejected() {
+    for source in [
+        r#"
+            fn generate(home: &Path) {
+                let _ = home;
+                const KEY: &str = "AGEND_HOME";
+                let _ = std::env::var(KEY);
+            }
+        "#,
+        r#"
+            fn generate(home: &Path) {
+                let _ = home;
+                let key = "AGEND_HOME";
+                let _ = std::env::var(key);
+            }
+        "#,
+        r#"
+            fn generate(home: &Path) {
+                let _ = home;
+                let _ = std::env::var(&"AGEND_HOME");
+                let _ = std::env::var(concat!("AGEND_", "HOME"));
+            }
+        "#,
+        r#"
+            fn generate(home: &Path) {
+                let _ = home;
+                let _ = std::env::vars();
+            }
+        "#,
+        r#"
+            static LOOKUP: fn(&str) -> Result<String, std::env::VarError> = std::env::var;
+
+            fn generate(home: &Path) {
+                let _ = home;
+                let _ = LOOKUP("AGEND_HOME");
+            }
+        "#,
+    ] {
+        assert!(
+            has_ambient_home_lookup(source),
+            "every std::env lookup reference must be rejected regardless of key syntax"
+        );
+    }
+}
+
+#[test]
 fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
     let instructions = read_source("src/instructions.rs");
     for function in ["generate", "generate_for_owner", "generate_with_context"] {
