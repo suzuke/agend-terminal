@@ -81,12 +81,7 @@ impl<'ast> Visit<'ast> for ProvisioningCallVisitor {
     }
 }
 
-fn audit_items(
-    items: &[syn::Item],
-    path: &str,
-    test_scope: bool,
-    violations: &mut Vec<String>,
-) {
+fn audit_items(items: &[syn::Item], path: &str, test_scope: bool, violations: &mut Vec<String>) {
     for item in items {
         match item {
             syn::Item::Mod(module) => {
