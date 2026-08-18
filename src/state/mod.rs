@@ -1365,9 +1365,10 @@ impl StateTracker {
                     let _ = matched;
                 }
                 // #3294: the daemon's OWN startup modal wears the generic confirm
-                // chrome (see `is_dev_channel_startup_modal`), so suppress it the way
-                // the anchor / position gates do — the startup edge must never land an
-                // error-class state that the supervisor reports and never retracts.
+                // chrome (see `is_dev_channel_startup_modal`). Drop the detection, keeping
+                // the prior state via latch maintenance only (no structural fallback,
+                // unlike the anchor / position gates), so the startup edge never lands an
+                // error-class state the supervisor reports and never retracts.
                 Some((AgentState::PermissionPrompt, matched))
                     if is_dev_channel_startup_modal(matched, screen_text) =>
                 {

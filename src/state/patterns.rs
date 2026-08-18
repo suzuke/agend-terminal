@@ -396,6 +396,9 @@ pub(super) fn is_dev_channel_startup_modal(matched: &str, screen: &str) -> bool 
         "Esc to cancel · Tab to amend",
         "allow all edits during this session",
     ];
+    // The modal's own option row (`agent::dismiss` carries the captured grid).
+    const MODAL_OPTION_ROW: &str = "I am using this for local development";
+    const MODAL_TAIL_ROWS: usize = 5;
     if matched != GENERIC_CONFIRM_CHROME
         || PERMISSION_CHROME
             .iter()
@@ -408,22 +411,40 @@ pub(super) fn is_dev_channel_startup_modal(matched: &str, screen: &str) -> bool 
     // modal left in the scrolled-back rows, and it may wear this same generic
     // chrome. `detect_with_match` hands us the LEFTMOST match, so decide on the
     // lowest footer's own block: the rows between the previous chrome line (of any
-    // kind) and that footer. Suppress only when the marker is in THAT block.
+    // kind) and that footer.
     let Some(footer) = screen.rfind(GENERIC_CONFIRM_CHROME) else {
         return false;
     };
-    let block_start = std::iter::once(GENERIC_CONFIRM_CHROME)
-        .chain(PERMISSION_CHROME.iter().copied())
-        .filter_map(|chrome| screen[..footer].rfind(chrome).map(|at| at + chrome.len()))
-        .max()
+    // Only the generic chrome can appear here: a screen carrying permission-specific
+    // chrome already returned above, so chaining it in would be unreachable.
+    let block_start = screen[..footer]
+        .rfind(GENERIC_CONFIRM_CHROME)
+        .map(|at| at + GENERIC_CONFIRM_CHROME.len())
         .unwrap_or(0);
+    let block = &screen[block_start..footer];
     static MARKER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    MARKER
+    if !MARKER
         .get_or_init(|| {
             Regex::new(r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels")
                 .expect("dev-channel startup modal regex compiles")
         })
-        .is_match(&screen[block_start..footer])
+        .is_match(block)
+    {
+        return false;
+    }
+    // #3297 r1 (reviewer): the marker string circulates in ordinary pane content
+    // — issue text, PR bodies, this file — and a block boundary only exists while
+    // the modal's OWN footer survives. Both shapes let a quoted or half-repainted
+    // modal blind a real dialog below it, which is #3294 inverted: a genuinely
+    // blocked agent classified non-error-class, so nothing notifies the operator.
+    // Require the modal to OWN this footer: its option row must sit in the rows
+    // immediately above it (three rows apart in the rendered modal), which no
+    // dialog rendered below the modal's body can satisfy.
+    block
+        .lines()
+        .rev()
+        .take(MODAL_TAIL_ROWS)
+        .any(|line| line.contains(MODAL_OPTION_ROW))
 }
 
 pub(super) fn is_generic_startup_prompt(text: &str) -> bool {
