@@ -29,6 +29,26 @@ fn has_explicit_path_parameter(source: &str, function: &str) -> bool {
     })
 }
 
+fn has_ambient_home_lookup(source: &str) -> bool {
+    source.contains("crate::home_dir()")
+}
+
+#[test]
+fn aliased_ambient_home_lookup_is_rejected() {
+    let source = r#"
+        use crate::home_dir as ambient;
+
+        fn generate(home: &Path) {
+            let _ = home;
+            let _ = ambient();
+        }
+    "#;
+    assert!(
+        has_ambient_home_lookup(source),
+        "aliased crate::home_dir calls must be rejected"
+    );
+}
+
 #[test]
 fn provisioning_boundary_requires_explicit_home_and_has_no_ambient_lookup() {
     let instructions = read_source("src/instructions.rs");

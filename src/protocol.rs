@@ -160,9 +160,93 @@ struct DefaultHealedAudit {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_DEFAULT_HEALED_AUDIT: std::cell::RefCell<Option<Vec<DefaultHealedAudit>>> =
-        const { std::cell::RefCell::new(None) };
+#[derive(Default)]
+struct DefaultHealedAuditFields {
+    path: Option<PathBuf>,
+    from_digest: Option<String>,
+    to_digest: Option<String>,
+    build_sha: Option<String>,
+    message: Option<String>,
+}
+
+#[cfg(test)]
+impl tracing::field::Visit for DefaultHealedAuditFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let value = format!("{value:?}");
+        match field.name() {
+            "path" => self.path = Some(PathBuf::from(value)),
+            "from_digest" => self.from_digest = Some(value),
+            "to_digest" => self.to_digest = Some(value),
+            "build_sha" => self.build_sha = Some(value),
+            "message" => self.message = Some(value),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct DefaultHealedAuditLayer {
+    events: std::sync::Arc<std::sync::Mutex<Vec<DefaultHealedAudit>>>,
+}
+
+#[cfg(test)]
+impl<S> tracing_subscriber::layer::Layer<S> for DefaultHealedAuditLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "agend_terminal::protocol" {
+            return;
+        }
+
+        let mut fields = DefaultHealedAuditFields::default();
+        event.record(&mut fields);
+        let (Some(path), Some(from_digest), Some(to_digest), Some(build_sha), Some(message)) = (
+            fields.path,
+            fields.from_digest,
+            fields.to_digest,
+            fields.build_sha,
+            fields.message,
+        ) else {
+            return;
+        };
+        if message != "protocol default healed" {
+            return;
+        }
+
+        self.events
+            .lock()
+            .expect("default healed audit capture lock")
+            .push(DefaultHealedAudit {
+                target: "agend_terminal::protocol",
+                message: "protocol default healed",
+                path,
+                from_digest,
+                to_digest,
+                build_sha,
+            });
+    }
+}
+
+#[cfg(test)]
+fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHealedAudit>) {
+    use tracing_subscriber::prelude::*;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(DefaultHealedAuditLayer {
+        events: events.clone(),
+    });
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let events = std::sync::Arc::try_unwrap(events)
+        .expect("default healed audit capture still referenced")
+        .into_inner()
+        .expect("default healed audit capture lock");
+    (result, events)
 }
 
 fn emit_default_healed_audit(path: &Path, from_digest: &str, identity: &ProtocolIdentity) {
@@ -174,33 +258,6 @@ fn emit_default_healed_audit(path: &Path, from_digest: &str, identity: &Protocol
         build_sha = %identity.build_sha,
         "protocol default healed"
     );
-
-    #[cfg(test)]
-    TEST_DEFAULT_HEALED_AUDIT.with(|capture| {
-        if let Some(events) = capture.borrow_mut().as_mut() {
-            events.push(DefaultHealedAudit {
-                target: "agend_terminal::protocol",
-                message: "protocol default healed",
-                path: path.to_path_buf(),
-                from_digest: from_digest.to_owned(),
-                to_digest: identity.content_sha256.clone(),
-                build_sha: identity.build_sha.clone(),
-            });
-        }
-    });
-}
-
-#[cfg(test)]
-fn capture_default_healed_audit<T>(f: impl FnOnce() -> T) -> (T, Vec<DefaultHealedAudit>) {
-    TEST_DEFAULT_HEALED_AUDIT.with(|capture| {
-        *capture.borrow_mut() = Some(Vec::new());
-        let result = f();
-        let events = capture
-            .borrow_mut()
-            .take()
-            .expect("default healed audit capture was not initialized");
-        (result, events)
-    })
 }
 
 /// Extract embedded protocol to `AGEND_HOME/protocol/.default/`.
