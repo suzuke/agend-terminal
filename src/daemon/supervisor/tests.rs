@@ -965,6 +965,131 @@ fn auth_error_gate_fires_when_held_past_window() {
 /// 2 teams (team-a: orch-a + worker-a, team-b: orch-b + worker-b).
 /// worker-a transitions Idle → UsageLimit.
 /// Assert: orch-a inbox has 1 event; orch-b/worker-a/worker-b have 0.
+/// #3306 fixture: the daemon's own development-channels startup modal, the
+/// exact shape `Backend::ClaudeCode` auto-dismisses at spawn/restart. Copied
+/// from the #3294/#3297 state fixture so this file stays self-contained.
+const DEV_CHANNEL_STARTUP_MODAL_3306: &str = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels:   server:agend-claude-channel
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+";
+
+/// #3306: a Claude restart renders the dev-channel modal, the daemon
+/// auto-dismisses it (~300ms), and the pane goes Idle — yet the
+/// `starting → permission` member_state_change still reaches the team
+/// orchestrator with an "approve or deny" hint for a prompt the daemon has
+/// already pressed. This drives the production pipeline exactly as the
+/// supervisor tick does (feed → drain → reactions → notify) and pins that a
+/// DEV-TAGGED prompt entry produces NO immediate orchestrator notify — it is
+/// deferred behind the #3306 stability gate instead (see
+/// `dev_prompt_deferred_notify_fires_once_held_past_grace_3306` for the
+/// stuck-modal path that still notifies).
+#[test]
+fn dev_tagged_prompt_entry_does_not_notify_orchestrator_3306() {
+    let home = std::env::temp_dir().join(format!("agend-notify-3306-defer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "edge", "members": ["lead-3306", "impl-3306"], "orchestrator": "lead-3306"}),
+    );
+
+    // The member tracker exactly as production builds it: ClaudeCode starts in
+    // `Starting`; the dev-shaped frame classifies PermissionPrompt honestly and
+    // tags the episode (#3297 prompt_latch).
+    let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3306);
+    assert_eq!(
+        st.current,
+        crate::state::AgentState::PermissionPrompt,
+        "precondition: the modal must classify as PermissionPrompt"
+    );
+
+    let (transitions, _) = st.drain_pending_transitions();
+    let mut tracks = std::collections::HashMap::new();
+    for decision in reactions_from_transitions(&transitions) {
+        super::maybe_notify_member_state_change(
+            &home,
+            "impl-3306",
+            decision.from,
+            decision.to,
+            "",
+            &mut tracks,
+        );
+    }
+
+    let lead_inbox = home.join("inbox").join("lead-3306.jsonl");
+    let lead_count = std::fs::read_to_string(&lead_inbox)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(
+        lead_count, 0,
+        "#3306: an auto-dismissed dev-channel modal must not member-notify the orchestrator"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3306 control (#1552 unchanged): a GENERIC permission prompt — no
+/// dev-channel shape, so no episode tag — still member-notifies the
+/// orchestrator immediately, edge-triggered, byte-identical to today.
+#[test]
+fn generic_prompt_entry_still_notifies_orchestrator_3306() {
+    let home = std::env::temp_dir().join(format!("agend-notify-3306-generic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "edge", "members": ["lead-3306g", "impl-3306g"], "orchestrator": "lead-3306g"}),
+    );
+
+    let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    st.feed("  Requesting permission for: rm -rf /\n\n  Esc to cancel · Tab to amend\n");
+    assert_eq!(
+        st.current,
+        crate::state::AgentState::PermissionPrompt,
+        "precondition: the generic chrome must classify as PermissionPrompt"
+    );
+
+    let (transitions, _) = st.drain_pending_transitions();
+    let mut tracks = std::collections::HashMap::new();
+    for decision in reactions_from_transitions(&transitions) {
+        super::maybe_notify_member_state_change(
+            &home,
+            "impl-3306g",
+            decision.from,
+            decision.to,
+            "",
+            &mut tracks,
+        );
+    }
+
+    let lead_inbox = home.join("inbox").join("lead-3306g.jsonl");
+    let lead_count = std::fs::read_to_string(&lead_inbox)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(
+        lead_count, 1,
+        "#1552: a real (untagged) permission prompt must still notify the orchestrator"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn notify_single_receiver_2x2_invariant() {
     let home = std::env::temp_dir().join(format!("agend-notify-2x2-{}", std::process::id()));
