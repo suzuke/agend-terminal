@@ -901,6 +901,96 @@ mod review_assignment_marker_tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #3309: a typed review_assignment dispatch whose target task is already
+    /// TERMINAL (Done / Cancelled / Superseded) must be rejected atomically,
+    /// BEFORE any assignment is minted or enqueued. The reconcile pass already
+    /// encodes this invariant (assignment_reconcile.rs task-terminal gate,
+    /// #2878-16: "a cancelled/done task cannot produce a valid review — retire
+    /// the assignment instead of re-nudging it"); without the dispatch-side
+    /// twin, the caller receives a live-looking assignment_id that reconcile
+    /// retires on a later tick — a success-shaped response for an assignment
+    /// that can never produce a review.
+    #[test]
+    fn review_assignment_rejects_terminal_task_atomically_3309() {
+        let by = crate::task_events::InstanceName("system:test".into());
+        let terminal_events: Vec<(&str, crate::task_events::TaskEvent)> = vec![
+            (
+                "cancelled",
+                crate::task_events::TaskEvent::Cancelled {
+                    task_id: crate::task_events::TaskId("t-rev-1".into()),
+                    by: by.clone(),
+                    reason: "head advanced after a REJECTED verdict".into(),
+                },
+            ),
+            (
+                "done",
+                crate::task_events::TaskEvent::Done {
+                    task_id: crate::task_events::TaskId("t-rev-1".into()),
+                    by: by.clone(),
+                    source: crate::task_events::DoneSource::OperatorManual {
+                        authored_at: "2026-08-19T00:00:00Z".into(),
+                        result: None,
+                    },
+                },
+            ),
+            (
+                "superseded",
+                crate::task_events::TaskEvent::Superseded {
+                    task_id: crate::task_events::TaskId("t-rev-1".into()),
+                    by: by.clone(),
+                    successor_id: crate::task_events::TaskId("t-rev-2".into()),
+                },
+            ),
+        ];
+        for (label, terminal) in terminal_events {
+            let home = tmp_home(&format!("terminal-{label}"));
+            seed_fleet(
+                &home,
+                "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+            );
+            // Task owned by the reviewer target, complete pr_state on disk: the
+            // dispatch clears every existing gate, so the ONLY thing standing
+            // between it and a minted assignment is the terminal-status check.
+            seed_exact_subject_with_owner(&home, "reviewer");
+            crate::task_events::append(&home, &by, terminal).unwrap();
+            let sender = Some(Sender::new("lead").unwrap());
+            let out = handle_delegate_task(
+                &home,
+                &json!({
+                    "instance": "reviewer",
+                    "task": "review the PR",
+                    "review_assignment": true,
+                    "task_id": "t-rev-1",
+                    "branch": "feat/x",
+                    "repository": "owner/repo",
+                    "pr_number": 42,
+                    "reviewed_head": EXACT_HEAD,
+                    "review_author": {"external": "octocat"}
+                }),
+                &sender,
+                None,
+            );
+            assert_eq!(
+                out["code"], "review_assignment_task_terminal",
+                "a {label} task must reject the marker dispatch atomically: {out}"
+            );
+            assert!(
+                out.get("assignment_id").is_none(),
+                "no assignment_id may be returned against a {label} task: {out}"
+            );
+            assert!(
+                crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                    .is_none(),
+                "terminal-task rejection must not persist assignment authority ({label})"
+            );
+            assert!(
+                crate::daemon::assignment_authority::active_branches(&home).is_empty(),
+                "terminal-task rejection must not create a store branch ({label})"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
     /// T17 (B18): a marker dispatch with missing OR zero pr_number is atomically
     /// rejected BEFORE any side effect (no bind/create).
     #[test]
