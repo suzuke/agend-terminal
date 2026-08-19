@@ -820,6 +820,161 @@ fn unavailable_queue_does_not_poison_same_id_retry_or_restart_state() {
 }
 
 #[test]
+fn prepared_prefix_reserves_same_id_and_marks_receipt_ambiguous() {
+    let home = home("prepared-prefix");
+    let locator = test_published_locator(&home, "claude-agent");
+    let envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        crate::agent::fresh_restart_self_kick_prompt(),
+    );
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    append_log(
+        &home,
+        "claude-agent",
+        &ChannelLogRecord::InboundPrepared {
+            delivery_id,
+            chat_id: chat_id.clone(),
+            sender_id: Some("agend-terminal".to_string()),
+            content: envelope.body.clone(),
+            recorded_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("prepared prefix");
+
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("restart runtime");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    runtime.set_sender(sender);
+    assert_eq!(
+        runtime
+            .admit_channel_notification(
+                delivery_id,
+                &chat_id,
+                Some("agend-terminal"),
+                &envelope.body,
+            )
+            .expect("same-id replay"),
+        NotificationAdmission::Duplicate
+    );
+    assert_eq!(
+        runtime
+            .admit_channel_notification(delivery_id, &chat_id, Some("agend-terminal"), "different",)
+            .expect("same-id conflict"),
+        NotificationAdmission::Conflict
+    );
+    assert!(receiver.try_recv().is_err());
+    let receipt = store
+        .latest(delivery_id)
+        .expect("latest receipt")
+        .expect("ambiguous receipt");
+    assert_eq!(receipt.state, DeliveryState::Ambiguous);
+    assert!(receipt
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("prepared admission")));
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn rejected_suffix_reopens_prepared_id_across_restart() {
+    let home = home("rejected-suffix");
+    let locator = test_published_locator(&home, "claude-agent");
+    let delivery_id = Uuid::new_v4();
+    append_log(
+        &home,
+        "claude-agent",
+        &ChannelLogRecord::InboundPrepared {
+            delivery_id,
+            chat_id: "chat-1".to_string(),
+            sender_id: None,
+            content: "hello".to_string(),
+            recorded_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("prepared prefix");
+    append_log(
+        &home,
+        "claude-agent",
+        &ChannelLogRecord::InboundRejected {
+            delivery_id,
+            recorded_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("rejected suffix");
+
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("restart runtime");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    runtime.set_sender(sender);
+    assert_eq!(
+        runtime
+            .admit_channel_notification(delivery_id, "chat-1", None, "hello")
+            .expect("retry after rejection"),
+        NotificationAdmission::Accepted
+    );
+    let notification = receiver.recv().expect("retry notification");
+    assert_eq!(
+        notification.pointer("/params/meta/delivery_id"),
+        Some(&Value::String(delivery_id.to_string()))
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn legacy_inbound_prefix_is_reserved_and_marked_ambiguous() {
+    let home = home("legacy-inbound-prefix");
+    let locator = test_published_locator(&home, "claude-agent");
+    let envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        crate::agent::fresh_restart_self_kick_prompt(),
+    );
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    append_log(
+        &home,
+        "claude-agent",
+        &ChannelLogRecord::Inbound {
+            delivery_id,
+            chat_id: chat_id.clone(),
+            sender_id: Some("agend-terminal".to_string()),
+            content: envelope.body.clone(),
+            recorded_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("legacy inbound prefix");
+
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("restart runtime");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    runtime.set_sender(sender);
+    assert_eq!(
+        runtime
+            .admit_channel_notification(
+                delivery_id,
+                &chat_id,
+                Some("agend-terminal"),
+                &envelope.body,
+            )
+            .expect("legacy same-id replay"),
+        NotificationAdmission::Duplicate
+    );
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        store
+            .latest(delivery_id)
+            .expect("latest receipt")
+            .expect("ambiguous receipt")
+            .state,
+        DeliveryState::Ambiguous
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn reply_requires_delivery_and_chat_correlation() {
     let home = home("correlation");
     let locator = test_published_locator(&home, "claude-agent");
