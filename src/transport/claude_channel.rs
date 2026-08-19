@@ -26,8 +26,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-mod replay;
-
 pub(crate) const CHANNEL_SERVER_NAME: &str = "agend-claude-channel";
 const MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 80);
 const BRIDGE_VERSION: &str = "0.1.0";
@@ -222,7 +220,6 @@ struct ChannelRuntime {
 impl ChannelRuntime {
     fn new(home: &Path, instance: &str, locator: &SessionLocator) -> anyhow::Result<Self> {
         let mut inbound = InboundIndex::default();
-        let mut prepared = HashMap::new();
         let mut replies = HashMap::new();
         for record in load_log(home, instance)? {
             match record {
@@ -233,10 +230,8 @@ impl ChannelRuntime {
                     content,
                     ..
                 } => {
-                    // Legacy `Inbound` was persisted before the notification
-                    // entered the bridge queue, so it has the same ambiguous
-                    // replay contract as an unresolved `InboundPrepared`.
-                    prepared.insert(
+                    inbound.by_chat.insert(chat_id.clone(), delivery_id);
+                    inbound.by_delivery.insert(
                         delivery_id,
                         InboundIdentity {
                             chat_id,
@@ -252,7 +247,6 @@ impl ChannelRuntime {
                     content,
                     ..
                 } => {
-                    prepared.remove(&delivery_id);
                     inbound.by_chat.insert(chat_id.clone(), delivery_id);
                     inbound.by_delivery.insert(
                         delivery_id,
@@ -263,25 +257,8 @@ impl ChannelRuntime {
                         },
                     );
                 }
-                ChannelLogRecord::InboundPrepared {
-                    delivery_id,
-                    chat_id,
-                    sender_id,
-                    content,
-                    ..
-                } => {
-                    prepared.insert(
-                        delivery_id,
-                        InboundIdentity {
-                            chat_id,
-                            sender_id: sender_id.unwrap_or_else(|| "agend-terminal".to_string()),
-                            content,
-                        },
-                    );
-                }
-                ChannelLogRecord::InboundRejected { delivery_id, .. } => {
-                    prepared.remove(&delivery_id);
-                }
+                ChannelLogRecord::InboundPrepared { .. }
+                | ChannelLogRecord::InboundRejected { .. } => {}
                 ChannelLogRecord::Reply {
                     delivery_id,
                     chat_id,
@@ -302,7 +279,6 @@ impl ChannelRuntime {
                 }
             }
         }
-        replay::restore_prepared(home, instance, &mut inbound, prepared)?;
         Ok(Self {
             home: home.to_path_buf(),
             instance: instance.to_string(),
