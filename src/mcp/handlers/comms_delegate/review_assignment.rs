@@ -180,6 +180,22 @@ pub(crate) fn validate_review_assignment_marker(
             "code": "review_assignment_task_owner_mismatch",
         }));
     }
+    // #3309: dispatch-side twin of assignment_reconcile's task-terminal gate
+    // (#2878-16). A terminal task cannot produce a valid review; without this
+    // check the marker mints a live-looking assignment_id that reconcile
+    // retires on a later tick — a silent failure on the dispatching side.
+    // Same authority as the reconcile gate: `TaskStatus::is_terminal()`
+    // (Done | Cancelled | Superseded), so the two sides cannot drift apart on
+    // which statuses count.
+    if task.status.is_terminal() {
+        return Err(json!({
+            "error": format!(
+                "review_assignment task `{task_id}` is terminal ({}) — a terminal task cannot produce a valid review",
+                task.status
+            ),
+            "code": "review_assignment_task_terminal",
+        }));
+    }
     let task_review_class = task
         .metadata
         .get("review_class")
