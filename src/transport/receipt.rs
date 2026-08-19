@@ -163,6 +163,11 @@ impl ReceiptStore {
     ) -> anyhow::Result<DeliveryReceipt> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
+        if let Some(previous) = self.latest_locked(envelope.delivery_id)? {
+            if previous.state == DeliveryState::Ambiguous {
+                return Ok(previous);
+            }
+        }
         let mut receipt = DeliveryReceipt::queued(envelope);
         receipt.attempt = self.next_attempt_locked(envelope)?;
         self.append_locked(DurableRecord {

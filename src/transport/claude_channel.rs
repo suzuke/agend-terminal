@@ -437,12 +437,15 @@ impl ChannelRuntime {
         if current.state == DeliveryState::TurnStarted {
             return Ok(current);
         }
-        if current.state.is_terminal() {
+        if current.state.is_terminal() && current.state != DeliveryState::Ambiguous {
             anyhow::bail!("self-kick delivery is no longer awaiting start acknowledgement")
         }
         if !matches!(
             current.state,
-            DeliveryState::Queued | DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+            DeliveryState::Queued
+                | DeliveryState::ProtocolAccepted
+                | DeliveryState::Ambiguous
+                | DeliveryState::AckOverdue
         ) {
             anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
         }
@@ -473,7 +476,7 @@ impl ChannelRuntime {
         }
         if !matches!(
             current.state,
-            DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+            DeliveryState::ProtocolAccepted | DeliveryState::Ambiguous | DeliveryState::AckOverdue
         ) {
             anyhow::bail!("self-kick delivery is not protocol-accepted")
         }
@@ -497,7 +500,9 @@ impl ChannelRuntime {
             }
             if !matches!(
                 latest.state,
-                DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+                DeliveryState::ProtocolAccepted
+                    | DeliveryState::Ambiguous
+                    | DeliveryState::AckOverdue
             ) {
                 anyhow::bail!("self-kick start acknowledgement lost a receipt race")
             }
