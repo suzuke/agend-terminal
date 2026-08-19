@@ -146,6 +146,49 @@ fn restart_retires_terminal_receipt_rows_without_restamping_3310() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// #3310 the point of the whole fix: the SECOND restart must be a no-op for
+/// an already-retired row. The retirement record nets the legacy row out of
+/// `prepared` at load, so restart #2 adds zero journal records and leaves the
+/// receipt exactly as restart #1 stamped it — instead of re-priming the row
+/// (and the in-memory inbound maps) forever, which is what shipped before.
+#[test]
+fn second_restart_is_a_noop_for_retired_rows_3310() {
+    let home = home("3310-idem");
+    let locator = test_published_locator(&home, "claude-agent");
+    let delivery_id = seed_legacy_inbound_row_3310(&home, DeliveryState::Queued);
+
+    drop(ChannelRuntime::new(&home, "claude-agent", &locator).expect("first restart"));
+    let journal_after_first = load_log(&home, "claude-agent").expect("journal").len();
+    assert_eq!(
+        journal_retire_rows_for_3310(&home, delivery_id),
+        1,
+        "restart #1 retires the row exactly once"
+    );
+
+    drop(ChannelRuntime::new(&home, "claude-agent", &locator).expect("second restart"));
+    assert_eq!(
+        load_log(&home, "claude-agent").expect("journal").len(),
+        journal_after_first,
+        "restart #2 must add ZERO journal records for an already-retired row"
+    );
+    assert_eq!(
+        journal_retire_rows_for_3310(&home, delivery_id),
+        1,
+        "restart #2 must not re-retire"
+    );
+    let latest = ReceiptStore::for_instance(&home, "claude-agent")
+        .expect("store")
+        .latest(delivery_id)
+        .expect("latest readable")
+        .expect("receipt present");
+    assert_eq!(
+        latest.state,
+        DeliveryState::Ambiguous,
+        "the receipt keeps restart #1's single Ambiguous stamp"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 /// #3310: 1636 receipts flipped fleet-wide in ten seconds with not one log
 /// line. The sweep must say what it did — one summary per restore pass.
 #[test]
