@@ -297,6 +297,25 @@ pub(crate) enum ReactionKind {
 /// This replaces the pre-#1530 `if prev_state != new_state` gate, which was
 /// blind to feed-driven transitions (they complete async in the read-loop
 /// thread, so `prev == new` by the next supervisor tick) — see #1530.
+/// #3306 gate — production-path-coupled per §3.5.10 (the supervisor tick and
+/// the tests call this same function). A reaction whose target is
+/// `PermissionPrompt` while the member's #3297 dev-channel episode tag is live
+/// must NOT notify the orchestrator on the edge: the prompt is the daemon's
+/// own startup modal mid-auto-dismiss, and the "approve or deny" hint would be
+/// un-actionable noise. The caller records the decision as pending instead;
+/// `resolve_pending_dev_prompt` (supervisor.rs) fires it once the episode has
+/// been HELD past `DEV_PROMPT_NOTIFY_STABILITY` — so a stuck modal (failed
+/// auto-dismiss) still reaches the orchestrator (#1552 preserved, bounded
+/// delay) while the normal sub-second dismiss produces zero notify. An
+/// untagged (generic) prompt returns false and keeps today's edge-triggered
+/// immediate notify byte-identical.
+pub(crate) fn dev_prompt_defers_member_notify(
+    to: crate::state::AgentState,
+    dev_prompt_tagged: bool,
+) -> bool {
+    to == crate::state::AgentState::PermissionPrompt && dev_prompt_tagged
+}
+
 pub(crate) fn reactions_from_transitions(
     transitions: &[crate::state::TransitionRecord],
 ) -> Vec<ReactionDecision> {

@@ -71,6 +71,20 @@ impl StateTracker {
         }
     }
 
+    /// #3306: how long the CURRENT dev-tagged prompt episode has been held, or
+    /// `None` when no dev-tagged episode is live (untagged prompt, released,
+    /// or exited). The supervisor captures this under the core lock and feeds
+    /// it to the deferred member-notify gate — `Some` defers the edge notify,
+    /// and the held duration decides when a stuck (auto-dismiss failed) modal
+    /// finally does notify the orchestrator. `since` is the prompt-entry
+    /// instant and is stable across repeated dev frames (same-state
+    /// transitions early-return), so the duration measures the episode, not
+    /// the latest repaint.
+    pub(crate) fn dev_prompt_episode_held(&self) -> Option<std::time::Duration> {
+        (self.current == AgentState::PermissionPrompt && self.prompt_episode.is_some())
+            .then(|| self.since.elapsed())
+    }
+
     /// Drop the tag whenever the prompt is left by any path, so it can never
     /// outlive the episode that created it. Called from `record_set`, the single
     /// funnel, BEFORE `current` moves.

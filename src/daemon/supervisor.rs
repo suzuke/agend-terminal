@@ -67,6 +67,14 @@ const AWAITING_ENGAGEMENT_WINDOW_MS: i64 = 15_000;
 /// copying the 90s — both gates defend the identical content-FP boundary on the
 /// identical `StateTracker::since` continuous-`AuthError` signal.
 pub(crate) const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
+/// #3306: how long a DEV-TAGGED `PermissionPrompt` episode (the daemon's own
+/// development-channels startup modal, mid-auto-dismiss) must be continuously
+/// held before the deferred member-notify fires. The normal dismiss
+/// round-trip is sub-second (live sample on the issue: 384ms); 10s
+/// comfortably clears repaint jitter while still alerting the orchestrator
+/// 12x sooner than the 120s `INTERACTIVE_EXPIRY` backstop when the
+/// auto-dismiss genuinely failed and a human must intervene.
+pub(crate) const DEV_PROMPT_NOTIFY_STABILITY: Duration = Duration::from_secs(10);
 /// #1696: tiered retry budget. Phase A burst (5/15/30s) handles instant jitter;
 /// Phase B backoff (1m/2m/5m) handles minute-scale proxy faults; Phase C
 /// sustained (10m × 6 = 1hr) keeps a "pilot light" through a long outage. The
@@ -208,6 +216,54 @@ fn resolve_pending_auth(
     }
 }
 
+/// #3306: a deferred member-notify for a dev-tagged `PermissionPrompt`
+/// episode (see `reactions::dev_prompt_defers_member_notify`). Carries the
+/// originating `from` + pane tail captured at the edge, exactly like
+/// [`PendingAuthError`], so the eventual notify renders the real transition.
+struct PendingDevPrompt {
+    from: crate::state::AgentState,
+    pane_tail: String,
+}
+
+/// #3306: stability verdict for a (possibly) pending dev-prompt notify.
+/// `dev_prompt_held` is `Some(elapsed)` iff the agent CURRENTLY sits in a
+/// dev-tagged `PermissionPrompt` episode
+/// (`StateTracker::dev_prompt_episode_held` — state-age straight from
+/// `since`, no separate clock to drift). Same tri-state contract as
+/// [`auth_error_gate`], whose verdict enum it reuses: `None` → the episode
+/// ended (the auto-dismiss's release landed, or the prompt was exited) →
+/// `Cancel`; held < N → `Wait`; held ≥ N → `Fire` — the auto-dismiss failed
+/// and the orchestrator genuinely needs to know (#1552, bounded delay).
+fn dev_prompt_gate(dev_prompt_held: Option<Duration>) -> AuthErrorGate {
+    match dev_prompt_held {
+        Some(held) if held >= DEV_PROMPT_NOTIFY_STABILITY => AuthErrorGate::Fire,
+        Some(_) => AuthErrorGate::Wait,
+        None => AuthErrorGate::Cancel,
+    }
+}
+
+/// #3306 twin of [`resolve_pending_auth`] over the dev-prompt pending map —
+/// deliberately the same body, including the #1741 boot-grace hold semantics
+/// (a `Fire` during boot-grace stays pending rather than being lost or
+/// re-paged). Kept parallel instead of genericized so the #1523 path stays
+/// byte-untouched.
+fn resolve_pending_dev_prompt(
+    gate: AuthErrorGate,
+    in_boot_grace: bool,
+    name: &str,
+    pending_dev_prompt: &mut HashMap<String, PendingDevPrompt>,
+) -> Option<PendingDevPrompt> {
+    match gate {
+        AuthErrorGate::Fire if in_boot_grace => None,
+        AuthErrorGate::Fire => pending_dev_prompt.remove(name),
+        AuthErrorGate::Cancel => {
+            pending_dev_prompt.remove(name);
+            None
+        }
+        AuthErrorGate::Wait => None,
+    }
+}
+
 /// Sprint 54 P2-3: dedup key for `PaneInputNotSubmitted` emission.
 /// Records the `last_input_epoch_ms` of the most recent emit so the
 /// supervisor doesn't re-fire on every 10-s tick while the operator
@@ -295,6 +351,8 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
     // #1523: deferred AuthError member-notifies awaiting stability confirmation.
     let mut pending_auth: HashMap<String, PendingAuthError> = HashMap::new();
+    // #3306: deferred dev-prompt member-notifies awaiting the stability gate.
+    let mut pending_dev_prompt: HashMap<String, PendingDevPrompt> = HashMap::new();
     let mut retry_tracks: HashMap<String, RateLimitRetry> = HashMap::new();
     // #1697: agents currently in a nudged ApiError episode (re-armed on leaving
     // the ApiError state). #1696/#1697: last continue-inject time per agent,
@@ -353,6 +411,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
                 &registry,
                 &mut notify_tracks,
                 &mut pending_auth,
+                &mut pending_dev_prompt,
                 loop_started_at,
                 &input_timestamps,
             );
@@ -425,6 +484,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             // will NOT overwrite). Sweep it against the live set, mirroring the
             // `notify_tracks` prune directly above.
             pending_auth.retain(|name, _| live_agents.contains(name));
+            pending_dev_prompt.retain(|name, _| live_agents.contains(name));
         }));
         if let Err(payload) = outcome {
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
@@ -685,6 +745,7 @@ fn tick(
     registry: &AgentRegistry,
     notify_tracks: &mut HashMap<String, NotifyTrack>,
     pending_auth: &mut HashMap<String, PendingAuthError>,
+    pending_dev_prompt: &mut HashMap<String, PendingDevPrompt>,
     loop_started_at: Instant,
     input_timestamps: &HashMap<String, (i64, i64)>,
 ) {
@@ -784,6 +845,10 @@ fn tick(
         // state-age — so no separate clock can drift. Assigned exactly once
         // inside the (unconditional) lock block below.
         let auth_error_held: Option<Duration>;
+        // #3306: Some(held) iff the agent currently sits in a dev-tagged
+        // PermissionPrompt episode; captured under the core lock alongside
+        // auth_error_held, consumed by the post-lock gates below.
+        let dev_prompt_held: Option<Duration>;
         // CR-2026-06-14 (concurrency): captured under the core lock, the actual
         // (disk-writing) `clear_waiting_on_if_stale` runs lock-free after the
         // lock drops — keeps blocking file IO out of the per-agent core-mutex
@@ -915,6 +980,7 @@ fn tick(
             // AuthError; the gate uses it to confirm/cancel a deferred notify.
             auth_error_held = (agent_state == crate::state::AgentState::AuthError)
                 .then(|| core.state.since.elapsed());
+            dev_prompt_held = core.state.dev_prompt_episode_held();
             let silent = core.state.last_output.elapsed();
             // #1563: role policy gates the two `Starting`-context stall-forward
             // paths (branch-1 startup-stall, branch-2 startup-prose prompt) for
@@ -1106,6 +1172,25 @@ fn tick(
                                         from: intent.from,
                                         pane_tail: intent.pane_tail.clone(),
                                     });
+                            } else if dev_prompt_defers_member_notify(
+                                intent.to,
+                                dev_prompt_held.is_some(),
+                            ) {
+                                // #3306: the daemon's own dev-channel startup
+                                // modal is mid-auto-dismiss — record the edge as
+                                // pending instead of paging the orchestrator
+                                // with an un-actionable approve/deny hint.
+                                // `resolve_pending_dev_prompt` below fires it
+                                // only if the episode survives
+                                // DEV_PROMPT_NOTIFY_STABILITY (dismiss failed)
+                                // and cancels it when the release lands (the
+                                // normal sub-second case).
+                                pending_dev_prompt.entry(name.clone()).or_insert(
+                                    PendingDevPrompt {
+                                        from: intent.from,
+                                        pane_tail: intent.pane_tail.clone(),
+                                    },
+                                );
                             } else if !crate::daemon::per_tick::in_boot_grace(loop_started_at) {
                                 // #1741 boot-grace: a daemon restart resets
                                 // notify_tracks (the 60s cooldown) AND re-derives
@@ -1153,6 +1238,28 @@ fn tick(
                 &name,
                 p.from,
                 crate::state::AgentState::AuthError,
+                &p.pane_tail,
+                notify_tracks,
+            );
+        }
+
+        // #3306: deferred dev-prompt member-notify — same confirm-or-cancel
+        // shape as the #1523 AuthError gate directly above. Fires once the
+        // dev-tagged episode has been HELD past DEV_PROMPT_NOTIFY_STABILITY
+        // (the auto-dismiss failed — #1552 still reaches the orchestrator,
+        // seconds late instead of never); cancels silently when the release
+        // landed, which is the normal sub-second case.
+        if let Some(p) = resolve_pending_dev_prompt(
+            dev_prompt_gate(dev_prompt_held),
+            in_boot_grace,
+            &name,
+            pending_dev_prompt,
+        ) {
+            maybe_notify_member_state_change(
+                home,
+                &name,
+                p.from,
+                crate::state::AgentState::PermissionPrompt,
                 &p.pane_tail,
                 notify_tracks,
             );
