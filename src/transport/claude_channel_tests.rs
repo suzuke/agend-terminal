@@ -25,6 +25,145 @@ fn test_published_locator(home: &Path, instance: &str) -> SessionLocator {
     locator
 }
 
+/// #3310 seed: one legacy `Inbound` journal row (the pre-settle era shape —
+/// this host carried 765 of them with ZERO settle records) whose receipt is
+/// still non-terminal, i.e. exactly the backlog the 2026-08-19 restart swept
+/// into 1636 Ambiguous receipts fleet-wide in ten seconds.
+fn seed_legacy_inbound_row_3310(home: &Path, state: DeliveryState) -> Uuid {
+    let mut envelope = DeliveryEnvelope::new(
+        "claude-agent",
+        SessionLocator::claude(
+            "http://127.0.0.1:43123".to_string(),
+            "claude-test-session".to_string(),
+            "test-token".to_string(),
+        ),
+        crate::transport::envelope::DeliveryKind::Notification,
+        "[AGEND-MSG] id=m-3310 kind=task from=lead inbox=1",
+        None,
+    );
+    let delivery_id = envelope.delivery_id;
+    let store = ReceiptStore::for_instance(home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    if state != DeliveryState::Queued {
+        store
+            .record(DeliveryReceipt::for_state(&envelope, state))
+            .expect("advance receipt");
+    }
+    envelope.delivery_id = delivery_id;
+    append_log(
+        home,
+        "claude-agent",
+        &ChannelLogRecord::Inbound {
+            delivery_id,
+            chat_id: format!("chat-{delivery_id}"),
+            sender_id: None,
+            content: "[AGEND-MSG] id=m-3310 kind=task from=lead inbox=1".to_string(),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("legacy journal row");
+    delivery_id
+}
+
+fn journal_retire_rows_for_3310(home: &Path, delivery_id: Uuid) -> usize {
+    load_log(home, "claude-agent")
+        .expect("journal readable")
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record,
+                ChannelLogRecord::InboundRejected { delivery_id: id, .. } if *id == delivery_id
+            )
+        })
+        .count()
+}
+
+/// #3310: the restart sweep stamps a replayed prepared row Ambiguous but
+/// writes NOTHING back to the journal, so the same row re-primes `prepared`
+/// (and the in-memory inbound maps) on EVERY subsequent restart, forever.
+/// The fix: after the sweep decides a row's fate, RETIRE it in the journal
+/// (an `InboundRejected` record — its replay semantic, `prepared.remove`, is
+/// exactly right and pre-#3310 readers already understand it) so the next
+/// load nets it out. Stamp-then-retire order keeps the crash window
+/// convergent: a crash between the two leaves an Ambiguous receipt that the
+/// next sweep skips-and-retires.
+#[test]
+fn restart_retires_replayed_prepared_rows_in_the_journal_3310() {
+    let home = home("3310-retire");
+    let locator = test_published_locator(&home, "claude-agent");
+    let delivery_id = seed_legacy_inbound_row_3310(&home, DeliveryState::Queued);
+
+    let _runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+
+    // Existing behavior (sanity): the non-terminal receipt was swept Ambiguous.
+    let latest = ReceiptStore::for_instance(&home, "claude-agent")
+        .expect("store")
+        .latest(delivery_id)
+        .expect("latest readable")
+        .expect("receipt present");
+    assert_eq!(
+        latest.state,
+        DeliveryState::Ambiguous,
+        "precondition: the sweep must stamp the replayed row Ambiguous"
+    );
+
+    // #3310 contract: the sweep must also retire the row in the journal.
+    assert_eq!(
+        journal_retire_rows_for_3310(&home, delivery_id),
+        1,
+        "the restart sweep must retire the replayed prepared row in the journal \
+         so the next restart does not re-prime it"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #3310: a receipt already TERMINAL (e.g. Completed) is skipped by the
+/// Ambiguous stamp — but its journal row still replayed into `prepared` on
+/// every restart. It must be retired too, without touching the receipt.
+#[test]
+fn restart_retires_terminal_receipt_rows_without_restamping_3310() {
+    let home = home("3310-terminal");
+    let locator = test_published_locator(&home, "claude-agent");
+    let delivery_id = seed_legacy_inbound_row_3310(&home, DeliveryState::Completed);
+
+    let _runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+
+    let latest = ReceiptStore::for_instance(&home, "claude-agent")
+        .expect("store")
+        .latest(delivery_id)
+        .expect("latest readable")
+        .expect("receipt present");
+    assert_eq!(
+        latest.state,
+        DeliveryState::Completed,
+        "a terminal receipt must never be re-stamped by the sweep"
+    );
+    assert_eq!(
+        journal_retire_rows_for_3310(&home, delivery_id),
+        1,
+        "a terminal-receipt row must still be retired from the journal"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #3310: 1636 receipts flipped fleet-wide in ten seconds with not one log
+/// line. The sweep must say what it did — one summary per restore pass.
+#[test]
+#[tracing_test::traced_test]
+fn restart_sweep_logs_one_summary_line_3310() {
+    let home = home("3310-summary");
+    let locator = test_published_locator(&home, "claude-agent");
+    let _delivery_id = seed_legacy_inbound_row_3310(&home, DeliveryState::Queued);
+
+    let _runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+
+    assert!(
+        logs_contain("bridge restart retired"),
+        "#3310: the restart sweep must log a summary of what it swept"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn claude_uses_channel_bridge_by_default() {
     assert_eq!(
