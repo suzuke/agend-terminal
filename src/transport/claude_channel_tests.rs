@@ -875,6 +875,64 @@ fn prepared_prefix_reserves_same_id_and_marks_receipt_ambiguous() {
         .detail
         .as_deref()
         .is_some_and(|detail| detail.contains("prepared admission")));
+
+    let retry = store
+        .record_queued(&envelope)
+        .expect("same-id retry bookkeeping");
+    assert_eq!(retry.state, DeliveryState::Ambiguous);
+    assert_eq!(
+        store
+            .latest(delivery_id)
+            .expect("latest retry receipt")
+            .expect("preserved ambiguous receipt")
+            .state,
+        DeliveryState::Ambiguous
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn prepared_prefix_ambiguous_accepts_exact_start_ack() {
+    let home = home("prepared-prefix-start-ack");
+    let locator = test_published_locator(&home, "claude-agent");
+    let envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        crate::agent::fresh_restart_self_kick_prompt(),
+    );
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    append_log(
+        &home,
+        "claude-agent",
+        &ChannelLogRecord::InboundPrepared {
+            delivery_id,
+            chat_id,
+            sender_id: Some("agend-terminal".to_string()),
+            content: envelope.body.clone(),
+            recorded_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("prepared prefix");
+
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("restart runtime");
+    assert_eq!(
+        store
+            .latest(delivery_id)
+            .expect("latest receipt")
+            .expect("ambiguous receipt")
+            .state,
+        DeliveryState::Ambiguous
+    );
+    assert_eq!(
+        runtime
+            .acknowledge_self_kick(delivery_id)
+            .expect("exact start ack")
+            .state,
+        DeliveryState::TurnStarted
+    );
     let _ = fs::remove_dir_all(home);
 }
 
@@ -970,6 +1028,54 @@ fn legacy_inbound_prefix_is_reserved_and_marked_ambiguous() {
             .expect("ambiguous receipt")
             .state,
         DeliveryState::Ambiguous
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn legacy_inbound_ambiguous_accepts_exact_start_ack() {
+    let home = home("legacy-inbound-start-ack");
+    let locator = test_published_locator(&home, "claude-agent");
+    let envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        crate::agent::fresh_restart_self_kick_prompt(),
+    );
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+    accepted.protocol_request_id = Some(delivery_id.to_string());
+    store.record(accepted).expect("protocol accepted receipt");
+    append_log(
+        &home,
+        "claude-agent",
+        &ChannelLogRecord::Inbound {
+            delivery_id,
+            chat_id,
+            sender_id: Some("agend-terminal".to_string()),
+            content: envelope.body.clone(),
+            recorded_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .expect("legacy inbound prefix");
+
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("restart runtime");
+    assert_eq!(
+        store
+            .latest(delivery_id)
+            .expect("latest receipt")
+            .expect("ambiguous receipt")
+            .state,
+        DeliveryState::Ambiguous
+    );
+    assert_eq!(
+        runtime
+            .acknowledge_self_kick(delivery_id)
+            .expect("exact start ack")
+            .state,
+        DeliveryState::TurnStarted
     );
     let _ = fs::remove_dir_all(home);
 }
