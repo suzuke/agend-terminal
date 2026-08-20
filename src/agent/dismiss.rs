@@ -757,6 +757,157 @@ Should we add a dismiss_pattern?
         );
     }
 
+    /// #3314 fixture: the dev-channel startup modal as Claude Code v2.1.224
+    /// renders it under `--dangerously-load-development-channels`. Same capture
+    /// as `claude_development_channel_modal_matches_and_sends_one_enter` and
+    /// `state::tests::DEV_CHANNEL_STARTUP_MODAL_3294`.
+    const DEV_CHANNEL_STARTUP_MODAL_3314: &str = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels:   server:agend-claude-channel
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+";
+
+    /// #3314 fixture: the SAME marker line as ORDINARY TRANSCRIPT TEXT sitting
+    /// above a LIVE, unrelated approval modal that the operator owns. Shape and
+    /// rationale taken verbatim from
+    /// `state::tests::bare_marker_transcript_does_not_blind_a_later_generic_dialog_3294`
+    /// — this string circulates in issue bodies, PR text and this fix's own
+    /// source, and the frame still classifies `PermissionPrompt`. Pressing Enter
+    /// here answers "Yes" to a question the operator was asked.
+    const DEV_CHANNEL_MARKER_OVER_LIVE_MODAL_3314: &str = "\
+WARNING: Loading development channels
+
+  Delete every file in this directory?
+
+  ❯ 1. Yes
+    2. No
+
+  Enter to confirm · Esc to cancel
+";
+
+    fn claude_prepared_patterns_3314() -> Vec<PreparedDismissPattern> {
+        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        prepare_dismiss_patterns(&patterns)
+    }
+
+    fn recording_writer_3314() -> (PtyWriter, Arc<Mutex<Vec<u8>>>) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+            bytes: Arc::clone(&bytes),
+        })));
+        (writer, bytes)
+    }
+
+    /// #3314 RED: on a FRESH spawn the trust dialog renders first, is dismissed
+    /// while the startup latch is still open, Claude then paints output that
+    /// trips the (monotonic) latch, and only THEN does the dev-channel modal
+    /// render. The frame re-arms the scan (#2473) because it is PermissionPrompt,
+    /// but the dev-channel pattern is excluded from the re-arm class — so the
+    /// modal is never dismissed and the agent escalates `awaiting operator` at
+    /// ~35-39s. This drives the production re-arm path end to end: real preset
+    /// patterns, real classifier, real matcher.
+    #[test]
+    fn dev_channel_modal_is_dismissed_on_a_post_latch_rearm_3314() {
+        use crate::state::AgentState;
+        let prepared = claude_prepared_patterns_3314();
+
+        let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        st.feed(DEV_CHANNEL_STARTUP_MODAL_3314);
+        assert_eq!(
+            st.get_state(),
+            AgentState::PermissionPrompt,
+            "precondition (#3294): the dev-channel modal classifies PermissionPrompt"
+        );
+        assert!(
+            dismiss_scan_armed(
+                /* scan_enabled (latch already off) */ false,
+                is_dismissible_prompt_state(st.get_state()),
+                /* state_changed */ true,
+            ),
+            "precondition (#2473): a prompt-blocked frame re-arms the scan past the startup latch"
+        );
+
+        let (writer, written) = recording_writer_3314();
+        assert!(
+            try_prepared_dismiss_dialog(
+                "claude-3314-postlatch",
+                DEV_CHANNEL_STARTUP_MODAL_3314,
+                &writer,
+                &prepared,
+                true,
+            ),
+            "#3314: a dev-channel modal rendered AFTER the startup latch closed must still be \
+             dismissed — it is a daemon-CAUSED modal (the daemon passes \
+             --dangerously-load-development-channels) with a fixed safe answer, never an \
+             operator decision"
+        );
+        for _ in 0..20 {
+            if written.lock().as_slice() == b"\r" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            written.lock().as_slice(),
+            b"\r",
+            "#3314: the dismissal sends exactly one Enter (confirms the default option 1)"
+        );
+    }
+
+    /// #3314 NEGATIVE, and the reason a bare allowlist entry cannot be the fix:
+    /// once the agent is SETTLED (it has reached Idle at least once, so a session
+    /// is running), the same marker line on screen is transcript, not a modal —
+    /// and the modal that IS live belongs to the operator. Enter here answers it.
+    /// This is the #2474 (r6) failure mode the re-arm class exists to prevent, so
+    /// it must hold for the dev-channel pattern too.
+    #[test]
+    fn dev_channel_marker_over_a_live_modal_is_not_dismissed_when_settled_3314() {
+        use crate::state::AgentState;
+        let prepared = claude_prepared_patterns_3314();
+
+        let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+        st.feed(DEV_CHANNEL_MARKER_OVER_LIVE_MODAL_3314);
+        assert_eq!(
+            st.get_state(),
+            AgentState::PermissionPrompt,
+            "precondition (#3294 r3): a quoted marker must not cost the live dialog its classification"
+        );
+
+        let (writer, written) = recording_writer_3314();
+        assert!(
+            !try_prepared_dismiss_dialog(
+                "claude-3314-settled",
+                DEV_CHANNEL_MARKER_OVER_LIVE_MODAL_3314,
+                &writer,
+                &prepared,
+                true,
+            ),
+            "#3314: after the agent has settled, a quoted dev-channel marker must NOT fire — \
+             the live modal underneath it is the operator's decision (#2474 r6)"
+        );
+        assert!(
+            written.lock().is_empty(),
+            "#3314: nothing may be written to the PTY for a settled-agent transcript match"
+        );
+    }
+
     /// #2473 (r6): pin the trust-class classification on the REAL presets — agy +
     /// claude `Yes, I trust` re-arm; claude `Yes, proceed` does not; claude has
     /// exactly one re-arm-eligible pattern.
