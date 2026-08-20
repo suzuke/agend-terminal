@@ -1110,11 +1110,22 @@ WARNING: Loading development channels
             "#3314: `ever_idle` must be derived from the classified state under the core lock"
         );
         assert!(
-            body.contains("dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)"),
-            "#3314: the scan must be scoped by the latch AND the ever-Idle flag, not by the latch alone"
+            body.contains("if agent_is_idle {"),
+            "#3314: recording the flag must be guarded by this frame's classified state"
         );
+        // Order is asserted by BYTE OFFSET, not by matching across a newline:
+        // Windows runners check out `.rs` with CRLF (`.gitattributes` pins only
+        // `docs/*.md` to LF), so a pattern containing `\n` cannot match there —
+        // which is exactly how the first revision of this pin failed CI. The
+        // offset form is line-ending independent and a stronger claim besides.
+        let scope_call = body
+            .find("dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)")
+            .expect("#3314: the scan must be scoped by the latch AND the ever-Idle flag, not by the latch alone");
+        let flag_set = body
+            .find("dismiss_agent_ever_idle = true;")
+            .expect("#3314: the read loop must record that the agent has reached Idle");
         assert!(
-            body.contains("if agent_is_idle {\n                    dismiss_agent_ever_idle = true;"),
+            flag_set > scope_call,
             "#3314: the flag must be set AFTER this frame's scan, so the settling frame is still scanned pre-Idle"
         );
     }
