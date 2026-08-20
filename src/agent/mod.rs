@@ -20,7 +20,7 @@ mod dismiss;
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
-    dismiss_scan_armed, is_dismissible_prompt_state, prepare_dismiss_patterns,
+    dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
     try_prepared_dismiss_dialog, PreparedDismissPattern,
 };
 
@@ -2082,6 +2082,11 @@ fn pty_read_loop(
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
+    // #3314: has the agent reached Idle at least once? That is the point after
+    // which a daemon-caused STARTUP modal can no longer legitimately appear, so
+    // the post-latch re-arm narrows to workspace-trust only. See
+    // `dismiss_scan_scope`.
+    let mut dismiss_agent_ever_idle = false;
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -2131,7 +2136,7 @@ fn pty_read_loop(
                 // post-render means we match what the user actually sees —
                 // Ink-style TUIs that draw char-by-char with cursor positioning
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
-                let (screen, state_changed, dismiss_latch_off, prompt_blocked) = {
+                let (screen, state_changed, dismiss_latch_off, prompt_blocked, agent_is_idle) = {
                     let mut c = core.lock();
                     // Disjoint field borrows so the lazy-fg closure may read
                     // `vterm` while `state` is borrowed mutably (both fields of
@@ -2166,8 +2171,17 @@ fn pty_read_loop(
                     // past the startup latch — agy's banner trips the latch before
                     // its trust modal renders. See `dismiss_scan_armed`.
                     let prompt_blocked = is_dismissible_prompt_state(cur);
+                    // #3314: recorded AFTER this frame's scan (below), so the very
+                    // frame that first settles the agent is still scanned pre-Idle.
+                    let agent_is_idle = cur == crate::state::AgentState::Idle;
                     broadcast_pty_output(subscribers, data, &mut dropped_chunks, name);
-                    (screen, state_changed, dismiss_latch_off, prompt_blocked)
+                    (
+                        screen,
+                        state_changed,
+                        dismiss_latch_off,
+                        prompt_blocked,
+                        agent_is_idle,
+                    )
                 };
 
                 let in_cooldown = dismiss_cooldown_until
@@ -2181,9 +2195,12 @@ fn pty_read_loop(
                         pty_writer,
                         dismiss_patterns,
                         // #2473 (r6): a post-latch re-arm (scan_enabled==false,
-                        // armed only via prompt_blocked) scans ONLY workspace-
-                        // trust patterns — never runtime-approval `Yes, proceed`.
-                        !dismiss_scan_enabled,
+                        // armed only via prompt_blocked) never reaches runtime-
+                        // approval `Yes, proceed`. #3314: before the agent has ever
+                        // been Idle it additionally reaches daemon-caused startup
+                        // modals, which is the window a fresh spawn's dev-channel
+                        // modal falls into.
+                        dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle),
                     )
                 {
                     dismiss_cooldown_until =
@@ -2191,6 +2208,9 @@ fn pty_read_loop(
                 }
                 if dismiss_latch_off {
                     dismiss_scan_enabled = false;
+                }
+                if agent_is_idle {
+                    dismiss_agent_ever_idle = true;
                 }
             }
             Err(e) => {

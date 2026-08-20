@@ -53,6 +53,11 @@ pub struct PreparedDismissPattern {
     /// `Yes, proceed`) is false so it never auto-acts a real mid-session
     /// permission modal. Derived from [`REARM_PAST_LATCH_TRUST_HINTS`].
     rearm_past_latch: bool,
+    /// #3314: may this pattern fire on a post-latch re-arm while the agent has
+    /// NEVER reached Idle — i.e. the startup sequence is demonstrably still
+    /// running? True for daemon-CAUSED startup modals only. Derived from
+    /// [`REARM_PRE_IDLE_STARTUP_HINTS`]; see [`DismissScanScope`].
+    rearm_pre_idle: bool,
 }
 
 /// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
@@ -146,6 +151,65 @@ fn is_rearm_past_latch_hint(literal_hint: &str) -> bool {
     REARM_PAST_LATCH_TRUST_HINTS.contains(&literal_hint)
 }
 
+/// #3314: literal hints of DAEMON-CAUSED STARTUP modals — prompts the daemon
+/// itself provokes by how it launches the backend, whose answer is fixed and is
+/// never the operator's to make. They may fire on a post-latch re-arm, but ONLY
+/// while the agent has never reached Idle ([`DismissScanScope::RearmPreIdle`]).
+///
+/// The dev-channel modal is here because the daemon passes
+/// `--dangerously-load-development-channels`; on a FRESH spawn the workspace-
+/// trust dialog renders first and settles the (monotonic) startup latch before
+/// this modal ever appears, so the startup window alone never sees it and the
+/// agent hangs at `awaiting operator`.
+///
+/// Why NOT [`REARM_PAST_LATCH_TRUST_HINTS`]: that list carries no time bound, and
+/// this literal circulates as ordinary transcript text (issue bodies, PR text,
+/// this file). Listed there, a quoted marker line above a LIVE approval modal
+/// would auto-answer it — the #2474 (r6) footgun. The pre-Idle bound closes that:
+/// a live modal needs a running session, which needs the composer, which is Idle.
+const REARM_PRE_IDLE_STARTUP_HINTS: &[&str] = &["WARNING: Loading development channels"];
+
+fn is_rearm_pre_idle_hint(literal_hint: &str) -> bool {
+    REARM_PRE_IDLE_STARTUP_HINTS.contains(&literal_hint)
+}
+
+/// #3314: which dismiss patterns may a single rendered frame's scan consider?
+/// Selected by [`dismiss_scan_scope`] from the startup latch plus whether the
+/// agent has ever been Idle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DismissScanScope {
+    /// Startup latch still open: every configured pattern (unchanged behavior).
+    Startup,
+    /// Post-latch re-arm, agent has never reached Idle — the startup sequence is
+    /// still running: workspace-trust patterns plus daemon-caused startup modals.
+    RearmPreIdle,
+    /// Post-latch re-arm after the agent has settled at least once: workspace-
+    /// trust only, so a runtime-approval modal is never auto-acted (#2473/#2474).
+    RearmSettled,
+}
+
+/// #3314: the scan scope for this frame. `scan_enabled` is the startup latch;
+/// `ever_idle` records that the agent has reached Idle at least once, which is
+/// the point after which a startup modal can no longer legitimately appear.
+pub(crate) fn dismiss_scan_scope(scan_enabled: bool, ever_idle: bool) -> DismissScanScope {
+    match (scan_enabled, ever_idle) {
+        (true, _) => DismissScanScope::Startup,
+        (false, false) => DismissScanScope::RearmPreIdle,
+        (false, true) => DismissScanScope::RearmSettled,
+    }
+}
+
+impl PreparedDismissPattern {
+    /// #3314: may this pattern be considered under `scope`?
+    fn eligible(&self, scope: DismissScanScope) -> bool {
+        match scope {
+            DismissScanScope::Startup => true,
+            DismissScanScope::RearmPreIdle => self.rearm_past_latch || self.rearm_pre_idle,
+            DismissScanScope::RearmSettled => self.rearm_past_latch,
+        }
+    }
+}
+
 pub fn prepare_dismiss_patterns(
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> Vec<PreparedDismissPattern> {
@@ -157,6 +221,7 @@ pub fn prepare_dismiss_patterns(
             Some(PreparedDismissPattern {
                 pattern: pattern.clone(),
                 rearm_past_latch: is_rearm_past_latch_hint(&literal_hint),
+                rearm_pre_idle: is_rearm_pre_idle_hint(&literal_hint),
                 literal_hint,
                 regex,
                 key_seq: key_seq.clone(),
@@ -174,21 +239,29 @@ pub fn try_dismiss_dialog(
 ) -> bool {
     let prepared = prepare_dismiss_patterns(dismiss_patterns);
     // Default callers (tests + the `try_dismiss_dialog` seam) get the full
-    // startup-window scan (`trust_class_only = false`).
-    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared, false)
+    // startup-window scan.
+    try_prepared_dismiss_dialog(
+        name,
+        screen,
+        pty_writer,
+        &prepared,
+        DismissScanScope::Startup,
+    )
 }
 
-/// `trust_class_only` (#2473): when true, only WORKSPACE-TRUST-class patterns
-/// (`rearm_past_latch`) are considered — used on a POST-latch re-arm so a
-/// runtime-approval pattern (claude `Yes, proceed`) can never auto-act a real
-/// mid-session permission modal. The startup-window scan passes false (full
-/// list, unchanged behavior). See [`REARM_PAST_LATCH_TRUST_HINTS`].
+/// `scope` (#2473, narrowed by #3314): which patterns this frame's scan may
+/// consider. A POST-latch re-arm never reaches runtime-approval patterns (claude
+/// `Yes, proceed`), so it can never auto-act a real mid-session permission modal;
+/// a re-arm before the agent has ever been Idle additionally reaches daemon-caused
+/// startup modals. The startup-window scan passes [`DismissScanScope::Startup`]
+/// (full list, unchanged behavior). See [`REARM_PAST_LATCH_TRUST_HINTS`],
+/// [`REARM_PRE_IDLE_STARTUP_HINTS`] and [`dismiss_scan_scope`].
 pub fn try_prepared_dismiss_dialog(
     name: &str,
     screen: &str,
     pty_writer: &PtyWriter,
     dismiss_patterns: &[PreparedDismissPattern],
-    trust_class_only: bool,
+    scope: DismissScanScope,
 ) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -198,9 +271,10 @@ pub fn try_prepared_dismiss_dialog(
     }
 
     for pattern in dismiss_patterns {
-        // #2473: on a post-latch re-arm, skip everything but workspace-trust
-        // patterns — never fire runtime-approval (`Yes, proceed`) off the latch.
-        if trust_class_only && !pattern.rearm_past_latch {
+        // #2473/#3314: on a post-latch re-arm, skip everything the scope does
+        // not admit — never fire runtime-approval (`Yes, proceed`) off the latch,
+        // and admit a daemon-caused startup modal only before the agent settles.
+        if !pattern.eligible(scope) {
             continue;
         }
         if !pattern.literal_hint.is_empty() && !screen.contains(&pattern.literal_hint) {
@@ -358,12 +432,19 @@ mod tests {
 
     /// #3294: the dev-channel startup modal IS classified as `PermissionPrompt`,
     /// honestly, like any other matching frame (`state::prompt_latch` changes only
-    /// when that latch releases, never the classification). This test pins the two
-    /// facts that make the auto-dismiss independent of that classification either
-    /// way, so a future change to prompt state cannot silently break dismissal:
-    /// the scan is armed by the state-INDEPENDENT startup latch, and this pattern
-    /// is not in the post-latch re-arm class, so `prompt_blocked` is not its
-    /// delivery path.
+    /// when that latch releases, never the classification). The startup latch is
+    /// state-INDEPENDENT, so a frame inside the launch window arms the scan with
+    /// no dismissible state at all — that half is unchanged.
+    ///
+    /// #3314 CORRECTED the other half. This test used to assert
+    /// `!is_rearm_past_latch_hint(hint)` and read that as "so `prompt_blocked` is
+    /// not its delivery path". The first clause still holds and is still pinned —
+    /// the dev-channel modal is deliberately NOT trust-class, because that list
+    /// has no time bound and this literal circulates as ordinary transcript text.
+    /// The reading was wrong: startup-window-only is precisely what made a fresh
+    /// spawn hang, since the trust dialog settles the latch before this modal
+    /// renders. `prompt_blocked` IS its delivery path now — through the pre-Idle
+    /// re-arm scope, which is bounded by "the agent has never been Idle" instead.
     #[test]
     fn dev_channel_modal_dismissal_does_not_depend_on_prompt_state_3294() {
         assert!(
@@ -379,7 +460,11 @@ mod tests {
             .expect("claude ships the dev-channel dismiss pattern");
         assert!(
             !is_rearm_past_latch_hint(hint),
-            "#3294: the dev-channel pattern is startup-window-only, so its dismissal does not ride the PermissionPrompt classification"
+            "#3294/#3314: the dev-channel pattern must NOT be trust-class — that list is unbounded in time, and this literal circulates as ordinary transcript text"
+        );
+        assert!(
+            is_rearm_pre_idle_hint(hint),
+            "#3314: it is a daemon-caused startup modal, so it rides the PRE-IDLE re-arm scope"
         );
     }
 
@@ -708,7 +793,14 @@ Should we add a dismiss_pattern?
         // agy `Yes, I trust` IS workspace-trust-class, so it still fires.
         let prepared = prepare_dismiss_patterns(&patterns);
         assert!(
-            armed && try_prepared_dismiss_dialog("agy", &screen, &test_writer(), &prepared, true),
+            armed
+                && try_prepared_dismiss_dialog(
+                    "agy",
+                    &screen,
+                    &test_writer(),
+                    &prepared,
+                    DismissScanScope::RearmSettled,
+                ),
             "#2473: the re-armed (trust-class-only) scan must match the real agy trust modal \
              and fire Enter. Screen:\n{screen}"
         );
@@ -739,20 +831,34 @@ Should we add a dismiss_pattern?
         vt.process(" Esc to cancel · Enter to confirm\r\n".as_bytes());
         let screen = vt.tail_lines(30);
 
-        // Post-latch re-arm (trust_class_only=true): `Yes, proceed` is NOT
-        // trust-class → skipped → returns false. A false return is authoritative
-        // "did not fire": the keystroke write happens ONLY inside the matched-fire
-        // block, which a false return never enters — so no `\x1b[A\x1b[A\r`.
-        assert!(
-            !try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, true),
-            "#2473 r6: `Yes, proceed` (runtime approval) must NOT re-arm past the latch. \
-             Screen:\n{screen}"
-        );
+        // Post-latch re-arm: `Yes, proceed` is NOT trust-class → skipped →
+        // returns false. A false return is authoritative "did not fire": the
+        // keystroke write happens ONLY inside the matched-fire block, which a
+        // false return never enters — so no `\x1b[A\x1b[A\r`.
+        // #3314 widened the re-arm into two scopes; the runtime-approval pattern
+        // must stay excluded from BOTH, so the new pre-Idle scope cannot become a
+        // back door into the exact footgun r6 rejected.
+        for scope in [
+            DismissScanScope::RearmSettled,
+            DismissScanScope::RearmPreIdle,
+        ] {
+            assert!(
+                !try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, scope),
+                "#2473 r6: `Yes, proceed` (runtime approval) must NOT re-arm past the latch \
+                 under {scope:?}. Screen:\n{screen}"
+            );
+        }
 
-        // Sanity: in the STARTUP window (trust_class_only=false) the SAME pattern
-        // DOES match — proving it is the re-arm GATE that blocks it, not the regex.
+        // Sanity: in the STARTUP window the SAME pattern DOES match — proving it
+        // is the re-arm GATE that blocks it, not the regex.
         assert!(
-            try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, false),
+            try_prepared_dismiss_dialog(
+                "claude",
+                &screen,
+                &test_writer(),
+                &prepared,
+                DismissScanScope::Startup,
+            ),
             "sanity: in the startup window `Yes, proceed` still matches (gate, not regex, blocks re-arm)"
         );
     }
@@ -851,7 +957,7 @@ WARNING: Loading development channels
                 DEV_CHANNEL_STARTUP_MODAL_3314,
                 &writer,
                 &prepared,
-                true,
+                DismissScanScope::RearmPreIdle,
             ),
             "#3314: a dev-channel modal rendered AFTER the startup latch closed must still be \
              dismissed — it is a daemon-CAUSED modal (the daemon passes \
@@ -897,7 +1003,7 @@ WARNING: Loading development channels
                 DEV_CHANNEL_MARKER_OVER_LIVE_MODAL_3314,
                 &writer,
                 &prepared,
-                true,
+                DismissScanScope::RearmSettled,
             ),
             "#3314: after the agent has settled, a quoted dev-channel marker must NOT fire — \
              the live modal underneath it is the operator's decision (#2474 r6)"
@@ -905,6 +1011,111 @@ WARNING: Loading development channels
         assert!(
             written.lock().is_empty(),
             "#3314: nothing may be written to the PTY for a settled-agent transcript match"
+        );
+    }
+
+    /// #3314: the BOUND itself. The very same real modal that must be dismissed
+    /// pre-Idle must NOT be dismissed once the agent has settled — otherwise the
+    /// pre-Idle scope would be indistinguishable from listing the hint as
+    /// trust-class, which is the unsafe fix this design rejects.
+    #[test]
+    fn dev_channel_modal_is_not_dismissed_after_the_agent_has_settled_3314() {
+        let prepared = claude_prepared_patterns_3314();
+        let (writer, written) = recording_writer_3314();
+        assert!(
+            !try_prepared_dismiss_dialog(
+                "claude-3314-bound",
+                DEV_CHANNEL_STARTUP_MODAL_3314,
+                &writer,
+                &prepared,
+                DismissScanScope::RearmSettled,
+            ),
+            "#3314: a settled agent's re-arm must not fire the dev-channel pattern — after Idle \
+             this text is transcript, and the modal that may be live is the operator's"
+        );
+        assert!(written.lock().is_empty());
+        // ... and the pattern is genuinely reachable, so the assertion above is
+        // the SCOPE refusing it rather than a regex that never matched.
+        let (writer, written) = recording_writer_3314();
+        assert!(
+            try_prepared_dismiss_dialog(
+                "claude-3314-bound-control",
+                DEV_CHANNEL_STARTUP_MODAL_3314,
+                &writer,
+                &prepared,
+                DismissScanScope::Startup,
+            ),
+            "control: the same screen fires inside the startup window"
+        );
+        for _ in 0..20 {
+            if written.lock().as_slice() == b"\r" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(written.lock().as_slice(), b"\r");
+    }
+
+    /// #3314: the scope selector. The startup latch wins outright; once it is off,
+    /// "has the agent ever been Idle" decides whether daemon-caused startup modals
+    /// are still admissible.
+    #[test]
+    fn dismiss_scan_scope_matrix_3314() {
+        assert_eq!(
+            dismiss_scan_scope(true, false),
+            DismissScanScope::Startup,
+            "latch open, never Idle → full startup scan"
+        );
+        assert_eq!(
+            dismiss_scan_scope(true, true),
+            DismissScanScope::Startup,
+            "latch open wins even if the agent has been Idle (agy-shaped re-open never happens, but the latch is authoritative while set)"
+        );
+        assert_eq!(
+            dismiss_scan_scope(false, false),
+            DismissScanScope::RearmPreIdle,
+            "#3314: latch closed by productive output but the agent has never settled → startup modals still admissible"
+        );
+        assert_eq!(
+            dismiss_scan_scope(false, true),
+            DismissScanScope::RearmSettled,
+            "#2473/#2474: a settled agent's re-arm is trust-class only"
+        );
+    }
+
+    /// #3314 wiring pin (the #1644/#1530-F2 source-grep convention): the tests
+    /// above prove the scope SEMANTICS, but `pty_read_loop` is a 150-line inline
+    /// block with no unit seam, so deleting the `ever_idle` bookkeeping or passing
+    /// a constant scope would leave every one of them green while fresh spawns
+    /// hang again — mutation-blind wiring. Pins the three wiring points.
+    #[test]
+    fn pty_read_loop_wires_the_pre_idle_scan_scope_3314() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("\nfn pty_read_loop(")
+            .expect("pty_read_loop must exist");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\nfn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+
+        assert!(
+            body.contains("let mut dismiss_agent_ever_idle = false;"),
+            "#3314: the read loop must track whether the agent has ever been Idle"
+        );
+        assert!(
+            body.contains("let agent_is_idle = cur == crate::state::AgentState::Idle;"),
+            "#3314: `ever_idle` must be derived from the classified state under the core lock"
+        );
+        assert!(
+            body.contains("dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)"),
+            "#3314: the scan must be scoped by the latch AND the ever-Idle flag, not by the latch alone"
+        );
+        assert!(
+            body.contains("if agent_is_idle {\n                    dismiss_agent_ever_idle = true;"),
+            "#3314: the flag must be set AFTER this frame's scan, so the settling frame is still scanned pre-Idle"
         );
     }
 
