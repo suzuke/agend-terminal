@@ -512,6 +512,21 @@ struct FakeChannel {
     stop: Arc<AtomicBool>,
     health_probes: Arc<AtomicUsize>,
     not_ready_answers: Arc<AtomicUsize>,
+    /// #3322 test-support: bumped immediately after `accept`, BEFORE any read.
+    /// Lets a test synchronise on "the connection was accepted" instead of
+    /// sleeping and hoping, which is what the request-split RED needs.
+    accepted_connections: Arc<AtomicUsize>,
+    /// #3322 test-support: widen the window between finishing the request read
+    /// and sending the response. That window is REAL and normally microseconds
+    /// wide — read, format, `write_all`, drop — and a request segment landing
+    /// inside it is left unread at close. This makes the existing race
+    /// observable; it does not invent one.
+    pause_before_response: Arc<Mutex<Duration>>,
+    /// #3322 test-support: force the LINUX shape — a BLOCKING accepted socket —
+    /// on whatever platform the test runs on. macOS inherits the listener's
+    /// non-blocking flag and Linux does not, so without this the normalisation
+    /// guard is unreachable from a developer machine and only CI could see it.
+    simulate_blocking_accept: Arc<AtomicBool>,
     exit: Arc<Mutex<Option<FakeChannelExit>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -532,10 +547,16 @@ impl FakeChannel {
         let stop = Arc::new(AtomicBool::new(false));
         let health_probes = Arc::new(AtomicUsize::new(0));
         let not_ready_answers = Arc::new(AtomicUsize::new(0));
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let pause_before_response = Arc::new(Mutex::new(Duration::from_millis(0)));
+        let simulate_blocking_accept = Arc::new(AtomicBool::new(false));
         let exit = Arc::new(Mutex::new(None));
         let thread_stop = Arc::clone(&stop);
         let thread_probes = Arc::clone(&health_probes);
         let thread_not_ready = Arc::clone(&not_ready_answers);
+        let thread_accepted = Arc::clone(&accepted_connections);
+        let thread_pause = Arc::clone(&pause_before_response);
+        let thread_simulate_blocking = Arc::clone(&simulate_blocking_accept);
         let thread_exit = Arc::clone(&exit);
         let handle = thread::spawn(move || {
             let reason = loop {
@@ -544,9 +565,14 @@ impl FakeChannel {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&request[..read]);
+                        thread_accepted.fetch_add(1, Ordering::AcqRel);
+                        if thread_simulate_blocking.load(Ordering::Acquire) {
+                            // The Linux shape, reproduced anywhere.
+                            let _ = stream.set_nonblocking(false);
+                        }
+                        let mut raw = [0_u8; 4096];
+                        let read = stream.read(&mut raw).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&raw[..read]).into_owned();
                         let path = request.split_whitespace().nth(1).unwrap_or("/");
                         let (status, body) = if path == "/health" {
                             let served = thread_probes.fetch_add(1, Ordering::AcqRel) + 1;
@@ -576,6 +602,11 @@ impl FakeChannel {
                                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             );
+                        // #3322 test-support: the real read->close window, widened.
+                        let pause = *thread_pause.lock();
+                        if !pause.is_zero() {
+                            thread::sleep(pause);
+                        }
                         let _ = stream.write_all(response.as_bytes());
                     }
                     Err(error) if !accept_error_is_fatal(error.kind()) => {
@@ -593,6 +624,9 @@ impl FakeChannel {
             stop,
             health_probes,
             not_ready_answers,
+            accepted_connections,
+            pause_before_response,
+            simulate_blocking_accept,
             exit,
             handle: Some(handle),
         }
@@ -608,6 +642,135 @@ impl FakeChannel {
             .clone()
             .expect("fake channel must record why its accept loop ended")
     }
+}
+
+/// #3322 RED: the stand-in answers a request it has not finished reading, then
+/// closes — and closing a socket whose receive queue still holds the request
+/// body sends an RST instead of a FIN, so the client's read of the response
+/// dies with `ECONNRESET` even though `write_all` succeeded.
+///
+/// This is the observed CI failure: `channel_bridge_queue_without_turn_start_is
+/// _truthfully_overdue` panicked at `self_kick_tests.rs:35:6` with
+/// "ChannelBridge webhook queue admission: Connection reset by peer (os error
+/// 104)", on `main` at 485b8920 and again on PR #3320's head. It is a race, so
+/// it passes most of the time — this test removes the race by SPLITTING the
+/// request on purpose.
+///
+/// NOT a sleep-and-hope: the test synchronises on `accepted_connections` for the
+/// accept, and only the gap between accept and the stand-in's single read is
+/// timed. The unfixed stand-in reads immediately on accept, so that gap is not
+/// a guess; after the fix the stand-in waits for the body and the gap stops
+/// mattering at all.
+#[test]
+fn split_request_is_drained_before_the_response_closes_3322() {
+    use std::io::Write as _;
+
+    let mut channel = FakeChannel::spawn(1);
+    let port = channel.port;
+    // Widen the real read->close window so the race is observable rather than
+    // occasional. The window exists without this; it is normally microseconds.
+    *channel.pause_before_response.lock() = Duration::from_millis(400);
+    let before = channel.accepted_connections.load(Ordering::Acquire);
+
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let body = json!({"kind": "queue", "id": "3322"}).to_string();
+    client
+        .write_all(
+            format!(
+                "POST /webhook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .expect("headers");
+
+    // Synchronise on the accept, then leave the unfixed stand-in's single read
+    // room to consume the headers alone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.accepted_connections.load(Ordering::Acquire) == before
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_ne!(
+        channel.accepted_connections.load(Ordering::Acquire),
+        before,
+        "#3322 fixture check: the stand-in must have accepted the connection"
+    );
+    thread::sleep(Duration::from_millis(80));
+
+    // The body arrives while the stand-in sits in that window: an unfixed
+    // stand-in has already finished its single read, so the body is still queued
+    // in its receive buffer when it closes.
+    client.write_all(body.as_bytes()).expect("body");
+
+    let mut response = Vec::new();
+    let read = io::Read::read_to_end(&mut client, &mut response);
+
+    assert!(
+        read.is_ok(),
+        "#3322: the stand-in closed with the request body unread, so the close \
+         sent an RST and the client lost the response it had already been sent. \
+         A stand-in must DRAIN the request before answering it: {:?}",
+        read.err()
+    );
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("202 Accepted"),
+        "#3322: a fully drained /webhook POST must be answered 202, not degraded \
+         to a 404 by a request the stand-in never finished reading; got: {text:?}"
+    );
+
+    assert_eq!(channel.stop_and_join(), FakeChannelExit::StopRequested);
+}
+
+/// #3322: a client that connects and says nothing must not wedge teardown.
+///
+/// The drain is bounded by `stop` and never by a clock, but `stop` is only
+/// reachable if `read` RETURNS — which makes the accepted socket's blocking mode
+/// load-bearing. macOS inherits the listener's non-blocking flag; **Linux does
+/// not**, so a blocking read on a silent client parks forever and the join in
+/// `stop_and_join` waits on a thread that will never finish. This test FORCES
+/// the Linux shape everywhere, and deliberately does not join to observe the
+/// outcome: joining a parked thread hangs the binary instead of reporting the
+/// failure.
+#[test]
+fn a_silent_client_does_not_wedge_teardown_3322() {
+    let mut channel = FakeChannel::spawn(1);
+    channel
+        .simulate_blocking_accept
+        .store(true, Ordering::Release);
+    let port = channel.port;
+
+    let _silent = std::net::TcpStream::connect(("127.0.0.1", port)).expect("#3322: connect");
+    let accept_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.accepted_connections.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < accept_deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    thread::sleep(Duration::from_millis(50));
+
+    // What `stop_and_join` does, minus the join we cannot safely perform yet.
+    channel.stop.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.exit.lock().is_none() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    if channel.exit.lock().is_none() {
+        // Leak rather than join: `stop_and_join` joins, and joining a thread
+        // parked in a blocking read hangs the whole binary in place of this
+        // message.
+        std::mem::forget(channel);
+        panic!(
+            "#3322: the request drain never observed `stop` — the accepted \
+             socket's blocking mode was inherited rather than normalised, so \
+             `read` never returned and the join would have wedged the binary"
+        );
+    }
+
+    assert_eq!(channel.stop_and_join(), FakeChannelExit::StopRequested);
 }
 
 #[test]
