@@ -130,6 +130,48 @@ fn review_reactivation_resets_legacy_quiet_period_3316() {
 }
 
 #[test]
+fn review_baseline_ack_does_not_pre_authorize_future_retirement_3316() {
+    let home = tmp_home("baseline-ack-consume");
+    let repo = home.join("baseline-repo");
+    git_repo_with_origin(&repo, "https://github.com/org/baseline.git");
+    write_sweep_fleet(
+        &home,
+        &format!(
+            "  baseline:\n    members: [devA]\n    source_repo: {}\n    project_id: baseline-board\n",
+            repo.display()
+        ),
+    );
+    let created = crate::tasks::handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create",
+            "title": "pre-existing baseline task",
+            "project": "baseline-board"
+        }),
+    );
+    assert!(created["id"].as_str().is_some());
+    let key = provenance_key("baseline-board", "org/baseline", DEFAULT_GITHUB_API_BASE);
+    handle_task_sweep_config(&home, &serde_json::json!({"acknowledge_provenance": [key]}));
+
+    let accepted = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert_eq!(accepted.boards.len(), 1);
+    assert!(!accepted.boards[0].legacy_compat);
+    assert!(load_config(&home).provenance_acknowledgements.is_empty());
+
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  devA:\n    backend: claude\nteams:\n",
+    )
+    .unwrap();
+    let inactive = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert_eq!(inactive.boards.len(), 1);
+    assert!(inactive.boards[0].legacy_compat);
+    assert!(load_provenance(&home).entries[0].retired_at.is_none());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn operator_ack_retires_legacy_mapping_immediately_and_keeps_audit_3316() {
     let (home, key) = legacy_fixture("legacy-operator-ack");
     resolve_sweep_plan(&home, &load_config(&home)).unwrap();

@@ -100,9 +100,9 @@ pub struct SweepConfig {
     /// PRs already alerted — prevents duplicate telegram notifications.
     #[serde(default)]
     pub alerted_prs: Vec<u64>,
-    /// #3316: provenance keys explicitly acknowledged by an operator. The
-    /// append-only provenance record remains on disk for audit; acknowledgement
-    /// only permits that legacy mapping to retire from active compatibility scans.
+    /// #3316: provenance keys explicitly acknowledged by an operator. A key
+    /// consumed while admitting an unverified baseline is removed; a key added
+    /// after materialization authorizes immediate retirement of that mapping.
     #[serde(default)]
     pub provenance_acknowledgements: Vec<String>,
 }
@@ -334,6 +334,7 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
     let now_string = now.to_rfc3339();
     let mut boards = Vec::new();
     let mut current_keys = HashSet::new();
+    let mut consumed_acknowledgements = Vec::new();
 
     for (project_id, repo) in &claims {
         let key = provenance_key(project_id, repo, &api_base);
@@ -361,6 +362,9 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
                     ),
                 });
             } else {
+                if acknowledged {
+                    consumed_acknowledgements.push(key.clone());
+                }
                 store.next_generation = store.next_generation.saturating_add(1);
                 store.entries.push(SweepProvenance {
                     project_id: project_id.clone(),
@@ -395,6 +399,14 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
                 legacy_compat: false,
             });
         }
+    }
+
+    if !consumed_acknowledgements.is_empty() {
+        let mut updated_cfg = cfg.clone();
+        updated_cfg
+            .provenance_acknowledgements
+            .retain(|ack| !consumed_acknowledgements.iter().any(|key| key == ack));
+        save_config(home, &updated_cfg)?;
     }
 
     for entry in &mut store.entries {
