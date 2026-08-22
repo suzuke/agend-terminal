@@ -40,6 +40,11 @@ struct Pending {
     injected_at_ms: u64,
     /// The wake text, re-injected verbatim on the one re-delivery attempt.
     text: String,
+    /// #3324: the typed external-channel provenance the original wake was
+    /// admitted with. A re-delivery is the SAME logical delivery, so it must
+    /// carry the same origin: dropping it to `None` would hand the re-delivered
+    /// copy the permissive (internal) classification the reply guard keys on.
+    channel_origin: Option<crate::channel::ChannelKind>,
     /// True once the single re-delivery has fired (the latch).
     redelivered: bool,
     /// Transport generation that admitted the original actionable wake.
@@ -60,6 +65,12 @@ struct DurableLatch {
     agent: String,
     row_id: String,
     text: String,
+    /// #3324: provenance survives the restart hop too — a latch reloaded after
+    /// a daemon restart rebuilds `Pending`, and an absent field there would
+    /// silently downgrade a channel wake to internal. `serde default` keeps
+    /// pre-#3324 latch files loading as internal, which is what they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel_origin: Option<crate::channel::ChannelKind>,
     transport_mode: crate::transport::TransportMode,
     #[serde(default)]
     transport_epoch: u64,
@@ -73,6 +84,9 @@ pub(crate) struct PreparedArm {
     row_id: String,
     agent: String,
     text: String,
+    /// #3324: carried from the admission call so the committed `Pending` keeps
+    /// the origin the delivery was actually admitted with.
+    channel_origin: Option<crate::channel::ChannelKind>,
     transport_mode: crate::transport::TransportMode,
     durable_rearm_count: u8,
     rearm_pending: bool,
@@ -226,6 +240,8 @@ fn persist_latch(home: &Path, row_id: &str, pending: &Pending) -> anyhow::Result
             agent: pending.agent.clone(),
             row_id: row_id.to_string(),
             text: pending.text.clone(),
+            // RED: nor does the durable latch.
+            channel_origin: None,
             transport_mode: pending.transport_mode,
             transport_epoch: pending.transport_epoch,
             rearm_pending: pending.rearm_pending,
@@ -257,6 +273,7 @@ pub(crate) fn prepare_arm(
     text: &str,
     transport_mode: crate::transport::TransportMode,
     transport_epoch: u64,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> Option<PreparedArm> {
     crate::daemon::hook_shadow::snapshot_for(agent)?;
     let row_id = logical_row_id(agent, text);
@@ -281,6 +298,11 @@ pub(crate) fn prepare_arm(
         row_id,
         agent: agent.to_string(),
         text: text.to_string(),
+        // RED: the arm accepts the origin and drops it.
+        channel_origin: {
+            let _ = channel_origin;
+            None
+        },
         transport_mode,
         durable_rearm_count: durable_latch.map_or(0, |latch| latch.rearm_count),
         rearm_pending: deferred_rearm,
@@ -325,6 +347,7 @@ pub(crate) fn commit_prepared_arm(prepared: PreparedArm, transport_epoch: u64) -
             agent: prepared.agent,
             injected_at_ms: now_ms(),
             text: prepared.text,
+            channel_origin: prepared.channel_origin,
             redelivered: false,
             transport_epoch,
             transport_mode: prepared.transport_mode,
@@ -359,6 +382,7 @@ fn arm_with_transport_epoch_for_test(
             agent: agent.to_string(),
             injected_at_ms: now_ms(),
             text: text.to_string(),
+            channel_origin: None,
             redelivered: false,
             transport_epoch,
             transport_mode,
@@ -415,6 +439,7 @@ pub(crate) fn seed_structured_terminal_for_test(
         agent: agent.to_string(),
         injected_at_ms: now_ms(),
         text: text.to_string(),
+        channel_origin: None,
         redelivered: true,
         transport_epoch: crate::daemon::delivery_worker::current_transport_epoch(home, agent),
         transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -496,6 +521,7 @@ pub(crate) fn reserve_rearm_after_reclaim(
         agent: agent.to_string(),
         injected_at_ms: now_ms(),
         text: latch.text,
+        channel_origin: latch.channel_origin,
         redelivered: false,
         transport_epoch,
         transport_mode: latch.transport_mode,
@@ -604,6 +630,7 @@ pub(crate) fn take_deferred_rearm_for_flush(
         agent: agent.to_string(),
         injected_at_ms: now_ms(),
         text: latch.text,
+        channel_origin: latch.channel_origin,
         redelivered: false,
         transport_epoch,
         transport_mode: latch.transport_mode,
@@ -983,7 +1010,8 @@ pub(crate) fn verify_pass(home: &Path) {
     let now = now_ms();
     // Decide under the lock, act (re-inject) after dropping it — the inject is a
     // self-IPC vector (#1492) and must not run while holding our mutex.
-    let mut to_redeliver: Vec<(String, String, u64)> = Vec::new();
+    let mut to_redeliver: Vec<(String, String, u64, Option<crate::channel::ChannelKind>)> =
+        Vec::new();
     let mut gave_up: Vec<(String, String)> = Vec::new();
     let mut latches_to_persist: Vec<(String, Pending)> = Vec::new();
     {
@@ -997,7 +1025,12 @@ pub(crate) fn verify_pass(home: &Path) {
                 return true; // still inside the window — keep waiting
             }
             if !p.redelivered {
-                to_redeliver.push((p.agent.clone(), p.text.clone(), p.transport_epoch));
+                to_redeliver.push((
+                    p.agent.clone(),
+                    p.text.clone(),
+                    p.transport_epoch,
+                    p.channel_origin,
+                ));
                 p.redelivered = true;
                 p.injected_at_ms = now; // fresh window for the re-delivery
                 true
@@ -1025,7 +1058,7 @@ pub(crate) fn verify_pass(home: &Path) {
             );
         }
     }
-    for (agent, text, transport_epoch) in to_redeliver {
+    for (agent, text, transport_epoch, channel_origin) in to_redeliver {
         // Re-inject via the plain submit path — NOT compose_aware_inject — so the
         // re-delivery does not re-arm verification (the latch lives in `Pending`).
         #[cfg(test)]
@@ -1035,6 +1068,7 @@ pub(crate) fn verify_pass(home: &Path) {
             &agent,
             &text,
             transport_epoch,
+            channel_origin,
         );
         match result {
             Ok(()) => {
@@ -1129,6 +1163,7 @@ mod tests {
                 agent: agent.to_string(),
                 injected_at_ms,
                 text: text.to_string(),
+                channel_origin: None,
                 redelivered: false,
                 transport_epoch,
                 transport_mode: crate::transport::TransportMode::LegacyPty,
@@ -1146,6 +1181,66 @@ mod tests {
             .values()
             .find(|pending| pending.agent == agent)
             .map(|p| p.redelivered)
+    }
+
+    /// #3324: the #2044 re-delivery is the SAME logical delivery as the wake it
+    /// verifies, so the origin has to survive both hops it takes — the arm, and
+    /// the durable latch a daemon restart reloads it from.
+    ///
+    /// It matters because the actionable classifier reads the notification
+    /// TEXT: the inline inbound rendering embeds the sender's own words, so a
+    /// channel message containing `kind=task ` is armed like any other
+    /// actionable wake and reaches this path. Re-delivering it as `None` would
+    /// hand the copy the permissive classification the reply guard keys on.
+    #[test]
+    fn the_2044_redelivery_path_preserves_channel_origin_3324() {
+        let home = tmp_home("origin-carry-3324");
+        let agent = "origin-carry-3324-agent";
+        let text = "[user:alice] via telegram] please help kind=task ";
+        forget(agent);
+        remove_durable_latches(&home, agent).expect("clean latches");
+        crate::daemon::hook_shadow::record_event(agent, "UserPromptSubmit", None);
+        let epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, agent);
+        let row_id = logical_row_id(agent, text);
+
+        let prepared = prepare_arm(
+            &home,
+            agent,
+            text,
+            crate::transport::TransportMode::ChannelBridge,
+            epoch,
+            Some(crate::channel::ChannelKind::Telegram),
+        )
+        .expect("arm");
+        assert!(commit_prepared_arm(prepared, epoch));
+        let armed = store().lock().get(&row_id).cloned().expect("armed row");
+        assert_eq!(
+            armed.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: the armed wake must remember the origin it was admitted with"
+        );
+
+        // Durable hop: persist the latch, drop the in-memory row the way a
+        // restart would, then rebuild from disk.
+        let mut latched = armed.clone();
+        latched.gave_up = true;
+        latched.rearm_pending = true;
+        assert!(
+            persist_latch(&home, &row_id, &latched).expect("persist latch"),
+            "the latch must be written at the current epoch"
+        );
+        store().lock().remove(&row_id);
+
+        take_deferred_rearm_for_flush(&home, agent, &row_id).expect("rebuild from latch");
+        let rebuilt = store().lock().get(&row_id).cloned().expect("rebuilt row");
+        assert_eq!(
+            rebuilt.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: a latch reloaded after a restart must not downgrade the wake to internal"
+        );
+
+        forget(agent);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
@@ -1263,6 +1358,7 @@ mod tests {
                 agent: agent.to_string(),
                 injected_at_ms: now_ms() - VERIFY_WINDOW_MS - 1,
                 text: format!("[AGEND-MSG-PENDING] id={row_id} kind=task from=lead inbox=1"),
+                channel_origin: None,
                 redelivered: true,
                 transport_epoch: 0,
                 transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1312,6 +1408,7 @@ mod tests {
                 agent: agent.to_string(),
                 injected_at_ms: now_ms(),
                 text: format!("[AGEND-MSG-PENDING] id={row_id} kind=task from=lead inbox=1"),
+                channel_origin: None,
                 redelivered: true,
                 transport_epoch: 0,
                 transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1486,6 +1583,7 @@ mod tests {
             agent: agent.to_string(),
             injected_at_ms: now_ms(),
             text: format!("wake id={row_id}"),
+            channel_origin: None,
             redelivered: true,
             transport_epoch: epoch,
             transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1536,6 +1634,7 @@ mod tests {
                 agent: agent.to_string(),
                 injected_at_ms: now_ms() - VERIFY_WINDOW_MS - 1,
                 text: text.to_string(),
+                channel_origin: None,
                 redelivered: true,
                 transport_epoch: old_epoch,
                 transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1581,6 +1680,7 @@ mod tests {
             text,
             crate::transport::TransportMode::ChannelBridge,
             successor_epoch,
+            None,
         )
         .expect("successor can arm after cleanup");
         assert!(commit_prepared_arm(prepared, successor_epoch));
@@ -1599,6 +1699,7 @@ mod tests {
                 text,
                 crate::transport::TransportMode::ChannelBridge,
                 successor_epoch,
+                None,
             )
             .is_some(),
             "a delayed predecessor persist must not recreate a terminal latch"
@@ -1619,6 +1720,7 @@ mod tests {
             agent: agent.to_string(),
             injected_at_ms: now_ms(),
             text: "wake id=m-stale-before-lock".to_string(),
+            channel_origin: None,
             redelivered: true,
             transport_epoch: old_epoch,
             transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1671,6 +1773,7 @@ mod tests {
                 agent: agent.to_string(),
                 injected_at_ms: now_ms(),
                 text: format!("wake id={row_id}"),
+                channel_origin: None,
                 redelivered: false,
                 transport_epoch: epoch,
                 transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1747,6 +1850,7 @@ mod tests {
                 old_text,
                 crate::transport::TransportMode::ChannelBridge,
                 old_epoch,
+                None,
             )
         });
         ready_rx
@@ -1761,6 +1865,7 @@ mod tests {
             agent: agent.to_string(),
             injected_at_ms: now_ms(),
             text: format!("wake id={successor_row}"),
+            channel_origin: None,
             redelivered: true,
             transport_epoch: successor_epoch,
             transport_mode: crate::transport::TransportMode::ChannelBridge,
@@ -1805,6 +1910,7 @@ mod tests {
                 text,
                 crate::transport::TransportMode::ChannelBridge,
                 0,
+                None,
             )
             .is_none(),
             "unavailable latch lock must fail closed"
@@ -1835,6 +1941,7 @@ mod tests {
                 agent: agent.to_string(),
                 injected_at_ms: now_ms(),
                 text: format!("[AGEND-MSG-PENDING] id={row_id} kind=task"),
+                channel_origin: None,
                 redelivered: false,
                 transport_epoch: epoch,
                 transport_mode: crate::transport::TransportMode::ChannelBridge,

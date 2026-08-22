@@ -58,6 +58,22 @@ impl fmt::Display for NotifySource<'_> {
 }
 
 impl NotifySource<'_> {
+    /// #3324: the EXTERNAL channel this notification came from, if any.
+    ///
+    /// Read off the typed variant — never re-derived from the rendered header.
+    /// A display name is operator-authored free text and can contain the `]`
+    /// that closes the header, so reverse-parsing the human rendering makes an
+    /// external delivery look internal, and internal is the permissive side of
+    /// the reply guard.
+    pub(crate) fn external_channel(&self) -> Option<crate::channel::ChannelKind> {
+        match self {
+            Self::Channel(_, kind) => Some(*kind),
+            #[cfg(test)]
+            Self::Agent(_) => None,
+            Self::System(_) => None,
+        }
+    }
+
     pub(crate) fn reply_hint(&self) -> Cow<'static, str> {
         match self {
             // #3324: name the EXACT tool. Two tools are called `reply` in a

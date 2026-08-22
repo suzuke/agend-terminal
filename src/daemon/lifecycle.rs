@@ -640,6 +640,7 @@ mod tests {
                         hook_home,
                         hook_agent,
                         "late fenced actionable wake",
+                        None,
                     ))
                     .expect("fenced inject result receiver");
             }),
@@ -707,6 +708,7 @@ mod tests {
             &home,
             agent,
             "queue-full result invalidated by delete",
+            None,
         );
         crate::daemon::delivery_worker::test_support::set_force_full(false);
         assert!(

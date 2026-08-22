@@ -28,6 +28,12 @@ pub struct QueuedNotification {
     /// default` keeps pre-#1513 queue lines (no field) deserializing as ambient.
     #[serde(default)]
     pub actionable: bool,
+    /// #3324: the external channel this notification originated on, carried
+    /// through the DEFERRED path so a queued Telegram message keeps its typed
+    /// provenance across the durable hop. `serde default` keeps pre-#3324 rows
+    /// deserializing as internal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<crate::channel::ChannelKind>,
     /// #1513: epoch-ms when this item was FIRST deferred. Drives the MAX_DEFER
     /// anti-starvation cap (release after the cap even if the agent stays busy).
     /// Preserved across requeue so the cap counts from the original defer.
@@ -401,6 +407,16 @@ pub fn drain_one(home: &Path, agent_name: &str) -> Option<QueuedNotification> {
     None
 }
 
+/// Ambient enqueue with no channel provenance.
+///
+/// #3324: `#[cfg(test)]` deliberately. The production ambient defer path
+/// (`route_notification`) now writes its row through
+/// [`enqueue_classified_with_origin`], because the queued row is what the drain
+/// later injects — a row that lost its origin comes back out classified as
+/// internal, which is the permissive side of the ChannelBridge reply guard.
+/// Keeping a provenance-free entry point available to production is how that
+/// regression would return silently, so it is available to tests only.
+#[cfg(test)]
 pub fn enqueue(home: &Path, agent_name: &str, text: &str) -> anyhow::Result<()> {
     enqueue_classified(home, agent_name, text, false)
 }
@@ -414,10 +430,24 @@ pub fn enqueue_classified(
     text: &str,
     actionable: bool,
 ) -> anyhow::Result<()> {
+    enqueue_classified_with_origin(home, agent_name, text, actionable, None)
+}
+
+/// #3324: same, carrying the typed external-channel provenance across the
+/// durable defer hop. Internal callers keep using [`enqueue_classified`]; only
+/// the inbound notification path has an origin to carry.
+pub fn enqueue_classified_with_origin(
+    home: &Path,
+    agent_name: &str,
+    text: &str,
+    actionable: bool,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> anyhow::Result<()> {
     let msg = QueuedNotification {
         text: text.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         actionable,
+        channel_origin,
         deferred_since_ms: chrono::Utc::now().timestamp_millis(),
     };
     append_queued(home, agent_name, &msg)
@@ -470,6 +500,8 @@ pub fn enqueue_coalesced_auto(home: &Path, agent_name: &str, text: &str) -> anyh
         text: text.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         actionable: false,
+        // AGEND-AUTO nudges are daemon-generated, never channel-originated.
+        channel_origin: None,
         deferred_since_ms: chrono::Utc::now().timestamp_millis(),
     };
     let Some(kind_key) = agend_auto_kind_prefix(text) else {

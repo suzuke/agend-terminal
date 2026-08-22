@@ -1033,6 +1033,7 @@ fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
             &home,
             "claude-agent",
             "registry delivery",
+            None,
             move |_, _, _| {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
@@ -1118,6 +1119,7 @@ fn permanently_terminated_channel_helper_surfaces_transport_error() {
             &home,
             "claude-agent",
             "registry delivery",
+            None,
             move |_, _, _| {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
@@ -1783,6 +1785,20 @@ fn seed_delivery(
     body: &str,
     origin: Option<crate::channel::ChannelKind>,
 ) -> (Uuid, String) {
+    seed_delivery_with_logical_id(home, locator, runtime, body, origin, Some("m-3324"))
+}
+
+/// #3324 (N5): the logical id is what the refusal names as `message_id=`. It is
+/// absent whenever the notification carried no `[AGEND-MSG] id=…` header, so the
+/// refusal text has to be correct for both cases.
+fn seed_delivery_with_logical_id(
+    home: &Path,
+    locator: &SessionLocator,
+    runtime: &ChannelRuntime,
+    body: &str,
+    origin: Option<crate::channel::ChannelKind>,
+    logical_delivery_id: Option<&str>,
+) -> (Uuid, String) {
     let mut envelope = DeliveryEnvelope::new(
         "claude-agent",
         locator.clone(),
@@ -1791,7 +1807,7 @@ fn seed_delivery(
         None,
     );
     envelope.channel_origin = origin;
-    envelope.logical_delivery_id = Some("m-3324".to_string());
+    envelope.logical_delivery_id = logical_delivery_id.map(str::to_string);
     let delivery_id = envelope.delivery_id;
     let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
     let store = ReceiptStore::for_instance(home, "claude-agent").expect("store");
@@ -1904,6 +1920,89 @@ fn bridge_reply_serves_a_delivery_with_no_receipt_3324() {
     assert!(
         runtime.reply_for(delivery_id).is_some(),
         "#3324: and its reply must be recorded"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324 RED: the bracket-in-name case, pinned at the GUARD.
+///
+/// The typed-source unit test says the classification is right; this says the
+/// DELIVERY is actually refused, which is the property the user's message
+/// depends on. The origin here comes from `NotifySource::external_channel`,
+/// exactly as production takes it — so the header this body renders (an
+/// operator whose configured allowlist name contains `]`) is along for the
+/// ride, not the evidence. Both channel kinds, because the guard must key on
+/// "external", not on Telegram.
+#[test]
+fn bridge_reply_is_refused_for_a_bracketed_display_name_3324() {
+    for kind in [
+        crate::channel::ChannelKind::Telegram,
+        crate::channel::ChannelKind::Discord,
+    ] {
+        let home = home(&format!("bracket-name-refused-3324-{kind:?}"));
+        let locator = test_published_locator(&home, "claude-agent");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let source = crate::inbox::NotifySource::Channel("alice]", kind);
+        let body = crate::inbox::notify::format_notification_for_inject(
+            false,
+            &source,
+            "please help",
+            &[],
+        );
+        let (delivery_id, chat_id) =
+            seed_delivery(&home, &locator, &runtime, &body, source.external_channel());
+
+        let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "#3324: a `]` in the display name must not let an external delivery \
+             through the bridge (kind={kind:?}); got {response}"
+        );
+        assert!(
+            runtime.reply_for(delivery_id).is_none(),
+            "#3324: and nothing may be recorded as replied (kind={kind:?})"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
+/// #3324 (N5): when the envelope carries no logical id, the refusal must not
+/// name one.
+///
+/// The first cut rendered prose into the value slot —
+/// `message_id=the original message id from the inbox` — which reads as a
+/// literal id an agent can pass straight through to the other tool, turning a
+/// helpful refusal into a second failed call.
+#[test]
+fn the_refusal_omits_message_id_when_the_envelope_has_none_3324() {
+    let home = home("no-logical-id-refusal-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery_with_logical_id(
+        &home,
+        &locator,
+        &runtime,
+        "[user:alice via telegram] no AGEND-MSG header here",
+        Some(crate::channel::ChannelKind::Telegram),
+        None,
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: it is still an external delivery and still refused; got {response}"
+    );
+    assert!(
+        !message.contains("message_id="),
+        "#3324 (N5): no `message_id=` may be named when the envelope has no \
+         logical id — got {message:?}"
+    );
+    assert!(
+        message.contains("mcp__agend-terminal__reply"),
+        "#3324: the exact delivering tool must still be named; got {message:?}"
     );
     let _ = fs::remove_dir_all(home);
 }

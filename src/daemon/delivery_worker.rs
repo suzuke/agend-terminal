@@ -88,6 +88,9 @@ struct TransportDelivery {
     home: PathBuf,
     agent: String,
     notification: String,
+    /// #3324: typed external-channel provenance, carried from the inbound
+    /// construction so the envelope can record it without re-reading the header.
+    channel_origin: Option<crate::channel::ChannelKind>,
     epoch: u64,
 }
 
@@ -478,6 +481,7 @@ fn dispatch_transport(
         home,
         agent,
         notification,
+        channel_origin,
         epoch,
     } = job;
     if crate::agent::deleting::is_deleting(&home, &agent) || transport_epoch(&home, &agent) != epoch
@@ -494,6 +498,7 @@ fn dispatch_transport(
         &home,
         &agent,
         &notification,
+        channel_origin,
         |home, agent, text| {
             #[cfg(test)]
             test_support::note_legacy_wake(agent);
@@ -548,11 +553,22 @@ pub(crate) fn enqueue_transport_delivery_with_epoch(
     agent: &str,
     notification: &str,
 ) -> Result<u64, TransportEnqueueError> {
+    enqueue_transport_delivery_with_epoch_and_origin(home, agent, notification, None)
+}
+
+/// #3324: same, carrying the typed external-channel provenance to the envelope.
+pub(crate) fn enqueue_transport_delivery_with_epoch_and_origin(
+    home: &Path,
+    agent: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> Result<u64, TransportEnqueueError> {
     let epoch = transport_epoch_for_enqueue(home, agent)?;
     schedule_transport_delivery(TransportDelivery {
         home: home.to_path_buf(),
         agent: agent.to_string(),
         notification: notification.to_string(),
+        channel_origin,
         epoch,
     })?;
     Ok(epoch)
@@ -567,6 +583,7 @@ pub(crate) fn enqueue_transport_delivery_at_epoch(
     agent: &str,
     notification: &str,
     expected_epoch: u64,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> Result<u64, TransportEnqueueError> {
     let epoch = transport_epoch_for_enqueue(home, agent)?;
     if epoch != expected_epoch {
@@ -576,6 +593,14 @@ pub(crate) fn enqueue_transport_delivery_at_epoch(
         home: home.to_path_buf(),
         agent: agent.to_string(),
         notification: notification.to_string(),
+        // #3324: a #2044 re-delivery is the SAME logical delivery as the wake
+        // that was armed, so it carries the origin recorded at arm time rather
+        // than re-deriving one. It is NOT `None`: the actionable classifier
+        // (`notification_is_actionable_wake`) matches on the notification TEXT,
+        // and the inline inbound rendering embeds the sender's own words — so a
+        // channel message containing `kind=task ` is armed like any other
+        // actionable wake and reaches this path.
+        channel_origin,
         epoch: expected_epoch,
     })?;
     Ok(expected_epoch)
@@ -631,11 +656,17 @@ pub(crate) fn arm_transport_verification_if_current(
     agent: &str,
     epoch: u64,
     notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> bool {
     let mode = crate::transport::mode_for_instance(home, agent);
-    let Some(prepared) =
-        crate::daemon::inject_delivery::prepare_arm(home, agent, notification, mode, epoch)
-    else {
+    let Some(prepared) = crate::daemon::inject_delivery::prepare_arm(
+        home,
+        agent,
+        notification,
+        mode,
+        epoch,
+        channel_origin,
+    ) else {
         return false;
     };
     let committed = {
@@ -1288,6 +1319,7 @@ mod tests {
             home: home.clone(),
             agent: "legacy-agent".to_string(),
             notification: "one logical wake".to_string(),
+            channel_origin: None,
             epoch: transport_epoch(&home, "legacy-agent"),
         })
         .expect("transport scheduler accepts test delivery");
@@ -1545,6 +1577,7 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "stale teardown wake".to_string(),
+            channel_origin: None,
             epoch: stale_epoch,
         })
         .is_ok());
@@ -1638,6 +1671,7 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "stale cleanup tail wake".to_string(),
+            channel_origin: None,
             epoch: stale_epoch,
         })
         .is_ok());
@@ -1786,6 +1820,7 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "queued before spawn transition".to_string(),
+            channel_origin: None,
             epoch: before_epoch,
         })
         .is_ok());
@@ -1793,6 +1828,7 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "queued during spawn transition".to_string(),
+            channel_origin: None,
             epoch: during_epoch,
         })
         .is_ok());

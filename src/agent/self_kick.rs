@@ -96,6 +96,10 @@ pub(super) fn deliver_self_kick(
                 target.name.as_str(),
                 epoch,
                 &prompt,
+                // #3324: the self-kick prompt is composed by the daemon itself,
+                // so it has no external channel origin by construction — not
+                // because nothing was found in its text.
+                None,
             );
             return Ok(SelfKickDelivery::LegacyPty);
         }

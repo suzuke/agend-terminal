@@ -50,18 +50,22 @@ impl PerTickHandler for NotificationFlushHandler {
 /// queued hints must land WITH the backend submit key or one-shot backends
 /// silently drop the wake).
 pub(crate) fn flush_all(home: &Path) {
-    flush_all_with(home, |agent, text| {
-        crate::inbox::notify::inject_notification_with_submit(home, agent, text)
+    flush_all_with(home, |agent, text, channel_origin| {
+        // #3324: the queued row's typed provenance travels with it out of the
+        // durable queue, so a deferred Telegram message reaches the envelope
+        // marked external instead of being re-classified from its own text.
+        crate::inbox::notify::inject_notification_with_submit(home, agent, text, channel_origin)
     });
 }
 
-/// Test-seam variant: `injector` receives `(agent_name, notification_text)`.
+/// Test-seam variant: `injector` receives
+/// `(agent_name, notification_text, channel_origin)`.
 /// The busy/typing/draft GATING lives in the shared core
 /// (`inbox::notify::flush_agent_queue`), so a test driving this entry asserts
 /// exactly what the daemon tick delivers.
 pub(crate) fn flush_all_with<F>(home: &Path, mut injector: F)
 where
-    F: FnMut(&str, &str) -> anyhow::Result<()>,
+    F: FnMut(&str, &str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
     let Ok(fleet) = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home))
     else {
@@ -79,7 +83,9 @@ where
         }
         // Shared core applies the SAME draft/busy/typing gating + MAX_DEFER
         // caps as the TUI flush; failed injects are requeued for next tick.
-        crate::inbox::notify::flush_agent_queue(home, agent, |text| injector(agent, text));
+        crate::inbox::notify::flush_agent_queue(home, agent, |text, channel_origin| {
+            injector(agent, text, channel_origin)
+        });
     }
 }
 
@@ -141,7 +147,7 @@ mod tests {
 
         let delivered: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
         let d = delivered.clone();
-        flush_all_with(&home, |agent, text| {
+        flush_all_with(&home, |agent, text, _channel_origin| {
             d.lock().push((agent.to_string(), text.to_string()));
             Ok(())
         });
@@ -175,7 +181,7 @@ mod tests {
         notification_queue::enqueue(&home, "a", "fresh").expect("enqueue fresh");
         let count = Arc::new(Mutex::new(0usize));
         let c = count.clone();
-        flush_all_with(&home, |_, _| {
+        flush_all_with(&home, |_, _, _channel_origin| {
             *c.lock() += 1;
             Ok(())
         });
@@ -193,7 +199,7 @@ mod tests {
         items[0].deferred_since_ms -= 8_000;
         notification_queue::requeue_all(&home, "a", &items);
 
-        flush_all_with(&home, |_, _| {
+        flush_all_with(&home, |_, _, _channel_origin| {
             *c.lock() += 1;
             Ok(())
         });
@@ -214,7 +220,9 @@ mod tests {
         snapshot_state(&home, "a", "idle");
         notification_queue::enqueue(&home, "a", "msg").expect("enqueue");
 
-        flush_all_with(&home, |_, _| anyhow::bail!("pane not ready"));
+        flush_all_with(&home, |_, _, _channel_origin| {
+            anyhow::bail!("pane not ready")
+        });
         assert_eq!(
             notification_queue::pending_count(&home, "a"),
             1,
@@ -244,7 +252,7 @@ mod tests {
         write_fleet_n(&home, N);
         notification_queue::reset_scan_counters();
 
-        flush_all_with(&home, |_, _| Ok(()));
+        flush_all_with(&home, |_, _, _channel_origin| Ok(()));
 
         assert_eq!(
             notification_queue::dir_scan_count(),
@@ -271,7 +279,7 @@ mod tests {
 
         let delivered: Arc<Mutex<Vec<String>>> = Arc::default();
         let d = delivered.clone();
-        flush_all_with(&home, |_, text| {
+        flush_all_with(&home, |_, text, _channel_origin| {
             d.lock().push(text.to_string());
             Ok(())
         });

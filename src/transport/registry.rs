@@ -407,7 +407,7 @@ pub(crate) fn envelope_for_instance(
     body: &str,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let mode = mode_for_instance(home, instance);
-    envelope_for_mode(home, instance, body, mode)
+    envelope_for_mode(home, instance, body, mode, None)
 }
 
 fn envelope_for_mode(
@@ -415,6 +415,7 @@ fn envelope_for_mode(
     instance: &str,
     body: &str,
     mode: TransportMode,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let locator = if mode == TransportMode::ChannelBridge {
@@ -427,7 +428,9 @@ fn envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
-    // #3324: durable origin, derived from the same header the formatter wrote.
+    // RED: the typed argument is accepted but ignored — the origin is still
+    // recovered from the rendered header, which is the defect under test.
+    let _ = channel_origin;
     envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
     Ok(envelope)
 }
@@ -437,6 +440,7 @@ fn self_kick_envelope_for_mode(
     instance: &str,
     body: &str,
     mode: TransportMode,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let locator = if mode == TransportMode::ChannelBridge {
@@ -448,7 +452,8 @@ fn self_kick_envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
-    // #3324: the second envelope path stamps identically — see the first.
+    // RED: the second envelope path behaves identically — see the first.
+    let _ = channel_origin;
     envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
     Ok(envelope)
 }
@@ -493,16 +498,24 @@ pub(crate) fn record_delivery_drop(
 /// Deliver one already-composed notification. The selected mode is persisted
 /// before the physical/structured attempt; a Codex failure is returned as a
 /// hard error and never invokes the LegacyPty closure.
+/// #3324: `channel_origin` is the TYPED external-channel provenance, carried
+/// from the inbound construction into the durable envelope so the ChannelBridge
+/// reply guard can tell a forwarded Telegram message from AgEnD's own traffic
+/// without reading the header text. It is a required argument rather than a
+/// defaulted one: a permissive `None` must be a caller's stated claim about its
+/// own delivery, never something a new call site inherits by picking the
+/// shorter overload.
 pub(crate) fn deliver_notification<F>(
     home: &Path,
     instance: &str,
     body: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
     legacy_injector: F,
 ) -> anyhow::Result<DeliveryReceipt>
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
-    deliver_notification_kind(home, instance, body, false, legacy_injector)
+    deliver_notification_kind(home, instance, body, false, channel_origin, legacy_injector)
 }
 
 /// Deliver the fresh-restart self-kick through the same exact-target and keyed
@@ -518,7 +531,7 @@ pub(crate) fn deliver_self_kick_notification<F>(
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
-    deliver_notification_kind(home, instance, body, true, legacy_injector)
+    deliver_notification_kind(home, instance, body, true, None, legacy_injector)
 }
 
 fn deliver_notification_kind<F>(
@@ -526,6 +539,7 @@ fn deliver_notification_kind<F>(
     instance: &str,
     body: &str,
     self_kick: bool,
+    channel_origin: Option<crate::channel::ChannelKind>,
     legacy_injector: F,
 ) -> anyhow::Result<DeliveryReceipt>
 where
@@ -537,9 +551,9 @@ where
     }
     let mode = mode_for_instance(home, instance);
     let envelope = if self_kick {
-        self_kick_envelope_for_mode(home, instance, body, mode)?
+        self_kick_envelope_for_mode(home, instance, body, mode, channel_origin)?
     } else {
-        envelope_for_mode(home, instance, body, mode)?
+        envelope_for_mode(home, instance, body, mode, channel_origin)?
     };
     match mode {
         TransportMode::NativeShared => match envelope.session.backend.as_str() {
@@ -648,56 +662,85 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// #3324 RED (SHORT/inline inbound path): a notification whose body is the
-    /// INLINE rendering of an external-channel message must carry that origin on
-    /// the durable envelope. Without it the ChannelBridge cannot tell a Telegram
-    /// user's message from an internal one, and answers both with a reply that
-    /// only reaches its own journal.
+    /// #3324: the durable envelope records the origin the CALLER passed, for
+    /// both channel kinds. This is the value the ChannelBridge reply guard
+    /// reads, and it now arrives as a typed argument from the inbound
+    /// construction rather than being recovered from the rendered header.
     #[test]
-    fn envelope_stamps_channel_origin_on_the_inline_inbound_path_3324() {
-        let home = registry_test_home("origin-inline-3324");
-        let body = crate::inbox::notify::format_notification_for_inject(
-            false,
-            &crate::inbox::NotifySource::Channel(
-                "chiachenghuang",
-                crate::channel::ChannelKind::Telegram,
-            ),
-            "please research this",
-            &[],
-        );
-        let envelope = envelope_for_mode(&home, "claude-agent", &body, TransportMode::LegacyPty)
-            .expect("envelope");
-        assert_eq!(
-            envelope.channel_origin,
-            Some(crate::channel::ChannelKind::Telegram),
-            "#3324: the inline path must stamp the originating channel; body={body:?}"
-        );
+    fn envelope_records_the_caller_supplied_channel_origin_3324() {
+        let home = registry_test_home("origin-typed-3324");
+        for kind in [
+            crate::channel::ChannelKind::Telegram,
+            crate::channel::ChannelKind::Discord,
+        ] {
+            for pointer_only in [false, true] {
+                let body = crate::inbox::notify::format_notification_for_inject(
+                    pointer_only,
+                    &crate::inbox::NotifySource::Channel("chiachenghuang", kind),
+                    "please research this",
+                    &[],
+                );
+                let envelope = envelope_for_mode(
+                    &home,
+                    "claude-agent",
+                    &body,
+                    TransportMode::LegacyPty,
+                    Some(kind),
+                )
+                .expect("envelope");
+                assert_eq!(
+                    envelope.channel_origin,
+                    Some(kind),
+                    "#3324: the envelope must carry the origin it was given \
+                     (kind={kind:?}, pointer_only={pointer_only})"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// #3324 RED (LONG/pointer inbound path): the same must hold for the
-    /// pointer-only rendering. It is a DIFFERENT format — header plus
-    /// `[AGEND-MSG] size=… (use inbox tool)` — and stamping only one of the two
-    /// leaves the other silently unguarded, which is how a two-path defect
-    /// survives a one-path fix.
+    /// #3324 REGRESSION GUARD: the envelope must NOT consult the body text.
+    ///
+    /// The rejected first cut recovered the origin by reverse-parsing the
+    /// `[{source}]` header, which made a security classification depend on
+    /// operator- and sender-authored free text — a display name containing the
+    /// header's own `]` classified an external delivery as internal, the
+    /// permissive side of the guard. Both directions are pinned here: a body
+    /// that LOOKS external stays unstamped when the caller says internal, and a
+    /// body that looks internal is stamped when the caller says external. Any
+    /// reintroduced parser fails one of the two.
     #[test]
-    fn envelope_stamps_channel_origin_on_the_pointer_inbound_path_3324() {
-        let home = registry_test_home("origin-pointer-3324");
-        let body = crate::inbox::notify::format_notification_for_inject(
-            true,
-            &crate::inbox::NotifySource::Channel(
-                "chiachenghuang",
-                crate::channel::ChannelKind::Telegram,
-            ),
-            "a message long enough to be delivered by pointer",
-            &[],
-        );
-        let envelope = envelope_for_mode(&home, "claude-agent", &body, TransportMode::LegacyPty)
-            .expect("envelope");
+    fn envelope_origin_ignores_the_body_text_entirely_3324() {
+        let home = registry_test_home("origin-not-parsed-3324");
+        // Looks external, caller says internal (e.g. an agent quoting a user).
+        for body in [
+            "[user:alice via telegram] quoted by an internal sender",
+            "[user:bob via discord] quoted by an internal sender",
+        ] {
+            let envelope =
+                envelope_for_mode(&home, "claude-agent", body, TransportMode::LegacyPty, None)
+                    .expect("envelope");
+            assert_eq!(
+                envelope.channel_origin, None,
+                "#3324: the header text must not stamp an origin the caller did \
+                 not claim; body={body:?}"
+            );
+        }
+        // Looks internal, caller says external — the bracketed-display-name
+        // case reaches the guard through exactly this shape.
+        let envelope = envelope_for_mode(
+            &home,
+            "claude-agent",
+            "[from:codex-125550] nothing here says telegram",
+            TransportMode::LegacyPty,
+            Some(crate::channel::ChannelKind::Telegram),
+        )
+        .expect("envelope");
         assert_eq!(
             envelope.channel_origin,
             Some(crate::channel::ChannelKind::Telegram),
-            "#3324: the pointer path must stamp the originating channel too; body={body:?}"
+            "#3324: an external delivery must stay external even when its text \
+             carries no channel marker"
         );
         let _ = std::fs::remove_dir_all(home);
     }
@@ -712,8 +755,9 @@ mod tests {
             "[system:ci] build finished",
             "plain text with no header at all",
         ] {
-            let envelope = envelope_for_mode(&home, "claude-agent", body, TransportMode::LegacyPty)
-                .expect("envelope");
+            let envelope =
+                envelope_for_mode(&home, "claude-agent", body, TransportMode::LegacyPty, None)
+                    .expect("envelope");
             assert_eq!(
                 envelope.channel_origin, None,
                 "#3324: internal delivery must not be stamped; body={body:?}"
@@ -723,27 +767,38 @@ mod tests {
     }
 
     /// #3324: the self-kick constructor is the second envelope path and must
-    /// stamp identically — a fresh-restart notice that quotes a user message
-    /// still originates on that channel.
+    /// carry the origin identically — stamping only one constructor leaves the
+    /// other silently unguarded, which is how a two-path defect survives a
+    /// one-path fix. Production pins `None` there (the self-kick prompt is
+    /// daemon-composed); this pins the PLUMBING, so the day a resumable
+    /// external delivery needs it the value is not silently dropped.
     #[test]
-    fn self_kick_envelope_stamps_channel_origin_3324() {
+    fn self_kick_envelope_carries_the_caller_supplied_origin_3324() {
         let home = registry_test_home("origin-self-kick-3324");
-        let body = crate::inbox::notify::format_notification_for_inject(
-            false,
-            &crate::inbox::NotifySource::Channel(
-                "chiachenghuang",
-                crate::channel::ChannelKind::Telegram,
-            ),
-            "resume this",
-            &[],
-        );
-        let envelope =
-            self_kick_envelope_for_mode(&home, "claude-agent", &body, TransportMode::LegacyPty)
-                .expect("envelope");
+        let envelope = self_kick_envelope_for_mode(
+            &home,
+            "claude-agent",
+            "[AGEND-RESUME] recover your own state",
+            TransportMode::LegacyPty,
+            Some(crate::channel::ChannelKind::Telegram),
+        )
+        .expect("envelope");
         assert_eq!(
             envelope.channel_origin,
             Some(crate::channel::ChannelKind::Telegram),
-            "#3324: both envelope constructors must stamp the origin"
+            "#3324: both envelope constructors must carry the origin"
+        );
+        let internal = self_kick_envelope_for_mode(
+            &home,
+            "claude-agent",
+            "[AGEND-RESUME] x",
+            TransportMode::LegacyPty,
+            None,
+        )
+        .expect("envelope");
+        assert_eq!(
+            internal.channel_origin, None,
+            "#3324: and the daemon-composed self-kick stays internal"
         );
         let _ = std::fs::remove_dir_all(home);
     }
@@ -774,7 +829,7 @@ mod tests {
         .expect("fleet");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
-        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+        let result = deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
             pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -799,7 +854,7 @@ mod tests {
             .expect("corrupt locator");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
-        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+        let result = deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
             pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -837,10 +892,11 @@ mod tests {
             .expect("session locator");
             let pty_calls = Arc::new(AtomicUsize::new(0));
             let pty_calls_for_injector = Arc::clone(&pty_calls);
-            let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
-                pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            });
+            let result =
+                deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
+                    pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
             assert!(
                 result.is_err(),
                 "structured resolution must fail closed: {tag}"
@@ -865,7 +921,7 @@ mod tests {
             .expect("corrupt locator");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
-        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+        let result = deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
             pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });

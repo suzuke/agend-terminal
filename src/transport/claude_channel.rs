@@ -588,15 +588,17 @@ impl ChannelRuntime {
             crate::channel::ChannelKind::Telegram => "telegram",
             crate::channel::ChannelKind::Discord => "discord",
         };
-        let target = envelope
-            .logical_delivery_id
-            .as_deref()
-            .unwrap_or("the original message id from the inbox");
+        // RED: prose is rendered into the `message_id=` value slot when the
+        // envelope carries no logical id.
+        let target = match envelope.logical_delivery_id.as_deref() {
+            Some(id) => format!("with message_id={id}"),
+            None => "with message_id=the original message id from the inbox".to_string(),
+        };
         anyhow::bail!(
             "this delivery originated on the {channel} channel, which the Claude \
              ChannelBridge cannot reach — a reply here is recorded as a transport \
              acknowledgement and never delivered. Use the mcp__agend-terminal__reply \
-             tool with message_id={target} instead. This reply obligation stays armed."
+             tool {target} instead. This reply obligation stays armed."
         )
     }
 

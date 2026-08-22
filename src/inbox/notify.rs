@@ -266,27 +266,20 @@ pub fn format_notification_for_inject(
     }
 }
 
-/// #3324: recover the EXTERNAL channel a notification came from, if any.
-///
-/// This is the exact inverse of the `[{source}]` prefix `format_notification_for_inject`
-/// writes, and it is deliberately anchored at position 0 and closed by the first
-/// `]`: both the inline and the pointer-only rendering start with that one
-/// header, so one parser covers both paths rather than one path being silently
-/// left unguarded.
-///
-/// `None` means "not an external channel" — internal agent, system, or an
-/// unheadered body. The consumer fails CLOSED on `Some`, so being conservative
-/// here means the bridge keeps answering everything it legitimately owns.
+/// PRE-FIX: recover the EXTERNAL channel by reverse-parsing the `[{source}]`
+/// prefix `format_notification_for_inject` writes. This is the behaviour under
+/// test — a security classification derived from operator- and sender-authored
+/// free text. Deleted by the implementation commit.
 pub(crate) fn channel_origin_from_notification(body: &str) -> Option<crate::channel::ChannelKind> {
-    let rest = body.strip_prefix('[')?;
-    let header = rest.split_once(']')?.0;
-    // `user:<name> via <kind>` — the name may contain spaces, the kind may not.
-    let (_, kind) = header.strip_prefix("user:")?.rsplit_once(" via ")?;
-    match kind {
-        "telegram" => Some(crate::channel::ChannelKind::Telegram),
-        "discord" => Some(crate::channel::ChannelKind::Discord),
-        _ => None,
-    }
+    let rest = body.strip_prefix("[user:")?;
+    [
+        (" via telegram]", crate::channel::ChannelKind::Telegram),
+        (" via discord]", crate::channel::ChannelKind::Discord),
+    ]
+    .into_iter()
+    .filter_map(|(terminator, kind)| rest.find(terminator).map(|at| (at, kind)))
+    .min_by_key(|(at, _)| *at)
+    .map(|(_, kind)| kind)
 }
 
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
@@ -311,7 +304,9 @@ pub fn notify_agent_with_attachments(
     });
     let notification =
         format_notification_for_inject(pointer_only_inject(), source, text, attachments);
-    compose_aware_inject(home, agent_name, &notification);
+    // #3324: take the provenance from the TYPED source, here, where it is still
+    // typed — not by reverse-parsing the header we just rendered.
+    compose_aware_inject_with_origin(home, agent_name, &notification, source.external_channel());
     // #836: record the (agent, msg_id) tuple in the dedup ledger
     if let Some(msg_id) =
         crate::daemon::notification_dedup::extract_msg_id_from_header(&notification)
@@ -344,11 +339,35 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     let _ = compose_aware_inject_result(home, agent_name, notification);
 }
 
+/// #3324: inject while carrying typed external-channel provenance. Only the
+/// inbound notification path has an origin; every internal caller keeps using
+/// [`compose_aware_inject`], which passes `None`.
+pub(crate) fn compose_aware_inject_with_origin(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) {
+    let _ = compose_aware_inject_result_with_origin(home, agent_name, notification, channel_origin);
+}
+
 pub(crate) fn compose_aware_inject_result(
     home: &Path,
     agent_name: &str,
     notification: &str,
 ) -> ComposeInjectOutcome {
+    compose_aware_inject_result_with_origin(home, agent_name, notification, None)
+}
+
+pub(crate) fn compose_aware_inject_result_with_origin(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> ComposeInjectOutcome {
+    // RED: accepted at the boundary, not yet propagated to any of the three
+    // delivery paths below.
+    let _ = channel_origin;
     // #911 dedup gate
     if should_suppress_911_reinject_with_ledger(
         home,
@@ -370,11 +389,13 @@ pub(crate) fn compose_aware_inject_result(
         crate::snapshot::agent_state_of(home, agent_name).as_deref(),
         actionable,
     ) {
-        return match crate::notification_queue::enqueue_classified(
+        return match crate::notification_queue::enqueue_classified_with_origin(
             home,
             agent_name,
             notification,
             actionable,
+            // RED: the plumbing exists; nothing flows through it yet.
+            None,
         ) {
             Ok(()) => ComposeInjectOutcome::Deferred,
             Err(error) => {
@@ -391,7 +412,8 @@ pub(crate) fn compose_aware_inject_result(
     // the PTY regardless of an operator DRAFT — only the busy/typing gate above
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
-        return match inject_with_submit_admitted(home, agent_name, notification) {
+        return match inject_with_submit_admitted_with_origin(home, agent_name, notification, None)
+        {
             Ok(epoch) => {
                 // #2044: arm delivery-verification only after admission succeeds,
                 // and linearize it against delete/transition on the captured
@@ -406,6 +428,7 @@ pub(crate) fn compose_aware_inject_result(
                     agent_name,
                     epoch,
                     notification,
+                    None,
                 ) {
                     tracing::debug!(
                         agent = %agent_name,
@@ -426,8 +449,8 @@ pub(crate) fn compose_aware_inject_result(
     }
     let deferred = crate::notification_queue::draft_state(home, agent_name)
         != crate::notification_queue::DraftState::None;
-    match route_notification(home, agent_name, notification, |msg| {
-        inject_with_submit(home, agent_name, msg)
+    match route_notification(home, agent_name, notification, None, |msg| {
+        inject_with_submit_with_origin(home, agent_name, msg, None)
     }) {
         Ok(()) if deferred => ComposeInjectOutcome::Deferred,
         Ok(()) => ComposeInjectOutcome::TransportAccepted,
@@ -875,12 +898,26 @@ fn inject_with_submit_admitted(
     agent_name: &str,
     message: &str,
 ) -> anyhow::Result<u64> {
+    inject_with_submit_admitted_with_origin(home, agent_name, message, None)
+}
+
+/// #3324: the admission primitive, carrying typed external-channel provenance
+/// through to the envelope the transport builds.
+fn inject_with_submit_admitted_with_origin(
+    home: &Path,
+    agent_name: &str,
+    message: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> anyhow::Result<u64> {
     finish_transport_admission(
         home,
         agent_name,
         message,
-        crate::daemon::delivery_worker::enqueue_transport_delivery_with_epoch(
-            home, agent_name, message,
+        crate::daemon::delivery_worker::enqueue_transport_delivery_with_epoch_and_origin(
+            home,
+            agent_name,
+            message,
+            channel_origin,
         ),
     )
 }
@@ -894,6 +931,7 @@ pub(crate) fn inject_notification_with_submit_at_epoch(
     agent_name: &str,
     notification: &str,
     expected_epoch: u64,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<()> {
     finish_transport_admission(
         home,
@@ -904,6 +942,7 @@ pub(crate) fn inject_notification_with_submit_at_epoch(
             agent_name,
             notification,
             expected_epoch,
+            channel_origin,
         ),
     )
     .map(|_| ())
@@ -945,6 +984,16 @@ fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::R
     inject_with_submit_admitted(home, agent_name, message).map(|_| ())
 }
 
+/// #3324: same, carrying typed external-channel provenance to the envelope.
+fn inject_with_submit_with_origin(
+    home: &Path,
+    agent_name: &str,
+    message: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> anyhow::Result<()> {
+    inject_with_submit_admitted_with_origin(home, agent_name, message, channel_origin).map(|_| ())
+}
+
 /// The physical submit-aware inject primitive: a self-IPC `api::call(INJECT)`
 /// loopback that drives the actual PTY write. Runs on a transport scheduler worker
 /// (see [`inject_with_submit`]); callers on the tick / main-loop thread MUST go
@@ -975,10 +1024,16 @@ pub(crate) fn inject_with_submit_direct(
 
 /// #982 RC: submit-aware notification inject for the
 /// `notification_queue` flush path.
+///
+/// #3324: `channel_origin` is the typed provenance the queued row preserved
+/// across the durable defer hop. Required rather than defaulted — see
+/// [`crate::transport::deliver_notification`] for why the permissive value must
+/// be stated, not inherited.
 pub fn inject_notification_with_submit(
     home: &Path,
     agent_name: &str,
     notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<()> {
     let deferred_rearm = crate::daemon::notification_dedup::extract_msg_id_from_header(
         notification,
@@ -987,9 +1042,9 @@ pub fn inject_notification_with_submit(
         crate::daemon::inject_delivery::take_deferred_rearm_for_flush(home, agent_name, &row_id)
     });
     let Some(reservation) = deferred_rearm else {
-        return inject_with_submit(home, agent_name, notification);
+        return inject_with_submit_with_origin(home, agent_name, notification, channel_origin);
     };
-    match inject_with_submit_admitted(home, agent_name, notification) {
+    match inject_with_submit_admitted_with_origin(home, agent_name, notification, channel_origin) {
         Ok(epoch) => {
             #[cfg(test)]
             crate::daemon::delivery_worker::test_support::run_transport_accepted_before_arm_hook(
@@ -1000,6 +1055,7 @@ pub fn inject_notification_with_submit(
                 agent_name,
                 epoch,
                 notification,
+                channel_origin,
             ) {
                 let _ = crate::daemon::inject_delivery::rollback_rearm_after_reclaim(
                     home,
@@ -1086,7 +1142,7 @@ pub(crate) fn flush_release(
 /// is mid-keystroke, bounded by the MAX_DEFER anti-starvation caps.
 pub(crate) fn flush_agent_queue<F>(home: &Path, agent_name: &str, injector: F)
 where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
     // Raw draft state only: the #1944/#1948 input-box probe needs the rendered
     // pane (TUI-owned vterm), so the headless caller conservatively honors the
@@ -1102,20 +1158,25 @@ where
 /// None drains through the busy/typing holds + MAX_DEFER anti-starvation
 /// caps (`flush_release`). The caller supplies the (possibly probe-refined)
 /// draft state.
+/// #3324: the injector receives the queued row's TYPED channel provenance
+/// alongside its text. The durable defer hop is the one place a notification
+/// stops being a live call frame, so the origin has to travel with the row —
+/// re-deriving it from the rendered text on the way out is exactly the
+/// body-content inference this change exists to remove.
 pub(crate) fn flush_agent_queue_with_state<F>(
     home: &Path,
     agent_name: &str,
     draft_state: crate::notification_queue::DraftState,
     mut injector: F,
 ) where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
     use crate::notification_queue::{self, DraftState};
     match draft_state {
         DraftState::Drafting => {}
         DraftState::Abandoned => {
             if let Some(notification) = notification_queue::drain_one(home, agent_name) {
-                if injector(&notification.text).is_err() {
+                if injector(&notification.text, None).is_err() {
                     notification_queue::requeue_all(home, agent_name, &[notification]);
                 }
             }
@@ -1149,7 +1210,7 @@ pub(crate) fn flush_agent_queue_with_state<F>(
                 if inject_failed || !flush_release(&notification, agent_busy, typing_recent, now_ms)
                 {
                     keep.push(notification);
-                } else if injector(&notification.text).is_err() {
+                } else if injector(&notification.text, None).is_err() {
                     inject_failed = true;
                     keep.push(notification);
                 }
@@ -1161,10 +1222,17 @@ pub(crate) fn flush_agent_queue_with_state<F>(
     }
 }
 
+/// #3324: `channel_origin` is the typed provenance of THIS notification. The
+/// defer branch writes a durable queue row, and that row is what the drain
+/// later injects — so the ambient path has to persist the origin for the same
+/// reason the actionable path does. This is the branch a channel message
+/// normally takes: an inbound user message carries no `kind=` token, so it is
+/// not an actionable wake, and a live operator draft sends it here.
 pub(super) fn route_notification<F>(
     home: &Path,
     agent_name: &str,
     notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
     mut injector: F,
 ) -> anyhow::Result<()>
 where
@@ -1176,7 +1244,13 @@ where
     // directly only when the buffer is clean (all typed input was submitted).
     use crate::notification_queue::DraftState;
     if crate::notification_queue::draft_state(home, agent_name) != DraftState::None {
-        crate::notification_queue::enqueue(home, agent_name, notification)?;
+        crate::notification_queue::enqueue_classified_with_origin(
+            home,
+            agent_name,
+            notification,
+            false,
+            channel_origin,
+        )?;
         return Ok(());
     }
     injector(notification)
@@ -1192,6 +1266,7 @@ mod flush_release_tests_1513 {
             text: "x".into(),
             timestamp: String::new(),
             actionable,
+            channel_origin: None,
             deferred_since_ms,
         }
     }
@@ -1738,7 +1813,7 @@ mod structured_transport_delivery_tests {
         let home = tmp_home("nonblocking");
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         let started = std::time::Instant::now();
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping", None);
         assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -1774,7 +1849,7 @@ mod structured_transport_delivery_tests {
         });
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         let started = std::time::Instant::now();
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping", None);
         assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -1790,7 +1865,7 @@ mod structured_transport_delivery_tests {
         let home = tmp_home("queue-full");
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(true);
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping", None);
         crate::daemon::delivery_worker::test_support::set_force_full(false);
 
         assert!(result.is_err(), "full queue must report a durable drop");
