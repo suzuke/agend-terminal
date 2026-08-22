@@ -1540,41 +1540,8 @@ pub(crate) fn spawn_agent_with_capture_home(
         })
         .unwrap_or_default();
     let dismiss = prepare_dismiss_patterns(&dismiss);
-    // #3314 R1 (argv provenance): did THIS generation's launch actually carry
-    // `--dangerously-load-development-channels`? Computed from the same
-    // `spawn_flags` that produced the argv a moment ago (backend.rs adds the flag
-    // only when the workspace mcp-config declares the channel server), so it is a
-    // fact about what we launched — not a decision-time re-read, and with no
-    // forgery surface, unlike anything on the screen.
-    let dev_modal_flagged = detected_backend
-        .as_ref()
-        .zip(*working_dir)
-        .map(|(b, wd)| {
-            b.spawn_flags(wd)
-                .iter()
-                .any(|flag| flag == "--dangerously-load-development-channels")
-        })
-        .unwrap_or(false);
-    // #3314 version-drift gate: pin the CONCRETE versioned binary this
-    // generation execs. `~/.local/bin/claude` is a symlink auto-update flips
-    // while the fleet runs, and old versions stay on disk, so a decision-time
-    // `--version` can report a binary this process is not running.
-    // Canonicalising at spawn is the only honest identity — and an unvalidated
-    // version disarms rather than assuming the modal still renders the way our
-    // captures recorded it.
-    let dev_modal_version = detected_backend
-        .as_ref()
-        .and_then(|b| which::which(b.preset().command).ok())
-        .and_then(|path| crate::agent::dev_modal::spawned_binary_version(&path));
-    let dev_modal_armed = dev_modal_flagged
-        && crate::agent::dev_modal::version_is_validated(dev_modal_version.as_deref());
-    if dev_modal_flagged && !dev_modal_armed {
-        tracing::info!(
-            agent = name,
-            version = ?dev_modal_version,
-            "#3314: startup-modal auto-answer disarmed — unvalidated backend version"
-        );
-    }
+    // #3314: argv provenance + version-drift gate, both decided at spawn.
+    let dev_modal_armed = dev_modal::armed_for_spawn(detected_backend.as_ref(), *working_dir, name);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);
@@ -2123,25 +2090,18 @@ fn pty_read_loop(
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
-    // #3314: per-generation startup-modal gate. A plain local, so it is
-    // generation-scoped BY CONSTRUCTION — no store keyed by agent name, nothing
-    // to evict, and no rollover race. It dies with this read loop.
-    let dev_modal_epoch = crate::agent::dev_modal::arm_epoch(pty_writer);
-    // #3314: this generation is over when the read loop exits, for ANY reason
-    // (EOF, read error, shutdown). Kept separate from `deleted`, because a child
-    // that simply exited is not a deleted instance and conflating the two would
-    // mislabel a crashed agent. A CR still queued behind the 300ms write delay
-    // must not land after the generation it was decided for has ended.
+    // #3314: per-generation gate — a plain local, generation-scoped by
+    // construction. See `agent::dev_modal`.
+    let dev_modal_epoch = dev_modal::arm_epoch(pty_writer);
+    // #3314: set when the read loop exits for ANY reason; see `WriteBarrier`.
     let dev_modal_generation_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut dev_modal_gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+    let mut dev_modal_gate = dev_modal::DevModalGate::with_epoch(
         *dev_modal_armed,
         dev_modal_epoch,
         Arc::clone(&dev_modal_generation_over),
         Arc::clone(deleted),
     );
-    // Monotonic base for the gate's stability window. The gate itself never
-    // reads a clock — time is supplied here so every stability test is
-    // deterministic instead of timing dependent.
+    // Monotonic base for the stability window; the gate never reads a clock.
     let dev_modal_clock = std::time::Instant::now();
     // #3314: has the agent reached Idle at least once? That is the point after
     // which a daemon-caused STARTUP modal can no longer legitimately appear, so
@@ -2263,9 +2223,7 @@ fn pty_read_loop(
                         // modal falls into.
                         dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle),
                         &mut dev_modal_gate,
-                        crate::agent::dev_modal::LogicalMs(
-                            dev_modal_clock.elapsed().as_millis() as u64
-                        ),
+                        dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
                     )
                 {
                     dismiss_cooldown_until =
@@ -2290,11 +2248,10 @@ fn pty_read_loop(
         }
     }
 
-    // #3314: the generation is over. Cancel FIRST, then stop tracking writes —
-    // a queued keystroke still holds its own Arc to this flag, so removing the
-    // registry entry alone would not have stopped it.
+    // #3314: cancel FIRST, then stop tracking — a queued keystroke holds its own
+    // Arc, so removing the registry entry alone would not stop it.
     dev_modal_generation_over.store(true, std::sync::atomic::Ordering::SeqCst);
-    crate::agent::dev_modal::disarm_epoch(pty_writer);
+    dev_modal::disarm_epoch(pty_writer);
 
     // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).
     // Previously only the Ok(0) branch called it; the Err branch broke without
@@ -2753,11 +2710,8 @@ pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
 }
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
-    // #3314: THE chokepoint for every PTY byte write in this daemon —
-    // `write_to_pty` delegates here, and so do the inject, dismiss and TUI
-    // socket paths. Bumping the per-writer epoch here covers every writer,
-    // including ones added later, with no per-caller wiring to forget. An
-    // in-flight startup-modal candidate is invalidated by any of them.
+    // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
+    // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
     crate::agent::dev_modal::note_pty_write(writer);
     if let Some(result) = try_actor_write(writer, data) {
         return result;

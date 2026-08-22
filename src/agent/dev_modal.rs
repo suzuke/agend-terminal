@@ -94,6 +94,41 @@ pub(crate) fn spawned_binary_version(command: &std::path::Path) -> Option<String
     Some(resolved.file_name()?.to_string_lossy().into_owned())
 }
 
+/// Is this generation eligible for startup-modal auto-answering at all?
+///
+/// Two owned facts, both decided at SPAWN: the argv we are about to exec really
+/// carries the provoking flag (`Backend::spawn_flags` adds it only when the
+/// workspace mcp-config declares the channel server), and the concrete
+/// versioned binary we will exec is one whose modal rendering we have actually
+/// captured. Neither is an observation of the screen, so neither can be forged
+/// by replayed output.
+pub(crate) fn armed_for_spawn(
+    backend: Option<&crate::backend::Backend>,
+    working_dir: Option<&std::path::Path>,
+    agent: &str,
+) -> bool {
+    let flagged = backend.zip(working_dir).is_some_and(|(b, wd)| {
+        b.spawn_flags(wd)
+            .iter()
+            .any(|flag| flag == "--dangerously-load-development-channels")
+    });
+    if !flagged {
+        return false;
+    }
+    let version = backend
+        .and_then(|b| which::which(b.preset().command).ok())
+        .and_then(|path| spawned_binary_version(&path));
+    let armed = version_is_validated(version.as_deref());
+    if !armed {
+        tracing::info!(
+            agent,
+            ?version,
+            "#3314: startup-modal auto-answer disarmed — unvalidated backend version"
+        );
+    }
+    armed
+}
+
 pub(crate) fn version_is_validated(version: Option<&str>) -> bool {
     version.is_some_and(|v| VALIDATED_CLAUDE_VERSIONS.contains(&v))
 }
