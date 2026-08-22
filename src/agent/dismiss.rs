@@ -20,6 +20,30 @@ pub(crate) fn set_inline_dismiss_write_for_test(on: bool) {
     INLINE_DISMISS_WRITE.with(|f| f.set(on));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// #3314 rendezvous: runs at the LAST instant before the startup-modal
+    /// keystroke syscall, so a test can deterministically deliver a
+    /// cancellation or a competing write exactly there and assert zero bytes.
+    /// It also makes W3 honest rather than rhetorical — the same hook placed
+    /// after the write shows a byte already gone cannot be recalled.
+    static PRE_WRITE_RENDEZVOUS: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_pre_write_rendezvous_for_test(hook: Option<Box<dyn Fn()>>) {
+    PRE_WRITE_RENDEZVOUS.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_pre_write_rendezvous() {
+    let hook = PRE_WRITE_RENDEZVOUS.with(|h| h.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Try to auto-dismiss dialogs using backend-configurable patterns. Returns true if dismissed.
 /// `screen` is the VTerm-rendered view the user sees — not raw PTY bytes —
 /// so Ink-style TUIs that paint char-by-char with cursor positioning still match.
@@ -357,13 +381,26 @@ pub fn try_prepared_dismiss_dialog(
             // #3314: spent ONLY here — after the in-flight slot was actually
             // claimed. A collision returns above without spending, so a lost
             // attempt can never strand the agent at an unanswered modal.
-            if pattern.rearm_pre_idle {
+            // #3314: the barrier is scoped to the startup-modal class ONLY.
+            // Other backends send multi-chunk sequences (agy's up-up-Enter), and
+            // each chunk's own write bumps the epoch — applying the barrier
+            // there would cancel a pattern midway through its own keystrokes.
+            let barrier = if pattern.rearm_pre_idle {
                 dev_gate.mark_enqueued();
-            }
+                Some(dev_gate.write_barrier())
+            } else {
+                None
+            };
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
                 let _guard = InFlightGuard(agent.clone());
-                let _ = write_with_timeout(&writer, &keys);
+                run_pre_write_rendezvous();
+                if barrier
+                    .as_ref()
+                    .is_none_or(crate::agent::dev_modal::WriteBarrier::still_valid)
+                {
+                    let _ = write_with_timeout(&writer, &keys);
+                }
                 return true;
             }
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
@@ -376,6 +413,18 @@ pub fn try_prepared_dismiss_dialog(
                     // thread entry so a panic / early-return still frees the slot.
                     let _guard = InFlightGuard(agent.clone());
                     std::thread::sleep(std::time::Duration::from_millis(300));
+                    // #3314 W3: re-check as late as we can. This closes the wide
+                    // decide-then-sleep-then-write window, but a check and a
+                    // syscall cannot be atomic with respect to another process's
+                    // output, so the last instant before `write` remains
+                    // irreducible. Bounded by exactly one CR and no retry.
+                    if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+                        tracing::debug!(
+                            agent = %agent,
+                            "#3314: startup-modal keystroke cancelled before write"
+                        );
+                        return;
+                    }
                     // Send keys in chunks split on \r/\n boundaries with delay between,
                     // so TUI frameworks process navigation before confirmation.
                     // H13: route each chunk through `write_with_timeout` (bounded
@@ -1237,6 +1286,10 @@ WARNING: Loading development channels
         fn bytes(&self) -> Vec<u8> {
             self.written.lock().clone()
         }
+
+        fn epoch_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+            self.gate.epoch_handle()
+        }
     }
 
     impl Drop for Generation3314 {
@@ -1351,6 +1404,117 @@ WARNING: Loading development channels
             !gen.stable_frame("  WARNING: Loading development channels\n\n  ❯ 1. Yes\n    2. No\n")
         );
         assert!(gen.bytes().is_empty());
+    }
+
+    /// #3314 version-drift gate: an unrecognised backend version disarms rather
+    /// than assuming the modal still renders the way our captures recorded it.
+    /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 across four days
+    /// — so this is a live concern, not a hypothetical.
+    #[test]
+    fn only_validated_backend_versions_are_armed_3314() {
+        use crate::agent::dev_modal::{version_is_validated, VALIDATED_CLAUDE_VERSIONS};
+        assert!(version_is_validated(Some("2.1.238")));
+        assert!(version_is_validated(Some("2.1.237")));
+        assert!(
+            !version_is_validated(Some("2.1.239")),
+            "#3314: a version we have never captured must disarm"
+        );
+        assert!(
+            !version_is_validated(None),
+            "#3314: an unresolvable binary identity must disarm, not default open"
+        );
+        assert!(
+            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.238"),
+            "the implementation-validated version must be listed"
+        );
+    }
+
+    /// #3314 startup-window expiry: past the bound, text carrying the modal is
+    /// transcript and must never be answered — even in an armed, unspent
+    /// generation showing a byte-perfect stable modal.
+    #[test]
+    fn eligibility_expires_with_the_startup_window_3314() {
+        use crate::agent::dev_modal::ELIGIBILITY_EXPIRY_MS;
+        let mut gen = Generation3314::new("3314-expiry", true);
+        gen.now = ELIGIBILITY_EXPIRY_MS + 1;
+        assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert!(
+            gen.bytes().is_empty(),
+            "#3314: an expired startup window must write nothing"
+        );
+    }
+
+    /// #3314: a COLLISION must not spend the one-shot. If a concurrent dismiss
+    /// already holds the in-flight slot we return without writing, and the
+    /// generation must still be able to answer the modal afterwards — otherwise
+    /// a lost attempt strands the agent at an unanswered prompt forever.
+    #[test]
+    fn collision_does_not_spend_the_one_shot_3314() {
+        let mut gen = Generation3314::new("3314-collision", true);
+        gen.frame(FRAME_LIVE_MODAL_3314);
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        // Occupy the in-flight slot only now, so the gate says Enqueue and the
+        // fire path then bails at the claim — the collision under test.
+        DISMISS_IN_FLIGHT
+            .lock()
+            .insert("3314-collision".to_string());
+        let _ = try_prepared_dismiss_dialog(
+            "3314-collision",
+            FRAME_LIVE_MODAL_3314,
+            &gen.writer,
+            &gen.prepared,
+            DismissScanScope::Startup,
+            &mut gen.gate,
+            LogicalMs(gen.now),
+        );
+        DISMISS_IN_FLIGHT.lock().remove("3314-collision");
+        assert!(gen.bytes().is_empty(), "#3314: a collision writes nothing");
+        // ... and the one-shot is still available: the very next frame answers.
+        // Asserted on BYTES, because a second call after a successful fire is
+        // (correctly) refused as spent, so the return flag alone would mislead.
+        assert!(
+            gen.frame(FRAME_LIVE_MODAL_3314),
+            "#3314: a collision must NOT spend the one-shot"
+        );
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+    }
+
+    /// #3314 W3 rendezvous: a competing write arriving at the LAST instant
+    /// before the syscall cancels the keystroke. Deterministic — the hook runs
+    /// exactly at that point, with no sleeping and no racing.
+    ///
+    /// This closes the decide-then-write window. It does NOT close W3 itself: a
+    /// check and a syscall cannot be atomic with respect to another process's
+    /// output, so bytes can still change after the final check. That residual is
+    /// documented, not tested away.
+    #[test]
+    fn competing_write_at_the_rendezvous_cancels_the_keystroke_3314() {
+        let mut gen = Generation3314::new("3314-rendezvous", true);
+        gen.frame(FRAME_LIVE_MODAL_3314);
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        let epoch = gen.gate.write_barrier();
+        // Something else writes into this PTY at the rendezvous point.
+        let bump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bump_seen = std::sync::Arc::clone(&bump);
+        let gate_epoch = gen.epoch_handle();
+        set_pre_write_rendezvous_for_test(Some(Box::new(move || {
+            gate_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bump_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+        gen.frame(FRAME_LIVE_MODAL_3314);
+        set_pre_write_rendezvous_for_test(None);
+        assert!(
+            bump.load(std::sync::atomic::Ordering::SeqCst),
+            "the rendezvous must actually have run"
+        );
+        assert!(
+            !epoch.still_valid(),
+            "the competing write must invalidate the barrier"
+        );
+        assert!(
+            gen.bytes().is_empty(),
+            "#3314: a keystroke cancelled at the rendezvous writes zero bytes"
+        );
     }
 
     /// #3314 REVIEWER RED: the full static fingerprint is NOT a safety
