@@ -522,13 +522,16 @@ fn accept_error_is_fatal(kind: io::ErrorKind) -> bool {
 /// request split across segments then left its body in the receive queue, and
 /// closing a socket with unread data sends an RST instead of a FIN — so the
 /// client loses the response it was already sent (`ECONNRESET`: os error 104 on
-/// Linux, 54 on macOS). That is the observed CI failure.
+/// Linux, 54 on macOS). That is the SAME MECHANISM as the observed CI failure —
+/// the error class matches and the fixture is racy by construction, but that
+/// this mechanism produced that particular run was never reproduced.
 ///
 /// Bounded by `stop`, never by a clock: a wall-clock bound is what makes a
 /// stand-in die under load. `Ok(None)` means the caller asked us to stop.
 fn drain_request(
     stream: &mut std::net::TcpStream,
     stop: &AtomicBool,
+    inject_read_error: &AtomicBool,
 ) -> io::Result<Option<String>> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
@@ -541,7 +544,12 @@ fn drain_request(
             }
         }
         let mut chunk = [0_u8; 4096];
-        match stream.read(&mut chunk) {
+        let attempt = if inject_read_error.load(Ordering::Acquire) {
+            Err(io::Error::other("#3322 injected read failure"))
+        } else {
+            stream.read(&mut chunk)
+        };
+        match attempt {
             // Peer half-closed: this is all the request there will ever be.
             Ok(0) => return Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -591,6 +599,14 @@ struct FakeChannel {
     /// inside it is left unread at close. This makes the existing race
     /// observable; it does not invent one.
     pause_before_response: Arc<Mutex<Duration>>,
+    /// #3322 test-support: make the mode normalisation itself fail. Otherwise
+    /// only a real `fcntl` failure reaches that arm, which no test can schedule,
+    /// so the fail-closed branch would ship undefended.
+    inject_mode_error: Arc<AtomicBool>,
+    /// #3322 test-support: make the request read fail with a NON-transient
+    /// error. `WouldBlock`/`Interrupted` are retried by design, so only an
+    /// injected error can reach the arm that records and ends the exchange.
+    inject_read_error: Arc<AtomicBool>,
     /// #3322 test-support: force the LINUX shape — a BLOCKING accepted socket —
     /// on whatever platform the test runs on. macOS inherits the listener's
     /// non-blocking flag and Linux does not, so without this the normalisation
@@ -619,6 +635,8 @@ impl FakeChannel {
         let accepted_connections = Arc::new(AtomicUsize::new(0));
         let pause_before_response = Arc::new(Mutex::new(Duration::from_millis(0)));
         let simulate_blocking_accept = Arc::new(AtomicBool::new(false));
+        let inject_mode_error = Arc::new(AtomicBool::new(false));
+        let inject_read_error = Arc::new(AtomicBool::new(false));
         let exit = Arc::new(Mutex::new(None));
         let thread_stop = Arc::clone(&stop);
         let thread_probes = Arc::clone(&health_probes);
@@ -626,6 +644,8 @@ impl FakeChannel {
         let thread_accepted = Arc::clone(&accepted_connections);
         let thread_pause = Arc::clone(&pause_before_response);
         let thread_simulate_blocking = Arc::clone(&simulate_blocking_accept);
+        let thread_inject_mode_error = Arc::clone(&inject_mode_error);
+        let thread_inject_read_error = Arc::clone(&inject_read_error);
         let thread_exit = Arc::clone(&exit);
         let handle = thread::spawn(move || {
             let reason = loop {
@@ -646,10 +666,19 @@ impl FakeChannel {
                         // drain below would be `stop`-bounded on one platform
                         // and unbounded on the other. Fail closed: after a failed
                         // normalisation the mode is unknown.
-                        if let Err(error) = stream.set_nonblocking(true) {
+                        let normalised = if thread_inject_mode_error.load(Ordering::Acquire) {
+                            Err(io::Error::other("#3322 injected mode failure"))
+                        } else {
+                            stream.set_nonblocking(true)
+                        };
+                        if let Err(error) = normalised {
                             break FakeChannelExit::AcceptedModeFailed(error.to_string());
                         }
-                        let request = match drain_request(&mut stream, &thread_stop) {
+                        let request = match drain_request(
+                            &mut stream,
+                            &thread_stop,
+                            &thread_inject_read_error,
+                        ) {
                             Ok(Some(request)) => request,
                             Ok(None) => break FakeChannelExit::StopRequested,
                             Err(error) => {
@@ -710,6 +739,8 @@ impl FakeChannel {
             accepted_connections,
             pause_before_response,
             simulate_blocking_accept,
+            inject_mode_error,
+            inject_read_error,
             exit,
             handle: Some(handle),
         }
@@ -732,7 +763,8 @@ impl FakeChannel {
 /// body sends an RST instead of a FIN, so the client's read of the response
 /// dies with `ECONNRESET` even though `write_all` succeeded.
 ///
-/// This is the observed CI failure: `channel_bridge_queue_without_turn_start_is
+/// This reproduces the same mechanism as a CI failure that was observed but not
+/// itself reproduced: `channel_bridge_queue_without_turn_start_is
 /// _truthfully_overdue` panicked at `self_kick_tests.rs:35:6` with
 /// "ChannelBridge webhook queue admission: Connection reset by peer (os error
 /// 104)", on `main` at 485b8920 and again on PR #3320's head. It is a race, so
@@ -854,6 +886,87 @@ fn a_silent_client_does_not_wedge_teardown_3322() {
     }
 
     assert_eq!(channel.stop_and_join(), FakeChannelExit::StopRequested);
+}
+
+/// #3322: wait for the serving loop to record WHY it ended, without joining.
+/// `stop_and_join` sets `stop` first, so joining straight after connecting races
+/// the accept and reports `StopRequested` instead of the arm under test.
+fn wait_for_exit_reason(channel: &FakeChannel, budget: Duration) -> Option<FakeChannelExit> {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if let Some(reason) = channel.exit.lock().clone() {
+            return Some(reason);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// #3322: a failed mode normalisation must END the exchange with its reason.
+///
+/// Fail-closed for a reason: after `set_nonblocking` fails the socket's mode is
+/// UNKNOWN, and an unknown mode is exactly the state that can park the drain
+/// forever. Serving on regardless trades a reported failure for a hang.
+/// Reviewer `archfix-codex-dev` rejected the first version of this PR because
+/// this arm had no seam — deleting the guard left the suite green — so the seam
+/// makes the branch reachable and this test makes it defended.
+#[test]
+fn accepted_mode_failure_is_reported_and_ends_the_exchange_3322() {
+    let mut channel = FakeChannel::spawn(1);
+    channel.inject_mode_error.store(true, Ordering::Release);
+    let port = channel.port;
+
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+
+    let exit = wait_for_exit_reason(&channel, Duration::from_secs(5))
+        .expect("#3322: the loop must record why it ended");
+    assert_eq!(channel.stop_and_join(), exit);
+    match exit {
+        FakeChannelExit::AcceptedModeFailed(ref reason) => assert!(
+            reason.contains("injected mode failure"),
+            "#3322: the recorded reason must name the failure; got {reason:?}"
+        ),
+        other => panic!(
+            "#3322: a failed mode normalisation must end the loop as \
+             AcceptedModeFailed, not {other:?} — an unknown socket mode is the \
+             state that can park the drain forever"
+        ),
+    }
+}
+
+/// #3322: a NON-transient request-read error must END the exchange with its
+/// reason, never be swallowed.
+///
+/// `WouldBlock`/`Interrupted` are retried by design, so only an injected error
+/// reaches this arm — which is why it needs a seam. The behaviour it replaces
+/// was `unwrap_or(0)`: that swallowed the error AND degraded the request to
+/// empty, so the stand-in answered a plausible 404 and the caller could not tell
+/// "never arrived" from "wrong path".
+#[test]
+fn request_read_failure_is_reported_and_ends_the_exchange_3322() {
+    use std::io::Write as _;
+
+    let mut channel = FakeChannel::spawn(1);
+    channel.inject_read_error.store(true, Ordering::Release);
+    let port = channel.port;
+
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("#3322: connect");
+    let _ = client.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    let exit = wait_for_exit_reason(&channel, Duration::from_secs(5))
+        .expect("#3322: the loop must record why it ended");
+    assert_eq!(channel.stop_and_join(), exit);
+    match exit {
+        FakeChannelExit::RequestReadFailed(ref reason) => assert!(
+            reason.contains("injected read failure"),
+            "#3322: the recorded reason must name the failure; got {reason:?}"
+        ),
+        other => panic!(
+            "#3322: a non-transient read error must end the loop as \
+             RequestReadFailed, not {other:?} — swallowing it is what let the \
+             stand-in answer a request it never read"
+        ),
+    }
 }
 
 #[test]
