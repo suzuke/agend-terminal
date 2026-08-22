@@ -1852,6 +1852,93 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
+/// #3315 (pins the #3314 B1 fix): `SpawnProvenance` must report the argv this
+/// generation was ACTUALLY built with — not a re-derivation, and not a constant.
+///
+/// The existing B1 pin, `arming_must_not_re_derive_from_mutable_sources_3314`,
+/// is a NEGATIVE source-grep: it proves `spawn_flags`/`which::which` have not
+/// come back, and nothing more. It cannot see whether the replacement reads the
+/// real argv. An exact-head adversarial review demonstrated the gap by forcing
+/// `argv_has_dev_channel_flag: true` in `capture`, which arms EVERY generation
+/// regardless of argv and survived every target — a fail-open on an
+/// auto-keystroke gate, hidden behind a pin that only watched the old code.
+///
+/// This drives the real `build_command` in both directions and compares the
+/// provenance against the argv computed from the same `CommandBuilder`. The
+/// per-case direction is asserted too: equality alone would hold vacuously if
+/// both sides collapsed to false.
+#[test]
+fn spawn_provenance_flag_matches_the_built_argv_3315() {
+    const FLAG: &str = "--dangerously-load-development-channels";
+
+    // (label, mcp-config.json contents, the flag this workspace must produce)
+    let cases: [(&str, &str, bool); 2] = [
+        (
+            "bridge-declared",
+            r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-channel"}}}"#,
+            true,
+        ),
+        (
+            "no-bridge",
+            r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+            false,
+        ),
+    ];
+
+    for (label, mcp_config, expected_flag) in cases {
+        let workspace = resolve_test_home(&format!("provenance-argv-3315-{label}"));
+        std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
+        std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
+        std::fs::write(workspace.join("mcp-config.json"), mcp_config).expect("mcp-config.json");
+
+        let config = SpawnConfig {
+            name: "provenance-argv-3315",
+            backend: Some(&Backend::ClaudeCode),
+            backend_command: "claude",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: Some(&workspace),
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+
+        let (cmd, _detected, provenance) = build_command(&config).expect("build_command");
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let argv_carries_flag = argv.iter().any(|arg| arg == FLAG);
+
+        assert_eq!(
+            argv_carries_flag,
+            expected_flag,
+            "[{label}] fixture check: this workspace must build an argv that \
+             {} {FLAG}; argv={argv:?}",
+            if expected_flag { "carries" } else { "omits" }
+        );
+        assert_eq!(
+            provenance.argv_has_dev_channel_flag,
+            argv_carries_flag,
+            "[{label}] #3314 B1: provenance must be a fact ABOUT THE BUILT ARGV. \
+             It reported {} while the argv it was captured from {} the flag — so a \
+             generation could be armed on something other than what it is running. \
+             argv={argv:?}",
+            provenance.argv_has_dev_channel_flag,
+            if argv_carries_flag {
+                "carries"
+            } else {
+                "omits"
+            }
+        );
+    }
+}
+
 /// #2801 RED: the declared backend is authoritative even when `command:` is
 /// an arbitrarily named wrapper. Basename inference cannot recover this from
 /// `backend_command`, so the spawn config must carry the resolved fleet
