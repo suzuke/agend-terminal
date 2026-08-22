@@ -5159,3 +5159,37 @@ fn codex_remote_attach_argv_carries_mcp_overrides_before_resume_3317() {
         "#3317: bypass stays after the thread, ahead of caller args; argv={argv:?}"
     );
 }
+
+/// #3317: the Codex trust-dismiss matcher must NOT exist.
+///
+/// Measured at codex 0.149.0: the "Do you trust the contents of this
+/// directory?" prompt is still ANSWERABLE — it renders even under
+/// `--dangerously-bypass-approvals-and-sandbox` — and pressing Enter makes
+/// codex WRITE `[projects."<workspace>"] trust_level = "trusted"` into the
+/// operator's `$CODEX_HOME/config.toml`. A working matcher would therefore add
+/// one permanent entry per instance workspace, forever, with no cleanup on
+/// delete — exactly the accumulation `722140bd` removed, only authored by codex
+/// instead of by us and so indistinguishable from the operator's own entries.
+/// Fleet tools come from the per-invocation `-c` bridge registration instead;
+/// granting project trust is not ours to do.
+///
+/// Lives here rather than in `src/backend.rs` because that file sits 3 lines
+/// under the 2500-LOC anti-monolith ceiling (`tests/src_file_size_invariant.rs`)
+/// and the preset is reachable from any module in the crate.
+#[test]
+fn codex_preset_has_no_trust_dismiss_matcher_3317() {
+    let codex = Backend::Codex.preset();
+    assert!(
+        !codex
+            .dismiss_patterns
+            .iter()
+            .any(|dp| dp.label.contains("Do you trust")),
+        "#3317: a codex trust-dismiss would silently re-create per-instance \
+         persistent trust entries in the operator's codex config; patterns={:?}",
+        codex
+            .dismiss_patterns
+            .iter()
+            .map(|dp| dp.label)
+            .collect::<Vec<_>>()
+    );
+}
