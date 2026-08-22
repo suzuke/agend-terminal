@@ -1,0 +1,40 @@
+    --dangerously-load-development-channels is for local channel development
+    only. Do not use this option to run channels you have downloaded off the
+    internet.
+
+    Please use --channels to run a list of approved channels.
+
+    Channels:   server:agend-claude-channel
+
+    ❯ 1. I am using this for local development
+      2. Exit
+
+    Enter to confirm · Esc to cancel
+
+⏺ 這是 Claude Code 啟動時的確認對話框，不是我能代為操作的東西——它出現在你的終端機裡，需要你自己按鍵確認。
+
+  說明一下狀況：這個 session 是用 --dangerously-load-development-channels 載入 server:agend-claude-channel（AgEnD 的自訂 channel server）。這個警告是正常的，因為該 channel 是本地開發的 MCP
+  channel，不在官方核准清單上。
+
+  - 如果這是你自己開發／信任的 channel（AgEnD daemon 的就是），選 1. I am using this for local development 然後按 Enter 即可。
+  - 如果你不是刻意要載入它，按 Esc 或選 2 離開。
+
+  由於我現在已經在運作中，代表這個確認實際上已經通過了（或這段文字是貼上來的畫面快照）。若有其他要我處理的事，直接說即可。
+
+✻ Cooked for 19s
+
+❯ /model
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Select model
+  Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.
+
+    1. Default (recommended)  Opus 5 with 1M context · Best for everyday, complex tasks
+    2. Opus (1M context)      Opus 5 with 1M context · Best for everyday, complex tasks
+  ❯ 3. Fable ✔                Fable 5 · Most capable for your hardest and longest-running tasks
+    4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+    5. Haiku                  Haiku 4.5 · Fastest for quick answers
+
+  ◉ xHigh effort ←/→ to adjust
+
+  Enter to set as default · s to use this session only · Esc to cancel

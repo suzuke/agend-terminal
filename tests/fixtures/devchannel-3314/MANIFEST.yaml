@@ -1,0 +1,41 @@
+# #3314 dev-channel modal frames — REAL captures, never hand-written.
+#
+# Provenance: each .txt is the plain-text rendering of one TUI-socket frame#0
+# payload (`VTerm::dump_screen()`) taken from a live daemon-managed Claude
+# instance. The originating .raw bytes and their SHA-256s are recorded in
+# captures/3314/ADDENDUM-raw-evidence.md in the capturing agent's workspace.
+#
+# Why version matters (same rule as state-replay/MANIFEST.yaml): the recognizer
+# keys on literal strings Claude renders, and those change across CLI versions.
+# Do not silently re-record against a newer version without bumping the fields
+# below.
+#
+# NOTE ON GEOMETRY: absolute row positions are NOT stable even within one CLI
+# version — live_modal renders the modal at rows 1-13 while quoted renders the
+# same block at rows 14-28. Any recognizer keyed to absolute rows is broken by
+# construction; the fingerprint must be order-relative.
+
+captured_from_cli_version: "2.1.237"
+recorded_on: "2026-08-20"
+validated_against_cli_version: "2.1.238"
+validation_method: >
+  Every static line the recognizer depends on was confirmed byte-present in the
+  2.1.238 binary itself (/Users/suzuke/.local/share/claude/versions/2.1.238),
+  so the literal corpus survives the .237 -> .238 bump. Rendered geometry was
+  NOT re-captured on .238; the recognizer therefore must not depend on it.
+
+fixtures:
+  - file: live_modal.txt
+    scenario: fresh spawn, dev-channel modal LIVE and never auto-dismissed (the #3314 defect)
+    full_static_fingerprint: true
+  - file: replay.txt
+    scenario: --continue restart; the modal was already answered, the marker is present only as REPLAYED transcript
+    full_static_fingerprint: true
+    note: a complete replayed modal satisfies the fingerprint — the fingerprint alone cannot reject it
+  - file: competing.txt
+    scenario: marker on screen plus a LIVE `/model` picker (Enter would set the default model)
+    full_static_fingerprint: false
+    note: rejected only because the headline had scrolled off; do not rely on that
+  - file: quoted.txt
+    scenario: complete modal text as ordinary quoted transcript, nothing live
+    full_static_fingerprint: true

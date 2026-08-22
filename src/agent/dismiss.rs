@@ -1056,6 +1056,209 @@ WARNING: Loading development channels
         assert_eq!(written.lock().as_slice(), b"\r");
     }
 
+    // ── #3314 r1: real-capture frames, and the byte-count contract ─────────
+    //
+    // Provenance and the version rules are in
+    // tests/fixtures/devchannel-3314/MANIFEST.yaml. These are REAL captures
+    // (the #1450 rule), rendered from live daemon-managed Claude instances on
+    // CLI 2.1.237; every static line the recognizer depends on was separately
+    // confirmed byte-present in the 2.1.238 binary.
+
+    const FRAME_LIVE_MODAL_3314: &str =
+        include_str!("../../tests/fixtures/devchannel-3314/live_modal.txt");
+    const FRAME_REPLAY_3314: &str = include_str!("../../tests/fixtures/devchannel-3314/replay.txt");
+    const FRAME_COMPETING_3314: &str =
+        include_str!("../../tests/fixtures/devchannel-3314/competing.txt");
+    const FRAME_QUOTED_3314: &str = include_str!("../../tests/fixtures/devchannel-3314/quoted.txt");
+
+    /// Drive one frame through the production matcher and return every byte it
+    /// wrote. Byte counts are the contract: a would-be implementation that
+    /// computes the right verdict but still writes must not pass.
+    fn bytes_written_for_3314(tag: &str, screen: &str, scope: DismissScanScope) -> Vec<u8> {
+        let prepared = claude_prepared_patterns_3314();
+        let (writer, written) = recording_writer_3314();
+        let fired = try_prepared_dismiss_dialog(tag, screen, &writer, &prepared, scope);
+        // The keystroke is written by a detached thread after a delay, so poll
+        // rather than assume; on the refuse path there is nothing to wait for,
+        // which is exactly what the zero-byte assertions must observe.
+        for _ in 0..30 {
+            if !written.lock().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let out = written.lock().clone();
+        assert_eq!(
+            fired,
+            !out.is_empty(),
+            "#3314: the return value must agree with whether bytes were written (tag {tag})"
+        );
+        out
+    }
+
+    /// #3314 RED-A: the `--continue` replay frame. The modal was ALREADY
+    /// answered in that generation; this marker is replayed transcript. The
+    /// daemon must write nothing. On the pre-fix build it writes one CR — the
+    /// production false dismiss observed at 13:22:33.387 on 2ef791ca.
+    #[test]
+    fn replayed_marker_frame_writes_no_bytes_3314() {
+        let out = bytes_written_for_3314(
+            "3314-red-replay",
+            FRAME_REPLAY_3314,
+            DismissScanScope::Startup,
+        );
+        assert!(
+            out.is_empty(),
+            "#3314: a replayed dev-channel marker must not be auto-answered; wrote {out:?}"
+        );
+    }
+
+    /// #3314 RED-B: the complete modal as ordinary quoted transcript, nothing
+    /// live. Same contract, and this shape is routine in this repo — the text
+    /// lives in issue bodies, PR text and this file.
+    #[test]
+    fn quoted_marker_frame_writes_no_bytes_3314() {
+        let out = bytes_written_for_3314(
+            "3314-red-quoted",
+            FRAME_QUOTED_3314,
+            DismissScanScope::Startup,
+        );
+        assert!(
+            out.is_empty(),
+            "#3314: a quoted dev-channel modal must not be auto-answered; wrote {out:?}"
+        );
+    }
+
+    /// #3314 GUARD (passes before AND after, and I am labelling it honestly
+    /// rather than calling it a RED): the harm frame — marker on screen while a
+    /// LIVE `/model` picker owns the prompt, where Enter would set the
+    /// operator's default model. It does not fire on the pre-fix build only
+    /// because this capture's headline had scrolled off, so the anchored regex
+    /// misses. That is luck, not a rule — see
+    /// `full_static_fingerprint_alone_does_not_separate_live_from_replay_3314`.
+    /// Pinned so a future widening of the matcher cannot silently arm it.
+    #[test]
+    fn competing_live_dialog_frame_writes_no_bytes_3314() {
+        let out = bytes_written_for_3314(
+            "3314-red-competing",
+            FRAME_COMPETING_3314,
+            DismissScanScope::Startup,
+        );
+        assert!(
+            out.is_empty(),
+            "#3314: a frame owned by a different live dialog must not be auto-answered; wrote {out:?}"
+        );
+    }
+
+    /// Wait until the recorded byte stream STOPS growing, then return it.
+    /// The production write is issued by a detached thread after a 300ms delay,
+    /// so "poll until the first byte appears" would observe a single CR even
+    /// when a second one is still in flight — a timing accident, not a result.
+    /// Quiescence (no growth across a window strictly longer than that delay)
+    /// makes the observation deterministic in outcome.
+    fn bytes_after_quiescence_3314(written: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+        let mut last = written.lock().len();
+        let mut stable_rounds = 0;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let now = written.lock().len();
+            if now == last {
+                stable_rounds += 1;
+                // 600ms of no growth — twice the production write delay.
+                if stable_rounds >= 12 {
+                    break;
+                }
+            } else {
+                stable_rounds = 0;
+                last = now;
+            }
+        }
+        written.lock().clone()
+    }
+
+    /// #3314 RED-D: per-generation ONE-SHOT. Two successive frames of the real
+    /// live modal within one generation must yield exactly ONE CR in total.
+    /// Pre-fix the matcher is stateless and answers both, which is the shape
+    /// that produced the second and third CRs (+11.25s and +74.02s) in the
+    /// observed Resume generation.
+    #[test]
+    fn one_shot_per_generation_writes_exactly_one_cr_3314() {
+        let prepared = claude_prepared_patterns_3314();
+        let (writer, written) = recording_writer_3314();
+        for _ in 0..2 {
+            let _ = try_prepared_dismiss_dialog(
+                "3314-red-oneshot",
+                FRAME_LIVE_MODAL_3314,
+                &writer,
+                &prepared,
+                DismissScanScope::Startup,
+            );
+            // Let the in-flight slot clear so the SECOND call is gated by the
+            // one-shot under test, not by the #1886 bounded-dismiss guard.
+            let _ = bytes_after_quiescence_3314(&written);
+            DISMISS_IN_FLIGHT.lock().remove("3314-red-oneshot");
+        }
+        let out = bytes_after_quiescence_3314(&written);
+        assert_eq!(
+            out.as_slice(),
+            b"\r",
+            "#3314: a generation may answer this modal at most once; wrote {out:?}"
+        );
+    }
+
+    /// #3314 GUARD (passes before and after): the real live modal must still be
+    /// answered, with exactly one CR. Without this the other three tests are
+    /// trivially satisfiable by never dismissing anything.
+    #[test]
+    fn live_modal_frame_writes_exactly_one_cr_3314() {
+        let out = bytes_written_for_3314(
+            "3314-red-live",
+            FRAME_LIVE_MODAL_3314,
+            DismissScanScope::Startup,
+        );
+        assert_eq!(
+            out.as_slice(),
+            b"\r",
+            "#3314: the live dev-channel modal must still be answered with exactly one CR"
+        );
+    }
+
+    /// #3314 REVIEWER RED: the FULL static fingerprint is not a safety
+    /// mechanism, and this pins why so nobody later mistakes it for one.
+    /// Measured against the real captures: the replayed frame and the quoted
+    /// frame BOTH satisfy every static line of the modal, in order. Only the
+    /// competing frame fails, and only because its headline had scrolled off.
+    /// Safety therefore has to come from the launch/epoch/one-shot gates.
+    #[test]
+    fn full_static_fingerprint_alone_does_not_separate_live_from_replay_3314() {
+        const STATIC_LINES: &[&str] = &[
+            "WARNING: Loading development channels",
+            "is for local channel development",
+            "Do not use this option to run channels",
+            "Please use --channels to run a list of approved channels",
+            "Channels:",
+            "I am using this for local development",
+            "Enter to confirm",
+        ];
+        let complete = |screen: &str| STATIC_LINES.iter().all(|line| screen.contains(line));
+        assert!(
+            complete(FRAME_LIVE_MODAL_3314),
+            "the live modal is complete"
+        );
+        assert!(
+            complete(FRAME_REPLAY_3314),
+            "#3314: a REPLAYED modal satisfies the full fingerprint — the fingerprint cannot reject it"
+        );
+        assert!(
+            complete(FRAME_QUOTED_3314),
+            "#3314: a QUOTED modal satisfies the full fingerprint too"
+        );
+        assert!(
+            !complete(FRAME_COMPETING_3314),
+            "#3314: the competing frame fails only because its headline scrolled off — luck, not a rule"
+        );
+    }
+
     /// #3314: the scope selector. The startup latch wins outright; once it is off,
     /// "has the agent ever been Idle" decides whether daemon-caused startup modals
     /// are still admissible.
