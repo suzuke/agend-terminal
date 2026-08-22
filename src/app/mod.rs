@@ -2424,6 +2424,37 @@ mod tests {
         assert!(prod.contains("loop_result?;"));
     }
 
+    /// #3321 behavioral call-site pin: the real app teardown must persist the
+    /// pending pair, not merely leave a source-text reference to a helper that
+    /// some alternate teardown path could call.
+    #[test]
+    fn app_teardown_invokes_activity_flush_3321() {
+        let home = tmp_home("activity-app-teardown-callsite-3321");
+        let layout = Layout::new();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        notification_queue::record_input_activity(&home, "agent1");
+        notification_queue::record_submit_activity(&home, "agent1");
+
+        app_teardown(&home, &layout, &registry, true, Vec::new());
+
+        let (input_ms, submit_ms) =
+            notification_queue::read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            input_ms > 0,
+            "app teardown must persist pending input activity"
+        );
+        assert!(
+            submit_ms > 0,
+            "app teardown must persist pending submit activity"
+        );
+        assert_eq!(
+            notification_queue::pending_input_count_for(&home),
+            0,
+            "app teardown must drain the pending pair"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn flush_drains_queue_on_idle() {
         let home = tmp_home("flush");
