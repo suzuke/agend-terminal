@@ -571,6 +571,14 @@ impl ChannelRuntime {
     fn reject_external_channel_reply(&self, delivery_id: Uuid) -> anyhow::Result<()> {
         let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
         let Some((envelope, _)) = store.delivery(delivery_id)? else {
+            // No envelope means UNKNOWN origin, not external, and unknown must
+            // stay permissive: `deliver_resident` records the envelope before it
+            // posts the webhook, so anything this bridge can be asked to answer
+            // normally has one — the absent case is a pruned or pre-settle row
+            // (#3310), where refusing would break internal replies with no way
+            // for the agent to tell why. A pruned external row is still caught
+            // downstream: the reply obligation and its nudge ladder do not
+            // depend on this record.
             return Ok(());
         };
         let Some(origin) = envelope.channel_origin else {

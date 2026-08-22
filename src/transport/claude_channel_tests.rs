@@ -1506,6 +1506,44 @@ fn bridge_reply_is_refused_for_an_external_channel_origin_3324() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3324: a delivery with NO receipt is served, deliberately.
+///
+/// Unknown origin is not external origin. `deliver_resident` records the
+/// envelope before posting the webhook, so a live delivery has one; the absent
+/// case is a pruned or pre-settle row (#3310), and refusing those would break
+/// internal replies with no way for the agent to tell why. Pinned so the choice
+/// is a decision rather than an accident — a later "fail closed on anything
+/// unknown" would break legacy rows and this test says so.
+#[test]
+fn bridge_reply_serves_a_delivery_with_no_receipt_3324() {
+    let home = home("no-receipt-served-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let delivery_id = Uuid::new_v4();
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    // Inbound mapping only — no receipt is ever written for this delivery.
+    runtime
+        .remember_inbound(
+            delivery_id,
+            &chat_id,
+            Some("agend-terminal"),
+            "orphaned row",
+        )
+        .expect("inbound mapping");
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    assert!(
+        response.get("error").is_none(),
+        "#3324: an unknown-origin delivery must still be answerable; got {response}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_some(),
+        "#3324: and its reply must be recorded"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 /// #3324: the guard must not overreach. A delivery that originated INSIDE AgEnD
 /// is the bridge's own to answer, and refusing it would break every internal
 /// query.
