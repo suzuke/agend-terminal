@@ -49,6 +49,14 @@ pub(super) struct PullListServer {
     /// whether the loop ENDED without joining it. Joining a parked thread hangs
     /// the binary instead of reporting the failure.
     pub(super) exited: Arc<AtomicBool>,
+    /// #3320: connections accepted AND mode-normalised, i.e. the loop has
+    /// reached the read wait. A test that only SLEEPS before acting cannot tell
+    /// "parked in the read wait" from "not scheduled yet", and would pass
+    /// without exercising anything.
+    pub(super) accepted: Arc<AtomicU32>,
+    /// #3320: times the INJECTED would-block was produced and retried. Proves
+    /// the arm under test was actually taken rather than missed.
+    pub(super) injected_would_block_hits: Arc<AtomicU32>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -86,6 +94,8 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let simulate_blocking_accept = Arc::new(AtomicBool::new(false));
     let inject_mode_error = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(AtomicU32::new(0));
+    let injected_would_block_hits = Arc::new(AtomicU32::new(0));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
@@ -97,6 +107,8 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let simulate_blocking_for_thread = Arc::clone(&simulate_blocking_accept);
     let inject_mode_error_for_thread = Arc::clone(&inject_mode_error);
     let exited_for_thread = Arc::clone(&exited);
+    let accepted_for_thread = Arc::clone(&accepted);
+    let would_block_hits_for_thread = Arc::clone(&injected_would_block_hits);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
         // used to bound this started at construction, so a caller whose setup
@@ -139,6 +151,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                         );
                         break;
                     }
+                    accepted_for_thread.fetch_add(1, Ordering::AcqRel);
                     // #3320: WAIT for the request instead of answering blind.
                     // macOS really does return `EAGAIN` here — BSD accepted
                     // sockets inherit the listener's non-blocking mode, set
@@ -155,6 +168,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                         let attempt = if inject_read_for_thread.load(Ordering::Acquire) {
                             Err(std::io::Error::other("#3320 injected read failure"))
                         } else if inject_read_would_block_for_thread.load(Ordering::Acquire) {
+                            would_block_hits_for_thread.fetch_add(1, Ordering::AcqRel);
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::WouldBlock,
                                 "#3320 injected read would-block",
@@ -249,6 +263,8 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         simulate_blocking_accept,
         inject_mode_error,
         exited,
+        accepted,
+        injected_would_block_hits,
         thread: Some(thread),
     }
 }
@@ -260,6 +276,39 @@ fn record_thread_error(slot: &Arc<Mutex<Option<String>>>, cause: String) {
     let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_none() {
         *guard = Some(cause);
+    }
+}
+
+/// #3320: wait for a counter the SERVING THREAD advances, so a test acts on a
+/// proven event instead of on elapsed time. A fixed sleep cannot tell "the
+/// thread reached the state under test" from "the thread has not run yet", and a
+/// pin that cannot tell those apart passes when nothing happened — the defect
+/// class this branch exists to remove, one level up in the test itself.
+fn wait_for_at_least(counter: &Arc<AtomicU32>, target: u32, budget: StdDuration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if counter.load(Ordering::Acquire) >= target {
+            return true;
+        }
+        std::thread::sleep(StdDuration::from_millis(5));
+    }
+    counter.load(Ordering::Acquire) >= target
+}
+
+/// #3320: wait for the serving thread to RECORD why it died. Same reason as
+/// `wait_for_at_least`: a fixed sleep turns a slow thread into a false failure,
+/// which is the mirror image of the false pass — both are the test measuring the
+/// scheduler instead of the property.
+fn wait_for_cause(slot: &Arc<Mutex<Option<String>>>, budget: StdDuration) -> Option<String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(cause) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Some(cause);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(StdDuration::from_millis(5));
     }
 }
 
@@ -325,14 +374,14 @@ fn server_serves_after_outlasting_the_old_construction_deadline_3320() {
 fn dead_server_thread_does_not_panic_on_drop_3320() {
     let server = pull_list_server("[]".to_string());
     server.inject_accept_error.store(true, Ordering::Release);
-    // Let the loop reach the injected error.
-    std::thread::sleep(StdDuration::from_millis(50));
 
     // Without this the test would pass even if the injection did nothing, and a
     // pin that cannot tell those apart is the exact defect class this branch is
-    // here to remove.
+    // here to remove. WAIT for the record rather than sleeping a fixed amount:
+    // a sleep short enough to keep the suite fast is also short enough to expire
+    // before a loaded machine schedules the serving thread.
     assert!(
-        server.thread_error.lock().unwrap().is_some(),
+        wait_for_cause(&server.thread_error, StdDuration::from_secs(5)).is_some(),
         "#3320 fixture check: the loop must have OBSERVED the injected accept \
          failure and recorded it, not simply carried on"
     );
@@ -363,9 +412,8 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
     // Drive one request so the write arm is entered. The response is expected to
     // fail; what is under test is whether that failure is VISIBLE afterwards.
     let _ = get(&server.base_url);
-    std::thread::sleep(StdDuration::from_millis(150));
 
-    let cause = server.thread_error.lock().unwrap().clone();
+    let cause = wait_for_cause(&server.thread_error, StdDuration::from_secs(5));
     assert!(
         cause
             .as_deref()
@@ -395,9 +443,8 @@ fn read_side_failure_is_reported_not_swallowed_3320() {
     // Drive one request so the read arm is entered. What is under test is
     // whether the failure is VISIBLE afterwards, not what the client received.
     let _ = get(&server.base_url);
-    std::thread::sleep(StdDuration::from_millis(150));
 
-    let cause = server.thread_error.lock().unwrap().clone();
+    let cause = wait_for_cause(&server.thread_error, StdDuration::from_secs(5));
     assert!(
         cause
             .as_deref()
@@ -437,7 +484,19 @@ fn a_would_block_read_is_waited_out_not_answered_blind_3320() {
     // would-block. `get` blocks until the response, so it has to run beside us.
     let base_url = server.base_url.clone();
     let client = std::thread::spawn(move || get(&base_url));
-    std::thread::sleep(StdDuration::from_millis(150));
+
+    // Wait for the INJECTED would-block to actually fire. A fixed sleep here
+    // would pass even if the serving thread had not run at all, proving nothing
+    // about the arm under test.
+    assert!(
+        wait_for_at_least(
+            &server.injected_would_block_hits,
+            1,
+            StdDuration::from_secs(5)
+        ),
+        "#3320 fixture check: the injected would-block never fired, so nothing \
+         below is evidence about waiting one out"
+    );
 
     assert_eq!(
         server.requests.load(Ordering::Acquire),
@@ -494,7 +553,16 @@ fn a_silent_client_does_not_wedge_teardown_3320() {
 
     // Connect and say NOTHING, so the stand-in is parked in the read wait.
     let _silent = std::net::TcpStream::connect(&addr).expect("#3320: connect");
-    std::thread::sleep(StdDuration::from_millis(100));
+
+    // PROVE it is parked there before releasing `stop`. Sleeping instead would
+    // let this pass on a loaded machine where the serving thread simply had not
+    // run yet: it would then see `stop` before ever accepting, set `exited`, and
+    // report success without touching the mode normalisation under test.
+    assert!(
+        wait_for_at_least(&server.accepted, 1, StdDuration::from_secs(5)),
+        "#3320 fixture check: the stand-in never accepted the connection, so \
+         the teardown below would prove nothing about the read wait"
+    );
 
     // What `Drop` does, minus the join we cannot safely perform yet.
     server.stop.store(true, Ordering::Release);
@@ -530,9 +598,8 @@ fn accepted_socket_mode_failure_is_reported_not_ignored_3320() {
     server.inject_mode_error.store(true, Ordering::Release);
 
     let _ = get(&server.base_url);
-    std::thread::sleep(StdDuration::from_millis(150));
 
-    let cause = server.thread_error.lock().unwrap().clone();
+    let cause = wait_for_cause(&server.thread_error, StdDuration::from_secs(5));
     assert!(
         cause
             .as_deref()
