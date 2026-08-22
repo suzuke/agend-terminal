@@ -22,9 +22,15 @@ pub(super) struct PullListServer {
     /// arm is only entered on a real syscall failure (realistically `EMFILE`
     /// under a parallel run), which no test can schedule.
     pub(super) inject_accept_error: Arc<AtomicBool>,
-    /// Set when the loop ended on a genuine accept failure, so a test can assert
-    /// on it instead of discovering it as an abort.
-    pub(super) accept_error: Arc<Mutex<Option<String>>>,
+    /// Why the serving loop ended, when it ended on a failure rather than on
+    /// `stop`. Covers BOTH arms: a failed `accept`, and a failed body read or
+    /// response write. Without the write arm recorded here, its panic is
+    /// discarded by `Drop`'s quiet join and the dependent test fails with no
+    /// cause attached.
+    pub(super) thread_error: Arc<Mutex<Option<String>>>,
+    /// #3320: makes the write arm fail. Otherwise only a real socket error
+    /// reaches it, which no test can schedule.
+    pub(super) inject_write_error: Arc<AtomicBool>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -55,12 +61,14 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let requests = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let inject_accept_error = Arc::new(AtomicBool::new(false));
-    let accept_error = Arc::new(Mutex::new(None));
+    let thread_error = Arc::new(Mutex::new(None));
+    let inject_write_error = Arc::new(AtomicBool::new(false));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
     let inject_for_thread = Arc::clone(&inject_accept_error);
-    let accept_error_for_thread = Arc::clone(&accept_error);
+    let thread_error_for_thread = Arc::clone(&thread_error);
+    let inject_write_for_thread = Arc::clone(&inject_write_error);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
         // used to bound this started at construction, so a caller whose setup
@@ -79,13 +87,36 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                 Ok((mut stream, _)) => {
                     let mut request = [0_u8; 2048];
                     let _ = stream.read(&mut request);
-                    let body = body_for_thread.lock().unwrap().clone();
+                    // #3320: record-and-break, never panic. A panic here dies
+                    // inside the server thread, and `Drop`'s quiet join discards
+                    // it — the dependent test then fails with no cause.
+                    let body = match body_for_thread.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => {
+                            record_thread_error(
+                                &thread_error_for_thread,
+                                format!("body lock poisoned: {poisoned}"),
+                            );
+                            break;
+                        }
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
-                    stream.write_all(response.as_bytes()).unwrap();
+                    let written = if inject_write_for_thread.load(Ordering::Acquire) {
+                        Err(std::io::Error::other("#3320 injected write failure"))
+                    } else {
+                        stream.write_all(response.as_bytes())
+                    };
+                    if let Err(error) = written {
+                        record_thread_error(
+                            &thread_error_for_thread,
+                            format!("response write failed: {error}"),
+                        );
+                        break;
+                    }
                     requests_for_thread.fetch_add(1, Ordering::AcqRel);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -98,7 +129,10 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                 // failure with an abort. The error is recorded so a test can
                 // still assert it happened.
                 Err(error) => {
-                    *accept_error_for_thread.lock().unwrap() = Some(error.to_string());
+                    record_thread_error(
+                        &thread_error_for_thread,
+                        format!("accept failed: {error}"),
+                    );
                     break;
                 }
             }
@@ -110,8 +144,19 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         requests,
         stop,
         inject_accept_error,
-        accept_error,
+        thread_error,
+        inject_write_error,
         thread: Some(thread),
+    }
+}
+
+/// Record why the serving loop ended. Never panics — a panic in the error path
+/// would be the very failure this exists to report. The FIRST cause wins: it is
+/// the one that ended the loop.
+fn record_thread_error(slot: &Arc<Mutex<Option<String>>>, cause: String) {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(cause);
     }
 }
 
@@ -184,11 +229,48 @@ fn dead_server_thread_does_not_panic_on_drop_3320() {
     // pin that cannot tell those apart is the exact defect class this branch is
     // here to remove.
     assert!(
-        server.accept_error.lock().unwrap().is_some(),
+        server.thread_error.lock().unwrap().is_some(),
         "#3320 fixture check: the loop must have OBSERVED the injected accept \
          failure and recorded it, not simply carried on"
     );
 
     // The property under test: this returns rather than panicking.
+    drop(server);
+}
+
+/// #3320 RED-C: a WRITE-side failure must be reported, not swallowed.
+///
+/// The accept arm records its cause; the write arm did not. Its `unwrap` panics
+/// the server thread, and `Drop`'s quiet join then discards that panic — so the
+/// dependent test fails on `served.is_ok()` or a request count with NO cause
+/// attached. This is not simply "worse than the abort it replaced": the abort
+/// BURIED the real assertion, while this leaves the assertion visible but
+/// STRIPS its cause. Both are wrong, in opposite directions, and recording the
+/// cause is what gets both right.
+///
+/// It matters most on Windows, where these tests have never yet run: an accepted
+/// socket may inherit the listener's non-blocking mode there, in which case
+/// `write_all` can return `WouldBlock` — a real, uninjected instance of exactly
+/// this arm, on the one platform with no evidence either way.
+#[test]
+fn write_side_failure_is_reported_not_swallowed_3320() {
+    let server = pull_list_server("[\"body-3320\"]".to_string());
+    server.inject_write_error.store(true, Ordering::Release);
+
+    // Drive one request so the write arm is entered. The response is expected to
+    // fail; what is under test is whether that failure is VISIBLE afterwards.
+    let _ = get(&server.base_url);
+    std::thread::sleep(StdDuration::from_millis(150));
+
+    let cause = server.thread_error.lock().unwrap().clone();
+    assert!(
+        cause
+            .as_deref()
+            .is_some_and(|c| c.contains("injected write failure")),
+        "#3320: a write-side failure must be RECORDED, so the test that depended \
+         on this server can say why it died; got {cause:?}"
+    );
+
+    // And teardown must still be quiet.
     drop(server);
 }
