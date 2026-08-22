@@ -864,6 +864,11 @@ fn a_silent_client_does_not_wedge_teardown_3322() {
     {
         thread::sleep(Duration::from_millis(2));
     }
+    assert_ne!(
+        channel.accepted_connections.load(Ordering::Acquire),
+        0,
+        "#3322 fixture check: the stand-in must have accepted the silent client"
+    );
     thread::sleep(Duration::from_millis(50));
 
     // What `stop_and_join` does, minus the join we cannot safely perform yet.
