@@ -1117,6 +1117,7 @@ fn log_path(board: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn board_event_lock_path(board: &Path) -> PathBuf {
     log_path(board).with_extension("jsonl.lock")
 }
