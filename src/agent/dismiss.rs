@@ -1517,6 +1517,115 @@ WARNING: Loading development channels
         );
     }
 
+    /// #3314 PRODUCTION SEAM: the epoch is bumped by the real
+    /// `write_with_timeout`, not by a test helper. This is the claim that
+    /// "every PTY writer invalidates a candidate" rests on — `write_to_pty`
+    /// delegates here, and so do the inject, dismiss and TUI socket paths — so
+    /// it is asserted against the production function itself.
+    #[test]
+    fn production_pty_write_bumps_the_epoch_3314() {
+        let (writer, _written) = recording_writer_3314();
+        let epoch = crate::agent::dev_modal::arm_epoch(&writer);
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = write_with_timeout(&writer, b"anything");
+        let after = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        crate::agent::dev_modal::disarm_epoch(&writer);
+        assert!(
+            after > before,
+            "#3314: a real PTY write must invalidate an in-flight candidate"
+        );
+    }
+
+    /// #3314: an UNARMED writer's writes are a no-op, so the registry cannot
+    /// grow unbounded and a disarmed generation costs nothing.
+    #[test]
+    fn writes_to_a_disarmed_writer_are_a_no_op_3314() {
+        let (writer, _written) = recording_writer_3314();
+        let epoch = crate::agent::dev_modal::arm_epoch(&writer);
+        crate::agent::dev_modal::disarm_epoch(&writer);
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = write_with_timeout(&writer, b"anything");
+        assert_eq!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "#3314: a disarmed generation must not keep counting"
+        );
+    }
+
+    /// #3314 TEARDOWN: a keystroke already queued behind the write delay must
+    /// not land after its generation ended. The queued barrier holds its own
+    /// Arc, so removing the registry entry alone would NOT have stopped it —
+    /// which is exactly the gap review caught. The generation-over flag is what
+    /// stops it.
+    #[test]
+    fn generation_teardown_cancels_a_queued_keystroke_3314() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let generation_over = std::sync::Arc::new(AtomicBool::new(false));
+        let deleted = std::sync::Arc::new(AtomicBool::new(false));
+        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+            true,
+            std::sync::Arc::clone(&epoch),
+            std::sync::Arc::clone(&generation_over),
+            std::sync::Arc::clone(&deleted),
+        );
+        let barrier = gate.write_barrier();
+        assert!(barrier.still_valid(), "valid while the generation is live");
+        generation_over.store(true, Ordering::SeqCst);
+        assert!(
+            !barrier.still_valid(),
+            "#3314: the generation ending must cancel a queued keystroke"
+        );
+    }
+
+    /// #3314 DELETE: instance deletion cancels the same way, and it is a
+    /// SEPARATE flag on purpose — a child that merely exited is not a deleted
+    /// instance, and conflating them would mislabel a crashed agent.
+    #[test]
+    fn instance_deletion_cancels_a_queued_keystroke_3314() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let generation_over = std::sync::Arc::new(AtomicBool::new(false));
+        let deleted = std::sync::Arc::new(AtomicBool::new(false));
+        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+            true,
+            std::sync::Arc::clone(&epoch),
+            std::sync::Arc::clone(&generation_over),
+            std::sync::Arc::clone(&deleted),
+        );
+        let barrier = gate.write_barrier();
+        deleted.store(true, Ordering::SeqCst);
+        assert!(
+            !barrier.still_valid(),
+            "#3314: deletion must cancel a queued keystroke"
+        );
+    }
+
+    /// #3314 wiring pins (the #1644/#1530-F2 source-grep convention, used here
+    /// because `pty_read_loop` and `Pane::resize_pty` need a live PTY, registry
+    /// and pane to drive). The semantics above are proven by real tests; these
+    /// prove the production CALL SITES exist, which no amount of gate-object
+    /// testing can. Deleting either wiring point would otherwise leave every
+    /// other test in this file green.
+    #[test]
+    fn production_wires_teardown_cancel_and_resize_bump_3314() {
+        let agent_src = include_str!("mod.rs");
+        assert!(
+            agent_src.contains("dev_modal_generation_over.store(true"),
+            "#3314: the read loop must cancel the generation when it exits"
+        );
+        assert!(
+            agent_src.contains("crate::agent::dev_modal::note_pty_write(writer);"),
+            "#3314: write_with_timeout must bump the epoch for every PTY write"
+        );
+        let pane_src = include_str!("../layout/pane.rs");
+        assert!(
+            pane_src.contains("dev_modal::note_pty_resize(&handle.pty_writer)"),
+            "#3314: a resize repaints the child and must invalidate a candidate; \
+             resize is not a byte write, so it needs its own call site"
+        );
+    }
+
     /// #3314 REVIEWER RED: the full static fingerprint is NOT a safety
     /// mechanism, and this pins why so nobody later mistakes it for one.
     /// Measured on the real captures: the replayed frame and the quoted frame

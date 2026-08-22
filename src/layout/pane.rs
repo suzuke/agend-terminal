@@ -435,6 +435,12 @@ impl Pane {
                 let redraw = redraw_seq_after_resize(self.backend.as_ref());
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(&self.instance_id) {
+                    // #3314: a geometry change repaints the child, so any
+                    // startup-modal candidate observed before it is no longer a
+                    // frame nobody has touched. Resize is NOT a byte write, so
+                    // it does not pass through `write_with_timeout` and needs
+                    // this explicit call site.
+                    crate::agent::dev_modal::note_pty_resize(&handle.pty_writer);
                     {
                         let master = handle.pty_master.lock();
                         let _ = master.resize(portable_pty::PtySize {

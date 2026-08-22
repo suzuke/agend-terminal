@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod dev_modal;
+pub(crate) mod dev_modal;
 mod dismiss;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
@@ -2127,9 +2127,16 @@ fn pty_read_loop(
     // generation-scoped BY CONSTRUCTION — no store keyed by agent name, nothing
     // to evict, and no rollover race. It dies with this read loop.
     let dev_modal_epoch = crate::agent::dev_modal::arm_epoch(pty_writer);
+    // #3314: this generation is over when the read loop exits, for ANY reason
+    // (EOF, read error, shutdown). Kept separate from `deleted`, because a child
+    // that simply exited is not a deleted instance and conflating the two would
+    // mislabel a crashed agent. A CR still queued behind the 300ms write delay
+    // must not land after the generation it was decided for has ended.
+    let dev_modal_generation_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut dev_modal_gate = crate::agent::dev_modal::DevModalGate::with_epoch(
         *dev_modal_armed,
         dev_modal_epoch,
+        Arc::clone(&dev_modal_generation_over),
         Arc::clone(deleted),
     );
     // Monotonic base for the gate's stability window. The gate itself never
@@ -2283,8 +2290,10 @@ fn pty_read_loop(
         }
     }
 
-    // #3314: stop tracking this generation's PTY writes. Paired with the
-    // `arm_epoch` above so the epoch map holds only live generations.
+    // #3314: the generation is over. Cancel FIRST, then stop tracking writes —
+    // a queued keystroke still holds its own Arc to this flag, so removing the
+    // registry entry alone would not have stopped it.
+    dev_modal_generation_over.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::agent::dev_modal::disarm_epoch(pty_writer);
 
     // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).

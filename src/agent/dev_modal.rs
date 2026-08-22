@@ -138,6 +138,17 @@ pub(crate) fn note_pty_write(writer: &crate::agent::PtyWriter) {
     }
 }
 
+/// A geometry change on this PTY. NOT a byte write, so it does not pass through
+/// `write_with_timeout` and needs its own call site (`Pane::resize_pty`).
+///
+/// The initial baseline resize needs no special case: a bump with no candidate
+/// in flight is a no-op by construction, because there is nothing to invalidate.
+/// That is the exemption, structurally rather than as a flag someone has to
+/// remember to clear.
+pub(crate) fn note_pty_resize(writer: &crate::agent::PtyWriter) {
+    note_pty_write(writer);
+}
+
 /// Snapshot handed to the writer thread so it can re-check IMMEDIATELY before
 /// the syscall. It cannot close W3 — a check and a syscall are not atomic with
 /// respect to another process's output — but it does close the much wider
@@ -146,13 +157,22 @@ pub(crate) fn note_pty_write(writer: &crate::agent::PtyWriter) {
 pub(crate) struct WriteBarrier {
     epoch: Arc<AtomicU64>,
     epoch_at_enqueue: u64,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// This GENERATION is over — set when the read loop exits for any reason
+    /// (EOF, read error, shutdown). Distinct from `deleted`: a child that simply
+    /// exited is not a deleted instance, and conflating them would mislabel a
+    /// crashed agent.
+    generation_over: Arc<std::sync::atomic::AtomicBool>,
+    /// The INSTANCE is being deleted (daemon/lifecycle.rs, crash_disposition).
+    deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WriteBarrier {
-    /// May the enqueued keystroke still be written?
+    /// May the enqueued keystroke still be written? Checked immediately before
+    /// the syscall — see the W3 note in this module's docs for what it does NOT
+    /// close.
     pub(crate) fn still_valid(&self) -> bool {
-        !self.cancelled.load(Ordering::SeqCst)
+        !self.generation_over.load(Ordering::SeqCst)
+            && !self.deleted.load(Ordering::SeqCst)
             && self.epoch.load(Ordering::SeqCst) == self.epoch_at_enqueue
     }
 }
@@ -230,7 +250,8 @@ pub(crate) struct DevModalGate {
     armed: bool,
     spent: bool,
     epoch: Arc<AtomicU64>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    generation_over: Arc<std::sync::atomic::AtomicBool>,
+    deleted: Arc<std::sync::atomic::AtomicBool>,
     candidate: Option<Candidate>,
 }
 
@@ -241,19 +262,22 @@ impl DevModalGate {
             armed,
             Arc::new(AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
     }
 
     pub(crate) fn with_epoch(
         armed: bool,
         epoch: Arc<AtomicU64>,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        generation_over: Arc<std::sync::atomic::AtomicBool>,
+        deleted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             armed,
             spent: false,
             epoch,
-            cancelled,
+            generation_over,
+            deleted,
             candidate: None,
         }
     }
@@ -269,7 +293,8 @@ impl DevModalGate {
         WriteBarrier {
             epoch: Arc::clone(&self.epoch),
             epoch_at_enqueue: self.epoch.load(Ordering::SeqCst),
-            cancelled: Arc::clone(&self.cancelled),
+            generation_over: Arc::clone(&self.generation_over),
+            deleted: Arc::clone(&self.deleted),
         }
     }
 
