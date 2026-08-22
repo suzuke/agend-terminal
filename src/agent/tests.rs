@@ -1792,7 +1792,7 @@ fn build_command_strips_agend_git_bypass() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     // #t-3 audit: actually assert the strip. portable_pty's CommandBuilder
     // captures the FULL parent env into its `envs` map at `::new()`, and
     // `env_remove` deletes the key from that map — so `get_env` DOES reflect
@@ -1839,7 +1839,7 @@ fn build_command_sets_git_editor_defaults() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     for key in &["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL"] {
         let value = cmd
             .get_env(key)
@@ -1879,7 +1879,7 @@ fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
         shutdown: None,
     };
 
-    let (cmd, detected) = build_command(&config).expect("build_command");
+    let (cmd, detected, _prov) = build_command(&config).expect("build_command");
     assert_eq!(
         detected,
         Some(Backend::ClaudeCode),
@@ -1966,7 +1966,7 @@ fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
         shutdown: None,
     };
 
-    let (cmd, detected) = build_command(&config).expect("build_command");
+    let (cmd, detected, _prov) = build_command(&config).expect("build_command");
     assert_eq!(detected, Some(Backend::ClaudeCode));
     let argv: Vec<String> = cmd
         .get_argv()
@@ -2011,7 +2011,7 @@ fn build_command_allows_operator_backend_credential_2106() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     assert_eq!(
         cmd.get_env("ANTHROPIC_AUTH_TOKEN")
             .map(|v| v.to_string_lossy().into_owned()),
@@ -2059,7 +2059,7 @@ fn build_command_credential_override_is_per_backend_2106() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     assert_ne!(
         cmd.get_env("ANTHROPIC_AUTH_TOKEN")
             .map(|v| v.to_string_lossy().into_owned()),
@@ -2106,7 +2106,7 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
         crate::backend::SpawnMode::Fresh,
         crate::backend::SpawnMode::Resume,
     ] {
-        let (oc, _) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
+        let (oc, _, _prov) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
         let content = oc
             .get_env("OPENCODE_CONFIG_CONTENT")
             .and_then(|v| v.to_str().map(String::from))
@@ -2128,7 +2128,7 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
     }
     // Non-OpenCode backends must NOT receive either env (no cross-backend leakage).
     for cmd in ["claude", "codex", "echo"] {
-        let (c, _) =
+        let (c, _, _prov) =
             build_command(&cfg(cmd, crate::backend::SpawnMode::Fresh)).expect("build_command");
         assert!(
             c.get_env("OPENCODE_CONFIG_CONTENT").is_none(),
@@ -2180,7 +2180,7 @@ fn build_command_reinjects_agend_home_under_env_isolation_med5() {
         None => std::env::remove_var("AGEND_ENV_ISOLATION"),
     }
 
-    let (cmd, _) = built.expect("build_command");
+    let (cmd, _, _prov) = built.expect("build_command");
     let v = cmd
         .get_env("AGEND_HOME")
         .expect("MED-5: AGEND_HOME must survive env_clear under isolation");
@@ -2225,7 +2225,7 @@ fn build_agy_cmd(
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, backend) = build_command(&config).expect("build_command");
+    let (cmd, backend, _prov) = build_command(&config).expect("build_command");
     assert_eq!(backend, Some(Backend::Agy));
     (cmd, crate::agy_workspace::link_path(home, "agy-int"))
 }

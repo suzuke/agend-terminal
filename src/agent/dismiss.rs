@@ -378,19 +378,17 @@ pub fn try_prepared_dismiss_dialog(
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();
             let agent = name.to_string();
-            // #3314: spent ONLY here — after the in-flight slot was actually
-            // claimed. A collision returns above without spending, so a lost
-            // attempt can never strand the agent at an unanswered modal.
             // #3314: the barrier is scoped to the startup-modal class ONLY.
             // Other backends send multi-chunk sequences (agy's up-up-Enter), and
             // each chunk's own write bumps the epoch — applying the barrier
             // there would cancel a pattern midway through its own keystrokes.
-            let barrier = if pattern.rearm_pre_idle {
-                dev_gate.mark_enqueued();
-                Some(dev_gate.write_barrier())
-            } else {
-                None
-            };
+            //
+            // P2-D: snapshot the barrier here, but spend the one-shot only AFTER
+            // the write is successfully submitted. A failed thread spawn or a
+            // rejected enqueue must leave the generation able to try again;
+            // spending early strands it as Refused(Spent) with the modal
+            // unanswered, which is the exact failure the rule exists to prevent.
+            let barrier = pattern.rearm_pre_idle.then(|| dev_gate.write_barrier());
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
                 let _guard = InFlightGuard(agent.clone());
@@ -400,6 +398,9 @@ pub fn try_prepared_dismiss_dialog(
                     .is_none_or(crate::agent::dev_modal::WriteBarrier::still_valid)
                 {
                     let _ = write_with_timeout(&writer, &keys);
+                }
+                if pattern.rearm_pre_idle {
+                    dev_gate.mark_enqueued();
                 }
                 return true;
             }
@@ -439,16 +440,22 @@ pub fn try_prepared_dismiss_dialog(
                         if b == b'\r' || b == b'\n' {
                             // Send everything up to (not including) this Enter
                             if start < i {
-                                let _ = write_with_timeout(&writer, &keys[start..i]);
+                                let _ = write_with_timeout_guarded(
+                                    &writer,
+                                    &keys[start..i],
+                                    barrier.clone(),
+                                );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                             }
                             // Send the Enter
-                            let _ = write_with_timeout(&writer, &keys[i..=i]);
+                            let _ =
+                                write_with_timeout_guarded(&writer, &keys[i..=i], barrier.clone());
                             start = i + 1;
                         }
                     }
                     if start < keys.len() {
-                        let _ = write_with_timeout(&writer, &keys[start..]);
+                        let _ =
+                            write_with_timeout_guarded(&writer, &keys[start..], barrier.clone());
                     }
                     tracing::debug!(agent = %agent, "dismiss keystrokes sent");
                     // H2: in-flight slot freed by `_guard` on scope exit.
@@ -457,6 +464,11 @@ pub fn try_prepared_dismiss_dialog(
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
                 DISMISS_IN_FLIGHT.lock().remove(name);
+            } else if pattern.rearm_pre_idle {
+                // P2-D: submitted. Only now is the generation's single answer
+                // spent; the spawn-failure branch above deliberately leaves it
+                // unspent so the modal can still be answered.
+                dev_gate.mark_enqueued();
             }
             return true;
         }
@@ -1674,13 +1686,28 @@ WARNING: Loading development channels
     /// it — so a queued CR can outlive the last check. The inline recording-writer
     /// seam the rendezvous test uses is a TEST path and proves nothing about the
     /// registered production writer.
+    ///
+    /// The first draft of this pin only asserted that `write_actor.rs` mentions
+    /// `WriteBarrier`, which the FIELD DECLARATION alone satisfies — deleting
+    /// the actual check left it green. It now pins the check INSIDE
+    /// `service_once` and, crucially, its ORDER relative to the syscall.
     #[test]
     fn write_actor_must_carry_the_barrier_to_the_syscall_3314() {
         let src = include_str!("write_actor.rs");
+        let start = src
+            .find("fn service_once(")
+            .expect("service_once must exist");
+        let body = &src[start..];
+        let check = body
+            .find("still_valid()")
+            .expect("#3314 P1-B: service_once must re-check the barrier before it writes");
+        let syscall = body
+            .find("libc::write(")
+            .expect("service_once must perform the write syscall");
         assert!(
-            src.contains("WriteBarrier"),
-            "#3314 P1-B: the write actor must receive the barrier so it can be \
-             re-checked immediately before the real write syscall"
+            check < syscall,
+            "#3314 P1-B: the barrier must be re-checked BEFORE the write syscall, \
+             not merely carried on the job"
         );
     }
 
@@ -1712,18 +1739,58 @@ WARNING: Loading development channels
     #[test]
     fn one_shot_is_spent_only_after_successful_submission_3314() {
         let src = include_str!("dismiss.rs");
+        // Anchored on the WRITE, not the thread spawn: the first `mark_enqueued`
+        // in the file lives in the inline test branch, so comparing against the
+        // spawn measured the wrong occurrence. (My first draft of this pin did
+        // exactly that and stayed red against correct code.)
         let spend = src
             .find("dev_gate.mark_enqueued()")
             .expect("the one-shot spend must exist");
-        let spawn = src
-            .find("std::thread::Builder::new()")
-            .expect("the dismiss writer thread spawn must exist");
+        let write = src
+            .find("let _ = write_with_timeout(&writer, &keys);")
+            .expect("the dismiss write must exist");
         assert!(
-            spend > spawn,
+            spend > write,
             "#3314 P2-D: the one-shot is spent BEFORE the write is submitted; a \
              failed spawn or a full queue then strands the generation as Spent \
              with the modal unanswered"
         );
+    }
+
+    /// #3314 B1 GREEN: arming is now a PURE function of the provenance captured
+    /// from the command that was actually built. No filesystem, no path
+    /// resolution — so it cannot disagree with the process that is running,
+    /// which is exactly how r1 failed open.
+    #[test]
+    fn arming_is_a_pure_function_of_captured_provenance_3314() {
+        use crate::agent::dev_modal::{armed_for_spawn, SpawnProvenance};
+        let armed = SpawnProvenance {
+            argv_has_dev_channel_flag: true,
+            binary_version: Some("2.1.238".to_string()),
+        };
+        assert!(armed_for_spawn(&armed, "t"));
+
+        // The argv fact alone is not enough: an unvalidated version disarms.
+        let unvalidated = SpawnProvenance {
+            argv_has_dev_channel_flag: true,
+            binary_version: Some("2.1.239".to_string()),
+        };
+        assert!(!armed_for_spawn(&unvalidated, "t"));
+
+        // An unidentifiable binary disarms rather than defaulting open.
+        let unknown = SpawnProvenance {
+            argv_has_dev_channel_flag: true,
+            binary_version: None,
+        };
+        assert!(!armed_for_spawn(&unknown, "t"));
+
+        // And a generation whose argv never carried the flag can never be armed,
+        // whatever is on disk — it cannot render this modal at all.
+        let unflagged = SpawnProvenance {
+            argv_has_dev_channel_flag: false,
+            binary_version: Some("2.1.238".to_string()),
+        };
+        assert!(!armed_for_spawn(&unflagged, "t"));
     }
 
     /// #3314 REVIEWER RED: the full static fingerprint is NOT a safety

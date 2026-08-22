@@ -29,6 +29,21 @@
 //! rows are not stable even within one CLI version — the same modal block
 //! renders at rows 1-13 in one capture and rows 14-28 in another.
 //!
+//! # What the tests DO and DO NOT establish (r1 review N2/N3)
+//!
+//! The shipped contract is "never answers a stale frame AFTER the first CR",
+//! NOT "never answers a stale frame". Every stale-frame regression primes the
+//! generation with the live modal first, spending the one-shot, before feeding
+//! the replayed or quoted frame. No test feeds a stale frame as the FIRST
+//! sighting in an armed generation, because the fingerprint cannot reject one —
+//! a complete replayed modal satisfies it exactly as a live one does. A reader
+//! must not take a green run as proof of the stronger claim.
+//!
+//! The capture corpus also has NO frame carrying a COMPLETE fingerprint beside a
+//! LIVE competing operator dialog. `competing.txt` refuses only because its
+//! headline had scrolled off, so it is a non-discriminating control, not
+//! coverage of the most dangerous shape. That is a capture gap, recorded as one.
+//!
 //! # W3: the irreducible residual
 //!
 //! Between the last check and the `write(2)`, the child can repaint arbitrarily,
@@ -81,7 +96,14 @@ pub(crate) const ELIGIBILITY_EXPIRY_MS: u64 = 120_000;
 /// modal must cost a hang plus an operator notice, never a stray keystroke.
 pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238"];
 
-/// Resolve the version of the binary this generation will actually exec.
+/// Resolve the version of a concrete backend binary.
+///
+/// LAYOUT-DEPENDENT, deliberately disclosed (r1 review N4): this returns the
+/// canonicalised file NAME, which is a version only because the installer lays
+/// binaries out as `.../claude/versions/<version>`. A homebrew or npm layout
+/// yields `claude`, which is not in the allowlist and therefore DISARMS. The
+/// direction is fail-closed, but the gate should be read as "a layout we have
+/// validated", not "the version".
 ///
 /// `~/.local/bin/claude` is a SYMLINK that auto-update flips while the fleet is
 /// running, and old version binaries are retained on disk — so a process
@@ -94,35 +116,54 @@ pub(crate) fn spawned_binary_version(command: &std::path::Path) -> Option<String
     Some(resolved.file_name()?.to_string_lossy().into_owned())
 }
 
+/// Facts about the command that was ACTUALLY built and spawned for this
+/// generation. Captured from the `CommandBuilder` itself and from the path
+/// `build_command` resolved, BEFORE the child is exec'd — not re-derived
+/// afterwards.
+///
+/// Re-deriving was the r1 defect: `Backend::spawn_flags` is not pure (it stats
+/// and re-parses the workspace mcp-config at call time) and `which::which` is a
+/// second, independent path resolution. Between the build and a later re-read,
+/// a config edit or an auto-update symlink flip can make the answer disagree
+/// with the process that is actually running — and it disagrees in the
+/// FAIL-OPEN direction: arming a generation whose argv never carried the flag,
+/// or one running a binary version we have never captured.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SpawnProvenance {
+    /// The built argv really contains `--dangerously-load-development-channels`.
+    pub(crate) argv_has_dev_channel_flag: bool,
+    /// Version of the concrete binary this generation will exec, as resolved for
+    /// the command itself. `None` when it cannot be identified — which disarms.
+    pub(crate) binary_version: Option<String>,
+}
+
+impl SpawnProvenance {
+    /// Read the two facts off the command that is about to be spawned.
+    pub(crate) fn capture(cmd: &portable_pty::CommandBuilder, resolved: &std::path::Path) -> Self {
+        Self {
+            argv_has_dev_channel_flag: cmd
+                .get_argv()
+                .iter()
+                .any(|arg| arg == "--dangerously-load-development-channels"),
+            binary_version: spawned_binary_version(resolved),
+        }
+    }
+}
+
 /// Is this generation eligible for startup-modal auto-answering at all?
 ///
-/// Two owned facts, both decided at SPAWN: the argv we are about to exec really
-/// carries the provoking flag (`Backend::spawn_flags` adds it only when the
-/// workspace mcp-config declares the channel server), and the concrete
-/// versioned binary we will exec is one whose modal rendering we have actually
-/// captured. Neither is an observation of the screen, so neither can be forged
-/// by replayed output.
-pub(crate) fn armed_for_spawn(
-    backend: Option<&crate::backend::Backend>,
-    working_dir: Option<&std::path::Path>,
-    agent: &str,
-) -> bool {
-    let flagged = backend.zip(working_dir).is_some_and(|(b, wd)| {
-        b.spawn_flags(wd)
-            .iter()
-            .any(|flag| flag == "--dangerously-load-development-channels")
-    });
-    if !flagged {
+/// PURE: a function of the captured provenance and nothing else. It touches no
+/// filesystem and resolves no paths, so it cannot disagree with the process that
+/// is running.
+pub(crate) fn armed_for_spawn(provenance: &SpawnProvenance, agent: &str) -> bool {
+    if !provenance.argv_has_dev_channel_flag {
         return false;
     }
-    let version = backend
-        .and_then(|b| which::which(b.preset().command).ok())
-        .and_then(|path| spawned_binary_version(&path));
-    let armed = version_is_validated(version.as_deref());
+    let armed = version_is_validated(provenance.binary_version.as_deref());
     if !armed {
         tracing::info!(
             agent,
-            ?version,
+            version = ?provenance.binary_version,
             "#3314: startup-modal auto-answer disarmed — unvalidated backend version"
         );
     }

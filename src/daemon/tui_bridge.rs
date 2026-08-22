@@ -208,6 +208,11 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                         Ok((TAG_RESIZE, data)) if data.len() == 4 => {
                             let cols = u16::from_be_bytes([data[0], data[1]]);
                             let rows = u16::from_be_bytes([data[2], data[3]]);
+                            // #3314: a client resize repaints the child, so any
+                            // startup-modal candidate observed before it is no
+                            // longer a frame nobody has touched. Resize is not a
+                            // byte write and never reaches `write_with_timeout`.
+                            crate::agent::dev_modal::note_pty_resize(&pty_writer);
                             let _ = pty_master.lock().resize(PtySize {
                                 rows,
                                 cols,

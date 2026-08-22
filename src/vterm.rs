@@ -203,6 +203,12 @@ impl EventListener for PtyWriteListener {
         if let Some(mut w) = writer.try_lock() {
             let _ = w.write_all(text.as_bytes());
             let _ = w.flush();
+            drop(w);
+            // #3314: this bypasses `write_with_timeout`, so it must invalidate an
+            // in-flight startup-modal candidate itself. Bumped only when the
+            // bytes actually went out — a skipped write on lock contention has
+            // not touched the child's frame.
+            crate::agent::dev_modal::note_pty_write(writer);
         }
     }
 }

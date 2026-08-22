@@ -35,7 +35,11 @@ fixtures:
   - file: competing.txt
     scenario: marker on screen plus a LIVE `/model` picker (Enter would set the default model)
     full_static_fingerprint: false
-    note: rejected only because the headline had scrolled off; do not rely on that
+    note: >
+      NON-DISCRIMINATING CONTROL, not coverage. It refuses only because its
+      headline had scrolled off, so it also passes against unfixed code. The
+      corpus contains NO frame carrying a COMPLETE fingerprint beside a LIVE
+      competing operator dialog — the most dangerous shape is a capture gap.
   - file: quoted.txt
     scenario: complete modal text as ordinary quoted transcript, nothing live
     full_static_fingerprint: true

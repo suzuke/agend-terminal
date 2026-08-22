@@ -805,7 +805,9 @@ fn provision_opencode_data_dir(
 /// Extracted from `spawn_agent` so the command-construction logic (arg
 /// enrichment, env filtering, PATH prepend, cwd validation) is isolated
 /// from the PTY plumbing that follows.
-fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option<Backend>)> {
+fn build_command(
+    config: &SpawnConfig,
+) -> anyhow::Result<(CommandBuilder, Option<Backend>, dev_modal::SpawnProvenance)> {
     let SpawnConfig {
         name,
         backend: _,
@@ -889,6 +891,11 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
     let mut cmd = CommandBuilder::new(&resolved_command);
     cmd.args(&enriched_args);
+    // #3314 B1: capture the arming facts from the command we JUST built — the
+    // argv read back off the builder, and the path we resolved for it — before
+    // anything can exec or a config/symlink can move under us. Re-deriving them
+    // after the spawn is what made r1 fail open.
+    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &resolved_command);
 
     // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
     // before any env injection below, or the explicit keys we set would be wiped.
@@ -1245,7 +1252,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // git shim (which checks the var), not inherit a blanket bypass.
     cmd.env_remove("AGEND_GIT_BYPASS");
 
-    Ok((cmd, detected_backend))
+    Ok((cmd, detected_backend, spawn_provenance))
 }
 
 /// Resolve the authoritative registry `InstanceId` for a spawn (#1441).
@@ -1370,7 +1377,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         }
     }
 
-    let (cmd, detected_backend) = build_command(config)?;
+    let (cmd, detected_backend, spawn_provenance) = build_command(config)?;
 
     // #995 Bug 3: emit a warning when spawning a backend whose MCP
     // discovery is incompatible with fleet's `<workdir>/.<vendor>/mcp_config.json`
@@ -1540,8 +1547,9 @@ pub(crate) fn spawn_agent_with_capture_home(
         })
         .unwrap_or_default();
     let dismiss = prepare_dismiss_patterns(&dismiss);
-    // #3314: argv provenance + version-drift gate, both decided at spawn.
-    let dev_modal_armed = dev_modal::armed_for_spawn(detected_backend.as_ref(), *working_dir, name);
+    // #3314 B1: arming is a PURE function of the provenance captured from the
+    // command that was actually built and spawned — never a post-spawn re-read.
+    let dev_modal_armed = dev_modal::armed_for_spawn(&spawn_provenance, name);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);
@@ -2689,14 +2697,6 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its
-/// result directly. `None` -> not registered (Windows; synthetic/test
-/// writer) -- fall through to the thread-per-write mechanism below.
-#[cfg(unix)]
-fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
-    write_actor::write(writer, data.to_vec(), PTY_WRITE_TIMEOUT)
-}
-
 #[cfg(not(unix))]
 fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
     None
@@ -2710,10 +2710,25 @@ pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
 }
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
+    write_with_timeout_guarded(writer, data, None)
+}
+
+/// As [`write_with_timeout`], but the write carries a #3314 barrier re-checked
+/// immediately before the syscall on the registered-writer (actor) path.
+fn write_with_timeout_guarded(
+    writer: &PtyWriter,
+    data: &[u8],
+    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
+) -> std::io::Result<()> {
     // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
     // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
     crate::agent::dev_modal::note_pty_write(writer);
-    if let Some(result) = try_actor_write(writer, data) {
+    if let Some(result) = write_actor::write_guarded(
+        writer,
+        data.to_vec(),
+        std::time::Duration::from_secs(5),
+        barrier,
+    ) {
         return result;
     }
 

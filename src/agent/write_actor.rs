@@ -215,6 +215,11 @@ struct Job {
     data: Vec<u8>,
     offset: usize,
     done: SyncSender<io::Result<()>>,
+    /// #3314: re-checked immediately before the real `write` syscall. Checking
+    /// only at enqueue leaves the whole queue+service delay unguarded, so a
+    /// keystroke decided for one frame can land long after that frame is gone.
+    /// `None` for every other caller — behaviour unchanged for them.
+    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
 }
 
 impl Job {
@@ -486,10 +491,25 @@ fn poll_call_count(writer: &PtyWriter) -> Option<u64> {
 /// background regardless — same as today's spawned thread continuing past
 /// the caller's timeout), `Err(..)` of another kind on a real write error
 /// (e.g. `EPIPE` — the pty is gone).
+/// Unguarded convenience wrapper. Production routes through
+/// [`write_guarded`] so a #3314 barrier can reach the syscall; this remains for
+/// the actor's own tests, which have no barrier to carry.
+#[cfg(test)]
 pub(crate) fn write(
     writer: &PtyWriter,
     data: Vec<u8>,
     timeout: Duration,
+) -> Option<io::Result<()>> {
+    write_guarded(writer, data, timeout, None)
+}
+
+/// As [`write`], but the job carries a #3314 barrier that is re-checked
+/// immediately before the syscall.
+pub(crate) fn write_guarded(
+    writer: &PtyWriter,
+    data: Vec<u8>,
+    timeout: Duration,
+    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
 ) -> Option<io::Result<()>> {
     let key = Arc::as_ptr(writer) as usize;
     let state = writers().lock().get(&key).cloned()?;
@@ -508,6 +528,7 @@ pub(crate) fn write(
             data,
             offset: 0,
             done: tx,
+            barrier,
         });
     }
     // #2620: wake writer_thread if it's parked (queue was empty) so it
@@ -676,8 +697,19 @@ fn writer_thread(key: usize, state: Arc<WriterState>) {
 /// delaying any other writer's enqueue or service.
 fn service_once(state: &WriterState) {
     let (chunk, offset_before) = {
-        let q = state.queue.lock();
+        let mut q = state.queue.lock();
         let Some(job) = q.front() else { return };
+        // #3314: the LAST check before the syscall. Between enqueue and here the
+        // child may have repainted, the generation may have ended, or the
+        // instance may have been deleted — any of which makes this keystroke a
+        // decision about a frame that no longer exists. Drop it rather than
+        // write it. This does not make the check and the syscall atomic (W3);
+        // it closes the queue+service window, which is the wide one.
+        if job.barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+            let job = q.pop_front().expect("front() just returned Some");
+            let _ = job.done.try_send(Ok(()));
+            return;
+        }
         let remaining = job.remaining();
         let n = remaining.len().min(CHUNK_SIZE);
         (remaining[..n].to_vec(), job.offset)
@@ -877,6 +909,47 @@ mod tests {
         );
         let _ = child.kill();
         unregister(&writer);
+    }
+
+    /// #3314 P1-B: a job whose barrier is already invalid is DROPPED at the
+    /// front of the queue instead of being written, and the caller sees the
+    /// normal completion contract rather than an error.
+    ///
+    /// HONEST LIMIT: this asserts the drop path's caller-visible outcome on a
+    /// real registered writer. It does NOT assert byte-level that the fd
+    /// received nothing, because bytes written into a pty master are not
+    /// readable back by us — the child owns the other end. That the drop
+    /// happens BEFORE the syscall is pinned separately by source in
+    /// `agent::dismiss`'s `write_actor_must_carry_the_barrier_to_the_syscall_3314`.
+    #[test]
+    fn a_cancelled_barrier_drops_the_job_3314() {
+        let _lock = TEST_LOCK.lock();
+        let (writer, mut child, _master) = wedged_pty("barrier-3314", 5);
+
+        let gate = crate::agent::dev_modal::DevModalGate::new(true);
+        let barrier = gate.write_barrier();
+        // Something else touched the PTY between enqueue and service.
+        gate.epoch_handle()
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !barrier.still_valid(),
+            "precondition: the barrier is cancelled"
+        );
+
+        let result = write_guarded(
+            &writer,
+            b"cancelled-keystroke".to_vec(),
+            Duration::from_secs(2),
+            Some(barrier),
+        )
+        .expect("a registered writer must resolve to Some");
+        assert!(
+            result.is_ok(),
+            "#3314: a cancelled job completes normally rather than erroring: {result:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
