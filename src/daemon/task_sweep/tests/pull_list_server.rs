@@ -37,6 +37,18 @@ pub(super) struct PullListServer {
     /// not arrived yet and must be waited out.
     pub(super) inject_read_error: Arc<AtomicBool>,
     pub(super) inject_read_would_block: Arc<AtomicBool>,
+    /// #3320: forces the LINUX shape — a BLOCKING accepted socket — on whatever
+    /// platform the test runs on. macOS inherits the listener's non-blocking
+    /// mode and Linux does not, so without this the guard that matters is
+    /// unreachable from a developer machine and only CI can see it fail.
+    pub(super) simulate_blocking_accept: Arc<AtomicBool>,
+    /// #3320: makes the mode normalisation itself fail. Otherwise only a real
+    /// `fcntl` failure reaches that arm, which no test can schedule.
+    pub(super) inject_mode_error: Arc<AtomicBool>,
+    /// #3320: set by the serving thread on its way out, so a test can ask
+    /// whether the loop ENDED without joining it. Joining a parked thread hangs
+    /// the binary instead of reporting the failure.
+    pub(super) exited: Arc<AtomicBool>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -71,6 +83,9 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let inject_write_error = Arc::new(AtomicBool::new(false));
     let inject_read_error = Arc::new(AtomicBool::new(false));
     let inject_read_would_block = Arc::new(AtomicBool::new(false));
+    let simulate_blocking_accept = Arc::new(AtomicBool::new(false));
+    let inject_mode_error = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
@@ -79,6 +94,8 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let inject_write_for_thread = Arc::clone(&inject_write_error);
     let inject_read_for_thread = Arc::clone(&inject_read_error);
     let inject_read_would_block_for_thread = Arc::clone(&inject_read_would_block);
+    let simulate_blocking_for_thread = Arc::clone(&simulate_blocking_accept);
+    let exited_for_thread = Arc::clone(&exited);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
         // used to bound this started at construction, so a caller whose setup
@@ -95,6 +112,10 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
             };
             match accepted {
                 Ok((mut stream, _)) => {
+                    if simulate_blocking_for_thread.load(Ordering::Acquire) {
+                        // The Linux shape, reproduced anywhere.
+                        let _ = stream.set_nonblocking(false);
+                    }
                     // #3320: WAIT for the request instead of answering blind.
                     // macOS really does return `EAGAIN` here — BSD accepted
                     // sockets inherit the listener's non-blocking mode, set
@@ -190,6 +211,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                 }
             }
         }
+        exited_for_thread.store(true, Ordering::Release);
     });
     PullListServer {
         base_url,
@@ -201,6 +223,9 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         inject_write_error,
         inject_read_error,
         inject_read_would_block,
+        simulate_blocking_accept,
+        inject_mode_error,
+        exited,
         thread: Some(thread),
     }
 }
@@ -422,29 +447,80 @@ fn a_would_block_read_is_waited_out_not_answered_blind_3320() {
     );
 }
 
-/// #3320: waiting for a request must not wedge teardown.
+/// #3320: waiting for a request must not wedge teardown — on EITHER platform.
 ///
-/// The wait added for the arm above is unbounded BY TIME on purpose — a clock is
-/// what this branch is removing — so `stop` has to be the thing that ends it.
-/// A client that connects and never speaks is the case that tells the two apart:
-/// `Drop` sets `stop` and JOINS, so a wait that only watched the socket would
-/// hang the test binary rather than fail it, which is worse than the flake it
-/// replaced.
+/// The wait is unbounded by time on purpose (a clock is what this branch
+/// removes), so `stop` has to end it. `stop` is only reachable if `read`
+/// RETURNS, which makes the accepted socket's blocking mode load-bearing: macOS
+/// inherits the listener's non-blocking flag and **Linux does not**, so a
+/// blocking read on a client that never speaks parks forever and `Drop`'s join
+/// waits on a thread that will never finish. CI killed exactly that at 120s.
+///
+/// So this test FORCES the Linux shape everywhere, and it deliberately does not
+/// use `Drop` to observe the outcome: joining a parked thread hangs the binary
+/// instead of reporting the failure, which is the one thing worse than the flake
+/// this branch replaced. It asks the thread whether it ENDED, and on failure
+/// leaks the server rather than joining it.
 #[test]
 fn a_silent_client_does_not_wedge_teardown_3320() {
     let server = pull_list_server("[]".to_string());
+    server
+        .simulate_blocking_accept
+        .store(true, Ordering::Release);
     let addr = server.base_url.trim_start_matches("http://").to_string();
 
     // Connect and say NOTHING, so the stand-in is parked in the read wait.
     let _silent = std::net::TcpStream::connect(&addr).expect("#3320: connect");
-    std::thread::sleep(StdDuration::from_millis(50));
+    std::thread::sleep(StdDuration::from_millis(100));
 
-    let started = Instant::now();
+    // What `Drop` does, minus the join we cannot safely perform yet.
+    server.stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while !server.exited.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(StdDuration::from_millis(10));
+    }
+
+    if !server.exited.load(Ordering::Acquire) {
+        // Leak rather than join: `Drop` joins, and joining a thread parked in a
+        // blocking read hangs the whole binary in place of this message.
+        std::mem::forget(server);
+        panic!(
+            "#3320: the read wait never observed `stop` — the accepted socket's \
+             blocking mode was inherited rather than normalised, so `read` never \
+             returned and `Drop`'s join would have wedged the test binary"
+        );
+    }
+
+    // The thread is gone, so the join in `Drop` is now a formality.
     drop(server);
+}
+
+/// #3320: if the mode normalisation itself fails, say so and stop.
+///
+/// It is the guard the whole read wait rests on. A failure there leaves a socket
+/// whose blocking mode is unknown, which is precisely the state that can park
+/// the read forever — so it must end the exchange with a cause, never carry on
+/// hoping.
+#[test]
+fn accepted_socket_mode_failure_is_reported_not_ignored_3320() {
+    let server = pull_list_server("[\"body-3320\"]".to_string());
+    server.inject_mode_error.store(true, Ordering::Release);
+
+    let _ = get(&server.base_url);
+    std::thread::sleep(StdDuration::from_millis(150));
+
+    let cause = server.thread_error.lock().unwrap().clone();
     assert!(
-        started.elapsed() < StdDuration::from_secs(5),
-        "#3320: teardown must end the read wait through `stop`; it took {:?}",
-        started.elapsed()
+        cause
+            .as_deref()
+            .is_some_and(|c| c.contains("injected mode failure")),
+        "#3320: a failed mode normalisation must be RECORDED — the read wait \
+         cannot be trusted after it; got {cause:?}"
+    );
+    assert_eq!(
+        server.requests.load(Ordering::Acquire),
+        0,
+        "#3320: the exchange ended before service, so nothing may be counted"
     );
 }
 
