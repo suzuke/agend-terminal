@@ -1626,6 +1626,106 @@ WARNING: Loading development channels
         );
     }
 
+    // ── #3314 r2 RED: the four blockers from the exact-head dual review ──────
+    //
+    // All four are wiring/ordering defects that no gate-object test can see, so
+    // they are pinned where they live. Each assertion FAILS on the reviewed head
+    // f17fe148 and is environment-independent — no installed backend, no network,
+    // no timing.
+
+    /// #3314 r2 RED-1 (B1 / P1-A): arming must be a fact about the command we
+    /// ACTUALLY built and spawned, not a re-read afterwards.
+    ///
+    /// `armed_for_spawn` is called ~104 lines AFTER `.spawn_command(cmd)`, and
+    /// inside it both facts are re-derived from mutable sources: `spawn_flags`
+    /// re-does `exists()` + `read_to_string` + parse on the workspace
+    /// mcp-config (backend.rs), and `which::which` is a SECOND, independent path
+    /// resolution that an auto-update symlink flip can move between the two
+    /// reads. Two fail-open paths follow: a generation whose argv never carried
+    /// the flag can be armed, and a generation running an UNVALIDATED binary can
+    /// be armed because the re-resolution saw a newer one.
+    #[test]
+    fn arming_must_not_re_derive_from_mutable_sources_3314() {
+        let src = include_str!("dev_modal.rs");
+        let start = src
+            .find("pub(crate) fn armed_for_spawn(")
+            .expect("armed_for_spawn must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\npub(crate) fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            !body.contains("spawn_flags"),
+            "#3314 B1: arming must not re-read the workspace mcp-config after spawn — \
+             take the argv fact captured from the command that was actually built"
+        );
+        assert!(
+            !body.contains("which::which"),
+            "#3314 B1: arming must not re-resolve the backend path after spawn — \
+             take the binary identity resolved for the command that was actually spawned"
+        );
+    }
+
+    /// #3314 r2 RED-2 (P1-B): the write barrier must be re-checked at the REAL
+    /// syscall. Today it is checked before the actor QUEUE, and
+    /// `write_actor::service_once` performs the raw `libc::write` later without
+    /// it — so a queued CR can outlive the last check. The inline recording-writer
+    /// seam the rendezvous test uses is a TEST path and proves nothing about the
+    /// registered production writer.
+    #[test]
+    fn write_actor_must_carry_the_barrier_to_the_syscall_3314() {
+        let src = include_str!("write_actor.rs");
+        assert!(
+            src.contains("WriteBarrier"),
+            "#3314 P1-B: the write actor must receive the barrier so it can be \
+             re-checked immediately before the real write syscall"
+        );
+    }
+
+    /// #3314 r2 RED-3 (P1-C): two PTY paths bypass the epoch entirely, which
+    /// falsifies the "single chokepoint" claim. VTerm answers terminal queries by
+    /// writing straight through `writer.try_lock()`, and the TUI bridge resizes
+    /// the master directly on a client TAG_RESIZE.
+    #[test]
+    fn direct_pty_paths_must_invalidate_the_epoch_3314() {
+        let vterm = include_str!("../vterm.rs");
+        assert!(
+            vterm.contains("note_pty_write"),
+            "#3314 P1-C: VTerm's terminal-query responses write directly to the \
+             PTY and must invalidate an in-flight startup-modal candidate"
+        );
+        let bridge = include_str!("../daemon/tui_bridge.rs");
+        assert!(
+            bridge.contains("note_pty_resize"),
+            "#3314 P1-C: a TUI client resize repaints the child and must \
+             invalidate an in-flight startup-modal candidate"
+        );
+    }
+
+    /// #3314 r2 RED-4 (P2-D): the one-shot must be spent only AFTER the write is
+    /// successfully submitted. Today `mark_enqueued` runs before the thread spawn
+    /// and before the actor enqueue, so a spawn failure or a full queue leaves the
+    /// generation permanently `Refused(Spent)` with the modal unanswered — the
+    /// exact stranding the rule exists to prevent.
+    #[test]
+    fn one_shot_is_spent_only_after_successful_submission_3314() {
+        let src = include_str!("dismiss.rs");
+        let spend = src
+            .find("dev_gate.mark_enqueued()")
+            .expect("the one-shot spend must exist");
+        let spawn = src
+            .find("std::thread::Builder::new()")
+            .expect("the dismiss writer thread spawn must exist");
+        assert!(
+            spend > spawn,
+            "#3314 P2-D: the one-shot is spent BEFORE the write is submitted; a \
+             failed spawn or a full queue then strands the generation as Spent \
+             with the modal unanswered"
+        );
+    }
+
     /// #3314 REVIEWER RED: the full static fingerprint is NOT a safety
     /// mechanism, and this pins why so nobody later mistakes it for one.
     /// Measured on the real captures: the replayed frame and the quoted frame
