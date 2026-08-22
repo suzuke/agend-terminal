@@ -1752,6 +1752,35 @@ mod tests {
     /// without tripping those) is caught here. The expected column equals the
     /// pre-refactor per-arm literal — reviewer can read it to verify all 6
     /// presets stayed equivalent.
+    /// #3317: the Codex trust-dismiss matcher must NOT exist.
+    ///
+    /// Measured at codex 0.149.0: the "Do you trust the contents of this
+    /// directory?" prompt is still ANSWERABLE (it renders even under
+    /// `--dangerously-bypass-approvals-and-sandbox`), and pressing Enter makes
+    /// codex WRITE `[projects."<workspace>"] trust_level = "trusted"` into the
+    /// operator's `$CODEX_HOME/config.toml`. A working matcher would therefore
+    /// add one permanent entry per instance workspace, forever, with no cleanup
+    /// on delete — exactly the accumulation `722140bd` removed, only authored by
+    /// codex instead of by agend. Fleet tools come from the per-invocation `-c`
+    /// bridge registration instead; trust is not ours to grant.
+    #[test]
+    fn codex_preset_has_no_trust_dismiss_matcher_3317() {
+        let codex = Backend::Codex.preset();
+        assert!(
+            !codex
+                .dismiss_patterns
+                .iter()
+                .any(|dp| dp.label.contains("Do you trust")),
+            "#3317: a codex trust-dismiss would silently re-create per-instance \
+             persistent trust entries in the operator's codex config; patterns={:?}",
+            codex
+                .dismiss_patterns
+                .iter()
+                .map(|dp| dp.label)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn preset_default_merged_fields_byte_identical_w2_5() {
         // (backend, submit_key, inject_prefix, typed_inject, quit_command,

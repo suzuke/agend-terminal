@@ -4331,6 +4331,7 @@ fn codex_managed_tui_resume_targets_the_persisted_thread() {
         &locator,
         &["--model=gpt-5".to_string()],
         crate::backend::SpawnMode::Resume,
+        &[],
     )
     .expect("managed Codex resume argv");
     assert_eq!(
@@ -4355,7 +4356,7 @@ fn codex_managed_tui_resume_falls_back_to_last_thread_in_cwd() {
         None,
     );
     assert_eq!(
-        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume)
+        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume, &[])
             .expect("managed Codex resume fallback argv"),
         vec![
             "--remote",
@@ -4376,7 +4377,7 @@ fn codex_managed_tui_does_not_require_a_precreated_thread() {
         Some("stale-thread".to_string()),
     );
     assert_eq!(
-        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Fresh)
+        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Fresh, &[])
             .expect("TUI-first remote argv"),
         vec![
             "--remote",
@@ -4920,4 +4921,228 @@ fn write_to_pty_surfaces_backpressure_reject_immediately_not_after_full_timeout_
     );
 
     let _ = child.kill();
+}
+
+// ---------------------------------------------------------------------------
+// #3317: per-invocation Codex MCP injection.
+//
+// codex 0.148/0.149 ignore a project-local `.codex/config.toml` until the
+// directory is a TRUSTED project, so a freshly spawned codex instance silently
+// loses every agend MCP tool. The remedy registers the bridge on the child argv
+// with `-c` overrides — the same per-invocation mechanism #1626 already uses for
+// `check_for_update_on_startup` — which bypasses trust entirely and writes
+// nothing to the operator's global `~/.codex/config.toml`.
+//
+// Verified interactively at codex 0.149.0 before implementing: a `-c`-injected
+// server is LAUNCHED by the interactive session, which then issues `initialize`
+// and `tools/list` against it, on Fresh and on `resume --last`.
+// ---------------------------------------------------------------------------
+
+/// Collect a built command's argv as owned strings.
+fn argv_of_3317(cmd: &CommandBuilder) -> Vec<String> {
+    cmd.get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A codex `SpawnConfig` over a scratch home + workspace. `home` is what the
+/// bridge receives as `AGEND_HOME`, so the caller can vary it to pin encoding.
+fn codex_cfg_dirs_3317(tag: &str, home_leaf: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("agend-3317-{tag}-{}", uuid::Uuid::new_v4()));
+    let home = base.join(home_leaf);
+    // The workspace must sit under an allowed root of `home` (spawn-time
+    // `validate_working_directory`), which is where a real instance lives.
+    let workspace = home.join("workspace").join(format!("codex-3317-{tag}"));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    (home, workspace)
+}
+
+fn codex_argv_3317(
+    home: &std::path::Path,
+    workspace: &std::path::Path,
+    name: &str,
+    mode: crate::backend::SpawnMode,
+) -> Vec<String> {
+    let args: Vec<String> = Vec::new();
+    let config = SpawnConfig {
+        name,
+        backend: Some(&Backend::Codex),
+        backend_command: "codex",
+        args: &args,
+        spawn_mode: mode,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: Some(workspace),
+        submit_key: "\r",
+        home: Some(home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, detected) = build_command(&config).expect("build_command codex");
+    assert_eq!(detected, Some(Backend::Codex));
+    argv_of_3317(&cmd)
+}
+
+/// #3317 RED: a Fresh codex spawn must carry the bridge registration on its own
+/// argv. Without it the instance boots with zero fleet tools whenever its
+/// workspace is not a trusted codex project — which is every new instance.
+#[test]
+fn codex_fresh_argv_carries_mcp_bridge_overrides_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("fresh", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3317-fresh",
+        crate::backend::SpawnMode::Fresh,
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a.starts_with("mcp_servers.agend-terminal.command=")),
+        "#3317: fresh codex argv must register the bridge command; argv={argv:?}"
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a.starts_with("mcp_servers.agend-terminal.env.AGEND_HOME=")),
+        "#3317: fresh codex argv must pass AGEND_HOME to the bridge; argv={argv:?}"
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a == "mcp_servers.agend-terminal.env.AGEND_INSTANCE_NAME='codex-3317-fresh'"),
+        "#3317: the bridge needs THIS instance's name to route fleet traffic; argv={argv:?}"
+    );
+    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+}
+
+/// #3317 RED: the overrides must precede any subcommand. `-c` is accepted after
+/// `resume` on 0.149, but the affected boundary includes 0.148, where the
+/// preset's own comment records that `-c` is a global option that must come
+/// first. Placing them ahead of the preset is correct on BOTH versions.
+#[test]
+fn codex_resume_argv_places_mcp_overrides_before_the_resume_subcommand_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("resume", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3317-resume",
+        crate::backend::SpawnMode::Resume,
+    );
+    let first_mcp = argv
+        .iter()
+        .position(|a| a.starts_with("mcp_servers.agend-terminal."))
+        .unwrap_or_else(|| panic!("#3317: resume argv must register the bridge; argv={argv:?}"));
+    let resume_at = argv
+        .iter()
+        .position(|a| a == "resume")
+        .unwrap_or_else(|| panic!("codex resume argv must contain the subcommand; argv={argv:?}"));
+    assert!(
+        first_mcp < resume_at,
+        "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
+         `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
+    );
+    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+}
+
+/// #3317 RED (encoding): an `AGEND_HOME` containing an apostrophe cannot be a
+/// single-line TOML literal, so it must fall back to an escaped basic string.
+/// This is the `toml_string_value` contract, pinned on the argv path — the same
+/// class of bug that produced the Windows-path failures behind `722140bd`.
+#[test]
+fn codex_mcp_overrides_encode_an_apostrophe_home_as_a_basic_string_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("quote", "it's-home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3317-quote",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let entry = argv
+        .iter()
+        .find(|a| a.starts_with("mcp_servers.agend-terminal.env.AGEND_HOME="))
+        .unwrap_or_else(|| panic!("#3317: AGEND_HOME override missing; argv={argv:?}"));
+    let value = entry.split_once('=').expect("key=value").1;
+    assert!(
+        value.starts_with('"') && value.ends_with('"'),
+        "#3317: a home containing `'` must use an escaped BASIC string, not a \
+         literal that cannot represent the apostrophe; value={value}"
+    );
+    assert!(
+        value.contains("it's-home"),
+        "#3317: the apostrophe must survive verbatim inside the basic string; value={value}"
+    );
+    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+}
+
+/// #3317: no cross-backend leakage. Only codex takes `-c` config overrides.
+#[test]
+fn non_codex_backends_get_no_mcp_overrides_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("leak", "home");
+    for (command, backend) in [("claude", Backend::ClaudeCode), ("echo", Backend::Shell)] {
+        let args: Vec<String> = Vec::new();
+        let config = SpawnConfig {
+            name: "codex-3317-leak",
+            backend: Some(&backend),
+            backend_command: command,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: Some(&workspace),
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: None,
+            shutdown: None,
+        };
+        let (cmd, _) = build_command(&config).expect("build_command");
+        let argv = argv_of_3317(&cmd);
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("mcp_servers.agend-terminal")),
+            "#3317: {command} must not receive codex `-c` overrides; argv={argv:?}"
+        );
+    }
+    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+}
+
+/// #3317 RED: the NativeShared remote/attach path assembles its argv separately
+/// (`codex_remote_command_args`) and must inject too, or every attached instance
+/// stays toolless. Placement matches the existing `check_for_update_on_startup`
+/// override: after the endpoint flags, before the `resume` subcommand.
+#[test]
+fn codex_remote_attach_argv_carries_mcp_overrides_before_resume_3317() {
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-3317.sock"),
+        Some("thread-3317".to_string()),
+    );
+    let mcp: Vec<String> = vec![
+        "-c".to_string(),
+        "mcp_servers.agend-terminal.command='/opt/agend-mcp-bridge'".to_string(),
+    ];
+    let argv = codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume, &mcp)
+        .expect("remote argv");
+    let first_mcp = argv
+        .iter()
+        .position(|a| a.starts_with("mcp_servers.agend-terminal."))
+        .unwrap_or_else(|| panic!("#3317: remote argv must register the bridge; argv={argv:?}"));
+    let resume_at = argv
+        .iter()
+        .position(|a| a == "resume")
+        .expect("resume subcommand");
+    assert!(
+        first_mcp < resume_at,
+        "#3317: remote overrides must precede `resume`; argv={argv:?}"
+    );
+    assert_eq!(
+        argv.first().map(String::as_str),
+        Some("--remote"),
+        "#3317: the endpoint flag must stay first; argv={argv:?}"
+    );
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some("--dangerously-bypass-approvals-and-sandbox"),
+        "#3317: bypass stays after the thread, ahead of caller args; argv={argv:?}"
+    );
 }
