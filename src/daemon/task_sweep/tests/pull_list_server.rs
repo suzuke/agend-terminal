@@ -31,6 +31,12 @@ pub(super) struct PullListServer {
     /// #3320: makes the write arm fail. Otherwise only a real socket error
     /// reaches it, which no test can schedule.
     pub(super) inject_write_error: Arc<AtomicBool>,
+    /// #3320: makes the request-read arm fail. TWO seams, because the two
+    /// outcomes must be told apart: a genuine read error ends the exchange and
+    /// has to be reported, while a would-block means only that the request has
+    /// not arrived yet and must be waited out.
+    pub(super) inject_read_error: Arc<AtomicBool>,
+    pub(super) inject_read_would_block: Arc<AtomicBool>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -63,12 +69,16 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let inject_accept_error = Arc::new(AtomicBool::new(false));
     let thread_error = Arc::new(Mutex::new(None));
     let inject_write_error = Arc::new(AtomicBool::new(false));
+    let inject_read_error = Arc::new(AtomicBool::new(false));
+    let inject_read_would_block = Arc::new(AtomicBool::new(false));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
     let inject_for_thread = Arc::clone(&inject_accept_error);
     let thread_error_for_thread = Arc::clone(&thread_error);
     let inject_write_for_thread = Arc::clone(&inject_write_error);
+    let inject_read_for_thread = Arc::clone(&inject_read_error);
+    let inject_read_would_block_for_thread = Arc::clone(&inject_read_would_block);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
         // used to bound this started at construction, so a caller whose setup
@@ -86,7 +96,17 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
             match accepted {
                 Ok((mut stream, _)) => {
                     let mut request = [0_u8; 2048];
-                    let _ = stream.read(&mut request);
+                    let read = if inject_read_for_thread.load(Ordering::Acquire) {
+                        Err(std::io::Error::other("#3320 injected read failure"))
+                    } else if inject_read_would_block_for_thread.load(Ordering::Acquire) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "#3320 injected read would-block",
+                        ))
+                    } else {
+                        stream.read(&mut request)
+                    };
+                    let _ = read;
                     // #3320: record-and-break, never panic. A panic here dies
                     // inside the server thread, and `Drop`'s quiet join discards
                     // it — the dependent test then fails with no cause.
@@ -146,6 +166,8 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         inject_accept_error,
         thread_error,
         inject_write_error,
+        inject_read_error,
+        inject_read_would_block,
         thread: Some(thread),
     }
 }
@@ -273,6 +295,98 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
 
     // And teardown must still be quiet.
     drop(server);
+}
+
+/// #3320 RED-D: a REQUEST-READ failure must be reported, not swallowed.
+///
+/// The accept, body-lock and write arms all record why the loop ended; the read
+/// did not — its `Result` was discarded outright, and the `thread_error` doc
+/// claimed a coverage this arm never had. Found by the secondary review of
+/// `ac9a2372`.
+///
+/// The failure is INJECTED. What is pinned is this branch's behaviour, not the
+/// OS's willingness to fail a read at that instant.
+#[test]
+fn read_side_failure_is_reported_not_swallowed_3320() {
+    let server = pull_list_server("[\"body-3320\"]".to_string());
+    server.inject_read_error.store(true, Ordering::Release);
+
+    // Drive one request so the read arm is entered. What is under test is
+    // whether the failure is VISIBLE afterwards, not what the client received.
+    let _ = get(&server.base_url);
+    std::thread::sleep(StdDuration::from_millis(150));
+
+    let cause = server.thread_error.lock().unwrap().clone();
+    assert!(
+        cause
+            .as_deref()
+            .is_some_and(|c| c.contains("injected read failure")),
+        "#3320: a request-read failure must be RECORDED, so the test that \
+         depended on this server can say why it died; got {cause:?}"
+    );
+
+    // And teardown must still be quiet.
+    drop(server);
+}
+
+/// #3320 RED-E: a would-block read means the request has NOT ARRIVED YET, and
+/// the stand-in must wait for it instead of answering a request it never read.
+///
+/// This is not a hypothetical arm. macOS returns `EAGAIN` here from a REAL
+/// `read`: BSD accepted sockets inherit the listener's non-blocking mode, which
+/// this file sets. The single discarded attempt therefore raced every request —
+/// and losing that race is not harmless, because an unread request means the
+/// close sends an RST instead of a FIN and the client loses the response the
+/// server did write. That is a second, independent producer of the same
+/// `left: Open, right: Done` flake this branch exists to remove, in the arm
+/// nobody was looking at.
+///
+/// It is also the reviewer's Windows concern, answered with a measurement
+/// instead of a guess: whatever Winsock does with inheritance, waiting is
+/// correct on every platform and a stand-in that never waits is wrong on this
+/// one.
+#[test]
+fn a_would_block_read_is_waited_out_not_answered_blind_3320() {
+    let server = pull_list_server("[\"sentinel-3320\"]".to_string());
+    server
+        .inject_read_would_block
+        .store(true, Ordering::Release);
+
+    // The client's request is on the wire, and the stand-in can only see a
+    // would-block. `get` blocks until the response, so it has to run beside us.
+    let base_url = server.base_url.clone();
+    let client = std::thread::spawn(move || get(&base_url));
+    std::thread::sleep(StdDuration::from_millis(150));
+
+    assert_eq!(
+        server.requests.load(Ordering::Acquire),
+        0,
+        "#3320: the request has not been read, so nothing may be counted as \
+         served — answering here is what strands the response behind an RST"
+    );
+
+    // Now let the read succeed: service must RESUME, not have died.
+    server
+        .inject_read_would_block
+        .store(false, Ordering::Release);
+    let served = client.join().expect("#3320: client thread");
+    assert!(
+        served.as_deref().unwrap_or("").contains("sentinel-3320"),
+        "#3320: after the request arrives the stand-in must serve it; got \
+         {served:?}"
+    );
+    assert_eq!(
+        server.requests.load(Ordering::Acquire),
+        1,
+        "#3320: exactly one request should have been served"
+    );
+    let cause = server.thread_error.lock().unwrap().clone();
+    assert!(
+        cause.is_none(),
+        "#3320: waiting for a request is not a death and must not be recorded \
+         as one — a wrong cause is worse than none, because it gets believed; \
+         got {cause:?}"
+    );
 }
 
 /// #3320: the recorder's own two documented properties, pinned.
