@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::Duration as StdDuration;
 
 pub(super) struct PullListServer {
     pub(super) base_url: String,
@@ -22,6 +22,9 @@ pub(super) struct PullListServer {
     /// arm is only entered on a real syscall failure (realistically `EMFILE`
     /// under a parallel run), which no test can schedule.
     pub(super) inject_accept_error: Arc<AtomicBool>,
+    /// Set when the loop ended on a genuine accept failure, so a test can assert
+    /// on it instead of discovering it as an abort.
+    pub(super) accept_error: Arc<Mutex<Option<String>>>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -29,7 +32,11 @@ impl Drop for PullListServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+            // #3320: teardown stays deterministic — we still JOIN, so the thread
+            // is gone before the test returns. But a thread that panicked must
+            // not panic us in turn: that would be a panic during unwind, i.e. an
+            // abort that buries the real failure.
+            let _ = thread.join();
         }
     }
 }
@@ -48,13 +55,21 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let requests = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let inject_accept_error = Arc::new(AtomicBool::new(false));
+    let accept_error = Arc::new(Mutex::new(None));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
     let inject_for_thread = Arc::clone(&inject_accept_error);
+    let accept_error_for_thread = Arc::clone(&accept_error);
     let thread = std::thread::spawn(move || {
-        let deadline = Instant::now() + StdDuration::from_secs(5);
-        while !stop_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+        // #3320: `stop` is the ONLY termination condition. The wall clock that
+        // used to bound this started at construction, so a caller whose setup
+        // ran long lost its server before it ever asked for one. `Drop` sets
+        // `stop` and joins, so every dropped server is reaped; a leaked one
+        // outlives the test binary, which is the right trade for scaffolding —
+        // a leak is a bug to fix, not something to paper over with a timeout
+        // that silently breaks working tests.
+        while !stop_for_thread.load(Ordering::Acquire) {
             let accepted = if inject_for_thread.load(Ordering::Acquire) {
                 Err(std::io::Error::other("#3320 injected accept failure"))
             } else {
@@ -76,7 +91,16 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(StdDuration::from_millis(5));
                 }
-                Err(error) => panic!("pull-list server accept failed: {error}"),
+                // #3320: BREAK, do not panic. A panicking server thread turns
+                // `Drop`'s join into a panic; during a test's own unwind that is
+                // an abort that hides the real assertion. A dead stand-in should
+                // fail the assertion that depended on it, not replace that
+                // failure with an abort. The error is recorded so a test can
+                // still assert it happened.
+                Err(error) => {
+                    *accept_error_for_thread.lock().unwrap() = Some(error.to_string());
+                    break;
+                }
             }
         }
     });
@@ -86,6 +110,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         requests,
         stop,
         inject_accept_error,
+        accept_error,
         thread: Some(thread),
     }
 }
@@ -155,6 +180,15 @@ fn dead_server_thread_does_not_panic_on_drop_3320() {
     // Let the loop reach the injected error.
     std::thread::sleep(StdDuration::from_millis(50));
 
-    // The assertion under test is that this returns rather than panicking.
+    // Without this the test would pass even if the injection did nothing, and a
+    // pin that cannot tell those apart is the exact defect class this branch is
+    // here to remove.
+    assert!(
+        server.accept_error.lock().unwrap().is_some(),
+        "#3320 fixture check: the loop must have OBSERVED the injected accept \
+         failure and recorded it, not simply carried on"
+    );
+
+    // The property under test: this returns rather than panicking.
     drop(server);
 }
