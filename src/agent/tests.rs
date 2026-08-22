@@ -3510,6 +3510,74 @@ fn r8_startup_dialog_still_dismisses_before_latch_off() {
     );
 }
 
+/// #3315 B2 (integration): the unit test above proves the guard's Drop does the
+/// right thing; this one proves the REAL `pty_read_loop` is what arms it, by
+/// making the loop die the way trailing statements cannot survive — a panic out
+/// of `read()`, not EOF. Deterministic: the panic is in the fixture reader.
+///
+/// The normal-exit half is asserted too, because moving teardown into a Drop is
+/// only safe if the ordinary EOF path still tears down exactly as before.
+#[test]
+fn pty_read_loop_ends_the_generation_on_both_exits_3315() {
+    struct PanickingReader;
+    impl Read for PanickingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("injected read-loop unwind (#3315 B2)");
+        }
+    }
+
+    for (label, panicking) in [("EOF", false), ("unwind", true)] {
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        })));
+        let ctx = PtyReadContext {
+            dev_modal_armed: true,
+            name: format!("gen-guard-{label}-3315"),
+            instance_id: crate::types::InstanceId::default(),
+            core: Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+                vterm: VTerm::new(80, 24),
+                subscribers: Vec::new(),
+                state: StateTracker::new(Some(&Backend::ClaudeCode)),
+                health: HealthTracker::new(),
+                api_activity: crate::agent::ApiActivity::default(),
+                observed_status: None,
+            })),
+            pty_writer: Arc::clone(&writer),
+            registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            home: None,
+            crash_tx: None,
+            dismiss_patterns: Vec::new(),
+            shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        };
+        let capture = crate::capture::make_capture_writer(None, "gen-guard-3315", "claude");
+        let ran = std::thread::Builder::new()
+            .name(format!("read-loop-{label}-3315"))
+            .spawn(move || {
+                let mut eof = ChunkReader {
+                    chunks: Vec::new(),
+                    next: 0,
+                };
+                let mut boom = PanickingReader;
+                let reader: &mut dyn Read = if panicking { &mut boom } else { &mut eof };
+                pty_read_loop(reader, &ctx, capture);
+            })
+            .expect("spawn")
+            .join();
+        assert_eq!(
+            ran.is_err(),
+            panicking,
+            "fixture check: the {label} run must exit the way this case intends"
+        );
+        assert!(
+            !crate::agent::dev_modal::epoch_is_armed(&writer),
+            "#3315 B2: `pty_read_loop` must stop tracking the writer on its {label} \
+             exit. A trailing statement covers only the first case; a Drop covers both"
+        );
+    }
+}
+
 /// #1145: write_with_timeout stuck thread must clear WRITE_IN_PROGRESS
 /// guard on completion, even after the caller has timed out. Before the
 /// fix, the guard persisted forever after timeout, permanently blocking

@@ -205,6 +205,14 @@ pub(crate) fn disarm_epoch(writer: &crate::agent::PtyWriter) {
     epochs().lock().remove(&writer_key(writer));
 }
 
+/// Is this writer still tracked? The leak this exists to observe is invisible
+/// from outside — a stale entry keeps counting writes for a dead generation and
+/// is inherited by the next writer allocated at the same address.
+#[cfg(test)]
+pub(crate) fn epoch_is_armed(writer: &crate::agent::PtyWriter) -> bool {
+    epochs().lock().contains_key(&writer_key(writer))
+}
+
 /// Record that bytes were written into this PTY. Cheap and lock-bounded: one
 /// map lookup on a path that is already about to make a syscall.
 pub(crate) fn note_pty_write(writer: &crate::agent::PtyWriter) {
