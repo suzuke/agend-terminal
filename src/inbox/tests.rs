@@ -6189,6 +6189,35 @@ fn a_deferred_channel_message_keeps_its_origin_end_to_end_3324() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// #3324 (N4): the same end-to-end path, carrying a DISCORD origin.
+///
+/// Primary review's N4: every pipeline test drove Telegram, so nothing proved
+/// the plumbing is kind-agnostic rather than Telegram-shaped. The guard keys on
+/// "external", not on one channel, and the typed value is what makes that true.
+#[test]
+fn a_deferred_discord_message_keeps_its_origin_end_to_end_3324() {
+    let home = tmp_home("e2e-defer-origin-discord-3324");
+    mark_composing(&home, "claude-agent");
+    crate::inbox::notify::notify_agent(
+        &home,
+        "claude-agent",
+        &crate::inbox::NotifySource::Channel("bob]", crate::channel::ChannelKind::Discord),
+        "please research this",
+    );
+    let drained = crate::notification_queue::drain(&home, "claude-agent");
+    assert_eq!(
+        drained.len(),
+        1,
+        "#3324: the message must have been deferred behind the draft; got {drained:?}"
+    );
+    assert_eq!(
+        drained[0].channel_origin,
+        Some(crate::channel::ChannelKind::Discord),
+        "#3324 (N4): a deferred Discord message must stay external, and stay DISCORD"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 /// #3324: the drain hands each row's typed origin to the injector.
 ///
 /// Both release branches are covered: `None` (the backlog drain) and

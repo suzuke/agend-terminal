@@ -1178,6 +1178,42 @@ mod tests {
             .map(|p| p.redelivered)
     }
 
+    /// #3324 (N1): a latch file written before this change has no
+    /// `channel_origin` field, and it must load as internal rather than fail
+    /// the whole latch read.
+    ///
+    /// Primary review's N1: the queue's equivalent upgrade is pinned by
+    /// `pre_3324_queue_rows_deserialize_as_internal_3324`, but the LATCH is the
+    /// file that survives a daemon restart mid-flight — the actual upgrade
+    /// scenario — and it was covered only by a reviewer's one-off probe. A
+    /// failure here would not downgrade one wake; `load_latches_unlocked`
+    /// returns `None` on unreadable content, which discards the whole file.
+    #[test]
+    fn pre_3324_durable_latches_deserialize_as_internal_3324() {
+        let latch: DurableLatch = serde_json::from_str(
+            r#"{"agent":"a","row_id":"m-old","text":"old wake",
+                "transport_mode":"ChannelBridge","transport_epoch":7,
+                "rearm_pending":true,"gave_up":true,"rearm_count":0}"#,
+        )
+        .expect("#3324: a pre-change latch must still deserialize");
+        // NOTE on what this can and cannot catch: serde's derive already maps a
+        // missing `Option<T>` to `None`, so the `#[serde(default)]` on the field
+        // is not what makes this pass — removing that attribute leaves this test
+        // green (measured). This is a CONTRACT pin, not an attribute guard: it
+        // fails if the field is ever made required (a compile failure here), if
+        // a custom deserializer starts rejecting absent origins, or if the
+        // record's wire shape drifts — and it documents that absent means
+        // internal, which is the decision, not an accident of the type.
+        assert_eq!(
+            latch.channel_origin, None,
+            "#3324 (N1): an absent field means internal, the classification those latches had"
+        );
+        assert_eq!(
+            latch.transport_epoch, 7,
+            "the rest of the record must survive the upgrade intact"
+        );
+    }
+
     /// #3324: the #2044 re-delivery is the SAME logical delivery as the wake it
     /// verifies, so the origin has to survive both hops it takes — the arm, and
     /// the durable latch a daemon restart reloads it from.

@@ -2007,6 +2007,63 @@ fn the_refusal_omits_message_id_when_the_envelope_has_none_3324() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3324 (N2): the self-kick refusal runs BEFORE the origin guard, and that
+/// ordering is what makes `deliver_self_kick_notification`'s unconditional
+/// `None` safe.
+///
+/// Production composes the self-kick prompt itself, so it has no external
+/// origin by construction and passes `None`. Primary review's N2: the safety of
+/// that `None` therefore rests on `reject_self_kick_reply` refusing every
+/// self-kick reply first — a call order nothing pinned. This seeds the
+/// adversarial combination (a self-kick envelope that DOES carry an external
+/// origin) and asserts the self-kick refusal is the one that fires, so a future
+/// reorder is a test failure rather than a silent change of which guard owns
+/// the case.
+#[test]
+fn the_self_kick_refusal_runs_before_the_origin_guard_3324() {
+    let home = home("self-kick-before-origin-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let mut envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        "[AGEND-RESUME] recover your own state",
+    );
+    envelope.channel_origin = Some(crate::channel::ChannelKind::Telegram);
+    envelope.logical_delivery_id = Some("m-3324-self-kick".to_string());
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    runtime
+        .remember_inbound(
+            delivery_id,
+            &chat_id,
+            Some("agend-terminal"),
+            &envelope.body,
+        )
+        .expect("inbound mapping");
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: it must still be refused; got {response}"
+    );
+    assert!(
+        message.contains("ack_complete"),
+        "#3324 (N2): the SELF-KICK refusal must be the one that fires — it runs \
+         first, which is what lets the self-kick path pass `None` safely; \
+         got {message:?}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_none(),
+        "#3324: and nothing may be recorded as replied"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 /// #3324: the guard must not overreach. A delivery that originated INSIDE AgEnD
 /// is the bridge's own to answer, and refusing it would break every internal
 /// query.
