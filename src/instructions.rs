@@ -312,7 +312,7 @@ pub(crate) fn build_instructions_body(
          - If message has `[user:NAME via telegram]` prefix → use the `reply` MCP tool\n\
          - If message has `[from:AGENT_NAME]` prefix → use `send` (alias `send` also works)\n\
          - If **neither prefix present** (operator typed in TUI directly) → respond with **direct text**, do NOT use any tool\n\n\
-         The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal.\n\n\
+         The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the mcp__agend-terminal__reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal. #3324: name that tool exactly; a ChannelBridge environment also exposes `mcp__agend-claude-channel__reply`, which records an acknowledgement WITHOUT delivering to the channel and refuses external-origin deliveries.\n\n\
          Mixing channels (e.g. telegram reply when operator typed in TUI directly) makes the response appear in the wrong place — the operator-typed TUI input has no associated channel binding, so a `reply` MCP call returns \"no active channel\" error.\n",
     );
 

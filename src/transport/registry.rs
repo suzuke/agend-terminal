@@ -427,6 +427,8 @@ fn envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    // #3324: durable origin, derived from the same header the formatter wrote.
+    envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
     Ok(envelope)
 }
 
@@ -446,6 +448,8 @@ fn self_kick_envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    // #3324: the second envelope path stamps identically — see the first.
+    envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
     Ok(envelope)
 }
 

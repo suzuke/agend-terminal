@@ -566,7 +566,7 @@ pub fn lead_text(agent: &str, channel: &str, msg_id: Option<&str>, armed_at_ms: 
     format!(
         "[reply-ledger] {agent} owes the operator a reply to a {channel} message \
          ({}, received {}) — it was nudged once and the reply is still missing. \
-         Please check it / re-prime it to answer via the reply tool.",
+         Please check it / re-prime it to answer via the mcp__agend-terminal__reply tool.",
         msg_id.unwrap_or("id unknown"),
         format_hhmm(armed_at_ms)
     )
@@ -580,13 +580,15 @@ pub fn nudge_text(channel: &str, msg_id: Option<&str>, gap_d: bool) -> String {
     if gap_d {
         format!(
             "Your reply to {channel} message {id} FAILED to send — the operator \
-             received nothing. Retry it via the reply tool now."
+             received nothing. Retry it via the mcp__agend-terminal__reply tool now \
+             (the ChannelBridge `reply` records an acknowledgement without delivering)."
         )
     } else {
         format!(
             "The {channel} message {id} has not been answered on its channel — \
-             your output went to the TUI only. Send your answer via the reply \
-             tool so the operator receives it."
+             your output went to the TUI only. Send your answer via the \
+             mcp__agend-terminal__reply tool so the operator receives it (the \
+             ChannelBridge `reply` records an acknowledgement without delivering)."
         )
     }
 }

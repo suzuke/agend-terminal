@@ -1377,7 +1377,15 @@ fn bridge_instructions_describe_the_real_envelope_and_the_exact_tool_3324() {
     let locator = test_published_locator(&home, "claude-agent");
     let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
     let response = mcp_message(
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-06-18",
+                "clientInfo":{"name":"claude-code","version":"2.1.80"}
+            }
+        }),
         &runtime,
     )
     .expect("initialize response");
