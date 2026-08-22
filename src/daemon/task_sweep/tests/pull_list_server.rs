@@ -95,6 +95,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let inject_read_for_thread = Arc::clone(&inject_read_error);
     let inject_read_would_block_for_thread = Arc::clone(&inject_read_would_block);
     let simulate_blocking_for_thread = Arc::clone(&simulate_blocking_accept);
+    let inject_mode_error_for_thread = Arc::clone(&inject_mode_error);
     let exited_for_thread = Arc::clone(&exited);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
@@ -115,6 +116,28 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                     if simulate_blocking_for_thread.load(Ordering::Acquire) {
                         // The Linux shape, reproduced anywhere.
                         let _ = stream.set_nonblocking(false);
+                    }
+                    // #3320: NORMALISE the accepted socket, never inherit it.
+                    // The read wait below can only observe `stop` if `read`
+                    // returns, and the mode decides whether it does: macOS
+                    // inherits the listener's non-blocking flag, Linux does not
+                    // (std's `accept4` never asks for `SOCK_NONBLOCK`), and std
+                    // normalises neither. Inheriting means the wait is
+                    // `stop`-bounded on one platform and unbounded on the other.
+                    let normalised = if inject_mode_error_for_thread.load(Ordering::Acquire) {
+                        Err(std::io::Error::other("#3320 injected mode failure"))
+                    } else {
+                        stream.set_nonblocking(true)
+                    };
+                    // Fail CLOSED: after a failed normalisation the socket's mode
+                    // is unknown, and that is precisely the state that can park
+                    // the read forever.
+                    if let Err(error) = normalised {
+                        record_thread_error(
+                            &thread_error_for_thread,
+                            format!("accepted socket mode normalisation failed: {error}"),
+                        );
+                        break;
                     }
                     // #3320: WAIT for the request instead of answering blind.
                     // macOS really does return `EAGAIN` here — BSD accepted
