@@ -16,6 +16,11 @@ thread_local! {
     /// #3320: forces `spawn_dismiss_thread` to fail, so the stranding path is
     /// reachable from a test.
     static FORCE_DISMISS_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #3320: counts how many times the injection above actually fired. An
+    /// assertion that "nothing was written" is TIME-BLIND — the success path
+    /// writes 300ms later — so a test needs positive proof the failure branch
+    /// was the one taken.
+    static FORCED_DISMISS_SPAWN_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -26,6 +31,12 @@ pub(crate) fn set_inline_dismiss_write_for_test(on: bool) {
 #[cfg(test)]
 pub(crate) fn set_force_dismiss_spawn_failure(on: bool) {
     FORCE_DISMISS_SPAWN_FAILURE.with(|f| f.set(on));
+}
+
+/// #3320: how many times the forced spawn-failure seam has fired on this thread.
+#[cfg(test)]
+pub(crate) fn forced_dismiss_spawn_failures() -> u32 {
+    FORCED_DISMISS_SPAWN_FAILURES.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -135,8 +146,16 @@ where
 {
     #[cfg(test)]
     if FORCE_DISMISS_SPAWN_FAILURE.with(std::cell::Cell::get) {
+        FORCED_DISMISS_SPAWN_FAILURES.with(|c| c.set(c.get().saturating_add(1)));
         return Err(std::io::Error::other("#3320 injected spawn failure"));
     }
+    // fire-and-forget: the dismiss-keystroke writer is short-lived — it sleeps
+    // 300ms, re-checks its #3314 barrier, writes at most one keystroke sequence
+    // and exits. Nothing joins it: the caller must return to the read loop
+    // immediately, and the in-flight slot it holds is freed by `InFlightGuard`
+    // on ANY exit including a panic (#1886 follow-up). Extracting this spawn out
+    // of the call site (#3320) moved it away from the rationale that used to sit
+    // above it there, so the rationale travels with the spawn.
     std::thread::Builder::new()
         .name("dismiss-dialog".into())
         .spawn(body)
@@ -1778,6 +1797,7 @@ WARNING: Loading development channels
 
         // 1. The submission FAILS. Nothing is written, and the generation must
         //    keep its answer.
+        let failures_before = forced_dismiss_spawn_failures();
         set_force_dismiss_spawn_failure(true);
         let attempted = try_prepared_dismiss_dialog(
             "agent-3320",
@@ -1792,6 +1812,13 @@ WARNING: Loading development channels
         assert!(
             attempted,
             "fixture check: the pattern must match, so a dismissal is attempted"
+        );
+        assert_eq!(
+            forced_dismiss_spawn_failures(),
+            failures_before + 1,
+            "fixture check: the FAILURE branch must be the one taken. Asserting \
+             only that nothing was written is time-blind — the success path \
+             writes 300ms later, so an immediate emptiness check passes either way"
         );
         assert!(
             bytes.lock().is_empty(),
