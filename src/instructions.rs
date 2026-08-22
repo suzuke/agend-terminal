@@ -1754,11 +1754,32 @@ mod tests {
                 "{backend_cmd} instructions must teach the no-prefix → direct text branch, path={}",
                 instr_path.display()
             );
-            // The reply MCP tool name must appear (operator-hit error
-            // root-cause: agent called `reply` from TUI-direct context).
+            // #3324: the AUTHORITATIVE routing rule must name the EXACT tool.
+            //
+            // This assertion used to accept the bare "`reply` MCP tool", which
+            // is precisely the ambiguity that cost eleven minutes: a
+            // ChannelBridge environment exposes a second tool also called
+            // `reply` that records an acknowledgement and never delivers. The
+            // supplemental hint further down already named the exact tool, but
+            // the document itself says the PREFIX RULE is authoritative — so
+            // the rule line is the one an agent follows, and it is the line
+            // that has to be unambiguous. Scoped to that line on purpose: a
+            // whole-content check passes on the hint alone and would have let
+            // this ship.
+            let routing_rule = content
+                .lines()
+                .find(|line| line.contains("[user:NAME via telegram]") && line.contains("prefix"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{backend_cmd} instructions must carry a telegram prefix routing rule, path={}",
+                        instr_path.display()
+                    )
+                });
             assert!(
-                content.contains("`reply` MCP tool"),
-                "{backend_cmd} instructions must name the `reply` MCP tool explicitly, path={}",
+                routing_rule.contains("mcp__agend-terminal__reply"),
+                "{backend_cmd} instructions must name `mcp__agend-terminal__reply` on the \
+                 AUTHORITATIVE routing rule itself, not only in the hint below it — \
+                 got {routing_rule:?}, path={}",
                 instr_path.display()
             );
         }
