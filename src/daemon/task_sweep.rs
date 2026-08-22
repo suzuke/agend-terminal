@@ -109,8 +109,7 @@ pub struct SweepConfig {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct SweepProvenanceStore {
-    /// Append-only history. Retired entries are retained for audit and are never
-    /// silently deleted or merged.
+    /// Append-only history; retired entries remain for audit.
     #[serde(default)]
     entries: Vec<SweepProvenance>,
     #[serde(default)]
@@ -124,6 +123,9 @@ struct SweepProvenance {
     api_base: String,
     observed_at: String,
     config_generation: u64,
+    /// #3316: first persisted inactive instant; TTL starts at this transition.
+    #[serde(default)]
+    legacy_since: Option<String>,
     #[serde(default)]
     retired_at: Option<String>,
     #[serde(default)]
@@ -300,8 +302,7 @@ fn active_team_claims(home: &Path, cfg: &SweepConfig) -> anyhow::Result<BTreeMap
         resolved.insert(project, repo);
     }
 
-    // Team claims are authoritative for the DEFAULT board. The configured repo
-    // remains the single-project fallback only when no team claims that board.
+    // Team claims are authoritative; cfg.repo is the DEFAULT fallback only when unclaimed.
     if !resolved.contains_key(crate::task_events::DEFAULT_PROJECT) {
         if let Some(repo) = cfg.repo.as_deref().filter(|repo| !repo.trim().is_empty()) {
             let repo = canonical_repo(repo)
@@ -367,6 +368,7 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
                     api_base: api_base.clone(),
                     observed_at: now_string.clone(),
                     config_generation: store.next_generation,
+                    legacy_since: None,
                     retired_at: None,
                     retirement_reason: None,
                 });
@@ -397,7 +399,11 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
             .provenance_acknowledgements
             .iter()
             .any(|ack| ack == &entry_key);
-        let age_elapsed = chrono::DateTime::parse_from_rfc3339(&entry.observed_at)
+        let legacy_since = entry
+            .legacy_since
+            .get_or_insert_with(|| now_string.clone())
+            .clone();
+        let age_elapsed = chrono::DateTime::parse_from_rfc3339(&legacy_since)
             .map(|observed| {
                 now.signed_duration_since(observed.with_timezone(&chrono::Utc))
                     .num_seconds()
@@ -1389,6 +1395,9 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration as StdDuration, Instant};
 
+    #[path = "tests_3316.rs"]
+    mod tests_3316;
+
     fn tmp_home(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1604,67 +1613,6 @@ mod tests {
                 .unwrap();
             assert_eq!(task.status, crate::task_events::TaskStatus::Done);
         }
-        drop(server);
-        fs::remove_dir_all(&home).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn board_a_close_path_failure_does_not_block_board_b_scan_3316() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = tmp_home("board-close-error-isolation");
-        let repo_a = home.join("repo-a");
-        let repo_b = home.join("repo-b");
-        git_repo_with_origin(&repo_a, "https://github.com/org/a.git");
-        git_repo_with_origin(&repo_b, "https://github.com/org/b.git");
-        write_sweep_fleet(
-            &home,
-            &format!(
-                "  teamA:\n    members: [devA]\n    source_repo: {}\n    project_id: board-a\n  teamB:\n    members: [devB]\n    source_repo: {}\n    project_id: board-b\n",
-                repo_a.display(),
-                repo_b.display()
-            ),
-        );
-        let server = pull_list_server("[]".to_string());
-        handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": server.base_url}));
-        resolve_sweep_plan(&home, &load_config(&home)).unwrap();
-        let make_task = |caller: &str| {
-            crate::tasks::handle(
-                &home,
-                caller,
-                &serde_json::json!({
-                    "action": "create",
-                    "title": "board isolation task",
-                    "assignee": caller
-                }),
-            )["id"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
-        let task_a = make_task("devA");
-        let task_b = make_task("devB");
-        let board_a = crate::task_events::board_root(&home, "board-a");
-        let lock_path = board_a.join("task_events.jsonl.lock");
-        let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
-        permissions.set_mode(0o444);
-        fs::set_permissions(&lock_path, permissions).unwrap();
-        server.set_body(pr_json(&format!("Closes {task_a}\nCloses {task_b}")));
-
-        sweep_tick(&home).unwrap();
-
-        let task_a_state = crate::tasks::list_all_at(&home, &board_a)
-            .into_iter()
-            .find(|candidate| candidate.id == task_a)
-            .unwrap();
-        let board_b = crate::task_events::board_root(&home, "board-b");
-        let task_b_state = crate::tasks::list_all_at(&home, &board_b)
-            .into_iter()
-            .find(|candidate| candidate.id == task_b)
-            .unwrap();
-        assert_eq!(task_a_state.status, crate::task_events::TaskStatus::Open);
-        assert_eq!(task_b_state.status, crate::task_events::TaskStatus::Done);
         drop(server);
         fs::remove_dir_all(&home).ok();
     }
@@ -2255,16 +2203,6 @@ mod tests {
         let r3 = handle_task_sweep_config(&home, &serde_json::json!({"dry_run": true}));
         assert_eq!(r3["dry_run"], true);
         assert_eq!(r3["paused"], true);
-        let r4 = handle_task_sweep_config(
-            &home,
-            &serde_json::json!({
-                "acknowledge_provenance": ["board-a|org/repo|https://api.github.com"]
-            }),
-        );
-        assert_eq!(
-            r4["provenance_acknowledgements"],
-            serde_json::json!(["board-a|org/repo|https://api.github.com"])
-        );
         fs::remove_dir_all(&home).ok();
     }
 
