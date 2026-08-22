@@ -95,6 +95,41 @@ fn legacy_transition_with_nonterminal_tasks_never_retires_on_ttl_3316() {
 }
 
 #[test]
+fn review_reactivation_resets_legacy_quiet_period_3316() {
+    let (home, _) = legacy_fixture("legacy-reactivation");
+    resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    set_legacy_since(
+        &home,
+        (chrono::Utc::now() - chrono::Duration::seconds(LEGACY_RETIREMENT_TTL_SECS + 1))
+            .to_rfc3339(),
+    );
+
+    let repo = home.join("legacy-repo");
+    write_sweep_fleet(
+        &home,
+        &format!(
+            "  legacy:\n    members: [devA]\n    source_repo: {}\n    project_id: legacy-board\n",
+            repo.display()
+        ),
+    );
+    let active_plan = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert_eq!(active_plan.boards.len(), 1);
+    assert!(!active_plan.boards[0].legacy_compat);
+    assert!(load_provenance(&home).entries[0].legacy_since.is_none());
+
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  devA:\n    backend: claude\nteams:\n",
+    )
+    .unwrap();
+    let inactive_plan = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert_eq!(inactive_plan.boards.len(), 1);
+    assert!(inactive_plan.boards[0].legacy_compat);
+    assert!(load_provenance(&home).entries[0].retired_at.is_none());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn operator_ack_retires_legacy_mapping_immediately_and_keeps_audit_3316() {
     let (home, key) = legacy_fixture("legacy-operator-ack");
     resolve_sweep_plan(&home, &load_config(&home)).unwrap();
@@ -132,6 +167,24 @@ fn config_tool_acknowledgement_round_trip_3316() {
         result["provenance_acknowledgements"],
         serde_json::json!(["board-a|org/repo|https://api.github.com"])
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn config_tool_round_trip() {
+    let home = tmp_home("config_rt");
+    let r1 = handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "suzuke/agend-terminal"}),
+    );
+    assert_eq!(r1["repo"], "suzuke/agend-terminal");
+    assert!(!r1["paused"].as_bool().unwrap());
+    let r2 = handle_task_sweep_config(&home, &serde_json::json!({"pause": true}));
+    assert!(r2["paused"].as_bool().unwrap());
+    assert_eq!(r2["repo"], "suzuke/agend-terminal");
+    let r3 = handle_task_sweep_config(&home, &serde_json::json!({"dry_run": true}));
+    assert!(r3["dry_run"].as_bool().unwrap());
+    assert!(r3["paused"].as_bool().unwrap());
     fs::remove_dir_all(&home).ok();
 }
 
@@ -173,7 +226,7 @@ fn board_a_close_path_failure_does_not_block_board_b_scan_3316() {
     let task_a = make_task("devA");
     let task_b = make_task("devB");
     let board_a = crate::task_events::board_root(&home, "board-a");
-    let lock_path = board_a.join("task_events.jsonl.lock");
+    let lock_path = crate::task_events::board_event_lock_path(&board_a);
     let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
     permissions.set_mode(0o444);
     fs::set_permissions(&lock_path, permissions).unwrap();

@@ -380,6 +380,14 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
                 });
             }
         } else {
+            if let Some(entry) = store.entries.iter_mut().find(|entry| {
+                entry.retired_at.is_none()
+                    && provenance_key(&entry.project_id, &entry.repo, &entry.api_base) == key
+            }) {
+                // A mapping that becomes active again starts a fresh quiet
+                // period if it later becomes legacy once more.
+                entry.legacy_since = None;
+            }
             boards.push(SweepBoard {
                 project_id: project_id.clone(),
                 repo: repo.clone(),
@@ -2181,29 +2189,6 @@ mod tests {
         assert_eq!(meta.merge_commit_sha.as_deref(), Some("abcdef1234"));
         assert_eq!(meta.author_login, "dev-impl-1");
         assert!(meta.merged); // merged_at non-null
-    }
-
-    /// `task_sweep_config` CLI round-trip (#2547: moved from the MCP tool) —
-    /// operator sets repo, then pauses, then disables dry-run; final state
-    /// matches.
-    #[test]
-    fn config_tool_round_trip() {
-        let home = tmp_home("config_rt");
-        let r1 = handle_task_sweep_config(
-            &home,
-            &serde_json::json!({"repository": "suzuke/agend-terminal"}),
-        );
-        assert_eq!(r1["repo"], "suzuke/agend-terminal");
-        assert_eq!(r1["paused"], false);
-
-        let r2 = handle_task_sweep_config(&home, &serde_json::json!({"pause": true}));
-        assert_eq!(r2["paused"], true);
-        assert_eq!(r2["repo"], "suzuke/agend-terminal");
-
-        let r3 = handle_task_sweep_config(&home, &serde_json::json!({"dry_run": true}));
-        assert_eq!(r3["dry_run"], true);
-        assert_eq!(r3["paused"], true);
-        fs::remove_dir_all(&home).ok();
     }
 
     /// `task_sweep_config` empty-string `repo` disables sweep (sets to

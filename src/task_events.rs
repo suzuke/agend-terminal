@@ -1116,6 +1116,11 @@ fn log_path(board: &Path) -> PathBuf {
     board.join(format!("{LOG_NAME}.jsonl"))
 }
 
+#[cfg(test)]
+pub(crate) fn board_event_lock_path(board: &Path) -> PathBuf {
+    log_path(board).with_extension("jsonl.lock")
+}
+
 fn archive_dir(board: &Path) -> PathBuf {
     board.join("task_events_archive")
 }
