@@ -495,6 +495,15 @@ fn persisted_claude_locator_keeps_channel_mode() {
 enum FakeChannelExit {
     StopRequested,
     AcceptFailed(String),
+    /// #3322: the accepted socket's blocking mode could not be normalised. After
+    /// that the mode is unknown, which is exactly the state that can park a read
+    /// forever, so the stand-in stops instead of serving blind.
+    AcceptedModeFailed(String),
+    /// #3322: a non-transient error while reading the request. It used to be
+    /// swallowed by `unwrap_or(0)`, which also degraded the request to empty and
+    /// answered 404 — a wrong-but-plausible result the caller could not tell
+    /// apart from a real one.
+    RequestReadFailed(String),
 }
 
 /// `WouldBlock` is the nonblocking-accept idle case; `Interrupted` and
@@ -505,6 +514,66 @@ fn accept_error_is_fatal(kind: io::ErrorKind) -> bool {
         kind,
         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
     )
+}
+
+/// #3322: read the WHOLE request before answering it.
+///
+/// The stand-in used to make ONE `read` attempt and answer whatever it got. A
+/// request split across segments then left its body in the receive queue, and
+/// closing a socket with unread data sends an RST instead of a FIN — so the
+/// client loses the response it was already sent (`ECONNRESET`: os error 104 on
+/// Linux, 54 on macOS). That is the observed CI failure.
+///
+/// Bounded by `stop`, never by a clock: a wall-clock bound is what makes a
+/// stand-in die under load. `Ok(None)` means the caller asked us to stop.
+fn drain_request(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+) -> io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if let Some(end) = header_end(&buf) {
+            if buf.len() >= end + content_length(&buf[..end]) {
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+        }
+        let mut chunk = [0_u8; 4096];
+        match stream.read(&mut chunk) {
+            // Peer half-closed: this is all the request there will ever be.
+            Ok(0) => return Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Index just past the `\r\n\r\n` that ends the request headers.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// `Content-Length` from the header block, or 0 when absent (e.g. `GET /health`).
+fn content_length(headers: &[u8]) -> usize {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0)
 }
 
 struct FakeChannel {
@@ -570,9 +639,23 @@ impl FakeChannel {
                             // The Linux shape, reproduced anywhere.
                             let _ = stream.set_nonblocking(false);
                         }
-                        let mut raw = [0_u8; 4096];
-                        let read = stream.read(&mut raw).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&raw[..read]).into_owned();
+                        // #3322: NORMALISE the accepted socket, never inherit it.
+                        // macOS inherits the listener's non-blocking flag and
+                        // Linux does not (std's `accept4` never asks for
+                        // `SOCK_NONBLOCK`), and std normalises neither — so the
+                        // drain below would be `stop`-bounded on one platform
+                        // and unbounded on the other. Fail closed: after a failed
+                        // normalisation the mode is unknown.
+                        if let Err(error) = stream.set_nonblocking(true) {
+                            break FakeChannelExit::AcceptedModeFailed(error.to_string());
+                        }
+                        let request = match drain_request(&mut stream, &thread_stop) {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break FakeChannelExit::StopRequested,
+                            Err(error) => {
+                                break FakeChannelExit::RequestReadFailed(error.to_string())
+                            }
+                        };
                         let path = request.split_whitespace().nth(1).unwrap_or("/");
                         let (status, body) = if path == "/health" {
                             let served = thread_probes.fetch_add(1, Ordering::AcqRel) + 1;
