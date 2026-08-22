@@ -1,4 +1,24 @@
 use super::*;
+use crate::agent::dev_modal::{DevModalGate, GateOutcome, LogicalMs};
+
+// #3314 test seam: perform the dismiss write INLINE instead of on a detached
+// thread with the production 300ms pacing. Every new race/one-shot assertion
+// needs to observe bytes without sleeping — a wall-clock wait is exactly the
+// dependence that let the first draft of the one-shot regression pass against
+// unfixed code. Production is untouched; other backends keep their #468 pacing.
+#[cfg(test)]
+thread_local! {
+    /// THREAD-local, deliberately: the test binary runs cases in parallel, and a
+    /// process-global flag lets one case's teardown disarm another case
+    /// mid-run — which is exactly how the first draft of this seam produced
+    /// three spurious failures.
+    static INLINE_DISMISS_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_inline_dismiss_write_for_test(on: bool) {
+    INLINE_DISMISS_WRITE.with(|f| f.set(on));
+}
 
 /// Try to auto-dismiss dialogs using backend-configurable patterns. Returns true if dismissed.
 /// `screen` is the VTerm-rendered view the user sees — not raw PTY bytes —
@@ -240,12 +260,23 @@ pub fn try_dismiss_dialog(
     let prepared = prepare_dismiss_patterns(dismiss_patterns);
     // Default callers (tests + the `try_dismiss_dialog` seam) get the full
     // startup-window scan.
+    // Default callers (tests + the `try_dismiss_dialog` seam) get the full
+    // startup-window scan with a permanently-armed, never-spent gate, and the
+    // stability window PRE-SATISFIED by observing this same frame once at t=0,
+    // so a single call keeps its historical meaning for the backends that use
+    // this seam. It is therefore NOT a model of production timing: the read
+    // loop supplies a real monotonic clock and a real per-generation gate, and
+    // there a candidate must genuinely persist unmodified across the window.
+    let mut gate = DevModalGate::new(true);
+    let _ = gate.observe(screen, LogicalMs(0));
     try_prepared_dismiss_dialog(
         name,
         screen,
         pty_writer,
         &prepared,
         DismissScanScope::Startup,
+        &mut gate,
+        LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
     )
 }
 
@@ -262,6 +293,8 @@ pub fn try_prepared_dismiss_dialog(
     pty_writer: &PtyWriter,
     dismiss_patterns: &[PreparedDismissPattern],
     scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
 ) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -291,6 +324,26 @@ pub fn try_prepared_dismiss_dialog(
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
             // H2: bounded dismiss — skip if one already in-flight for this agent.
             // Prevents thread accumulation from rapid dialog re-detection.
+            // #3314: a daemon-caused STARTUP modal is gated on facts the daemon
+            // OWNS — this generation's argv, the untouched-frame epoch, and a
+            // per-generation one-shot — never on the frame alone. Recognition is
+            // precision, not safety: a replayed or quoted modal satisfies the
+            // fingerprint just as well as a live one (measured, see the fixtures).
+            // Every other pattern keeps its existing path and pacing untouched.
+            if pattern.rearm_pre_idle {
+                match dev_gate.observe(screen, now) {
+                    GateOutcome::Enqueue => {}
+                    GateOutcome::Hold => return false,
+                    GateOutcome::Refuse(reason) => {
+                        tracing::debug!(
+                            agent = name,
+                            ?reason,
+                            "startup-modal dismiss refused by the generation gate"
+                        );
+                        return false;
+                    }
+                }
+            }
             {
                 let mut inflight = DISMISS_IN_FLIGHT.lock();
                 if inflight.contains(name) {
@@ -301,6 +354,18 @@ pub fn try_prepared_dismiss_dialog(
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();
             let agent = name.to_string();
+            // #3314: spent ONLY here — after the in-flight slot was actually
+            // claimed. A collision returns above without spending, so a lost
+            // attempt can never strand the agent at an unanswered modal.
+            if pattern.rearm_pre_idle {
+                dev_gate.mark_enqueued();
+            }
+            #[cfg(test)]
+            if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
+                let _guard = InFlightGuard(agent.clone());
+                let _ = write_with_timeout(&writer, &keys);
+                return true;
+            }
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
             // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
             // on any exit (incl. panic), armed at thread entry below.
@@ -409,6 +474,25 @@ pub(crate) fn dismiss_scan_armed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pre-#3314-r1 tests exercise the MATCHER, not the generation gate. Give
+    /// them a permanently-armed gate already past the stability window so their
+    /// meaning is unchanged by the new parameters.
+    fn ungated_3314() -> (DevModalGate, LogicalMs) {
+        (
+            DevModalGate::new(true),
+            LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+        )
+    }
+
+    /// As [`ungated_3314`], but with the stability window already satisfied for
+    /// `screen`, for tests that assert the MATCHER's verdict in a single call.
+    /// Production never gets this shortcut — see `try_prepared_dismiss_dialog`.
+    fn ungated_stable_3314(screen: &str) -> (DevModalGate, LogicalMs) {
+        let mut gate = DevModalGate::new(true);
+        let _ = gate.observe(screen, LogicalMs(0));
+        (gate, LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS))
+    }
 
     fn test_writer() -> PtyWriter {
         Arc::new(Mutex::new(Box::new(Vec::<u8>::new())))
@@ -800,6 +884,8 @@ Should we add a dismiss_pattern?
                     &test_writer(),
                     &prepared,
                     DismissScanScope::RearmSettled,
+                    &mut ungated_3314().0,
+                    LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
                 ),
             "#2473: the re-armed (trust-class-only) scan must match the real agy trust modal \
              and fire Enter. Screen:\n{screen}"
@@ -843,7 +929,18 @@ Should we add a dismiss_pattern?
             DismissScanScope::RearmPreIdle,
         ] {
             assert!(
-                !try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, scope),
+                !{
+                    let (mut g, t) = ungated_3314();
+                    try_prepared_dismiss_dialog(
+                        "claude",
+                        &screen,
+                        &test_writer(),
+                        &prepared,
+                        scope,
+                        &mut g,
+                        t,
+                    )
+                },
                 "#2473 r6: `Yes, proceed` (runtime approval) must NOT re-arm past the latch \
                  under {scope:?}. Screen:\n{screen}"
             );
@@ -858,6 +955,8 @@ Should we add a dismiss_pattern?
                 &test_writer(),
                 &prepared,
                 DismissScanScope::Startup,
+                &mut ungated_3314().0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
             ),
             "sanity: in the startup window `Yes, proceed` still matches (gate, not regex, blocks re-arm)"
         );
@@ -958,6 +1057,8 @@ WARNING: Loading development channels
                 &writer,
                 &prepared,
                 DismissScanScope::RearmPreIdle,
+                &mut ungated_stable_3314(DEV_CHANNEL_STARTUP_MODAL_3314).0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
             ),
             "#3314: a dev-channel modal rendered AFTER the startup latch closed must still be \
              dismissed — it is a daemon-CAUSED modal (the daemon passes \
@@ -1004,6 +1105,8 @@ WARNING: Loading development channels
                 &writer,
                 &prepared,
                 DismissScanScope::RearmSettled,
+                &mut ungated_3314().0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
             ),
             "#3314: after the agent has settled, a quoted dev-channel marker must NOT fire — \
              the live modal underneath it is the operator's decision (#2474 r6)"
@@ -1029,6 +1132,8 @@ WARNING: Loading development channels
                 &writer,
                 &prepared,
                 DismissScanScope::RearmSettled,
+                &mut ungated_3314().0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
             ),
             "#3314: a settled agent's re-arm must not fire the dev-channel pattern — after Idle \
              this text is transcript, and the modal that may be live is the operator's"
@@ -1044,6 +1149,8 @@ WARNING: Loading development channels
                 &writer,
                 &prepared,
                 DismissScanScope::Startup,
+                &mut ungated_stable_3314(DEV_CHANNEL_STARTUP_MODAL_3314).0,
+                LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
             ),
             "control: the same screen fires inside the startup window"
         );
@@ -1056,13 +1163,18 @@ WARNING: Loading development channels
         assert_eq!(written.lock().as_slice(), b"\r");
     }
 
-    // ── #3314 r1: real-capture frames, and the byte-count contract ─────────
+    // ── #3314 r1: real-capture frames, generation gate, byte-count contract ──
     //
     // Provenance and the version rules are in
     // tests/fixtures/devchannel-3314/MANIFEST.yaml. These are REAL captures
-    // (the #1450 rule), rendered from live daemon-managed Claude instances on
-    // CLI 2.1.237; every static line the recognizer depends on was separately
+    // (the #1450 rule) rendered from live daemon-managed Claude instances on CLI
+    // 2.1.237; every static line the recognizer depends on was separately
     // confirmed byte-present in the 2.1.238 binary.
+    //
+    // Every assertion below is on BYTES, and none of them sleeps: the harness
+    // drives an injected logical clock and writes inline. Wall-clock waiting is
+    // what let the first draft of the one-shot regression pass against unfixed
+    // code, so it is banned here.
 
     const FRAME_LIVE_MODAL_3314: &str =
         include_str!("../../tests/fixtures/devchannel-3314/live_modal.txt");
@@ -1071,191 +1183,198 @@ WARNING: Loading development channels
         include_str!("../../tests/fixtures/devchannel-3314/competing.txt");
     const FRAME_QUOTED_3314: &str = include_str!("../../tests/fixtures/devchannel-3314/quoted.txt");
 
-    /// Drive one frame through the production matcher and return every byte it
-    /// wrote. Byte counts are the contract: a would-be implementation that
-    /// computes the right verdict but still writes must not pass.
-    fn bytes_written_for_3314(tag: &str, screen: &str, scope: DismissScanScope) -> Vec<u8> {
-        let prepared = claude_prepared_patterns_3314();
-        let (writer, written) = recording_writer_3314();
-        let fired = try_prepared_dismiss_dialog(tag, screen, &writer, &prepared, scope);
-        // The keystroke is written by a detached thread after a delay, so poll
-        // rather than assume; on the refuse path there is nothing to wait for,
-        // which is exactly what the zero-byte assertions must observe.
-        for _ in 0..30 {
-            if !written.lock().is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let out = written.lock().clone();
-        assert_eq!(
-            fired,
-            !out.is_empty(),
-            "#3314: the return value must agree with whether bytes were written (tag {tag})"
-        );
-        out
+    /// One process generation, driven deterministically.
+    struct Generation3314 {
+        gate: DevModalGate,
+        prepared: Vec<PreparedDismissPattern>,
+        writer: PtyWriter,
+        written: Arc<Mutex<Vec<u8>>>,
+        now: u64,
+        tag: String,
     }
 
-    /// #3314 RED-A: the `--continue` replay frame. The modal was ALREADY
-    /// answered in that generation; this marker is replayed transcript. The
-    /// daemon must write nothing. On the pre-fix build it writes one CR — the
-    /// production false dismiss observed at 13:22:33.387 on 2ef791ca.
-    #[test]
-    fn replayed_marker_frame_writes_no_bytes_3314() {
-        let out = bytes_written_for_3314(
-            "3314-red-replay",
-            FRAME_REPLAY_3314,
-            DismissScanScope::Startup,
-        );
-        assert!(
-            out.is_empty(),
-            "#3314: a replayed dev-channel marker must not be auto-answered; wrote {out:?}"
-        );
-    }
-
-    /// #3314 RED-B: the complete modal as ordinary quoted transcript, nothing
-    /// live. Same contract, and this shape is routine in this repo — the text
-    /// lives in issue bodies, PR text and this file.
-    #[test]
-    fn quoted_marker_frame_writes_no_bytes_3314() {
-        let out = bytes_written_for_3314(
-            "3314-red-quoted",
-            FRAME_QUOTED_3314,
-            DismissScanScope::Startup,
-        );
-        assert!(
-            out.is_empty(),
-            "#3314: a quoted dev-channel modal must not be auto-answered; wrote {out:?}"
-        );
-    }
-
-    /// #3314 GUARD (passes before AND after, and I am labelling it honestly
-    /// rather than calling it a RED): the harm frame — marker on screen while a
-    /// LIVE `/model` picker owns the prompt, where Enter would set the
-    /// operator's default model. It does not fire on the pre-fix build only
-    /// because this capture's headline had scrolled off, so the anchored regex
-    /// misses. That is luck, not a rule — see
-    /// `full_static_fingerprint_alone_does_not_separate_live_from_replay_3314`.
-    /// Pinned so a future widening of the matcher cannot silently arm it.
-    #[test]
-    fn competing_live_dialog_frame_writes_no_bytes_3314() {
-        let out = bytes_written_for_3314(
-            "3314-red-competing",
-            FRAME_COMPETING_3314,
-            DismissScanScope::Startup,
-        );
-        assert!(
-            out.is_empty(),
-            "#3314: a frame owned by a different live dialog must not be auto-answered; wrote {out:?}"
-        );
-    }
-
-    /// Wait until the recorded byte stream STOPS growing, then return it.
-    /// The production write is issued by a detached thread after a 300ms delay,
-    /// so "poll until the first byte appears" would observe a single CR even
-    /// when a second one is still in flight — a timing accident, not a result.
-    /// Quiescence (no growth across a window strictly longer than that delay)
-    /// makes the observation deterministic in outcome.
-    fn bytes_after_quiescence_3314(written: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
-        let mut last = written.lock().len();
-        let mut stable_rounds = 0;
-        for _ in 0..40 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let now = written.lock().len();
-            if now == last {
-                stable_rounds += 1;
-                // 600ms of no growth — twice the production write delay.
-                if stable_rounds >= 12 {
-                    break;
-                }
-            } else {
-                stable_rounds = 0;
-                last = now;
+    impl Generation3314 {
+        fn new(tag: &str, armed: bool) -> Self {
+            set_inline_dismiss_write_for_test(true);
+            let (writer, written) = recording_writer_3314();
+            Self {
+                gate: DevModalGate::new(armed),
+                prepared: claude_prepared_patterns_3314(),
+                writer,
+                written,
+                now: 0,
+                tag: tag.to_string(),
             }
         }
-        written.lock().clone()
-    }
 
-    /// #3314 RED-D: per-generation ONE-SHOT. Two successive frames of the real
-    /// live modal within one generation must yield exactly ONE CR in total.
-    /// Pre-fix the matcher is stateless and answers both, which is the shape
-    /// that produced the second and third CRs (+11.25s and +74.02s) in the
-    /// observed Resume generation.
-    #[test]
-    fn one_shot_per_generation_writes_exactly_one_cr_3314() {
-        let prepared = claude_prepared_patterns_3314();
-        let (writer, written) = recording_writer_3314();
-        for _ in 0..2 {
-            let _ = try_prepared_dismiss_dialog(
-                "3314-red-oneshot",
-                FRAME_LIVE_MODAL_3314,
-                &writer,
-                &prepared,
+        /// One rendered frame at the current logical time.
+        fn frame(&mut self, screen: &str) -> bool {
+            let fired = try_prepared_dismiss_dialog(
+                &self.tag,
+                screen,
+                &self.writer,
+                &self.prepared,
                 DismissScanScope::Startup,
+                &mut self.gate,
+                LogicalMs(self.now),
             );
-            // Let the in-flight slot clear so the SECOND call is gated by the
-            // one-shot under test, not by the #1886 bounded-dismiss guard.
-            let _ = bytes_after_quiescence_3314(&written);
-            DISMISS_IN_FLIGHT.lock().remove("3314-red-oneshot");
+            DISMISS_IN_FLIGHT.lock().remove(&self.tag);
+            fired
         }
-        let out = bytes_after_quiescence_3314(&written);
-        assert_eq!(
-            out.as_slice(),
-            b"\r",
-            "#3314: a generation may answer this modal at most once; wrote {out:?}"
-        );
+
+        /// The production shape: a candidate is seen, stays untouched, and is
+        /// still identical once the stability window has elapsed.
+        fn stable_frame(&mut self, screen: &str) -> bool {
+            self.frame(screen);
+            self.now += crate::agent::dev_modal::MIN_STABLE_MS;
+            self.frame(screen)
+        }
+
+        fn note_activity(&mut self) {
+            self.gate.note_pty_activity();
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.written.lock().clone()
+        }
     }
 
-    /// #3314 GUARD (passes before and after): the real live modal must still be
-    /// answered, with exactly one CR. Without this the other three tests are
-    /// trivially satisfiable by never dismissing anything.
+    impl Drop for Generation3314 {
+        fn drop(&mut self) {
+            set_inline_dismiss_write_for_test(false);
+        }
+    }
+
+    /// #3314: the live modal is answered exactly once. Without this the negative
+    /// tests are trivially satisfiable by never dismissing anything.
     #[test]
     fn live_modal_frame_writes_exactly_one_cr_3314() {
-        let out = bytes_written_for_3314(
-            "3314-red-live",
-            FRAME_LIVE_MODAL_3314,
-            DismissScanScope::Startup,
-        );
+        let mut gen = Generation3314::new("3314-live", true);
+        assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+    }
+
+    /// #3314: a candidate must be STABLE before it is answered. One sighting is
+    /// not enough — deterministic, because the clock is injected.
+    #[test]
+    fn single_sighting_is_not_stable_enough_to_answer_3314() {
+        let mut gen = Generation3314::new("3314-unstable", true);
+        assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+        assert!(gen.bytes().is_empty(), "one sighting must write nothing");
+    }
+
+    /// #3314: the observed production failure. The generation answers the LIVE
+    /// modal, and the replayed marker that follows must add nothing. On 2ef791ca
+    /// this generation sent the correct CR at +0.80s and stale ones at +11.25s
+    /// and +74.02s.
+    #[test]
+    fn replay_after_the_first_cr_adds_no_bytes_3314() {
+        let mut gen = Generation3314::new("3314-replay", true);
+        assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+        assert!(!gen.stable_frame(FRAME_REPLAY_3314));
+        assert!(!gen.stable_frame(FRAME_REPLAY_3314));
         assert_eq!(
-            out.as_slice(),
+            gen.bytes().as_slice(),
             b"\r",
-            "#3314: the live dev-channel modal must still be answered with exactly one CR"
+            "#3314: a replayed modal after the first CR must add nothing"
         );
     }
 
-    /// #3314 REVIEWER RED: the FULL static fingerprint is not a safety
+    /// #3314: same contract for a quoted transcript, which is routine in this
+    /// repo — the modal text lives in issue bodies, PR text and this file.
+    #[test]
+    fn quoted_transcript_after_the_first_cr_adds_no_bytes_3314() {
+        let mut gen = Generation3314::new("3314-quoted", true);
+        assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert!(!gen.stable_frame(FRAME_QUOTED_3314));
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+    }
+
+    /// #3314: resize/teardown-shaped repaints after the first CR add nothing.
+    /// The one-shot is never reset, so there is no path back.
+    #[test]
+    fn repaints_after_the_first_cr_add_no_bytes_3314() {
+        let mut gen = Generation3314::new("3314-repaint", true);
+        assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        for _ in 0..5 {
+            gen.note_activity(); // attach / resize / any writer
+            assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        }
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+    }
+
+    /// #3314 R1: a generation whose argv never carried the flag has no such
+    /// modal, so a marker on its screen is someone else's text. Zero bytes, and
+    /// this holds in the STARTUP window too.
+    #[test]
+    fn unarmed_generation_writes_no_bytes_3314() {
+        let mut gen = Generation3314::new("3314-unarmed", false);
+        assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert!(gen.bytes().is_empty());
+    }
+
+    /// #3314 epoch: any writer touching the PTY invalidates the candidate, so
+    /// the stability window restarts rather than completing across the write.
+    #[test]
+    fn pty_activity_invalidates_the_candidate_3314() {
+        let mut gen = Generation3314::new("3314-epoch", true);
+        assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+        gen.note_activity();
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        assert!(
+            !gen.frame(FRAME_LIVE_MODAL_3314),
+            "#3314: a candidate touched by a writer must restart, not complete"
+        );
+        assert!(gen.bytes().is_empty());
+        // Untouched from here, it becomes answerable again.
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        assert!(gen.frame(FRAME_LIVE_MODAL_3314));
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+    }
+
+    /// #3314: the harm frame — marker on screen while a LIVE `/model` picker
+    /// owns the prompt, where Enter would set the operator's default model.
+    /// Rejected because it does not carry the complete modal.
+    #[test]
+    fn competing_live_dialog_frame_writes_no_bytes_3314() {
+        let mut gen = Generation3314::new("3314-competing", true);
+        assert!(!gen.stable_frame(FRAME_COMPETING_3314));
+        assert!(gen.bytes().is_empty());
+    }
+
+    /// #3314: a bare marker line is not a modal.
+    #[test]
+    fn bare_marker_line_is_not_a_complete_modal_3314() {
+        let mut gen = Generation3314::new("3314-bare", true);
+        assert!(
+            !gen.stable_frame("  WARNING: Loading development channels\n\n  ❯ 1. Yes\n    2. No\n")
+        );
+        assert!(gen.bytes().is_empty());
+    }
+
+    /// #3314 REVIEWER RED: the full static fingerprint is NOT a safety
     /// mechanism, and this pins why so nobody later mistakes it for one.
-    /// Measured against the real captures: the replayed frame and the quoted
-    /// frame BOTH satisfy every static line of the modal, in order. Only the
-    /// competing frame fails, and only because its headline had scrolled off.
-    /// Safety therefore has to come from the launch/epoch/one-shot gates.
+    /// Measured on the real captures: the replayed frame and the quoted frame
+    /// BOTH satisfy every static line, in order. Only the competing frame fails,
+    /// and only because its headline had scrolled off. Safety therefore has to
+    /// come from the argv / epoch / one-shot gates, which is what the tests
+    /// above exercise.
     #[test]
     fn full_static_fingerprint_alone_does_not_separate_live_from_replay_3314() {
-        const STATIC_LINES: &[&str] = &[
-            "WARNING: Loading development channels",
-            "is for local channel development",
-            "Do not use this option to run channels",
-            "Please use --channels to run a list of approved channels",
-            "Channels:",
-            "I am using this for local development",
-            "Enter to confirm",
-        ];
-        let complete = |screen: &str| STATIC_LINES.iter().all(|line| screen.contains(line));
+        use crate::agent::dev_modal::complete_modal_digest;
+        assert!(complete_modal_digest(FRAME_LIVE_MODAL_3314).is_some());
         assert!(
-            complete(FRAME_LIVE_MODAL_3314),
-            "the live modal is complete"
+            complete_modal_digest(FRAME_REPLAY_3314).is_some(),
+            "#3314: a REPLAYED modal satisfies the fingerprint — it cannot reject it"
         );
         assert!(
-            complete(FRAME_REPLAY_3314),
-            "#3314: a REPLAYED modal satisfies the full fingerprint — the fingerprint cannot reject it"
+            complete_modal_digest(FRAME_QUOTED_3314).is_some(),
+            "#3314: a QUOTED modal satisfies the fingerprint too"
         );
         assert!(
-            complete(FRAME_QUOTED_3314),
-            "#3314: a QUOTED modal satisfies the full fingerprint too"
-        );
-        assert!(
-            !complete(FRAME_COMPETING_3314),
-            "#3314: the competing frame fails only because its headline scrolled off — luck, not a rule"
+            complete_modal_digest(FRAME_COMPETING_3314).is_none(),
+            "#3314: the competing frame fails only because its headline scrolled off"
         );
     }
 

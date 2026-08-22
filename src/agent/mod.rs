@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod dev_modal;
 mod dismiss;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
@@ -1539,6 +1540,21 @@ pub(crate) fn spawn_agent_with_capture_home(
         })
         .unwrap_or_default();
     let dismiss = prepare_dismiss_patterns(&dismiss);
+    // #3314 R1 (argv provenance): did THIS generation's launch actually carry
+    // `--dangerously-load-development-channels`? Computed from the same
+    // `spawn_flags` that produced the argv a moment ago (backend.rs adds the flag
+    // only when the workspace mcp-config declares the channel server), so it is a
+    // fact about what we launched — not a decision-time re-read, and with no
+    // forgery surface, unlike anything on the screen.
+    let dev_modal_armed = detected_backend
+        .as_ref()
+        .zip(*working_dir)
+        .map(|(b, wd)| {
+            b.spawn_flags(wd)
+                .iter()
+                .any(|flag| flag == "--dangerously-load-development-channels")
+        })
+        .unwrap_or(false);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);
@@ -1556,6 +1572,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         home: home_for_reaper,
         crash_tx: crash_tx_for_reaper,
         dismiss_patterns: dismiss,
+        dev_modal_armed,
         shutdown: shutdown_for_reaper,
         deleted: deleted_for_reaper,
         generation,
@@ -2012,6 +2029,9 @@ struct PtyReadContext {
     home: Option<std::path::PathBuf>,
     crash_tx: Option<CrashChannel>,
     dismiss_patterns: Vec<PreparedDismissPattern>,
+    /// #3314: this generation's argv actually carried
+    /// `--dangerously-load-development-channels`.
+    dev_modal_armed: bool,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
     generation: crash_disposition::SpawnGeneration,
@@ -2075,6 +2095,7 @@ fn pty_read_loop(
         home,
         crash_tx,
         dismiss_patterns,
+        dev_modal_armed,
         shutdown,
         deleted,
         generation,
@@ -2082,6 +2103,14 @@ fn pty_read_loop(
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
+    // #3314: per-generation startup-modal gate. A plain local, so it is
+    // generation-scoped BY CONSTRUCTION — no store keyed by agent name, nothing
+    // to evict, and no rollover race. It dies with this read loop.
+    let mut dev_modal_gate = crate::agent::dev_modal::DevModalGate::new(*dev_modal_armed);
+    // Monotonic base for the gate's stability window. The gate itself never
+    // reads a clock — time is supplied here so every stability test is
+    // deterministic instead of timing dependent.
+    let dev_modal_clock = std::time::Instant::now();
     // #3314: has the agent reached Idle at least once? That is the point after
     // which a daemon-caused STARTUP modal can no longer legitimately appear, so
     // the post-latch re-arm narrows to workspace-trust only. See
@@ -2201,10 +2230,19 @@ fn pty_read_loop(
                         // modals, which is the window a fresh spawn's dev-channel
                         // modal falls into.
                         dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle),
+                        &mut dev_modal_gate,
+                        crate::agent::dev_modal::LogicalMs(
+                            dev_modal_clock.elapsed().as_millis() as u64
+                        ),
                     )
                 {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                    // #3314: our own keystroke — including the trust-dialog CR that
+                    // precedes the dev modal on a fresh spawn — is a write into this
+                    // PTY, so any candidate observed before it is no longer a frame
+                    // nobody has touched.
+                    dev_modal_gate.note_pty_activity();
                 }
                 if dismiss_latch_off {
                     dismiss_scan_enabled = false;

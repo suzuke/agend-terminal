@@ -3034,6 +3034,7 @@ fn pty_read_error_triggers_cleanup() {
     );
 
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: agent_name.to_string(),
         instance_id,
         core,
@@ -3182,6 +3183,7 @@ fn run_pty_close_capturing_crash(
     let (tx, rx) = crossbeam_channel::unbounded();
     let tx_guard = tx.clone();
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: "rank4-guard".to_string(),
         instance_id: id,
         core,
@@ -3407,6 +3409,7 @@ fn run_pty_read_loop_for_r8(
         observed_status: None,
     }));
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: "r8-dismiss-test".to_string(),
         instance_id: crate::types::InstanceId::default(),
         core,
