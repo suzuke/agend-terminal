@@ -511,17 +511,19 @@ fn run_app(
     let (app_externals, app_configs, app_cycle) =
         build_app_maintenance(&home, attached_mode, owner_services, &daemon_binary_stale);
     log_pre_render_milestone(size_debug, restore_start, attached_mode);
-    loop {
+    let loop_result: Result<()> = loop {
         if term_requested_logged() || state.poll_restart(&deps) == LoopFlow::Break {
-            break;
+            break Ok(());
         }
         state.pre_select(terminal, &deps);
-        state.render_frame(terminal, &deps)?;
+        if let Err(error) = state.render_frame(terminal, &deps) {
+            break Err(error);
+        }
         crossbeam_channel::select! {
             recv(app_restart_rx) -> req => state.handle_restart_request(req, &deps),
             recv(event_rx) -> ev => {
                 if state.handle_crossterm_event(ev, terminal, &deps) == LoopFlow::Break {
-                    break;
+                    break Ok(());
                 }
             }
             recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
@@ -532,7 +534,7 @@ fn run_app(
             }
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
-    }
+    };
     // Teardown gating rationale is documented on `app_teardown`.
     app_teardown(
         &home,
@@ -541,6 +543,7 @@ fn run_app(
         attached_mode,
         attach_workers,
     );
+    loop_result?;
     Ok(state.restart.restart_outcome)
 }
 
@@ -1012,6 +1015,10 @@ fn app_teardown(
     attached_mode: bool,
     attach_workers: Vec<std::thread::JoinHandle<()>>,
 ) {
+    // The event loop has stopped, so this final batch may wait for a metadata
+    // lock. Periodic UI flushing uses only the nonblocking path above; placing
+    // this before every other teardown side effect also covers render errors.
+    notification_queue::flush_pending_activity_at_teardown(home);
     session::save_session(home, layout);
     if !attached_mode {
         // Sync fleet.yaml to match current state (Owned-only — daemon owns
@@ -2381,6 +2388,40 @@ mod tests {
              silent-drop root fix). No call to 'register_event_subscribers(' \
              found in the production region of src/app/mod.rs"
         );
+    }
+
+    #[test]
+    fn activity_flush_is_wired_to_both_producers_and_render_error_teardown_3321() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        for function in ["fn write_to_focused", "fn write_to_pane("] {
+            let start = prod.find(function).expect("activity producer must exist");
+            let tail = &prod[start..];
+            let end = tail.find("\nfn ").unwrap_or(tail.len());
+            let body = &tail[..end];
+            assert!(
+                body.contains("record_input_activity("),
+                "{function} must record composing input"
+            );
+            assert!(
+                body.contains("record_submit_activity("),
+                "{function} must record submit activity"
+            );
+        }
+        let render = prod
+            .find("if let Err(error) = state.render_frame(terminal, &deps)")
+            .expect("render errors must be captured before teardown");
+        let teardown_flush = prod
+            .find("notification_queue::flush_pending_activity_at_teardown(home);")
+            .expect("teardown must flush the remaining activity pair");
+        assert!(
+            teardown_flush > render,
+            "render errors must reach teardown before they are returned"
+        );
+        assert!(prod.contains("let loop_result: Result<()> = loop"));
+        assert!(prod.contains("loop_result?;"));
     }
 
     #[test]

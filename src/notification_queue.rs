@@ -49,72 +49,138 @@ fn draining_path(home: &Path, agent_name: &str) -> PathBuf {
     queue_path(home, agent_name).with_extension("draining")
 }
 
-/// #2965: in-memory buffer for coalesced input-activity timestamps.
-/// Drained by `flush_pending_input_activity` at the ~1s `sync_badges` cadence.
-static PENDING_INPUT: std::sync::Mutex<Vec<(PathBuf, String, i64)>> =
-    std::sync::Mutex::new(Vec::new());
+/// #3321: latest-wins in-memory activity pair. Both producers update this
+/// buffer; the periodic flush drains one pair into one metadata RMW.
+#[derive(Debug, Clone)]
+struct PendingActivity {
+    home: PathBuf,
+    agent: String,
+    input_ms: Option<i64>,
+    submit_ms: Option<i64>,
+}
 
-pub fn record_input_activity(home: &Path, agent_name: &str) {
-    let ts = chrono::Utc::now().timestamp_millis();
-    if let Ok(mut pending) = PENDING_INPUT.lock() {
-        if let Some(entry) = pending
-            .iter_mut()
-            .find(|(h, a, _)| h.as_path() == home && a == agent_name)
-        {
-            entry.2 = ts;
-        } else {
-            pending.push((home.to_path_buf(), agent_name.to_owned(), ts));
-        }
+static PENDING_ACTIVITY: std::sync::Mutex<Vec<PendingActivity>> = std::sync::Mutex::new(Vec::new());
+
+fn merge_activity(target: &mut PendingActivity, source: &PendingActivity) {
+    if source.home != target.home || source.agent != target.agent {
+        return;
+    }
+    if source.input_ms > target.input_ms {
+        target.input_ms = source.input_ms;
+    }
+    if source.submit_ms > target.submit_ms {
+        target.submit_ms = source.submit_ms;
     }
 }
 
-/// #2965: flush any in-memory pending input-activity timestamps to disk.
-/// Called from the ~1s `sync_badges` cadence so keystrokes coalesce into
-/// at most one durable metadata write per window instead of one per keystroke.
+fn record_activity(home: &Path, agent_name: &str, input: bool) {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let mut pending = PENDING_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = pending
+        .iter_mut()
+        .find(|entry| entry.home.as_path() == home && entry.agent == agent_name)
+    {
+        if input {
+            entry.input_ms = Some(entry.input_ms.unwrap_or(0).max(timestamp));
+        } else {
+            entry.submit_ms = Some(entry.submit_ms.unwrap_or(0).max(timestamp));
+        }
+    } else {
+        pending.push(PendingActivity {
+            home: home.to_path_buf(),
+            agent: agent_name.to_owned(),
+            input_ms: input.then_some(timestamp),
+            submit_ms: (!input).then_some(timestamp),
+        });
+    }
+}
+
+pub fn record_input_activity(home: &Path, agent_name: &str) {
+    record_activity(home, agent_name, true);
+}
+
+fn take_pending_activity(home: &Path) -> Vec<PendingActivity> {
+    let mut pending = PENDING_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (drained, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+        .into_iter()
+        .partition(|entry| entry.home.as_path() == home);
+    *pending = kept;
+    drained
+}
+
+fn activity_values(entry: &PendingActivity) -> Vec<(&str, serde_json::Value)> {
+    let mut values = Vec::with_capacity(2);
+    if let Some(timestamp) = entry.input_ms {
+        values.push((COMPOSE_METADATA_KEY, json!(timestamp)));
+    }
+    if let Some(timestamp) = entry.submit_ms {
+        values.push((SUBMIT_METADATA_KEY, json!(timestamp)));
+    }
+    values
+}
+
+fn requeue_activity(entry: PendingActivity) {
+    let mut pending = PENDING_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = pending
+        .iter_mut()
+        .find(|existing| existing.home == entry.home && existing.agent == entry.agent)
+    {
+        merge_activity(existing, &entry);
+    } else {
+        pending.push(entry);
+    }
+}
+
+/// #3321: flush pending activity without waiting on an instance metadata lock.
+/// Called from the ~1s `sync_badges` cadence. Contention and persistence
+/// errors requeue the drained latest-wins pair; the input/render loop never
+/// falls back to a blocking metadata write.
 pub fn flush_pending_input_activity(home: &Path) {
-    let to_flush = {
-        let mut pending = match PENDING_INPUT.lock() {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let mut kept = Vec::new();
-        let mut flushed = Vec::new();
-        for entry in std::mem::take(&mut *pending) {
-            if entry.0.as_path() == home {
-                flushed.push(entry);
-            } else {
-                kept.push(entry);
+    for entry in take_pending_activity(home) {
+        let values = activity_values(&entry);
+        match agent_ops::try_save_metadata_batch(home, &entry.agent, &values) {
+            agent_ops::TryMetadataBatchOutcome::Applied => {}
+            agent_ops::TryMetadataBatchOutcome::Contended
+            | agent_ops::TryMetadataBatchOutcome::Failed => {
+                requeue_activity(entry);
             }
         }
-        *pending = kept;
-        flushed
-    };
-    for (_, agent, ts) in to_flush {
-        agent_ops::save_metadata(home, &agent, COMPOSE_METADATA_KEY, json!(ts));
     }
 }
 
 #[cfg(test)]
 pub(crate) fn pending_input_count_for(home: &Path) -> usize {
-    PENDING_INPUT
+    PENDING_ACTIVITY
         .lock()
-        .map(|p| p.iter().filter(|e| e.0 == home).count())
+        .map(|pending| pending.iter().filter(|entry| entry.home == home).count())
         .unwrap_or(0)
 }
 
 /// Sprint 54 P2-3: record a submit-key keystroke (e.g. claude `\r`).
 /// Caller (`app::write_to_focused`) is responsible for the backend
-/// allowlist + submit-key match — this helper only persists the
-/// timestamp. The daemon supervisor tick reads it via
-/// `last_submit_at_ms` and compares against `last_input_at_ms` for
-/// the typed-but-not-submitted detection.
+/// allowlist + submit-key match — this helper only records the timestamp in
+/// the same pending pair as input activity. The daemon supervisor tick reads
+/// it via `last_submit_at_ms` and compares against `last_input_at_ms` for the
+/// typed-but-not-submitted detection.
 pub fn record_submit_activity(home: &Path, agent_name: &str) {
-    agent_ops::save_metadata(
-        home,
-        agent_name,
-        SUBMIT_METADATA_KEY,
-        json!(chrono::Utc::now().timestamp_millis()),
-    );
+    record_activity(home, agent_name, false);
+}
+
+/// Flush the remaining activity after the event loop has stopped. This is the
+/// only blocking activity flush: normal and render-error teardown are no
+/// longer latency-sensitive UI paths, so a final locked batch preserves the
+/// last pair before the process exits.
+pub fn flush_pending_activity_at_teardown(home: &Path) {
+    for entry in take_pending_activity(home) {
+        let values = activity_values(&entry);
+        agent_ops::save_metadata_batch(home, &entry.agent, &values);
+    }
 }
 
 /// Sprint 54 P2-3: read the last input/submit timestamps. Returns
@@ -942,6 +1008,25 @@ mod tests {
         dir
     }
 
+    fn hold_metadata_lock(
+        home: &Path,
+    ) -> (
+        crossbeam_channel::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let lock_path = agent_ops::metadata_path_resolved(home, "agent1").with_extension("lock");
+        let (locked_tx, locked_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = std::thread::spawn(move || {
+            let guard = crate::store::acquire_file_lock(&lock_path).unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        locked_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
     /// Retry-accumulate `drain` to absorb #2028's transient `Unavailable→empty`.
     /// `drain()` is contractually allowed to return an empty vec when
     /// `try_acquire_file_lock` hits a transient open/lock hiccup under heavy
@@ -1392,8 +1477,8 @@ mod tests {
 
     /// Sprint 54 P2-3: round-trip both timestamps; ensure
     /// `read_input_submit_timestamps` returns paired values and
-    /// `record_submit_activity` writes a value strictly newer than the
-    /// preceding `record_input_activity` call.
+    /// `record_submit_activity` records a value strictly newer than the
+    /// preceding `record_input_activity` call and the pair flushes together.
     #[test]
     fn record_and_read_input_submit_timestamps_round_trip() {
         let home = tmp_home("ts_round_trip");
@@ -1404,6 +1489,7 @@ mod tests {
         flush_pending_input_activity(&home);
         std::thread::sleep(Duration::from_millis(2));
         record_submit_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
         let (typed1, submit1) = read_input_submit_timestamps(&home, "agent1");
         assert!(typed1 > 0, "typed timestamp must be set after record");
         assert!(submit1 > 0, "submit timestamp must be set after record");
@@ -2050,19 +2136,19 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
-    /// #2965: submit remains immediately durable and the ordering
-    /// (input < submit) produces no false live-draft after flush.
+    /// #3321: submit joins input in the pending latest-wins pair and the
+    /// ordering (input < submit) produces no false live-draft after flush.
     #[test]
     fn submit_immediate_no_false_draft_after_flush() {
         let home = tmp_home("submit_order");
         std::fs::create_dir_all(home.join("metadata")).unwrap();
         record_input_activity(&home, "agent1");
         record_submit_activity(&home, "agent1");
-        // Submit is on disk already; input is still pending.
+        // Both activity fields stay in memory until the batch flush.
         let (typed_pre, submit_pre) = read_input_submit_timestamps(&home, "agent1");
         assert_eq!(typed_pre, 0, "input must still be pending (not flushed)");
-        assert!(submit_pre > 0, "submit must be immediately durable");
-        // Now flush input.
+        assert_eq!(submit_pre, 0, "submit must stay pending with input");
+        // Now flush the pair.
         flush_pending_input_activity(&home);
         let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
         assert!(
@@ -2075,6 +2161,172 @@ mod tests {
             DraftState::Drafting,
             "after submit, draft state must not be Drafting"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #3321 RED: both activity fields must stay in memory until one flush
+    /// performs one locked batch RMW, preserving unrelated metadata.
+    #[test]
+    fn activity_recorders_are_memory_only_and_flush_as_one_batch_3321() {
+        let home = tmp_home("activity-batch-3321");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        agent_ops::save_metadata(&home, "agent1", "role", json!("dev"));
+        agent_ops::reset_metadata_rmw_count();
+
+        record_input_activity(&home, "agent1");
+        record_submit_activity(&home, "agent1");
+        assert_eq!(
+            read_input_submit_timestamps(&home, "agent1"),
+            (0, 0),
+            "#3321: recorders must not touch metadata on the input path"
+        );
+        assert_eq!(pending_input_count_for(&home), 1);
+
+        flush_pending_input_activity(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(typed > 0, "#3321: input timestamp must flush");
+        assert!(submit > 0, "#3321: submit timestamp must flush");
+        let metadata = std::fs::read_to_string(home.join("metadata/agent1.json")).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            metadata["role"],
+            "dev",
+            "#3321: unrelated metadata survives"
+        );
+        assert_eq!(
+            agent_ops::take_metadata_rmw_count(),
+            1,
+            "#3321: input+submit must use one batch RMW"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn activity_requeue_merges_each_field_by_max_3321() {
+        let mut target = PendingActivity {
+            home: PathBuf::from("/home/agent"),
+            agent: "agent1".to_owned(),
+            input_ms: Some(200),
+            submit_ms: Some(400),
+        };
+        let newer_input = PendingActivity {
+            home: target.home.clone(),
+            agent: target.agent.clone(),
+            input_ms: Some(300),
+            submit_ms: Some(100),
+        };
+        merge_activity(&mut target, &newer_input);
+        assert_eq!(target.input_ms, Some(300));
+        assert_eq!(target.submit_ms, Some(400));
+    }
+
+    /// #3321 RED: a held exact metadata lock must not park the flush worker.
+    /// The channel barrier proves the lock is held before the flush begins;
+    /// the timeout only bounds a regression to the old blocking implementation.
+    #[test]
+    fn contended_activity_flush_returns_and_requeues_without_loss_3321() {
+        let home = tmp_home("activity-contention-3321");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        agent_ops::save_metadata(&home, "agent1", "role", json!("dev"));
+        record_input_activity(&home, "agent1");
+        record_submit_activity(&home, "agent1");
+        let (release_tx, holder) = hold_metadata_lock(&home);
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let flush_home = home.clone();
+        let flush_thread = std::thread::spawn(move || {
+            flush_pending_input_activity(&flush_home);
+            done_tx.send(()).unwrap();
+        });
+        let returned_while_held = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        flush_thread.join().unwrap();
+        assert!(
+            returned_while_held,
+            "#3321: periodic flush must use try-lock, never block on metadata flock"
+        );
+        assert_eq!(
+            pending_input_count_for(&home),
+            1,
+            "#3321: contention must retain the unified pending entry"
+        );
+
+        flush_pending_input_activity(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0 && submit > 0,
+            "#3321: retry must persist both fields"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #3321 RED: recording submit activity itself must remain nonblocking
+    /// while another process owns the exact metadata lock.
+    #[test]
+    fn activity_recorders_return_while_metadata_lock_is_held_3321() {
+        let home = tmp_home("activity-record-contention-3321");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        agent_ops::save_metadata(&home, "agent1", "role", json!("dev"));
+        let (release_tx, holder) = hold_metadata_lock(&home);
+
+        let record_home = home.clone();
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let recorder = std::thread::spawn(move || {
+            record_input_activity(&record_home, "agent1");
+            record_submit_activity(&record_home, "agent1");
+            done_tx.send(()).unwrap();
+        });
+        let returned_while_held = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        recorder.join().unwrap();
+        assert!(
+            returned_while_held,
+            "#3321: activity recorders must not wait on metadata flock"
+        );
+        assert_eq!(pending_input_count_for(&home), 1);
+        flush_pending_input_activity(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(typed > 0 && submit > 0);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #3321 RED: an atomic-write error after draining must requeue the latest
+    /// fields so a later retry cannot silently lose the activity pair.
+    #[test]
+    fn activity_flush_requeues_after_atomic_write_error_3321() {
+        let home = tmp_home("activity-error-3321");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        record_submit_activity(&home, "agent1");
+        let metadata_path = agent_ops::metadata_path_resolved(&home, "agent1");
+        crate::store::fail_next_atomic_write_for_test(&metadata_path);
+
+        flush_pending_input_activity(&home);
+        assert_eq!(
+            pending_input_count_for(&home),
+            1,
+            "#3321: failed persistence must requeue, not drop, the pair"
+        );
+        flush_pending_input_activity(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0 && submit > 0,
+            "#3321: retry after error must persist"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn activity_teardown_flush_persists_remaining_pair_3321() {
+        let home = tmp_home("activity-teardown-3321");
+        record_input_activity(&home, "agent1");
+        record_submit_activity(&home, "agent1");
+        flush_pending_activity_at_teardown(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(typed > 0 && submit > 0);
+        assert_eq!(pending_input_count_for(&home), 0);
         std::fs::remove_dir_all(home).ok();
     }
 }

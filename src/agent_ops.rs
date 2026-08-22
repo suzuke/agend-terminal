@@ -500,6 +500,94 @@ pub(crate) fn take_metadata_rmw_count() -> usize {
     METADATA_RMW_COUNT.with(|count| count.replace(0))
 }
 
+/// Outcome of the non-blocking metadata batch used by periodic UI work.
+/// Contention is expected; other errors are surfaced to the caller so drained
+/// in-memory activity can be requeued instead of being silently discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TryMetadataBatchOutcome {
+    Applied,
+    Contended,
+    Failed,
+}
+
+/// Persist a metadata batch without ever waiting for the instance lock.
+///
+/// The periodic TUI flush must not call `save_metadata_batch`: its blocking
+/// flock would park the single input/render loop. The caller owns retry and
+/// loss semantics, so this helper distinguishes expected contention from I/O
+/// or serialization failure and never logs-and-forgets a drained batch.
+pub(crate) fn try_save_metadata_batch(
+    home: &Path,
+    instance_name: &str,
+    entries: &[(&str, Value)],
+) -> TryMetadataBatchOutcome {
+    let meta_dir = home.join("metadata");
+    if let Err(error) = std::fs::create_dir_all(&meta_dir) {
+        tracing::warn!(
+            home = %home.display(),
+            agent = %instance_name,
+            error = %error,
+            "nonblocking activity metadata setup failed"
+        );
+        return TryMetadataBatchOutcome::Failed;
+    }
+    let meta_path = metadata_path_resolved(home, instance_name);
+    let lock_path = meta_path.with_extension("lock");
+    let lock = match crate::store::try_acquire_file_lock(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return TryMetadataBatchOutcome::Contended,
+        Err(error) => {
+            tracing::warn!(
+                path = %lock_path.display(),
+                error = %error,
+                "nonblocking activity metadata lock failed"
+            );
+            return TryMetadataBatchOutcome::Failed;
+        }
+    };
+
+    #[cfg(test)]
+    note_metadata_rmw();
+    let mut metadata = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    let object = metadata
+        .as_object_mut()
+        .expect("metadata normalized to a JSON object");
+    for (key, value) in entries {
+        object.insert((*key).to_owned(), value.clone());
+    }
+    let body = match serde_json::to_string_pretty(&metadata) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(
+                path = %meta_path.display(),
+                error = %error,
+                "nonblocking activity metadata serialization failed"
+            );
+            drop(lock);
+            return TryMetadataBatchOutcome::Failed;
+        }
+    };
+    let outcome = match crate::store::atomic_write(&meta_path, body.as_bytes()) {
+        Ok(()) => TryMetadataBatchOutcome::Applied,
+        Err(error) => {
+            tracing::warn!(
+                path = %meta_path.display(),
+                error = %error,
+                "nonblocking activity metadata write failed"
+            );
+            TryMetadataBatchOutcome::Failed
+        }
+    };
+    drop(lock);
+    outcome
+}
+
 /// Persist a single metadata key/value for an instance.
 ///
 /// #1886 C2: locked read-modify-write (flock spans load→modify→write) so two
