@@ -34,6 +34,7 @@ use crate::task_events::{
     self, DoneSource, InstanceName, LinkSource, PrId, PrSnapshot, TaskEvent, TaskId,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -58,6 +59,13 @@ const PR_LIST_LIMIT: u32 = 30;
 /// (`https://ghe.example.com/api/v3`) works instead of being pinned to
 /// github.com — mirrors `CiProvider::with_base_url`'s configurable base.
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// #3316: provenance is retained as an append-only audit set. An inactive
+/// mapping can retire only after this quiet period, unless an operator
+/// explicitly acknowledges it through the task-sweep config command.
+const LEGACY_RETIREMENT_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const PROVENANCE_FILE: &str = "task_sweep_provenance.json";
+const HEALTH_FILE: &str = "task_sweep_health.json";
 
 /// Configuration persisted at `<home>/task_sweep.json`. Operator mutates via
 /// the `agend-terminal admin task-sweep-config` CLI (#2547: moved from the
@@ -92,6 +100,67 @@ pub struct SweepConfig {
     /// PRs already alerted — prevents duplicate telegram notifications.
     #[serde(default)]
     pub alerted_prs: Vec<u64>,
+    /// #3316: provenance keys explicitly acknowledged by an operator. The
+    /// append-only provenance record remains on disk for audit; acknowledgement
+    /// only permits that legacy mapping to retire from active compatibility scans.
+    #[serde(default)]
+    pub provenance_acknowledgements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct SweepProvenanceStore {
+    /// Append-only history. Retired entries are retained for audit and are never
+    /// silently deleted or merged.
+    #[serde(default)]
+    entries: Vec<SweepProvenance>,
+    #[serde(default)]
+    next_generation: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SweepProvenance {
+    project_id: String,
+    repo: String,
+    api_base: String,
+    observed_at: String,
+    config_generation: u64,
+    #[serde(default)]
+    retired_at: Option<String>,
+    #[serde(default)]
+    retirement_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SweepHealthEntry {
+    code: String,
+    project_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    total_tasks: usize,
+    non_terminal_tasks: usize,
+    evidence: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct SweepHealthSnapshot {
+    #[serde(default)]
+    as_of: String,
+    #[serde(default)]
+    entries: Vec<SweepHealthEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepBoard {
+    project_id: String,
+    repo: String,
+    api_base: String,
+    legacy_compat: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SweepPlan {
+    boards: Vec<SweepBoard>,
+    default_repo: Option<String>,
 }
 
 fn config_path(home: &Path) -> PathBuf {
@@ -118,6 +187,318 @@ pub fn load_sweep_config_for_doctor(home: &Path) -> SweepConfig {
 
 fn save_config(home: &Path, cfg: &SweepConfig) -> anyhow::Result<()> {
     crate::store::save_atomic(&config_path(home), cfg)
+}
+
+fn provenance_path(home: &Path) -> PathBuf {
+    home.join(PROVENANCE_FILE)
+}
+
+fn health_path(home: &Path) -> PathBuf {
+    home.join(HEALTH_FILE)
+}
+
+fn load_provenance(home: &Path) -> SweepProvenanceStore {
+    crate::store::load(&provenance_path(home))
+}
+
+fn save_provenance(home: &Path, store: &SweepProvenanceStore) -> anyhow::Result<()> {
+    crate::store::save_atomic(&provenance_path(home), store)
+}
+
+fn save_health(home: &Path, entries: Vec<SweepHealthEntry>) -> anyhow::Result<()> {
+    crate::store::save_atomic(
+        &health_path(home),
+        &SweepHealthSnapshot {
+            as_of: chrono::Utc::now().to_rfc3339(),
+            entries,
+        },
+    )
+}
+
+fn canonical_project_id(project_id: &str) -> String {
+    let project_id = project_id.trim();
+    if project_id.is_empty()
+        || project_id.eq_ignore_ascii_case(crate::task_events::DEFAULT_PROJECT)
+        || project_id.eq_ignore_ascii_case("fleet")
+    {
+        crate::task_events::DEFAULT_PROJECT.to_string()
+    } else {
+        crate::task_events::project_slug(project_id)
+    }
+}
+
+fn canonical_api_base(api_base: &str) -> String {
+    let trimmed = api_base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        DEFAULT_GITHUB_API_BASE.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn canonical_repo(repo: &str) -> Option<String> {
+    crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(repo)
+}
+
+fn provenance_key(project_id: &str, repo: &str, api_base: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        canonical_project_id(project_id),
+        repo,
+        canonical_api_base(api_base)
+    )
+}
+
+fn board_counts(home: &Path, project_id: &str) -> (usize, usize) {
+    let board = crate::task_events::board_root(home, project_id);
+    let tasks = crate::tasks::list_all_at(home, &board);
+    let non_terminal = tasks
+        .iter()
+        .filter(|task| !task.status.is_terminal())
+        .count();
+    (tasks.len(), non_terminal)
+}
+
+fn active_team_claims(home: &Path, cfg: &SweepConfig) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut claims: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for team in crate::teams::list_all(home) {
+        let Some(repo_path) = team.source_repo.as_deref() else {
+            continue;
+        };
+        let Some(repo) =
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(repo_path)
+        else {
+            continue;
+        };
+        let repo = canonical_repo(&repo)
+            .ok_or_else(|| anyhow::anyhow!("team '{}' has an invalid GitHub origin", team.name))?;
+        let derived_project = crate::tasks::project_id_from_source_repo(repo_path);
+        let project = team
+            .project_id
+            .as_deref()
+            .map(canonical_project_id)
+            .unwrap_or_else(|| canonical_project_id(&derived_project));
+        claims
+            .entry(project)
+            .or_default()
+            .entry(repo)
+            .or_default()
+            .push(team.name);
+    }
+
+    let mut resolved = BTreeMap::new();
+    for (project, repos) in claims {
+        if repos.len() > 1 {
+            let details = repos
+                .iter()
+                .map(|(repo, teams)| format!("{repo} ({})", teams.join(",")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!("conflicting repo claims for project '{project}': {details}");
+        }
+        let (repo, _) = repos.into_iter().next().expect("non-empty repo claims");
+        resolved.insert(project, repo);
+    }
+
+    // Team claims are authoritative for the DEFAULT board. The configured repo
+    // remains the single-project fallback only when no team claims that board.
+    if !resolved.contains_key(crate::task_events::DEFAULT_PROJECT) {
+        if let Some(repo) = cfg.repo.as_deref().filter(|repo| !repo.trim().is_empty()) {
+            let repo = canonical_repo(repo)
+                .ok_or_else(|| anyhow::anyhow!("configured sweep repository is invalid: {repo}"))?;
+            resolved.insert(crate::task_events::DEFAULT_PROJECT.to_string(), repo);
+        }
+    }
+    Ok(resolved)
+}
+
+fn current_board_projects(home: &Path) -> HashSet<String> {
+    crate::tasks::list_all_boards(home)
+        .into_iter()
+        .filter(|(_, tasks)| !tasks.is_empty())
+        .map(|(project, _)| canonical_project_id(&project))
+        .collect()
+}
+
+fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPlan> {
+    let claims = active_team_claims(home, cfg)?;
+    let api_base = canonical_api_base(
+        cfg.api_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_GITHUB_API_BASE),
+    );
+    let mut store = load_provenance(home);
+    let mut health = Vec::new();
+    let now = chrono::Utc::now();
+    let now_string = now.to_rfc3339();
+    let mut boards = Vec::new();
+    let mut current_keys = HashSet::new();
+
+    for (project_id, repo) in &claims {
+        let key = provenance_key(project_id, repo, &api_base);
+        current_keys.insert(key.clone());
+        let (total_tasks, non_terminal_tasks) = board_counts(home, project_id);
+        let acknowledged = cfg
+            .provenance_acknowledgements
+            .iter()
+            .any(|ack| ack == &key);
+        let has_active_exact = store.entries.iter().any(|entry| {
+            entry.retired_at.is_none()
+                && provenance_key(&entry.project_id, &entry.repo, &entry.api_base) == key
+        });
+
+        if !has_active_exact {
+            if total_tasks > 0 && !acknowledged {
+                health.push(SweepHealthEntry {
+                    code: "BASELINE_UNVERIFIED".to_string(),
+                    project_id: project_id.clone(),
+                    repo: Some(repo.clone()),
+                    total_tasks,
+                    non_terminal_tasks,
+                    evidence: format!(
+                        "board has {total_tasks} task(s) but no acknowledged provenance key {key}"
+                    ),
+                });
+            } else {
+                store.next_generation = store.next_generation.saturating_add(1);
+                store.entries.push(SweepProvenance {
+                    project_id: project_id.clone(),
+                    repo: repo.clone(),
+                    api_base: api_base.clone(),
+                    observed_at: now_string.clone(),
+                    config_generation: store.next_generation,
+                    retired_at: None,
+                    retirement_reason: None,
+                });
+                boards.push(SweepBoard {
+                    project_id: project_id.clone(),
+                    repo: repo.clone(),
+                    api_base: api_base.clone(),
+                    legacy_compat: false,
+                });
+            }
+        } else {
+            boards.push(SweepBoard {
+                project_id: project_id.clone(),
+                repo: repo.clone(),
+                api_base: api_base.clone(),
+                legacy_compat: false,
+            });
+        }
+    }
+
+    for entry in &mut store.entries {
+        let entry_key = provenance_key(&entry.project_id, &entry.repo, &entry.api_base);
+        if entry.retired_at.is_some() || current_keys.contains(&entry_key) {
+            continue;
+        }
+        let (total_tasks, non_terminal_tasks) = board_counts(home, &entry.project_id);
+        let acknowledged = cfg
+            .provenance_acknowledgements
+            .iter()
+            .any(|ack| ack == &entry_key);
+        let age_elapsed = chrono::DateTime::parse_from_rfc3339(&entry.observed_at)
+            .map(|observed| {
+                now.signed_duration_since(observed.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    >= LEGACY_RETIREMENT_TTL_SECS
+            })
+            .unwrap_or(false);
+        if acknowledged || (non_terminal_tasks == 0 && age_elapsed) {
+            entry.retired_at = Some(now_string.clone());
+            entry.retirement_reason = Some(if acknowledged {
+                "operator_acknowledged".to_string()
+            } else {
+                "quiet_ttl_elapsed".to_string()
+            });
+            continue;
+        }
+        // Every non-retired historical mapping remains an active compatibility
+        // scan. Board emptiness and filesystem mtime are not retirement signals;
+        // retirement is intentionally limited to the auditable conditions above.
+        boards.push(SweepBoard {
+            project_id: canonical_project_id(&entry.project_id),
+            repo: entry.repo.clone(),
+            api_base: canonical_api_base(&entry.api_base),
+            legacy_compat: true,
+        });
+        health.push(SweepHealthEntry {
+            code: "LEGACY_COMPAT".to_string(),
+            project_id: canonical_project_id(&entry.project_id),
+            repo: Some(entry.repo.clone()),
+            total_tasks,
+            non_terminal_tasks,
+            evidence: format!(
+                "retained provenance key {entry_key} until acknowledgement or quiet TTL"
+            ),
+        });
+    }
+
+    // Explicitly-created boards that cannot be deterministically paired to a
+    // team/repo stay visible but are never guessed into a sweep.
+    for project_id in current_board_projects(home) {
+        if !claims.contains_key(&project_id) {
+            let (total_tasks, non_terminal_tasks) = board_counts(home, &project_id);
+            health.push(SweepHealthEntry {
+                code: "MANUAL_UNMAPPED".to_string(),
+                project_id,
+                repo: None,
+                total_tasks,
+                non_terminal_tasks,
+                evidence: "explicit project board has no deterministic team/repo mapping"
+                    .to_string(),
+            });
+        }
+    }
+
+    save_provenance(home, &store)?;
+    save_health(home, health.clone())?;
+    Ok(SweepPlan {
+        default_repo: claims.get(crate::task_events::DEFAULT_PROJECT).cloned(),
+        boards,
+    })
+}
+
+/// Return the last persisted sweep diagnostics for `task action=health`.
+pub fn task_sweep_health(home: &Path) -> serde_json::Value {
+    serde_json::to_value(crate::store::load::<SweepHealthSnapshot>(&health_path(
+        home,
+    )))
+    .unwrap_or_else(|_| serde_json::json!({"as_of": "", "entries": []}))
+}
+
+/// Explicit project names are operator-owned board selectors. Record an
+/// auditable warning when the project cannot be paired to exactly one current
+/// team/repo mapping; the board remains available to named-board CRUD.
+pub fn note_explicit_project(home: &Path, project_id: &str) {
+    let project_id = canonical_project_id(project_id);
+    let cfg = load_config(home);
+    let mapped = active_team_claims(home, &cfg)
+        .ok()
+        .and_then(|claims| claims.get(&project_id).cloned());
+    if mapped.is_some() {
+        return;
+    }
+    let (total_tasks, non_terminal_tasks) = board_counts(home, &project_id);
+    let mut snapshot = crate::store::load::<SweepHealthSnapshot>(&health_path(home));
+    snapshot
+        .entries
+        .retain(|entry| !(entry.code == "MANUAL_UNMAPPED" && entry.project_id == project_id));
+    snapshot.entries.push(SweepHealthEntry {
+        code: "MANUAL_UNMAPPED".to_string(),
+        project_id: project_id.clone(),
+        repo: None,
+        total_tasks,
+        non_terminal_tasks,
+        evidence:
+            "explicit project board retained as named-board access; no deterministic sweep mapping"
+                .to_string(),
+    });
+    snapshot.as_of = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = crate::store::save_atomic(&health_path(home), &snapshot) {
+        tracing::warn!(%error, project = %project_id, "task_sweep: failed to persist MANUAL_UNMAPPED evidence");
+    }
+    tracing::warn!(project = %project_id, "task_sweep: MANUAL_UNMAPPED explicit project board");
 }
 
 /// Holding-handle for the spawned sweep ticker. Drop is the existing
@@ -201,20 +582,23 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     if cfg.paused {
         return Ok(());
     }
-    let api_base = cfg
-        .api_base_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITHUB_API_BASE);
-
-    // #2117 P2: sweep each project board against ITS OWN repo. fleet.yaml teams
-    // contribute their per-project boards; `cfg.repo` is the operator override /
-    // single-project fallback for the DEFAULT (home) board. A merged PR in repo A
-    // is matched ONLY against board A's open tasks, so it can never auto-close a
-    // task that lives on board B (#2105). Single-project deployments (no per-team
-    // `source_repo`) resolve to exactly `[(DEFAULT, cfg.repo)]` → board == home →
-    // byte-identical to the pre-P2 single-repo tick.
-    let boards = resolve_sweep_boards(home, &cfg);
-    if boards.is_empty() {
+    let plan = match resolve_sweep_plan(home, &cfg) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let entry = SweepHealthEntry {
+                code: "CONFLICT_FAIL_CLOSED".to_string(),
+                project_id: crate::task_events::DEFAULT_PROJECT.to_string(),
+                repo: None,
+                total_tasks: 0,
+                non_terminal_tasks: 0,
+                evidence: error.to_string(),
+            };
+            save_health(home, vec![entry])?;
+            tracing::warn!(%error, "task_sweep: board resolution failed closed");
+            return Ok(());
+        }
+    };
+    if plan.boards.is_empty() {
         return Ok(());
     }
 
@@ -231,26 +615,46 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     let mut default_scanned = false;
     // CR-2026-06-14: capture the DEFAULT board's merged-PR list so the compliance
     // pass below reuses it instead of issuing a second identical GitHub fetch.
-    let mut default_prs: Option<Vec<PrMeta>> = None;
-    for (project_id, repo) in &boards {
-        match sweep_board(
-            home,
-            project_id,
-            repo,
-            api_base,
-            fleet_cfg.as_ref(),
-            cfg.dry_run,
-        ) {
-            Ok((scanned, prs)) => {
-                if project_id == crate::task_events::DEFAULT_PROJECT {
-                    default_scanned = scanned;
-                    default_prs = Some(prs);
+    let mut default_prs: Option<Arc<Vec<PrMeta>>> = None;
+    let mut fetch_cache: HashMap<(String, String), Arc<anyhow::Result<Vec<PrMeta>>>> =
+        HashMap::new();
+    for board in &plan.boards {
+        let cache_key = (board.api_base.clone(), board.repo.clone());
+        let result = fetch_cache
+            .entry(cache_key)
+            .or_insert_with(|| Arc::new(list_recently_merged_prs(&board.repo, &board.api_base)))
+            .clone();
+        match result.as_ref() {
+            Ok(prs) => {
+                match sweep_board_with_prs(
+                    home,
+                    &board.project_id,
+                    prs,
+                    fleet_cfg.as_ref(),
+                    cfg.dry_run,
+                ) {
+                    Ok(scanned) => {
+                        if board.project_id == crate::task_events::DEFAULT_PROJECT
+                            && !board.legacy_compat
+                        {
+                            default_scanned = scanned;
+                            default_prs = Some(Arc::new(prs.clone()));
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        project = %board.project_id,
+                        repo = %board.repo,
+                        api_base = %board.api_base,
+                        error = %error,
+                        "task_sweep: board close path failed"
+                    ),
                 }
             }
-            // Per-board isolation: a repo-A API/append failure must NOT abort the
-            // repo-B board scan (the #2105 multi-board goal). Log and continue.
-            Err(e) => tracing::warn!(
-                project = %project_id, repo = %repo, error = %e,
+            Err(error) => tracing::warn!(
+                project = %board.project_id,
+                repo = %board.repo,
+                api_base = %board.api_base,
+                error = %error,
                 "task_sweep: board scan failed"
             ),
         }
@@ -261,7 +665,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     // auto-close routing, not compliance (out of scope). Byte-identical: in a
     // single-project deployment the DEFAULT board IS `cfg.repo`.
     if default_scanned && cfg.compliance_mode != "off" {
-        if let Some(repo) = cfg.repo.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(repo) = plan.default_repo.as_deref() {
             // Reuse the DEFAULT board's already-fetched list (set together with
             // `default_scanned` above, so it is always `Some` here).
             if let Some(prs) = default_prs.as_deref() {
@@ -284,51 +688,20 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
 /// skipped — the poller only knows GitHub Actions. Order is deterministic
 /// (BTreeMap by project_id); distinct `source_repo`s that collapse to one
 /// project (a project can back multiple teams) dedupe to a single board.
+#[allow(dead_code)]
 fn resolve_sweep_boards(home: &Path, cfg: &SweepConfig) -> Vec<(String, String)> {
-    let mut boards: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for team in crate::teams::list_all(home) {
-        let Some(repo_path) = team.source_repo.as_deref() else {
-            continue;
-        };
-        let Some(slug) =
-            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(repo_path)
-        else {
-            continue;
-        };
-        let project_id = crate::tasks::project_id_from_source_repo(repo_path);
-        boards.entry(project_id).or_insert(slug);
+    match resolve_sweep_plan(home, cfg) {
+        Ok(plan) => plan
+            .boards
+            .into_iter()
+            .filter(|board| !board.legacy_compat)
+            .map(|board| (board.project_id, board.repo))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "task_sweep: compatibility board resolution failed closed");
+            Vec::new()
+        }
     }
-    if let Some(repo) = cfg.repo.as_deref().filter(|s| !s.is_empty()) {
-        boards
-            .entry(crate::task_events::DEFAULT_PROJECT.to_string())
-            .or_insert_with(|| repo.to_string());
-    }
-    boards.into_iter().collect()
-}
-
-/// #2117 P2: scan ONE project board against ITS repo for `Closes t-…` markers in
-/// recently-merged PRs and auto-close the matching open tasks. Mutations route to
-/// the board via `append_done_if_legal_at` (the P0/P1 `_at` seam). Returns
-/// `Ok(true)` if a full scan ran (PR list AND open-task set both non-empty),
-/// `Ok(false)` if it short-circuited — the caller uses the DEFAULT board's flag
-/// to gate the compliance pass exactly as the pre-P2 single-repo tick did.
-fn sweep_board(
-    home: &Path,
-    project_id: &str,
-    repo: &str,
-    api_base: &str,
-    fleet_cfg: Option<&crate::fleet::FleetConfig>,
-    dry_run: bool,
-) -> anyhow::Result<(bool, Vec<PrMeta>)> {
-    // #2117 P3a: the `list_recently_merged_prs` network fetch is the ONLY thing
-    // this adds over the testable close logic; delegate the rest to
-    // `sweep_board_with_prs` (the injectable seam).
-    // CR-2026-06-14: this is now the SINGLE merged-PR fetch per tick — the list
-    // is returned so `sweep_tick` can thread the DEFAULT board's slice into
-    // `compliance_sweep` instead of it re-fetching the identical data.
-    let prs = list_recently_merged_prs(repo, api_base)?;
-    let scanned = sweep_board_with_prs(home, project_id, &prs, fleet_cfg, dry_run)?;
-    Ok((scanned, prs))
 }
 
 /// #2117 P3a: the close logic of [`sweep_board`] with the PR list INJECTED. Seam
@@ -550,6 +923,7 @@ fn extract_closes_markers(body: &str) -> Vec<String> {
 /// PR metadata captured from the GitHub list-pulls response. Fields
 /// chosen to satisfy the 5 sweep validation must-haves; intermediate
 /// JSON parsing in [`parse_pr_meta`] flags schema mismatches.
+#[derive(Clone)]
 struct PrMeta {
     number: u64,
     #[allow(dead_code)]
@@ -691,6 +1065,17 @@ pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_
             Some(base.to_string())
         };
     }
+    if let Some(keys) = args
+        .get("acknowledge_provenance")
+        .and_then(|value| value.as_array())
+    {
+        for key in keys.iter().filter_map(|value| value.as_str()) {
+            if !key.trim().is_empty() && !cfg.provenance_acknowledgements.iter().any(|v| v == key) {
+                cfg.provenance_acknowledgements.push(key.to_string());
+            }
+        }
+        cfg.provenance_acknowledgements.sort();
+    }
     if let Err(e) = save_config(home, &cfg) {
         return serde_json::json!({"error": format!("save failed: {e}")});
     }
@@ -701,6 +1086,7 @@ pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_
         "compliance_mode": cfg.compliance_mode,
         "last_seen_merged_at": cfg.last_seen_merged_at,
         "api_base_url": cfg.api_base_url,
+        "provenance_acknowledgements": cfg.provenance_acknowledgements,
     })
 }
 
@@ -996,7 +1382,12 @@ fn compliance_sweep(home: &Path, repo: &str, prs: &[PrMeta]) -> Vec<ComplianceVi
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+    use std::time::{Duration as StdDuration, Instant};
 
     fn tmp_home(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1027,6 +1418,358 @@ mod tests {
         };
         git(&["init", "-b", "main"]);
         git(&["remote", "add", "origin", origin]);
+    }
+
+    struct PullListServer {
+        base_url: String,
+        body: Arc<Mutex<String>>,
+        requests: Arc<AtomicU32>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for PullListServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl PullListServer {
+        fn set_body(&self, body: String) {
+            *self.body.lock().unwrap() = body;
+        }
+    }
+
+    fn pull_list_server(body: String) -> PullListServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = Arc::new(Mutex::new(body));
+        let requests = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let body_for_thread = Arc::clone(&body);
+        let requests_for_thread = Arc::clone(&requests);
+        let stop_for_thread = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_secs(5);
+            while !stop_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let body = body_for_thread.lock().unwrap().clone();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        requests_for_thread.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(StdDuration::from_millis(5));
+                    }
+                    Err(error) => panic!("pull-list server accept failed: {error}"),
+                }
+            }
+        });
+        PullListServer {
+            base_url,
+            body,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn pr_json(body: &str) -> String {
+        serde_json::json!([{
+            "number": 3316,
+            "title": "fix: override-aware task sweep",
+            "state": "closed",
+            "merge_commit_sha": "abc3316",
+            "merged_at": "2026-08-22T00:00:00Z",
+            "body": body,
+            "user": {"login": "test-user"}
+        }])
+        .to_string()
+    }
+
+    fn write_sweep_fleet(home: &Path, teams: &str) {
+        fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            format!(
+                "instances:\n  devA:\n    backend: claude\n    github_login: test-user\n  devB:\n    backend: claude\n    github_login: test-user\nteams:\n{teams}"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn red_sweep_tick_routes_to_team_project_override_3316() {
+        let home = tmp_home("red-override-entrypoint");
+        let repo = home.join("Projects").join("simple-edge-tts");
+        git_repo_with_origin(&repo, "https://github.com/org/simple-edge-tts.git");
+        write_sweep_fleet(
+            &home,
+            &format!(
+                "  edge:\n    members: [devA]\n    source_repo: {}\n    project_id: simple-edge-tts\n",
+                repo.display()
+            ),
+        );
+        let server = pull_list_server("[]".to_string());
+        handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": server.base_url}));
+        resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+        let task = crate::tasks::handle(
+            &home,
+            "devA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "override-routed task",
+                "assignee": "devA"
+            }),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server.set_body(pr_json(&format!("Closes {task}")));
+
+        sweep_tick(&home).unwrap();
+
+        let board = crate::task_events::board_root(&home, "simple-edge-tts");
+        let routed = crate::tasks::list_all_at(&home, &board)
+            .into_iter()
+            .find(|candidate| candidate.id == task)
+            .expect("override-routed task must remain on the override board");
+        assert_eq!(
+            routed.status,
+            crate::task_events::TaskStatus::Done,
+            "real sweep entry point must scan the same board task CRUD selected"
+        );
+        drop(server);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn red_sweep_tick_deduplicates_same_repo_fetch_across_boards_3316() {
+        let home = tmp_home("red-fetch-cache-entrypoint");
+        let repo_a = home.join("srcA");
+        let repo_b = home.join("srcB");
+        git_repo_with_origin(&repo_a, "https://github.com/org/shared.git");
+        git_repo_with_origin(&repo_b, "git@github.com:org/shared.git");
+        write_sweep_fleet(
+            &home,
+            &format!(
+                "  teamA:\n    members: [devA]\n    source_repo: {}\n    project_id: board-a\n  teamB:\n    members: [devB]\n    source_repo: {}\n    project_id: board-b\n",
+                repo_a.display(),
+                repo_b.display()
+            ),
+        );
+        let server = pull_list_server("[]".to_string());
+        handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": server.base_url}));
+        resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+        let make_task = |caller: &str| {
+            crate::tasks::handle(
+                &home,
+                caller,
+                &serde_json::json!({
+                    "action": "create",
+                    "title": "shared-repo task",
+                    "assignee": caller
+                }),
+            )["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let task_a = make_task("devA");
+        let task_b = make_task("devB");
+        server.set_body(pr_json(&format!("Closes {task_a}\nCloses {task_b}")));
+
+        sweep_tick(&home).unwrap();
+
+        assert_eq!(
+            server.requests.load(Ordering::Acquire),
+            1,
+            "same normalized repo/api must issue one PR fetch while retaining board-local scans"
+        );
+        for (project, task_id) in [("board-a", task_a), ("board-b", task_b)] {
+            let board = crate::task_events::board_root(&home, project);
+            let task = crate::tasks::list_all_at(&home, &board)
+                .into_iter()
+                .find(|candidate| candidate.id == task_id)
+                .unwrap();
+            assert_eq!(task.status, crate::task_events::TaskStatus::Done);
+        }
+        drop(server);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn board_a_close_path_failure_does_not_block_board_b_scan_3316() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tmp_home("board-close-error-isolation");
+        let repo_a = home.join("repo-a");
+        let repo_b = home.join("repo-b");
+        git_repo_with_origin(&repo_a, "https://github.com/org/a.git");
+        git_repo_with_origin(&repo_b, "https://github.com/org/b.git");
+        write_sweep_fleet(
+            &home,
+            &format!(
+                "  teamA:\n    members: [devA]\n    source_repo: {}\n    project_id: board-a\n  teamB:\n    members: [devB]\n    source_repo: {}\n    project_id: board-b\n",
+                repo_a.display(),
+                repo_b.display()
+            ),
+        );
+        let server = pull_list_server("[]".to_string());
+        handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": server.base_url}));
+        resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+        let make_task = |caller: &str| {
+            crate::tasks::handle(
+                &home,
+                caller,
+                &serde_json::json!({
+                    "action": "create",
+                    "title": "board isolation task",
+                    "assignee": caller
+                }),
+            )["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let task_a = make_task("devA");
+        let task_b = make_task("devB");
+        let board_a = crate::task_events::board_root(&home, "board-a");
+        let lock_path = board_a.join("task_events.jsonl.lock");
+        let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&lock_path, permissions).unwrap();
+        server.set_body(pr_json(&format!("Closes {task_a}\nCloses {task_b}")));
+
+        sweep_tick(&home).unwrap();
+
+        let task_a_state = crate::tasks::list_all_at(&home, &board_a)
+            .into_iter()
+            .find(|candidate| candidate.id == task_a)
+            .unwrap();
+        let board_b = crate::task_events::board_root(&home, "board-b");
+        let task_b_state = crate::tasks::list_all_at(&home, &board_b)
+            .into_iter()
+            .find(|candidate| candidate.id == task_b)
+            .unwrap();
+        assert_eq!(task_a_state.status, crate::task_events::TaskStatus::Open);
+        assert_eq!(task_b_state.status, crate::task_events::TaskStatus::Done);
+        drop(server);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn baseline_without_provenance_fails_closed_and_surfaces_health_3316() {
+        let home = tmp_home("baseline-unverified");
+        let repo = home.join("Projects").join("baseline");
+        git_repo_with_origin(&repo, "https://github.com/org/baseline.git");
+        write_sweep_fleet(
+            &home,
+            &format!(
+                "  baseline:\n    members: [devA]\n    source_repo: {}\n    project_id: baseline-board\n",
+                repo.display()
+            ),
+        );
+        let server = pull_list_server("[]".to_string());
+        handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": server.base_url}));
+        let task = crate::tasks::handle(
+            &home,
+            "devA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "unverified baseline task",
+                "assignee": "devA"
+            }),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server.set_body(pr_json(&format!("Closes {task}")));
+
+        sweep_tick(&home).unwrap();
+
+        assert_eq!(server.requests.load(Ordering::Acquire), 0);
+        let board = crate::task_events::board_root(&home, "baseline-board");
+        let task = crate::tasks::list_all_at(&home, &board)
+            .into_iter()
+            .find(|candidate| candidate.id == task)
+            .unwrap();
+        assert_eq!(task.status, crate::task_events::TaskStatus::Open);
+        let health = task_sweep_health(&home);
+        assert!(health["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["code"] == "BASELINE_UNVERIFIED"));
+        drop(server);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn conflicting_team_repo_claims_fail_closed_3316() {
+        let home = tmp_home("conflicting-claims");
+        let repo_a = home.join("repo-a");
+        let repo_b = home.join("repo-b");
+        git_repo_with_origin(&repo_a, "https://github.com/org/a.git");
+        git_repo_with_origin(&repo_b, "https://github.com/org/b.git");
+        write_sweep_fleet(
+            &home,
+            &format!(
+                "  teamA:\n    members: [devA]\n    source_repo: {}\n    project_id: same-board\n  teamB:\n    members: [devB]\n    source_repo: {}\n    project_id: same-board\n",
+                repo_a.display(),
+                repo_b.display()
+            ),
+        );
+        let server = pull_list_server("[]".to_string());
+        handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": server.base_url}));
+
+        sweep_tick(&home).unwrap();
+
+        assert_eq!(server.requests.load(Ordering::Acquire), 0);
+        let health = task_sweep_health(&home);
+        assert!(health["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["code"] == "CONFLICT_FAIL_CLOSED"));
+        drop(server);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn explicit_unmapped_project_is_named_access_with_health_evidence_3316() {
+        let home = tmp_home("manual-unmapped");
+        let created = crate::tasks::handle(
+            &home,
+            "devA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "named project task",
+                "project": "operator-board"
+            }),
+        );
+        assert!(created["id"].as_str().is_some());
+        let health = task_sweep_health(&home);
+        let entry = health["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["code"] == "MANUAL_UNMAPPED")
+            .unwrap();
+        assert_eq!(entry["project_id"], "operator-board");
+        assert_eq!(entry["non_terminal_tasks"], 1);
+        fs::remove_dir_all(&home).ok();
     }
 
     /// #2117 P2: the sweep enumerates ONE board per project — each fleet team's
@@ -1512,6 +2255,16 @@ mod tests {
         let r3 = handle_task_sweep_config(&home, &serde_json::json!({"dry_run": true}));
         assert_eq!(r3["dry_run"], true);
         assert_eq!(r3["paused"], true);
+        let r4 = handle_task_sweep_config(
+            &home,
+            &serde_json::json!({
+                "acknowledge_provenance": ["board-a|org/repo|https://api.github.com"]
+            }),
+        );
+        assert_eq!(
+            r4["provenance_acknowledgements"],
+            serde_json::json!(["board-a|org/repo|https://api.github.com"])
+        );
         fs::remove_dir_all(&home).ok();
     }
 
@@ -1765,6 +2518,7 @@ mod tests {
             last_seen_merged_at: None,
             alerted_prs: Vec::new(),
             api_base_url: None,
+            provenance_acknowledgements: Vec::new(),
         };
         save_config(&home, &cfg).unwrap();
         let violations = compliance_sweep(&home, "test/repo", &[]);
@@ -1787,6 +2541,7 @@ mod tests {
             last_seen_merged_at: None,
             alerted_prs: Vec::new(),
             api_base_url: None,
+            provenance_acknowledgements: Vec::new(),
         };
         // Simulate cursor update (done by compliance_sweep at end)
         cfg.last_seen_merged_at = Some("2026-05-12T00:00:00Z".to_string());

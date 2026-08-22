@@ -555,6 +555,10 @@ enum AdminCommands {
         /// the default `https://api.github.com`.
         #[arg(long)]
         api_base_url: Option<String>,
+        /// Retire a previously observed provenance mapping after operator review.
+        /// Repeat the flag to acknowledge multiple `project|repo|api` keys.
+        #[arg(long = "acknowledge-provenance")]
+        acknowledge_provenance: Vec<String>,
     },
     /// #2548: list Phase 4 GC candidates (released, past-grace, daemon-managed
     /// worktrees) without deleting them. Non-destructive. Moved from the
@@ -1406,6 +1410,7 @@ fn main() -> anyhow::Result<()> {
                 dry_run,
                 no_dry_run,
                 api_base_url,
+                acknowledge_provenance,
             } => {
                 let mut args = serde_json::json!({});
                 if let Some(repo) = repository {
@@ -1423,6 +1428,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 if let Some(url) = api_base_url {
                     args["api_base_url"] = serde_json::json!(url);
+                }
+                if !acknowledge_provenance.is_empty() {
+                    args["acknowledge_provenance"] = serde_json::json!(acknowledge_provenance);
                 }
                 let result = daemon::task_sweep::handle_task_sweep_config(&home, &args);
                 println!(

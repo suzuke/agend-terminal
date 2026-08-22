@@ -324,6 +324,9 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
             let _ = super::board_router::record_task_project(home, &id, &project);
+            if args["project"].as_str().is_some() {
+                crate::daemon::task_sweep::note_explicit_project(home, &project);
+            }
             // #2249: seed the plan-ack gate's metadata right after Created.
             // No new event variant — composes onto the existing MetadataSet
             // event/action, matching #2249's "reuse existing mechanisms"
@@ -1853,7 +1856,14 @@ fn handle_health_with_live_instances(
             });
         }
     };
-    build_health_response(&state, live, &fleet_instances)
+    let mut response = build_health_response(&state, live, &fleet_instances);
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "task_sweep".to_string(),
+            crate::daemon::task_sweep::task_sweep_health(home),
+        );
+    }
+    response
 }
 
 fn handle_activity(home: &Path, args: &Value) -> Value {
