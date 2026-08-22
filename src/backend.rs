@@ -543,16 +543,24 @@ impl Backend {
                 instructions_shared: true,
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
-                    // Trust directory prompt: "Yes, continue" is pre-selected → Enter.
-                    // CR (\r), not LF — Ink's keyboard reader treats CR as Enter.
-                    // macOS openpty doesn't translate LF→CR on input (ConPTY does),
-                    // so LF here would silently no-op on mac.
-                    // Issue #468: anchored regex (see ClaudeCode comment above).
-                    // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
-                    DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]*Do you trust",
-                        sequence: b"\r",
-                    },
+                    // #3317: the trust-directory matcher is DELIBERATELY ABSENT.
+                    //
+                    // Measured at codex 0.149.0: that prompt is still answerable —
+                    // it renders even under `--dangerously-bypass-approvals-and-sandbox`
+                    // — and answering it makes codex WRITE
+                    // `[projects."<workspace>"] trust_level = "trusted"` into the
+                    // operator's `$CODEX_HOME/config.toml`. Auto-pressing Enter would
+                    // therefore add one permanent entry per instance workspace,
+                    // forever, with no cleanup on delete: exactly the accumulation
+                    // `722140bd` removed, only authored by codex instead of by us and
+                    // so indistinguishable from the operator's own entries.
+                    //
+                    // Fleet tools no longer depend on trust at all — the MCP bridge is
+                    // registered on the child argv (`mcp_config::codex_mcp_config_args`).
+                    // Granting project trust is the operator's decision; a daemon that
+                    // manufactures it on every launch is not a fallback, it is the bug.
+                    // Do not re-add this pattern; `codex_preset_has_no_trust_dismiss_matcher_3317`
+                    // pins its absence.
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]*Please restart",
                         sequence: b"\r",

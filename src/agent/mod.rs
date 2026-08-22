@@ -739,10 +739,13 @@ fn codex_remote_command_args(
     args: &[String],
     spawn_mode: crate::backend::SpawnMode,
     // #3317: per-invocation `-c` overrides registering the agend MCP bridge.
-    // Unused in the RED commit; wired in the fix.
-    _mcp_args: &[String],
+    // Placed with the existing `check_for_update_on_startup` override — after
+    // the endpoint flags, BEFORE the `resume` subcommand — because `-c` is a
+    // global option on codex 0.148 and only gained a per-subcommand form later.
+    mcp_args: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut enriched = crate::transport::codex_attach_args(locator)?;
+    enriched.extend(mcp_args.iter().cloned());
     enriched.extend([
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),
@@ -835,12 +838,22 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         _ => None,
     };
 
+    // #3317: codex ignores its project-local `.codex/config.toml` until the
+    // directory is a trusted project, so a new instance would boot with no fleet
+    // tools. Register the bridge on the child argv instead — no global write, no
+    // trust dependency. `home` is required (it is what the bridge receives as
+    // `AGEND_HOME`); an ad-hoc codex spawn without one is unchanged.
+    let codex_mcp_args: Vec<String> = match (detected_backend.as_ref(), *home) {
+        (Some(Backend::Codex), Some(h)) => crate::mcp_config::codex_mcp_config_args(h, Some(name)),
+        _ => Vec::new(),
+    };
+
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
         opencode_attach_command_args(locator, args)?
     } else if let Some(locator) = codex_locator.as_ref() {
-        codex_remote_command_args(locator, args, *spawn_mode, &[])?
+        codex_remote_command_args(locator, args, *spawn_mode, &codex_mcp_args)?
     } else {
         let preset = detected_backend
             .as_ref()
@@ -851,8 +864,12 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
             .zip(*working_dir)
             .map(|(b, wd)| b.spawn_flags(wd))
             .unwrap_or_default();
-        preset
-            .into_iter()
+        // #3317: the overrides lead, so they precede the preset's own `resume`
+        // subcommand on a Resume spawn. Empty for every non-codex backend.
+        codex_mcp_args
+            .iter()
+            .cloned()
+            .chain(preset)
             .chain(args.iter().cloned())
             .chain(flags)
             .collect()

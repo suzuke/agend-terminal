@@ -3483,8 +3483,13 @@ fn r8_startup_dialog_still_dismisses_before_latch_off() {
         .iter()
         .map(|p| (p.label.to_string(), p.sequence.to_vec()))
         .collect();
+    // #3317: the codex trust-directory matcher was REMOVED (answering that
+    // prompt makes codex persist a per-workspace trust entry in the operator's
+    // config). This test is about the LATCH mechanics, not about that specific
+    // prompt, so it now drives another real codex startup modal with the same
+    // `\r` keystroke — the assertions below are unchanged.
     let written = run_pty_read_loop_for_r8(
-        vec![b"\x1b[2J\x1b[HDo you trust this folder?\nYes, continue"],
+        vec![b"\x1b[2J\x1b[HPlease restart the app to finish updating"],
         Backend::Codex,
         patterns,
     );
@@ -5012,7 +5017,9 @@ fn codex_fresh_argv_carries_mcp_bridge_overrides_3317() {
             .any(|a| a == "mcp_servers.agend-terminal.env.AGEND_INSTANCE_NAME='codex-3317-fresh'"),
         "#3317: the bridge needs THIS instance's name to route fleet traffic; argv={argv:?}"
     );
-    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
 }
 
 /// #3317 RED: the overrides must precede any subcommand. `-c` is accepted after
@@ -5041,7 +5048,9 @@ fn codex_resume_argv_places_mcp_overrides_before_the_resume_subcommand_3317() {
         "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
          `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
     );
-    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
 }
 
 /// #3317 RED (encoding): an `AGEND_HOME` containing an apostrophe cannot be a
@@ -5071,7 +5080,9 @@ fn codex_mcp_overrides_encode_an_apostrophe_home_as_a_basic_string_3317() {
         value.contains("it's-home"),
         "#3317: the apostrophe must survive verbatim inside the basic string; value={value}"
     );
-    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
 }
 
 /// #3317: no cross-backend leakage. Only codex takes `-c` config overrides.
@@ -5104,7 +5115,9 @@ fn non_codex_backends_get_no_mcp_overrides_3317() {
             "#3317: {command} must not receive codex `-c` overrides; argv={argv:?}"
         );
     }
-    std::fs::remove_dir_all(home.parent().unwrap()).ok();
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
 }
 
 /// #3317 RED: the NativeShared remote/attach path assembles its argv separately
