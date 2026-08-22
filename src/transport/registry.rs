@@ -427,6 +427,8 @@ fn envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    // #3324: durable origin, derived from the same header the formatter wrote.
+    envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
     Ok(envelope)
 }
 
@@ -446,6 +448,8 @@ fn self_kick_envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    // #3324: the second envelope path stamps identically — see the first.
+    envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
     Ok(envelope)
 }
 
@@ -643,6 +647,120 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// #3324 RED (SHORT/inline inbound path): a notification whose body is the
+    /// INLINE rendering of an external-channel message must carry that origin on
+    /// the durable envelope. Without it the ChannelBridge cannot tell a Telegram
+    /// user's message from an internal one, and answers both with a reply that
+    /// only reaches its own journal.
+    #[test]
+    fn envelope_stamps_channel_origin_on_the_inline_inbound_path_3324() {
+        let home = registry_test_home("origin-inline-3324");
+        let body = crate::inbox::notify::format_notification_for_inject(
+            false,
+            &crate::inbox::NotifySource::Channel(
+                "chiachenghuang",
+                crate::channel::ChannelKind::Telegram,
+            ),
+            "please research this",
+            &[],
+        );
+        let envelope = envelope_for_mode(&home, "claude-agent", &body, TransportMode::LegacyPty)
+            .expect("envelope");
+        assert_eq!(
+            envelope.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: the inline path must stamp the originating channel; body={body:?}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3324 RED (LONG/pointer inbound path): the same must hold for the
+    /// pointer-only rendering. It is a DIFFERENT format — header plus
+    /// `[AGEND-MSG] size=… (use inbox tool)` — and stamping only one of the two
+    /// leaves the other silently unguarded, which is how a two-path defect
+    /// survives a one-path fix.
+    #[test]
+    fn envelope_stamps_channel_origin_on_the_pointer_inbound_path_3324() {
+        let home = registry_test_home("origin-pointer-3324");
+        let body = crate::inbox::notify::format_notification_for_inject(
+            true,
+            &crate::inbox::NotifySource::Channel(
+                "chiachenghuang",
+                crate::channel::ChannelKind::Telegram,
+            ),
+            "a message long enough to be delivered by pointer",
+            &[],
+        );
+        let envelope = envelope_for_mode(&home, "claude-agent", &body, TransportMode::LegacyPty)
+            .expect("envelope");
+        assert_eq!(
+            envelope.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: the pointer path must stamp the originating channel too; body={body:?}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3324: internal traffic must stay unstamped, or the guard would refuse
+    /// every agent-to-agent and system delivery the bridge legitimately owns.
+    #[test]
+    fn envelope_leaves_channel_origin_absent_for_internal_bodies_3324() {
+        let home = registry_test_home("origin-internal-3324");
+        for body in [
+            "[from:codex-125550] status?",
+            "[system:ci] build finished",
+            "plain text with no header at all",
+        ] {
+            let envelope = envelope_for_mode(&home, "claude-agent", body, TransportMode::LegacyPty)
+                .expect("envelope");
+            assert_eq!(
+                envelope.channel_origin, None,
+                "#3324: internal delivery must not be stamped; body={body:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3324: the self-kick constructor is the second envelope path and must
+    /// stamp identically — a fresh-restart notice that quotes a user message
+    /// still originates on that channel.
+    #[test]
+    fn self_kick_envelope_stamps_channel_origin_3324() {
+        let home = registry_test_home("origin-self-kick-3324");
+        let body = crate::inbox::notify::format_notification_for_inject(
+            false,
+            &crate::inbox::NotifySource::Channel(
+                "chiachenghuang",
+                crate::channel::ChannelKind::Telegram,
+            ),
+            "resume this",
+            &[],
+        );
+        let envelope =
+            self_kick_envelope_for_mode(&home, "claude-agent", &body, TransportMode::LegacyPty)
+                .expect("envelope");
+        assert_eq!(
+            envelope.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: both envelope constructors must stamp the origin"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn registry_test_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-registry-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  claude-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+        home
+    }
 
     #[test]
     fn codex_mode_failure_never_calls_pty_fallback() {

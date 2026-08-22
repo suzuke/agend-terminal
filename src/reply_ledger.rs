@@ -566,7 +566,7 @@ pub fn lead_text(agent: &str, channel: &str, msg_id: Option<&str>, armed_at_ms: 
     format!(
         "[reply-ledger] {agent} owes the operator a reply to a {channel} message \
          ({}, received {}) — it was nudged once and the reply is still missing. \
-         Please check it / re-prime it to answer via the reply tool.",
+         Please check it / re-prime it to answer via the mcp__agend-terminal__reply tool.",
         msg_id.unwrap_or("id unknown"),
         format_hhmm(armed_at_ms)
     )
@@ -580,13 +580,15 @@ pub fn nudge_text(channel: &str, msg_id: Option<&str>, gap_d: bool) -> String {
     if gap_d {
         format!(
             "Your reply to {channel} message {id} FAILED to send — the operator \
-             received nothing. Retry it via the reply tool now."
+             received nothing. Retry it via the mcp__agend-terminal__reply tool now \
+             (the ChannelBridge `reply` records an acknowledgement without delivering)."
         )
     } else {
         format!(
             "The {channel} message {id} has not been answered on its channel — \
-             your output went to the TUI only. Send your answer via the reply \
-             tool so the operator receives it."
+             your output went to the TUI only. Send your answer via the \
+             mcp__agend-terminal__reply tool so the operator receives it (the \
+             ChannelBridge `reply` records an acknowledgement without delivering)."
         )
     }
 }
@@ -1235,9 +1237,24 @@ mod tests {
     fn nudge_and_lead_texts_carry_msg_id_2042() {
         let nudge = nudge_text("telegram", Some("m-77"), false);
         assert!(nudge.contains("m-77"), "nudge names the message id");
+        // #3324: "the reply tool" is AMBIGUOUS — the environment exposes two
+        // tools named `reply`, and the one the bridge provides records an
+        // acknowledgement without delivering to the channel. A nudge that says
+        // only "the reply tool" is what sent the agent to the wrong one twice.
         assert!(
-            nudge.contains("reply tool"),
-            "nudge instructs the reply tool"
+            nudge.contains("mcp__agend-terminal__reply"),
+            "#3324: the nudge must name the EXACT tool that reaches the channel; got {nudge:?}"
+        );
+        let gap_d = nudge_text("telegram", Some("m-77"), true);
+        assert!(
+            gap_d.contains("mcp__agend-terminal__reply"),
+            "#3324: the retry nudge must name it too — it is the one that fires \
+             after a failed send, i.e. exactly when the agent is choosing again; got {gap_d:?}"
+        );
+        assert!(
+            lead_text("dev-1", "telegram", Some("m-77"), 0).contains("mcp__agend-terminal__reply"),
+            "#3324: the lead text tells a human to re-prime the agent, so it must \
+             name the same exact tool"
         );
         let lead = lead_text("dev-1", "telegram", Some("m-77"), 0);
         assert!(lead.contains("dev-1") && lead.contains("m-77"));

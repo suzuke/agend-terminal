@@ -147,6 +147,15 @@ pub(crate) struct DeliveryEnvelope {
     /// independent internal deliveries, which must each remain attempt 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_delivery_id: Option<String>,
+    /// #3324: the EXTERNAL channel this delivery originated on, when it did.
+    ///
+    /// The ChannelBridge is an inbound transport to the agent, not an outbound
+    /// sender: a bridge `reply` records a transport acknowledgement and never
+    /// reaches Telegram. Two tools are named `reply` in that environment, so
+    /// without a typed origin the wrong one succeeds silently. `None` means the
+    /// delivery originated inside AgEnD and the bridge owns its reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<crate::channel::ChannelKind>,
 }
 
 impl DeliveryEnvelope {
@@ -171,6 +180,7 @@ impl DeliveryEnvelope {
             payload_digest,
             transport_mode: None,
             logical_delivery_id: None,
+            channel_origin: None,
         }
     }
 

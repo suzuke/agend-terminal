@@ -556,6 +556,50 @@ impl ChannelRuntime {
         Ok(())
     }
 
+    /// #3324: refuse to "reply" to a delivery that originated on an EXTERNAL
+    /// channel.
+    ///
+    /// This bridge is an inbound transport. Its `reply` records a transport
+    /// acknowledgement in the instance journal and never reaches Telegram — but
+    /// the environment exposes a SECOND tool also called `reply` that does. An
+    /// agent that picks this one is told "sent", the operator receives nothing,
+    /// and the recorded Reply then makes the loss look like a delivered answer.
+    ///
+    /// So fail CLOSED, name the exact tool that can deliver and the message to
+    /// address, and refuse BEFORE any Reply/SSE record so the reply obligation
+    /// stays armed and the nudge ladder keeps working.
+    fn reject_external_channel_reply(&self, delivery_id: Uuid) -> anyhow::Result<()> {
+        let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        let Some((envelope, _)) = store.delivery(delivery_id)? else {
+            // No envelope means UNKNOWN origin, not external, and unknown must
+            // stay permissive: `deliver_resident` records the envelope before it
+            // posts the webhook, so anything this bridge can be asked to answer
+            // normally has one — the absent case is a pruned or pre-settle row
+            // (#3310), where refusing would break internal replies with no way
+            // for the agent to tell why. A pruned external row is still caught
+            // downstream: the reply obligation and its nudge ladder do not
+            // depend on this record.
+            return Ok(());
+        };
+        let Some(origin) = envelope.channel_origin else {
+            return Ok(());
+        };
+        let channel = match origin {
+            crate::channel::ChannelKind::Telegram => "telegram",
+            crate::channel::ChannelKind::Discord => "discord",
+        };
+        let target = envelope
+            .logical_delivery_id
+            .as_deref()
+            .unwrap_or("the original message id from the inbox");
+        anyhow::bail!(
+            "this delivery originated on the {channel} channel, which the Claude \
+             ChannelBridge cannot reach — a reply here is recorded as a transport \
+             acknowledgement and never delivered. Use the mcp__agend-terminal__reply \
+             tool with message_id={target} instead. This reply obligation stays armed."
+        )
+    }
+
     fn remember_reply(
         &self,
         delivery_id: Uuid,
@@ -751,7 +795,7 @@ fn mcp_initialize(message: &Value, runtime: &ChannelRuntime) -> Value {
                 "tools": {}
             },
             "serverInfo": {"name": CHANNEL_SERVER_NAME, "version": BRIDGE_VERSION},
-            "instructions": "Messages arrive as <channel source=\"agend-terminal\" chat_id=\"...\" delivery_id=\"...\">. Each delivery has a unique chat_id; reply with the reply tool using the same chat_id and delivery_id. For [AGEND-RESUME], immediately call ack_start with the exact delivery_id from channel metadata before recovery, then call ack_complete only after the bounded recovery sequence; self-kick acknowledgements never send an outward reply."
+            "instructions": "Messages arrive as <channel source=\"agend-claude-channel\" chat_id=\"...\" delivery_id=\"...\" sender_id=\"agend-terminal\">. Each delivery has a unique chat_id. This server's `reply` answers deliveries that ORIGINATED INSIDE AgEnD, using the same chat_id and delivery_id; it records a transport acknowledgement and CANNOT reach an external channel. A message forwarded from an external channel (a `[user:NAME via telegram]` prefix) must be answered with the mcp__agend-terminal__reply tool instead — replying here is refused, and the refusal names the message to address. For [AGEND-RESUME], immediately call ack_start with the exact delivery_id from channel metadata before recovery, then call ack_complete only after the bounded recovery sequence; self-kick acknowledgements never send an outward reply."
         }
     })
 }
@@ -896,6 +940,11 @@ fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
                 },
             };
             if let Err(error) = runtime.reject_self_kick_reply(delivery_id) {
+                return Some(json_rpc_error(id, -32602, &error.to_string()));
+            }
+            // #3324: BEFORE the Reply record and its SSE fan-out — a recorded
+            // reply is exactly what made this loss invisible.
+            if let Err(error) = runtime.reject_external_channel_reply(delivery_id) {
                 return Some(json_rpc_error(id, -32602, &error.to_string()));
             }
             match runtime.remember_reply(delivery_id, chat_id, text) {

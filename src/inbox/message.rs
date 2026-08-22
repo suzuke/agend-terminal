@@ -60,8 +60,13 @@ impl fmt::Display for NotifySource<'_> {
 impl NotifySource<'_> {
     pub(crate) fn reply_hint(&self) -> Cow<'static, str> {
         match self {
+            // #3324: name the EXACT tool. Two tools are called `reply` in a
+            // ChannelBridge environment and the bridge's own one acknowledges
+            // without delivering, so "the reply tool" is what sent an agent's
+            // answer into a journal while the operator waited.
             Self::Channel(_, _) => {
-                "\n(Reply using the reply tool — do NOT respond with direct text)".into()
+                "\n(Reply using the mcp__agend-terminal__reply tool — do NOT respond with direct text)"
+                    .into()
             }
             #[cfg(test)]
             Self::Agent(sender) => {

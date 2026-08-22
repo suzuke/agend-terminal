@@ -266,6 +266,29 @@ pub fn format_notification_for_inject(
     }
 }
 
+/// #3324: recover the EXTERNAL channel a notification came from, if any.
+///
+/// This is the exact inverse of the `[{source}]` prefix `format_notification_for_inject`
+/// writes, and it is deliberately anchored at position 0 and closed by the first
+/// `]`: both the inline and the pointer-only rendering start with that one
+/// header, so one parser covers both paths rather than one path being silently
+/// left unguarded.
+///
+/// `None` means "not an external channel" — internal agent, system, or an
+/// unheadered body. The consumer fails CLOSED on `Some`, so being conservative
+/// here means the bridge keeps answering everything it legitimately owns.
+pub(crate) fn channel_origin_from_notification(body: &str) -> Option<crate::channel::ChannelKind> {
+    let rest = body.strip_prefix('[')?;
+    let header = rest.split_once(']')?.0;
+    // `user:<name> via <kind>` — the name may contain spaces, the kind may not.
+    let (_, kind) = header.strip_prefix("user:")?.rsplit_once(" via ")?;
+    match kind {
+        "telegram" => Some(crate::channel::ChannelKind::Telegram),
+        "discord" => Some(crate::channel::ChannelKind::Discord),
+        _ => None,
+    }
+}
+
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
     notify_agent_with_attachments(home, agent_name, source, text, &[]);
 }
