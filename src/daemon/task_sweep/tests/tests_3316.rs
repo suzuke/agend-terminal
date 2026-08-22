@@ -197,6 +197,53 @@ fn operator_ack_retires_legacy_mapping_immediately_and_keeps_audit_3316() {
 }
 
 #[test]
+fn retirement_ack_does_not_pre_authorize_reclaimed_baseline_3316() {
+    let (home, key) = legacy_fixture("legacy-retirement-ack-consume");
+    let response =
+        handle_task_sweep_config(&home, &serde_json::json!({"acknowledge_provenance": [key]}));
+    assert_eq!(
+        response["provenance_acknowledgements"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let retired = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert!(retired.boards.is_empty());
+    assert!(load_config(&home).provenance_acknowledgements.is_empty());
+
+    let created = crate::tasks::handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create",
+            "title": "reclaimed baseline task",
+            "project": "legacy-board"
+        }),
+    );
+    assert!(created["id"].as_str().is_some());
+
+    let repo = home.join("legacy-repo");
+    write_sweep_fleet(
+        &home,
+        &format!(
+            "  legacy:\n    members: [devA]\n    source_repo: {}\n    project_id: legacy-board\n",
+            repo.display()
+        ),
+    );
+    let reclaimed = resolve_sweep_plan(&home, &load_config(&home)).unwrap();
+    assert!(reclaimed.boards.is_empty());
+    let health = task_sweep_health(&home);
+    assert!(health["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["code"] == "BASELINE_UNVERIFIED"));
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn config_tool_acknowledgement_round_trip_3316() {
     let home = tmp_home("config-acknowledgement");
     let result = handle_task_sweep_config(

@@ -401,14 +401,6 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
         }
     }
 
-    if !consumed_acknowledgements.is_empty() {
-        let mut updated_cfg = cfg.clone();
-        updated_cfg
-            .provenance_acknowledgements
-            .retain(|ack| !consumed_acknowledgements.iter().any(|key| key == ack));
-        save_config(home, &updated_cfg)?;
-    }
-
     for entry in &mut store.entries {
         let entry_key = provenance_key(&entry.project_id, &entry.repo, &entry.api_base);
         if entry.retired_at.is_some() || current_keys.contains(&entry_key) {
@@ -431,6 +423,9 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
             })
             .unwrap_or(false);
         if acknowledged || (non_terminal_tasks == 0 && age_elapsed) {
+            if acknowledged {
+                consumed_acknowledgements.push(entry_key.clone());
+            }
             entry.retired_at = Some(now_string.clone());
             entry.retirement_reason = Some(if acknowledged {
                 "operator_acknowledged".to_string()
@@ -458,6 +453,14 @@ fn resolve_sweep_plan(home: &Path, cfg: &SweepConfig) -> anyhow::Result<SweepPla
                 "retained provenance key {entry_key} until acknowledgement or quiet TTL"
             ),
         });
+    }
+
+    if !consumed_acknowledgements.is_empty() {
+        let mut updated_cfg = cfg.clone();
+        updated_cfg
+            .provenance_acknowledgements
+            .retain(|ack| !consumed_acknowledgements.iter().any(|key| key == ack));
+        save_config(home, &updated_cfg)?;
     }
 
     // Explicitly-created boards that cannot be deterministically paired to a
