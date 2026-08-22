@@ -128,6 +128,24 @@ fn is_test_only_file(path: &Path) -> bool {
     if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
         return true;
     }
+    // #3320: same convention, one level out — a file inside a `tests/` DIRECTORY
+    // is test code. The `#[path]` heuristic below only scans SIBLINGS, so it
+    // cannot see a module declared from the owning file two levels up (as
+    // `src/daemon/task_sweep.rs` declares `tests/pull_list_server.rs`), and such
+    // a file was being scanned as production. The rule this test enforces
+    // exempts test code explicitly — see the module docs above and the protocol
+    // text in `src/instructions.rs` ("Tests exempt") — so the miss was in the
+    // detection, not in the code being flagged. Without this, the only way to
+    // pass was to label an explicitly-joined thread `fire-and-forget`, i.e. to
+    // write something false into the source purely to satisfy a text scan.
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("tests")
+    {
+        return true;
+    }
     let parent = match path.parent() {
         Some(p) => p,
         None => return false,
