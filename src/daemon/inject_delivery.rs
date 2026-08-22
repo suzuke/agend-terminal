@@ -240,8 +240,7 @@ fn persist_latch(home: &Path, row_id: &str, pending: &Pending) -> anyhow::Result
             agent: pending.agent.clone(),
             row_id: row_id.to_string(),
             text: pending.text.clone(),
-            // RED: nor does the durable latch.
-            channel_origin: None,
+            channel_origin: pending.channel_origin,
             transport_mode: pending.transport_mode,
             transport_epoch: pending.transport_epoch,
             rearm_pending: pending.rearm_pending,
@@ -298,11 +297,7 @@ pub(crate) fn prepare_arm(
         row_id,
         agent: agent.to_string(),
         text: text.to_string(),
-        // RED: the arm accepts the origin and drops it.
-        channel_origin: {
-            let _ = channel_origin;
-            None
-        },
+        channel_origin,
         transport_mode,
         durable_rearm_count: durable_latch.map_or(0, |latch| latch.rearm_count),
         rearm_pending: deferred_rearm,

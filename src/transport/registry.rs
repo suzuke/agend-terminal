@@ -428,10 +428,10 @@ fn envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
-    // RED: the typed argument is accepted but ignored — the origin is still
-    // recovered from the rendered header, which is the defect under test.
-    let _ = channel_origin;
-    envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
+    // #3324: typed provenance, CARRIED from the inbound construction. Never
+    // re-derived from the rendered header — a display name is free text and can
+    // contain the `]` that closes it.
+    envelope.channel_origin = channel_origin;
     Ok(envelope)
 }
 
@@ -452,9 +452,8 @@ fn self_kick_envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
-    // RED: the second envelope path behaves identically — see the first.
-    let _ = channel_origin;
-    envelope.channel_origin = crate::inbox::notify::channel_origin_from_notification(body);
+    // #3324: the second envelope path carries it identically — see the first.
+    envelope.channel_origin = channel_origin;
     Ok(envelope)
 }
 

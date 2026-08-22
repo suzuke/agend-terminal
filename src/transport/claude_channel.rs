@@ -588,11 +588,14 @@ impl ChannelRuntime {
             crate::channel::ChannelKind::Telegram => "telegram",
             crate::channel::ChannelKind::Discord => "discord",
         };
-        // RED: prose is rendered into the `message_id=` value slot when the
-        // envelope carries no logical id.
+        // #3324 (N5): only name a `message_id=` when there IS one. The former
+        // fallback rendered prose into the value slot — `message_id=the original
+        // message id from the inbox` — which reads as a literal id an agent can
+        // pass straight through. An absent logical id means the envelope never
+        // carried one, so say where to find the target instead of inventing it.
         let target = match envelope.logical_delivery_id.as_deref() {
             Some(id) => format!("with message_id={id}"),
-            None => "with message_id=the original message id from the inbox".to_string(),
+            None => "addressed to the original message, whose id is in your inbox".to_string(),
         };
         anyhow::bail!(
             "this delivery originated on the {channel} channel, which the Claude \
