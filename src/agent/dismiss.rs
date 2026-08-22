@@ -1623,8 +1623,11 @@ WARNING: Loading development channels
     fn production_wires_teardown_cancel_and_resize_bump_3314() {
         let agent_src = include_str!("mod.rs");
         assert!(
-            agent_src.contains("dev_modal_generation_over.store(true"),
-            "#3314: the read loop must cancel the generation when it exits"
+            agent_src.contains("dev_modal::arm_generation(pty_writer"),
+            "#3314/#3315 B2: the read loop must take its gate from `arm_generation`, which \
+             hands out the RAII guard that ends the generation. The two trailing statements \
+             this replaced were skipped by an unwind — the EFFECT is proven behaviourally by \
+             `pty_read_loop_ends_the_generation_on_both_exits_3315`; this pins the call site"
         );
         assert!(
             agent_src.contains("crate::agent::dev_modal::note_pty_write(writer);"),

@@ -213,6 +213,56 @@ pub(crate) fn epoch_is_armed(writer: &crate::agent::PtyWriter) -> bool {
     epochs().lock().contains_key(&writer_key(writer))
 }
 
+/// #3315 B2: RAII end-of-generation. The read loop used to cancel and disarm
+/// with two TRAILING statements, which an unwind skips — leaving the generation
+/// live (a CR still queued behind the 300ms write delay would pass its barrier
+/// and land after the loop was gone) and leaking the writer's epoch entry, which
+/// the next writer allocated at the same address would then inherit.
+/// `dismiss::InFlightGuard` is the same shape for the same reason.
+///
+/// Owning an `Arc` clone of the writer is load-bearing, not incidental: the
+/// registry is keyed by pointer identity, so keeping the allocation alive until
+/// Drop is what makes the key still mean this generation when we remove it.
+///
+/// Dropping during an unwind takes the `epochs()` lock, which is only safe
+/// because no caller holds it across a panic point: every holder in this module
+/// is a single map operation. A Drop that could re-enter a lock its own thread
+/// already holds would turn a panic into a deadlock.
+pub(crate) struct GenerationGuard {
+    writer: crate::agent::PtyWriter,
+    generation_over: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for GenerationGuard {
+    fn drop(&mut self) {
+        // Cancel FIRST, then stop tracking — a queued keystroke holds its own
+        // Arc on the flag, so removing the registry entry alone would not stop it.
+        self.generation_over
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        disarm_epoch(&self.writer);
+    }
+}
+
+/// Arm one generation: write tracking, the gate, and the guard that ends both.
+/// Handing them out together is the point — the teardown cannot be forgotten,
+/// re-ordered, or skipped by an early exit, because it is a Drop and not a step.
+pub(crate) fn arm_generation(
+    writer: &crate::agent::PtyWriter,
+    armed: bool,
+    deleted: Arc<std::sync::atomic::AtomicBool>,
+) -> (GenerationGuard, DevModalGate) {
+    let epoch = arm_epoch(writer);
+    let generation_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = GenerationGuard {
+        writer: Arc::clone(writer),
+        generation_over: Arc::clone(&generation_over),
+    };
+    (
+        guard,
+        DevModalGate::with_epoch(armed, epoch, generation_over, deleted),
+    )
+}
+
 /// Record that bytes were written into this PTY. Cheap and lock-bounded: one
 /// map lookup on a path that is already about to make a syscall.
 pub(crate) fn note_pty_write(writer: &crate::agent::PtyWriter) {

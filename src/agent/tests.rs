@@ -3510,6 +3510,52 @@ fn r8_startup_dialog_still_dismisses_before_latch_off() {
     );
 }
 
+/// #3315 B2 (unit): forced unwind with the guard live. BOTH halves of the
+/// end-of-generation must happen — cancel the in-flight CR and stop tracking the
+/// writer. The two used to be trailing statements in `pty_read_loop`, which an
+/// unwind skips; `dismiss::InFlightGuard` is the same shape for the same reason.
+///
+/// The panic is injected, not awaited: no timing, no backend, no PTY.
+#[test]
+fn generation_guard_ends_the_generation_on_unwind_3315() {
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::new(Mutex::new(Vec::new())),
+    })));
+    let (guard, gate) = crate::agent::dev_modal::arm_generation(
+        &writer,
+        true,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    // The snapshot a queued keystroke carries into its 300ms sleep.
+    let barrier = gate.write_barrier();
+    assert!(
+        barrier.still_valid() && crate::agent::dev_modal::epoch_is_armed(&writer),
+        "precondition: the generation is live and tracked before the unwind"
+    );
+
+    let h = std::thread::Builder::new()
+        .name("gen-guard-panic-3315".into())
+        .spawn(move || {
+            let _guard = guard;
+            panic!("injected unwind before any normal end-of-generation");
+        })
+        .expect("spawn");
+    assert!(h.join().is_err(), "the injected panic must propagate");
+
+    assert!(
+        !barrier.still_valid(),
+        "#3315 B2: an unwind must CANCEL the generation — a CR still queued \
+         behind the 300ms write delay would otherwise pass its barrier and land \
+         on a PTY whose read loop is already gone"
+    );
+    assert!(
+        !crate::agent::dev_modal::epoch_is_armed(&writer),
+        "#3315 B2: an unwind must also stop tracking this writer — a leaked epoch \
+         entry keeps counting for a dead generation and is inherited by the next \
+         writer allocated at the same address"
+    );
+}
+
 /// #3315 B2 (integration): the unit test above proves the guard's Drop does the
 /// right thing; this one proves the REAL `pty_read_loop` is what arms it, by
 /// making the loop die the way trailing statements cannot survive — a panic out

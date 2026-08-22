@@ -2099,16 +2099,11 @@ fn pty_read_loop(
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
     // #3314: per-generation gate — a plain local, generation-scoped by
-    // construction. See `agent::dev_modal`.
-    let dev_modal_epoch = dev_modal::arm_epoch(pty_writer);
-    // #3314: set when the read loop exits for ANY reason; see `WriteBarrier`.
-    let dev_modal_generation_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut dev_modal_gate = dev_modal::DevModalGate::with_epoch(
-        *dev_modal_armed,
-        dev_modal_epoch,
-        Arc::clone(&dev_modal_generation_over),
-        Arc::clone(deleted),
-    );
+    // construction. #3315 B2: the guard ends the generation (cancel, then
+    // disarm) from its Drop, so EVERY exit of this loop is covered, including
+    // an unwind — which the trailing statements it replaces silently skipped.
+    let (dev_modal_guard, mut dev_modal_gate) =
+        dev_modal::arm_generation(pty_writer, *dev_modal_armed, Arc::clone(deleted));
     // Monotonic base for the stability window; the gate never reads a clock.
     let dev_modal_clock = std::time::Instant::now();
     // #3314: has the agent reached Idle at least once? That is the point after
@@ -2256,10 +2251,10 @@ fn pty_read_loop(
         }
     }
 
-    // #3314: cancel FIRST, then stop tracking — a queued keystroke holds its own
-    // Arc, so removing the registry entry alone would not stop it.
-    dev_modal_generation_over.store(true, std::sync::atomic::Ordering::SeqCst);
-    dev_modal::disarm_epoch(pty_writer);
+    // #3315 B2: explicit so the ordering the trailing statements had is kept —
+    // the generation ends BEFORE `handle_pty_close`. On an unwind this line is
+    // skipped and Drop does it anyway, which is the whole point.
+    drop(dev_modal_guard);
 
     // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).
     // Previously only the Ok(0) branch called it; the Err branch broke without
@@ -2697,8 +2692,26 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its result
+/// directly. `None` -> not registered (Windows; synthetic/test writer) -- fall
+/// through to the thread-per-write mechanism below. #3315 B3: `mod write_actor`
+/// is `#[cfg(unix)]`, so this shim is the ONLY place the write path may name it
+/// — see `tests/write_actor_platform_shim_invariant.rs`.
+#[cfg(unix)]
+fn try_actor_write_guarded(
+    writer: &PtyWriter,
+    data: &[u8],
+    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
+) -> Option<std::io::Result<()>> {
+    write_actor::write_guarded(writer, data.to_vec(), PTY_WRITE_TIMEOUT, barrier)
+}
+
 #[cfg(not(unix))]
-fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
+fn try_actor_write_guarded(
+    _writer: &PtyWriter,
+    _data: &[u8],
+    _barrier: Option<crate::agent::dev_modal::WriteBarrier>,
+) -> Option<std::io::Result<()>> {
     None
 }
 
@@ -2723,12 +2736,7 @@ fn write_with_timeout_guarded(
     // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
     // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
     crate::agent::dev_modal::note_pty_write(writer);
-    if let Some(result) = write_actor::write_guarded(
-        writer,
-        data.to_vec(),
-        std::time::Duration::from_secs(5),
-        barrier,
-    ) {
+    if let Some(result) = try_actor_write_guarded(writer, data, barrier) {
         return result;
     }
 
