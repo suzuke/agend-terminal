@@ -962,14 +962,25 @@ fn codex_mcp_config_args_from(
         "mcp_servers.agend-terminal.command={}",
         toml_string_value(bin)
     ));
-    if !bridge_args.is_empty() {
-        let rendered = bridge_args
-            .iter()
-            .map(|a| toml_string_value(a))
-            .collect::<Vec<_>>()
-            .join(", ");
-        push(format!("mcp_servers.agend-terminal.args=[{rendered}]"));
-    }
+    // ALWAYS emit `args`, empty included. `-c` MERGES with the user/global config
+    // rather than replacing the server entry, so on an install that still carries
+    // an older `[mcp_servers.agend-terminal]` with e.g. `args = ["mcp"]`, omitting
+    // this would replace `command` while INHERITING the stale argument vector —
+    // the bridge would be launched as `<bridge> mcp`. Measured at codex 0.149.0:
+    // omitting it leaves `args = ["mcp"]` in place; emitting `args=[]` clears it,
+    // and unrelated user `mcp_servers` are untouched either way.
+    //
+    // `env` cannot be made authoritative the same way: codex merges that table
+    // recursively, so an inherited key we do not know the name of survives even a
+    // whole-table `env={…}` override. The two keys the bridge reads
+    // (`AGEND_HOME`, `AGEND_INSTANCE_NAME`) ARE overwritten, and a stray extra
+    // env var does not change the command line the way a stale argv does.
+    let rendered = bridge_args
+        .iter()
+        .map(|a| toml_string_value(a))
+        .collect::<Vec<_>>()
+        .join(", ");
+    push(format!("mcp_servers.agend-terminal.args=[{rendered}]"));
     push(format!(
         "mcp_servers.agend-terminal.env.AGEND_HOME={}",
         toml_string_value(home)
@@ -1696,6 +1707,8 @@ mod tests {
                 "-c",
                 "mcp_servers.agend-terminal.command='/opt/agend-mcp-bridge'",
                 "-c",
+                "mcp_servers.agend-terminal.args=[]",
+                "-c",
                 "mcp_servers.agend-terminal.env.AGEND_HOME='/home/a/.agend'",
                 "-c",
                 "mcp_servers.agend-terminal.env.AGEND_INSTANCE_NAME='dev'",
@@ -1719,7 +1732,7 @@ mod tests {
             "backslashes must survive verbatim inside a single-quoted literal"
         );
         assert_eq!(
-            args[3],
+            args[5],
             r"mcp_servers.agend-terminal.env.AGEND_HOME='C:\Users\alice\.agend'"
         );
     }
@@ -1740,12 +1753,12 @@ mod tests {
             r#"mcp_servers.agend-terminal.command="C:\\Program' Files\\bridge.exe""#
         );
         assert_eq!(
-            args[3],
+            args[5],
             r#"mcp_servers.agend-terminal.env.AGEND_HOME="/home/it's/.agend""#
         );
         assert_eq!(
             args.len(),
-            4,
+            6,
             "no instance name → no AGEND_INSTANCE_NAME entry"
         );
     }
@@ -1770,15 +1783,17 @@ mod tests {
         );
     }
 
-    /// #3317: bridge args are emitted only when there are any, and as a TOML
-    /// array whose elements use the same encoding as every other value.
+    /// #3317: `args` is emitted ALWAYS, empty included, because `-c` MERGES with
+    /// the user/global config instead of replacing the server entry — an install
+    /// carrying an older `[mcp_servers.agend-terminal] args = ["mcp"]` would
+    /// otherwise run the new command with the stale argument vector. Measured on
+    /// codex 0.149.0. Elements use the same encoding as every other value.
     #[test]
-    fn codex_mcp_config_args_render_bridge_args_only_when_present_3317() {
-        assert!(
-            !codex_mcp_config_args_from("/b", &[], "/h", None)
-                .iter()
-                .any(|a| a.contains(".args=")),
-            "no bridge args → no `args=` override"
+    fn codex_mcp_config_args_always_emit_args_to_clear_inherited_ones_3317() {
+        assert_eq!(
+            codex_mcp_config_args_from("/b", &[], "/h", None)[3],
+            "mcp_servers.agend-terminal.args=[]",
+            "an empty `args=[]` is what CLEARS an inherited value; omitting it inherits"
         );
         let args = codex_mcp_config_args_from("/b", &["serve", r"C:\x"], "/h", None);
         assert_eq!(
