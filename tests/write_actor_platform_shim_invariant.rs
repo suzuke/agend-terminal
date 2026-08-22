@@ -15,7 +15,7 @@
 //! is correctly accepted while a bare one is not.
 //!
 //! SCOPE BOUNDARY (deliberate, stated rather than implied): this pins
-//! `src/agent/mod.rs` only. Other files naming `write_actor` (`agent/tests.rs`,
+//! the two files that may name it. Other files naming `write_actor` (`agent/tests.rs`,
 //! `daemon/lifecycle.rs`, …) inherit their gate from the `mod` declaration in
 //! ANOTHER file, and this walk does not model cross-file cfg inheritance. The
 //! Windows CI job remains the total gate; this is the fast local one for the
@@ -23,7 +23,13 @@
 
 use syn::visit::{self, Visit};
 
-const TARGET: &str = "src/agent/mod.rs";
+/// Every file that may legitimately name `write_actor`. The shim was re-homed
+/// out of `mod.rs` when that file hit its anti-monolith ceiling, so the scan
+/// follows it — a pin that watched only the old location would have gone quietly
+/// vacuous the moment the code moved.
+const TARGETS: &[&str] = &["src/agent/mod.rs", "src/agent/actor_write.rs"];
+/// The file that must carry BOTH platform arms of the shim.
+const SHIM_FILE: &str = "src/agent/actor_write.rs";
 const SHIM: &str = "try_actor_write_guarded";
 
 /// Does this `cfg` predicate IMPLY `unix`? Conservative by construction:
@@ -195,8 +201,8 @@ fn collect_ungated(items: &[syn::Item], out: &mut Vec<String>) {
     }
 }
 
-fn parse_target() -> syn::File {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(TARGET);
+fn parse_file(rel: &str) -> syn::File {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     let src =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     syn::parse_file(&src).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
@@ -204,20 +210,24 @@ fn parse_target() -> syn::File {
 
 #[test]
 fn write_actor_is_never_named_outside_a_unix_gate_3315() {
-    let file = parse_target();
     let mut ungated = Vec::new();
-    collect_ungated(&file.items, &mut ungated);
+    for target in TARGETS {
+        let file = parse_file(target);
+        let mut hits = Vec::new();
+        collect_ungated(&file.items, &mut hits);
+        ungated.extend(hits.into_iter().map(|hit| format!("{target}: {hit}")));
+    }
     assert!(
         ungated.is_empty(),
         "#3315 B3: `mod write_actor` is #[cfg(unix)], so naming it from an item that also \
          compiles on Windows is a build break the local (macOS/Linux) gates cannot see. \
-         Route the call through the `{SHIM}` cfg-pair instead. Ungated in {TARGET}: {ungated:?}"
+         Route the call through the `{SHIM}` cfg-pair instead. Ungated: {ungated:?}"
     );
 }
 
 #[test]
 fn the_actor_write_shim_keeps_both_platform_arms_3315() {
-    let file = parse_target();
+    let file = parse_file(SHIM_FILE);
     let mut unix_arm = 0usize;
     let mut non_unix_arm = 0usize;
     let mut arities = Vec::new();
@@ -245,7 +255,7 @@ fn the_actor_write_shim_keeps_both_platform_arms_3315() {
         "#3315 B3: `{SHIM}` must exist exactly once per platform arm — one #[cfg(unix)] \
          delegating to write_actor and one #[cfg(not(unix))] returning None. Deleting the \
          non-Unix arm compiles here and breaks the Windows job. Found {unix_arm} unix / \
-         {non_unix_arm} non-unix in {TARGET}"
+         {non_unix_arm} non-unix in {SHIM_FILE}"
     );
     assert!(
         arities.windows(2).all(|w| w[0] == w[1]),

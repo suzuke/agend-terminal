@@ -5189,7 +5189,7 @@ fn codex_argv_3317(
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, detected) = build_command(&config).expect("build_command codex");
+    let (cmd, detected, _provenance) = build_command(&config).expect("build_command codex");
     assert_eq!(detected, Some(Backend::Codex));
     argv_of_3317(&cmd)
 }
@@ -5310,7 +5310,7 @@ fn non_codex_backends_get_no_mcp_overrides_3317() {
             crash_tx: None,
             shutdown: None,
         };
-        let (cmd, _) = build_command(&config).expect("build_command");
+        let (cmd, _, _) = build_command(&config).expect("build_command");
         let argv = argv_of_3317(&cmd);
         assert!(
             !argv

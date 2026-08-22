@@ -27,6 +27,8 @@ use dismiss::{
 
 pub mod deleting;
 
+/// #3315 B3: platform shim so the write path never names `write_actor` directly.
+mod actor_write;
 #[cfg(unix)]
 mod write_actor;
 
@@ -2692,29 +2694,6 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its result
-/// directly. `None` -> not registered (Windows; synthetic/test writer) -- fall
-/// through to the thread-per-write mechanism below. #3315 B3: `mod write_actor`
-/// is `#[cfg(unix)]`, so this shim is the ONLY place the write path may name it
-/// — see `tests/write_actor_platform_shim_invariant.rs`.
-#[cfg(unix)]
-fn try_actor_write_guarded(
-    writer: &PtyWriter,
-    data: &[u8],
-    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
-) -> Option<std::io::Result<()>> {
-    write_actor::write_guarded(writer, data.to_vec(), PTY_WRITE_TIMEOUT, barrier)
-}
-
-#[cfg(not(unix))]
-fn try_actor_write_guarded(
-    _writer: &PtyWriter,
-    _data: &[u8],
-    _barrier: Option<crate::agent::dev_modal::WriteBarrier>,
-) -> Option<std::io::Result<()>> {
-    None
-}
-
 /// Test-only cross-module registration check (used by `daemon::lifecycle`'s
 /// Unix-only test — `write_actor` doesn't exist on other platforms).
 #[cfg(all(test, unix))]
@@ -2736,7 +2715,7 @@ fn write_with_timeout_guarded(
     // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
     // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
     crate::agent::dev_modal::note_pty_write(writer);
-    if let Some(result) = try_actor_write_guarded(writer, data, barrier) {
+    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier) {
         return result;
     }
 
