@@ -1363,6 +1363,170 @@ fn legacy_inbound_ambiguous_accepts_exact_start_ack() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3324: the bridge's own MCP instructions are one of the two signals that
+/// sent the agent to the wrong tool, and BOTH halves were wrong.
+///
+/// It described the envelope as `source="agend-terminal"` when the real wrapper
+/// is `source="agend-claude-channel" ... sender_id="agend-terminal"` — the two
+/// fields transposed — and then said "reply with the reply tool", which names
+/// two different tools in this environment. An agent reading it reasons
+/// correctly to the wrong conclusion.
+#[test]
+fn bridge_instructions_describe_the_real_envelope_and_the_exact_tool_3324() {
+    let home = home("instructions-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let response = mcp_message(
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        &runtime,
+    )
+    .expect("initialize response");
+    let text = response["result"]["instructions"]
+        .as_str()
+        .expect("instructions")
+        .to_string();
+    let _ = fs::remove_dir_all(home);
+    assert!(
+        text.contains("source=\"agend-claude-channel\""),
+        "#3324: instructions must describe the envelope the agent actually \
+         receives; got {text:?}"
+    );
+    assert!(
+        !text.contains("source=\"agend-terminal\""),
+        "#3324: the transposed source/sender_id description must be gone; got {text:?}"
+    );
+    assert!(
+        text.contains("mcp__agend-terminal__reply"),
+        "#3324: instructions must name the tool that actually reaches an \
+         external channel, since this server's own `reply` does not; got {text:?}"
+    );
+}
+
+/// #3324: seed one delivery exactly as the daemon would, and hand the runtime
+/// the inbound mapping the bridge webhook records.
+fn seed_delivery(
+    home: &Path,
+    locator: &SessionLocator,
+    runtime: &ChannelRuntime,
+    body: &str,
+    origin: Option<crate::channel::ChannelKind>,
+) -> (Uuid, String) {
+    let mut envelope = DeliveryEnvelope::new(
+        "claude-agent",
+        locator.clone(),
+        crate::transport::envelope::DeliveryKind::Notification,
+        body,
+        None,
+    );
+    envelope.channel_origin = origin;
+    envelope.logical_delivery_id = Some("m-3324".to_string());
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    runtime
+        .remember_inbound(delivery_id, &chat_id, Some("agend-terminal"), body)
+        .expect("inbound mapping");
+    (delivery_id, chat_id)
+}
+
+fn call_bridge_reply(runtime: &ChannelRuntime, chat_id: &str, delivery_id: Uuid) -> Value {
+    mcp_message(
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params": {
+                "name":"reply",
+                "arguments": {
+                    "chat_id": chat_id,
+                    "delivery_id": delivery_id,
+                    "text":"the answer the user is waiting for"
+                }
+            }
+        }),
+        runtime,
+    )
+    .expect("tool response")
+}
+
+/// #3324 RED: a delivery that ORIGINATED on an external channel must not be
+/// replied to through the bridge.
+///
+/// The bridge is an inbound transport. Its `reply` records a transport
+/// acknowledgement and never reaches Telegram — and the environment exposes a
+/// SECOND tool also called `reply` that does. The observed incident: the agent
+/// called this one twice, got success twice, and the user received nothing for
+/// eleven minutes while the escalation ladder ran.
+///
+/// Fail CLOSED, and fail BEFORE the Reply record: a recorded reply is what makes
+/// the loss invisible afterwards.
+#[test]
+fn bridge_reply_is_refused_for_an_external_channel_origin_3324() {
+    let home = home("external-origin-refused-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery(
+        &home,
+        &locator,
+        &runtime,
+        "[user:chiachenghuang via telegram] please research this",
+        Some(crate::channel::ChannelKind::Telegram),
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: an external-origin delivery must be REFUSED, not acknowledged; got {response}"
+    );
+    assert!(
+        message.contains("mcp__agend-terminal__reply"),
+        "#3324: the refusal must name the exact tool that can deliver, or the \
+         agent picks the wrong `reply` again; got {message:?}"
+    );
+    assert!(
+        message.contains("m-3324"),
+        "#3324: the refusal must name the target identity so the agent can \
+         address the right message; got {message:?}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_none(),
+        "#3324: nothing may be recorded as replied — the obligation stays armed"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324: the guard must not overreach. A delivery that originated INSIDE AgEnD
+/// is the bridge's own to answer, and refusing it would break every internal
+/// query.
+#[test]
+fn bridge_reply_still_serves_an_internal_delivery_3324() {
+    let home = home("internal-origin-served-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery(
+        &home,
+        &locator,
+        &runtime,
+        "[from:codex-125550] status?",
+        None,
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    assert!(
+        response.get("error").is_none(),
+        "#3324: an internal delivery must still be accepted; got {response}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_some(),
+        "#3324: the internal reply must still be recorded"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 #[test]
 fn reply_requires_delivery_and_chat_correlation() {
     let home = home("correlation");

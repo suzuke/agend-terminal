@@ -6058,3 +6058,18 @@ fn audit3_005_mark_ci_watch_superseded_preserves_corrupt_line_control() {
     );
     fs::remove_dir_all(&home).ok();
 }
+
+/// #3324: the per-message hint is the LAST thing an agent reads before choosing
+/// a tool, and "the reply tool" names two different tools in a ChannelBridge
+/// environment — one of which acknowledges without delivering. Name the one
+/// that reaches the channel.
+#[test]
+fn channel_reply_hint_names_the_exact_tool_3324() {
+    let hint =
+        crate::inbox::NotifySource::Channel("someone", crate::channel::ChannelKind::Telegram)
+            .reply_hint();
+    assert!(
+        hint.contains("mcp__agend-terminal__reply"),
+        "#3324: the channel hint must name the exact delivering tool; got {hint:?}"
+    );
+}
