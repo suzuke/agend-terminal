@@ -37,10 +37,8 @@ pub(super) struct PullListServer {
     /// not arrived yet and must be waited out.
     pub(super) inject_read_error: Arc<AtomicBool>,
     pub(super) inject_read_would_block: Arc<AtomicBool>,
-    /// #3320: forces the LINUX shape — a BLOCKING accepted socket — on whatever
-    /// platform the test runs on. macOS inherits the listener's non-blocking
-    /// mode and Linux does not, so without this the guard that matters is
-    /// unreachable from a developer machine and only CI can see it fail.
+    /// #3320: forces the LINUX shape — a BLOCKING accepted socket — on any
+    /// platform, so the normalisation guard below is reachable off CI.
     pub(super) simulate_blocking_accept: Arc<AtomicBool>,
     /// #3320: makes the mode normalisation itself fail. Otherwise only a real
     /// `fcntl` failure reaches that arm, which no test can schedule.
@@ -153,13 +151,11 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                     }
                     accepted_for_thread.fetch_add(1, Ordering::AcqRel);
                     // #3320: WAIT for the request instead of answering blind.
-                    // macOS really does return `EAGAIN` here — BSD accepted
-                    // sockets inherit the listener's non-blocking mode, set
-                    // above — so a single discarded attempt raced every request.
-                    // Losing that race strands the response: an unread request
-                    // makes the close send an RST rather than a FIN, and the
-                    // client loses what was written. `stop` still wins, so
-                    // `Drop` cannot hang behind a client that never speaks.
+                    // A single attempt raced every request, and losing that race
+                    // STRANDS the response: an unread request makes the close
+                    // send an RST rather than a FIN, so the client loses what was
+                    // written. `stop` still wins, so `Drop` cannot hang behind a
+                    // client that never speaks.
                     let mut request = [0_u8; 2048];
                     let read = loop {
                         if stop_for_thread.load(Ordering::Acquire) {
@@ -296,9 +292,8 @@ fn wait_for_at_least(counter: &Arc<AtomicU32>, target: u32, budget: StdDuration)
 }
 
 /// #3320: wait for the serving thread to RECORD why it died. Same reason as
-/// `wait_for_at_least`: a fixed sleep turns a slow thread into a false failure,
-/// which is the mirror image of the false pass — both are the test measuring the
-/// scheduler instead of the property.
+/// `wait_for_at_least`, mirrored: a fixed sleep here makes a slow thread a FALSE
+/// FAILURE rather than a false pass.
 fn wait_for_cause(slot: &Arc<Mutex<Option<String>>>, budget: StdDuration) -> Option<String> {
     let deadline = Instant::now() + budget;
     loop {
@@ -328,10 +323,10 @@ fn get(base_url: &str) -> std::io::Result<String> {
 ///
 /// The deadline it replaces was `Instant::now() + 5s` fixed at CONSTRUCTION,
 /// while every caller does substantial setup — config, `resolve_sweep_plan`,
-/// task creation, permission changes — before the sweep ever issues its
-/// request. On a loaded runner that setup outlives the window, the thread is
-/// already gone, the fetch fails, and the task is never closed. That is the
-/// confirmed mechanism behind the `left: Open, right: Done` flake.
+/// task creation, permission changes — before the sweep issues its request. On a
+/// loaded runner that setup outlives the window: the thread is already gone, the
+/// fetch fails, the task is never closed. The confirmed mechanism behind the
+/// `left: Open, right: Done` flake.
 ///
 /// SLOW BY DESIGN, NOT FLAKY: the gap deliberately outlasts the 5s deadline
 /// being removed, and more elapsed time can never make this pass falsely. A
@@ -362,14 +357,13 @@ fn server_serves_after_outlasting_the_old_construction_deadline_3320() {
 
 /// #3320 RED-B: a dead server thread must not turn `Drop` into a panic.
 ///
-/// The accept loop ends `Err(error) => panic!(...)` and `Drop` joins with
-/// `.unwrap()`, so a thread that hit an accept error makes the JOIN panic. When
-/// the test is already unwinding from its own failure that is a panic during
-/// unwind — an abort, with the real assertion message lost behind it. The
-/// trigger is not hypothetical: on a non-blocking listener `WouldBlock` is
-/// handled, so that arm fires on a genuine syscall failure, realistically
-/// `EMFILE`/`ENFILE` from a parallel run where every one of these tests binds
-/// its own listener — the SAME load that produces RED-A's timing miss.
+/// The accept loop ended `Err(error) => panic!(...)` while `Drop` joined with
+/// `.unwrap()`, so an accept error made the JOIN panic — during a test's own
+/// unwind that is an abort, with the real assertion lost behind it. The trigger
+/// is not hypothetical: `WouldBlock` is handled, so that arm fires on a genuine
+/// syscall failure, realistically `EMFILE`/`ENFILE` from a parallel run where
+/// every one of these tests binds its own listener — the SAME load that produces
+/// RED-A's timing miss.
 #[test]
 fn dead_server_thread_does_not_panic_on_drop_3320() {
     let server = pull_list_server("[]".to_string());
@@ -400,10 +394,9 @@ fn dead_server_thread_does_not_panic_on_drop_3320() {
 /// STRIPS its cause. Both are wrong, in opposite directions, and recording the
 /// cause is what gets both right.
 ///
-/// It matters most on Windows, where these tests have never yet run: an accepted
-/// socket may inherit the listener's non-blocking mode there, in which case
-/// `write_all` can return `WouldBlock` — a real, uninjected instance of exactly
-/// this arm, on the one platform with no evidence either way.
+/// Since the accepted socket is now normalised to non-blocking on every
+/// platform, `write_all` can return `WouldBlock` here for real — measured as
+/// unreachable at these response sizes, and tracked separately.
 #[test]
 fn write_side_failure_is_reported_not_swallowed_3320() {
     let server = pull_list_server("[\"body-3320\"]".to_string());
@@ -460,19 +453,13 @@ fn read_side_failure_is_reported_not_swallowed_3320() {
 /// #3320 RED-E: a would-block read means the request has NOT ARRIVED YET, and
 /// the stand-in must wait for it instead of answering a request it never read.
 ///
-/// This is not a hypothetical arm. macOS returns `EAGAIN` here from a REAL
-/// `read`: BSD accepted sockets inherit the listener's non-blocking mode, which
-/// this file sets. The single discarded attempt therefore raced every request —
-/// and losing that race is not harmless, because an unread request means the
-/// close sends an RST instead of a FIN and the client loses the response the
-/// server did write. That is a second, independent producer of the same
-/// `left: Open, right: Done` flake this branch exists to remove, in the arm
-/// nobody was looking at.
-///
-/// It is also the reviewer's Windows concern, answered with a measurement
-/// instead of a guess: whatever Winsock does with inheritance, waiting is
-/// correct on every platform and a stand-in that never waits is wrong on this
-/// one.
+/// Not a hypothetical arm: macOS returns `EAGAIN` here from a REAL `read`, so
+/// one discarded attempt raced every request — and losing that race STRANDS the
+/// response (see the accept loop). A second, independent producer of the same
+/// `left: Open, right: Done` flake, in the arm nobody was looking at. It also
+/// answers the reviewer's Windows concern by measurement rather than guess:
+/// waiting is correct on every platform, and never waiting is already wrong on
+/// this one.
 #[test]
 fn a_would_block_read_is_waited_out_not_answered_blind_3320() {
     let server = pull_list_server("[\"sentinel-3320\"]".to_string());
@@ -532,17 +519,15 @@ fn a_would_block_read_is_waited_out_not_answered_blind_3320() {
 /// #3320: waiting for a request must not wedge teardown — on EITHER platform.
 ///
 /// The wait is unbounded by time on purpose (a clock is what this branch
-/// removes), so `stop` has to end it. `stop` is only reachable if `read`
-/// RETURNS, which makes the accepted socket's blocking mode load-bearing: macOS
-/// inherits the listener's non-blocking flag and **Linux does not**, so a
-/// blocking read on a client that never speaks parks forever and `Drop`'s join
-/// waits on a thread that will never finish. CI killed exactly that at 120s.
+/// removes), so `stop` has to end it — which is only reachable if `read`
+/// RETURNS, making the accepted socket's mode load-bearing (see the accept
+/// loop). CI killed this exact case at 120s.
 ///
-/// So this test FORCES the Linux shape everywhere, and it deliberately does not
-/// use `Drop` to observe the outcome: joining a parked thread hangs the binary
-/// instead of reporting the failure, which is the one thing worse than the flake
-/// this branch replaced. It asks the thread whether it ENDED, and on failure
-/// leaks the server rather than joining it.
+/// So the test FORCES the Linux shape, and deliberately does not use `Drop` to
+/// observe the outcome: joining a parked thread hangs the binary instead of
+/// reporting the failure, which is the one thing worse than the flake this
+/// branch replaced. It asks the thread whether it ENDED, and on failure leaks
+/// the server rather than joining it.
 #[test]
 fn a_silent_client_does_not_wedge_teardown_3320() {
     let server = pull_list_server("[]".to_string());
@@ -617,11 +602,10 @@ fn accepted_socket_mode_failure_is_reported_not_ignored_3320() {
 /// #3320: the recorder's own two documented properties, pinned.
 ///
 /// `record_thread_error` claims it never panics and that the FIRST cause wins.
-/// Nothing tested either, which is the same shape of defect this branch exists
-/// to remove — a documented property with no defender — and it matters here
-/// because both failure modes are silent: a recorder that panics IS the failure
-/// it exists to report, and one that overwrites hands the reader the wrong
-/// reason for the death it is explaining.
+/// Nothing tested either — a documented property with no defender, the same
+/// shape this branch exists to remove — and both failure modes are silent: a
+/// recorder that panics IS the failure it reports, and one that overwrites hands
+/// the reader the wrong reason for the death it is explaining.
 #[test]
 fn recorded_cause_keeps_the_first_and_never_panics_3320() {
     let slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
