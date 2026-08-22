@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 pub(super) struct PullListServer {
     pub(super) base_url: String,
@@ -23,10 +23,10 @@ pub(super) struct PullListServer {
     /// under a parallel run), which no test can schedule.
     pub(super) inject_accept_error: Arc<AtomicBool>,
     /// Why the serving loop ended, when it ended on a failure rather than on
-    /// `stop`. Covers BOTH arms: a failed `accept`, and a failed body read or
-    /// response write. Without the write arm recorded here, its panic is
-    /// discarded by `Drop`'s quiet join and the dependent test fails with no
-    /// cause attached.
+    /// `stop`. Covers every arm that can end it: a failed `accept`, a failed
+    /// request read, a poisoned body lock, and a failed response write. Without
+    /// a cause recorded here the arm's failure is discarded by `Drop`'s quiet
+    /// join and the dependent test fails with no cause attached.
     pub(super) thread_error: Arc<Mutex<Option<String>>>,
     /// #3320: makes the write arm fail. Otherwise only a real socket error
     /// reaches it, which no test can schedule.
@@ -87,7 +87,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         // outlives the test binary, which is the right trade for scaffolding —
         // a leak is a bug to fix, not something to paper over with a timeout
         // that silently breaks working tests.
-        while !stop_for_thread.load(Ordering::Acquire) {
+        'serving: while !stop_for_thread.load(Ordering::Acquire) {
             let accepted = if inject_for_thread.load(Ordering::Acquire) {
                 Err(std::io::Error::other("#3320 injected accept failure"))
             } else {
@@ -95,18 +95,51 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
             };
             match accepted {
                 Ok((mut stream, _)) => {
+                    // #3320: WAIT for the request instead of answering blind.
+                    // macOS really does return `EAGAIN` here — BSD accepted
+                    // sockets inherit the listener's non-blocking mode, set
+                    // above — so a single discarded attempt raced every request.
+                    // Losing that race strands the response: an unread request
+                    // makes the close send an RST rather than a FIN, and the
+                    // client loses what was written. `stop` still wins, so
+                    // `Drop` cannot hang behind a client that never speaks.
                     let mut request = [0_u8; 2048];
-                    let read = if inject_read_for_thread.load(Ordering::Acquire) {
-                        Err(std::io::Error::other("#3320 injected read failure"))
-                    } else if inject_read_would_block_for_thread.load(Ordering::Acquire) {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "#3320 injected read would-block",
-                        ))
-                    } else {
-                        stream.read(&mut request)
+                    let read = loop {
+                        if stop_for_thread.load(Ordering::Acquire) {
+                            break 'serving;
+                        }
+                        let attempt = if inject_read_for_thread.load(Ordering::Acquire) {
+                            Err(std::io::Error::other("#3320 injected read failure"))
+                        } else if inject_read_would_block_for_thread.load(Ordering::Acquire) {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "#3320 injected read would-block",
+                            ))
+                        } else {
+                            stream.read(&mut request)
+                        };
+                        match attempt {
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                std::thread::sleep(StdDuration::from_millis(5));
+                            }
+                            settled => break settled,
+                        }
                     };
-                    let _ = read;
+                    // Anything else IS a failure, and ends the exchange with a
+                    // cause — the arm the review found swallowed.
+                    if let Err(error) = read {
+                        record_thread_error(
+                            &thread_error_for_thread,
+                            format!("request read failed: {error}"),
+                        );
+                        break;
+                    }
                     // #3320: record-and-break, never panic. A panic here dies
                     // inside the server thread, and `Drop`'s quiet join discards
                     // it — the dependent test then fails with no cause.
@@ -386,6 +419,32 @@ fn a_would_block_read_is_waited_out_not_answered_blind_3320() {
         "#3320: waiting for a request is not a death and must not be recorded \
          as one — a wrong cause is worse than none, because it gets believed; \
          got {cause:?}"
+    );
+}
+
+/// #3320: waiting for a request must not wedge teardown.
+///
+/// The wait added for the arm above is unbounded BY TIME on purpose — a clock is
+/// what this branch is removing — so `stop` has to be the thing that ends it.
+/// A client that connects and never speaks is the case that tells the two apart:
+/// `Drop` sets `stop` and JOINS, so a wait that only watched the socket would
+/// hang the test binary rather than fail it, which is worse than the flake it
+/// replaced.
+#[test]
+fn a_silent_client_does_not_wedge_teardown_3320() {
+    let server = pull_list_server("[]".to_string());
+    let addr = server.base_url.trim_start_matches("http://").to_string();
+
+    // Connect and say NOTHING, so the stand-in is parked in the read wait.
+    let _silent = std::net::TcpStream::connect(&addr).expect("#3320: connect");
+    std::thread::sleep(StdDuration::from_millis(50));
+
+    let started = Instant::now();
+    drop(server);
+    assert!(
+        started.elapsed() < StdDuration::from_secs(5),
+        "#3320: teardown must end the read wait through `stop`; it took {:?}",
+        started.elapsed()
     );
 }
 
