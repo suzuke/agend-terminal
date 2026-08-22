@@ -274,3 +274,47 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
     // And teardown must still be quiet.
     drop(server);
 }
+
+/// #3320: the recorder's own two documented properties, pinned.
+///
+/// `record_thread_error` claims it never panics and that the FIRST cause wins.
+/// Nothing tested either, which is the same shape of defect this branch exists
+/// to remove — a documented property with no defender — and it matters here
+/// because both failure modes are silent: a recorder that panics IS the failure
+/// it exists to report, and one that overwrites hands the reader the wrong
+/// reason for the death it is explaining.
+#[test]
+fn recorded_cause_keeps_the_first_and_never_panics_3320() {
+    let slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    record_thread_error(&slot, "the cause that ended the loop".to_string());
+    record_thread_error(&slot, "a later, misleading cause".to_string());
+    assert_eq!(
+        slot.lock().unwrap().as_deref(),
+        Some("the cause that ended the loop"),
+        "#3320: the FIRST cause must win — it is the one that ended the loop; a \
+         later one describes the aftermath and would misattribute the failure"
+    );
+
+    // A poisoned slot must still record, not panic: the poisoning is itself a
+    // symptom of the failure being reported.
+    let poisoned: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let holder = Arc::clone(&poisoned);
+    let _ = std::thread::Builder::new()
+        .name("poison-3320".into())
+        .spawn(move || {
+            let _guard = holder.lock().unwrap();
+            panic!("#3320: poison the slot");
+        })
+        .expect("spawn")
+        .join();
+    record_thread_error(&poisoned, "recorded despite poison".to_string());
+    assert_eq!(
+        poisoned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref(),
+        Some("recorded despite poison"),
+        "#3320: the recorder must survive a poisoned slot — a panic in the error \
+         path would be the very failure it exists to report"
+    );
+}
