@@ -13,11 +13,19 @@ thread_local! {
     /// mid-run — which is exactly how the first draft of this seam produced
     /// three spurious failures.
     static INLINE_DISMISS_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #3320: forces `spawn_dismiss_thread` to fail, so the stranding path is
+    /// reachable from a test.
+    static FORCE_DISMISS_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_inline_dismiss_write_for_test(on: bool) {
     INLINE_DISMISS_WRITE.with(|f| f.set(on));
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_dismiss_spawn_failure(on: bool) {
+    FORCE_DISMISS_SPAWN_FAILURE.with(|f| f.set(on));
 }
 
 #[cfg(test)]
@@ -115,6 +123,23 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         DISMISS_IN_FLIGHT.lock().remove(&self.0);
     }
+}
+
+/// #3320: spawn the dismiss-keystroke thread. Extracted so a test can force the
+/// FAILURE branch — the one that must leave the generation's one-shot unspent.
+/// A real `spawn` failure is resource exhaustion, which no test can schedule, so
+/// without this seam the stranding path is unreachable and therefore unpinnable.
+fn spawn_dismiss_thread<F>(body: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    if FORCE_DISMISS_SPAWN_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("#3320 injected spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name("dismiss-dialog".into())
+        .spawn(body)
 }
 
 fn compile_dismiss_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
@@ -407,60 +432,56 @@ pub fn try_prepared_dismiss_dialog(
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
             // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
             // on any exit (incl. panic), armed at thread entry below.
-            if std::thread::Builder::new()
-                .name("dismiss-dialog".into())
-                .spawn(move || {
-                    // #1886 follow-up: arm the in-flight removal as a Drop guard at
-                    // thread entry so a panic / early-return still frees the slot.
-                    let _guard = InFlightGuard(agent.clone());
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    // #3314 W3: re-check as late as we can. This closes the wide
-                    // decide-then-sleep-then-write window, but a check and a
-                    // syscall cannot be atomic with respect to another process's
-                    // output, so the last instant before `write` remains
-                    // irreducible. Bounded by exactly one CR and no retry.
-                    if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
-                        tracing::debug!(
-                            agent = %agent,
-                            "#3314: startup-modal keystroke cancelled before write"
-                        );
-                        return;
-                    }
-                    // Send keys in chunks split on \r/\n boundaries with delay between,
-                    // so TUI frameworks process navigation before confirmation.
-                    // H13: route each chunk through `write_with_timeout` (bounded
-                    // worker + 5s deadline) rather than holding the raw shared
-                    // `writer.lock()` across an unbounded `write_all`. A hung agent
-                    // that has stopped draining its PTY input buffer — exactly the
-                    // state that triggers a dismiss — would otherwise pin the writer
-                    // lock forever, wedging every future inject to that agent until
-                    // daemon restart. `write_with_timeout` flushes internally.
-                    let mut start = 0;
-                    for (i, &b) in keys.iter().enumerate() {
-                        if b == b'\r' || b == b'\n' {
-                            // Send everything up to (not including) this Enter
-                            if start < i {
-                                let _ = write_with_timeout_guarded(
-                                    &writer,
-                                    &keys[start..i],
-                                    barrier.clone(),
-                                );
-                                std::thread::sleep(std::time::Duration::from_millis(200));
-                            }
-                            // Send the Enter
-                            let _ =
-                                write_with_timeout_guarded(&writer, &keys[i..=i], barrier.clone());
-                            start = i + 1;
+            if spawn_dismiss_thread(move || {
+                // #1886 follow-up: arm the in-flight removal as a Drop guard at
+                // thread entry so a panic / early-return still frees the slot.
+                let _guard = InFlightGuard(agent.clone());
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                // #3314 W3: re-check as late as we can. This closes the wide
+                // decide-then-sleep-then-write window, but a check and a
+                // syscall cannot be atomic with respect to another process's
+                // output, so the last instant before `write` remains
+                // irreducible. Bounded by exactly one CR and no retry.
+                if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+                    tracing::debug!(
+                        agent = %agent,
+                        "#3314: startup-modal keystroke cancelled before write"
+                    );
+                    return;
+                }
+                // Send keys in chunks split on \r/\n boundaries with delay between,
+                // so TUI frameworks process navigation before confirmation.
+                // H13: route each chunk through `write_with_timeout` (bounded
+                // worker + 5s deadline) rather than holding the raw shared
+                // `writer.lock()` across an unbounded `write_all`. A hung agent
+                // that has stopped draining its PTY input buffer — exactly the
+                // state that triggers a dismiss — would otherwise pin the writer
+                // lock forever, wedging every future inject to that agent until
+                // daemon restart. `write_with_timeout` flushes internally.
+                let mut start = 0;
+                for (i, &b) in keys.iter().enumerate() {
+                    if b == b'\r' || b == b'\n' {
+                        // Send everything up to (not including) this Enter
+                        if start < i {
+                            let _ = write_with_timeout_guarded(
+                                &writer,
+                                &keys[start..i],
+                                barrier.clone(),
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
                         }
+                        // Send the Enter
+                        let _ = write_with_timeout_guarded(&writer, &keys[i..=i], barrier.clone());
+                        start = i + 1;
                     }
-                    if start < keys.len() {
-                        let _ =
-                            write_with_timeout_guarded(&writer, &keys[start..], barrier.clone());
-                    }
-                    tracing::debug!(agent = %agent, "dismiss keystrokes sent");
-                    // H2: in-flight slot freed by `_guard` on scope exit.
-                })
-                .is_err()
+                }
+                if start < keys.len() {
+                    let _ = write_with_timeout_guarded(&writer, &keys[start..], barrier.clone());
+                }
+                tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                // H2: in-flight slot freed by `_guard` on scope exit.
+            })
+            .is_err()
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
                 DISMISS_IN_FLIGHT.lock().remove(name);
@@ -1734,29 +1755,98 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 r2 RED-4 (P2-D): the one-shot must be spent only AFTER the write is
-    /// successfully submitted. Today `mark_enqueued` runs before the thread spawn
-    /// and before the actor enqueue, so a spawn failure or a full queue leaves the
-    /// generation permanently `Refused(Spent)` with the modal unanswered — the
-    /// exact stranding the rule exists to prevent.
+    /// #3320: the one-shot must survive a FAILED submission and be spent by a
+    /// successful one — asserted through behaviour, not through the file's text.
+    ///
+    /// This replaces `one_shot_is_spent_only_after_successful_submission_3314`,
+    /// which compared the BYTE OFFSETS of `dev_gate.mark_enqueued()` and the
+    /// dismiss write in this file's own source. That pin was worse than
+    /// positional: `find` returns the FIRST occurrence of each, and both first
+    /// occurrences live inside the `INLINE_DISMISS_WRITE` test seam — so it
+    /// compared two lines of test-only code and never looked at the production
+    /// spawn path at all. Reintroducing the stranding bug left it GREEN, along
+    /// with all 52 tests in this module.
+    ///
+    /// What is actually at stake: spending the generation's single answer before
+    /// the write is submitted strands the agent at an unanswered modal forever,
+    /// because `Refused(Spent)` is permanent and there is no retry.
     #[test]
-    fn one_shot_is_spent_only_after_successful_submission_3314() {
-        let src = include_str!("dismiss.rs");
-        // Anchored on the WRITE, not the thread spawn: the first `mark_enqueued`
-        // in the file lives in the inline test branch, so comparing against the
-        // spawn measured the wrong occurrence. (My first draft of this pin did
-        // exactly that and stayed red against correct code.)
-        let spend = src
-            .find("dev_gate.mark_enqueued()")
-            .expect("the one-shot spend must exist");
-        let write = src
-            .find("let _ = write_with_timeout(&writer, &keys);")
-            .expect("the dismiss write must exist");
+    fn one_shot_survives_a_failed_submission_and_is_spent_by_a_successful_one_3320() {
+        let prepared = claude_prepared_patterns_3314();
+        let (writer, bytes) = recording_writer_3314();
+        let (mut gate, now) = ungated_stable_3314(DEV_CHANNEL_STARTUP_MODAL_3314);
+
+        // 1. The submission FAILS. Nothing is written, and the generation must
+        //    keep its answer.
+        set_force_dismiss_spawn_failure(true);
+        let attempted = try_prepared_dismiss_dialog(
+            "agent-3320",
+            DEV_CHANNEL_STARTUP_MODAL_3314,
+            &writer,
+            &prepared,
+            DismissScanScope::RearmPreIdle,
+            &mut gate,
+            now,
+        );
+        set_force_dismiss_spawn_failure(false);
         assert!(
-            spend > write,
-            "#3314 P2-D: the one-shot is spent BEFORE the write is submitted; a \
-             failed spawn or a full queue then strands the generation as Spent \
-             with the modal unanswered"
+            attempted,
+            "fixture check: the pattern must match, so a dismissal is attempted"
+        );
+        assert!(
+            bytes.lock().is_empty(),
+            "fixture check: a failed submission writes nothing"
+        );
+
+        // 2. The retry must still be able to answer. If the one-shot was spent
+        //    before submission, the gate now refuses Spent and NOTHING is ever
+        //    written — the modal stays up for the life of the generation.
+        let retried = try_prepared_dismiss_dialog(
+            "agent-3320",
+            DEV_CHANNEL_STARTUP_MODAL_3314,
+            &writer,
+            &prepared,
+            DismissScanScope::RearmPreIdle,
+            &mut gate,
+            now,
+        );
+        assert!(
+            retried,
+            "#3320: a failed submission must leave the generation able to answer; \
+             the one-shot was spent before the write was submitted, so the agent \
+             is stranded at an unanswered modal with no retry"
+        );
+        for _ in 0..40 {
+            if !bytes.lock().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            bytes.lock().as_slice(),
+            b"\r",
+            "#3320: the successful retry sends EXACTLY one Enter"
+        );
+
+        // 3. And now it IS spent: a further identical frame adds no bytes.
+        let again = try_prepared_dismiss_dialog(
+            "agent-3320-second",
+            DEV_CHANNEL_STARTUP_MODAL_3314,
+            &writer,
+            &prepared,
+            DismissScanScope::RearmPreIdle,
+            &mut gate,
+            now,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert!(
+            !again,
+            "#3320: the one-shot is spent, so a later frame must be refused"
+        );
+        assert_eq!(
+            bytes.lock().as_slice(),
+            b"\r",
+            "#3320: still exactly one Enter — the one-shot bounds the generation"
         );
     }
 
