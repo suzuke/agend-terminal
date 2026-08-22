@@ -1010,10 +1010,7 @@ mod tests {
 
     fn hold_metadata_lock(
         home: &Path,
-    ) -> (
-        crossbeam_channel::Sender<()>,
-        std::thread::JoinHandle<()>,
-    ) {
+    ) -> (crossbeam_channel::Sender<()>, std::thread::JoinHandle<()>) {
         let lock_path = agent_ops::metadata_path_resolved(home, "agent1").with_extension("lock");
         let (locked_tx, locked_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
@@ -2189,8 +2186,7 @@ mod tests {
         let metadata = std::fs::read_to_string(home.join("metadata/agent1.json")).unwrap();
         let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
         assert_eq!(
-            metadata["role"],
-            "dev",
+            metadata["role"], "dev",
             "#3321: unrelated metadata survives"
         );
         assert_eq!(
