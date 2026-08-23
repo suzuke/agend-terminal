@@ -464,11 +464,13 @@ pub fn try_prepared_dismiss_dialog(
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
                 DISMISS_IN_FLIGHT.lock().remove(name);
-            } else if pattern.rearm_pre_idle {
-                // P2-D: submitted. Only now is the generation's single answer
-                // spent; the spawn-failure branch above deliberately leaves it
-                // unspent so the modal can still be answered.
-                dev_gate.mark_enqueued();
+            } else {
+                if pattern.rearm_pre_idle {
+                    // P2-D: submitted. Only now is the generation's single answer
+                    // spent; the spawn-failure branch above deliberately leaves it
+                    // unspent so the modal can still be answered.
+                    dev_gate.mark_enqueued();
+                }
             }
             return true;
         }
@@ -1430,6 +1432,32 @@ WARNING: Loading development channels
             complete_modal_digest(FRAME_LIVE_MODAL_2_1_240_WRAPPED_3314).is_some(),
             "#3314: a width-induced line wrap must preserve the modal fingerprint"
         );
+    }
+
+    /// #3314: recognizing the headline is not a successful dismiss. A refused
+    /// generation must not emit the success signal that operators rely on.
+    #[test]
+    #[tracing_test::traced_test]
+    fn refused_startup_modal_is_not_logged_as_dismissed_3314() {
+        let mut gen = Generation3314::new("3314-refused-log", false);
+        assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert!(gen.bytes().is_empty());
+        assert!(
+            !logs_contain("auto-dismissing dialog")
+                && !logs_contain("dialog dismiss submitted"),
+            "a refused generation must not emit a dismiss-success log"
+        );
+    }
+
+    /// #3314: the replacement success signal is emitted only after the write
+    /// has crossed the generation gate and been submitted.
+    #[test]
+    #[tracing_test::traced_test]
+    fn submitted_startup_modal_has_truthful_success_log_3314() {
+        let mut gen = Generation3314::new("3314-submitted-log", true);
+        assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+        assert!(logs_contain("dialog dismiss submitted"));
     }
 
     /// #3314 version-drift gate: an unrecognised backend version disarms rather
