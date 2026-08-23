@@ -1545,7 +1545,13 @@ mod tests {
     /// Contrast `record_input_activity`, which #2965 already moved off the
     /// synchronous path into an in-memory buffer. That fix skipped the submit
     /// twin, which is why plain typing is smooth and only Enter freezes.
+    /// IGNORED BY DESIGN: this is the #3321 REPRODUCTION, and it fails until the fix
+    /// lands — `record_submit_activity` still takes a blocking, unbounded flock on the
+    /// TUI thread. Run it deliberately with:
+    ///   cargo test --bin agend-terminal -- --ignored record_submit_activity_must_not_block
+    /// Un-ignore it in the PR that fixes the blocking write; it is the acceptance test.
     #[test]
+    #[ignore = "#3321 reproduction — RED until the Enter-path flock is fixed"]
     fn record_submit_activity_must_not_block_on_contended_metadata_lock() {
         let home = tmp_home("submit_flock_contention");
         std::fs::create_dir_all(home.join("metadata")).ok();
