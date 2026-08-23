@@ -891,13 +891,20 @@ fn build_command(
     // avoids a `#[cfg(windows)]` split here.
     let resolved_command =
         which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
-    let mut cmd = CommandBuilder::new(&resolved_command);
+    // #3329: execute the same concrete file whose identity arms the startup
+    // modal gate. Claude's updater flips its launcher symlink while retaining
+    // versioned binaries; validating the target but executing the symlink left
+    // a validation-to-exec TOCTOU. `dunce` keeps the pinned path acceptable to
+    // Windows process creation by removing the verbatim-path prefix.
+    let pinned_command =
+        dunce::canonicalize(&resolved_command).unwrap_or_else(|_| resolved_command.clone());
+    let mut cmd = CommandBuilder::new(&pinned_command);
     cmd.args(&enriched_args);
     // #3314 B1: capture the arming facts from the command we JUST built — the
     // argv read back off the builder, and the path we resolved for it — before
     // anything can exec or a config/symlink can move under us. Re-deriving them
     // after the spawn is what made r1 fail open.
-    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &resolved_command);
+    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &pinned_command);
 
     // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
     // before any env injection below, or the explicit keys we set would be wiped.

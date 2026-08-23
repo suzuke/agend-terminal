@@ -97,7 +97,7 @@ pub(crate) const ELIGIBILITY_EXPIRY_MS: u64 = 120_000;
 /// modal must cost a hang plus an operator notice, never a stray keystroke.
 pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238", "2.1.240"];
 
-/// Resolve the version of a concrete backend binary.
+/// Read the version from an already-pinned concrete backend binary path.
 ///
 /// LAYOUT-DEPENDENT, deliberately disclosed (r1 review N4): this returns the
 /// canonicalised file NAME, which is a version only because the installer lays
@@ -113,8 +113,7 @@ pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238", "2
 /// concrete versioned file this generation runs, which is the only identity
 /// that can honestly gate its behaviour.
 pub(crate) fn spawned_binary_version(command: &std::path::Path) -> Option<String> {
-    let resolved = std::fs::canonicalize(command).ok()?;
-    Some(resolved.file_name()?.to_string_lossy().into_owned())
+    Some(command.file_name()?.to_string_lossy().into_owned())
 }
 
 /// Facts about the command that was ACTUALLY built and spawned for this
@@ -140,13 +139,13 @@ pub(crate) struct SpawnProvenance {
 
 impl SpawnProvenance {
     /// Read the two facts off the command that is about to be spawned.
-    pub(crate) fn capture(cmd: &portable_pty::CommandBuilder, resolved: &std::path::Path) -> Self {
+    pub(crate) fn capture(cmd: &portable_pty::CommandBuilder, pinned: &std::path::Path) -> Self {
         Self {
             argv_has_dev_channel_flag: cmd
                 .get_argv()
                 .iter()
                 .any(|arg| arg == "--dangerously-load-development-channels"),
-            binary_version: spawned_binary_version(resolved),
+            binary_version: spawned_binary_version(pinned),
         }
     }
 }
