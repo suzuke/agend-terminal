@@ -402,7 +402,7 @@ pub(crate) enum GateOutcome {
     /// A candidate is being observed but is not yet stable, or its epoch moved.
     Hold,
     /// Stable, unmodified, and unspent — the caller may enqueue exactly one CR
-    /// and must then call [`DevModalGate::mark_enqueued`].
+    /// and must mark its [`EnqueueReceipt`] only after successful delivery.
     Enqueue,
 }
 
@@ -419,7 +419,7 @@ struct Candidate {
 /// eviction to forget, and no rollover race.
 pub(crate) struct DevModalGate {
     armed: bool,
-    spent: bool,
+    spent: Arc<std::sync::atomic::AtomicBool>,
     epoch: Arc<AtomicU64>,
     generation_over: Arc<std::sync::atomic::AtomicBool>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
@@ -445,7 +445,7 @@ impl DevModalGate {
     ) -> Self {
         Self {
             armed,
-            spent: false,
+            spent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch,
             generation_over,
             deleted,
@@ -486,7 +486,7 @@ impl DevModalGate {
         if !self.armed {
             return GateOutcome::Refuse(Refused::NotArmed);
         }
-        if self.spent {
+        if self.spent.load(Ordering::SeqCst) {
             return GateOutcome::Refuse(Refused::Spent);
         }
         if now.0 > ELIGIBILITY_EXPIRY_MS {
@@ -518,11 +518,23 @@ impl DevModalGate {
         }
     }
 
-    /// Spend the one-shot. Called ONLY after the CR was successfully enqueued —
-    /// a collision or a failed enqueue must leave the generation able to try
-    /// again, otherwise a lost attempt would strand the agent at the modal.
-    pub(crate) fn mark_enqueued(&mut self) {
-        self.spent = true;
-        self.candidate = None;
+    /// A detached writer cannot borrow the read-loop-owned gate. This handle
+    /// carries only the monotonic one-shot bit, so a successful writer can
+    /// spend it without moving candidate recognition off the read loop.
+    pub(crate) fn enqueue_receipt(&self) -> EnqueueReceipt {
+        EnqueueReceipt {
+            spent: Arc::clone(&self.spent),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct EnqueueReceipt {
+    spent: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EnqueueReceipt {
+    pub(crate) fn mark_enqueued(&self) {
+        self.spent.store(true, Ordering::SeqCst);
     }
 }

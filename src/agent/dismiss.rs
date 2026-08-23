@@ -377,6 +377,7 @@ pub fn try_prepared_dismiss_dialog(
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();
             let agent = name.to_string();
+            let pattern_text = pattern.pattern.clone();
             // #3314: the barrier is scoped to the startup-modal class ONLY.
             // Other backends send multi-chunk sequences (agy's up-up-Enter), and
             // each chunk's own write bumps the epoch — applying the barrier
@@ -388,20 +389,30 @@ pub fn try_prepared_dismiss_dialog(
             // spending early strands it as Refused(Spent) with the modal
             // unanswered, which is the exact failure the rule exists to prevent.
             let barrier = pattern.rearm_pre_idle.then(|| dev_gate.write_barrier());
+            let enqueue_receipt = pattern.rearm_pre_idle.then(|| dev_gate.enqueue_receipt());
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
                 let _guard = InFlightGuard(agent.clone());
                 run_pre_write_rendezvous();
-                if barrier
+                let result = if barrier
                     .as_ref()
                     .is_none_or(crate::agent::dev_modal::WriteBarrier::still_valid)
                 {
-                    let _ = write_with_timeout(&writer, &keys);
+                    write_with_timeout(&writer, &keys)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "PTY write cancelled by stale-frame barrier",
+                    ))
+                };
+                if result.is_ok() {
+                    if let Some(receipt) = enqueue_receipt.as_ref() {
+                        receipt.mark_enqueued();
+                    }
                 }
-                if pattern.rearm_pre_idle {
-                    dev_gate.mark_enqueued();
+                if result.is_ok() {
+                    tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
                 }
-                tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
                 return true;
             }
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
@@ -435,43 +446,55 @@ pub fn try_prepared_dismiss_dialog(
                     // state that triggers a dismiss — would otherwise pin the writer
                     // lock forever, wedging every future inject to that agent until
                     // daemon restart. `write_with_timeout` flushes internally.
-                    let mut start = 0;
-                    for (i, &b) in keys.iter().enumerate() {
-                        if b == b'\r' || b == b'\n' {
-                            // Send everything up to (not including) this Enter
-                            if start < i {
-                                let _ = write_with_timeout_guarded(
+                    let result = (|| -> std::io::Result<()> {
+                        let mut start = 0;
+                        for (i, &b) in keys.iter().enumerate() {
+                            if b == b'\r' || b == b'\n' {
+                                // Send everything up to (not including) this Enter
+                                if start < i {
+                                    write_with_timeout_guarded(
+                                        &writer,
+                                        &keys[start..i],
+                                        barrier.clone(),
+                                    )?;
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                }
+                                // Send the Enter
+                                write_with_timeout_guarded(
                                     &writer,
-                                    &keys[start..i],
+                                    &keys[i..=i],
                                     barrier.clone(),
-                                );
-                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                )?;
+                                start = i + 1;
                             }
-                            // Send the Enter
-                            let _ =
-                                write_with_timeout_guarded(&writer, &keys[i..=i], barrier.clone());
-                            start = i + 1;
+                        }
+                        if start < keys.len() {
+                            write_with_timeout_guarded(
+                                &writer,
+                                &keys[start..],
+                                barrier.clone(),
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            if let Some(receipt) = enqueue_receipt {
+                                receipt.mark_enqueued();
+                            }
+                            tracing::info!(agent = %agent, pattern = %pattern_text, "dialog dismiss submitted");
+                            tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                        }
+                        Err(error) => {
+                            tracing::debug!(agent = %agent, %error, "dialog dismiss write failed");
                         }
                     }
-                    if start < keys.len() {
-                        let _ =
-                            write_with_timeout_guarded(&writer, &keys[start..], barrier.clone());
-                    }
-                    tracing::debug!(agent = %agent, "dismiss keystrokes sent");
                     // H2: in-flight slot freed by `_guard` on scope exit.
                 })
                 .is_err()
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
                 DISMISS_IN_FLIGHT.lock().remove(name);
-            } else {
-                if pattern.rearm_pre_idle {
-                    // P2-D: submitted. Only now is the generation's single answer
-                    // spent; the spawn-failure branch above deliberately leaves it
-                    // unspent so the modal can still be answered.
-                    dev_gate.mark_enqueued();
-                }
-                tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
             }
             return true;
         }
@@ -1815,24 +1838,22 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 r2 RED-4 (P2-D): the one-shot must be spent only AFTER the write is
-    /// successfully submitted. Today `mark_enqueued` runs before the thread spawn
-    /// and before the actor enqueue, so a spawn failure or a full queue leaves the
-    /// generation permanently `Refused(Spent)` with the modal unanswered — the
-    /// exact stranding the rule exists to prevent.
+    /// #3314 r2 (P2-D): the one-shot must be spent only AFTER the write is
+    /// successfully delivered. A spawn, queue, barrier, or write failure must
+    /// leave the generation eligible for another observed attempt.
     #[test]
     fn one_shot_is_spent_only_after_successful_submission_3314() {
         let src = include_str!("dismiss.rs");
-        // Anchored on the WRITE, not the thread spawn: the first `mark_enqueued`
-        // in the file lives in the inline test branch, so comparing against the
-        // spawn measured the wrong occurrence. (My first draft of this pin did
-        // exactly that and stayed red against correct code.)
-        let spend = src
-            .find("dev_gate.mark_enqueued()")
-            .expect("the one-shot spend must exist");
-        let write = src
-            .find("let _ = write_with_timeout(&writer, &keys);")
-            .expect("the dismiss write must exist");
+        let detached = src
+            .find("let result = (|| -> std::io::Result<()>")
+            .expect("the detached dismiss writer must retain its result");
+        let production = &src[detached..];
+        let write = production
+            .find("write_with_timeout_guarded(")
+            .expect("the detached dismiss write must exist");
+        let spend = production
+            .find("receipt.mark_enqueued()")
+            .expect("the detached one-shot spend must exist");
         assert!(
             spend > write,
             "#3314 P2-D: the one-shot is spent BEFORE the write is submitted; a \

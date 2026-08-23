@@ -16,6 +16,16 @@
 use super::PtyWriter;
 use crate::agent::dev_modal::WriteBarrier;
 
+pub(super) fn record_successful_write(
+    writer: &PtyWriter,
+    result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    if result.is_ok() {
+        crate::agent::dev_modal::note_pty_write(writer);
+    }
+    result
+}
+
 /// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its result
 /// directly. `None` -> not registered (Windows; synthetic/test writer) -- the
 /// caller falls through to its thread-per-write mechanism.

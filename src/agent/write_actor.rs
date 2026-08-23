@@ -707,7 +707,10 @@ fn service_once(state: &WriterState) {
         // it closes the queue+service window, which is the wide one.
         if job.barrier.as_ref().is_some_and(|b| !b.still_valid()) {
             let job = q.pop_front().expect("front() just returned Some");
-            let _ = job.done.try_send(Ok(()));
+            let _ = job.done.try_send(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PTY write cancelled by stale-frame barrier",
+            )));
             return;
         }
         let remaining = job.remaining();
@@ -944,7 +947,8 @@ mod tests {
         )
         .expect("a registered writer must resolve to Some");
         assert_eq!(
-            result.expect_err("a cancelled barrier is not a successful delivery")
+            result
+                .expect_err("a cancelled barrier is not a successful delivery")
                 .kind(),
             std::io::ErrorKind::Interrupted,
             "#3314: cancellation must be observable by the one-shot owner"

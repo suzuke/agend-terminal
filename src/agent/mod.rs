@@ -2712,13 +2712,14 @@ fn write_with_timeout_guarded(
     data: &[u8],
     barrier: Option<crate::agent::dev_modal::WriteBarrier>,
 ) -> std::io::Result<()> {
-    // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
-    // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
-    crate::agent::dev_modal::note_pty_write(writer);
-    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier) {
-        return result;
+    // #3314: chokepoint for every PTY write; see `agent::dev_modal`.
+    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier.clone()) {
+        return actor_write::record_successful_write(writer, result);
     }
-
+    if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    crate::agent::dev_modal::note_pty_write(writer);
     let key = Arc::as_ptr(writer) as usize;
 
     // If a previous write is still stuck, fail fast.
