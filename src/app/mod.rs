@@ -1061,6 +1061,31 @@ mod tests {
         std::fs::remove_dir_all(&home).expect("remove temp home");
     }
 
+    #[test]
+    fn session_restore_waits_for_agent_spawn_completion() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "agend-thin-client-session-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        assert!(!wait_for_agent_spawn_completion(
+            &run_dir,
+            std::time::Duration::from_millis(20)
+        ));
+        std::fs::write(run_dir.join(".ready"), b"ready").expect("write ready marker");
+        assert!(wait_for_agent_spawn_completion(
+            &run_dir,
+            std::time::Duration::from_millis(20)
+        ));
+
+        std::fs::remove_dir_all(&run_dir).expect("remove temp run dir");
+    }
+
     /// #t-84833-10 redraw-storm frame cap — the `should_draw` rate-limit decision.
     #[test]
     fn should_draw_caps_at_frame_rate() {
