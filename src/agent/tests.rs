@@ -3511,9 +3511,16 @@ impl std::io::Read for TimedChunkReader {
         };
         if self.next == 1 {
             if let Some(written) = &self.wait_for_first_write {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while written.lock().is_empty() && std::time::Instant::now() < deadline {
                     std::thread::yield_now();
+                }
+                if let Some(name) = self.wait_for_dismiss {
+                    while dismiss::dismiss_in_flight_for_test(name)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
                 }
             }
         }
@@ -3734,6 +3741,29 @@ fn pty_read_loop_keeps_non_dev_prompt_inside_trust_cooldown_3314() {
         written.lock().as_slice(),
         b"\r",
         "#3314: a non-development-channel prompt must remain suppressed by the trust-dismiss cooldown"
+    );
+}
+
+#[test]
+fn pty_read_loop_does_not_reanswer_trust_without_complete_dev_modal_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let second_trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test-2\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_with_ordering_3333(
+        vec![
+            (trust, std::time::Duration::ZERO),
+            (second_trust, std::time::Duration::ZERO),
+        ],
+        true,
+    );
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: cooldown bypass requires a complete development-channel modal"
     );
 }
 
