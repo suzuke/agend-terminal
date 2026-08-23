@@ -783,92 +783,35 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
     Some(reply.is_object())
 }
 
-/// #2453 R2 (supersedes the #2098 app-mode fail-closed placeholder): `agend-terminal
-/// app` owner-restart now RE-EXECS in place. The pre-R2 handler fail-closed as a
-/// stopgap against the #2098 app-mode brick; R2 replaces it with a real in-place
-/// re-exec. This is the real-entry lifecycle witness that consolidates the ordering
-/// and exec-lifecycle merge-blockers. A real `restart_daemon` MCP call over the LIVE
-/// app api socket must:
-///
-/// 1. return `prepared` — receiving it proves the reply crossed the socket BEFORE
-///    teardown dropped it (ORDERING: reply precedes teardown/exec). `prepared` (not
-///    `committing`) is the honest pre-ack wording: the commit happens only after the
-///    transport ack the TUI polls for, so the reply is an indeterminate attempt;
-/// 2. re-exec IN PLACE — the SAME pid stays alive across the exec (exec, not a
-///    spawned successor; execve preserves the pid);
-/// 3. bring the control plane back on the RE-READ api.port and serve a real
-///    request (NO BRICK). We do NOT require the port VALUE to change — the OS may
-///    legitimately reuse the same ephemeral port after close+rebind, so asserting
-///    a change would flake (per #2453 R2 review);
-/// 4. leave EXACTLY ONE active pid — no successor / RESTART_PENDING / flock
-///    competitor. This is why the #2098 brick class cannot recur under R2:
-///    re-exec sets no RESTART_PENDING and spawns no flock rival.
-///
-/// The #2098 brick guarantee is preserved here by assertions 3 + 4. The sibling
-/// `self_respawn_*` tests keep DAEMON-mode (`start --foreground`) fail-close /
-/// regression coverage SEPARATELY. The app runs under a PTY so `ratatui::init`
-/// succeeds headlessly. Unix-only (in-place exec is Unix-only; Windows fail-closes
-/// at the handler — covered by the `#[cfg(windows)]` unit test in restart.rs). Per
-/// decision d-20260712034222169749-5.
+/// Permanent-thin-client regression: starting `app` without a daemon must boot a
+/// detached daemon, and `restart_daemon` must use that daemon's normal self-respawn
+/// lifecycle. The app process remains only a client throughout.
 #[cfg(unix)]
 #[test]
-fn app_mode_restart_reexecs_in_place_2453() {
+fn app_mode_restart_routes_to_detached_daemon_2453() {
     let home = std::env::temp_dir().join(format!("agend-2453-reexec-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
 
     let mut child = boot_app_under_pty(&home);
 
-    // The app's in-process api server must come up (run dir + api.port + live pid).
-    let pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+    let original_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
         Some(p) => p,
         None => {
             let _ = child.kill();
             let _ = child.wait();
             cleanup_test_home(&home);
-            panic!("app-mode api server never became the single active daemon");
+            panic!("app did not start its detached daemon");
         }
     };
 
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
 
-    // Real restart_daemon over the real app api socket. Receiving the `prepared`
-    // reply IS the ordering proof: it crossed the socket BEFORE teardown dropped it
-    // (the arm replies `prepared`, the transport flushes it, then the TUI polls the
-    // post-flush ack and commits → ordered teardown + exec).
-    let resp = trigger_restart(&home, pid);
-
-    // Bounded, EVENT-DRIVEN settle for the in-place re-exec. execve preserves the
-    // pid and the process NEVER exits (`child.try_wait()` stays `None`); the
-    // disabled-exec RED path runs `exit(70)` after teardown (`try_wait` returns
-    // `Some`). The re-exec'd control plane then serves again on the RE-READ api.port
-    // (`api_status_once` re-reads run_dir/api.port each attempt, so a rebound port —
-    // same OR different value — is handled). We conclude "re-exec'd" ONLY after the
-    // process has been continuously alive AND serving for a stability window that
-    // OUTLASTS the RED teardown→exit — this rejects the brief "old server answers
-    // mid-teardown" transient (which occurs on BOTH the exec and the exit path) that
-    // a one-shot alive+serving check would mistake for success.
-    const STABLE: Duration = Duration::from_secs(4);
-    let deadline = Instant::now() + Duration::from_secs(40);
-    let mut exited = false;
-    let mut serving_since: Option<Instant> = None;
-    let mut reexec_confirmed = false;
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            exited = true; // process exited → did NOT re-exec in place (the RED path)
-            break;
-        }
-        if api_status_once(&home, pid) == Some(true) {
-            if serving_since.get_or_insert_with(Instant::now).elapsed() >= STABLE {
-                reexec_confirmed = true; // alive + serving continuously past teardown→exit
-                break;
-            }
-        } else {
-            serving_since = None; // teardown/exec gap (not serving) → reset the timer
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    let single_active = active_pids(&home) == vec![pid];
+    let resp = trigger_restart(&home, original_pid);
+    let successor_pid = wait_for_single_active(&home, Duration::from_secs(40), |pid| {
+        pid != original_pid && api_status_once(&home, pid) == Some(true)
+    });
+    let app_stayed_alive = child.try_wait().expect("query app child").is_none();
 
     // Cleanup BEFORE asserting so a failure never leaks the child. (The drain
     // thread is detached — see boot_app_under_pty — nothing to join.)
@@ -876,8 +819,7 @@ fn app_mode_restart_reexecs_in_place_2453() {
     let _ = child.wait();
     cleanup_test_home(&home);
 
-    // (1) ORDERING: the `prepared` reply was received before the socket dropped.
-    let resp = resp.expect("app-mode restart must return a prepared reply before the socket drops");
+    let resp = resp.expect("daemon restart must return a reply");
     let result_ok = resp
         .get("result")
         .and_then(|r| r.get("ok"))
@@ -889,33 +831,19 @@ fn app_mode_restart_reexecs_in_place_2453() {
     assert_eq!(
         result_ok,
         Some(true),
-        "app-mode restart_daemon must report result.ok=true (re-exec prepared), got {resp}"
+        "thin-client restart_daemon must report result.ok=true, got {resp}"
     );
     assert_eq!(
         restart,
-        Some("prepared"),
-        "app-mode restart_daemon must report restart=prepared (reply precedes teardown/exec), got {resp}"
+        Some("self-respawn"),
+        "thin-client app must route restart to the detached daemon, got {resp}"
     );
-
-    // (2) EXEC-NOT-SPAWN + NO BRICK: the ORIGINAL pid stayed alive across the exec
-    // (never exited) AND the re-exec'd control plane serves again on the re-read
-    // api.port for a stable window. A disabled exec would exit(70) after teardown →
-    // `exited` and this fails RED.
     assert!(
-        !exited && reexec_confirmed,
-        "the app must re-exec IN PLACE: the SAME pid stays alive across the exec (execve preserves \
-         the pid; a disabled exec exits instead) AND serves again on the re-read api.port (no brick) \
-         — exited={exited}, reexec_confirmed={reexec_confirmed}"
+        app_stayed_alive,
+        "daemon self-respawn must not terminate the thin-client app"
     );
-    // (3) EXACTLY ONE active pid — no successor / flock competitor / RESTART_PENDING latch.
     assert!(
-        single_active,
-        "exactly one active pid (the re-exec'd original) — no successor double-bind or flock competitor"
-    );
-
-    eprintln!(
-        "#2453 R2 evidence: app-mode in-place re-exec lifecycle verified on {} (pid {} survived exec + served again)",
-        std::env::consts::OS,
-        pid
+        successor_pid.is_some(),
+        "daemon self-respawn must settle on one live successor with a serving API"
     );
 }
