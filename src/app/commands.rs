@@ -746,6 +746,28 @@ mod tests {
     }
 
     #[test]
+    fn remove_agent_pane_closes_single_pane_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("opencode".into(), test_pane(1, "opencode", None)));
+        layout.add_tab(Tab::new("kiro".into(), test_pane(2, "kiro", None)));
+
+        remove_agent_pane("opencode", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1, "single-pane tab should be removed");
+        assert_eq!(layout.tabs[0].name, "kiro");
+    }
+
+    #[test]
+    fn remove_agent_pane_noop_when_agent_missing() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("kiro".into(), test_pane(1, "kiro", None)));
+
+        remove_agent_pane("ghost", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1);
+    }
+
+    #[test]
     fn lookup_fleet_name_found() {
         let mut layout = Layout::new();
         layout.add_tab(Tab::new(
