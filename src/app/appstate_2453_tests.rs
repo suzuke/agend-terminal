@@ -39,7 +39,9 @@ fn app_prod_region() -> String {
     let source = std::fs::read_to_string("src/app/mod.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
         .expect("source file must be readable from test cwd");
-    let cutoff = source.find("#[cfg(test)]").unwrap_or(source.len());
+    let cutoff = source
+        .find("\n#[cfg(test)]\nmod tests")
+        .unwrap_or(source.len());
     let mut prod = source[..cutoff].to_string();
     for candidate in [
         "src/app/app_state.rs",
