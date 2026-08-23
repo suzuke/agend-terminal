@@ -2222,13 +2222,13 @@ fn pty_read_loop(
                         &screen,
                         pty_writer,
                         dismiss_patterns,
-                        // #2473 (r6): a post-latch re-arm (scan_enabled==false,
-                        // armed only via prompt_blocked) never reaches runtime-
-                        // approval `Yes, proceed`. #3314: before the agent has ever
-                        // been Idle it additionally reaches daemon-caused startup
-                        // modals, which is the window a fresh spawn's dev-channel
-                        // modal falls into.
-                        dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle),
+                        // #3314: the cooldown bypass admits only the daemon-caused
+                        // startup modal, never runtime approval patterns.
+                        if startup_dev_modal_in_cooldown {
+                            dismiss::DismissScanScope::RearmPreIdle
+                        } else {
+                            dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
+                        },
                         &mut dev_modal_gate,
                         dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
                     )
