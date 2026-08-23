@@ -38,7 +38,8 @@ const DURABLE_LOOP_OWNERS_2453: [&str; 16] = [
 fn app_prod_region() -> String {
     let source = std::fs::read_to_string("src/app/mod.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
-        .expect("source file must be readable from test cwd");
+        .expect("source file must be readable from test cwd")
+        .replace("\r\n", "\n");
     let cutoff = source
         .find("\n#[cfg(test)]\nmod tests")
         .unwrap_or(source.len());
