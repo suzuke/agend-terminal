@@ -3678,6 +3678,26 @@ fn pty_read_loop_answers_one_static_dev_modal_frame_3333() {
 }
 
 #[test]
+fn pty_read_loop_answers_dev_modal_inside_trust_cooldown_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (modal, std::time::Duration::from_millis(350)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r\r",
+        "#3314: the static startup modal must not be stranded by the preceding trust-dismiss cooldown"
+    );
+}
+
+#[test]
 fn pty_read_loop_new_child_output_cancels_pending_dev_modal_cr_3333() {
     let _guard = R8_DISMISS_TEST_LOCK
         .lock()
