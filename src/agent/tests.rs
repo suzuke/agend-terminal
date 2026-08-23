@@ -1939,6 +1939,70 @@ fn spawn_provenance_flag_matches_the_built_argv_3315() {
     }
 }
 
+/// #3329 RED: the executable identity validated for modal auto-dismissal must
+/// be the exact path later handed to `spawn_command`. Claude's installer flips
+/// `~/.local/bin/claude` between retained version binaries, so merely reading
+/// the canonical target for provenance while leaving argv[0] as the symlink
+/// permits a validation-to-exec swap.
+#[cfg(unix)]
+#[test]
+fn build_command_pins_the_validated_executable_across_symlink_swap_3329() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = resolve_test_home("spawn-path-swap-3329");
+    let workspace = root.join("workspace");
+    let versions = root.join("versions");
+    let launcher = root.join("claude");
+    std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
+    std::fs::create_dir_all(&versions).expect("versions dir");
+    std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions")
+        .expect("agend.md");
+    std::fs::write(
+        workspace.join("mcp-config.json"),
+        r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-channel"}}}"#,
+    )
+    .expect("mcp-config.json");
+
+    let validated = versions.join("2.1.240");
+    let replacement = versions.join("2.1.999");
+    for binary in [&validated, &replacement] {
+        std::fs::write(binary, b"#!/bin/sh\nexit 0\n").expect("fake executable");
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable permissions");
+    }
+    symlink(&validated, &launcher).expect("initial launcher symlink");
+
+    let backend_command = launcher.to_string_lossy().into_owned();
+    let config = SpawnConfig {
+        name: "spawn-path-swap-3329",
+        backend: Some(&Backend::ClaudeCode),
+        backend_command: &backend_command,
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: Some(&workspace),
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+
+    let (cmd, _, provenance) = build_command(&config).expect("build_command");
+    std::fs::remove_file(&launcher).expect("remove old launcher symlink");
+    symlink(&replacement, &launcher).expect("flip launcher symlink");
+
+    let argv0 = std::path::PathBuf::from(&cmd.get_argv()[0]);
+    assert_eq!(provenance.binary_version.as_deref(), Some("2.1.240"));
+    assert_eq!(
+        argv0,
+        validated.canonicalize().expect("validated target"),
+        "the command must exec the concrete binary whose version armed the gate; \
+         leaving argv[0] as {launcher:?} lets an updater swap it to {replacement:?}"
+    );
+}
+
 /// #2801 RED: the declared backend is authoritative even when `command:` is
 /// an arbitrarily named wrapper. Basename inference cannot recover this from
 /// `backend_command`, so the spawn config must carry the resolved fleet
