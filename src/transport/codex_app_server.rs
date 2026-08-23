@@ -1660,6 +1660,7 @@ mod tests {
         );
         let steered_id = steered.delivery_id;
         let (client, mut server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        // fire-and-forget: the fake peer is joined after its single response.
         let peer = thread::spawn(move || {
             let Ok((_, body)) = read_websocket_frame(&mut server) else {
                 return None;
