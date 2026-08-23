@@ -3493,6 +3493,7 @@ struct TimedChunkReader {
     chunks: Vec<(&'static [u8], std::time::Duration)>,
     next: usize,
     wait_for_dismiss: Option<&'static str>,
+    wait_for_first_write: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl std::io::Read for TimedChunkReader {
@@ -3508,6 +3509,14 @@ impl std::io::Read for TimedChunkReader {
             }
             return Ok(0);
         };
+        if self.next == 1 {
+            if let Some(written) = &self.wait_for_first_write {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while written.lock().is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+            }
+        }
         std::thread::sleep(*delay);
         self.next += 1;
         let n = chunk.len().min(buf.len());
@@ -3608,6 +3617,13 @@ fn run_pty_read_loop_for_r8(
 fn run_dev_modal_pty_read_loop_3333(
     chunks: Vec<(&'static [u8], std::time::Duration)>,
 ) -> Arc<Mutex<Vec<u8>>> {
+    run_dev_modal_pty_read_loop_with_ordering_3333(chunks, false)
+}
+
+fn run_dev_modal_pty_read_loop_with_ordering_3333(
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+    second_chunk_follows_first_write: bool,
+) -> Arc<Mutex<Vec<u8>>> {
     let written = Arc::new(Mutex::new(Vec::new()));
     let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
         bytes: Arc::clone(&written),
@@ -3645,6 +3661,7 @@ fn run_dev_modal_pty_read_loop_3333(
         chunks,
         next: 0,
         wait_for_dismiss: Some("dev-modal-3333"),
+        wait_for_first_write: second_chunk_follows_first_write.then(|| Arc::clone(&written)),
     };
     let capture = crate::capture::make_capture_writer(None, "dev-modal-3333", "claude");
     pty_read_loop(&mut reader, &ctx, capture);
@@ -3685,10 +3702,13 @@ fn pty_read_loop_answers_dev_modal_inside_trust_cooldown_3314() {
     let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
     let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
 
-    let written = run_dev_modal_pty_read_loop_3333(vec![
-        (trust, std::time::Duration::ZERO),
-        (modal, std::time::Duration::from_millis(350)),
-    ]);
+    let written = run_dev_modal_pty_read_loop_with_ordering_3333(
+        vec![
+            (trust, std::time::Duration::ZERO),
+            (modal, std::time::Duration::ZERO),
+        ],
+        true,
+    );
 
     assert_eq!(
         written.lock().as_slice(),

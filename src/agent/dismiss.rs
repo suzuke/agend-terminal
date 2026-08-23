@@ -65,11 +65,27 @@ static DISMISS_REGEX_CACHE: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, Option<std::sync::Arc<regex::Regex>>>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-/// H2: agents with a dismiss thread currently in flight — gates rapid dialog
-/// re-detection to one thread per agent. Hoisted to module scope (#1886
+/// H2: dismiss classes currently in flight — gates rapid re-detection without
+/// letting a trust-prompt worker strand the distinct startup modal that follows.
+/// Hoisted to module scope (#1886
 /// follow-up) so the RAII [`InFlightGuard`] can clear it on drop.
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct InFlightKey {
+    agent: String,
+    startup_modal: bool,
+}
+
+impl InFlightKey {
+    fn new(agent: &str, startup_modal: bool) -> Self {
+        Self {
+            agent: agent.to_string(),
+            startup_modal,
+        }
+    }
+}
+
 static DISMISS_IN_FLIGHT: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashSet<String>>,
+    parking_lot::Mutex<std::collections::HashSet<InFlightKey>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
@@ -87,7 +103,7 @@ pub(crate) fn dismiss_scan_count_for_test() -> usize {
 
 #[cfg(test)]
 pub(crate) fn dismiss_in_flight_for_test(name: &str) -> bool {
-    DISMISS_IN_FLIGHT.lock().contains(name)
+    DISMISS_IN_FLIGHT.lock().iter().any(|key| key.agent == name)
 }
 
 #[derive(Clone)]
@@ -114,7 +130,7 @@ pub struct PreparedDismissPattern {
 /// the removal was a trailing statement, so a panic before it left a stale entry
 /// that silently no-op'd every future dismiss for that agent until daemon
 /// restart. Arm it at thread entry; the in-flight slot is freed on any exit.
-struct InFlightGuard(String);
+struct InFlightGuard(InFlightKey);
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
@@ -380,12 +396,13 @@ pub fn try_prepared_dismiss_dialog(
                     }
                 }
             }
+            let flight_key = InFlightKey::new(name, pattern.rearm_pre_idle);
             {
                 let mut inflight = DISMISS_IN_FLIGHT.lock();
-                if inflight.contains(name) {
+                if inflight.contains(&flight_key) {
                     return true; // dismiss already pending
                 }
-                inflight.insert(name.to_string());
+                inflight.insert(flight_key.clone());
             }
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();
@@ -406,10 +423,10 @@ pub fn try_prepared_dismiss_dialog(
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
                 if scheduled_from_first_sighting {
-                    DISMISS_IN_FLIGHT.lock().remove(name);
+                    DISMISS_IN_FLIGHT.lock().remove(&flight_key);
                     return false;
                 }
-                let _guard = InFlightGuard(agent.clone());
+                let _guard = InFlightGuard(flight_key.clone());
                 run_pre_write_rendezvous();
                 let result = if barrier
                     .as_ref()
@@ -432,6 +449,7 @@ pub fn try_prepared_dismiss_dialog(
                 }
                 return true;
             }
+            let worker_flight_key = flight_key.clone();
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
             // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
             // on any exit (incl. panic), armed at thread entry below.
@@ -440,7 +458,7 @@ pub fn try_prepared_dismiss_dialog(
                 .spawn(move || {
                     // #1886 follow-up: arm the in-flight removal as a Drop guard at
                     // thread entry so a panic / early-return still frees the slot.
-                    let _guard = InFlightGuard(agent.clone());
+                    let _guard = InFlightGuard(worker_flight_key);
                     std::thread::sleep(std::time::Duration::from_millis(
                         crate::agent::dev_modal::MIN_STABLE_MS,
                     ));
@@ -513,7 +531,7 @@ pub fn try_prepared_dismiss_dialog(
                 .is_err()
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
-                DISMISS_IN_FLIGHT.lock().remove(name);
+                DISMISS_IN_FLIGHT.lock().remove(&flight_key);
             }
             return true;
         }
@@ -773,18 +791,18 @@ mod tests {
         // Inject a panic after the guard is armed and assert the slot is cleared.
         DISMISS_IN_FLIGHT
             .lock()
-            .insert("panic-agent-1886".to_string());
+            .insert(InFlightKey::new("panic-agent-1886", false));
         let h = std::thread::Builder::new()
             .name("dismiss-panic-test".into())
             .spawn(|| {
-                let _guard = InFlightGuard("panic-agent-1886".to_string());
+                let _guard = InFlightGuard(InFlightKey::new("panic-agent-1886", false));
                 panic!("injected panic before normal in-flight removal");
             })
             .expect("spawn");
         // Join the panicking thread (the panic is contained to it).
         assert!(h.join().is_err(), "the injected panic must propagate");
         assert!(
-            !DISMISS_IN_FLIGHT.lock().contains("panic-agent-1886"),
+            !dismiss_in_flight_for_test("panic-agent-1886"),
             "InFlightGuard must clear the in-flight slot even when the thread panics"
         );
     }
@@ -1346,7 +1364,7 @@ WARNING: Loading development channels
                 &mut self.gate,
                 LogicalMs(self.now),
             );
-            DISMISS_IN_FLIGHT.lock().remove(&self.tag);
+            DISMISS_IN_FLIGHT.lock().retain(|key| key.agent != self.tag);
             fired
         }
 
@@ -1584,13 +1602,13 @@ WARNING: Loading development channels
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("the detached writer must attempt the PTY write");
         for _ in 0..100 {
-            if !DISMISS_IN_FLIGHT.lock().contains(&gen.tag) {
+            if !dismiss_in_flight_for_test(&gen.tag) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(
-            !DISMISS_IN_FLIGHT.lock().contains(&gen.tag),
+            !dismiss_in_flight_for_test(&gen.tag),
             "the detached writer must finish before the gate is inspected"
         );
         assert_ne!(
@@ -1667,7 +1685,7 @@ WARNING: Loading development channels
         // fire path then bails at the claim — the collision under test.
         DISMISS_IN_FLIGHT
             .lock()
-            .insert("3314-collision".to_string());
+            .insert(InFlightKey::new("3314-collision", true));
         let _ = try_prepared_dismiss_dialog(
             "3314-collision",
             FRAME_LIVE_MODAL_3314,
@@ -1677,7 +1695,9 @@ WARNING: Loading development channels
             &mut gen.gate,
             LogicalMs(gen.now),
         );
-        DISMISS_IN_FLIGHT.lock().remove("3314-collision");
+        DISMISS_IN_FLIGHT
+            .lock()
+            .remove(&InFlightKey::new("3314-collision", true));
         assert!(gen.bytes().is_empty(), "#3314: a collision writes nothing");
         // ... and the one-shot is still available: the very next frame answers.
         // Asserted on BYTES, because a second call after a successful fire is
@@ -1699,7 +1719,7 @@ WARNING: Loading development channels
         gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
         DISMISS_IN_FLIGHT
             .lock()
-            .insert("3314-cross-class".to_string());
+            .insert(InFlightKey::new("3314-cross-class", false));
         let fired = try_prepared_dismiss_dialog(
             "3314-cross-class",
             FRAME_LIVE_MODAL_3314,
@@ -1709,7 +1729,9 @@ WARNING: Loading development channels
             &mut gen.gate,
             LogicalMs(gen.now),
         );
-        DISMISS_IN_FLIGHT.lock().remove("3314-cross-class");
+        DISMISS_IN_FLIGHT
+            .lock()
+            .remove(&InFlightKey::new("3314-cross-class", false));
         assert!(fired);
         assert_eq!(gen.bytes().as_slice(), b"\r");
     }
