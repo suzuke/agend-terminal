@@ -1838,7 +1838,11 @@ mod tests {
             wrapline: false,
             wide_spacer: col % 2 == 1,
         });
-        assert_eq!(text.chars().count(), cols / 2, "one wide char per two columns");
+        assert_eq!(
+            text.chars().count(),
+            cols / 2,
+            "one wide char per two columns"
+        );
         assert!(
             text.len() > cols,
             "a full-width CJK row is {} bytes across {cols} columns — \
@@ -1864,7 +1868,13 @@ mod tests {
         };
         let (text, fg, dim) = tail_lines_core(10, 1, 1, true, false, |_, col| {
             let (c, spacer) = row[col];
-            CellView { c, fg: fgc, dim: false, wrapline: false, wide_spacer: spacer }
+            CellView {
+                c,
+                fg: fgc,
+                dim: false,
+                wrapline: false,
+                wide_spacer: spacer,
+            }
         });
         assert_eq!(text, "a中b", "trailing blanks trimmed, wide spacer skipped");
         assert_eq!(
@@ -1882,7 +1892,10 @@ mod tests {
             wrapline: col == 3,
             wide_spacer: false,
         });
-        assert_eq!(wrapped_text, "x   ", "a soft-wrapped row keeps its trailing space");
+        assert_eq!(
+            wrapped_text, "x   ",
+            "a soft-wrapped row keeps its trailing space"
+        );
     }
 
     // ── CR-2026-06-14: PTY-writer raw-lock hardening (t-30) ──────────────
