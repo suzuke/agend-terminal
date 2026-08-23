@@ -1731,9 +1731,8 @@ pub(crate) enum BootstrapRegistrationState {
     AlreadyRegistered,
 }
 
-/// First-turn readiness authority plus the registration contract. Legacy PTY
-/// waits for raw prompt classification because a starting TUI can swallow bytes;
-/// structured adapters own their handshake, session discovery, and turn admission.
+/// First-turn readiness authority plus registration contract. Legacy PTY waits
+/// for raw prompt classification; structured adapters own their handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapWaitPolicy {
     RawPromptIdle(BootstrapRegistrationState),
