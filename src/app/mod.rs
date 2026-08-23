@@ -535,7 +535,7 @@ fn wait_for_ready_daemon(home: &Path, timeout: std::time::Duration) -> Option<Pa
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
-            if run_dir.join(".ready").is_file() && crate::ipc::probe_api(&run_dir) {
+            if crate::ipc::probe_api(&run_dir) {
                 return Some(run_dir);
             }
         }
