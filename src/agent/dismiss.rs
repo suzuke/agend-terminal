@@ -405,8 +405,6 @@ pub fn try_prepared_dismiss_dialog(
             let enqueue_receipt = pattern.rearm_pre_idle.then(|| dev_gate.enqueue_receipt());
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
-                // Deterministic matcher tests drive a second logical frame.
-                // Production uses the delayed writer and its late barrier.
                 if scheduled_from_first_sighting {
                     DISMISS_IN_FLIGHT.lock().remove(name);
                     return false;
