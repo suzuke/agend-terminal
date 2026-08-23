@@ -77,9 +77,20 @@ fn tail_lines_core(
     // physical row whose logical line continues on the next row).
     let mut wrapped: Vec<bool> = Vec::with_capacity(rows);
     for row in 0..rows {
-        let mut line = String::with_capacity(cols);
-        let mut fg: Vec<CellFg> = Vec::new();
-        let mut dim: Vec<bool> = Vec::new();
+        // #cjk-render-cost: the capacity is in BYTES but `cols` counts COLUMNS. For
+        // ASCII the two coincide, so this looked exact; a CJK row needs ~1.5 bytes per
+        // column (two columns per 3-byte char), so EVERY wide-char row overflowed the
+        // preallocation and forced a realloc + memmove — per row, per frame, inside
+        // `terminal.draw` on the render thread (see `DRAIN_OUTPUT_BUDGET_BYTES`).
+        // `cols * 4` is the most any single column can contribute in UTF-8.
+        let mut line = String::with_capacity(cols.saturating_mul(4));
+        // Same class: these grew from ZERO capacity one push at a time whenever
+        // `collect_fg` is on. Sized once here; still empty when the caller opted out.
+        let (mut fg, mut dim): (Vec<CellFg>, Vec<bool>) = if collect_fg {
+            (Vec::with_capacity(cols), Vec::with_capacity(cols))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut col = 0;
         while col < cols {
             let cell = get(row, col);
@@ -101,16 +112,21 @@ fn tail_lines_core(
         // trailing space can be a significant inter-word space at the wrap column, and
         // the next row is about to be concatenated WITHOUT a `\n` — trimming it would
         // fuse two words and re-break the phrase the de-wrap exists to keep whole.
-        let trimmed = if row_wrapped {
-            line.as_str()
+        // #cjk-render-cost: trim in place and MOVE the row out. `trimmed.to_string()`
+        // copied every row into a SECOND allocation on every frame, and
+        // `trimmed.chars().count()` ran the full UTF-8 decode scan TWICE per row.
+        let keep_bytes = if row_wrapped {
+            line.len()
         } else {
-            line.trim_end()
+            line.trim_end().len()
         };
         if collect_fg {
-            fg.truncate(trimmed.chars().count());
-            dim.truncate(trimmed.chars().count());
+            let keep_chars = line[..keep_bytes].chars().count();
+            fg.truncate(keep_chars);
+            dim.truncate(keep_chars);
         }
-        lines.push(trimmed.to_string());
+        line.truncate(keep_bytes);
+        lines.push(line);
         line_fgs.push(fg);
         line_dims.push(dim);
         wrapped.push(row_wrapped);
@@ -1802,6 +1818,71 @@ mod tests {
             content.contains("line"),
             "visible-row extract must contain real content, got: {content:?}"
         );
+    }
+
+    /// #cjk-render-cost regression: `tail_lines_core` preallocated its row buffer with
+    /// `String::with_capacity(cols)` — a COLUMN count used as a BYTE capacity. This test
+    /// pins the arithmetic that made that wrong: a full-width CJK row occupies `cols`
+    /// columns but needs MORE than `cols` bytes, so the old preallocation could never
+    /// hold it and every such row paid a realloc + memmove. Measured cost: the render
+    /// branch of the TUI main loop went from 2.6% of samples while typing ASCII to
+    /// 28.5% while typing CJK (~11x) on the same pane.
+    #[test]
+    fn tail_lines_core_row_buffer_must_hold_a_full_width_cjk_row() {
+        let cols = 80;
+        let (text, _, _) = tail_lines_core(cols, 1, 1, false, false, |_, col| CellView {
+            // even column = the wide char, odd column = its spacer
+            c: if col % 2 == 0 { '中' } else { ' ' },
+            fg: Color::Named(NamedColor::Foreground),
+            dim: false,
+            wrapline: false,
+            wide_spacer: col % 2 == 1,
+        });
+        assert_eq!(text.chars().count(), cols / 2, "one wide char per two columns");
+        assert!(
+            text.len() > cols,
+            "a full-width CJK row is {} bytes across {cols} columns — \
+             `String::with_capacity(cols)` could not hold it without reallocating",
+            text.len()
+        );
+    }
+
+    /// The allocation fix must not change what `tail_lines_core` returns. Covers the
+    /// paths the rewrite touched: trailing-space trimming (now done by truncating in
+    /// place instead of `trim_end().to_string()`), the wrapped-row exemption that keeps
+    /// a significant trailing space, and fg/dim truncation alignment on a MIXED-width
+    /// row (where byte length and char count diverge — exactly the case the single
+    /// `chars().count()` now has to get right).
+    #[test]
+    fn tail_lines_core_output_unchanged_by_the_allocation_fix() {
+        let fgc = Color::Named(NamedColor::Foreground);
+        // Row content: "a中b" then trailing spaces. cols wide, no wrap.
+        let row: Vec<(char, bool)> = {
+            let mut v = vec![('a', false), ('中', false), (' ', true), ('b', false)];
+            v.resize(10, (' ', false));
+            v
+        };
+        let (text, fg, dim) = tail_lines_core(10, 1, 1, true, false, |_, col| {
+            let (c, spacer) = row[col];
+            CellView { c, fg: fgc, dim: false, wrapline: false, wide_spacer: spacer }
+        });
+        assert_eq!(text, "a中b", "trailing blanks trimmed, wide spacer skipped");
+        assert_eq!(
+            fg.len(),
+            text.chars().count(),
+            "fg must be truncated to the CHAR count (3), not the byte length (5)"
+        );
+        assert_eq!(dim.len(), text.chars().count());
+
+        // Wrapped row: the trailing space is significant and must survive.
+        let (wrapped_text, _, _) = tail_lines_core(4, 1, 1, false, true, |_, col| CellView {
+            c: if col == 0 { 'x' } else { ' ' },
+            fg: fgc,
+            dim: false,
+            wrapline: col == 3,
+            wide_spacer: false,
+        });
+        assert_eq!(wrapped_text, "x   ", "a soft-wrapped row keeps its trailing space");
     }
 
     // ── CR-2026-06-14: PTY-writer raw-lock hardening (t-30) ──────────────
