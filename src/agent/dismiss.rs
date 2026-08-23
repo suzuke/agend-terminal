@@ -1689,6 +1689,31 @@ WARNING: Loading development channels
         assert_eq!(gen.bytes().as_slice(), b"\r");
     }
 
+    /// #3314: the trust prompt and the following development-channel modal are
+    /// distinct dismiss classes. A still-unwinding trust dismiss must not make
+    /// the modal's only static frame disappear behind the shared in-flight slot.
+    #[test]
+    fn ordinary_dismiss_in_flight_does_not_block_startup_modal_3314() {
+        let mut gen = Generation3314::new("3314-cross-class", true);
+        gen.frame(FRAME_LIVE_MODAL_3314);
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        DISMISS_IN_FLIGHT
+            .lock()
+            .insert("3314-cross-class".to_string());
+        let fired = try_prepared_dismiss_dialog(
+            "3314-cross-class",
+            FRAME_LIVE_MODAL_3314,
+            &gen.writer,
+            &gen.prepared,
+            DismissScanScope::Startup,
+            &mut gen.gate,
+            LogicalMs(gen.now),
+        );
+        DISMISS_IN_FLIGHT.lock().remove("3314-cross-class");
+        assert!(fired);
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+    }
+
     /// #3314 W3 rendezvous: a competing write arriving at the LAST instant
     /// before the syscall cancels the keystroke. Deterministic — the hook runs
     /// exactly at that point, with no sleeping and no racing.

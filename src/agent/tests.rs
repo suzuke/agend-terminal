@@ -3703,7 +3703,7 @@ fn pty_read_loop_keeps_non_dev_prompt_inside_trust_cooldown_3314() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
-    let proceed = b"\x1b[2J\x1b[H quoted: WARNING: Loading development channels\r\n\r\n Do you want to continue?\r\n\r\n   1. No\r\n \xe2\x9d\xaf 2. Yes, proceed\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let proceed = b"\x1b[2J\x1b[H quoted: WARNING: Loading development channels\r\n quoted: --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.\r\n quoted: Please use --channels to run a list of approved channels.\r\n quoted: Channels: server:agend-claude-channel\r\n quoted: I am using this for local development\r\n\r\n Do you want to continue?\r\n\r\n   1. No\r\n \xe2\x9d\xaf 2. Yes, proceed\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
 
     let written = run_dev_modal_pty_read_loop_3333(vec![
         (trust, std::time::Duration::ZERO),
