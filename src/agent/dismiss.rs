@@ -1425,6 +1425,10 @@ WARNING: Loading development channels
     #[test]
     fn only_validated_backend_versions_are_armed_3314() {
         use crate::agent::dev_modal::{version_is_validated, VALIDATED_CLAUDE_VERSIONS};
+        assert!(
+            version_is_validated(Some("2.1.240")),
+            "#3314: the production-captured 2.1.240 modal must be armed"
+        );
         assert!(version_is_validated(Some("2.1.238")));
         assert!(version_is_validated(Some("2.1.237")));
         assert!(
@@ -1434,6 +1438,10 @@ WARNING: Loading development channels
         assert!(
             !version_is_validated(None),
             "#3314: an unresolvable binary identity must disarm, not default open"
+        );
+        assert!(
+            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.240"),
+            "the production-captured version must be listed"
         );
         assert!(
             VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.238"),
