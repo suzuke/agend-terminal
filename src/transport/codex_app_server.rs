@@ -1620,6 +1620,75 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_delivery_steers_the_known_active_turn_without_replacing_its_owner() {
+        let home = std::env::temp_dir().join(format!("agend-codex-steer-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let locator = SessionLocator::codex(
+            std::env::temp_dir().join(format!("unused-{}.sock", Uuid::new_v4())),
+            Some("thread-1".to_string()),
+        );
+        let original = DeliveryEnvelope::new(
+            "codex-agent",
+            locator.clone(),
+            DeliveryKind::Prompt,
+            "original turn",
+            Some("corr-original".to_string()),
+        );
+        let original_id = original.delivery_id;
+        let steered = DeliveryEnvelope::new(
+            "codex-agent",
+            locator.clone(),
+            DeliveryKind::Notification,
+            "new assignment",
+            Some("corr-steer".to_string()),
+        );
+        let steered_id = steered.delivery_id;
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let peer = thread::spawn(move || {
+            let Ok((_, body)) = read_websocket_frame(&mut server) else {
+                return None;
+            };
+            let request: Value = serde_json::from_slice(&body).expect("decode request");
+            write_server_frame(
+                &mut server,
+                json!({"id": request.get("id"), "result": {"turn": {"id": "turn-1"}}}),
+            );
+            Some(request)
+        });
+
+        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+        adapter.ready = true;
+        adapter.locator = Some(locator);
+        adapter.writer = Some(client.try_clone().expect("clone client"));
+        adapter.reader = Some(client);
+        adapter.in_flight = Some(original_id);
+        adapter.active_turn_id = Some("turn-1".to_string());
+        adapter.pending.insert(original_id, original);
+
+        let accepted = adapter.deliver_blocking(steered).expect("steer accepted");
+        drop(adapter.writer.take());
+        drop(adapter.reader.take());
+        let request = peer.join().expect("peer").expect("steer request");
+
+        assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
+        assert_eq!(request.get("method"), Some(&json!("turn/steer")));
+        assert_eq!(
+            request.pointer("/params/expectedTurnId"),
+            Some(&json!("turn-1"))
+        );
+        assert_eq!(adapter.in_flight, Some(original_id));
+        assert!(adapter.pending.contains_key(&original_id));
+        assert!(!adapter.pending.contains_key(&steered_id));
+
+        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("store");
+        assert_eq!(
+            store.latest(steered_id).expect("latest").map(|r| r.state),
+            Some(DeliveryState::ProtocolAccepted)
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn readiness_failure_records_a_failed_closed_receipt() {
         let home =
             std::env::temp_dir().join(format!("agend-codex-failed-readiness-{}", Uuid::new_v4()));
