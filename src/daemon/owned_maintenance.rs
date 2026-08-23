@@ -2,7 +2,7 @@
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::ConfigRegistry;
-use crate::daemon::owner_services::{OwnerRole, OwnerServicesStarted};
+use crate::daemon::owner_services::OwnerServicesStarted;
 use crate::daemon::per_tick::{run_handlers_with_progress, PerTickHandler, TickContext};
 use crate::daemon::tick_stall::{TickProgress, TickStallMonitorGuard};
 use std::path::Path;
@@ -46,26 +46,6 @@ impl OwnedMaintenanceCycle {
             progress,
             _stall_monitor: stall_monitor,
         }
-    }
-
-    /// Construct only for an owned host. Attached hosts return `None` without
-    /// consuming a witness or creating any cycle state.
-    pub(crate) fn new_for_role(
-        role: OwnerRole,
-        handlers: Vec<Box<dyn PerTickHandler>>,
-        owner_services: Option<OwnerServicesStarted>,
-        host: &'static str,
-        home: &Path,
-    ) -> Option<Self> {
-        if role == OwnerRole::Attached {
-            return None;
-        }
-        Some(Self::new(
-            handlers,
-            owner_services.expect("owned maintenance requires owner-service witness"),
-            host,
-            home,
-        ))
     }
 
     /// Publish the between-tick boundary. Hosts call this immediately before
@@ -200,17 +180,5 @@ mod tests {
             cycle.phase_for_test(),
             Some(crate::daemon::tick_stall::Phase::PostHandlers)
         );
-    }
-
-    #[test]
-    fn attached_role_constructs_no_cycle() {
-        assert!(OwnedMaintenanceCycle::new_for_role(
-            OwnerRole::Attached,
-            Vec::new(),
-            None,
-            "attached-maintenance-red",
-            Path::new("/tmp/owned-maintenance-cycle-red"),
-        )
-        .is_none());
     }
 }

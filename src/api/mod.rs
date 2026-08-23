@@ -29,6 +29,7 @@ pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>
 /// Domain events emitted by the API server when agents or teams change.
 /// These are independent of any UI representation.
 #[derive(Debug)]
+#[allow(dead_code)] // retained as the API notifier compatibility payload
 pub enum ApiEvent {
     InstanceCreated {
         name: String,

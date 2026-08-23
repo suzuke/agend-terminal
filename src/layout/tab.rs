@@ -241,6 +241,7 @@ impl Tab {
     /// of the remembered direction/ratio, with the pane on its remembered
     /// side. Returns the pane back when none of the sibling agents are
     /// displayed in this tab (caller picks a fallback placement).
+    #[allow(dead_code)]
     pub fn restore_split(&mut self, split: &super::RemovedSplit, pane: Pane) -> Option<Pane> {
         let anchors: std::collections::HashSet<usize> = split
             .sibling_agents

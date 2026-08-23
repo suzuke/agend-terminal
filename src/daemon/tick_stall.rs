@@ -1157,25 +1157,13 @@ mod tests {
     /// that drops the `attached_mode` gate would silently create owned state on a
     /// host that never ticks. Also pins the daemon `run_core` host wiring.
     #[test]
-    fn hosts_wired_daemon_yes_attached_app_no() {
+    fn maintenance_cycle_is_daemon_owned_only() {
         let app = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("src/app/mod.rs must be readable");
-        let anchor = app
-            .find("let app_cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new_for_role(")
-            .expect("app must bind the owned maintenance cycle");
-        let region = &app[anchor..(anchor + 800).min(app.len())];
         assert!(
-            region.contains("if attached_mode"),
-            "the app cycle must be gated on attached_mode"
-        );
-        assert!(
-            region.contains("OwnerRole::Attached"),
-            "an attached app must select the attached role"
-        );
-        assert!(
-            region.contains("OwnerRole::Owned"),
-            "an owned app must select the owned role"
+            !app.contains("OwnedMaintenanceCycle"),
+            "the thin-client app must not construct daemon maintenance"
         );
 
         let daemon = std::fs::read_to_string("src/daemon/mod.rs")

@@ -74,45 +74,6 @@ pub(super) struct SessionPane {
     pub(super) display_name: Option<String>,
 }
 
-/// Sync fleet.yaml to match current pane state on detach.
-/// Removes fleet entries not present in any pane; adds panes with backend but missing from fleet.
-pub(super) fn sync_fleet_yaml(home: &Path, layout: &Layout) {
-    let fleet_path = crate::fleet::fleet_yaml_path(home);
-    let fleet = fleet::FleetConfig::load(&fleet_path).ok();
-
-    // Collect all fleet_instance_names currently in panes
-    let mut active_fleet_names: HashSet<String> = HashSet::new();
-    for tab in &layout.tabs {
-        for id in tab.root().pane_ids() {
-            if let Some(pane) = tab.root().find_pane(id) {
-                if let Some(ref name) = pane.fleet_instance_name {
-                    active_fleet_names.insert(name.clone());
-                }
-            }
-        }
-    }
-
-    // H2: guard — if no panes have fleet_instance_name, the layout wasn't
-    // populated from fleet.yaml (crash recovery / fresh start). Skip sync
-    // to avoid deleting all fleet entries.
-    if active_fleet_names.is_empty() {
-        return;
-    }
-
-    // Batch-remove fleet entries not in any pane (single atomic write)
-    if let Some(ref f) = fleet {
-        let to_remove: Vec<String> = f
-            .instance_names()
-            .into_iter()
-            .filter(|name| !active_fleet_names.contains(name))
-            .collect();
-        if !to_remove.is_empty() {
-            tracing::info!(removed = ?to_remove, "sync_fleet_yaml: removing fleet entries not in any pane");
-            let _ = fleet::remove_instances_from_yaml(home, &to_remove);
-        }
-    }
-}
-
 /// Save current session layout to disk. Only stores layout geometry, not agent config.
 /// Serialize the current layout to the pretty-printed `session.json` form.
 fn serialize_session(layout: &Layout) -> Option<String> {
@@ -267,21 +228,8 @@ pub(super) fn restore_with_reconciliation(
         return true;
     }
 
-    // No session.json or empty → rule 1: auto-start fleet (Owned-only).
-    // #1479: auto_start_fleet now team-groups via `place_agents_team_grouped`.
-    if !agent_source.is_empty() {
-        return super::api_server::auto_start_fleet(
-            fleet_path,
-            layout,
-            home,
-            cols,
-            rows,
-            name_counter,
-            attach_jobs,
-        );
-    }
-
-    // Rule 4: nothing → caller adds shell tab.
+    // Owned mode no longer exists. The permanent thin client restores agents
+    // only from the daemon-backed path below.
     false
 }
 

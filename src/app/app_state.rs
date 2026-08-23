@@ -5,6 +5,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::channel::TelegramStatus;
 
 /// #2453 R2: bounded typed owner for the app owner-restart in-flight state.
 /// At most one probe at a time (the gate CAS-serializes at the handler).
@@ -66,6 +67,8 @@ pub(super) struct AppState {
     /// alongside `last_decision_sync`; read at render time by both `render()`
     /// call sites (mirrors how `binary_stale` is snapshotted once per draw).
     pub(super) pending_decisions_total: usize,
+    /// Existing runtime discovery mode, surfaced directly in the status bar.
+    pub(super) daemon_list_mode: crate::runtime::AgentListMode,
     /// #freeze-4 (t-…2324) restart-flood boot phase: until the pre-restart
     /// backlog flood is drained, the loop runs a bounded "loading" phase — a
     /// TIME-capped drain ([`render::drain_all_panes_until`]) that clears the
@@ -146,6 +149,7 @@ impl AppState {
             last_notif_sync: None,
             last_decision_sync: None,
             pending_decisions_total: 0,
+            daemon_list_mode: crate::runtime::AgentListMode::Live,
             booting: true,
             boot_start: std::time::Instant::now(),
             attaches_expected: 0,
@@ -601,6 +605,7 @@ impl AppState {
                     telegram_status,
                     binary_stale,
                     self.pending_decisions_total,
+                    self.daemon_list_mode,
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
@@ -814,23 +819,6 @@ impl AppState {
         }
     }
 
-    pub(super) fn handle_tui_event(
-        &mut self,
-        ev: Result<TuiEvent, crossbeam_channel::RecvError>,
-        deps: &AppDeps<'_>,
-    ) {
-        let AppDeps {
-            registry,
-            wakeup_tx,
-            ..
-        } = *deps;
-        self.dirty = true;
-        if let Ok(event) = ev {
-            tui_events::handle_tui_event(event, &mut self.ui.layout, registry, wakeup_tx);
-            self.needs_resize = true;
-        }
-    }
-
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
         let AppDeps {
             home,
@@ -866,10 +854,9 @@ impl AppState {
                 // daemon.log — only Live↔Fallback transitions
                 // emit (validated by `runtime::tests::
                 // helper_steady_state_does_not_log_per_call`).
-                let current: std::collections::HashSet<String> =
-                    crate::runtime::list_agents_with_fallback(home)
-                        .into_iter()
-                        .collect();
+                let (agents, mode) = crate::runtime::list_agents_with_fallback_with_mode(home);
+                self.daemon_list_mode = mode;
+                let current: std::collections::HashSet<String> = agents.into_iter().collect();
                 let mut to_add: Vec<String> = current
                     .difference(&self.known_remote_agents)
                     .cloned()
@@ -959,18 +946,5 @@ impl AppState {
     pub(super) fn handle_wakeup(&mut self, wakeup_rx: &crossbeam_channel::Receiver<usize>) {
         while wakeup_rx.try_recv().is_ok() {}
         self.dirty = true;
-    }
-
-    /// One owned-mode maintenance tick (see `run_owned_maintenance_tick`).
-    pub(super) fn handle_maintenance_tick(
-        &mut self,
-        app_cycle: &Option<crate::daemon::owned_maintenance::OwnedMaintenanceCycle>,
-        deps: &AppDeps<'_>,
-        app_externals: &crate::agent::ExternalRegistry,
-        app_configs: &crate::api::ConfigRegistry,
-    ) {
-        let AppDeps { home, registry, .. } = *deps;
-        self.dirty = true;
-        run_owned_maintenance_tick(app_cycle, home, registry, app_externals, app_configs);
     }
 }

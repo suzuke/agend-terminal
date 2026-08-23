@@ -406,6 +406,7 @@ fn observed_or_raw_state(h: &agent::AgentHandle, show_observed: bool) -> AgentSt
     AgentState::from_u8(h.published_state.load(Relaxed))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     layout: &mut Layout,
@@ -414,6 +415,7 @@ pub fn render(
     telegram: TelegramStatus,
     binary_stale: bool,
     pending_decisions: usize,
+    daemon_list_mode: crate::runtime::AgentListMode,
 ) {
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -434,6 +436,7 @@ pub fn render(
         telegram,
         binary_stale,
         pending_decisions,
+        daemon_list_mode,
     );
 }
 
@@ -885,6 +888,15 @@ pub(super) fn pane_title_segments(
     let mut segments = Vec::new();
     let base = format!(" {}", pane.label());
     segments.push((base, title_style));
+    if pane.is_disconnected() {
+        segments.push((
+            " [DISCONNECTED]".to_string(),
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if pane.pending_notification_count > 0 {
         segments.push((
             format!(" [{}]", pane.pending_notification_count),
@@ -929,8 +941,19 @@ pub(super) fn render_status_bar(
     telegram: TelegramStatus,
     binary_stale: bool,
     pending_decisions: usize,
+    daemon_list_mode: crate::runtime::AgentListMode,
 ) {
     let mut spans = Vec::new();
+
+    if let Some(hint) = daemon_list_mode.hint() {
+        spans.push(Span::styled(
+            format!(" ! {hint} "),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // #1027: operator-facing indicator for "running daemon's binary is
     // older than the on-disk binary; restart to pick up new code".
@@ -1348,6 +1371,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     false,
                     0,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1431,6 +1455,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     false,
                     0,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1463,6 +1488,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     false,
                     0,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1564,6 +1590,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     true,
                     0,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1596,6 +1623,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     false,
                     0,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1609,6 +1637,37 @@ mod tests {
         assert!(
             !text.contains("daemon binary stale"),
             "binary_stale=false must NOT surface warning, got: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_surfaces_daemon_fallback_mode() {
+        let backend = ratatui::backend::TestBackend::new(160, 3);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        let layout = crate::layout::Layout::new();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                    0,
+                    crate::runtime::AgentListMode::FallbackDaemonAbsent,
+                );
+            })
+            .expect("draw status bar");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("fallback — no daemon detected"),
+            "got: {text}"
         );
     }
 
@@ -1627,6 +1686,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     false,
                     2,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1658,6 +1718,7 @@ mod tests {
                     TelegramStatus::NotConfigured,
                     false,
                     0,
+                    crate::runtime::AgentListMode::Live,
                 );
             })
             .expect("test terminal draw should succeed");

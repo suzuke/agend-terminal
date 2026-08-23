@@ -441,7 +441,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     let _ = crate::fleet::remove_instance_from_yaml(ctx.home, &fleet_name);
                 }
                 super::kill_agent(ctx.home, ctx.registry, name);
-                super::tui_events::remove_agent_pane(name, ctx.layout);
+                remove_agent_pane(name, ctx.layout);
                 return true;
             }
         }
@@ -631,6 +631,24 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         }
     }
     false
+}
+
+fn remove_agent_pane(name: &str, layout: &mut Layout) {
+    loop {
+        let target = layout.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
+            tab.root()
+                .find_pane_id_by_agent(name)
+                .map(|pane_id| (tab_idx, pane_id))
+        });
+        let Some((tab_idx, pane_id)) = target else {
+            break;
+        };
+        if layout.tabs[tab_idx].root().pane_count() <= 1 {
+            layout.close_tab(tab_idx);
+        } else {
+            layout.tabs[tab_idx].close_pane_by_id(pane_id);
+        }
+    }
 }
 
 /// Handle `:config get <key>` / `:config set <key> <value>` / `:config list`.

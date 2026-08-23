@@ -6,6 +6,7 @@ use crate::bridge_client::BridgeClient;
 use crate::vterm::VTerm;
 use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +17,7 @@ use std::time::Instant;
 /// `BridgeClient` that speaks to a daemon-hosted agent over TCP.
 pub enum PaneSource {
     Local,
-    Remote(Arc<Mutex<BridgeClient>>),
+    Remote(Arc<Mutex<BridgeClient>>, Arc<AtomicBool>),
 }
 
 /// A single pane displaying one agent's terminal output.
@@ -152,6 +153,10 @@ fn thread_cpu_time_us() -> Option<u64> {
 }
 
 impl Pane {
+    pub fn is_disconnected(&self) -> bool {
+        matches!(&self.source, PaneSource::Remote(_, connected) if !connected.load(Ordering::Acquire))
+    }
+
     /// Max scroll-back offset for THIS pane's render path. Off-thread mode
     /// (`AGEND_OFFTHREAD_PARSE`) renders the parser thread's published snapshot and
     /// leaves the main-thread `vterm` idle (drain no-ops), so its `max_scroll()` is 0
@@ -411,9 +416,13 @@ impl Pane {
                 // clear the audited turn without warning.
                 crate::reply_ledger::clear_turn(&self.agent_name);
             }
-            PaneSource::Remote(client) => {
-                let mut c = client.lock();
-                let _ = c.send_input(bytes);
+            PaneSource::Remote(client, connected) => {
+                if connected.load(Ordering::Acquire) {
+                    let mut c = client.lock();
+                    if c.send_input(bytes).is_err() {
+                        connected.store(false, Ordering::Release);
+                    }
+                }
             }
         }
     }
@@ -461,9 +470,13 @@ impl Pane {
                     }
                 }
             }
-            PaneSource::Remote(client) => {
-                let mut c = client.lock();
-                let _ = c.send_resize(cols, rows);
+            PaneSource::Remote(client, connected) => {
+                if connected.load(Ordering::Acquire) {
+                    let mut c = client.lock();
+                    if c.send_resize(cols, rows).is_err() {
+                        connected.store(false, Ordering::Release);
+                    }
+                }
             }
         }
     }

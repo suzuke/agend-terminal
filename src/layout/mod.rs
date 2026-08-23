@@ -30,6 +30,7 @@ pub enum MovePlacement {
 /// #1939: full placement of an agent's pane at removal time. Extends the
 /// #1431 tab-name-only memory so a `SameTab` respawn (restart_instance)
 /// restores the pane's position, not just its tab.
+#[allow(dead_code)]
 pub struct RemovedPanePlacement {
     pub tab_name: String,
     /// Index the tab occupied — re-inserts a recreated tab in place when the
@@ -40,6 +41,7 @@ pub struct RemovedPanePlacement {
 }
 
 /// #1939: the parent split of a removed pane.
+#[allow(dead_code)]
 pub struct RemovedSplit {
     pub dir: SplitDir,
     pub ratio: f32,
@@ -62,6 +64,7 @@ pub struct Layout {
     /// by agent name. Recorded on pane removal and consumed by a subsequent
     /// `LayoutHint::SameTab` spawn (restart_instance) so the new pane
     /// returns to its original position. Bounded by distinct agent names.
+    #[allow(dead_code)] // retained for serialized-layout compatibility tests
     removed_pane_memory: HashMap<String, RemovedPanePlacement>,
 }
 
@@ -96,6 +99,7 @@ impl Layout {
     /// #1431/#1939: record where `agent`'s pane currently sits (tab + parent
     /// split geometry) so a later `SameTab` spawn can restore it. Call BEFORE
     /// removing the pane; no-op if the agent has no pane.
+    #[allow(dead_code)]
     pub fn remember_removed_pane(&mut self, agent: &str) {
         if let Some((tab_idx, pane_id)) = self.find_agent_pane(agent) {
             let tab = &self.tabs[tab_idx];
@@ -111,6 +115,7 @@ impl Layout {
     }
 
     /// #1431: take (and forget) the remembered placement for `agent`.
+    #[allow(dead_code)]
     pub fn take_removed_pane(&mut self, agent: &str) -> Option<RemovedPanePlacement> {
         self.removed_pane_memory.remove(agent)
     }
@@ -119,6 +124,7 @@ impl Layout {
     /// Fallback chain: remembered split next to the surviving siblings (exact
     /// slot) → focused split in the same tab (pre-#1939 behavior) → recreate
     /// the tab at its remembered index.
+    #[allow(dead_code)]
     pub fn restore_removed_pane(&mut self, placement: &RemovedPanePlacement, pane: Pane) {
         match self.tabs.iter().position(|t| t.name == placement.tab_name) {
             Some(idx) => {
@@ -153,6 +159,7 @@ impl Layout {
 
     /// #1939: `add_tab` at a position — insert `tab` at `idx` (clamped to the
     /// current tab count) and focus it.
+    #[allow(dead_code)]
     pub fn insert_tab(&mut self, idx: usize, tab: Tab) {
         let idx = idx.min(self.tabs.len());
         self.switch_active(idx);
@@ -300,6 +307,7 @@ impl Layout {
     }
 
     /// Find the `(tab_idx, pane_id)` hosting `agent`, if any.
+    #[allow(dead_code)]
     pub fn find_agent_pane(&self, agent: &str) -> Option<(usize, usize)> {
         self.tabs
             .iter()

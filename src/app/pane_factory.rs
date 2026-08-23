@@ -1022,89 +1022,6 @@ pub(super) fn apply_attach_outcome(
     }
 }
 
-/// Attach a pane to an already-running agent (no spawn — subscribe only).
-/// Used when the API server creates an agent via MCP and the TUI needs to show it.
-pub(super) fn attach_pane(
-    name: &str,
-    registry: &AgentRegistry,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam_channel::Sender<usize>,
-    layout: &mut Layout,
-) -> Result<Pane> {
-    // #1441: registry is UUID-keyed. Locate the live handle by its display
-    // name and adopt its authoritative `id` as the pane's routing key — the
-    // handle's id was itself resolved from fleet.yaml at spawn, so this is the
-    // same single source, no `home` threading needed on the attach path.
-    let (rx, dump, backend_command, instance_id) = {
-        let reg = agent::lock_registry(registry);
-        let (id, handle) = reg
-            .iter()
-            .find(|(_, h)| h.name.as_str() == name)
-            .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found in registry"))?;
-        let (rx, dump) = agent::subscribe_with_dump(handle);
-        (rx, dump, handle.backend_command.clone(), *id)
-    };
-
-    let mut vterm = VTerm::new(cols, rows);
-    vterm.process(&dump);
-
-    let pane_id = layout.next_pane_id();
-    let tx = wakeup_tx.clone();
-    // #forwarder-reap: cancel pair so a pane close reaps the forwarder even when
-    // the agent is quiet (mirrors apply_attachment). `_fwd_cancel` goes on the
-    // returned Pane; dropping it disconnects `fwd_cancel_rx` → the `select!` exits.
-    let (fwd_cancel_tx, fwd_cancel_rx) = crossbeam_channel::unbounded::<()>();
-    let pane_rx = {
-        let n = name.to_string();
-        let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        // fire-and-forget: same lifecycle as create_pane forwarder — exits on
-        // fwd_tx.send fail (pane dropped), rx.recv fail (agent gone), or
-        // fwd_cancel_rx disconnect (pane dropped while agent quiet) (H1).
-        std::thread::Builder::new()
-            .name(format!("{n}_fwd"))
-            .spawn(move || loop {
-                crossbeam_channel::select! {
-                    recv(rx) -> msg => match msg {
-                        Ok(data) => {
-                            if fwd_tx.send(data).is_err() {
-                                break; // H1: pane closed, fwd_rx dropped
-                            }
-                            let _ = tx.send(pane_id);
-                        }
-                        Err(_) => break, // agent removed, broadcast sender dropped
-                    },
-                    recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
-                }
-            })
-            .ok();
-        fwd_rx
-    };
-
-    let backend = Backend::from_command(&backend_command);
-
-    Ok(Pane {
-        agent_name: name.to_string().into(),
-        instance_id,
-        vterm,
-        rx: pane_rx,
-        id: pane_id,
-        backend,
-        working_dir: None,
-        display_name: None,
-        scroll_offset: 0,
-        has_notification: false,
-        fleet_instance_name: Some(name.to_string()),
-        last_input_at: None,
-        pending_notification_count: 0,
-        pending_decision_count: 0,
-        selection: None,
-        source: crate::layout::PaneSource::Local,
-        offthread: None,
-        _fwd_cancel: Some(fwd_cancel_tx),
-    })
-}
-
 /// Create a pane from a fleet ResolvedInstance (full config: env, args, model, etc.).
 ///
 /// `spawn_mode` reflects caller intent — system rehydrate (daemon restart, session
@@ -1235,6 +1152,8 @@ pub(super) fn create_remote_pane(
     let pane_id = layout.next_pane_id();
     let (fwd_tx, pane_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let tx = wakeup_tx.clone();
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let forwarder_connected = Arc::clone(&connected);
     let thread_name = format!("{name}_remote_fwd");
     // fire-and-forget: no JoinHandle — this thread is reaped on pane close by
     // `BridgeClient::drop`, which `shutdown`s the shared socket so this parked
@@ -1254,7 +1173,11 @@ pub(super) fn create_remote_pane(
                 // Daemon never emits TAG_RESIZE toward clients today. Ignore
                 // unknown tags rather than tearing down a healthy session.
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => {
+                    forwarder_connected.store(false, std::sync::atomic::Ordering::Release);
+                    let _ = tx.send(pane_id);
+                    break;
+                }
             }
         })
         .ok();
@@ -1284,7 +1207,7 @@ pub(super) fn create_remote_pane(
         pending_notification_count: 0,
         pending_decision_count: 0,
         selection: None,
-        source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
+        source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client)), connected),
         offthread: None,
         // Remote panes forward from a dup'd socket reader, not a crossbeam agent
         // `rx`, so candidate-B's cancel channel does not apply here — the remote

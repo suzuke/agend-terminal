@@ -144,6 +144,7 @@ impl PaneNode {
     }
 
     /// Check if any pane in the tree has the given agent name (no allocation).
+    #[allow(dead_code)]
     pub fn has_agent(&self, name: &str) -> bool {
         match self {
             PaneNode::Leaf(p) => p.agent_name.as_str() == name,
@@ -168,6 +169,7 @@ impl PaneNode {
 /// #1939: geometry of the parent split holding the leaf `pane_id`: direction,
 /// ratio, which side the leaf sits on, and the sibling subtree's agents.
 /// `None` when the pane is the tab's root (no parent split) or absent.
+#[allow(dead_code)]
 pub(super) fn parent_split_of(node: &PaneNode, pane_id: usize) -> Option<super::RemovedSplit> {
     let PaneNode::Split {
         dir,
@@ -306,6 +308,7 @@ pub(super) fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, O
 /// removed pane's former sibling subtree) in a split of the remembered
 /// direction/ratio, with the new pane on its remembered side. Returns the
 /// pane back when no anchor is present in the tree (caller falls back).
+#[allow(dead_code)]
 pub(super) fn wrap_subtree_with_split(
     node: PaneNode,
     anchors: &std::collections::HashSet<usize>,
@@ -319,6 +322,7 @@ pub(super) fn wrap_subtree_with_split(
     (wrap_minimal(node, anchors, total, split, new_pane), None)
 }
 
+#[allow(dead_code)]
 fn count_anchor_panes(node: &PaneNode, anchors: &std::collections::HashSet<usize>) -> usize {
     match node {
         PaneNode::Leaf(p) => usize::from(anchors.contains(&p.id)),
@@ -331,6 +335,7 @@ fn count_anchor_panes(node: &PaneNode, anchors: &std::collections::HashSet<usize
 /// Descend toward the smallest subtree containing all `total` anchors, then
 /// wrap it. A leaf or a split whose anchors straddle both children is the
 /// minimal containing subtree.
+#[allow(dead_code)]
 fn wrap_minimal(
     node: PaneNode,
     anchors: &std::collections::HashSet<usize>,
@@ -376,6 +381,7 @@ fn wrap_minimal(
     wrap_node(node, split, new_pane)
 }
 
+#[allow(dead_code)]
 fn wrap_node(node: PaneNode, split: &super::RemovedSplit, new_pane: Pane) -> PaneNode {
     let new_leaf = Box::new(PaneNode::Leaf(Box::new(new_pane)));
     let existing = Box::new(node);

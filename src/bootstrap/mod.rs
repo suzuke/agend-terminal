@@ -180,7 +180,6 @@ pub struct OwnedFleet {
     pub home: PathBuf,
     #[allow(dead_code)] // read by diagnostics + tests
     pub fleet_path: PathBuf,
-    pub config: crate::fleet::FleetConfig,
     pub agents: Vec<AgentDef>,
     pub run_dir: PathBuf,
     #[allow(dead_code)] // read by tests; avoids re-reading cookie file
@@ -300,12 +299,11 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 
     let cookie = crate::auth_cookie::issue(&run_dir).context("issue api.cookie")?;
 
-    let (config, agents, telegram) = resolve_fleet_and_reconcile(home, fleet_path, &opts)?;
+    let (_config, agents, telegram) = resolve_fleet_and_reconcile(home, fleet_path, &opts)?;
 
     Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
         home: home.to_path_buf(),
         fleet_path: fleet_path.to_path_buf(),
-        config,
         agents,
         run_dir,
         cookie,
