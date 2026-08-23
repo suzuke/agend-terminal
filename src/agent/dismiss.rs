@@ -1243,6 +1243,8 @@ WARNING: Loading development channels
     const FRAME_COMPETING_3314: &str =
         include_str!("../../tests/fixtures/devchannel-3314/competing.txt");
     const FRAME_QUOTED_3314: &str = include_str!("../../tests/fixtures/devchannel-3314/quoted.txt");
+    const FRAME_LIVE_MODAL_2_1_240_WRAPPED_3314: &str =
+        include_str!("../../tests/fixtures/devchannel-3314/live_modal_2_1_240_wrapped.txt");
 
     /// One process generation, driven deterministically.
     struct Generation3314 {
@@ -1416,6 +1418,18 @@ WARNING: Loading development channels
             !gen.stable_frame("  WARNING: Loading development channels\n\n  ❯ 1. Yes\n    2. No\n")
         );
         assert!(gen.bytes().is_empty());
+    }
+
+    /// #3314: production capture from Claude 2.1.240 at the operator's real
+    /// pane width. The explanatory sentence wraps between `this` and `option`;
+    /// terminal geometry must not make an otherwise complete modal invisible.
+    #[test]
+    fn production_wrapped_2_1_240_modal_is_complete_3314() {
+        use crate::agent::dev_modal::complete_modal_digest;
+        assert!(
+            complete_modal_digest(FRAME_LIVE_MODAL_2_1_240_WRAPPED_3314).is_some(),
+            "#3314: a width-induced line wrap must preserve the modal fingerprint"
+        );
     }
 
     /// #3314 version-drift gate: an unrecognised backend version disarms rather
