@@ -438,7 +438,9 @@ pub fn try_prepared_dismiss_dialog(
                     // #1886 follow-up: arm the in-flight removal as a Drop guard at
                     // thread entry so a panic / early-return still frees the slot.
                     let _guard = InFlightGuard(agent.clone());
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        crate::agent::dev_modal::MIN_STABLE_MS,
+                    ));
                     // #3314 W3: re-check as late as we can. This closes the wide
                     // decide-then-sleep-then-write window, but a check and a
                     // syscall cannot be atomic with respect to another process's
