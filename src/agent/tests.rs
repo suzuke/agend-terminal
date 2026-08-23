@@ -3492,13 +3492,20 @@ impl std::io::Read for ChunkReader {
 struct TimedChunkReader {
     chunks: Vec<(&'static [u8], std::time::Duration)>,
     next: usize,
-    linger_before_eof: std::time::Duration,
+    wait_for_dismiss: Option<&'static str>,
 }
 
 impl std::io::Read for TimedChunkReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let Some((chunk, delay)) = self.chunks.get(self.next) else {
-            std::thread::sleep(self.linger_before_eof);
+            if let Some(name) = self.wait_for_dismiss {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while dismiss::dismiss_in_flight_for_test(name)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+            }
             return Ok(0);
         };
         std::thread::sleep(*delay);
@@ -3637,7 +3644,7 @@ fn run_dev_modal_pty_read_loop_3333(
     let mut reader = TimedChunkReader {
         chunks,
         next: 0,
-        linger_before_eof: std::time::Duration::from_millis(400),
+        wait_for_dismiss: Some("dev-modal-3333"),
     };
     let capture = crate::capture::make_capture_writer(None, "dev-modal-3333", "claude");
     pty_read_loop(&mut reader, &ctx, capture);
