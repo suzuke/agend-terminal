@@ -460,7 +460,11 @@ fn run_app(
     let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
         Default::default();
     let (app_restart_gate, _app_restart_inject, _app_restart_rx) = build_app_restart_wiring();
-    let attached_run_dir = Some(setup_app_bootstrap(&home, &fleet_path)?);
+    let attached_run_dir = setup_app_bootstrap(&home, &fleet_path)?;
+    if !wait_for_agent_spawn_completion(&attached_run_dir, std::time::Duration::from_secs(30)) {
+        anyhow::bail!("daemon control plane is ready but agent startup did not complete");
+    }
+    let attached_run_dir = Some(attached_run_dir);
     let attached_mode = true;
     let app_restart_rx = crossbeam_channel::never();
     let mut state = AppState::new();
@@ -541,6 +545,21 @@ fn wait_for_ready_daemon(home: &Path, timeout: std::time::Duration) -> Option<Pa
         }
         if std::time::Instant::now() >= deadline {
             return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Session reconciliation needs the complete daemon registry. This is separate
+/// from the API liveness gate above: `.ready` means the agent spawn loop ended.
+fn wait_for_agent_spawn_completion(run_dir: &Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if run_dir.join(".ready").is_file() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
