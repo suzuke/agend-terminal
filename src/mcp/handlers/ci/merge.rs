@@ -113,6 +113,85 @@ fn resolve_task_assignee_for_branch(
     if matches.len() == 1 {
         Some(matches.remove(0))
     } else {
+        resolve_task_assignee_from_board(home, repo, branch)
+    }
+}
+
+/// Task-board fallback for [`resolve_task_assignee_for_branch`]: when no live
+/// binding carries the PR branch, look the branch up on the task board —
+/// Release-before-merge deletes the assignee's binding.json BEFORE `repo.merge`
+/// runs, so the live-binding scan misses exactly the normal pipeline. Finds
+/// open-work (`open` / `claimed` / `in_progress` / `in_review` / `blocked`)
+/// tasks whose `branch` equals the PR branch, on a board whose owning team's
+/// source_repo canonicalizes to the merged repo (same lockstep normalizer as
+/// the binding path). Fail-closed: 0 or ≥2 unique (assignee, task-id) matches,
+/// an unreadable/duplicate-board replay error, or no repo-owning team → None.
+fn resolve_task_assignee_from_board(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+) -> Option<(String, String)> {
+    use crate::task_events::TaskStatus;
+    if branch.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let repo_lower = repo.to_lowercase();
+    let teams = crate::teams::list_all(home);
+    // Board project slug → does some team owning this board canonicalize to
+    // the merged repo? A team resolves its board either via explicit
+    // `project_id` (#2509) or via its source_repo path guess — mirror
+    // `board_router::project_id_for_team`'s precedence so the lookup hits the
+    // board tasks are actually created on. The DEFAULT ("default"/"fleet"/empty)
+    // project maps to home, which has no owning team.
+    let repo_boards: std::collections::HashSet<String> = teams
+        .iter()
+        .filter_map(|team| {
+            let team_slug = team.source_repo.as_deref().and_then(|src| {
+                crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(src)
+            })?;
+            if !team_slug.to_lowercase().eq(&repo_lower) {
+                return None;
+            }
+            // Mirror board_router::project_id_for_team's precedence (explicit
+            // #2509 override else source-path guess), then slug it the same way
+            // enumerate_projects names the on-disk board dir.
+            let board_id = team.project_id.clone().or_else(|| {
+                team.source_repo
+                    .as_ref()
+                    .map(|p| crate::tasks::project_id_from_source_repo(p))
+            })?;
+            Some(crate::task_events::project_slug(&board_id))
+        })
+        .collect();
+    // Per-board scan: (project, tasks) pairs give each task's board directly —
+    // no index/emitter context needed.
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for (project, tasks) in crate::tasks::list_all_boards(home) {
+        if !repo_boards.contains(&project) {
+            continue;
+        }
+        for task in &tasks {
+            if task.branch.as_deref() != Some(branch) {
+                continue;
+            }
+            if !matches!(
+                task.status,
+                TaskStatus::Open
+                    | TaskStatus::Claimed
+                    | TaskStatus::InProgress
+                    | TaskStatus::InReview
+                    | TaskStatus::Blocked
+            ) {
+                continue;
+            }
+            if let Some(assignee) = task.assignee.as_ref() {
+                matches.push((assignee.clone(), task.id.clone()));
+            }
+        }
+    }
+    if matches.len() == 1 {
+        Some(matches.remove(0))
+    } else {
         None
     }
 }
