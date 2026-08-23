@@ -1955,8 +1955,7 @@ fn build_command_pins_the_validated_executable_across_symlink_swap_3329() {
     let launcher = root.join("claude");
     std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
     std::fs::create_dir_all(&versions).expect("versions dir");
-    std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions")
-        .expect("agend.md");
+    std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
     std::fs::write(
         workspace.join("mcp-config.json"),
         r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-channel"}}}"#,
