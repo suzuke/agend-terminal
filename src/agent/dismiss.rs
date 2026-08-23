@@ -1653,17 +1653,13 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314: a COLLISION must not spend the one-shot. If a concurrent dismiss
-    /// already holds the in-flight slot we return without writing, and the
-    /// generation must still be able to answer the modal afterwards — otherwise
-    /// a lost attempt strands the agent at an unanswered prompt forever.
+    /// #3314: same-class collisions dedupe without spending the one-shot, while
+    /// an ordinary trust-prompt worker must not block the distinct startup modal.
     #[test]
     fn collision_does_not_spend_the_one_shot_3314() {
         let mut gen = Generation3314::new("3314-collision", true);
         gen.frame(FRAME_LIVE_MODAL_3314);
         gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
-        // Occupy the in-flight slot only now, so the gate says Enqueue and the
-        // fire path then bails at the claim — the collision under test.
         DISMISS_IN_FLIGHT
             .lock()
             .insert(("3314-collision".to_string(), true));
@@ -1680,13 +1676,16 @@ WARNING: Loading development channels
             .lock()
             .remove(&("3314-collision".to_string(), true));
         assert!(gen.bytes().is_empty(), "#3314: a collision writes nothing");
-        // ... and the one-shot is still available: the very next frame answers.
-        // Asserted on BYTES, because a second call after a successful fire is
-        // (correctly) refused as spent, so the return flag alone would mislead.
+        DISMISS_IN_FLIGHT
+            .lock()
+            .insert(("3314-collision".to_string(), false));
         assert!(
             gen.frame(FRAME_LIVE_MODAL_3314),
-            "#3314: a collision must NOT spend the one-shot"
+            "#3314: an ordinary worker must not strand the startup modal"
         );
+        DISMISS_IN_FLIGHT
+            .lock()
+            .remove(&("3314-collision".to_string(), false));
         assert_eq!(gen.bytes().as_slice(), b"\r");
     }
 
