@@ -48,7 +48,7 @@ fn app_prod_region() -> String {
         "agend-terminal/src/app/app_state.rs",
     ] {
         if let Ok(extra) = std::fs::read_to_string(candidate) {
-            let extra_cutoff = extra.find("#[cfg(test)]").unwrap_or(extra.len());
+            let extra_cutoff = extra.rfind("\nmod tests {").unwrap_or(extra.len());
             prod.push_str(&extra[..extra_cutoff]);
             break;
         }

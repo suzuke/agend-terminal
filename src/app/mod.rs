@@ -448,10 +448,11 @@ pub(crate) enum RunOutcome {
 fn run_app(
     terminal: &mut DefaultTerminal,
     fleet_override: Option<&Path>,
-    restart_requester_id: Option<crate::types::InstanceId>,
+    _restart_requester_id: Option<crate::types::InstanceId>,
 ) -> Result<RunOutcome> {
     let home = crate::home_dir();
     app_boot_preflight(&home);
+    crate::bootstrap::signals::install_term_only();
     let fleet_path =
         fleet_override.map_or_else(|| crate::fleet::fleet_yaml_path(&home), Path::to_path_buf);
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -483,23 +484,10 @@ fn run_app(
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
-    let mut restart_target =
-        restart_resume::resolve_target(&fleet_path, attached_mode, restart_requester_id);
-    restart_resume::arm_target_once(&mut restart_target, |instance_id, name, timeout| {
-        crate::agent::spawn_self_kick_bootstrap(
-            Arc::clone(&registry),
-            instance_id,
-            name,
-            home.clone(),
-            timeout,
-            crate::agent::BootstrapRegistrationState::MayRegisterLater,
-            None,
-        );
-    });
     let event_rx = spawn_crossterm_event_reader();
     log_pre_render_milestone(size_debug, restore_start, attached_mode);
     let loop_result: Result<()> = loop {
-        if state.poll_restart(&deps) == LoopFlow::Break {
+        if term_requested_logged() || state.poll_restart(&deps) == LoopFlow::Break {
             break Ok(());
         }
         state.pre_select(terminal, &deps);
@@ -558,23 +546,8 @@ fn wait_for_ready_daemon(home: &Path, timeout: std::time::Duration) -> Option<Pa
     }
 }
 
-/// App exit teardown: persist the on-screen layout, then (Owned mode only) sync
-/// fleet.yaml + kill every agent PTY. Extracted verbatim from the tail of
-/// `run_app` (#14) — byte-identical.
-///
-/// `save_session` is UNGATED (#895): tab grouping / splits / ratios are
-/// presentation-layer state the app owns even when Attached, so the next attach
-/// can restore the custom layout. `sync_fleet_yaml` + agent-kill STAY gated to
-/// Owned mode — in Attached mode the daemon owns fleet.yaml and the agent PTYs.
-/// Process-global app-mode shutdown flag, cloned into every Owned-mode agent's
-/// `SpawnConfig.shutdown` (see `pane_factory::attach_agent_to_pane`). app mode
-/// is a singleton process, so one flag covers the whole fleet — this avoids
-/// threading an `Arc<AtomicBool>` through the entire restore/pane-factory call
-/// chain. `app_teardown` flips it true before killing agents so each agent's
-/// PTY-close handler (`agent::handle_pty_close`) takes the fast `is_shutdown`
-/// early-return (no per-thread 2 s exit-poll, no crash / shell-fallback events
-/// during teardown). It is the app-mode equivalent of run_core's
-/// "drain registry first" race guard. Sticky-true — process exits after.
+/// Process-global flag used by app-owned pane attachment workers while the TUI
+/// exits. Sticky-true because the process exits immediately afterwards.
 static APP_SHUTDOWN: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -613,6 +586,14 @@ fn log_pre_render_milestone(size_debug: bool, restore_start: std::time::Instant,
         attached = attached,
         "pre-render-loop: entering render loop (first draw imminent)"
     );
+}
+
+fn term_requested_logged() -> bool {
+    if crate::bootstrap::signals::term_requested() {
+        tracing::info!("app: SIGTERM received, exiting main loop");
+        return true;
+    }
+    false
 }
 
 /// #2453 Slice 2: one-shot app boot preflight, extracted verbatim from the
@@ -679,6 +660,8 @@ fn bounded_join_attach_workers(
     detached
 }
 
+/// Flush presentation state and bound worker shutdown. The daemon and agent
+/// processes remain independently owned.
 fn app_teardown(home: &Path, layout: &Layout, attach_workers: Vec<std::thread::JoinHandle<()>>) {
     // The event loop has stopped, so this final batch may wait for a metadata
     // lock. Periodic UI flushing uses only the nonblocking path above; placing
@@ -1036,6 +1019,14 @@ mod tests {
     use crate::backend::Backend;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    fn daemon_prod_source() -> String {
+        let source = std::fs::read_to_string("src/daemon/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/mod.rs"))
+            .expect("daemon source file must be readable from test cwd");
+        let cutoff = source.rfind("\nmod tests {").unwrap_or(source.len());
+        source[..cutoff].to_string()
+    }
 
     #[test]
     fn ready_daemon_requires_identity_marker_and_live_api() {
@@ -1578,44 +1569,23 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// TaskSweep silent-dead-in-app fix companion (same class as #2413 below):
-    /// `TaskSweep::spawn`'s only other call site is run_core's
-    /// build_tick_infrastructure, and the LIVE fleet daemon runs THIS app-mode
-    /// path — so without an app-mode wiring, sweep_tick / save_provenance /
-    /// save_health never ran in production. This source-pins that the PRODUCTION
-    /// region of app/mod.rs spawns it inside `start_owned_services`, owner-only
-    /// (the attached branch must NOT also tick — the daemon that owns the fleet
-    /// already did). REVERSE-MUTATION verified: with the test present but the
-    /// production spawn removed, this fails; restoring the spawn turns it GREEN.
+    /// The daemon is the sole TaskSweep owner after app becomes a thin client.
     #[test]
     fn run_app_wires_task_sweep_owner_only() {
-        let source = std::fs::read_to_string("src/daemon/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/mod.rs"))
-            .expect("source file must be readable from test cwd");
-        assert!(
-            source.contains("crate::daemon::task_sweep::TaskSweep::spawn("),
-            "daemon run_core must own TaskSweep after app becomes a thin client"
+        let source = daemon_prod_source();
+        assert_eq!(
+            source
+                .matches("crate::daemon::task_sweep::TaskSweep::spawn(")
+                .count(),
+            1,
+            "daemon production code must own exactly one TaskSweep"
         );
     }
 
-    /// #2413 Phase B live-fix companion: the reducer driver is useless without the
-    /// hook-event SOCKET SERVER feeding its buffer, and `shadow::start` is the only thing
-    /// that binds it. `run_core` already calls it; this source-pins that `run_app` does
-    /// too, so the plane can't be half-wired in app mode again (driver runs, but folds an
-    /// always-empty buffer). The behavioural end-to-end (flag-on → observed_status
-    /// populated) is the operator's live dogfood; this is the cheap cross-platform guard.
-    ///
-    /// Scans ONLY the production region (before the `#[cfg(test)]` cutoff). This
-    /// assertion's own needle literal lives in the test module below, so a WHOLE-FILE
-    /// substring check would self-match and stay green even if the real `run_app` call
-    /// were deleted — the #2433 vacuous-pin class this very PR fixes (DUAL round-1 caught
-    /// it here). Mirrors `run_app_registers_event_bus_subscribers`. REVERSE-MUTATION
-    /// verified: deleting the real `shadow::start(&home)` call from run_app turns this RED.
+    /// The daemon owns the shadow socket after app becomes a thin client.
     #[test]
     fn run_app_wires_shadow_socket_server_2413() {
-        let source = std::fs::read_to_string("src/daemon/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/mod.rs"))
-            .expect("source file must be readable from test cwd");
+        let source = daemon_prod_source();
         assert!(
             source.contains("crate::daemon::shadow::start("),
             "daemon run_core must own the shadow socket after app becomes a thin client"
@@ -1958,22 +1928,11 @@ mod tests {
         assert_eq!(Backend::KiroCli.input_dim_ghost_marker(), None);
     }
 
-    /// app-mode subscriber-wiring source pin. Owned `agend-terminal app` mode
-    /// never calls `daemon::run_core`, so `run_app` MUST itself register the
-    /// event-bus subscribers — otherwise the maintenance tick emits `CronFire` /
-    /// `CiReady` / idle nudges into an empty bus and every delivery silently
-    /// drops (the live #1720 cron silent-drop; regression class #1002 / #982).
-    ///
-    /// File-level positive pin (cross-platform-safe; survives rustfmt re-wrap),
-    /// same pattern as `flush_idle_notifications_wired_to_submit_aware_inject`.
-    /// The functional counterpart —
-    /// `cron_tick::tests::global_bus_cron_subscriber_delivers` — proves the
-    /// registered set actually delivers a CronFire on the process-global bus.
+    /// The daemon owns event-bus subscriber registration after app becomes a
+    /// thin client.
     #[test]
     fn run_app_registers_event_bus_subscribers() {
-        let source = std::fs::read_to_string("src/daemon/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/mod.rs"))
-            .expect("source file must be readable from test cwd");
+        let source = daemon_prod_source();
         assert!(
             source.contains("register_event_subscribers(&ctx.registry)"),
             "daemon run_core must register event subscribers after app becomes a thin client"

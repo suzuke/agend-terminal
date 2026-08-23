@@ -336,24 +336,19 @@ fn successor_argv_contract_is_hidden_and_commit_only() {
 #[test]
 fn cold_boot_and_uuid_mismatch_do_not_schedule_resume() {
     let app = include_str!("mod.rs");
-    let resume = include_str!("restart_resume.rs");
     assert!(
-        app.contains("if attached_mode") && app.contains("spawn_self_kick_bootstrap"),
-        "resume scheduling must be owned-app-only and use the existing bootstrap"
-    );
-    assert!(
-        resume.contains("resolve_name_by_uuid"),
-        "restore scheduling must reverse-resolve the exact UUID, with no name fallback"
+        !app.contains("spawn_self_kick_bootstrap"),
+        "permanent thin-client app must not schedule daemon-owner resume work"
     );
 }
 
 #[test]
-fn restore_resume_scheduling_has_one_production_call_site() {
+fn restore_resume_scheduling_has_no_app_production_call_site() {
     let app = include_str!("mod.rs");
     assert_eq!(
         app.matches("spawn_self_kick_bootstrap").count(),
-        1,
-        "app restore must arm the existing self-kick exactly once"
+        0,
+        "permanent thin-client app must leave resume ownership to the daemon"
     );
 }
 
@@ -377,72 +372,4 @@ fn successor_argv_behavior_is_cold_boot_or_exact_requester() {
             id.full(),
         ]
     );
-}
-
-#[test]
-fn restore_arm_behavior_is_owned_exact_uuid_and_once() {
-    use super::restart_resume::{arm_target_once, resolve_target};
-    use crate::types::InstanceId;
-
-    let home = std::env::temp_dir().join(format!(
-        "agend-app-restart-resume-matrix-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&home).expect("create test home");
-    let default_fleet = home.join("fleet.yaml");
-    let override_fleet = home.join("override-fleet.yaml");
-    let id = InstanceId::new();
-    let other_id = InstanceId::new();
-
-    assert!(
-        resolve_target(&override_fleet, false, None).is_none(),
-        "cold boot must not arm"
-    );
-    assert!(
-        resolve_target(&override_fleet, true, Some(id)).is_none(),
-        "attached mode must not arm"
-    );
-    assert!(
-        resolve_target(&override_fleet, false, Some(id)).is_none(),
-        "missing UUID must not arm"
-    );
-    std::fs::write(
-        &default_fleet,
-        format!(
-            "instances:\n  lead:\n    id: {}\n    backend: codex\n",
-            other_id.full()
-        ),
-    )
-    .expect("write conflicting default fleet");
-    std::fs::write(
-        &override_fleet,
-        format!(
-            "instances:\n  lead:\n    id: {}\n    backend: codex\n",
-            id.full()
-        ),
-    )
-    .expect("write fleet");
-    assert!(
-        resolve_target(&override_fleet, false, Some(other_id)).is_none(),
-        "UUID mismatch must not redirect by name"
-    );
-
-    let mut target = resolve_target(&override_fleet, false, Some(id));
-    assert!(target.is_some(), "matching UUID must resolve one target");
-    let mut armed = 0;
-    assert!(arm_target_once(&mut target, |_id, name, _timeout| {
-        armed += 1;
-        assert_eq!(name, "lead");
-    }));
-    assert_eq!(
-        armed, 1,
-        "matching UUID must schedule exactly one bootstrap"
-    );
-    assert!(
-        !arm_target_once(&mut target, |_id, _name, _timeout| {
-            panic!("a consumed target must not schedule twice")
-        }),
-        "the same handoff target must be consumed once"
-    );
-    std::fs::remove_dir_all(home).ok();
 }

@@ -1726,6 +1726,7 @@ enum IdleInjectWaitTerminal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BootstrapRegistrationState {
+    #[cfg(test)]
     MayRegisterLater,
     AlreadyRegistered,
 }

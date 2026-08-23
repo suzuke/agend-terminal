@@ -6,55 +6,6 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use std::path::Path;
-use std::time::Duration;
-
-pub(crate) type RestartSelfKickTarget = (crate::types::InstanceId, String, Duration);
-
-fn resolve_name_by_uuid(fleet_path: &Path, uuid: &str) -> Option<String> {
-    let fleet = crate::fleet::FleetConfig::load(fleet_path).ok()?;
-    fleet
-        .instances
-        .iter()
-        .find(|(_, instance)| instance.id.as_deref() == Some(uuid))
-        .map(|(name, _)| name.clone())
-}
-
-pub(crate) fn resolve_target(
-    fleet_path: &Path,
-    attached_mode: bool,
-    requester_id: Option<crate::types::InstanceId>,
-) -> Option<RestartSelfKickTarget> {
-    if attached_mode {
-        return None;
-    }
-    let requester_id = requester_id?;
-    let name = resolve_name_by_uuid(fleet_path, &requester_id.full())?;
-    let fleet = crate::fleet::FleetConfig::load(fleet_path).ok()?;
-    let resolved = fleet.resolve_instance(&name)?;
-    let timeout = Duration::from_secs(
-        resolved
-            .backend
-            .preset()
-            .ready_timeout_secs
-            .saturating_add(15),
-    );
-    Some((requester_id, name, timeout))
-}
-
-/// Arm one successor self-kick target. The callback seam makes the exact-once
-/// scheduling contract deterministic in tests while production supplies the
-/// existing `spawn_self_kick_bootstrap` callback.
-pub(crate) fn arm_target_once<F>(target: &mut Option<RestartSelfKickTarget>, arm: F) -> bool
-where
-    F: FnOnce(crate::types::InstanceId, String, Duration),
-{
-    let Some((instance_id, name, timeout)) = target.take() else {
-        return false;
-    };
-    arm(instance_id, name, timeout);
-    true
-}
 
 /// #2453 R2: an in-flight app-restart preflight probe (a direct child running
 /// `--restart-probe`), owned + polled non-blocking by the TUI loop. Carries the
