@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 pub(crate) mod dev_modal;
 mod dismiss;
+mod executable;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
@@ -880,24 +881,7 @@ fn build_command(
             .collect()
     };
 
-    // Resolve bare command names to absolute paths via `which` before handing
-    // them to `CommandBuilder`. On Windows, npm global installs drop both a
-    // Unix-style shell-script (no extension) and a `.cmd` wrapper in the same
-    // directory; `CreateProcessW`'s PATHEXT search walks the exact name first
-    // and picks the extensionless Unix script, which blows up with
-    // ERROR_BAD_EXE_FORMAT (193). Pre-resolving gives us the `.cmd` path
-    // unambiguously. On Unix this is a no-op — `execvp` already does the
-    // equivalent PATH walk — but keeping the same code path on both platforms
-    // avoids a `#[cfg(windows)]` split here.
-    let resolved_command =
-        which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
-    // #3329: execute the same concrete file whose identity arms the startup
-    // modal gate. Claude's updater flips its launcher symlink while retaining
-    // versioned binaries; validating the target but executing the symlink left
-    // a validation-to-exec TOCTOU. `dunce` keeps the pinned path acceptable to
-    // Windows process creation by removing the verbatim-path prefix.
-    let pinned_command =
-        dunce::canonicalize(&resolved_command).unwrap_or_else(|_| resolved_command.clone());
+    let pinned_command = executable::resolve_and_pin(backend_command);
     let mut cmd = CommandBuilder::new(&pinned_command);
     cmd.args(&enriched_args);
     // #3314 B1: capture the arming facts from the command we JUST built — the
