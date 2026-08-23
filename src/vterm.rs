@@ -45,6 +45,12 @@ struct CellView {
     wide_spacer: bool,
 }
 
+fn row_buffer(cols: usize) -> String {
+    // Capacity is measured in bytes, while `cols` is terminal columns. A single
+    // visible cell can hold a four-byte UTF-8 scalar, so reserve the safe bound.
+    String::with_capacity(cols.saturating_mul(4))
+}
+
 /// Shared core for `VTerm::tail_lines` / `tail_lines_with_fg` / `tail_lines_with_dim`
 /// AND their [`GridSnapshot`] equivalents. `get(row, col)` yields the visible-grid
 /// cell at `(row, col)` (row 0 = visible top); the caller supplies the source — the
@@ -83,7 +89,7 @@ fn tail_lines_core(
         // preallocation and forced a realloc + memmove — per row, per frame, inside
         // `terminal.draw` on the render thread (see `DRAIN_OUTPUT_BUDGET_BYTES`).
         // `cols * 4` is the most any single column can contribute in UTF-8.
-        let mut line = String::with_capacity(cols.saturating_mul(4));
+        let mut line = row_buffer(cols);
         // Same class: these grew from ZERO capacity one push at a time whenever
         // `collect_fg` is on. Sized once here; still empty when the caller opted out.
         let (mut fg, mut dim): (Vec<CellFg>, Vec<bool>) = if collect_fg {

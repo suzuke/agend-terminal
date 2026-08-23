@@ -1,9 +1,8 @@
 //! #3330: the `tail_lines_core` CJK-allocation tests, split out of the inline
 //! `vterm::tests` module so `src/vterm.rs` stays under its 3103-LOC grandfathered
-//! ceiling (`tests/src_file_size_invariant.rs`). Move-only — every test body and
-//! name is unchanged from the commit that introduced them.
+//! ceiling (`tests/src_file_size_invariant.rs`).
 
-use super::{tail_lines_core, CellView};
+use super::{row_buffer, tail_lines_core, CellView};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 /// #cjk-render-cost regression: `tail_lines_core` preallocated its row buffer with
@@ -16,6 +15,11 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 #[test]
 fn tail_lines_core_row_buffer_must_hold_a_full_width_cjk_row() {
     let cols = 80;
+    let required_bytes = (cols / 2) * '中'.len_utf8();
+    assert!(
+        row_buffer(cols).capacity() >= required_bytes,
+        "the production row buffer must hold a full-width CJK row without reallocating"
+    );
     let (text, _, _) = tail_lines_core(cols, 1, 1, false, false, |_, col| CellView {
         // even column = the wide char, odd column = its spacer
         c: if col % 2 == 0 { '中' } else { ' ' },
