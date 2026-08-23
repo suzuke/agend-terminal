@@ -133,12 +133,15 @@ impl CodexNativeShared {
         if let Some(locator) = self.locator.clone() {
             envelope.session = locator;
         }
-        if self.in_flight.is_some() && !matches!(envelope.kind, DeliveryKind::Steer) {
+        if self.in_flight.is_some()
+            && self.active_turn_id.is_none()
+            && !matches!(envelope.kind, DeliveryKind::Steer)
+        {
             let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
-            queued.detail = Some("one ordinary turn is already in flight".to_string());
+            queued.detail = Some("the active Codex turn id is not known yet".to_string());
             store.record(queued)?;
             return Err(anyhow::anyhow!(
-                "Codex thread already has an ordinary turn in flight"
+                "Codex active turn is not ready for turn/steer"
             ));
         }
 
@@ -152,6 +155,7 @@ impl CodexNativeShared {
                 return Err(error);
             }
         };
+        let steers_active_turn = method == "turn/steer";
         let request_id = self.next_request_id.to_string();
         let response = match self.send_request(&method, params) {
             Ok(response) => response,
@@ -184,12 +188,19 @@ impl CodexNativeShared {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             });
-        self.pending.insert(envelope.delivery_id, envelope.clone());
-        self.in_flight = Some(envelope.delivery_id);
+        if !steers_active_turn {
+            self.active_turn_id = backend_request_id.clone();
+            self.pending.insert(envelope.delivery_id, envelope.clone());
+            self.in_flight = Some(envelope.delivery_id);
+        }
         let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
         receipt.protocol_request_id = Some(backend_request_id.unwrap_or(request_id));
         receipt.tui_visibility = Some("shared_codex_thread".to_string());
-        receipt.detail = Some("Codex app-server accepted turn request".to_string());
+        receipt.detail = Some(if steers_active_turn {
+            "Codex app-server accepted turn/steer".to_string()
+        } else {
+            "Codex app-server accepted turn/start".to_string()
+        });
         store.record(receipt.clone())?;
         Ok(receipt)
     }
@@ -298,20 +309,23 @@ impl CodexNativeShared {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Codex NativeShared requires a thread_id"))?;
         let input = json!([{"type": "text", "text": envelope.body}]);
+        if matches!(envelope.kind, DeliveryKind::Steer)
+            || (self.in_flight.is_some() && !matches!(envelope.kind, DeliveryKind::Interrupt))
+        {
+            let turn_id = self
+                .active_turn_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("turn/steer requires an active Codex turn id"))?;
+            return Ok((
+                "turn/steer".to_string(),
+                json!({
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": input,
+                }),
+            ));
+        }
         match envelope.kind {
-            DeliveryKind::Steer => {
-                let turn_id = self.active_turn_id.clone().ok_or_else(|| {
-                    anyhow::anyhow!("turn/steer requires an active Codex turn id")
-                })?;
-                Ok((
-                    "turn/steer".to_string(),
-                    json!({
-                        "threadId": thread_id,
-                        "expectedTurnId": turn_id,
-                        "input": input,
-                    }),
-                ))
-            }
             DeliveryKind::Interrupt => Err(anyhow::anyhow!(
                 "interrupt requires an explicit Codex protocol operation; ordinary delivery cannot infer it"
             )),
@@ -327,6 +341,7 @@ impl CodexNativeShared {
                     "clientUserMessageId": envelope.delivery_id.to_string(),
                 }),
             )),
+            DeliveryKind::Steer => unreachable!("steer is handled before ordinary turn/start"),
         }
     }
 
@@ -1595,6 +1610,7 @@ mod tests {
         let mut adapter = CodexNativeShared::new(&home, "codex-agent");
         let accepted = adapter.deliver_blocking(envelope).expect("accepted");
         assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
+        assert_eq!(adapter.active_turn_id.as_deref(), Some("turn-1"));
         assert!(matches!(
             adapter.next_event_blocking().expect("started"),
             BackendEvent::TurnStarted { .. }
