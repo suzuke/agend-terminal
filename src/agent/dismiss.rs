@@ -601,6 +601,24 @@ mod tests {
         }
     }
 
+    struct FailingWriter {
+        attempted: std::sync::mpsc::Sender<()>,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.attempted.send(());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected PTY write failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// #3294: the dev-channel startup modal IS classified as `PermissionPrompt`,
     /// honestly, like any other matching frame (`state::prompt_latch` changes only
     /// when that latch releases, never the classification). The startup latch is
@@ -1514,6 +1532,46 @@ WARNING: Loading development channels
         );
     }
 
+    /// #3314: a valid barrier does not make a failed PTY write a submission.
+    /// This reaches the detached writer's result arm rather than its earlier
+    /// stale-frame check, pinning the production path that review found absent.
+    #[test]
+    fn failed_detached_write_leaves_the_one_shot_unspent_3314() {
+        let mut gen = Generation3314::new("3314-detached-failure", true);
+        assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        set_inline_dismiss_write_for_test(false);
+        let (attempted, observed) = std::sync::mpsc::channel();
+        gen.writer = Arc::new(Mutex::new(Box::new(FailingWriter { attempted })));
+        assert!(try_prepared_dismiss_dialog(
+            &gen.tag,
+            FRAME_LIVE_MODAL_3314,
+            &gen.writer,
+            &gen.prepared,
+            DismissScanScope::Startup,
+            &mut gen.gate,
+            LogicalMs(gen.now),
+        ));
+        observed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the detached writer must attempt the PTY write");
+        for _ in 0..100 {
+            if !DISMISS_IN_FLIGHT.lock().contains(&gen.tag) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !DISMISS_IN_FLIGHT.lock().contains(&gen.tag),
+            "the detached writer must finish before the gate is inspected"
+        );
+        assert_ne!(
+            gen.gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(gen.now)),
+            GateOutcome::Refuse(crate::agent::dev_modal::Refused::Spent),
+            "a failed detached write must leave the one-shot unspent"
+        );
+    }
+
     /// #3314 version-drift gate: an unrecognised backend version disarms rather
     /// than assuming the modal still renders the way our captures recorded it.
     /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 -> .240
@@ -1650,6 +1708,42 @@ WARNING: Loading development channels
             after > before,
             "#3314: a real PTY write must invalidate an in-flight candidate"
         );
+    }
+
+    #[test]
+    fn failed_pty_write_does_not_bump_the_epoch_3314() {
+        let (attempted, observed) = std::sync::mpsc::channel();
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(FailingWriter { attempted })));
+        let epoch = crate::agent::dev_modal::arm_epoch(&writer);
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            write_with_timeout(&writer, b"anything")
+                .expect_err("the injected write must fail")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        observed.recv().expect("the writer must be attempted");
+        let after = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        crate::agent::dev_modal::disarm_epoch(&writer);
+        assert_eq!(
+            after, before,
+            "#3314: a failed write delivered no input and must not invalidate the candidate"
+        );
+    }
+
+    #[test]
+    fn fallback_write_rechecks_the_barrier_3314() {
+        let (writer, written) = recording_writer_3314();
+        let mut gate = DevModalGate::new(true);
+        let barrier = gate.write_barrier();
+        gate.note_pty_activity();
+        assert_eq!(
+            write_with_timeout_guarded(&writer, b"\r", Some(barrier))
+                .expect_err("an invalid barrier must cancel the fallback write")
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(written.lock().is_empty());
     }
 
     /// #3314: an UNARMED writer's writes are a no-op, so the registry cannot
