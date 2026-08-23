@@ -22,8 +22,8 @@ mod executable;
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
-    dev_modal_rescan_armed, dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state,
-    prepare_dismiss_patterns, try_prepared_dismiss_dialog, PreparedDismissPattern,
+    dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
+    try_prepared_dismiss_dialog, PreparedDismissPattern,
 };
 
 pub mod deleting;
@@ -2146,11 +2146,6 @@ fn pty_read_loop(
                 }
                 let data = &buf[..n_bytes];
 
-                // A scheduled startup-modal CR is valid only while the child
-                // has emitted no newer frame.  Count every PTY output chunk
-                // before snapshotting the candidate barrier below.
-                dev_modal::note_pty_output(pty_writer);
-
                 capture.write(data);
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic),
@@ -2209,8 +2204,7 @@ fn pty_read_loop(
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
-                if (dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
-                    || dev_modal_rescan_armed(dismiss_agent_ever_idle, &screen))
+                if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
                     && !in_cooldown
                     && try_prepared_dismiss_dialog(
                         name,

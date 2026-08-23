@@ -272,12 +272,6 @@ pub(crate) fn note_pty_write(writer: &crate::agent::PtyWriter) {
     }
 }
 
-/// Record child output that can repaint a startup-modal candidate while its
-/// delayed confirmation is pending.
-pub(crate) fn note_pty_output(writer: &crate::agent::PtyWriter) {
-    note_pty_write(writer);
-}
-
 /// A geometry change on this PTY. NOT a byte write, so it does not pass through
 /// `write_with_timeout` and needs its own call site (`Pane::resize_pty`).
 ///
@@ -406,10 +400,6 @@ pub(crate) enum GateOutcome {
     Refuse(Refused),
     /// A candidate is being observed but is not yet stable, or its epoch moved.
     Hold,
-    /// The first complete sighting is allowed to start the existing delayed
-    /// writer.  Its late barrier check supplies the stability window even when
-    /// the child emits no second PTY frame (the normal static-modal case).
-    Schedule,
     /// Stable, unmodified, and unspent — the caller may enqueue exactly one CR
     /// and must mark its [`EnqueueReceipt`] only after successful delivery.
     Enqueue,
@@ -522,7 +512,7 @@ impl DevModalGate {
                     first_seen: now,
                     epoch_at: self.epoch.load(Ordering::SeqCst),
                 });
-                GateOutcome::Schedule
+                GateOutcome::Hold
             }
         }
     }
