@@ -17,7 +17,7 @@
 
 captured_from_cli_version: "2.1.237"
 recorded_on: "2026-08-20"
-validated_against_cli_versions: ["2.1.238", "2.1.240"]
+validated_against_cli_versions: ["2.1.238", "2.1.240", "2.1.241"]
 validation_method: >
   Every static line the recognizer depends on was confirmed byte-present in the
   2.1.238 and 2.1.240 binaries. The 2.1.240 binary SHA-256 was
@@ -25,6 +25,10 @@ validation_method: >
   The 2.1.240 rendered frame was captured from the preserved production pane;
   its fixture differs from the capture only by a final newline. The recognizer
   must tolerate terminal-induced wrapping without depending on geometry.
+  The 2.1.241 binary SHA-256 was
+  1495eb7c42d3b4451f5f1cd38b6d498d22a4a38c802bc2be5c1cf1795e64820d;
+  its rendered frame was captured from the preserved archfix-opus-3
+  production startup pane on 2026-08-23.
 
 fixtures:
   - file: live_modal.txt
@@ -34,6 +38,10 @@ fixtures:
     scenario: Claude 2.1.240 production spawn at 100 columns, modal LIVE and wrapped
     full_static_fingerprint: true
     capture_sha256: dc798dd9a718b734694d65a6a9c85afb222638bcc7de3f7e90ce8487ae61fab5
+  - file: live_modal_2_1_241.txt
+    scenario: Claude 2.1.241 production spawn, modal LIVE before operator confirmation
+    full_static_fingerprint: true
+    capture_sha256: 2bd9fb4a890d95d7054efa7185166c14ed519b31062a087cf8947bd3ffa633eb
   - file: replay.txt
     scenario: --continue restart; the modal was already answered, the marker is present only as REPLAYED transcript
     full_static_fingerprint: true

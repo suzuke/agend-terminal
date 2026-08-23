@@ -1289,6 +1289,8 @@ WARNING: Loading development channels
     const FRAME_QUOTED_3314: &str = include_str!("../../tests/fixtures/devchannel-3314/quoted.txt");
     const FRAME_LIVE_MODAL_2_1_240_WRAPPED_3314: &str =
         include_str!("../../tests/fixtures/devchannel-3314/live_modal_2_1_240_wrapped.txt");
+    const FRAME_LIVE_MODAL_2_1_241_3314: &str =
+        include_str!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
 
     /// One process generation, driven deterministically.
     struct Generation3314 {
@@ -1476,6 +1478,13 @@ WARNING: Loading development channels
         );
     }
 
+    /// #3329: production capture from the operator's Claude 2.1.241 startup.
+    #[test]
+    fn production_2_1_241_modal_is_complete_3329() {
+        use crate::agent::dev_modal::complete_modal_digest;
+        assert!(complete_modal_digest(FRAME_LIVE_MODAL_2_1_241_3314).is_some());
+    }
+
     /// #3314: recognizing the headline is not a successful dismiss. A refused
     /// generation must not emit the success signal that operators rely on.
     #[test]
@@ -1583,6 +1592,10 @@ WARNING: Loading development channels
             version_is_validated(Some("2.1.240")),
             "#3314: the production-captured 2.1.240 modal must be armed"
         );
+        assert!(
+            version_is_validated(Some("2.1.241")),
+            "#3329: the production-captured 2.1.241 modal must be armed"
+        );
         assert!(version_is_validated(Some("2.1.238")));
         assert!(version_is_validated(Some("2.1.237")));
         assert!(
@@ -1596,6 +1609,10 @@ WARNING: Loading development channels
         assert!(
             VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.240"),
             "the production-captured version must be listed"
+        );
+        assert!(
+            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.241"),
+            "the current production-captured version must be listed"
         );
         assert!(
             VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.238"),
