@@ -2719,7 +2719,6 @@ fn write_with_timeout_guarded(
     if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
         return Err(std::io::ErrorKind::Interrupted.into());
     }
-    crate::agent::dev_modal::note_pty_write(writer);
     let key = Arc::as_ptr(writer) as usize;
 
     // If a previous write is still stuck, fail fast.
@@ -2735,6 +2734,7 @@ fn write_with_timeout_guarded(
         guard.insert(key);
     }
 
+    let epoch_writer = Arc::clone(writer);
     let data = data.to_vec();
     let writer = Arc::clone(writer);
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -2794,7 +2794,7 @@ fn write_with_timeout_guarded(
         }
     };
 
-    result
+    actor_write::record_successful_write(&epoch_writer, result)
 }
 
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {

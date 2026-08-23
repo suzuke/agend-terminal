@@ -1828,8 +1828,8 @@ WARNING: Loading development channels
              `pty_read_loop_ends_the_generation_on_both_exits_3315`; this pins the call site"
         );
         assert!(
-            agent_src.contains("crate::agent::dev_modal::note_pty_write(writer);"),
-            "#3314: write_with_timeout must bump the epoch for every PTY write"
+            agent_src.contains("actor_write::record_successful_write"),
+            "#3314: write_with_timeout must bump the epoch after successful PTY writes"
         );
         let pane_src = include_str!("../layout/pane.rs");
         assert!(
