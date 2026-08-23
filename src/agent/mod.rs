@@ -2209,8 +2209,14 @@ fn pty_read_loop(
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
+                // #3314: Claude renders its daemon-owned development-channel
+                // startup modal immediately after the trust prompt. Do not let
+                // the trust dismiss's cooldown strand that complete, gated modal.
+                let startup_dev_modal_in_cooldown = in_cooldown
+                    && !dismiss_agent_ever_idle
+                    && dev_modal::complete_modal_digest(&screen).is_some();
                 if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
-                    && !in_cooldown
+                    && (!in_cooldown || startup_dev_modal_in_cooldown)
                     && try_prepared_dismiss_dialog(
                         name,
                         &screen,
