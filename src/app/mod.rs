@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_daemon_requires_identity_marker_and_live_api() {
+    fn ready_daemon_accepts_live_control_plane_before_agent_spawn_finishes() {
         let home = std::env::temp_dir().join(format!(
             "agend-thin-client-ready-{}-{}",
             std::process::id(),
@@ -1041,7 +1041,6 @@ mod tests {
         let run_dir = home.join("run").join(std::process::id().to_string());
         std::fs::create_dir_all(&run_dir).expect("create run dir");
         crate::daemon::write_daemon_id(&run_dir);
-        std::fs::write(run_dir.join(".ready"), b"ready").expect("write ready marker");
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind probe listener");
         crate::ipc::write_port(
@@ -1050,6 +1049,10 @@ mod tests {
             listener.local_addr().expect("listener address").port(),
         )
         .expect("publish api port");
+        assert!(
+            !run_dir.join(".ready").exists(),
+            "agent spawn completion is intentionally still pending"
+        );
 
         assert_eq!(
             wait_for_ready_daemon(&home, std::time::Duration::from_millis(20)).as_deref(),
