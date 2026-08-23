@@ -1460,6 +1460,37 @@ WARNING: Loading development channels
         assert!(logs_contain("dialog dismiss submitted"));
     }
 
+    /// #3314: the real detached writer sleeps before its final barrier check.
+    /// Cancelling in that window is not a submission: it must neither spend the
+    /// generation nor emit the success signal.
+    #[test]
+    #[tracing_test::traced_test]
+    fn cancelled_detached_write_is_not_a_submission_3314() {
+        let mut gen = Generation3314::new("3314-detached-cancel", true);
+        assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        set_inline_dismiss_write_for_test(false);
+        assert!(try_prepared_dismiss_dialog(
+            &gen.tag,
+            FRAME_LIVE_MODAL_3314,
+            &gen.writer,
+            &gen.prepared,
+            DismissScanScope::Startup,
+            &mut gen.gate,
+            LogicalMs(gen.now),
+        ));
+
+        gen.note_activity();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert!(gen.bytes().is_empty());
+        assert!(!logs_contain("dialog dismiss submitted"));
+        assert_ne!(
+            gen.gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(gen.now)),
+            GateOutcome::Refuse(crate::agent::dev_modal::Refused::Spent),
+            "a barrier-cancelled detached write must leave the one-shot unspent"
+        );
+    }
+
     /// #3314 version-drift gate: an unrecognised backend version disarms rather
     /// than assuming the modal still renders the way our captures recorded it.
     /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 -> .240
