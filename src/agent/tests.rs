@@ -3641,6 +3641,16 @@ fn run_dev_modal_pty_read_loop_3333(
     };
     let capture = crate::capture::make_capture_writer(None, "dev-modal-3333", "claude");
     pty_read_loop(&mut reader, &ctx, capture);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while dismiss::dismiss_in_flight_for_test("dev-modal-3333")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(
+        !dismiss::dismiss_in_flight_for_test("dev-modal-3333"),
+        "#3333: production dismiss worker did not finish before the bounded test deadline"
+    );
     written
 }
 

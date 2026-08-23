@@ -85,6 +85,11 @@ pub(crate) fn dismiss_scan_count_for_test() -> usize {
     DISMISS_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(test)]
+pub(crate) fn dismiss_in_flight_for_test(name: &str) -> bool {
+    DISMISS_IN_FLIGHT.lock().contains(name)
+}
+
 #[derive(Clone)]
 pub struct PreparedDismissPattern {
     pattern: String,
