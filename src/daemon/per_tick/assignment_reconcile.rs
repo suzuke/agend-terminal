@@ -165,8 +165,10 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     workset.extend(crate::daemon::pr_state::list_state_identities(home));
 
     let mut wakes = ReconcileWakes::default();
+    // #3336: ONE memo per pass, shared by every branch. See `TaskTerminalMemo`.
+    let mut task_status = TaskTerminalMemo::default();
     for (repo, branch) in workset {
-        let branch_wakes = reconcile_branch(home, &repo, &branch, now);
+        let branch_wakes = reconcile_branch(home, &repo, &branch, now, &mut task_status);
         wakes
             .assignment_targets
             .extend(branch_wakes.assignment_targets);
@@ -175,9 +177,57 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     wakes
 }
 
+/// #3336: `crate::tasks::load_routed` costs ~4.7 s per call — `route_task` replays
+/// EVERY project board (13 here) and `replay_strict_at` has no cache at all. The
+/// inner loop below called it once per ACTIVE ASSIGNMENT RECORD, and this store's
+/// 360 record files carry only 2 DISTINCT task ids, so the same 13-board scan was
+/// repeated for every record. Worse, `reconcile_pass` runs inside the maintenance
+/// tick, which the owned-mode TUI executes ON THE MAIN LOOP (`app::run_app`'s
+/// `select!` tick arm) — so each repeat froze the whole UI.
+///
+/// Memoize per PASS. The call site reads exactly one thing (`status.is_terminal()`),
+/// so the memo stores exactly that, and `None` collapses EVERY `TaskRouteError`
+/// (Ambiguous / Unreadable / NotFound) into the same fail-closed "preserve the
+/// assignment" branch the `if let Ok(..)` already produced — behaviour is unchanged.
+///
+/// Freshness: all records in one pass now share the routing observed at that id's
+/// FIRST lookup in the pass, instead of re-routing per record. A pass already spans
+/// seconds, so per-record re-routing bought no real freshness; at worst a task that
+/// turns terminal mid-pass retires its assignment on the next tick.
+///
+/// This does NOT fix the underlying 4.7 s (that needs the #3336 board-index and
+/// strict-replay-cache work) — it stops paying it once per record.
+#[derive(Default)]
+struct TaskTerminalMemo {
+    seen: std::collections::HashMap<String, Option<crate::task_events::TaskStatus>>,
+}
+
+impl TaskTerminalMemo {
+    fn status_of(
+        &mut self,
+        home: &Path,
+        task_id: &str,
+    ) -> Option<crate::task_events::TaskStatus> {
+        if let Some(hit) = self.seen.get(task_id) {
+            return *hit;
+        }
+        let resolved = crate::tasks::load_routed(home, task_id)
+            .ok()
+            .map(|routed| routed.task.status);
+        self.seen.insert(task_id.to_string(), resolved);
+        resolved
+    }
+}
+
 /// One branch. Returns the targets to WAKE (A3). No lock is held across the calls
 /// below — each store op locks internally, so they never nest (no re-lock deadlock).
-fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> ReconcileWakes {
+fn reconcile_branch(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    now: &str,
+    task_status: &mut TaskTerminalMemo,
+) -> ReconcileWakes {
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
     store::tombstone_terminal_matches(home, repo, branch);
@@ -228,8 +278,8 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Reconci
         // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
         // valid review — retire the assignment instead of re-nudging it.
         // Fail-closed: route error or unknown task_id → preserve.
-        if let Ok(routed) = crate::tasks::load_routed(home, &record.task_id) {
-            if routed.task.status.is_terminal() {
+        if let Some(status) = task_status.status_of(home, &record.task_id) {
+            if status.is_terminal() {
                 if store::retire_if_id_matches(
                     home,
                     repo,
@@ -244,7 +294,7 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Reconci
                         assignment_id = %record.assignment_id,
                         target = %record.target,
                         task_id = %record.task_id,
-                        task_status = %routed.task.status,
+                        task_status = %status,
                         "assignment retired: owning task is terminal"
                     );
                 }
@@ -418,6 +468,58 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// #3336: the memo must resolve each DISTINCT task id at most once per pass.
+    /// `load_routed` costs ~4.7s (13 board replays, `replay_strict_at` uncached) and
+    /// the reconcile inner loop hits it once per ACTIVE ASSIGNMENT RECORD — this
+    /// store's 360 record files carry only 2 distinct ids, so the repeat was pure waste.
+    ///
+    /// Proof that the second lookup does NOT touch disk: resolve once against a real
+    /// home, then DELETE the home. A non-memoized second call would now route against
+    /// a missing board and answer differently (or `None`); a memoized one returns the
+    /// first answer verbatim.
+    #[test]
+    fn task_terminal_memo_resolves_each_id_once_per_pass() {
+        let home = tmp_home("memo");
+        let tid = "t-memo-1";
+        crate::task_events::append(
+            &home,
+            &InstanceName("creator".into()),
+            TaskEvent::Created {
+                task_id: TaskId(tid.into()),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .expect("seed task");
+
+        let mut memo = TaskTerminalMemo::default();
+        let first = memo.status_of(&home, tid);
+        assert!(first.is_some(), "a freshly created task must route");
+        assert_eq!(memo.seen.len(), 1, "one distinct id → one memo entry");
+
+        // Disk is gone: only the memo can answer now.
+        std::fs::remove_dir_all(&home).ok();
+        let second = memo.status_of(&home, tid);
+        assert_eq!(second, first, "repeat lookup must come from the memo, not disk");
+        assert_eq!(memo.seen.len(), 1, "a repeat must not add an entry");
+
+        // A DIFFERENT id is a real (now-failing) lookup and is cached as such —
+        // an unroutable id collapses to None, the fail-closed "preserve" answer.
+        let other = memo.status_of(&home, "t-memo-2");
+        assert_eq!(other, None, "unroutable id must collapse to None (preserve)");
+        assert_eq!(memo.seen.len(), 2, "a distinct id adds exactly one entry");
     }
 
     fn mk(repo: &str, branch: &str, target: &str, pr: u64, created: &str) -> ActiveAssignment {
