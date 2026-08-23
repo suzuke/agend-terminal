@@ -61,8 +61,9 @@ use std::sync::Arc;
 /// The modal's static lines, in render order.
 ///
 /// Version-exact: every entry was confirmed byte-present in the Claude 2.1.238
-/// binary, and the captures they are matched against were rendered on 2.1.237
-/// (see `tests/fixtures/devchannel-3314/MANIFEST.yaml`). The option NUMBERING is
+/// and 2.1.240 binaries, and the captures they are matched against were rendered
+/// on 2.1.237 and 2.1.240 (see `tests/fixtures/devchannel-3314/MANIFEST.yaml`).
+/// The option NUMBERING is
 /// deliberately absent — `2. Exit` is not a literal in the binary because the
 /// list index is rendered dynamically, so keying on it would be keying on
 /// something Claude computes rather than something it ships.
@@ -92,9 +93,9 @@ pub(crate) const ELIGIBILITY_EXPIRY_MS: u64 = 120_000;
 /// Claude CLI versions whose modal rendering has actually been validated
 /// against real captures. An unrecognised version DISABLES auto-answering
 /// rather than assuming the geometry still holds — the fleet auto-updates
-/// (2.1.235 -> .236 -> .237 -> .238 across four days), and a silently changed
+/// (2.1.235 -> .236 -> .237 -> .238 -> .240), and a silently changed
 /// modal must cost a hang plus an operator notice, never a stray keystroke.
-pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238"];
+pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238", "2.1.240"];
 
 /// Resolve the version of a concrete backend binary.
 ///
@@ -328,11 +329,12 @@ pub(crate) fn complete_modal_digest(screen: &str) -> Option<u64> {
     let mut start = None;
     let mut end = 0usize;
     for line in MODAL_STATIC_LINES {
-        let found = screen[cursor..].find(line)? + cursor;
+        let (relative_start, relative_end) = find_wrapped_literal(&screen[cursor..], line)?;
+        let found = relative_start + cursor;
         if start.is_none() {
             start = Some(found);
         }
-        end = found + line.len();
+        end = relative_end + cursor;
         cursor = end;
     }
     let region = &screen[start?..end];
@@ -342,6 +344,41 @@ pub(crate) fn complete_modal_digest(screen: &str) -> Option<u64> {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     Some(hash)
+}
+
+/// Find an ASCII literal while tolerating terminal-induced wrapping inside its
+/// whitespace runs. The returned byte range stays in the original frame so the
+/// stability digest remains sensitive to the exact rendered bytes.
+fn find_wrapped_literal(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let first_token = needle.split_ascii_whitespace().next()?;
+    for (start, _) in haystack.match_indices(first_token) {
+        let mut hay = start;
+        let mut pat = 0;
+        let hay_bytes = haystack.as_bytes();
+        let pat_bytes = needle.as_bytes();
+        while pat < pat_bytes.len() {
+            if pat_bytes[pat].is_ascii_whitespace() {
+                while pat < pat_bytes.len() && pat_bytes[pat].is_ascii_whitespace() {
+                    pat += 1;
+                }
+                if hay >= hay_bytes.len() || !hay_bytes[hay].is_ascii_whitespace() {
+                    break;
+                }
+                while hay < hay_bytes.len() && hay_bytes[hay].is_ascii_whitespace() {
+                    hay += 1;
+                }
+            } else if hay < hay_bytes.len() && hay_bytes[hay] == pat_bytes[pat] {
+                hay += 1;
+                pat += 1;
+            } else {
+                break;
+            }
+        }
+        if pat == pat_bytes.len() {
+            return Some((start, hay));
+        }
+    }
+    None
 }
 
 /// Why the gate refused. Carried so the read loop can log a reason instead of

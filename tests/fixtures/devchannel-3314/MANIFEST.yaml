@@ -17,17 +17,23 @@
 
 captured_from_cli_version: "2.1.237"
 recorded_on: "2026-08-20"
-validated_against_cli_version: "2.1.238"
+validated_against_cli_versions: ["2.1.238", "2.1.240"]
 validation_method: >
   Every static line the recognizer depends on was confirmed byte-present in the
-  2.1.238 binary itself (/Users/suzuke/.local/share/claude/versions/2.1.238),
-  so the literal corpus survives the .237 -> .238 bump. Rendered geometry was
-  NOT re-captured on .238; the recognizer therefore must not depend on it.
+  2.1.238 and 2.1.240 binaries. The 2.1.240 binary SHA-256 was
+  8917e01c99ea0ce6ed887a1729a4cda693c758fe542747be71756987b145c772.
+  The 2.1.240 rendered frame was captured from the preserved production pane;
+  its fixture differs from the capture only by a final newline. The recognizer
+  must tolerate terminal-induced wrapping without depending on geometry.
 
 fixtures:
   - file: live_modal.txt
     scenario: fresh spawn, dev-channel modal LIVE and never auto-dismissed (the #3314 defect)
     full_static_fingerprint: true
+  - file: live_modal_2_1_240_wrapped.txt
+    scenario: Claude 2.1.240 production spawn at 100 columns, modal LIVE and wrapped
+    full_static_fingerprint: true
+    capture_sha256: dc798dd9a718b734694d65a6a9c85afb222638bcc7de3f7e90ce8487ae61fab5
   - file: replay.txt
     scenario: --continue restart; the modal was already answered, the marker is present only as REPLAYED transcript
     full_static_fingerprint: true

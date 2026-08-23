@@ -342,7 +342,6 @@ pub fn try_prepared_dismiss_dialog(
         // whenever the phrase appeared anywhere on screen — including in agent
         // output and scrollback — sending input the user never authorized.
         if pattern.regex.is_match(screen) {
-            tracing::info!(agent = name, pattern = %pattern.pattern, "auto-dismissing dialog");
             // Delayed write: TUI escape-sequence parsers need time to distinguish
             // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
@@ -402,6 +401,7 @@ pub fn try_prepared_dismiss_dialog(
                 if pattern.rearm_pre_idle {
                     dev_gate.mark_enqueued();
                 }
+                tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
                 return true;
             }
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
@@ -471,6 +471,7 @@ pub fn try_prepared_dismiss_dialog(
                     // unspent so the modal can still be answered.
                     dev_gate.mark_enqueued();
                 }
+                tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
             }
             return true;
         }
@@ -1443,8 +1444,7 @@ WARNING: Loading development channels
         assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
         assert!(gen.bytes().is_empty());
         assert!(
-            !logs_contain("auto-dismissing dialog")
-                && !logs_contain("dialog dismiss submitted"),
+            !logs_contain("auto-dismissing dialog") && !logs_contain("dialog dismiss submitted"),
             "a refused generation must not emit a dismiss-success log"
         );
     }
@@ -1462,7 +1462,7 @@ WARNING: Loading development channels
 
     /// #3314 version-drift gate: an unrecognised backend version disarms rather
     /// than assuming the modal still renders the way our captures recorded it.
-    /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 across four days
+    /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 -> .240
     /// — so this is a live concern, not a hypothetical.
     #[test]
     fn only_validated_backend_versions_are_armed_3314() {
