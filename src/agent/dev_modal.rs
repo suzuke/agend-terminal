@@ -61,8 +61,8 @@ use std::sync::Arc;
 /// The modal's static lines, in render order.
 ///
 /// Version-exact: every entry was confirmed byte-present in the Claude 2.1.238
-/// and 2.1.240 binaries, and the captures they are matched against were rendered
-/// on 2.1.237 and 2.1.240 (see `tests/fixtures/devchannel-3314/MANIFEST.yaml`).
+/// through 2.1.241 binaries, and the captures they are matched against were
+/// rendered on 2.1.237, 2.1.240, and 2.1.241 (see the fixture manifest).
 /// The option NUMBERING is
 /// deliberately absent — `2. Exit` is not a literal in the binary because the
 /// list index is rendered dynamically, so keying on it would be keying on
@@ -95,7 +95,7 @@ pub(crate) const ELIGIBILITY_EXPIRY_MS: u64 = 120_000;
 /// rather than assuming the geometry still holds — the fleet auto-updates
 /// (2.1.235 -> .236 -> .237 -> .238 -> .240), and a silently changed
 /// modal must cost a hang plus an operator notice, never a stray keystroke.
-pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238", "2.1.240"];
+pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238", "2.1.240", "2.1.241"];
 
 /// Read the version from an already-pinned concrete backend binary path.
 ///
