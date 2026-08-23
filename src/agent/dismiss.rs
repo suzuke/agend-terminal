@@ -353,9 +353,17 @@ pub fn try_prepared_dismiss_dialog(
             // precision, not safety: a replayed or quoted modal satisfies the
             // fingerprint just as well as a live one (measured, see the fixtures).
             // Every other pattern keeps its existing path and pacing untouched.
+            #[cfg(test)]
+            let mut scheduled_from_first_sighting = false;
             if pattern.rearm_pre_idle {
                 match dev_gate.observe(screen, now) {
                     GateOutcome::Enqueue => {}
+                    GateOutcome::Schedule => {
+                        #[cfg(test)]
+                        {
+                            scheduled_from_first_sighting = true;
+                        }
+                    }
                     GateOutcome::Hold => return false,
                     GateOutcome::Refuse(reason) => {
                         tracing::debug!(
@@ -392,6 +400,12 @@ pub fn try_prepared_dismiss_dialog(
             let enqueue_receipt = pattern.rearm_pre_idle.then(|| dev_gate.enqueue_receipt());
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
+                // Deterministic matcher tests drive a second logical frame.
+                // Production uses the delayed writer and its late barrier.
+                if scheduled_from_first_sighting {
+                    DISMISS_IN_FLIGHT.lock().remove(name);
+                    return false;
+                }
                 let _guard = InFlightGuard(agent.clone());
                 run_pre_write_rendezvous();
                 let result = if barrier

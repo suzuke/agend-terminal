@@ -2146,6 +2146,11 @@ fn pty_read_loop(
                 }
                 let data = &buf[..n_bytes];
 
+                // A delayed startup-modal CR is valid only while the child has
+                // emitted no newer frame. Count every PTY output chunk before
+                // snapshotting the candidate barrier below.
+                dev_modal::note_pty_output(pty_writer);
+
                 capture.write(data);
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic),

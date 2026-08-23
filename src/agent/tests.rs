@@ -3669,7 +3669,10 @@ fn pty_read_loop_new_child_output_cancels_pending_dev_modal_cr_3333() {
 
     let written = run_dev_modal_pty_read_loop_3333(vec![
         (modal, std::time::Duration::ZERO),
-        (b"\x1b[2J\x1b[HClaude ready\n> ", std::time::Duration::from_millis(25)),
+        (
+            b"\x1b[2J\x1b[HClaude ready\n> ",
+            std::time::Duration::from_millis(25),
+        ),
     ]);
 
     assert!(
