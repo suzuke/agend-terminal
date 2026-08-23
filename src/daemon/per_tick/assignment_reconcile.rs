@@ -203,11 +203,7 @@ struct TaskTerminalMemo {
 }
 
 impl TaskTerminalMemo {
-    fn status_of(
-        &mut self,
-        home: &Path,
-        task_id: &str,
-    ) -> Option<crate::task_events::TaskStatus> {
+    fn status_of(&mut self, home: &Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
         if let Some(hit) = self.seen.get(task_id) {
             return *hit;
         }
@@ -512,13 +508,19 @@ mod tests {
         // Disk is gone: only the memo can answer now.
         std::fs::remove_dir_all(&home).ok();
         let second = memo.status_of(&home, tid);
-        assert_eq!(second, first, "repeat lookup must come from the memo, not disk");
+        assert_eq!(
+            second, first,
+            "repeat lookup must come from the memo, not disk"
+        );
         assert_eq!(memo.seen.len(), 1, "a repeat must not add an entry");
 
         // A DIFFERENT id is a real (now-failing) lookup and is cached as such —
         // an unroutable id collapses to None, the fail-closed "preserve" answer.
         let other = memo.status_of(&home, "t-memo-2");
-        assert_eq!(other, None, "unroutable id must collapse to None (preserve)");
+        assert_eq!(
+            other, None,
+            "unroutable id must collapse to None (preserve)"
+        );
         assert_eq!(memo.seen.len(), 2, "a distinct id adds exactly one entry");
     }
 
