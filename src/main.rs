@@ -10,6 +10,9 @@ mod admin;
 mod agent;
 mod agent_ops;
 mod agy_workspace;
+// Windows ships the thin client but still compiles daemon support for shared
+// types and tests, so production reachability intentionally differs there.
+#[cfg_attr(windows, allow(dead_code))]
 mod api;
 mod api_activity_probe;
 mod app;
@@ -32,6 +35,7 @@ mod cleanup_intents;
 mod cli;
 mod config_integrity;
 mod connect;
+#[cfg_attr(windows, allow(dead_code))]
 mod daemon;
 mod daemon_config;
 mod decisions;
@@ -47,6 +51,7 @@ mod framing;
 mod git_helpers;
 mod git_worktree;
 mod github_token;
+#[cfg_attr(windows, allow(dead_code))]
 mod health;
 mod identity;
 mod image_paste;
@@ -72,6 +77,7 @@ mod protocol;
 mod provider_detect;
 mod quickstart;
 mod render;
+#[cfg_attr(windows, allow(dead_code))]
 mod reply_ledger;
 mod review_receipt;
 #[cfg(test)]
@@ -81,16 +87,19 @@ pub mod runtime_config;
 pub(crate) mod runtime_controls;
 mod schedules;
 mod scm;
+#[cfg_attr(windows, allow(dead_code))]
 mod sent_ledger;
 mod service;
 mod shared_async;
 mod skills;
 mod snapshot;
+#[cfg_attr(windows, allow(dead_code))]
 mod state;
 mod status_summary;
 mod store;
 mod sync_audit;
 mod task_events;
+#[cfg_attr(windows, allow(dead_code))]
 mod tasks;
 mod team_ops;
 mod teams;
