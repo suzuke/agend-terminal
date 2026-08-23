@@ -3489,6 +3489,26 @@ impl std::io::Read for ChunkReader {
     }
 }
 
+struct TimedChunkReader {
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+    next: usize,
+    linger_before_eof: std::time::Duration,
+}
+
+impl std::io::Read for TimedChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some((chunk, delay)) = self.chunks.get(self.next) else {
+            std::thread::sleep(self.linger_before_eof);
+            return Ok(0);
+        };
+        std::thread::sleep(*delay);
+        self.next += 1;
+        let n = chunk.len().min(buf.len());
+        buf[..n].copy_from_slice(&chunk[..n]);
+        Ok(n)
+    }
+}
+
 #[derive(Clone)]
 struct RecordingWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -3576,6 +3596,86 @@ fn run_pty_read_loop_for_r8(
     let capture = crate::capture::make_capture_writer(None, "r8-dismiss-test", backend.name());
     pty_read_loop(&mut reader, &ctx, capture);
     written
+}
+
+fn run_dev_modal_pty_read_loop_3333(
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+) -> Arc<Mutex<Vec<u8>>> {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&written),
+    })));
+    let backend = Backend::ClaudeCode;
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(160, 40),
+        subscribers: Vec::new(),
+        state: StateTracker::new(Some(&backend)),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let patterns: Vec<(String, Vec<u8>)> = backend
+        .preset()
+        .dismiss_patterns
+        .iter()
+        .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+        .collect();
+    let ctx = PtyReadContext {
+        dev_modal_armed: true,
+        name: "dev-modal-3333".to_string(),
+        instance_id: crate::types::InstanceId::default(),
+        core,
+        pty_writer: writer,
+        registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        home: None,
+        crash_tx: None,
+        dismiss_patterns: dismiss::prepare_dismiss_patterns(&patterns),
+        shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+    };
+    let mut reader = TimedChunkReader {
+        chunks,
+        next: 0,
+        linger_before_eof: std::time::Duration::from_millis(400),
+    };
+    let capture = crate::capture::make_capture_writer(None, "dev-modal-3333", "claude");
+    pty_read_loop(&mut reader, &ctx, capture);
+    written
+}
+
+#[test]
+fn pty_read_loop_answers_one_static_dev_modal_frame_3333() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(modal, std::time::Duration::ZERO)]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3333: the production PTY entry point must answer a complete static modal without a second child frame"
+    );
+}
+
+#[test]
+fn pty_read_loop_new_child_output_cancels_pending_dev_modal_cr_3333() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (modal, std::time::Duration::ZERO),
+        (b"\x1b[2J\x1b[HClaude ready\n> ", std::time::Duration::from_millis(25)),
+    ]);
+
+    assert!(
+        written.lock().is_empty(),
+        "#3333: newer child output must invalidate the delayed modal Enter before the production writer fires"
+    );
 }
 
 #[test]
