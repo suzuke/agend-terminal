@@ -1529,6 +1529,94 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// The operator's Enter keystroke must never pin the single-threaded TUI
+    /// event loop. `app::write_to_focused` calls `record_submit_activity`
+    /// INLINE on that loop whenever the keystroke buffer contains the backend's
+    /// submit key (`\r` for every preset since #1457). That call lands in
+    /// `save_metadata` → `with_json_state_or_create` → `acquire_file_lock`,
+    /// whose `fs4::FileExt::lock` is a BLOCKING flock with no timeout.
+    ///
+    /// The same per-instance `metadata/<id>.lock` is taken by ~29 other write
+    /// sites, including `flush_pending_input_activity` on the ~1s `sync_badges`
+    /// cadence — which writes the file of the very agent being typed to. When
+    /// Enter races that flush, the whole TUI stalls: no tab/pane switching, no
+    /// render, while the agents (separate processes) keep running.
+    ///
+    /// Contrast `record_input_activity`, which #2965 already moved off the
+    /// synchronous path into an in-memory buffer. That fix skipped the submit
+    /// twin, which is why plain typing is smooth and only Enter freezes.
+    #[test]
+    fn record_submit_activity_must_not_block_on_contended_metadata_lock() {
+        let home = tmp_home("submit_flock_contention");
+        std::fs::create_dir_all(home.join("metadata")).ok();
+        let lock_path =
+            crate::agent_ops::metadata_path_resolved(&home, "agent1").with_extension("lock");
+
+        // Stand in for any of the other metadata writers holding the lock.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let hold_for = Duration::from_millis(1500);
+        let lp = lock_path.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = crate::store::acquire_file_lock(&lp).expect("holder acquires lock");
+            held_tx.send(()).expect("signal lock held");
+            std::thread::sleep(hold_for);
+            drop(guard);
+        });
+        held_rx.recv().expect("holder signalled");
+
+        // The TUI main-loop path.
+        let start = std::time::Instant::now();
+        record_submit_activity(&home, "agent1");
+        let elapsed = start.elapsed();
+
+        holder.join().expect("holder thread");
+        std::fs::remove_dir_all(&home).ok();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "record_submit_activity blocked {elapsed:?} on a contended metadata \
+             flock while the lock was held for {hold_for:?}. On the TUI thread \
+             this is a full UI freeze on every Enter that races another writer."
+        );
+    }
+
+    /// Control for the test above: the SAME contended lock, the SAME code path
+    /// up to the recording call — but plain typing goes through
+    /// `record_input_activity`, which #2965 moved into an in-memory buffer. It
+    /// must return immediately. The delta between these two tests is exactly
+    /// the operator-visible symptom: typing stays smooth, Enter freezes.
+    #[test]
+    fn record_input_activity_does_not_block_on_contended_metadata_lock() {
+        let home = tmp_home("input_flock_contention");
+        std::fs::create_dir_all(home.join("metadata")).ok();
+        let lock_path =
+            crate::agent_ops::metadata_path_resolved(&home, "agent1").with_extension("lock");
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let hold_for = Duration::from_millis(1500);
+        let lp = lock_path.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = crate::store::acquire_file_lock(&lp).expect("holder acquires lock");
+            held_tx.send(()).expect("signal lock held");
+            std::thread::sleep(hold_for);
+            drop(guard);
+        });
+        held_rx.recv().expect("holder signalled");
+
+        let start = std::time::Instant::now();
+        record_input_activity(&home, "agent1");
+        let elapsed = start.elapsed();
+
+        holder.join().expect("holder thread");
+        std::fs::remove_dir_all(&home).ok();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "record_input_activity must stay off the flock (it buffers in memory \
+             since #2965), but it took {elapsed:?}"
+        );
+    }
+
     /// #1680 regression: the keystroke WRITE (`record_input_activity` →
     /// `save_metadata` → `metadata_path_resolved` → `<uuid>.json`) and the
     /// draft-gate READ (`read_input_submit_timestamps`) MUST land on the SAME
