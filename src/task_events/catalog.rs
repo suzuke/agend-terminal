@@ -150,6 +150,38 @@ impl StrictTaskCatalog {
         }
     }
 
+    pub fn observe_board_set(
+        &self,
+        observed: &BTreeSet<String>,
+        since: &str,
+    ) -> Result<(), CatalogRouteError> {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let known = inner.boards.keys().cloned().collect();
+        match classify_board_set(&known, observed) {
+            BoardSetFreshness::Current => {
+                if inner.phase == Phase::Ready {
+                    Ok(())
+                } else {
+                    Err(CatalogRouteError::Unreadable)
+                }
+            }
+            BoardSetFreshness::New { .. } => {
+                inner.phase = Phase::Building;
+                Err(CatalogRouteError::Unreadable)
+            }
+            BoardSetFreshness::Missing { names } => {
+                inner.phase = Phase::Unhealthy {
+                    since: since.to_string(),
+                    causes: vec![format!("missing boards: {}", names.join(", "))],
+                };
+                Err(CatalogRouteError::Unreadable)
+            }
+        }
+    }
+
     pub fn route(
         &self,
         task_id: &TaskId,
