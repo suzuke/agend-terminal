@@ -862,6 +862,56 @@ mod tests {
     }
 
     #[test]
+    fn advisory_catalog_snapshot_is_phase_labelled_and_pointer_only() {
+        let first_id = TaskId::from("t-20260824000000000000-1-1");
+        let second_id = TaskId::from("t-20260824000000000000-1-2");
+        let create = |task_id: TaskId| TaskEvent::Created {
+            task_id,
+            title: "advisory fixture".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let first = BoardProjection::from_sorted_envelopes(&[envelope(
+            1,
+            create(first_id.clone()),
+        )])
+        .expect("first board");
+        let second = BoardProjection::from_sorted_envelopes(&[envelope(
+            1,
+            create(second_id.clone()),
+        )])
+        .expect("second board");
+        let first_snapshot = first.task_snapshot(&first_id).expect("first snapshot");
+        let second_snapshot = second.task_snapshot(&second_id).expect("second snapshot");
+        let catalog = StrictTaskCatalog::new(
+            Phase::Building,
+            BTreeMap::from([("a-board".into(), first), ("b-board".into(), second)]),
+        );
+
+        let (phase, snapshots) = catalog.snapshot_advisory();
+
+        assert_eq!(phase, Phase::Building);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        assert!(Arc::ptr_eq(&snapshots[0], &first_snapshot));
+        assert!(Arc::ptr_eq(&snapshots[1], &second_snapshot));
+    }
+
+    #[test]
     fn incremental_apply_matches_incumbent_replay() {
         let task_id = TaskId::from("t-20260824000000000000-1-1");
         let child_id = TaskId::from("t-20260824000000000000-1-2");
