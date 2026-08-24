@@ -1863,7 +1863,9 @@ mod tests {
                 if let Some(name) = function_name(&code) {
                     current_function = name;
                 }
-                let kind = if code.contains("api::call_at(") {
+                let kind = if code.contains("api::call_at(")
+                    || code.contains("api::call_at_with_timeout(")
+                {
                     "call_at"
                 } else if code.contains("api::call(") {
                     "call"
@@ -1886,6 +1888,9 @@ mod tests {
     fn classify_transport(path: &str, function: &str, kind: &str) -> &'static str {
         if path == "src/mcp/handlers/restart.rs" && function == "phase1_gate" && kind == "call_at" {
             return "cross_daemon_successor_status";
+        }
+        if path == "src/app/rpc.rs" && function == "call_task" && kind == "call_at" {
+            return "app_thin_client_task_rpc";
         }
         if path == "src/mcp/handlers/instance_state/lifecycle.rs"
             && function == "delete_with_runtime_or_legacy"

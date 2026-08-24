@@ -839,6 +839,8 @@ impl AppState {
         }
         if let Overlay::Tasks {
             items,
+            col,
+            row,
             pending,
             notice: overlay_notice,
             ..
@@ -846,6 +848,9 @@ impl AppState {
         {
             if notice.is_none() {
                 *items = self.task_snapshot.clone();
+                *col = (*col).min(4);
+                let columns = crate::render::task_board_columns(items);
+                *row = (*row).min(crate::render::selectable_len(&columns, *col).saturating_sub(1));
             }
             *pending = false;
             *overlay_notice = notice;

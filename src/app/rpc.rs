@@ -20,7 +20,7 @@ pub(super) fn spawn_task_worker(
     let (request_tx, request_rx) = crossbeam_channel::bounded(1);
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
     let run_dir = run_dir.to_path_buf();
-    // fire-and-forget: false; the returned JoinHandle is joined by AppDeps::drop.
+    // fire-and-forget: false; run_app joins the returned handle after dropping the sender.
     let worker = std::thread::Builder::new()
         .name("app-task-rpc".into())
         .spawn(move || {
@@ -49,12 +49,13 @@ fn execute(run_dir: &Path, request: TaskRequest) -> TaskOutcome {
 }
 
 fn call_task(run_dir: &Path, arguments: Value) -> Result<Value, String> {
-    let response = crate::api::call_at(
+    let response = crate::api::call_at_with_timeout(
         run_dir,
         &serde_json::json!({
             "method": crate::api::method::MCP_TOOL,
             "params": {"tool": "task", "arguments": arguments, "instance": ""}
         }),
+        std::time::Duration::from_secs(10),
     )
     .map_err(|error| error.to_string())?;
     if response["ok"].as_bool() == Some(true) {
@@ -72,7 +73,9 @@ mod tests {
     #[test]
     fn app_task_rpc_uses_the_bounded_cross_process_call() {
         let source = include_str!("rpc.rs");
-        assert!(source.contains("crate::api::call_at("));
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(production.contains("crate::api::call_at_with_timeout("));
+        assert!(production.contains("std::time::Duration::from_secs(10)"));
     }
 
     #[test]
@@ -80,6 +83,7 @@ mod tests {
         for (path, source) in [
             ("dispatch.rs", include_str!("dispatch.rs")),
             ("overlay.rs", include_str!("overlay.rs")),
+            ("panels.rs", include_str!("../render/panels.rs")),
         ] {
             let production = source.split("#[cfg(test)]").next().unwrap_or(source);
             assert!(

@@ -8,6 +8,11 @@ use std::path::Path;
 /// Sprint scope: tasks created in last 7 days (per operator Q1 decision).
 pub fn build_summary(home: &Path) -> String {
     let tasks = crate::tasks::list_all(home);
+    build_summary_from_tasks(home, &tasks)
+}
+
+/// Build the same summary from a caller-provided task snapshot.
+pub fn build_summary_from_tasks(home: &Path, tasks: &[crate::tasks::Task]) -> String {
     let decisions = crate::decisions::list_all(home);
     let now = chrono::Utc::now();
 

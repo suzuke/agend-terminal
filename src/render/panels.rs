@@ -237,14 +237,16 @@ pub fn render_tasks(
         BoardView::Monitor => "[t] tasks | [f] fleet | [s] status | [M] MONITOR",
     };
     let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
-    let inner = render_overlay_frame(frame, Color::Blue, &title);
+    let mut inner = render_overlay_frame(frame, Color::Blue, &title);
 
     if let Some(notice) = notice {
+        let notice_area = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
         frame.render_widget(
             Paragraph::new(format!("  {notice}")).style(Style::default().fg(Color::Red)),
-            inner,
+            notice_area,
         );
-        return;
+        inner.y = inner.y.saturating_add(1);
+        inner.height = inner.height.saturating_sub(1);
     }
 
     if matches!(view, BoardView::Monitor) {
@@ -253,7 +255,7 @@ pub fn render_tasks(
     }
 
     if matches!(view, BoardView::Status) {
-        let summary = crate::status_summary::build_summary(home);
+        let summary = crate::status_summary::build_summary_from_tasks(home, items);
         let lines: Vec<ratatui::text::Line> = summary
             .lines()
             .map(|l| ratatui::text::Line::from(l.to_string()))
@@ -1030,7 +1032,10 @@ mod tests {
         }
     }
 
-    fn render_task_board_to_string(mode: &crate::app::TaskBoardMode) -> String {
+    fn render_task_board_to_string(
+        mode: &crate::app::TaskBoardMode,
+        notice: Option<&str>,
+    ) -> String {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal =
             ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
@@ -1066,7 +1071,7 @@ mod tests {
                     mode,
                     crate::app::BoardView::Tasks,
                     std::path::Path::new("/tmp"),
-                    None,
+                    notice,
                 )
             })
             .expect("test terminal draw should succeed");
@@ -1083,7 +1088,7 @@ mod tests {
 
     #[test]
     fn task_board_footer_shows_help_hint() {
-        let output = render_task_board_to_string(&crate::app::TaskBoardMode::Board);
+        let output = render_task_board_to_string(&crate::app::TaskBoardMode::Board, None);
         assert!(
             output.contains("? help"),
             "Board mode should show '? help' hint, got:\n{output}"
@@ -1092,10 +1097,20 @@ mod tests {
 
     #[test]
     fn task_board_help_mode_hides_footer() {
-        let output = render_task_board_to_string(&crate::app::TaskBoardMode::Help);
+        let output = render_task_board_to_string(&crate::app::TaskBoardMode::Help, None);
         assert!(
             !output.contains("? help"),
             "Help mode should NOT show '? help' hint, got:\n{output}"
         );
+    }
+
+    #[test]
+    fn task_board_notice_keeps_last_good_snapshot_visible() {
+        let output = render_task_board_to_string(
+            &crate::app::TaskBoardMode::Board,
+            Some("task write timed out"),
+        );
+        assert!(output.contains("task write timed out"));
+        assert!(output.contains("Todo (1)"), "snapshot missing:\n{output}");
     }
 }

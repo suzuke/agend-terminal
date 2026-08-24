@@ -928,9 +928,18 @@ fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
 /// hanging the handler. No self-IPC guard: this connects to a DIFFERENT
 /// process's socket, so the registry-lock deadlock class does not apply.
 pub fn call_at(run_dir: &Path, request: &Value) -> anyhow::Result<Value> {
+    call_at_with_timeout(run_dir, request, std::time::Duration::from_secs(2))
+}
+
+/// Like [`call_at`], with a caller-selected read deadline.
+pub fn call_at_with_timeout(
+    run_dir: &Path,
+    request: &Value,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Value> {
     let stream = crate::ipc::connect_run_dir_api(run_dir)?;
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .set_read_timeout(Some(timeout))
         .context("set call_at read timeout")?;
     // P0a (#2342 B4): the operator surface presents the operator full-capability
     // token, NOT the shared agent cookie — so it authenticates as

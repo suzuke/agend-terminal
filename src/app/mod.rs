@@ -1148,6 +1148,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_rpc_refresh_clamps_stale_board_row() {
+        let mut state = app_state::AppState::new();
+        state.ui.overlay = Overlay::Tasks {
+            items: Vec::new(),
+            col: 0,
+            row: 4,
+            mode: TaskBoardMode::Board,
+            view: BoardView::Tasks,
+            pending: true,
+            notice: None,
+        };
+        let task = crate::tasks::Task {
+            id: "t-1".into(),
+            title: "remaining".into(),
+            description: String::new(),
+            status: crate::task_events::TaskStatus::Open,
+            priority: crate::task_events::TaskPriority::Normal,
+            assignee: None,
+            routed_to: None,
+            depends_on: Vec::new(),
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            created_by: "test".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            due_at: None,
+            branch: None,
+            started_at: None,
+            eta_secs: None,
+            auto_release_on_verdict: None,
+            tags: Vec::new(),
+            parent_id: None,
+            metadata: std::collections::BTreeMap::new(),
+        };
+
+        state.handle_task_rpc_outcome(Ok(Ok(vec![task])));
+
+        let Overlay::Tasks { row, items, .. } = &state.ui.overlay else {
+            panic!("task overlay remains open");
+        };
+        assert_eq!(*row, 0);
+        assert_eq!(items.len(), 1);
+    }
+
     /// #t-84833-10: the redraw count under a wakeup flood is bounded by the FRAME
     /// RATE, not by the number of wakeups (the storm fix). 1000 wakeups packed into
     /// ~100ms must yield only ~3-4 draws (100ms / 33ms), not 1000.
