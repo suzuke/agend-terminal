@@ -148,6 +148,20 @@ pub struct BoardProjection {
 }
 
 impl BoardProjection {
+    /// Project an already-canonical replay while retaining its order high-water.
+    pub fn from_sorted_envelopes(
+        envelopes: &[TaskEventEnvelope],
+    ) -> Result<Self, OrderedApplyError> {
+        let mut projection = Self::default();
+        for env in envelopes {
+            projection.apply_ordered(env)?;
+        }
+        Ok(projection)
+    }
+
+    /// Convert an incumbent replay result when the source envelopes are unavailable.
+    /// This bridge cannot seed an order high-water; new rebuild paths should use
+    /// [`Self::from_sorted_envelopes`].
     pub fn from_replay(state: TaskBoardState) -> Self {
         Self {
             tasks: state
@@ -181,8 +195,7 @@ impl BoardProjection {
         self.last_order_key.as_ref()
     }
 
-    /// Apply one live-tail envelope only when its canonical key advances.
-    /// Replay/rebuild callers sort first and continue to use [`Self::apply`].
+    /// Apply one canonical envelope only when its key advances.
     pub fn apply_ordered(&mut self, env: &TaskEventEnvelope) -> Result<bool, OrderedApplyError> {
         let received = OrderKey::from_envelope(env)?;
         if let Some(previous) = &self.last_order_key {
@@ -969,7 +982,8 @@ mod tests {
         let mut order_key_sorted = envelopes.clone();
         order_key_sorted.sort_by_key(|env| OrderKey::from_envelope(env).expect("valid key"));
         super::super::sort_envelopes(&mut envelopes);
-        let identity = |env: &TaskEventEnvelope| (&env.timestamp, &env.instance, env.seq);
+        let identity =
+            |env: &TaskEventEnvelope| (env.timestamp.clone(), env.instance.clone(), env.seq);
         assert_eq!(
             order_key_sorted.iter().map(identity).collect::<Vec<_>>(),
             envelopes.iter().map(identity).collect::<Vec<_>>()
