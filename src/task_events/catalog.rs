@@ -161,6 +161,36 @@ impl StrictTaskCatalog {
             .ok_or(CatalogRouteError::NotFound)
     }
 
+    pub fn statuses(
+        &self,
+        task_ids: &[TaskId],
+    ) -> Result<Vec<(TaskId, Option<TaskStatus>)>, CatalogRouteError> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+
+        let mut statuses = Vec::with_capacity(task_ids.len());
+        for task_id in task_ids {
+            if let Some(boards) = inner.duplicates.get(task_id) {
+                return Err(CatalogRouteError::Ambiguous {
+                    boards: boards.clone(),
+                });
+            }
+            let status = inner.index.get(task_id).map(|board_id| {
+                inner.boards[board_id]
+                    .task(task_id)
+                    .expect("catalog index must reference its source record")
+                    .status
+            });
+            statuses.push((task_id.clone(), status));
+        }
+        Ok(statuses)
+    }
+
     pub fn snapshot_advisory(&self) -> (Phase, Vec<Arc<ProjectedTaskRecord>>) {
         let inner = self
             .inner
