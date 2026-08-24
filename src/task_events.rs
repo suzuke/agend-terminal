@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod catalog;
+
 /// Persisted-envelope schema version. Bumped only on changes that older
 /// readers cannot interpret. Forward-compat: v(N) reader rejects v(N+1)
 /// envelopes (fail-closed). Backward-compat: v(N) reader accepts v(<=N).
@@ -633,7 +635,7 @@ impl TaskStatus {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HistoryEntry {
     pub seq: u64,
     pub timestamp: String,

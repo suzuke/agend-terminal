@@ -2,7 +2,7 @@
 //!
 //! Mirrors `legacy_outbound_path_audit.rs` (Sprint 22 P0) and
 //! `spawn_rationale_audit.rs` (Sprint 21 Phase 5) — same anti-growth
-//! contract: only `src/task_events.rs` may reference `task_events.jsonl`
+//! contract: only the `src/task_events` module may reference `task_events.jsonl`
 //! or the `"task_events"` log-name string. Every other production caller
 //! MUST go through `task_events::append` / `task_events::append_batch`.
 //!
@@ -126,8 +126,8 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
 
     for path in rust_files_in_src() {
         let rel_path = rel(&path, &src_root);
-        // task_events.rs is the canonical producer.
-        if rel_path.ends_with("task_events.rs") {
+        // task_events.rs and its child modules are the canonical producer.
+        if rel_path == "task_events.rs" || rel_path.starts_with("task_events/") {
             continue;
         }
         if EXEMPTED_CALLERS.iter().any(|s| rel_path.ends_with(s)) {
@@ -161,7 +161,7 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
 
     assert!(
         violations.is_empty(),
-        "Sprint 24 P0 PR1 anti-bypass invariant — {} site(s) reference `task_events.jsonl` or the `\"task_events\"` log-name constant outside `src/task_events.rs`.\n\nFix: route all task-event mutations through `task_events::append` or `task_events::append_batch`. Direct file access defeats the seq-monotonicity guarantee + replay determinism contract.\n\nDo NOT add to `EXEMPTED_CALLERS` without explicit dispatch scope (the list is meant to shrink, not grow).\n\nViolations:\n{}",
+        "Sprint 24 P0 PR1 anti-bypass invariant — {} site(s) reference `task_events.jsonl` or the `\"task_events\"` log-name constant outside the `src/task_events` module.\n\nFix: route all task-event mutations through `task_events::append` or `task_events::append_batch`. Direct file access defeats the seq-monotonicity guarantee + replay determinism contract.\n\nDo NOT add to `EXEMPTED_CALLERS` without explicit dispatch scope (the list is meant to shrink, not grow).\n\nViolations:\n{}",
         violations.len(),
         violations.join("\n")
     );
