@@ -1396,6 +1396,54 @@ mod tests {
     }
 
     #[test]
+    fn board_set_observation_updates_phase_without_discovering_or_folding() {
+        let boards = BTreeMap::from([
+            ("default".to_string(), BoardProjection::default()),
+            ("research".to_string(), BoardProjection::default()),
+        ]);
+
+        let current = StrictTaskCatalog::new(Phase::Ready, boards.clone());
+        assert_eq!(
+            current.observe_board_set(
+                &BTreeSet::from(["default".to_string(), "research".to_string()]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Ok(())
+        );
+        assert_eq!(current.snapshot_advisory().0, Phase::Ready);
+
+        let added = StrictTaskCatalog::new(Phase::Ready, boards.clone());
+        assert_eq!(
+            added.observe_board_set(
+                &BTreeSet::from([
+                    "default".to_string(),
+                    "research".to_string(),
+                    "support".to_string(),
+                ]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Err(CatalogRouteError::Unreadable)
+        );
+        assert_eq!(added.snapshot_advisory().0, Phase::Building);
+
+        let missing = StrictTaskCatalog::new(Phase::Ready, boards);
+        assert_eq!(
+            missing.observe_board_set(
+                &BTreeSet::from(["support".to_string()]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Err(CatalogRouteError::Unreadable)
+        );
+        assert_eq!(
+            missing.snapshot_advisory().0,
+            Phase::Unhealthy {
+                since: "2026-08-24T15:40:00Z".to_string(),
+                causes: vec!["missing boards: default, research".to_string()],
+            }
+        );
+    }
+
+    #[test]
     fn incremental_apply_matches_incumbent_replay() {
         let task_id = TaskId::from("t-20260824000000000000-1-1");
         let child_id = TaskId::from("t-20260824000000000000-1-2");
