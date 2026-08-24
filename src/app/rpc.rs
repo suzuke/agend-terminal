@@ -20,6 +20,7 @@ pub(super) fn spawn_task_worker(
     let (request_tx, request_rx) = crossbeam_channel::bounded(1);
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
     let run_dir = run_dir.to_path_buf();
+    // fire-and-forget: false; the returned JoinHandle is joined by AppDeps::drop.
     let worker = std::thread::Builder::new()
         .name("app-task-rpc".into())
         .spawn(move || {

@@ -1330,7 +1330,9 @@ mod tests {
         );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        let crate::app::rpc::TaskRequest::Mutate(arguments) = task_rx.recv().unwrap() else {
+        let crate::app::rpc::TaskRequest::Mutate(arguments) =
+            task_rx.recv().expect("task mutation should be queued")
+        else {
             panic!("expected task mutation")
         };
         assert_eq!(arguments["action"], "update");
@@ -1385,7 +1387,9 @@ mod tests {
             );
             handle_key(&mut overlay, key_event, &mut ctx);
 
-            let crate::app::rpc::TaskRequest::Mutate(arguments) = task_rx.recv().unwrap() else {
+            let crate::app::rpc::TaskRequest::Mutate(arguments) =
+                task_rx.recv().expect("task mutation should be queued")
+            else {
                 panic!("expected task mutation")
             };
             assert_eq!(arguments["action"], "done", "Shift+D ({label}) action");
@@ -1452,7 +1456,9 @@ mod tests {
         );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        let crate::app::rpc::TaskRequest::Mutate(arguments) = task_rx.recv().unwrap() else {
+        let crate::app::rpc::TaskRequest::Mutate(arguments) =
+            task_rx.recv().expect("task mutation should be queued")
+        else {
             panic!("expected task mutation")
         };
         assert_eq!(arguments["action"], "update");
