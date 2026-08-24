@@ -143,6 +143,8 @@ pub(super) enum Overlay {
         mode: TaskBoardMode,
         /// Active view: Tasks (kanban) or Fleet (agent dashboard).
         view: BoardView,
+        pending: bool,
+        notice: Option<String>,
     },
     /// Floating scratch shell (Ctrl+B ~). Esc kills the shell and closes the
     /// overlay. Pane is boxed because it's much larger than any other variant.
@@ -180,6 +182,7 @@ pub(super) struct OverlayCtx<'a> {
     pub fleet_path: &'a Path,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
+    pub task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
 }
 
 #[derive(Default)]
@@ -747,6 +750,8 @@ pub(super) fn handle_key(
             ref mut row,
             ref mut mode,
             ref mut view,
+            ref mut pending,
+            ref mut notice,
         } => {
             // Tab switches between Tasks and Fleet views
             if key.code == KeyCode::Tab && matches!(mode, TaskBoardMode::Board) {
@@ -769,17 +774,18 @@ pub(super) fn handle_key(
                 }
                 TaskBoardMode::NewTask { ref mut input } => match key.code {
                     KeyCode::Enter if !input.is_empty() => {
-                        crate::tasks::handle(
-                            ctx.home,
-                            "user",
-                            &serde_json::json!({
+                        if submit_task_request(
+                            ctx.task_rpc_tx,
+                            serde_json::json!({
                                 "action": "create",
                                 "title": input.as_str(),
                                 "priority": "normal",
                             }),
-                        );
-                        *items = crate::tasks::list_all(ctx.home);
-                        *mode = TaskBoardMode::Board;
+                            pending,
+                            notice,
+                        ) {
+                            *mode = TaskBoardMode::Board;
+                        }
                     }
                     KeyCode::Char(c) => input.push(c),
                     KeyCode::Backspace => {
@@ -804,17 +810,18 @@ pub(super) fn handle_key(
                     KeyCode::Enter if !choices.is_empty() => {
                         // M3: use captured task_id instead of col/row indices
                         let assignee = &choices[*selected].1;
-                        crate::tasks::handle(
-                            ctx.home,
-                            "user",
-                            &serde_json::json!({
+                        if submit_task_request(
+                            ctx.task_rpc_tx,
+                            serde_json::json!({
                                 "action": "update",
                                 "id": task_id,
                                 "assignee": assignee,
                             }),
-                        );
-                        *items = crate::tasks::list_all(ctx.home);
-                        *mode = TaskBoardMode::Board;
+                            pending,
+                            notice,
+                        ) {
+                            *mode = TaskBoardMode::Board;
+                        }
                     }
                     KeyCode::Esc => {
                         *mode = TaskBoardMode::Board;
@@ -870,20 +877,15 @@ pub(super) fn handle_key(
                                 && !columns[*col].is_empty() =>
                         {
                             if let Some(task) = columns[*col].get(*row) {
-                                crate::tasks::handle(
-                                    ctx.home,
-                                    "user",
-                                    &serde_json::json!({
+                                submit_task_request(
+                                    ctx.task_rpc_tx,
+                                    serde_json::json!({
                                         "action": "update",
                                         "id": task.id,
                                         "status": "cancelled",
                                     }),
-                                );
-                                *items = crate::tasks::list_all(ctx.home);
-                                let new_cols = crate::render::task_board_columns(items);
-                                *row = (*row).min(
-                                    crate::render::selectable_len(&new_cols, *col)
-                                        .saturating_sub(1),
+                                    pending,
+                                    notice,
                                 );
                             }
                         }
@@ -891,19 +893,14 @@ pub(super) fn handle_key(
                         // Match 'D' (legacy terminals) and 'd'+SHIFT (Kitty protocol)
                         KeyCode::Char('D') | KeyCode::Char('d') if !columns[*col].is_empty() => {
                             if let Some(task) = columns[*col].get(*row) {
-                                crate::tasks::handle(
-                                    ctx.home,
-                                    "user",
-                                    &serde_json::json!({
+                                submit_task_request(
+                                    ctx.task_rpc_tx,
+                                    serde_json::json!({
                                         "action": "done",
                                         "id": task.id,
                                     }),
-                                );
-                                *items = crate::tasks::list_all(ctx.home);
-                                let new_cols = crate::render::task_board_columns(items);
-                                *row = (*row).min(
-                                    crate::render::selectable_len(&new_cols, *col)
-                                        .saturating_sub(1),
+                                    pending,
+                                    notice,
                                 );
                             }
                         }
@@ -967,21 +964,16 @@ pub(super) fn handle_key(
                                     _ => None,
                                 };
                                 if let Some(val) = new_status {
-                                    crate::tasks::handle(
-                                        ctx.home,
-                                        "user",
-                                        &serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                    submit_task_request(
+                                        ctx.task_rpc_tx,
+                                        serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                        pending,
+                                        notice,
                                     );
-                                    *items = crate::tasks::list_all(ctx.home);
                                     // Follow the task to whichever column its NEW
                                     // status lands in (column order != status order,
                                     // so a fixed ±1 would mis-track — e.g. Blocked).
                                     *col = crate::render::board_column_for_status(val);
-                                    let new_cols = crate::render::task_board_columns(items);
-                                    *row = (*row).min(
-                                        crate::render::selectable_len(&new_cols, *col)
-                                            .saturating_sub(1),
-                                    );
                                 }
                             }
                         }
@@ -1001,18 +993,13 @@ pub(super) fn handle_key(
                                     _ => None,
                                 };
                                 if let Some(val) = new_status {
-                                    crate::tasks::handle(
-                                        ctx.home,
-                                        "user",
-                                        &serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                    submit_task_request(
+                                        ctx.task_rpc_tx,
+                                        serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                        pending,
+                                        notice,
                                     );
-                                    *items = crate::tasks::list_all(ctx.home);
                                     *col = crate::render::board_column_for_status(val);
-                                    let new_cols = crate::render::task_board_columns(items);
-                                    *row = (*row).min(
-                                        crate::render::selectable_len(&new_cols, *col)
-                                            .saturating_sub(1),
-                                    );
                                 }
                             }
                         }
@@ -1063,6 +1050,33 @@ pub(super) fn handle_key(
     outcome
 }
 
+fn submit_task_request(
+    tx: &crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    arguments: serde_json::Value,
+    pending: &mut bool,
+    notice: &mut Option<String>,
+) -> bool {
+    if *pending {
+        *notice = Some("task request already pending".to_string());
+        return false;
+    }
+    match tx.try_send(super::rpc::TaskRequest::Mutate(arguments)) {
+        Ok(()) => {
+            *pending = true;
+            *notice = None;
+            true
+        }
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            *notice = Some("task request already pending".to_string());
+            false
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            *notice = Some("task RPC worker stopped".to_string());
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,7 +1096,20 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         }
+    }
+
+    fn test_task_channel() -> &'static (
+        crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+        crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+    ) {
+        static CHANNEL: std::sync::OnceLock<(
+            crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+            crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+        )> = std::sync::OnceLock::new();
+        CHANNEL.get_or_init(crossbeam_channel::unbounded)
     }
 
     fn get_mode(overlay: &Overlay) -> &TaskBoardMode {
@@ -1090,6 +1117,23 @@ mod tests {
             Overlay::Tasks { mode, .. } => mode,
             _ => panic!("expected Tasks overlay"),
         }
+    }
+
+    #[test]
+    fn task_write_failure_is_visible_and_does_not_mark_pending() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        drop(rx);
+        let mut pending = false;
+        let mut notice = None;
+
+        assert!(!submit_task_request(
+            &tx,
+            serde_json::json!({"action": "done", "id": "t-1"}),
+            &mut pending,
+            &mut notice,
+        ));
+        assert!(!pending);
+        assert_eq!(notice.as_deref(), Some("task RPC worker stopped"));
     }
 
     /// #2305: a per-test temp home (process+tag unique — no env, no cross-test
@@ -1115,6 +1159,7 @@ mod tests {
             fleet_path: home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
         };
         for k in keys {
             handle_key(overlay, press(*k), &mut ctx);
@@ -1136,6 +1181,7 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
         };
         let mut overlay = task_overlay();
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
@@ -1158,6 +1204,7 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1165,6 +1212,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Help,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Esc), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
@@ -1186,6 +1235,7 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1193,6 +1243,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Help,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
@@ -1223,6 +1275,7 @@ mod tests {
         layout: &'a mut crate::layout::Layout,
         registry: &'a crate::agent::AgentRegistry,
         tx: &'a crossbeam_channel::Sender<usize>,
+        task_rpc_tx: &'a crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
         name_counter: &'a mut HashMap<String, usize>,
     ) -> OverlayCtx<'a> {
         OverlayCtx {
@@ -1232,16 +1285,18 @@ mod tests {
             fleet_path: home,
             wakeup_tx: tx,
             name_counter,
+            task_rpc_tx,
         }
     }
 
-    /// Regression: Shift+L (Kitty protocol: 'l'+SHIFT) must update task
-    /// status and persist to tasks.json.
+    /// Regression: Shift+L (Kitty protocol: 'l'+SHIFT) must request the
+    /// canonical status update through the daemon RPC seam.
     #[test]
-    fn task_board_l_updates_task_status_and_persists() {
+    fn task_board_l_requests_status_update_via_rpc() {
         let home = tmp_home("l_persist");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
+        let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
 
@@ -1260,20 +1315,27 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
 
         // Kitty protocol: Shift+L → KeyCode::Char('l') + SHIFT
-        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
+        let mut ctx = make_ctx(
+            &home,
+            &mut layout,
+            &registry,
+            &tx,
+            &task_tx,
+            &mut name_counter,
+        );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        // Reload from disk — must be persisted. #2306: Todo →L→ Working (in_progress).
-        let reloaded = crate::tasks::list_all(&home);
-        let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
-        assert_eq!(
-            task.status,
-            crate::task_events::TaskStatus::InProgress,
-            "L must persist status change"
-        );
+        let crate::app::rpc::TaskRequest::Mutate(arguments) = task_rx.recv().unwrap() else {
+            panic!("expected task mutation")
+        };
+        assert_eq!(arguments["action"], "update");
+        assert_eq!(arguments["id"], task_id);
+        assert_eq!(arguments["status"], "in_progress");
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1289,6 +1351,7 @@ mod tests {
             let home = tmp_home(&format!("shift_d_{label}"));
             let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
             let (tx, _rx) = crossbeam_channel::unbounded();
+            let (task_tx, task_rx) = crossbeam_channel::unbounded();
             let mut name_counter = HashMap::new();
             let mut layout = crate::layout::Layout::new();
 
@@ -1308,18 +1371,25 @@ mod tests {
                 row: 0,
                 mode: TaskBoardMode::Board,
                 view: BoardView::Tasks,
+                pending: false,
+                notice: None,
             };
 
-            let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
+            let mut ctx = make_ctx(
+                &home,
+                &mut layout,
+                &registry,
+                &tx,
+                &task_tx,
+                &mut name_counter,
+            );
             handle_key(&mut overlay, key_event, &mut ctx);
 
-            let reloaded = crate::tasks::list_all(&home);
-            let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
-            assert_eq!(
-                task.status,
-                crate::task_events::TaskStatus::Done,
-                "Shift+D ({label}) must mark done"
-            );
+            let crate::app::rpc::TaskRequest::Mutate(arguments) = task_rx.recv().unwrap() else {
+                panic!("expected task mutation")
+            };
+            assert_eq!(arguments["action"], "done", "Shift+D ({label}) action");
+            assert_eq!(arguments["id"], task_id, "Shift+D ({label}) task");
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -1333,6 +1403,7 @@ mod tests {
         let home = tmp_home("cursor_resolve");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
+        let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
 
@@ -1367,28 +1438,26 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
 
-        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
+        let mut ctx = make_ctx(
+            &home,
+            &mut layout,
+            &registry,
+            &tx,
+            &task_tx,
+            &mut name_counter,
+        );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        // high-pri must have moved, low-pri must stay
-        let reloaded = crate::tasks::list_all(&home);
-        let high = reloaded.iter().find(|t| t.id == high_id).expect("high-pri");
-        assert_eq!(
-            high.status,
-            crate::task_events::TaskStatus::InProgress,
-            "cursor row 0 must move high-pri task (Todo →L→ Working)"
-        );
-        let low = reloaded
-            .iter()
-            .find(|t| t.title == "low-pri")
-            .expect("low-pri");
-        assert_eq!(
-            low.status,
-            crate::task_events::TaskStatus::Open,
-            "low-pri must remain in Open"
-        );
+        let crate::app::rpc::TaskRequest::Mutate(arguments) = task_rx.recv().unwrap() else {
+            panic!("expected task mutation")
+        };
+        assert_eq!(arguments["action"], "update");
+        assert_eq!(arguments["id"], high_id, "cursor must target high-pri");
+        assert_eq!(arguments["status"], "in_progress");
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1410,6 +1479,7 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1417,6 +1487,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {
@@ -1454,6 +1526,7 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1461,6 +1534,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Help,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {

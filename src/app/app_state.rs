@@ -69,6 +69,8 @@ pub(super) struct AppState {
     pub(super) pending_decisions_total: usize,
     /// Existing runtime discovery mode, surfaced directly in the status bar.
     pub(super) daemon_list_mode: crate::runtime::AgentListMode,
+    /// Last daemon-confirmed task list; APP never reconstructs it from JSONL.
+    pub(super) task_snapshot: Vec<crate::tasks::Task>,
     /// #freeze-4 (t-…2324) restart-flood boot phase: until the pre-restart
     /// backlog flood is drained, the loop runs a bounded "loading" phase — a
     /// TIME-capped drain ([`render::drain_all_panes_until`]) that clears the
@@ -118,6 +120,7 @@ pub(super) struct AppDeps<'a> {
     pub attached_run_dir: &'a Option<std::path::PathBuf>,
     pub attached_mode: bool,
     pub size_debug: bool,
+    pub task_rpc_tx: &'a crossbeam_channel::Sender<rpc::TaskRequest>,
 }
 
 /// #2453 Slice 2: the extracted run_app loop/setup logic, method-by-method.
@@ -150,6 +153,7 @@ impl AppState {
             last_decision_sync: None,
             pending_decisions_total: 0,
             daemon_list_mode: crate::runtime::AgentListMode::Live,
+            task_snapshot: Vec::new(),
             booting: true,
             boot_start: std::time::Instant::now(),
             attaches_expected: 0,
@@ -710,6 +714,8 @@ impl AppState {
             home,
             fleet_path,
             wakeup_tx,
+            task_rpc_tx: deps.task_rpc_tx,
+            task_snapshot: &self.task_snapshot,
         };
         let ui_deps = &ui_deps;
         self.dirty = true; // input may change the display → redraw next due frame
@@ -817,6 +823,34 @@ impl AppState {
                 }
             }
         }
+    }
+
+    pub(super) fn handle_task_rpc_outcome(
+        &mut self,
+        outcome: Result<rpc::TaskOutcome, crossbeam_channel::RecvError>,
+    ) {
+        let (items, notice) = match outcome {
+            Ok(Ok(items)) => (Some(items), None),
+            Ok(Err(error)) => (None, Some(error)),
+            Err(_) => (None, Some("task RPC worker stopped".to_string())),
+        };
+        if let Some(items) = items {
+            self.task_snapshot = items;
+        }
+        if let Overlay::Tasks {
+            items,
+            pending,
+            notice: overlay_notice,
+            ..
+        } = &mut self.ui.overlay
+        {
+            if notice.is_none() {
+                *items = self.task_snapshot.clone();
+            }
+            *pending = false;
+            *overlay_notice = notice;
+        }
+        self.dirty = true;
     }
 
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {

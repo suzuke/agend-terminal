@@ -217,6 +217,7 @@ pub fn render_decisions(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_tasks(
     frame: &mut Frame,
     items: &[crate::tasks::Task],
@@ -225,6 +226,7 @@ pub fn render_tasks(
     mode: &crate::app::TaskBoardMode,
     view: crate::app::BoardView,
     home: &std::path::Path,
+    notice: Option<&str>,
 ) {
     use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
@@ -236,6 +238,14 @@ pub fn render_tasks(
     };
     let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
+
+    if let Some(notice) = notice {
+        frame.render_widget(
+            Paragraph::new(format!("  {notice}")).style(Style::default().fg(Color::Red)),
+            inner,
+        );
+        return;
+    }
 
     if matches!(view, BoardView::Monitor) {
         render_monitor_view(frame, inner);
@@ -1056,6 +1066,7 @@ mod tests {
                     mode,
                     crate::app::BoardView::Tasks,
                     std::path::Path::new("/tmp"),
+                    None,
                 )
             })
             .expect("test terminal draw should succeed");

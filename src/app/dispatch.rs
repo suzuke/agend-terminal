@@ -23,6 +23,8 @@ pub(super) struct DispatchCtx<'a> {
     pub last_tab: &'a mut usize,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
+    pub task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub task_snapshot: &'a [crate::tasks::Task],
 }
 
 /// Signals back to `run_app`. Fields are applied independently — a single
@@ -204,46 +206,66 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             });
         }
         Action::ShowTasks => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Tasks,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::ShowFleet => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Fleet,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::ShowHelp => {
             out.new_overlay = Some(Overlay::Help);
         }
         Action::ShowStatus => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Status,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::ShowMonitor => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Monitor,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::Detach => {
@@ -452,8 +474,21 @@ mod tests {
             fleet_path: home,
             last_tab,
             wakeup_tx,
+            task_rpc_tx: &test_task_channel().0,
+            task_snapshot: &[],
             name_counter,
         }
+    }
+
+    fn test_task_channel() -> &'static (
+        crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+        crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+    ) {
+        static CHANNEL: std::sync::OnceLock<(
+            crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+            crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+        )> = std::sync::OnceLock::new();
+        CHANNEL.get_or_init(crossbeam_channel::unbounded)
     }
 
     #[test]

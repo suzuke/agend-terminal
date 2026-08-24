@@ -14,6 +14,7 @@ mod mouse;
 mod overlay;
 mod pane_factory;
 mod restart_resume;
+mod rpc;
 #[cfg(all(unix, test))]
 use restart_resume::restart_argv;
 pub(crate) use restart_resume::run_restart_probe;
@@ -427,8 +428,19 @@ fn render_active_overlay(
             row,
             ref mode,
             ref view,
+            ref notice,
+            ..
         } => {
-            render::render_tasks(frame, items, *col, *row, mode, *view, home);
+            render::render_tasks(
+                frame,
+                items,
+                *col,
+                *row,
+                mode,
+                *view,
+                home,
+                notice.as_deref(),
+            );
         }
         Overlay::ScratchShell { pane } => {
             render::render_scratch_shell(frame, pane, registry);
@@ -474,6 +486,8 @@ fn run_app(
     trace_tty_size(size_debug, "startup-baseline");
     // restart-freeze RCA anchor: boot critical path start (pure tracing).
     let restore_start = std::time::Instant::now();
+    let (task_rpc_tx, task_rpc_rx, task_rpc_worker) =
+        rpc::spawn_task_worker(attached_run_dir.as_ref().expect("attached run dir"));
     let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
@@ -485,6 +499,7 @@ fn run_app(
         attached_run_dir: &attached_run_dir,
         attached_mode,
         size_debug,
+        task_rpc_tx: &task_rpc_tx,
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
@@ -507,9 +522,12 @@ fn run_app(
             }
             recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
             recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps),
+            recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
     };
+    drop(task_rpc_tx);
+    let _ = task_rpc_worker.join();
     // Teardown gating rationale is documented on `app_teardown`.
     app_teardown(&home, &state.ui.layout, attach_workers);
     loop_result?;
