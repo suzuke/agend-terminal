@@ -20,6 +20,37 @@ use std::collections::{BTreeMap, VecDeque};
 /// unbounded audit timeline in memory.
 pub const RECENT_HISTORY_LIMIT: usize = 16;
 
+/// Canonical within-file fold order used by the incumbent replay.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OrderKey {
+    timestamp_ns: i64,
+    instance: InstanceName,
+    seq: u64,
+}
+
+impl OrderKey {
+    fn from_envelope(env: &TaskEventEnvelope) -> Result<Self, OrderedApplyError> {
+        let timestamp_ns = chrono::DateTime::parse_from_rfc3339(&env.timestamp)
+            .map_err(|_| OrderedApplyError::InvalidTimestamp(env.timestamp.clone()))?
+            .timestamp_nanos_opt()
+            .unwrap_or(0);
+        Ok(Self {
+            timestamp_ns,
+            instance: env.instance.clone(),
+            seq: env.seq,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrderedApplyError {
+    InvalidTimestamp(String),
+    OutOfOrder {
+        previous: OrderKey,
+        received: OrderKey,
+    },
+}
+
 /// Current task state stored by the catalog. Unlike [`TaskRecord`], this type
 /// is bounded with respect to the number of events applied to a task.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -113,6 +144,7 @@ pub struct BoardProjection {
     tasks: BTreeMap<TaskId, ProjectedTaskRecord>,
     last_seq_per_instance: BTreeMap<InstanceName, u64>,
     events_folded: u64,
+    last_order_key: Option<OrderKey>,
 }
 
 impl BoardProjection {
@@ -125,6 +157,7 @@ impl BoardProjection {
                 .collect(),
             last_seq_per_instance: state.last_seq_per_instance,
             events_folded: state.events_folded,
+            last_order_key: None,
         }
     }
 
@@ -142,6 +175,28 @@ impl BoardProjection {
 
     pub fn events_folded(&self) -> u64 {
         self.events_folded
+    }
+
+    pub fn last_order_key(&self) -> Option<&OrderKey> {
+        self.last_order_key.as_ref()
+    }
+
+    /// Apply one live-tail envelope only when its canonical key advances.
+    /// Replay/rebuild callers sort first and continue to use [`Self::apply`].
+    pub fn apply_ordered(&mut self, env: &TaskEventEnvelope) -> Result<bool, OrderedApplyError> {
+        let received = OrderKey::from_envelope(env)?;
+        if let Some(previous) = &self.last_order_key {
+            if received <= *previous {
+                return Err(OrderedApplyError::OutOfOrder {
+                    previous: previous.clone(),
+                    received,
+                });
+            }
+        }
+
+        let applied = self.apply(env);
+        self.last_order_key = Some(received);
+        Ok(applied)
     }
 
     /// Fold one canonical envelope into the bounded projection. Returns false
@@ -412,6 +467,12 @@ mod tests {
             emitter_id: None,
             event,
         }
+    }
+
+    fn envelope_at(timestamp: &str, seq: u64, event: TaskEvent) -> TaskEventEnvelope {
+        let mut env = envelope(seq, event);
+        env.timestamp = timestamp.to_string();
+        env
     }
 
     fn replay_with_metadata_events(count: u64) -> TaskBoardState {
@@ -761,5 +822,67 @@ mod tests {
             projection.last_seq_for(&InstanceName::from("other-writer")),
             Some(2)
         );
+    }
+
+    #[test]
+    fn ordered_apply_rejects_non_advancing_keys_without_mutation() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let created = envelope_at(
+            "2026-08-24T00:00:02Z",
+            1,
+            TaskEvent::Created {
+                task_id: task_id.clone(),
+                title: "ordered".into(),
+                description: "tail gate".into(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        );
+        let stale = envelope_at(
+            "2026-08-24T00:00:01Z",
+            2,
+            TaskEvent::TagsSet {
+                task_id: task_id.clone(),
+                tags: vec!["stale".into()],
+            },
+        );
+        let invalid = envelope_at(
+            "not-a-timestamp",
+            3,
+            TaskEvent::TagsSet {
+                task_id,
+                tags: vec!["invalid".into()],
+            },
+        );
+
+        let mut projection = BoardProjection::default();
+        assert_eq!(projection.apply_ordered(&created), Ok(true));
+        let accepted = projection.clone();
+
+        assert!(matches!(
+            projection.apply_ordered(&stale),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, accepted);
+        assert!(matches!(
+            projection.apply_ordered(&created),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, accepted);
+        assert_eq!(
+            projection.apply_ordered(&invalid),
+            Err(OrderedApplyError::InvalidTimestamp(
+                "not-a-timestamp".into()
+            ))
+        );
+        assert_eq!(projection, accepted);
     }
 }
