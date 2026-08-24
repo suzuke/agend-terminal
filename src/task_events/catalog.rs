@@ -153,9 +153,7 @@ impl BoardProjection {
         envelopes: &[TaskEventEnvelope],
     ) -> Result<Self, OrderedApplyError> {
         let mut projection = Self::default();
-        for env in envelopes {
-            projection.apply_ordered(env)?;
-        }
+        projection.apply_ordered_batch(envelopes)?;
         Ok(projection)
     }
 
@@ -210,6 +208,34 @@ impl BoardProjection {
         let applied = self.apply(env);
         self.last_order_key = Some(received);
         Ok(applied)
+    }
+
+    /// Apply a canonical batch only after every envelope advances the cursor.
+    pub fn apply_ordered_batch(
+        &mut self,
+        envelopes: &[TaskEventEnvelope],
+    ) -> Result<(), OrderedApplyError> {
+        let mut previous = self.last_order_key.clone();
+        let mut keys = Vec::with_capacity(envelopes.len());
+        for env in envelopes {
+            let received = OrderKey::from_envelope(env)?;
+            if let Some(previous) = &previous {
+                if received <= *previous {
+                    return Err(OrderedApplyError::OutOfOrder {
+                        previous: previous.clone(),
+                        received,
+                    });
+                }
+            }
+            previous = Some(received.clone());
+            keys.push(received);
+        }
+
+        for (env, key) in envelopes.iter().zip(keys) {
+            self.apply(env);
+            self.last_order_key = Some(key);
+        }
+        Ok(())
     }
 
     /// Fold one canonical envelope into the bounded projection. Returns false
