@@ -138,6 +138,48 @@ impl From<TaskRecord> for ProjectedTaskRecord {
     }
 }
 
+impl ProjectedTaskRecord {
+    fn matches_replay(&self, task: &TaskRecord) -> bool {
+        let recent_start = task.history.len().saturating_sub(RECENT_HISTORY_LIMIT);
+        self.id == task.id
+            && self.title == task.title
+            && self.description == task.description
+            && self.priority == task.priority
+            && self.status == task.status
+            && self.owner == task.owner
+            && self.linked_prs == task.linked_prs
+            && self.block_reason == task.block_reason
+            && self.created_by == task.created_by
+            && self.created_at == task.created_at
+            && self.updated_at == task.updated_at
+            && self.due_at == task.due_at
+            && self.depends_on == task.depends_on
+            && self.routed_to == task.routed_to
+            && self.result == task.result
+            && self.superseded_by == task.superseded_by
+            && self.branch == task.branch
+            && self.bind == task.bind
+            && self.started_at == task.started_at
+            && self.eta_secs == task.eta_secs
+            && self.tags == task.tags
+            && self.parent_id == task.parent_id
+            && self.metadata == task.metadata
+            && self.history_len == task.history.len() as u64
+            && self
+                .last_folded_event
+                .as_ref()
+                .map(|(instance, seq)| (instance, *seq))
+                == task
+                    .history
+                    .last()
+                    .map(|entry| (&entry.instance, entry.seq))
+            && self
+                .recent_history
+                .iter()
+                .eq(task.history[recent_start..].iter())
+    }
+}
+
 /// One board's bounded shadow snapshot, built from the incumbent replay.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct BoardProjection {
@@ -187,6 +229,20 @@ impl BoardProjection {
 
     pub fn events_folded(&self) -> u64 {
         self.events_folded
+    }
+
+    /// Compare the bounded shadow with the incumbent replay without cloning
+    /// its unbounded audit history.
+    pub fn matches_replay(&self, replay: &TaskBoardState) -> bool {
+        self.events_folded == replay.events_folded
+            && self.last_seq_per_instance == replay.last_seq_per_instance
+            && self.tasks.len() == replay.tasks.len()
+            && self.tasks.iter().all(|(id, task)| {
+                replay
+                    .tasks
+                    .get(id)
+                    .is_some_and(|replayed| task.matches_replay(replayed))
+            })
     }
 
     pub fn last_order_key(&self) -> Option<&OrderKey> {
