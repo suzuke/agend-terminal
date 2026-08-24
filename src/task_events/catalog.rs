@@ -41,7 +41,7 @@ pub struct ProjectedTaskRecord {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "dispatched_at", skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<i64>,
@@ -52,14 +52,14 @@ pub struct ProjectedTaskRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, serde_json::Value>,
     pub history_len: u64,
-    pub last_seq: Option<(InstanceName, u64)>,
+    pub last_folded_event: Option<(InstanceName, u64)>,
     pub recent_history: VecDeque<HistoryEntry>,
 }
 
 impl From<TaskRecord> for ProjectedTaskRecord {
     fn from(task: TaskRecord) -> Self {
         let history_len = task.history.len() as u64;
-        let last_seq = task
+        let last_folded_event = task
             .history
             .last()
             .map(|entry| (entry.instance.clone(), entry.seq));
@@ -98,7 +98,7 @@ impl From<TaskRecord> for ProjectedTaskRecord {
             parent_id: task.parent_id,
             metadata: task.metadata,
             history_len,
-            last_seq,
+            last_folded_event,
             recent_history,
         }
     }
@@ -210,14 +210,17 @@ mod tests {
         let mut projected = serde_json::to_value(task).expect("serialize projected task");
         let projected_object = projected.as_object_mut().expect("projected task object");
         projected_object.remove("history_len");
-        projected_object.remove("last_seq");
+        projected_object.remove("last_folded_event");
         projected_object.remove("recent_history");
 
         assert_eq!(projected, incumbent, "every current-state field must match");
         assert_eq!(task.history_len, 21);
         assert_eq!(task.recent_history.len(), RECENT_HISTORY_LIMIT);
         assert_eq!(task.recent_history.front().map(|entry| entry.seq), Some(6));
-        assert_eq!(task.last_seq, Some((InstanceName::from("writer"), 21)));
+        assert_eq!(
+            task.last_folded_event,
+            Some((InstanceName::from("writer"), 21))
+        );
         assert_eq!(
             projection.last_seq_for(&InstanceName::from("writer")),
             Some(21)
