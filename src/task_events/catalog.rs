@@ -586,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn shadow_equivalence_detects_current_state_and_high_water_mismatches() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let replay = replay_with_metadata_events(20);
+        let projection = BoardProjection::from_replay(replay.clone());
+
+        assert!(projection.matches_replay(&replay));
+
+        let mut changed_task = replay.clone();
+        changed_task
+            .tasks
+            .get_mut(&task_id)
+            .expect("replayed task")
+            .title = "different title".into();
+        assert!(!projection.matches_replay(&changed_task));
+
+        let mut changed_high_water = replay.clone();
+        changed_high_water
+            .last_seq_per_instance
+            .insert(InstanceName::from("writer"), 999);
+        assert!(!projection.matches_replay(&changed_high_water));
+
+        let mut changed_event_count = replay;
+        changed_event_count.events_folded += 1;
+        assert!(!projection.matches_replay(&changed_event_count));
+    }
+
+    #[test]
     fn projection_size_is_bounded_by_tasks_not_events() {
         let one_x = BoardProjection::from_replay(replay_with_metadata_events(100));
         let ten_x = BoardProjection::from_replay(replay_with_metadata_events(1_000));
