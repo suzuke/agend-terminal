@@ -15,7 +15,7 @@ use super::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Enough recent activity for the task-board detail view without retaining an
 /// unbounded audit timeline in memory.
@@ -50,6 +50,43 @@ pub enum OrderedApplyError {
         previous: OrderKey,
         received: OrderKey,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Phase {
+    Building,
+    Ready,
+    Unhealthy { since: String, causes: Vec<String> },
+}
+
+pub struct StrictTaskCatalog {
+    inner: RwLock<CatalogInner>,
+}
+
+struct CatalogInner {
+    phase: Phase,
+    boards: BTreeMap<String, BoardProjection>,
+}
+
+impl StrictTaskCatalog {
+    pub fn new(phase: Phase, boards: BTreeMap<String, BoardProjection>) -> Self {
+        Self {
+            inner: RwLock::new(CatalogInner { phase, boards }),
+        }
+    }
+
+    pub fn snapshot_advisory(&self) -> (Phase, Vec<Arc<ProjectedTaskRecord>>) {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshots = inner
+            .boards
+            .values()
+            .flat_map(BoardProjection::task_snapshots)
+            .collect();
+        (inner.phase.clone(), snapshots)
+    }
 }
 
 /// Current task state stored by the catalog. Unlike [`TaskRecord`], this type
@@ -880,16 +917,12 @@ mod tests {
             tags: Vec::new(),
             parent_id: None,
         };
-        let first = BoardProjection::from_sorted_envelopes(&[envelope(
-            1,
-            create(first_id.clone()),
-        )])
-        .expect("first board");
-        let second = BoardProjection::from_sorted_envelopes(&[envelope(
-            1,
-            create(second_id.clone()),
-        )])
-        .expect("second board");
+        let first =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(first_id.clone()))])
+                .expect("first board");
+        let second =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(second_id.clone()))])
+                .expect("second board");
         let first_snapshot = first.task_snapshot(&first_id).expect("first snapshot");
         let second_snapshot = second.task_snapshot(&second_id).expect("second snapshot");
         let catalog = StrictTaskCatalog::new(
