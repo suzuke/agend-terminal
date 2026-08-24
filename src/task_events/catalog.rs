@@ -759,6 +759,64 @@ mod tests {
     }
 
     #[test]
+    fn task_snapshots_replace_only_the_changed_record() {
+        let changed_id = TaskId::from("t-20260824000000000000-1-1");
+        let untouched_id = TaskId::from("t-20260824000000000000-1-2");
+        let create = |task_id: TaskId, title: &str| TaskEvent::Created {
+            task_id,
+            title: title.into(),
+            description: "snapshot fixture".into(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let mut projection = BoardProjection::from_sorted_envelopes(&[
+            envelope(1, create(changed_id.clone(), "changed")),
+            envelope(2, create(untouched_id.clone(), "untouched")),
+        ])
+        .expect("initial projection");
+        let changed_before = projection
+            .task_snapshot(&changed_id)
+            .expect("changed snapshot");
+        let untouched_before = projection
+            .task_snapshot(&untouched_id)
+            .expect("untouched snapshot");
+
+        projection
+            .apply_ordered(&envelope(
+                3,
+                TaskEvent::MetadataSet {
+                    task_id: changed_id.clone(),
+                    by: InstanceName::from("writer"),
+                    key: "updated".into(),
+                    value: serde_json::json!(true),
+                },
+            ))
+            .expect("ordered update");
+
+        let changed_after = projection
+            .task_snapshot(&changed_id)
+            .expect("changed snapshot");
+        let untouched_after = projection
+            .task_snapshot(&untouched_id)
+            .expect("untouched snapshot");
+        assert!(!std::sync::Arc::ptr_eq(&changed_before, &changed_after));
+        assert!(std::sync::Arc::ptr_eq(&untouched_before, &untouched_after));
+        assert!(changed_before.metadata.is_empty());
+        assert_eq!(
+            changed_after.metadata.get("updated"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
     fn incremental_apply_matches_incumbent_replay() {
         let task_id = TaskId::from("t-20260824000000000000-1-1");
         let child_id = TaskId::from("t-20260824000000000000-1-2");
