@@ -14,7 +14,7 @@ use super::{
     TaskId, TaskRecord, TaskStatus,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 /// Enough recent activity for the task-board detail view without retaining an
@@ -76,6 +76,27 @@ fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshne
         }
     } else {
         HotLogFreshness::Stale
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoardSetFreshness {
+    Current,
+    New { names: Vec<String> },
+    Missing { names: Vec<String> },
+}
+
+fn classify_board_set(known: &BTreeSet<String>, observed: &BTreeSet<String>) -> BoardSetFreshness {
+    let missing: Vec<_> = known.difference(observed).cloned().collect();
+    if !missing.is_empty() {
+        return BoardSetFreshness::Missing { names: missing };
+    }
+
+    let added: Vec<_> = observed.difference(known).cloned().collect();
+    if added.is_empty() {
+        BoardSetFreshness::Current
+    } else {
+        BoardSetFreshness::New { names: added }
     }
 }
 
