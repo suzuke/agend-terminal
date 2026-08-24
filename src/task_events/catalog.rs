@@ -1380,6 +1380,19 @@ mod tests {
                 names: vec!["research".to_string()],
             }
         );
+        assert_eq!(
+            classify_board_set(
+                &std::collections::BTreeSet::from([
+                    "a-second-one".to_string(),
+                    "default".to_string(),
+                    "research".to_string(),
+                ]),
+                &std::collections::BTreeSet::from(["default".to_string()]),
+            ),
+            BoardSetFreshness::Missing {
+                names: vec!["a-second-one".to_string(), "research".to_string()],
+            }
+        );
     }
 
     #[test]
