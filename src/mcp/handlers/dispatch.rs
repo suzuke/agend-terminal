@@ -1863,9 +1863,7 @@ mod tests {
                 if let Some(name) = function_name(&code) {
                     current_function = name;
                 }
-                let kind = if code.contains("api::call_at(")
-                    || code.contains("api::call_at_with_timeout(")
-                {
+                let kind = if code.contains("api::call_at(") {
                     "call_at"
                 } else if code.contains("api::call(") {
                     "call"

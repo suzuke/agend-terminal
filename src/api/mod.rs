@@ -914,25 +914,13 @@ fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
 }
 
 /// Send a request to the daemon API and read one NDJSON response.
-///
-/// Performs the P1-10 cookie handshake first: reads `api.cookie` from the
-/// active daemon's run dir, sends `{"auth":"<hex>"}`, and rejects the call
-/// if the server does not reply `{"ok":true}`. The cookie file has mode
-/// 0600 so only the daemon's user can read it — this is the peer-UID
-/// substitute for TCP loopback (see `auth_cookie.rs`).
+/// Performs the P1-10 cookie handshake using the mode-0600 credential in the
+/// supplied run dir and rejects calls without successful authentication.
 /// #1814: like [`call`] but targets a SPECIFIC run dir (cookie + api.port read
 /// from `run_dir`), not the active daemon. Used by the self-respawn Phase-1
-/// gate so the predecessor can do a real cookie-authenticated round-trip
-/// against the successor's own control plane while both are briefly alive. A
-/// short fixed read timeout (the gate retries) keeps a flaky successor from
-/// hanging the handler. No self-IPC guard: this connects to a DIFFERENT
-/// process's socket, so the registry-lock deadlock class does not apply.
-pub fn call_at(run_dir: &Path, request: &Value) -> anyhow::Result<Value> {
-    call_at_with_timeout(run_dir, request, std::time::Duration::from_secs(2))
-}
-
-/// Like [`call_at`], with a caller-selected read deadline.
-pub fn call_at_with_timeout(
+/// gate against the successor's control plane with a caller-selected deadline.
+/// No self-IPC guard: this connects to a DIFFERENT process's socket.
+pub fn call_at(
     run_dir: &Path,
     request: &Value,
     timeout: std::time::Duration,

@@ -49,7 +49,7 @@ fn execute(run_dir: &Path, request: TaskRequest) -> TaskOutcome {
 }
 
 fn call_task(run_dir: &Path, arguments: Value) -> Result<Value, String> {
-    let response = crate::api::call_at_with_timeout(
+    let response = crate::api::call_at(
         run_dir,
         &serde_json::json!({
             "method": crate::api::method::MCP_TOOL,
@@ -74,7 +74,7 @@ mod tests {
     fn app_task_rpc_uses_the_bounded_cross_process_call() {
         let source = include_str!("rpc.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(production.contains("crate::api::call_at_with_timeout("));
+        assert!(production.contains("crate::api::call_at("));
         assert!(production.contains("std::time::Duration::from_secs(10)"));
     }
 

@@ -417,6 +417,7 @@ fn phase1_gate(succ: &mut crate::bootstrap::daemon_spawn::SuccessorHandle) -> bo
             && crate::api::call_at(
                 &succ.run_dir,
                 &json!({"method": crate::api::method::STATUS}),
+                std::time::Duration::from_secs(2),
             )
             .is_ok()
         {
