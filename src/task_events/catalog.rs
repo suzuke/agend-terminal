@@ -228,6 +228,10 @@ impl BoardProjection {
         self.tasks.get(id).cloned()
     }
 
+    pub fn task_snapshots(&self) -> Vec<Arc<ProjectedTaskRecord>> {
+        self.tasks.values().cloned().collect()
+    }
+
     pub fn last_seq_for(&self, instance: &InstanceName) -> Option<u64> {
         self.last_seq_per_instance.get(instance).copied()
     }
