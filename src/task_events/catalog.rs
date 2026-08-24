@@ -1329,6 +1329,39 @@ mod tests {
     }
 
     #[test]
+    fn board_set_freshness_compares_names_and_fails_closed_on_missing() {
+        let known =
+            std::collections::BTreeSet::from(["default".to_string(), "research".to_string()]);
+
+        assert_eq!(
+            classify_board_set(&known, &known),
+            BoardSetFreshness::Current
+        );
+        assert_eq!(
+            classify_board_set(
+                &known,
+                &std::collections::BTreeSet::from([
+                    "default".to_string(),
+                    "research".to_string(),
+                    "support".to_string(),
+                ]),
+            ),
+            BoardSetFreshness::New {
+                names: vec!["support".to_string()],
+            }
+        );
+        assert_eq!(
+            classify_board_set(
+                &known,
+                &std::collections::BTreeSet::from(["default".to_string(), "support".to_string(),]),
+            ),
+            BoardSetFreshness::Missing {
+                names: vec!["research".to_string()],
+            }
+        );
+    }
+
+    #[test]
     fn incremental_apply_matches_incumbent_replay() {
         let task_id = TaskId::from("t-20260824000000000000-1-1");
         let child_id = TaskId::from("t-20260824000000000000-1-2");
