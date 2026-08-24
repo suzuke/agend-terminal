@@ -815,6 +815,16 @@ mod tests {
         let untouched_before = projection
             .task_snapshot(&untouched_id)
             .expect("untouched snapshot");
+        let all_before = projection.task_snapshots();
+        assert_eq!(
+            all_before
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            vec![changed_id.clone(), untouched_id.clone()]
+        );
+        assert!(Arc::ptr_eq(&all_before[0], &changed_before));
+        assert!(Arc::ptr_eq(&all_before[1], &untouched_before));
 
         projection
             .apply_ordered(&envelope(
@@ -834,9 +844,13 @@ mod tests {
         let untouched_after = projection
             .task_snapshot(&untouched_id)
             .expect("untouched snapshot");
+        let all_after = projection.task_snapshots();
         assert!(!std::sync::Arc::ptr_eq(&changed_before, &changed_after));
         assert!(std::sync::Arc::ptr_eq(&untouched_before, &untouched_after));
+        assert!(!Arc::ptr_eq(&all_before[0], &all_after[0]));
+        assert!(Arc::ptr_eq(&all_before[1], &all_after[1]));
         assert!(changed_before.metadata.is_empty());
+        assert!(all_before[0].metadata.is_empty());
         assert_eq!(
             changed_after.metadata.get("updated"),
             Some(&serde_json::json!(true))
