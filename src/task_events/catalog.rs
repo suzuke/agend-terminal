@@ -15,6 +15,7 @@ use super::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 /// Enough recent activity for the task-board detail view without retaining an
 /// unbounded audit timeline in memory.
@@ -183,7 +184,7 @@ impl ProjectedTaskRecord {
 /// One board's bounded shadow snapshot, built from the incumbent replay.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct BoardProjection {
-    tasks: BTreeMap<TaskId, ProjectedTaskRecord>,
+    tasks: BTreeMap<TaskId, Arc<ProjectedTaskRecord>>,
     last_seq_per_instance: BTreeMap<InstanceName, u64>,
     events_folded: u64,
     last_order_key: Option<OrderKey>,
@@ -207,7 +208,7 @@ impl BoardProjection {
             tasks: state
                 .tasks
                 .into_iter()
-                .map(|(id, task)| (id, task.into()))
+                .map(|(id, task)| (id, Arc::new(task.into())))
                 .collect(),
             last_seq_per_instance: state.last_seq_per_instance,
             events_folded: state.events_folded,
@@ -216,11 +217,15 @@ impl BoardProjection {
     }
 
     pub fn task(&self, id: &TaskId) -> Option<&ProjectedTaskRecord> {
-        self.tasks.get(id)
+        self.tasks.get(id).map(Arc::as_ref)
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &ProjectedTaskRecord> {
-        self.tasks.values()
+        self.tasks.values().map(Arc::as_ref)
+    }
+
+    pub fn task_snapshot(&self, id: &TaskId) -> Option<Arc<ProjectedTaskRecord>> {
+        self.tasks.get(id).cloned()
     }
 
     pub fn last_seq_for(&self, instance: &InstanceName) -> Option<u64> {
@@ -314,6 +319,7 @@ impl BoardProjection {
         self.apply_event(&env.event, &task_id, &env.instance, &env.timestamp);
 
         if let Some(task) = self.tasks.get_mut(&task_id) {
+            let task = Arc::make_mut(task);
             task.history_len += 1;
             task.last_folded_event = Some((env.instance.clone(), env.seq));
             task.recent_history.push_back(HistoryEntry {
@@ -327,6 +333,15 @@ impl BoardProjection {
             }
         }
         true
+    }
+
+    fn mutate_task(&mut self, task_id: &TaskId, mutate: impl FnOnce(&mut ProjectedTaskRecord)) {
+        let Some(current) = self.tasks.get(task_id) else {
+            return;
+        };
+        let mut updated = current.as_ref().clone();
+        mutate(&mut updated);
+        self.tasks.insert(task_id.clone(), Arc::new(updated));
     }
 
     fn apply_event(
@@ -352,9 +367,8 @@ impl BoardProjection {
                 parent_id,
                 ..
             } => {
-                self.tasks
-                    .entry(task_id.clone())
-                    .or_insert_with(|| ProjectedTaskRecord {
+                self.tasks.entry(task_id.clone()).or_insert_with(|| {
+                    Arc::new(ProjectedTaskRecord {
                         id: task_id.clone(),
                         title: title.clone(),
                         description: description.clone(),
@@ -381,44 +395,53 @@ impl BoardProjection {
                         history_len: 0,
                         last_folded_event: None,
                         recent_history: VecDeque::new(),
-                    });
+                    })
+                });
             }
             TaskEvent::Cancelled { .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::Cancelled;
                     task.updated_at = timestamp.to_string();
-                }
-                for child in self.tasks.values_mut().filter(|task| {
-                    task.parent_id.as_ref() == Some(task_id)
-                        && matches!(task.status, TaskStatus::Open | TaskStatus::Claimed)
-                }) {
-                    child.status = TaskStatus::Cancelled;
-                    child.updated_at = timestamp.to_string();
+                });
+                let child_ids = self
+                    .tasks
+                    .iter()
+                    .filter(|(_, task)| {
+                        task.parent_id.as_ref() == Some(task_id)
+                            && matches!(task.status, TaskStatus::Open | TaskStatus::Claimed)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                for child_id in child_ids {
+                    self.mutate_task(&child_id, |child| {
+                        child.status = TaskStatus::Cancelled;
+                        child.updated_at = timestamp.to_string();
+                    });
                 }
             }
             TaskEvent::Claimed { by, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::Claimed;
                     task.owner = Some(by.clone());
                     task.routed_to = None;
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::InProgress { by, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::InProgress;
                     task.owner = Some(by.clone());
                     task.updated_at = timestamp.to_string();
                     if task.started_at.is_none() {
                         task.started_at = Some(timestamp.to_string());
                     }
-                }
+                });
             }
             TaskEvent::Verified { .. } => {
                 self.set_status(task_id, timestamp, TaskStatus::Verified);
             }
             TaskEvent::Done { source, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::Done;
                     task.updated_at = timestamp.to_string();
                     match source {
@@ -430,48 +453,48 @@ impl BoardProjection {
                         }
                         _ => {}
                     }
-                }
+                });
             }
             TaskEvent::Superseded { successor_id, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::Superseded;
                     task.result = Some(format!("Superseded by {}", successor_id.0));
                     task.superseded_by = Some(successor_id.clone());
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::Linked { pr_id, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     if !task.linked_prs.contains(pr_id) {
                         task.linked_prs.push(*pr_id);
                     }
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::Blocked { reason, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::Blocked;
                     task.block_reason = Some(reason.clone());
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::Unblocked { .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     if task.status == TaskStatus::Blocked {
                         task.status = TaskStatus::Open;
                     }
                     task.block_reason = None;
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::Reopened { .. } => self.set_status(task_id, timestamp, TaskStatus::Open),
             TaskEvent::Released { .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.status = TaskStatus::Open;
                     task.owner = None;
                     task.routed_to = None;
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::MovedToBacklog { .. } => {
                 self.set_status(task_id, timestamp, TaskStatus::Backlog);
@@ -483,62 +506,62 @@ impl BoardProjection {
             TaskEvent::OwnerAssigned {
                 owner, routed_to, ..
             } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.owner = owner.clone();
                     task.routed_to = routed_to.clone();
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::PriorityChanged { priority, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.priority = priority.clone();
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::DescriptionUpdated { description, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.description = description.clone();
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::TagsSet { tags, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.tags = tags.clone();
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::ResultSet { result, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.result = Some(result.clone());
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::MetadataSet { key, value, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.metadata.insert(key.clone(), value.clone());
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
             TaskEvent::BranchLinked { branch, .. } => {
-                if let Some(task) = self.tasks.get_mut(task_id) {
+                self.mutate_task(task_id, |task| {
                     task.branch = Some(branch.clone());
                     task.updated_at = timestamp.to_string();
-                }
+                });
             }
         }
     }
 
     fn set_status(&mut self, task_id: &TaskId, timestamp: &str, status: TaskStatus) {
-        if let Some(task) = self.tasks.get_mut(task_id) {
+        self.mutate_task(task_id, |task| {
             task.status = status;
             task.updated_at = timestamp.to_string();
-        }
+        });
     }
 
     fn touch(&mut self, task_id: &TaskId, timestamp: &str) {
-        if let Some(task) = self.tasks.get_mut(task_id) {
+        self.mutate_task(task_id, |task| {
             task.updated_at = timestamp.to_string();
-        }
+        });
     }
 }
 
@@ -698,22 +721,26 @@ mod tests {
         assert!(!projection.matches_replay(&changed_history_len));
 
         let mut changed_last_folded = projection.clone();
-        changed_last_folded
-            .tasks
-            .get_mut(&task_id)
-            .expect("projected task")
-            .last_folded_event = None;
+        Arc::make_mut(
+            changed_last_folded
+                .tasks
+                .get_mut(&task_id)
+                .expect("projected task"),
+        )
+        .last_folded_event = None;
         assert!(!changed_last_folded.matches_replay(&replay));
 
         let mut changed_recent = projection.clone();
-        changed_recent
-            .tasks
-            .get_mut(&task_id)
-            .expect("projected task")
-            .recent_history
-            .back_mut()
-            .expect("recent history")
-            .kind = "different";
+        Arc::make_mut(
+            changed_recent
+                .tasks
+                .get_mut(&task_id)
+                .expect("projected task"),
+        )
+        .recent_history
+        .back_mut()
+        .expect("recent history")
+        .kind = "different";
         assert!(!changed_recent.matches_replay(&replay));
 
         let mut changed_task_set = replay.clone();

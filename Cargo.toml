@@ -128,7 +128,7 @@ arc-swap = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "time"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 base64 = "0.23"
 syn = { version = "3", features = ["parsing", "full", "visit"] }
