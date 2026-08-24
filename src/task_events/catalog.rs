@@ -1291,11 +1291,27 @@ mod tests {
             ),
             HotLogFreshness::CatchUp { start: 10, end: 14 }
         );
+        assert_eq!(
+            classify_hot_log(
+                cursor,
+                HotLogStamp {
+                    inode: 7,
+                    len: 14,
+                    mtime_ns: 100,
+                },
+            ),
+            HotLogFreshness::CatchUp { start: 10, end: 14 }
+        );
         for stale in [
             HotLogStamp {
                 inode: 8,
                 len: 10,
                 mtime_ns: 100,
+            },
+            HotLogStamp {
+                inode: 8,
+                len: 14,
+                mtime_ns: 101,
             },
             HotLogStamp {
                 inode: 7,
