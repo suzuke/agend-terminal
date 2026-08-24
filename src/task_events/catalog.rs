@@ -1,15 +1,18 @@
 //! Bounded task-state projection for the catalog shadow path.
 //!
-//! This first P2 slice deliberately has no authority: it projects an incumbent
-//! replay result into O(tasks) state. Incremental writes and catalog-backed
-//! reads land separately so this representation can be reviewed in isolation.
+//! This P2 shadow deliberately has no authority: it projects an incumbent
+//! replay result into O(tasks) state and can fold new envelopes incrementally.
+//! Catalog-backed reads and writer migration land separately.
 
 // This module is intentionally wired into production in the next P2 slice.
 // Keeping the allow local avoids fake call sites whose only purpose is lint
 // suppression while this independently reviewable representation lands.
 #![allow(dead_code)]
 
-use super::{HistoryEntry, InstanceName, PrId, TaskBoardState, TaskId, TaskRecord, TaskStatus};
+use super::{
+    DoneSource, HistoryEntry, InstanceName, PrId, TaskBoardState, TaskEvent, TaskEventEnvelope,
+    TaskId, TaskRecord, TaskStatus,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -105,7 +108,7 @@ impl From<TaskRecord> for ProjectedTaskRecord {
 }
 
 /// One board's bounded shadow snapshot, built from the incumbent replay.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct BoardProjection {
     tasks: BTreeMap<TaskId, ProjectedTaskRecord>,
     last_seq_per_instance: BTreeMap<InstanceName, u64>,
@@ -140,19 +143,272 @@ impl BoardProjection {
     pub fn events_folded(&self) -> u64 {
         self.events_folded
     }
+
+    /// Fold one canonical envelope into the bounded projection. Returns false
+    /// when this emitter sequence was already observed.
+    pub fn apply(&mut self, env: &TaskEventEnvelope) -> bool {
+        let previous = self
+            .last_seq_per_instance
+            .get(&env.instance)
+            .copied()
+            .unwrap_or(0);
+        if env.seq <= previous {
+            return false;
+        }
+
+        self.last_seq_per_instance
+            .insert(env.instance.clone(), env.seq);
+        self.events_folded += 1;
+
+        let task_id = env.event.task_id().clone();
+        self.apply_event(&env.event, &task_id, &env.instance, &env.timestamp);
+
+        if let Some(task) = self.tasks.get_mut(&task_id) {
+            task.history_len += 1;
+            task.last_folded_event = Some((env.instance.clone(), env.seq));
+            task.recent_history.push_back(HistoryEntry {
+                seq: env.seq,
+                timestamp: env.timestamp.clone(),
+                instance: env.instance.clone(),
+                kind: env.event.kind_str(),
+            });
+            if task.recent_history.len() > RECENT_HISTORY_LIMIT {
+                task.recent_history.pop_front();
+            }
+        }
+        true
+    }
+
+    fn apply_event(
+        &mut self,
+        event: &TaskEvent,
+        task_id: &TaskId,
+        instance: &InstanceName,
+        timestamp: &str,
+    ) {
+        match event {
+            TaskEvent::Created {
+                title,
+                description,
+                priority,
+                owner,
+                due_at,
+                depends_on,
+                routed_to,
+                branch,
+                bind,
+                eta_secs,
+                tags,
+                parent_id,
+                ..
+            } => {
+                self.tasks
+                    .entry(task_id.clone())
+                    .or_insert_with(|| ProjectedTaskRecord {
+                        id: task_id.clone(),
+                        title: title.clone(),
+                        description: description.clone(),
+                        priority: priority.clone(),
+                        status: TaskStatus::Open,
+                        owner: owner.clone(),
+                        linked_prs: Vec::new(),
+                        block_reason: None,
+                        created_by: instance.clone(),
+                        created_at: timestamp.to_string(),
+                        updated_at: timestamp.to_string(),
+                        due_at: due_at.clone(),
+                        depends_on: depends_on.clone(),
+                        routed_to: routed_to.clone(),
+                        result: None,
+                        superseded_by: None,
+                        branch: branch.clone(),
+                        bind: *bind,
+                        started_at: None,
+                        eta_secs: *eta_secs,
+                        tags: tags.clone(),
+                        parent_id: parent_id.clone(),
+                        metadata: BTreeMap::new(),
+                        history_len: 0,
+                        last_folded_event: None,
+                        recent_history: VecDeque::new(),
+                    });
+            }
+            TaskEvent::Cancelled { .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Cancelled;
+                    task.updated_at = timestamp.to_string();
+                }
+                for child in self.tasks.values_mut().filter(|task| {
+                    task.parent_id.as_ref() == Some(task_id)
+                        && matches!(task.status, TaskStatus::Open | TaskStatus::Claimed)
+                }) {
+                    child.status = TaskStatus::Cancelled;
+                    child.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::Claimed { by, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Claimed;
+                    task.owner = Some(by.clone());
+                    task.routed_to = None;
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::InProgress { by, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::InProgress;
+                    task.owner = Some(by.clone());
+                    task.updated_at = timestamp.to_string();
+                    if task.started_at.is_none() {
+                        task.started_at = Some(timestamp.to_string());
+                    }
+                }
+            }
+            TaskEvent::Verified { .. } => {
+                self.set_status(task_id, timestamp, TaskStatus::Verified);
+            }
+            TaskEvent::Done { source, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Done;
+                    task.updated_at = timestamp.to_string();
+                    match source {
+                        DoneSource::OperatorManual { result, .. } => task.result = result.clone(),
+                        DoneSource::ReportAutoClose { report_summary, .. }
+                            if task.result.is_none() =>
+                        {
+                            task.result = Some(report_summary.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            TaskEvent::Superseded { successor_id, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Superseded;
+                    task.result = Some(format!("Superseded by {}", successor_id.0));
+                    task.superseded_by = Some(successor_id.clone());
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::Linked { pr_id, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    if !task.linked_prs.contains(pr_id) {
+                        task.linked_prs.push(*pr_id);
+                    }
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::Blocked { reason, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Blocked;
+                    task.block_reason = Some(reason.clone());
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::Unblocked { .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    if task.status == TaskStatus::Blocked {
+                        task.status = TaskStatus::Open;
+                    }
+                    task.block_reason = None;
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::Reopened { .. } => self.set_status(task_id, timestamp, TaskStatus::Open),
+            TaskEvent::Released { .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Open;
+                    task.owner = None;
+                    task.routed_to = None;
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::MovedToBacklog { .. } => {
+                self.set_status(task_id, timestamp, TaskStatus::Backlog);
+            }
+            TaskEvent::MovedToReview { .. } => {
+                self.set_status(task_id, timestamp, TaskStatus::InReview);
+            }
+            TaskEvent::TaskCloseProposed { .. } => self.touch(task_id, timestamp),
+            TaskEvent::OwnerAssigned {
+                owner, routed_to, ..
+            } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.owner = owner.clone();
+                    task.routed_to = routed_to.clone();
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::PriorityChanged { priority, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.priority = priority.clone();
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::DescriptionUpdated { description, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.description = description.clone();
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::TagsSet { tags, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.tags = tags.clone();
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::ResultSet { result, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.result = Some(result.clone());
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::MetadataSet { key, value, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.metadata.insert(key.clone(), value.clone());
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+            TaskEvent::BranchLinked { branch, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.branch = Some(branch.clone());
+                    task.updated_at = timestamp.to_string();
+                }
+            }
+        }
+    }
+
+    fn set_status(&mut self, task_id: &TaskId, timestamp: &str, status: TaskStatus) {
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            task.status = status;
+            task.updated_at = timestamp.to_string();
+        }
+    }
+
+    fn touch(&mut self, task_id: &TaskId, timestamp: &str) {
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            task.updated_at = timestamp.to_string();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_events::{TaskEvent, TaskEventEnvelope, SCHEMA_VERSION};
+    use crate::task_events::{
+        ConfidenceScore, LinkSource, PrSnapshot, TaskEvent, TaskEventEnvelope, SCHEMA_VERSION,
+    };
 
     fn envelope(seq: u64, event: TaskEvent) -> TaskEventEnvelope {
+        envelope_from("writer", seq, event)
+    }
+
+    fn envelope_from(instance: &str, seq: u64, event: TaskEvent) -> TaskEventEnvelope {
         TaskEventEnvelope {
             schema_version: SCHEMA_VERSION,
             seq,
             timestamp: format!("2026-08-24T00:00:{:02}Z", seq % 60),
-            instance: InstanceName::from("writer"),
+            instance: InstanceName::from(instance),
             emitter_id: None,
             event,
         }
@@ -250,6 +506,253 @@ mod tests {
             "10x events grew bounded projection from {} to {} bytes",
             one_x_bytes.len(),
             ten_x_bytes.len()
+        );
+    }
+
+    #[test]
+    fn incremental_apply_matches_incumbent_replay() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let child_id = TaskId::from("t-20260824000000000000-1-2");
+        let actor = InstanceName::from("owner");
+        let snapshot = PrSnapshot {
+            pr_state: "merged".into(),
+            merge_sha: Some("abc123".into()),
+            api_response_hash: "hash".into(),
+            captured_at: "2026-08-24T00:00:00Z".into(),
+        };
+        let events = vec![
+            TaskEvent::Created {
+                task_id: task_id.clone(),
+                title: "parent".into(),
+                description: "original".into(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: Some(InstanceName::from("lead")),
+                branch: None,
+                bind: Some(true),
+                eta_secs: Some(60),
+                tags: Vec::new(),
+                parent_id: None,
+            },
+            TaskEvent::Created {
+                task_id: child_id.clone(),
+                title: "child".into(),
+                description: "cascade fixture".into(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: Some(task_id.clone()),
+            },
+            TaskEvent::Claimed {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+            },
+            TaskEvent::InProgress {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+            },
+            TaskEvent::Blocked {
+                task_id: task_id.clone(),
+                reason: "waiting".into(),
+            },
+            TaskEvent::Unblocked {
+                task_id: task_id.clone(),
+            },
+            TaskEvent::MovedToBacklog {
+                task_id: task_id.clone(),
+            },
+            TaskEvent::Reopened {
+                task_id: task_id.clone(),
+                reason: "retry".into(),
+                source_evidence: "test".into(),
+            },
+            TaskEvent::OwnerAssigned {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                owner: Some(actor.clone()),
+                routed_to: Some(InstanceName::from("lead")),
+            },
+            TaskEvent::PriorityChanged {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                priority: "high".into(),
+            },
+            TaskEvent::DescriptionUpdated {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                description: "updated".into(),
+            },
+            TaskEvent::TagsSet {
+                task_id: task_id.clone(),
+                tags: vec!["catalog".into()],
+            },
+            TaskEvent::ResultSet {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                result: "explicit".into(),
+            },
+            TaskEvent::MetadataSet {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                key: "key".into(),
+                value: serde_json::json!("value"),
+            },
+            TaskEvent::BranchLinked {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                branch: "fix/catalog".into(),
+            },
+            TaskEvent::Linked {
+                task_id: task_id.clone(),
+                pr_id: PrId(3347),
+                source: LinkSource::Explicit {
+                    authored_at: "2026-08-24T00:00:00Z".into(),
+                },
+                snapshot: snapshot.clone(),
+            },
+            TaskEvent::MovedToReview {
+                task_id: task_id.clone(),
+            },
+            TaskEvent::Verified {
+                task_id: task_id.clone(),
+                by_reviewer: InstanceName::from("reviewer"),
+                verdict: "VERIFIED".into(),
+            },
+            TaskEvent::TaskCloseProposed {
+                task_id: task_id.clone(),
+                candidate: DoneSource::LegacyBackfill {
+                    sweep_id: "sweep".into(),
+                    reasoning: "fixture".into(),
+                    snapshot: Some(snapshot),
+                },
+                sweep_id: "sweep".into(),
+                confidence: ConfidenceScore {
+                    total: 1.0,
+                    signal_count: 1,
+                    sub_scores: BTreeMap::new(),
+                },
+            },
+            TaskEvent::Done {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                source: DoneSource::ReportAutoClose {
+                    report_summary: "does not replace explicit".into(),
+                    closed_at: "2026-08-24T00:00:00Z".into(),
+                },
+            },
+            TaskEvent::Released {
+                task_id: task_id.clone(),
+                reason: "release".into(),
+            },
+            TaskEvent::Superseded {
+                task_id: task_id.clone(),
+                by: actor.clone(),
+                successor_id: TaskId::from("t-20260824000000000000-1-3"),
+            },
+            TaskEvent::Cancelled {
+                task_id: task_id.clone(),
+                by: actor,
+                reason: "cancel tree".into(),
+            },
+        ];
+
+        let mut incumbent = TaskBoardState::default();
+        let mut projection = BoardProjection::default();
+        for (index, event) in events.into_iter().enumerate() {
+            let env = envelope(index as u64 + 1, event);
+            assert!(incumbent.apply(&env));
+            assert!(projection.apply(&env));
+            assert_eq!(
+                projection,
+                BoardProjection::from_replay(incumbent.clone()),
+                "projection diverged at event {} ({})",
+                env.seq,
+                env.event.kind_str()
+            );
+        }
+
+        assert_eq!(
+            projection.task(&child_id).expect("child").status,
+            TaskStatus::Cancelled,
+            "parent cancellation must cascade exactly like incumbent replay"
+        );
+    }
+
+    #[test]
+    fn incremental_apply_dedupes_per_instance_and_bounds_history() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let created = envelope(
+            1,
+            TaskEvent::Created {
+                task_id: task_id.clone(),
+                title: "bounded".into(),
+                description: "incremental".into(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        );
+        let mut projection = BoardProjection::default();
+        assert!(projection.apply(&created));
+        assert!(!projection.apply(&created));
+
+        for seq in 2..=25 {
+            assert!(projection.apply(&envelope(
+                seq,
+                TaskEvent::MetadataSet {
+                    task_id: task_id.clone(),
+                    by: InstanceName::from("writer"),
+                    key: "seq".into(),
+                    value: serde_json::json!(seq),
+                },
+            )));
+        }
+        let other = envelope_from(
+            "other-writer",
+            2,
+            TaskEvent::TagsSet {
+                task_id: task_id.clone(),
+                tags: vec!["other".into()],
+            },
+        );
+        assert!(projection.apply(&other));
+        assert!(!projection.apply(&envelope_from(
+            "other-writer",
+            1,
+            TaskEvent::TagsSet {
+                task_id: task_id.clone(),
+                tags: vec!["stale".into()],
+            },
+        )));
+
+        let task = projection.task(&task_id).expect("task");
+        assert_eq!(task.history_len, 26);
+        assert_eq!(task.recent_history.len(), RECENT_HISTORY_LIMIT);
+        assert_eq!(task.recent_history.front().map(|entry| entry.seq), Some(11));
+        assert_eq!(task.recent_history.back().map(|entry| entry.seq), Some(2));
+        assert_eq!(projection.events_folded(), 26);
+        assert_eq!(
+            projection.last_seq_for(&InstanceName::from("writer")),
+            Some(25)
+        );
+        assert_eq!(
+            projection.last_seq_for(&InstanceName::from("other-writer")),
+            Some(2)
         );
     }
 }
