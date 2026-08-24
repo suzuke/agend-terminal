@@ -621,6 +621,9 @@ mod tests {
             TaskEvent::MovedToReview {
                 task_id: task_id.clone(),
             },
+            TaskEvent::Unblocked {
+                task_id: task_id.clone(),
+            },
             TaskEvent::Verified {
                 task_id: task_id.clone(),
                 by_reviewer: InstanceName::from("reviewer"),
@@ -656,6 +659,10 @@ mod tests {
                 task_id: task_id.clone(),
                 by: actor.clone(),
                 successor_id: TaskId::from("t-20260824000000000000-1-3"),
+            },
+            TaskEvent::Claimed {
+                task_id: child_id.clone(),
+                by: actor.clone(),
             },
             TaskEvent::Cancelled {
                 task_id: task_id.clone(),
