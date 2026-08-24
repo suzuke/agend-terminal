@@ -1007,5 +1007,14 @@ mod tests {
             Err(OrderedApplyError::OutOfOrder { .. })
         ));
         assert_eq!(projection, accepted);
+
+        let mut malformed = envelopes;
+        malformed[1].timestamp = "not-a-timestamp".into();
+        assert_eq!(
+            BoardProjection::from_sorted_envelopes(&malformed),
+            Err(OrderedApplyError::InvalidTimestamp(
+                "not-a-timestamp".into()
+            ))
+        );
     }
 }
