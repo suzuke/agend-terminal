@@ -858,10 +858,37 @@ mod tests {
             "not-a-timestamp",
             3,
             TaskEvent::TagsSet {
-                task_id,
+                task_id: task_id.clone(),
                 tags: vec!["invalid".into()],
             },
         );
+        let mut later_lower_instance = envelope_from(
+            "aaa",
+            2,
+            TaskEvent::TagsSet {
+                task_id: task_id.clone(),
+                tags: vec!["later".into()],
+            },
+        );
+        later_lower_instance.timestamp = "2026-08-24T00:00:03Z".into();
+        let mut lower_instance = envelope_from(
+            "AAA",
+            99,
+            TaskEvent::TagsSet {
+                task_id: task_id.clone(),
+                tags: vec!["wrong-instance".into()],
+            },
+        );
+        lower_instance.timestamp = later_lower_instance.timestamp.clone();
+        let mut lower_seq = envelope_from(
+            "aaa",
+            1,
+            TaskEvent::TagsSet {
+                task_id,
+                tags: vec!["wrong-seq".into()],
+            },
+        );
+        lower_seq.timestamp = later_lower_instance.timestamp.clone();
 
         let mut projection = BoardProjection::default();
         assert_eq!(projection.apply_ordered(&created), Ok(true));
@@ -884,5 +911,18 @@ mod tests {
             ))
         );
         assert_eq!(projection, accepted);
+
+        assert_eq!(projection.apply_ordered(&later_lower_instance), Ok(true));
+        let advanced = projection.clone();
+        assert!(matches!(
+            projection.apply_ordered(&lower_instance),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, advanced);
+        assert!(matches!(
+            projection.apply_ordered(&lower_seq),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, advanced);
     }
 }
