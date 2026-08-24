@@ -1231,7 +1231,13 @@ mod tests {
             ])
         );
         assert_eq!(
-            ready.statuses(&[duplicate_id]),
+            ready.statuses(&[duplicate_id.clone()]),
+            Err(CatalogRouteError::Ambiguous {
+                boards: vec!["a-board".into(), "b-board".into()],
+            })
+        );
+        assert_eq!(
+            ready.statuses(&[TaskId::from("t-20260824000000000000-1-1"), duplicate_id,]),
             Err(CatalogRouteError::Ambiguous {
                 boards: vec!["a-board".into(), "b-board".into()],
             })
