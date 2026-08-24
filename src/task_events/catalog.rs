@@ -1017,4 +1017,78 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn canonical_batch_is_atomic_and_matches_sequential_apply() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let event = |timestamp: &str, seq: u64, tag: &str| {
+            envelope_at(
+                timestamp,
+                seq,
+                TaskEvent::TagsSet {
+                    task_id: task_id.clone(),
+                    tags: vec![tag.into()],
+                },
+            )
+        };
+        let created = envelope_at(
+            "2026-08-24T00:00:01Z",
+            1,
+            TaskEvent::Created {
+                task_id: task_id.clone(),
+                title: "catch-up".into(),
+                description: "atomic batch".into(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        );
+        let valid = vec![
+            event("2026-08-24T00:00:02Z", 2, "second"),
+            event("2026-08-24T00:00:03Z", 3, "third"),
+        ];
+
+        let mut projection = BoardProjection::default();
+        projection.apply_ordered(&created).expect("seed");
+        let seed = projection.clone();
+
+        let mut malformed = valid.clone();
+        malformed[1].timestamp = "not-a-timestamp".into();
+        assert_eq!(
+            projection.apply_ordered_batch(&malformed),
+            Err(OrderedApplyError::InvalidTimestamp(
+                "not-a-timestamp".into()
+            ))
+        );
+        assert_eq!(projection, seed);
+
+        assert!(matches!(
+            projection.apply_ordered_batch(std::slice::from_ref(&created)),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, seed);
+
+        let out_of_order = vec![valid[1].clone(), valid[0].clone()];
+        assert!(matches!(
+            projection.apply_ordered_batch(&out_of_order),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, seed);
+
+        let mut sequential = seed;
+        for env in &valid {
+            sequential.apply_ordered(env).expect("ordered event");
+        }
+        projection
+            .apply_ordered_batch(&valid)
+            .expect("ordered batch");
+        assert_eq!(projection, sequential);
+    }
 }
