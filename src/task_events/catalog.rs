@@ -1231,7 +1231,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            ready.statuses(&[duplicate_id.clone()]),
+            ready.statuses(std::slice::from_ref(&duplicate_id)),
             Err(CatalogRouteError::Ambiguous {
                 boards: vec!["a-board".into(), "b-board".into()],
             })
