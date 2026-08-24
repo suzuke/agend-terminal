@@ -925,4 +925,73 @@ mod tests {
         ));
         assert_eq!(projection, advanced);
     }
+
+    #[test]
+    fn canonical_initial_fold_matches_replay_and_seeds_order_cursor() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let tagged = |instance: &str, timestamp: &str, seq: u64, tag: &str| {
+            let mut env = envelope_from(
+                instance,
+                seq,
+                TaskEvent::TagsSet {
+                    task_id: task_id.clone(),
+                    tags: vec![tag.into()],
+                },
+            );
+            env.timestamp = timestamp.into();
+            env
+        };
+        let mut envelopes = vec![
+            tagged("AAA", "2026-08-24T00:00:03Z", 1, "last"),
+            tagged("zzz", "2026-08-24T00:00:02Z", 1, "third"),
+            tagged("aaa", "2026-08-24T00:00:02Z", 2, "second"),
+            tagged("aaa", "2026-08-24T00:00:02Z", 1, "first"),
+            envelope_at(
+                "2026-08-24T00:00:01Z",
+                1,
+                TaskEvent::Created {
+                    task_id: task_id.clone(),
+                    title: "initial fold".into(),
+                    description: "cursor seed".into(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: Vec::new(),
+                    parent_id: None,
+                },
+            ),
+        ];
+        let mut order_key_sorted = envelopes.clone();
+        order_key_sorted.sort_by_key(|env| OrderKey::from_envelope(env).expect("valid key"));
+        super::super::sort_envelopes(&mut envelopes);
+        let identity = |env: &TaskEventEnvelope| (&env.timestamp, &env.instance, env.seq);
+        assert_eq!(
+            order_key_sorted.iter().map(identity).collect::<Vec<_>>(),
+            envelopes.iter().map(identity).collect::<Vec<_>>()
+        );
+
+        let mut incumbent = TaskBoardState::default();
+        for env in &envelopes {
+            assert!(incumbent.apply(env));
+        }
+        let projection = BoardProjection::from_sorted_envelopes(&envelopes).expect("initial fold");
+        let mut expected = BoardProjection::from_replay(incumbent);
+        expected.last_order_key = projection.last_order_key.clone();
+        assert_eq!(projection, expected);
+
+        let mut stale = tagged("zzz", "2026-08-24T00:00:02Z", 2, "stale");
+        stale.timestamp = "2026-08-24T00:00:02Z".into();
+        let mut projection = projection;
+        let accepted = projection.clone();
+        assert!(matches!(
+            projection.apply_ordered(&stale),
+            Err(OrderedApplyError::OutOfOrder { .. })
+        ));
+        assert_eq!(projection, accepted);
+    }
 }
