@@ -649,13 +649,79 @@ mod tests {
 
         assert!(projection.matches_replay(&replay));
 
-        let mut changed_task = replay.clone();
-        changed_task
+        macro_rules! field_mismatch {
+            ($field:ident, $value:expr) => {{
+                let mut changed = replay.clone();
+                changed
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("replayed task")
+                    .$field = $value;
+                assert!(
+                    !projection.matches_replay(&changed),
+                    "{} mismatch must be detected",
+                    stringify!($field)
+                );
+            }};
+        }
+        field_mismatch!(id, TaskId::from("different-id"));
+        field_mismatch!(title, "different title".into());
+        field_mismatch!(description, "different description".into());
+        field_mismatch!(priority, "low".into());
+        field_mismatch!(status, TaskStatus::Claimed);
+        field_mismatch!(owner, None);
+        field_mismatch!(linked_prs, vec![PrId(1)]);
+        field_mismatch!(block_reason, Some("blocked".into()));
+        field_mismatch!(created_by, InstanceName::from("different"));
+        field_mismatch!(created_at, "different".into());
+        field_mismatch!(updated_at, "different".into());
+        field_mismatch!(due_at, None);
+        field_mismatch!(depends_on, Vec::new());
+        field_mismatch!(routed_to, None);
+        field_mismatch!(result, Some("different".into()));
+        field_mismatch!(superseded_by, Some(TaskId::from("successor")));
+        field_mismatch!(branch, None);
+        field_mismatch!(bind, Some(false));
+        field_mismatch!(started_at, Some("different".into()));
+        field_mismatch!(eta_secs, None);
+        field_mismatch!(tags, Vec::new());
+        field_mismatch!(parent_id, Some(TaskId::from("parent")));
+        field_mismatch!(metadata, BTreeMap::new());
+
+        let mut changed_history_len = replay.clone();
+        let history = &mut changed_history_len
             .tasks
             .get_mut(&task_id)
             .expect("replayed task")
-            .title = "different title".into();
-        assert!(!projection.matches_replay(&changed_task));
+            .history;
+        history.insert(0, history[0].clone());
+        assert!(!projection.matches_replay(&changed_history_len));
+
+        let mut changed_last_folded = projection.clone();
+        changed_last_folded
+            .tasks
+            .get_mut(&task_id)
+            .expect("projected task")
+            .last_folded_event = None;
+        assert!(!changed_last_folded.matches_replay(&replay));
+
+        let mut changed_recent = projection.clone();
+        changed_recent
+            .tasks
+            .get_mut(&task_id)
+            .expect("projected task")
+            .recent_history
+            .back_mut()
+            .expect("recent history")
+            .kind = "different";
+        assert!(!changed_recent.matches_replay(&replay));
+
+        let mut changed_task_set = replay.clone();
+        let extra_id = TaskId::from("extra-task");
+        let mut extra = changed_task_set.tasks[&task_id].clone();
+        extra.id = extra_id.clone();
+        changed_task_set.tasks.insert(extra_id, extra);
+        assert!(!projection.matches_replay(&changed_task_set));
 
         let mut changed_high_water = replay.clone();
         changed_high_water
