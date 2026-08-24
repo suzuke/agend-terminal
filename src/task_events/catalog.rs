@@ -945,6 +945,71 @@ mod tests {
     }
 
     #[test]
+    fn catalog_route_is_ready_only_and_rejects_duplicate_ids() {
+        let unique_id = TaskId::from("t-20260824000000000000-1-1");
+        let duplicate_id = TaskId::from("t-20260824000000000000-1-2");
+        let create = |task_id: TaskId| TaskEvent::Created {
+            task_id,
+            title: "route fixture".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let first = BoardProjection::from_sorted_envelopes(&[
+            envelope(1, create(unique_id.clone())),
+            envelope(2, create(duplicate_id.clone())),
+        ])
+        .expect("first board");
+        let unique_snapshot = first.task_snapshot(&unique_id).expect("unique snapshot");
+        let second = BoardProjection::from_sorted_envelopes(&[envelope(
+            1,
+            create(duplicate_id.clone()),
+        )])
+        .expect("second board");
+        let boards = BTreeMap::from([
+            ("a-board".into(), first.clone()),
+            ("b-board".into(), second.clone()),
+        ]);
+
+        for phase in [
+            Phase::Building,
+            Phase::Unhealthy {
+                since: "2026-08-24T00:00:00Z".into(),
+                causes: vec!["fixture".into()],
+            },
+        ] {
+            let catalog = StrictTaskCatalog::new(phase, boards.clone());
+            assert!(matches!(
+                catalog.route(&unique_id),
+                Err(CatalogRouteError::Unreadable)
+            ));
+        }
+
+        let catalog = StrictTaskCatalog::new(Phase::Ready, boards);
+        let (board, task) = catalog.route(&unique_id).expect("unique route");
+        assert_eq!(board, "a-board");
+        assert!(Arc::ptr_eq(&task, &unique_snapshot));
+        assert_eq!(
+            catalog.route(&duplicate_id),
+            Err(CatalogRouteError::Ambiguous {
+                boards: vec!["a-board".into(), "b-board".into()],
+            })
+        );
+        assert_eq!(
+            catalog.route(&TaskId::from("missing")),
+            Err(CatalogRouteError::NotFound)
+        );
+    }
+
+    #[test]
     fn incremental_apply_matches_incumbent_replay() {
         let task_id = TaskId::from("t-20260824000000000000-1-1");
         let child_id = TaskId::from("t-20260824000000000000-1-2");
