@@ -1061,6 +1061,64 @@ mod tests {
     }
 
     #[test]
+    fn catalog_list_reads_are_ready_only_ordered_and_pointer_only() {
+        let first_id = TaskId::from("t-20260824000000000000-1-1");
+        let second_id = TaskId::from("t-20260824000000000000-1-2");
+        let create = |task_id: TaskId| TaskEvent::Created {
+            task_id,
+            title: "list fixture".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let first = BoardProjection::from_sorted_envelopes(&[envelope(
+            1,
+            create(first_id.clone()),
+        )])
+        .expect("first board");
+        let second = BoardProjection::from_sorted_envelopes(&[envelope(
+            1,
+            create(second_id.clone()),
+        )])
+        .expect("second board");
+        let first_snapshot = first.task_snapshot(&first_id).expect("first snapshot");
+        let second_snapshot = second.task_snapshot(&second_id).expect("second snapshot");
+        let boards = BTreeMap::from([
+            ("a-board".into(), first),
+            ("b-board".into(), second),
+        ]);
+
+        let building = StrictTaskCatalog::new(Phase::Building, boards.clone());
+        assert_eq!(building.all_tasks(), Err(CatalogRouteError::Unreadable));
+        assert_eq!(
+            building.board("a-board"),
+            Err(CatalogRouteError::Unreadable)
+        );
+
+        let ready = StrictTaskCatalog::new(Phase::Ready, boards);
+        let all = ready.all_tasks().expect("ready all-tasks snapshot");
+        assert_eq!(
+            all.iter().map(|task| task.id.clone()).collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        assert!(Arc::ptr_eq(&all[0], &first_snapshot));
+        assert!(Arc::ptr_eq(&all[1], &second_snapshot));
+
+        let board = ready.board("b-board").expect("ready board snapshot");
+        assert_eq!(board.len(), 1);
+        assert!(Arc::ptr_eq(&board[0], &second_snapshot));
+        assert_eq!(ready.board("missing"), Err(CatalogRouteError::NotFound));
+    }
+
+    #[test]
     fn incremental_apply_matches_incumbent_replay() {
         let task_id = TaskId::from("t-20260824000000000000-1-1");
         let child_id = TaskId::from("t-20260824000000000000-1-2");
