@@ -128,6 +128,39 @@ impl StrictTaskCatalog {
         Ok((board_id.clone(), task))
     }
 
+    pub fn all_tasks(&self) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+        Ok(inner
+            .boards
+            .values()
+            .flat_map(BoardProjection::task_snapshots)
+            .collect())
+    }
+
+    pub fn board(
+        &self,
+        board_id: &str,
+    ) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+        inner
+            .boards
+            .get(board_id)
+            .map(BoardProjection::task_snapshots)
+            .ok_or(CatalogRouteError::NotFound)
+    }
+
     pub fn snapshot_advisory(&self) -> (Phase, Vec<Arc<ProjectedTaskRecord>>) {
         let inner = self
             .inner
@@ -1079,22 +1112,15 @@ mod tests {
             tags: Vec::new(),
             parent_id: None,
         };
-        let first = BoardProjection::from_sorted_envelopes(&[envelope(
-            1,
-            create(first_id.clone()),
-        )])
-        .expect("first board");
-        let second = BoardProjection::from_sorted_envelopes(&[envelope(
-            1,
-            create(second_id.clone()),
-        )])
-        .expect("second board");
+        let first =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(first_id.clone()))])
+                .expect("first board");
+        let second =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(second_id.clone()))])
+                .expect("second board");
         let first_snapshot = first.task_snapshot(&first_id).expect("first snapshot");
         let second_snapshot = second.task_snapshot(&second_id).expect("second snapshot");
-        let boards = BTreeMap::from([
-            ("a-board".into(), first),
-            ("b-board".into(), second),
-        ]);
+        let boards = BTreeMap::from([("a-board".into(), first), ("b-board".into(), second)]);
 
         let building = StrictTaskCatalog::new(Phase::Building, boards.clone());
         assert_eq!(building.all_tasks(), Err(CatalogRouteError::Unreadable));
