@@ -1444,6 +1444,16 @@ mod tests {
         );
         assert_eq!(current.snapshot_advisory().0, Phase::Ready);
 
+        let building = StrictTaskCatalog::new(Phase::Building, boards.clone());
+        assert_eq!(
+            building.observe_board_set(
+                &BTreeSet::from(["default".to_string(), "research".to_string()]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Err(CatalogRouteError::Unreadable)
+        );
+        assert_eq!(building.snapshot_advisory().0, Phase::Building);
+
         let added = StrictTaskCatalog::new(Phase::Ready, boards.clone());
         assert_eq!(
             added.observe_board_set(
