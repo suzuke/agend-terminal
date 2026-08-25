@@ -272,7 +272,7 @@ pub use orphan::{
     release_inprogress_orphans_with_live,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub title: String,

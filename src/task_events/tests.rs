@@ -236,13 +236,25 @@ fn replay_skips_corrupt_midfile_line_keeps_full_lifecycle() {
     )
     .unwrap();
 
-    // The garbage really is in the log...
+    // The catalog write gate scrubs the malformed complete line before it
+    // accepts the next commit, preserving it under task_events.recovery.
     let raw = fs::read_to_string(&log).unwrap();
     assert!(
-        raw.contains("not valid json"),
-        "fixture must contain the bad line"
+        !raw.contains("not valid json"),
+        "catalog recovery must remove the bad line from the live log"
     );
-    // ...yet replay folds the full lifecycle, skipping it (no abort).
+    let recovered = fs::read_dir(home.join("task_events.recovery"))
+        .unwrap()
+        .flatten()
+        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten().flatten())
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .any(|content| content.contains("not valid json"));
+    assert!(
+        recovered,
+        "scrubbed bytes must remain available for forensics"
+    );
+
+    // Replay still folds the full lifecycle after the scrub.
     let state = replay(&home).expect("corrupt mid-line must NOT brick replay");
     let task = state
         .tasks

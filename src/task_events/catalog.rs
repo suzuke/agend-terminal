@@ -1,13 +1,8 @@
 //! Bounded task-state projection for the catalog shadow path.
 //!
-//! This P2 shadow deliberately has no authority: it projects an incumbent
-//! replay result into O(tasks) state and can fold new envelopes incrementally.
-//! Catalog-backed reads and writer migration land separately.
-
-// This module is intentionally wired into production in the next P2 slice.
-// Keeping the allow local avoids fake call sites whose only purpose is lint
-// suppression while this independently reviewable representation lands.
-#![allow(dead_code)]
+//! This P2 shadow deliberately has no authority yet: it projects incumbent
+//! replay results into O(tasks) state and verifies that every catalog read is
+//! fresh before it can be compared with the incumbent answer.
 
 use super::{
     DoneSource, HistoryEntry, InstanceName, PrId, TaskBoardState, TaskEvent, TaskEventEnvelope,
@@ -15,11 +10,40 @@ use super::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Enough recent activity for the task-board detail view without retaining an
 /// unbounded audit timeline in memory.
 pub const RECENT_HISTORY_LIMIT: usize = 16;
+
+static CATALOGS: std::sync::LazyLock<
+    parking_lot::Mutex<BTreeMap<PathBuf, Arc<StrictTaskCatalog>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
+static SHADOW_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
+
+/// Return the daemon-local shadow catalog for one AgEnD home.
+pub fn for_home(home: &Path) -> Arc<StrictTaskCatalog> {
+    let key = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let mut catalogs = CATALOGS.lock();
+    if let Some(catalog) = catalogs.get(&key) {
+        return Arc::clone(catalog);
+    }
+
+    let catalog = Arc::new(build_catalog(&key));
+    catalogs.insert(key, Arc::clone(&catalog));
+    catalog
+}
+
+pub(crate) fn record_shadow_divergence() {
+    SHADOW_DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn shadow_divergence_count() -> u64 {
+    SHADOW_DIVERGENCES.load(Ordering::Relaxed)
+}
 
 /// Canonical within-file fold order used by the incumbent replay.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -149,6 +173,7 @@ pub enum CatalogRouteError {
 }
 
 pub struct StrictTaskCatalog {
+    home: Option<PathBuf>,
     inner: RwLock<CatalogInner>,
 }
 
@@ -161,6 +186,14 @@ struct CatalogInner {
 
 impl StrictTaskCatalog {
     pub fn new(phase: Phase, boards: BTreeMap<String, BoardProjection>) -> Self {
+        Self::with_home(None, phase, boards)
+    }
+
+    fn with_home(
+        home: Option<PathBuf>,
+        phase: Phase,
+        boards: BTreeMap<String, BoardProjection>,
+    ) -> Self {
         let mut index = BTreeMap::new();
         let mut duplicates: BTreeMap<TaskId, Vec<String>> = BTreeMap::new();
         for (board_id, board) in &boards {
@@ -175,6 +208,7 @@ impl StrictTaskCatalog {
             }
         }
         Self {
+            home,
             inner: RwLock::new(CatalogInner {
                 phase,
                 boards,
@@ -182,6 +216,152 @@ impl StrictTaskCatalog {
                 duplicates,
             }),
         }
+    }
+
+    fn ensure_fresh(&self) -> Result<(), CatalogRouteError> {
+        match &self.home {
+            Some(home) => self.refresh_all(home),
+            None => Ok(()),
+        }
+    }
+
+    fn refresh_all(&self, home: &Path) -> Result<(), CatalogRouteError> {
+        let observed = board_paths(home).map_err(|cause| self.mark_unhealthy(cause))?;
+        let observed_names: BTreeSet<_> = observed.keys().cloned().collect();
+        let known_names: BTreeSet<_> = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .boards
+            .keys()
+            .cloned()
+            .collect();
+
+        match classify_board_set(&known_names, &observed_names) {
+            BoardSetFreshness::Missing { names } => {
+                return Err(self.mark_unhealthy(format!("missing boards: {}", names.join(", "))));
+            }
+            BoardSetFreshness::New { names } => {
+                {
+                    let mut inner = self
+                        .inner
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    inner.phase = Phase::Building;
+                }
+                let mut additions = Vec::with_capacity(names.len());
+                for name in names {
+                    let path = &observed[&name];
+                    let board = build_board_projection(path)
+                        .map_err(|cause| self.mark_unhealthy(format!("{name}: {cause}")))?;
+                    additions.push((name, board));
+                }
+                let mut inner = self
+                    .inner
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                inner.boards.extend(additions);
+                rebuild_routes(&mut inner);
+                inner.phase = Phase::Ready;
+            }
+            BoardSetFreshness::Current => {}
+        }
+
+        for (name, path) in observed {
+            self.refresh_board(&name, &path)?;
+        }
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase == Phase::Ready {
+            Ok(())
+        } else {
+            Err(CatalogRouteError::Unreadable)
+        }
+    }
+
+    fn refresh_board(&self, board_id: &str, board_path: &Path) -> Result<(), CatalogRouteError> {
+        let observed = hot_log_stamp(board_path)
+            .map_err(|cause| self.mark_unhealthy(format!("{board_id}: {cause}")))?;
+        let freshness = {
+            let inner = self
+                .inner
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let board = inner
+                .boards
+                .get(board_id)
+                .ok_or(CatalogRouteError::Unreadable)?;
+            let cursor = board.cursor().ok_or(CatalogRouteError::Unreadable)?;
+            cursor.classify_observed(observed.inode, observed.len, observed.mtime_ns)
+        };
+
+        match freshness {
+            HotLogFreshness::Current => Ok(()),
+            HotLogFreshness::Stale => {
+                Err(self.mark_unhealthy(format!("{board_id}: hot log identity or length changed")))
+            }
+            HotLogFreshness::CatchUp { start, end } => {
+                let (envelopes, consumed) = read_tail(board_path, start, end)
+                    .map_err(|cause| self.mark_unhealthy(format!("{board_id}: {cause}")))?;
+                let mut inner = self
+                    .inner
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut next = inner
+                    .boards
+                    .get(board_id)
+                    .cloned()
+                    .ok_or(CatalogRouteError::Unreadable)?;
+                if let Err(err) = next.apply_ordered_batch(&envelopes) {
+                    inner.phase = Phase::Unhealthy {
+                        since: chrono::Utc::now().to_rfc3339(),
+                        causes: vec![format!("{board_id}: {err:?}")],
+                    };
+                    return Err(CatalogRouteError::Unreadable);
+                }
+                let folded_len = start + consumed;
+                next.set_cursor(BoardCursor::from_folded_hot_log(
+                    observed.inode,
+                    folded_len,
+                    observed.mtime_ns,
+                ));
+                inner.boards.insert(board_id.to_string(), next);
+                rebuild_routes(&mut inner);
+                Ok(())
+            }
+        }
+    }
+
+    fn mark_unhealthy(&self, cause: String) -> CatalogRouteError {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.phase = Phase::Unhealthy {
+            since: chrono::Utc::now().to_rfc3339(),
+            causes: vec![cause],
+        };
+        CatalogRouteError::Unreadable
+    }
+
+    fn rebuild_from_disk(&self, home: &Path) -> Result<(), CatalogRouteError> {
+        let paths = board_paths(home).map_err(|cause| self.mark_unhealthy(cause))?;
+        let mut boards = BTreeMap::new();
+        for (name, path) in paths {
+            let board = build_board_projection(&path)
+                .map_err(|cause| self.mark_unhealthy(format!("{name}: {cause}")))?;
+            boards.insert(name, board);
+        }
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.boards = boards;
+        rebuild_routes(&mut inner);
+        inner.phase = Phase::Ready;
+        Ok(())
     }
 
     pub fn observe_board_set(
@@ -220,6 +400,7 @@ impl StrictTaskCatalog {
         &self,
         task_id: &TaskId,
     ) -> Result<(String, Arc<ProjectedTaskRecord>), CatalogRouteError> {
+        self.ensure_fresh()?;
         let inner = self
             .inner
             .read()
@@ -243,6 +424,7 @@ impl StrictTaskCatalog {
     }
 
     pub fn all_tasks(&self) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
+        self.ensure_fresh()?;
         let inner = self
             .inner
             .read()
@@ -261,6 +443,7 @@ impl StrictTaskCatalog {
         &self,
         board_id: &str,
     ) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
+        self.ensure_fresh()?;
         let inner = self
             .inner
             .read()
@@ -275,10 +458,32 @@ impl StrictTaskCatalog {
             .ok_or(CatalogRouteError::NotFound)
     }
 
+    /// Compare one incumbent board replay with the bounded shadow projection.
+    pub(crate) fn board_matches_replay(
+        &self,
+        board_id: &str,
+        replay: &TaskBoardState,
+    ) -> Result<bool, CatalogRouteError> {
+        self.ensure_fresh()?;
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+        inner
+            .boards
+            .get(board_id)
+            .map(|board| board.matches_replay(replay))
+            .ok_or(CatalogRouteError::NotFound)
+    }
+
     pub fn statuses(
         &self,
         task_ids: &[TaskId],
     ) -> Result<Vec<(TaskId, Option<TaskStatus>)>, CatalogRouteError> {
+        self.ensure_fresh()?;
         let inner = self
             .inner
             .read()
@@ -317,6 +522,358 @@ impl StrictTaskCatalog {
             .collect();
         (inner.phase.clone(), snapshots)
     }
+}
+
+/// The single production task-event commit path. Existing task-event append
+/// APIs are intentionally kept as compatibility shims over this function.
+pub(crate) fn commit_at<F>(
+    board: &Path,
+    instance: &InstanceName,
+    build: F,
+) -> anyhow::Result<Result<Vec<u64>, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
+{
+    let (home, board_id) = board_identity(board)?;
+    // The legacy append path created a new project board lazily. Preserve that
+    // behavior before catalog discovery so the board is folded before commit.
+    std::fs::create_dir_all(board)?;
+    let catalog = for_home(&home);
+    if catalog.ensure_fresh().is_err() {
+        super::recover_half_writes_at(board);
+        catalog
+            .rebuild_from_disk(&home)
+            .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;
+    }
+
+    let log_path = super::log_path(board);
+    let lock_path = log_path.with_extension("jsonl.lock");
+    let file_lock = crate::store::acquire_file_lock(&lock_path)?;
+    let mut inner = catalog
+        .inner
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if inner.phase != Phase::Ready {
+        anyhow::bail!("task catalog is not ready");
+    }
+
+    catch_up_board_locked(&mut inner, &board_id, board)?;
+    let state = super::replay_uncached(board)?;
+    let events = match build(&state) {
+        Ok(events) => events,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if events.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+
+    let count = events.len();
+    let (start_seq, hot_lines) =
+        super::next_seq_under_lock(board, &log_path, instance, count as u64)?;
+    let timestamp = next_commit_timestamp(
+        inner
+            .boards
+            .get(&board_id)
+            .and_then(BoardProjection::last_order_key),
+    );
+    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
+        Ok((id, _)) => Some(id.full()),
+        Err(error) => {
+            tracing::debug!(instance = %instance, %error, "emitter ID resolution failed");
+            None
+        }
+    };
+
+    let mut envelopes = Vec::with_capacity(count);
+    let mut seqs = Vec::with_capacity(count);
+    let mut lines = Vec::with_capacity(count);
+    for (offset, event) in events.into_iter().enumerate() {
+        let seq = start_seq + offset as u64;
+        let envelope = TaskEventEnvelope {
+            schema_version: super::SCHEMA_VERSION,
+            seq,
+            timestamp: timestamp.clone(),
+            instance: instance.clone(),
+            emitter_id: emitter_id.clone(),
+            event,
+        };
+        lines.push(serde_json::to_string(&envelope)?);
+        seqs.push(seq);
+        envelopes.push(envelope);
+    }
+
+    use std::io::Write;
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    for line in lines {
+        writeln!(log, "{line}")?;
+    }
+    log.sync_all()?;
+
+    let mut next = inner
+        .boards
+        .get(&board_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("catalog board disappeared during commit"))?;
+    next.apply_ordered_batch(&envelopes)
+        .map_err(|error| anyhow::anyhow!("catalog apply after durable append: {error:?}"))?;
+    let stamp = hot_log_stamp(board).map_err(anyhow::Error::msg)?;
+    next.set_cursor(BoardCursor::from_folded_hot_log(
+        stamp.inode,
+        stamp.len,
+        stamp.mtime_ns,
+    ));
+    inner.boards.insert(board_id.clone(), next);
+    rebuild_routes(&mut inner);
+
+    super::invalidate_replay_cache();
+    drop(inner);
+    drop(file_lock);
+
+    let post_append_lines = hot_lines + envelopes.len();
+    super::maybe_compact_events(board, post_append_lines);
+    if post_append_lines > super::COMPACTION_HIGH_WATER {
+        catalog
+            .rebuild_from_disk(&home)
+            .map_err(|_| anyhow::anyhow!("task catalog rebuild after compaction failed"))?;
+    }
+    Ok(Ok(seqs))
+}
+
+pub(crate) fn board_identity(board: &Path) -> anyhow::Result<(PathBuf, String)> {
+    let parent = board.parent();
+    if parent
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("boards")
+    {
+        let home = parent
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("board has no AgEnD home: {}", board.display()))?;
+        let board_id = board
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("board has no project id: {}", board.display()))?;
+        Ok((home.to_path_buf(), board_id.to_string()))
+    } else {
+        Ok((board.to_path_buf(), super::DEFAULT_PROJECT.to_string()))
+    }
+}
+
+fn catch_up_board_locked(
+    inner: &mut CatalogInner,
+    board_id: &str,
+    board: &Path,
+) -> anyhow::Result<()> {
+    let observed = hot_log_stamp(board).map_err(anyhow::Error::msg)?;
+    let cursor = inner
+        .boards
+        .get(board_id)
+        .and_then(BoardProjection::cursor)
+        .ok_or_else(|| anyhow::anyhow!("catalog board is missing or has no cursor"))?;
+    match cursor.classify_observed(observed.inode, observed.len, observed.mtime_ns) {
+        HotLogFreshness::Current => Ok(()),
+        HotLogFreshness::Stale => anyhow::bail!("task catalog hot log is stale"),
+        HotLogFreshness::CatchUp { start, end } => {
+            let (envelopes, consumed) = read_tail(board, start, end).map_err(anyhow::Error::msg)?;
+            let mut next = inner
+                .boards
+                .get(board_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("catalog board disappeared"))?;
+            next.apply_ordered_batch(&envelopes)
+                .map_err(|error| anyhow::anyhow!("catalog catch-up: {error:?}"))?;
+            next.set_cursor(BoardCursor::from_folded_hot_log(
+                observed.inode,
+                start + consumed,
+                observed.mtime_ns,
+            ));
+            inner.boards.insert(board_id.to_string(), next);
+            rebuild_routes(inner);
+            Ok(())
+        }
+    }
+}
+
+fn next_commit_timestamp(last: Option<&OrderKey>) -> String {
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let nanos = last
+        .map(|key| now.max(key.timestamp_ns.saturating_add(1)))
+        .unwrap_or(now);
+    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(nanos)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+fn build_catalog(home: &Path) -> StrictTaskCatalog {
+    let paths = match board_paths(home) {
+        Ok(paths) => paths,
+        Err(cause) => {
+            return StrictTaskCatalog::with_home(
+                Some(home.to_path_buf()),
+                Phase::Unhealthy {
+                    since: chrono::Utc::now().to_rfc3339(),
+                    causes: vec![cause],
+                },
+                BTreeMap::new(),
+            );
+        }
+    };
+
+    let mut boards = BTreeMap::new();
+    for (name, path) in paths {
+        match build_board_projection(&path) {
+            Ok(board) => {
+                boards.insert(name, board);
+            }
+            Err(cause) => {
+                return StrictTaskCatalog::with_home(
+                    Some(home.to_path_buf()),
+                    Phase::Unhealthy {
+                        since: chrono::Utc::now().to_rfc3339(),
+                        causes: vec![format!("{name}: {cause}")],
+                    },
+                    boards,
+                );
+            }
+        }
+    }
+
+    StrictTaskCatalog::with_home(Some(home.to_path_buf()), Phase::Ready, boards)
+}
+
+fn board_paths(home: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut boards = BTreeMap::from([(
+        super::DEFAULT_PROJECT.to_string(),
+        super::board_root(home, super::DEFAULT_PROJECT),
+    )]);
+    let boards_dir = home.join("boards");
+    if !boards_dir.exists() {
+        return Ok(boards);
+    }
+    let entries = std::fs::read_dir(&boards_dir)
+        .map_err(|err| format!("read {}: {err}", boards_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read board entry: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("stat {}: {err}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        boards.insert(name, entry.path());
+    }
+    Ok(boards)
+}
+
+fn build_board_projection(board: &Path) -> Result<BoardProjection, String> {
+    let replay = super::replay_strict_at_incumbent(board)
+        .map_err(|err| format!("strict replay {}: {}", err.path.display(), err.cause))?;
+    let mut projection = BoardProjection::from_replay(replay);
+    let order_high_water = super::stream_envelopes_at(board)
+        .map_err(|err| format!("read canonical envelopes: {err}"))?
+        .iter()
+        .map(OrderKey::from_envelope)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("invalid canonical order key: {err:?}"))?
+        .into_iter()
+        .max();
+    projection.last_order_key = order_high_water;
+    let stamp = hot_log_stamp(board)?;
+    projection.set_cursor(BoardCursor::from_folded_hot_log(
+        stamp.inode,
+        stamp.len,
+        stamp.mtime_ns,
+    ));
+    Ok(projection)
+}
+
+fn rebuild_routes(inner: &mut CatalogInner) {
+    inner.index.clear();
+    inner.duplicates.clear();
+    for (board_id, board) in &inner.boards {
+        for task_id in board.tasks.keys() {
+            if let Some(candidates) = inner.duplicates.get_mut(task_id) {
+                candidates.push(board_id.clone());
+            } else if let Some(first) = inner.index.remove(task_id) {
+                inner
+                    .duplicates
+                    .insert(task_id.clone(), vec![first, board_id.clone()]);
+            } else {
+                inner.index.insert(task_id.clone(), board_id.clone());
+            }
+        }
+    }
+}
+
+fn hot_log_stamp(board: &Path) -> Result<HotLogStamp, String> {
+    let path = super::log_path(board);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HotLogStamp {
+                inode: 0,
+                len: 0,
+                mtime_ns: 0,
+            });
+        }
+        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+    };
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or(0);
+    Ok(HotLogStamp {
+        inode: file_identity(&metadata),
+        len: metadata.len(),
+        mtime_ns,
+    })
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ metadata.len().rotate_left(17)
+}
+
+fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelope>, u64), String> {
+    let path = super::log_path(board);
+    let mut file =
+        std::fs::File::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|err| format!("seek {}: {err}", path.display()))?;
+    let mut bytes = vec![0; (end - start) as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|err| format!("read {}: {err}", path.display()))?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|err| format!("non-UTF8 task-event tail: {err}"))?;
+    let (complete, fragment) = super::split_complete_and_fragment(text);
+    let consumed = if fragment.is_some() {
+        text.rfind('\n').map(|index| index + 1).unwrap_or(0)
+    } else {
+        text.len()
+    };
+    let mut envelopes = Vec::with_capacity(complete.len());
+    for line in complete {
+        envelopes.push(super::parse_envelope_strict(line)?);
+    }
+    Ok((envelopes, consumed as u64))
 }
 
 /// Current task state stored by the catalog. Unlike [`TaskRecord`], this type
@@ -407,6 +964,39 @@ impl From<TaskRecord> for ProjectedTaskRecord {
 }
 
 impl ProjectedTaskRecord {
+    pub(crate) fn matches_task_record(&self, task: &TaskRecord) -> bool {
+        self.matches_replay(task)
+    }
+
+    pub(crate) fn current_task_record(&self) -> TaskRecord {
+        TaskRecord {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            priority: self.priority.clone(),
+            status: self.status,
+            owner: self.owner.clone(),
+            linked_prs: self.linked_prs.clone(),
+            block_reason: self.block_reason.clone(),
+            history: self.recent_history.iter().cloned().collect(),
+            created_by: self.created_by.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+            due_at: self.due_at.clone(),
+            depends_on: self.depends_on.clone(),
+            routed_to: self.routed_to.clone(),
+            result: self.result.clone(),
+            superseded_by: self.superseded_by.clone(),
+            branch: self.branch.clone(),
+            bind: self.bind,
+            started_at: self.started_at.clone(),
+            eta_secs: self.eta_secs,
+            tags: self.tags.clone(),
+            parent_id: self.parent_id.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
     fn matches_replay(&self, task: &TaskRecord) -> bool {
         let recent_start = task.history.len().saturating_sub(RECENT_HISTORY_LIMIT);
         self.id == task.id
@@ -853,6 +1443,15 @@ mod tests {
         ConfidenceScore, LinkSource, PrSnapshot, TaskEvent, TaskEventEnvelope, SCHEMA_VERSION,
     };
 
+    fn tmp_home(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let home =
+            std::env::temp_dir().join(format!("agend-catalog-{}-{tag}-{id}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        home
+    }
+
     fn envelope(seq: u64, event: TaskEvent) -> TaskEventEnvelope {
         envelope_from("writer", seq, event)
     }
@@ -872,6 +1471,24 @@ mod tests {
         let mut env = envelope(seq, event);
         env.timestamp = timestamp.to_string();
         env
+    }
+
+    fn created(task_id: &TaskId, title: &str) -> TaskEvent {
+        TaskEvent::Created {
+            task_id: task_id.clone(),
+            title: title.into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        }
     }
 
     fn replay_with_metadata_events(count: u64) -> TaskBoardState {
@@ -2061,5 +2678,156 @@ mod tests {
             .apply_ordered_batch(&valid)
             .expect("ordered batch");
         assert_eq!(projection, sequential);
+    }
+
+    #[test]
+    fn home_catalog_is_persistent_and_catches_up_appended_tail() {
+        let home = tmp_home("catch-up");
+        let task_id = TaskId::from("t-20260825000000000000-1-1");
+        let writer = InstanceName::from("writer");
+
+        super::super::append_at(&home, &writer, created(&task_id, "before")).expect("seed task");
+        let first = for_home(&home);
+        let second = for_home(&home);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "registry must retain one catalog"
+        );
+        assert_eq!(
+            first.route(&task_id).expect("initial route").1.title,
+            "before"
+        );
+
+        super::super::append_at(
+            &home,
+            &writer,
+            TaskEvent::DescriptionUpdated {
+                task_id: task_id.clone(),
+                by: writer.clone(),
+                description: "after".into(),
+            },
+        )
+        .expect("append update");
+
+        assert_eq!(
+            first
+                .route(&task_id)
+                .expect("tail catch-up route")
+                .1
+                .description,
+            "after"
+        );
+    }
+
+    #[test]
+    fn authority_fails_closed_when_known_hot_log_is_replaced() {
+        let home = tmp_home("replaced-log");
+        let task_id = TaskId::from("t-20260825000000000000-2-1");
+        let writer = InstanceName::from("writer");
+        super::super::append_at(&home, &writer, created(&task_id, "known")).expect("seed task");
+        let catalog = for_home(&home);
+        catalog.route(&task_id).expect("initial route");
+
+        std::fs::write(super::super::log_path(&home), b"").expect("replace hot log");
+        assert!(matches!(
+            catalog.route(&task_id),
+            Err(CatalogRouteError::Unreadable)
+        ));
+        assert!(matches!(
+            catalog.snapshot_advisory().0,
+            Phase::Unhealthy { .. }
+        ));
+    }
+
+    #[test]
+    fn authority_discovers_new_board_before_answering() {
+        let home = tmp_home("new-board");
+        let default_id = TaskId::from("t-20260825000000000000-3-1");
+        let project_id = TaskId::from("t-20260825000000000000-3-2");
+        let writer = InstanceName::from("writer");
+        super::super::append_at(&home, &writer, created(&default_id, "default"))
+            .expect("seed default");
+        let catalog = for_home(&home);
+        catalog.route(&default_id).expect("initial default route");
+
+        let project = super::super::board_root(&home, "project");
+        std::fs::create_dir_all(&project).expect("project board");
+        super::super::append_at(&project, &writer, created(&project_id, "project"))
+            .expect("seed project");
+
+        let (board, task) = catalog.route(&project_id).expect("new board folded");
+        assert_eq!(board, "project");
+        assert_eq!(task.title, "project");
+        assert_eq!(catalog.snapshot_advisory().0, Phase::Ready);
+    }
+
+    #[test]
+    fn commit_advances_canonical_order_past_a_future_cursor() {
+        let home = tmp_home("future-cursor");
+        let task_id = TaskId::from("t-20260825000000000000-4-1");
+        let writer = InstanceName::from("writer");
+        let seeded = envelope_at("2099-01-01T00:00:00Z", 1, created(&task_id, "future"));
+        std::fs::write(
+            super::super::log_path(&home),
+            format!("{}\n", serde_json::to_string(&seeded).expect("serialize")),
+        )
+        .expect("seed future event");
+
+        super::super::append_at(
+            &home,
+            &writer,
+            TaskEvent::DescriptionUpdated {
+                task_id: task_id.clone(),
+                by: writer.clone(),
+                description: "ordered".into(),
+            },
+        )
+        .expect("ordered commit");
+
+        let envelopes = super::super::stream_envelopes_at(&home).expect("stream events");
+        let keys = envelopes
+            .iter()
+            .map(OrderKey::from_envelope)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid keys");
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            for_home(&home)
+                .route(&task_id)
+                .expect("route")
+                .1
+                .description,
+            "ordered"
+        );
+    }
+
+    #[test]
+    fn commit_refuses_unreadable_board_without_writing_bytes() {
+        let home = tmp_home("write-gate");
+        let log = super::super::log_path(&home);
+        let future = serde_json::json!({
+            "schema_version": super::super::SCHEMA_VERSION + 1,
+            "seq": 1,
+            "timestamp": "2026-08-25T00:00:00Z",
+            "instance": "future",
+            "event": {
+                "kind": "Created",
+                "task_id": "t-20260825000000000000-5-1",
+                "title": "future",
+                "description": "",
+                "priority": "normal",
+                "owner": null
+            }
+        });
+        let original = format!("{future}\n");
+        std::fs::write(&log, &original).expect("future log");
+
+        let result = super::super::append_at(
+            &home,
+            &InstanceName::from("writer"),
+            created(&TaskId::from("t-20260825000000000000-5-2"), "must not land"),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(log).expect("read log"), original);
     }
 }

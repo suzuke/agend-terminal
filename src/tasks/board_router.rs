@@ -629,6 +629,58 @@ pub(super) fn route_task(
     home: &Path,
     task_id: &str,
 ) -> Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError> {
+    let incumbent = route_task_incumbent(home, task_id);
+    let catalog = crate::task_events::catalog::for_home(home);
+    let shadow = catalog.route(&TaskId(task_id.to_string()));
+    if !route_shadow_matches(&incumbent, &shadow) {
+        crate::task_events::catalog::record_shadow_divergence();
+        tracing::error!(
+            task_id,
+            incumbent = ?incumbent,
+            shadow = ?shadow,
+            divergence_count = crate::task_events::catalog::shadow_divergence_count(),
+            "task catalog route shadow diverged from incumbent"
+        );
+    }
+    incumbent
+}
+
+fn route_shadow_matches(
+    incumbent: &Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError>,
+    shadow: &Result<
+        (
+            String,
+            std::sync::Arc<crate::task_events::catalog::ProjectedTaskRecord>,
+        ),
+        crate::task_events::catalog::CatalogRouteError,
+    >,
+) -> bool {
+    use crate::task_events::catalog::CatalogRouteError;
+
+    match (incumbent, shadow) {
+        (Ok((project, _, task)), Ok((board, projected))) => {
+            project == board && projected.matches_task_record(task)
+        }
+        (Err(TaskRouteError::NotFound), Err(CatalogRouteError::NotFound)) => true,
+        (Err(TaskRouteError::Unreadable { .. }), Err(CatalogRouteError::Unreadable)) => true,
+        (
+            Err(TaskRouteError::Ambiguous { candidates, .. }),
+            Err(CatalogRouteError::Ambiguous { boards }),
+        ) => {
+            let mut candidates = candidates.clone();
+            let mut boards = boards.clone();
+            candidates.sort();
+            boards.sort();
+            candidates == boards
+        }
+        _ => false,
+    }
+}
+
+fn route_task_incumbent(
+    home: &Path,
+    task_id: &str,
+) -> Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError> {
     let tid = TaskId(task_id.to_string());
 
     // ── index cache: hard-read + conflict signals (NOT the uniqueness authority) ──
@@ -760,6 +812,49 @@ pub(super) fn replay_all_boards(home: &Path) -> anyhow::Result<crate::task_event
 /// Returns ALL tasks across every project board. Callers that need
 /// branch-filtered subsets should filter the result.
 pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> {
+    let incumbent = list_all_strict_incumbent(home);
+    let shadow = crate::task_events::catalog::for_home(home).all_tasks();
+    if !list_shadow_matches(&incumbent, &shadow) {
+        crate::task_events::catalog::record_shadow_divergence();
+        tracing::error!(
+            incumbent = ?incumbent,
+            shadow = ?shadow,
+            divergence_count = crate::task_events::catalog::shadow_divergence_count(),
+            "task catalog strict-list shadow diverged from incumbent"
+        );
+    }
+    incumbent
+}
+
+fn list_shadow_matches(
+    incumbent: &Result<Vec<Task>, TaskRouteError>,
+    shadow: &Result<
+        Vec<std::sync::Arc<crate::task_events::catalog::ProjectedTaskRecord>>,
+        crate::task_events::catalog::CatalogRouteError,
+    >,
+) -> bool {
+    use crate::task_events::catalog::CatalogRouteError;
+
+    match (incumbent, shadow) {
+        (Ok(incumbent), Ok(shadow)) => {
+            let mut incumbent = incumbent.clone();
+            let mut shadow: Vec<_> = shadow
+                .iter()
+                .map(|task| super::record_to_task(&task.current_task_record()))
+                .collect();
+            incumbent.sort_by(|left, right| left.id.cmp(&right.id));
+            shadow.sort_by(|left, right| left.id.cmp(&right.id));
+            incumbent == shadow
+        }
+        (
+            Err(TaskRouteError::Unreadable { .. }),
+            Err(CatalogRouteError::Unreadable | CatalogRouteError::Ambiguous { .. }),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn list_all_strict_incumbent(home: &Path) -> Result<Vec<Task>, TaskRouteError> {
     let mut all = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
     for project in enumerate_projects(home)? {

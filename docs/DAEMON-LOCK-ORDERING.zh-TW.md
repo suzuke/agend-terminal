@@ -45,9 +45,13 @@ Level 1 (per-agent, accessed via root):
 
 Level 2 (storage / transactional):
   task_events_jsonl_lock    — file lock around `<home>/task_events.jsonl`
-                              (`crate::task_events::append`); anti-bypass
+                              (`task_events::catalog::commit_at`)，必須在
+                              `task_catalog` 之前取得；anti-bypass
                               invariant `tests/task_events_invariant.rs`
                               enforces single-writer (Sprint 24 P0 PR #236)
+  task_catalog              — 每個 home 的 `RwLock<CatalogInner>`；commit
+                              路徑只能在 `task_events_jsonl_lock` 後取得，
+                              query 則只取得此鎖且不得再取得 flock
   decision_store_lock       — per-decision file lock beside
                               `<home>/decisions/<id>.json`
                               (`crate::decisions::with_decision_lock`)
