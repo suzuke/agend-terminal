@@ -2008,6 +2008,43 @@ mod tests {
         holder.join().unwrap();
     }
 
+    /// #3348 RED: an attached thin client has a pane but no local registry
+    /// handle, so the render snapshot must not manufacture `Idle` for it.
+    #[test]
+    fn thin_client_missing_registry_state_is_explicitly_unknown_3348() {
+        let pane = Pane {
+            agent_name: "remote".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(38, 11),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: Some(crate::backend::Backend::ClaudeCode),
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("remote".to_string(), pane));
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let snapshot = build_agent_state_snapshot(&layout, &registry);
+        assert_eq!(
+            format!("{:?}", snapshot.get("remote")),
+            "Some(None)",
+            "missing local registry state must remain render-only unknown, not Idle"
+        );
+    }
+
     /// #freeze-2: the render loop re-arms `dirty` on this when a budget-capped
     /// `drain_output` leaves a backlog — so it MUST report a visible pane's queued
     /// rx (else the backlog stalls; correctness rule ①). Cross-platform (no PTY).
