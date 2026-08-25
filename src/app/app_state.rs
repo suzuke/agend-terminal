@@ -5,6 +5,20 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+
+fn remote_attach_candidates(
+    current: &std::collections::HashSet<String>,
+    known: &std::collections::HashSet<String>,
+    is_disconnected: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = current
+        .iter()
+        .filter(|name| !known.contains(*name) || is_disconnected(name))
+        .cloned()
+        .collect();
+    candidates.sort();
+    candidates
+}
 use crate::channel::TelegramStatus;
 
 /// #2453 R2: bounded typed owner for the app owner-restart in-flight state.
@@ -923,11 +937,10 @@ impl AppState {
                 let (agents, mode) = crate::runtime::list_agents_with_fallback_with_mode(home);
                 self.daemon_list_mode = mode;
                 let current: std::collections::HashSet<String> = agents.into_iter().collect();
-                let mut to_add: Vec<String> = current
-                    .difference(&self.known_remote_agents)
-                    .cloned()
-                    .collect();
-                to_add.sort();
+                let to_add =
+                    remote_attach_candidates(&current, &self.known_remote_agents, |name| {
+                        self.ui.layout.agent_pane_is_disconnected(name)
+                    });
                 for name in &to_add {
                     let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
                     match pane_factory::create_remote_pane(
@@ -999,5 +1012,22 @@ impl AppState {
     pub(super) fn handle_wakeup(&mut self, wakeup_rx: &crossbeam_channel::Receiver<usize>) {
         while wakeup_rx.try_recv().is_ok() {}
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_attach_candidates;
+    use std::collections::HashSet;
+
+    #[test]
+    fn retained_disconnected_agent_is_reconnect_candidate() {
+        let current = HashSet::from(["returning".to_string(), "steady".to_string()]);
+        let known = current.clone();
+
+        assert_eq!(
+            remote_attach_candidates(&current, &known, |name| name == "returning"),
+            vec!["returning"]
+        );
     }
 }

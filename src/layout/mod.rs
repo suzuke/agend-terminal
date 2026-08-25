@@ -187,6 +187,12 @@ impl Layout {
         true
     }
 
+    pub fn agent_pane_is_disconnected(&self, agent_name: &str) -> bool {
+        self.find_agent_pane(agent_name)
+            .and_then(|(tab_idx, pane_id)| self.tabs[tab_idx].root().find_pane(pane_id))
+            .is_some_and(Pane::is_disconnected)
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
