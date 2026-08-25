@@ -101,7 +101,7 @@ pub(crate) fn def_inbox() -> Value {
 }
 
 pub(crate) fn def_list_instances() -> Value {
-    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
+    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. `observed_status` is an independent observation: `confidence: weak` means screen-only uncertainty, so its state may differ from `agent_state`; this is expected. `since_ms` is when that observed state began, not the last refresh. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
     "inputSchema": {"type": "object", "properties": {
         "instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"},
         "verbose": {"type": "boolean", "description": "#2475: include the per-instance `observed_status.evidence` trail (omitted by default to keep routine polls small)."},
@@ -217,7 +217,7 @@ pub(crate) fn def_pane_snapshot() -> Value {
 }
 
 pub(crate) fn def_instance() -> Value {
-    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances` (all active instances; pass `instance` for one instance's detail, `verbose`/`include_evidence` for the full evidence trail); action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Read-only only — structural lifecycle (create/delete/start/restart/move_pane) stays on the standalone tools, and the per-name `list_instances` / `pane_snapshot` tools remain available unchanged.",
+    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances`; its `observed_status` is independent, and `confidence: weak` means screen-only uncertainty whose state may differ from `agent_state`. Pass `instance` for one instance's detail or `verbose`/`include_evidence` for the full evidence trail. action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Structural lifecycle stays on the standalone tools.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "pane_snapshot"]},
             "instance": {"type": "string", "description": "action=list: optional — return detail for this one instance. action=pane_snapshot: required — the instance to snapshot."},
@@ -1496,5 +1496,20 @@ mod tests {
                 .is_some_and(|s| s.contains("discard")),
             "audit_reason description must reference discard use"
         );
+    }
+
+    #[test]
+    fn instance_tool_describes_weak_observation_uncertainty_3349() {
+        for tool in [def_list_instances(), def_instance()] {
+            let description = tool["description"].as_str().expect("tool description");
+            assert!(
+                description.contains("weak"),
+                "missing weak-confidence caveat"
+            );
+            assert!(
+                description.contains("may differ from `agent_state`"),
+                "missing independent-observation caveat"
+            );
+        }
     }
 }
