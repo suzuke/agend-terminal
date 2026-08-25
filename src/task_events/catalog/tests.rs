@@ -1349,6 +1349,73 @@ fn authority_fails_closed_when_known_hot_log_is_replaced() {
     ));
 }
 
+#[cfg(windows)]
+#[test]
+fn authority_fails_closed_when_replace_file_preserves_creation_time() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let home = tmp_home("replace-file-identity");
+    let task_id = TaskId::from("t-20260825000000000000-2-2");
+    let writer = InstanceName::from("writer");
+    super::super::append_at(&home, &writer, created(&task_id, "known")).expect("seed task");
+    let catalog = for_home(&home);
+    catalog.route(&task_id).expect("initial route");
+
+    let log_path = super::super::log_path(&home);
+    let replacement_path = log_path.with_extension("replacement");
+    let mut replacement = std::fs::read(&log_path).expect("read original log");
+    replacement.extend_from_slice(
+        format!(
+            "{}\n",
+            serde_json::to_string(&envelope(
+                2,
+                TaskEvent::DescriptionUpdated {
+                    task_id: task_id.clone(),
+                    by: writer,
+                    description: "replacement tail".into(),
+                }
+            ))
+            .expect("serialize replacement tail")
+        )
+        .as_bytes(),
+    );
+    std::fs::write(&replacement_path, replacement).expect("write replacement log");
+
+    let log_wide = log_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let replacement_wide = replacement_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both paths are valid, NUL-terminated UTF-16 buffers for this call.
+    let replaced = unsafe {
+        ReplaceFileW(
+            log_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_ne!(
+        replaced,
+        0,
+        "ReplaceFileW failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    assert!(matches!(
+        catalog.route(&task_id),
+        Err(CatalogRouteError::Unreadable)
+    ));
+}
+
 #[test]
 fn authority_discovers_new_board_before_answering() {
     let home = tmp_home("new-board");
