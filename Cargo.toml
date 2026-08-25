@@ -210,7 +210,7 @@ iana-time-zone = "0.1.65"
 # for `$AGEND_HOME/tray.toml`; dev-dependencies already list it, so the
 # runtime entry here only adds it to release graphs when `tray` is on.
 tray-icon = { version = "0.24", optional = true }
-tao = { version = "0.36", optional = true }
+tao = { version = "0.37", optional = true }
 toml = { version = "1.1", optional = true }
 
 # Discord (feature = "discord"). Modular twilight crates — gateway for
