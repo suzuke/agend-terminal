@@ -38,6 +38,10 @@ pub fn state_color(state: AgentState) -> Color {
     }
 }
 
+fn render_state_color(state: Option<AgentState>) -> Color {
+    state.map(state_color).unwrap_or(Color::LightCyan)
+}
+
 // ── dim non-focused panes (t-…50430, version b) ────────────────────────────────────────
 //
 // Blend every cell of a NON-focused pane's content toward the (dark) terminal background so
@@ -359,7 +363,15 @@ pub fn render_boot_indicator(frame: &mut Frame, applied: usize, expected: usize)
 fn build_agent_state_snapshot(
     layout: &Layout,
     registry: &AgentRegistry,
-) -> HashMap<String, AgentState> {
+) -> HashMap<String, Option<AgentState>> {
+    build_agent_state_snapshot_with_remote(layout, registry, None)
+}
+
+fn build_agent_state_snapshot_with_remote(
+    layout: &Layout,
+    registry: &AgentRegistry,
+    remote_states: Option<&HashMap<String, Option<AgentState>>>,
+) -> HashMap<String, Option<AgentState>> {
     let reg = agent::lock_registry(registry);
     // #2413 (A): show the Shadow Observer's high-confidence badge correction in place
     // of the raw screen state, unless the operator turned it off (`:set observed_badge
@@ -375,9 +387,16 @@ fn build_agent_state_snapshot(
                     snapshot
                         .entry(pane.agent_name.to_string())
                         .or_insert_with(|| {
-                            reg.get(&pane.instance_id)
-                                .map(|h| observed_or_raw_state(h, show_observed))
-                                .unwrap_or(AgentState::Idle)
+                            if let Some(remote_states) = remote_states {
+                                remote_states
+                                    .get(pane.agent_name.as_str())
+                                    .cloned()
+                                    .unwrap_or(None)
+                            } else {
+                                reg.get(&pane.instance_id)
+                                    .map(|h| Some(observed_or_raw_state(h, show_observed)))
+                                    .unwrap_or(None)
+                            }
                         });
                 }
             }
@@ -416,6 +435,7 @@ pub fn render(
     binary_stale: bool,
     pending_decisions: usize,
     daemon_list_mode: crate::runtime::AgentListMode,
+    remote_states: Option<&HashMap<String, Option<AgentState>>>,
 ) {
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -426,7 +446,12 @@ pub fn render(
         ])
         .split(frame.area());
 
-    let snapshot = build_agent_state_snapshot(layout, registry);
+    let snapshot = match remote_states {
+        Some(remote_states) => {
+            build_agent_state_snapshot_with_remote(layout, registry, Some(remote_states))
+        }
+        None => build_agent_state_snapshot(layout, registry),
+    };
     render_pane_tree(frame, chunks[1], layout, repeat_mode, registry, &snapshot);
     render_tab_bar(frame, chunks[0], layout, &snapshot);
     render_status_bar(
@@ -443,18 +468,17 @@ pub fn render(
 /// Get the highest-priority state across all panes in a tab.
 pub fn highest_priority_state(
     tab: &crate::layout::Tab,
-    snapshot: &HashMap<String, AgentState>,
-) -> AgentState {
-    let mut best = AgentState::Idle;
+    snapshot: &HashMap<String, Option<AgentState>>,
+) -> Option<AgentState> {
+    let mut best: Option<AgentState> = None;
     for id in tab.root().pane_ids() {
         if let Some(pane) = tab.root().find_pane(id) {
             if pane.backend.is_some() {
-                let s = snapshot
-                    .get(pane.agent_name.as_str())
-                    .copied()
-                    .unwrap_or(AgentState::Idle);
-                if s.priority() > best.priority() {
-                    best = s;
+                let Some(s) = snapshot.get(pane.agent_name.as_str()).copied().flatten() else {
+                    continue;
+                };
+                if best.is_none_or(|current| s.priority() > current.priority()) {
+                    best = Some(s);
                 }
             }
         }
@@ -469,7 +493,7 @@ fn render_tab_bar(
     frame: &mut Frame,
     area: Rect,
     layout: &Layout,
-    snapshot: &HashMap<String, AgentState>,
+    snapshot: &HashMap<String, Option<AgentState>>,
 ) {
     let mut spans = Vec::new();
 
@@ -485,7 +509,7 @@ fn render_tab_bar(
             .tab_reorder_target
             .is_some_and(|t| t == i && layout.tab_reorder_source.is_some_and(|s| s != i));
         let state = highest_priority_state(tab, snapshot);
-        let sc = state_color(state);
+        let sc = render_state_color(state);
 
         let style = if is_drag_drop || is_reorder_target {
             Style::default()
@@ -507,11 +531,13 @@ fn render_tab_bar(
 
         let blink = matches!(
             state,
-            AgentState::PermissionPrompt
-                | AgentState::InteractivePrompt
-                | AgentState::Hang
-                | AgentState::Restarting
-                | AgentState::AwaitingOperator
+            Some(
+                AgentState::PermissionPrompt
+                    | AgentState::InteractivePrompt
+                    | AgentState::Hang
+                    | AgentState::Restarting
+                    | AgentState::AwaitingOperator,
+            )
         );
         let dot = if blink {
             Span::styled(
@@ -554,7 +580,7 @@ fn render_pane_tree(
     layout: &mut Layout,
     repeat_mode: bool,
     registry: &AgentRegistry,
-    snapshot: &HashMap<String, AgentState>,
+    snapshot: &HashMap<String, Option<AgentState>>,
 ) {
     let tab = match layout.tabs.get_mut(layout.active) {
         Some(t) => t,
@@ -619,7 +645,7 @@ fn render_node(
     border_infos: &mut Vec<PaneBorderInfo>,
     repeat_mode: bool,
     registry: &AgentRegistry,
-    snapshot: &HashMap<String, AgentState>,
+    snapshot: &HashMap<String, Option<AgentState>>,
     drag_source: Option<usize>,
     drag_target: Option<usize>,
 ) {
@@ -695,7 +721,7 @@ fn render_pane(
     focused: bool,
     repeat_mode: bool,
     registry: &AgentRegistry,
-    snapshot: &HashMap<String, AgentState>,
+    snapshot: &HashMap<String, Option<AgentState>>,
     is_drag_source: bool,
     is_drag_target: bool,
 ) -> PaneBorderInfo {
@@ -709,14 +735,11 @@ fn render_pane(
     }
 
     let state = if pane.backend.is_some() {
-        snapshot
-            .get(pane.agent_name.as_str())
-            .copied()
-            .unwrap_or(AgentState::Idle)
+        snapshot.get(pane.agent_name.as_str()).copied().flatten()
     } else {
-        AgentState::Idle
+        Some(AgentState::Idle)
     };
-    let sc = state_color(state);
+    let sc = render_state_color(state);
 
     let (border_style, title_style, priority) = if is_drag_source {
         let s = Style::default()
@@ -882,7 +905,7 @@ fn render_pane(
 pub(super) fn pane_title_segments(
     pane: &crate::layout::Pane,
     title_style: Style,
-    state: AgentState,
+    state: Option<AgentState>,
     show_state_badge: bool,
 ) -> Vec<(String, Style)> {
     let mut segments = Vec::new();
@@ -927,8 +950,9 @@ pub(super) fn pane_title_segments(
     // eyeball-verify detection against the live pane. Extra text only — the
     // pane's colour (state_color) is untouched, and it uses the same
     // `title_style` so it introduces no new colour.
-    if show_state_badge {
-        segments.push((format!(" [{state:?}]"), title_style));
+    if show_state_badge || state.is_none() {
+        let badge = state.map_or_else(|| "[?]".to_string(), |state| format!("[{state:?}]"));
+        segments.push((format!(" {badge}"), title_style));
     }
     segments.push((" ".to_string(), title_style));
     segments
@@ -1088,7 +1112,7 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         };
-        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
+        let segments = pane_title_segments(&pane, Style::default(), Some(AgentState::Idle), false);
         let joined = segments
             .into_iter()
             .map(|(text, _)| text)
@@ -1118,7 +1142,7 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         };
-        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
+        let segments = pane_title_segments(&pane, Style::default(), Some(AgentState::Idle), false);
         let joined = segments
             .into_iter()
             .map(|(text, _)| text)
@@ -1160,7 +1184,7 @@ mod tests {
             .bg(Color::Cyan)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
-        let segments = pane_title_segments(&pane, title_style, AgentState::Idle, false);
+        let segments = pane_title_segments(&pane, title_style, Some(AgentState::Idle), false);
         let (_, icon_style) = segments
             .iter()
             .find(|(text, _)| text.contains('🔴'))
@@ -1202,7 +1226,7 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         };
-        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
+        let segments = pane_title_segments(&pane, Style::default(), Some(AgentState::Idle), false);
         let joined = segments
             .into_iter()
             .map(|(text, _)| text)
@@ -1237,11 +1261,18 @@ mod tests {
         };
         // #1713 flag OFF (default): no state badge appended; only the base label
         // (+ the transient Restarting/Crashed tab badge, which lives elsewhere).
-        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
+        let segments = pane_title_segments(&pane, Style::default(), Some(AgentState::Idle), false);
         let joined: String = segments.iter().map(|(t, _)| t.as_str()).collect();
         assert!(
             !joined.contains("[Idle]") && !joined.contains("[idle]"),
             "flag-off: pane title must not contain a state badge, got: {joined}"
+        );
+
+        let unknown = pane_title_segments(&pane, Style::default(), None, false);
+        let unknown_joined: String = unknown.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            unknown_joined.contains("[?]"),
+            "unknown remote state must be visible by default, got: {unknown_joined}"
         );
     }
 
@@ -1275,7 +1306,7 @@ mod tests {
             (AgentState::Active, "[Active]"),
             (AgentState::Idle, "[Idle]"),
         ] {
-            let segments = pane_title_segments(&pane, Style::default(), state, true);
+            let segments = pane_title_segments(&pane, Style::default(), Some(state), true);
             let joined: String = segments.iter().map(|(t, _)| t.as_str()).collect();
             assert!(
                 joined.contains(want),
@@ -1298,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn highest_priority_state_returns_idle_for_empty_tab() {
+    fn highest_priority_state_returns_unknown_for_empty_tab() {
         let tab = crate::layout::Tab::new(
             "empty".to_string(),
             crate::layout::Pane {
@@ -1324,7 +1355,7 @@ mod tests {
         );
         let snapshot = HashMap::new();
         let result = highest_priority_state(&tab, &snapshot);
-        assert_eq!(result, AgentState::Idle);
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -1372,6 +1403,7 @@ mod tests {
                     false,
                     0,
                     crate::runtime::AgentListMode::Live,
+                    None,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1456,6 +1488,7 @@ mod tests {
                     false,
                     0,
                     crate::runtime::AgentListMode::Live,
+                    None,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1997,7 +2030,7 @@ mod tests {
 
         assert_eq!(
             snap.get("agent"),
-            Some(&AgentState::Restarting),
+            Some(&Some(AgentState::Restarting)),
             "snapshot must report the published state"
         );
         assert!(
@@ -2043,6 +2076,11 @@ mod tests {
             "Some(None)",
             "missing local registry state must remain render-only unknown, not Idle"
         );
+
+        let remote_states = HashMap::from([("remote".to_string(), Some(AgentState::Active))]);
+        let snapshot =
+            build_agent_state_snapshot_with_remote(&layout, &registry, Some(&remote_states));
+        assert_eq!(snapshot.get("remote"), Some(&Some(AgentState::Active)));
     }
 
     /// #freeze-2: the render loop re-arms `dirty` on this when a budget-capped

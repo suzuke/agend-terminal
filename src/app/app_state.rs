@@ -32,6 +32,10 @@ pub(super) struct AppState {
     /// publishes for each live agent; periodic sync diffs this against the
     /// filesystem so hot-reload-added agents auto-materialize as tabs.
     pub(super) known_remote_agents: std::collections::HashSet<String>,
+    /// Last daemon-authoritative state snapshot for attached panes. Missing
+    /// entries intentionally remain unknown to render; they must not become
+    /// a locally invented `Idle` state.
+    pub(super) remote_agent_states: rpc::AgentStateSnapshot,
     /// Placeholder forwarder senders, keyed by pane id, retained until the
     /// matching AttachOutcome is applied (or the pane is closed first).
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
@@ -142,6 +146,7 @@ impl AppState {
                 mouse_state: mouse::MouseState::default(),
             },
             known_remote_agents: std::collections::HashSet::new(),
+            remote_agent_states: HashMap::new(),
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
@@ -610,6 +615,7 @@ impl AppState {
                     binary_stale,
                     self.pending_decisions_total,
                     self.daemon_list_mode,
+                    deps.attached_mode.then_some(&self.remote_agent_states),
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
@@ -886,6 +892,15 @@ impl AppState {
         if attached_run_dir.is_some()
             && self.last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
         {
+            if let Some(run_dir) = attached_run_dir {
+                match rpc::list_instances(run_dir) {
+                    Ok(states) => self.remote_agent_states = states,
+                    Err(error) => {
+                        self.remote_agent_states.clear();
+                        tracing::warn!(error, "daemon agent-state snapshot unavailable");
+                    }
+                }
+            }
             {
                 // #910 PR3 of 4: daemon-registry truth via runtime
                 // helper. The state-transition log gate inside the
