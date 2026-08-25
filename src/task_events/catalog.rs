@@ -1402,8 +1402,8 @@ fn rebuild_routes(inner: &mut CatalogInner) {
 
 fn hot_log_stamp(board: &Path) -> Result<HotLogStamp, String> {
     let path = super::log_path(board);
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HotLogStamp {
                 inode: 0,
@@ -1411,8 +1411,11 @@ fn hot_log_stamp(board: &Path) -> Result<HotLogStamp, String> {
                 mtime_ns: 0,
             });
         }
-        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+        Err(err) => return Err(format!("open {}: {err}", path.display())),
     };
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("stat {}: {err}", path.display()))?;
     let mtime_ns = metadata
         .modified()
         .ok()
@@ -1420,26 +1423,51 @@ fn hot_log_stamp(board: &Path) -> Result<HotLogStamp, String> {
         .map(|duration| duration.as_nanos() as i128)
         .unwrap_or(0);
     Ok(HotLogStamp {
-        inode: file_identity(&metadata),
+        inode: file_identity(&file, &metadata)?,
         len: metadata.len(),
         mtime_ns,
     })
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> u64 {
+fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<u64, String> {
     use std::os::unix::fs::MetadataExt;
-    metadata.ino()
+    Ok(metadata.ino())
 }
 
-#[cfg(not(unix))]
-fn file_identity(metadata: &std::fs::Metadata) -> u64 {
-    metadata
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File, _metadata: &std::fs::Metadata) -> Result<u64, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live handle and `info` is a correctly sized writable buffer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(format!(
+            "read Windows file identity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    let mut hasher = Sha256::new();
+    hasher.update(info.dwVolumeSerialNumber.to_le_bytes());
+    hasher.update(file_index.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut identity = [0_u8; 8];
+    identity.copy_from_slice(&digest[..8]);
+    Ok(u64::from_le_bytes(identity))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<u64, String> {
+    Ok(metadata
         .created()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelope>, u64), String> {
