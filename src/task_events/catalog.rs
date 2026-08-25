@@ -1440,7 +1440,6 @@ fn file_identity(metadata: &std::fs::Metadata) -> u64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0)
-        ^ metadata.len().rotate_left(17)
 }
 
 fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelope>, u64), String> {
