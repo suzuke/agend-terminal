@@ -2207,14 +2207,16 @@ fn pty_read_loop(
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
-                // #3314: Claude renders its daemon-owned development-channel
-                // startup modal immediately after the trust prompt. Do not let
-                // the trust dismiss's cooldown strand that complete, gated modal.
-                let startup_dev_modal_in_cooldown = in_cooldown
+                // #3314: a complete pre-Idle dev modal bypasses cooldown and state dedup.
+                let pre_idle_dev_modal_visible = *dev_modal_armed
                     && !dismiss_agent_ever_idle
                     && dev_modal::complete_modal_digest(&screen).is_some();
-                if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
-                    && (!in_cooldown || startup_dev_modal_in_cooldown)
+                if dismiss_scan_armed(
+                    dismiss_scan_enabled,
+                    prompt_blocked,
+                    state_changed,
+                    pre_idle_dev_modal_visible,
+                ) && (!in_cooldown || pre_idle_dev_modal_visible)
                     && try_prepared_dismiss_dialog(
                         name,
                         &screen,
@@ -2222,7 +2224,7 @@ fn pty_read_loop(
                         dismiss_patterns,
                         // #3314: the cooldown bypass admits only the daemon-caused
                         // startup modal, never runtime approval patterns.
-                        if startup_dev_modal_in_cooldown {
+                        if pre_idle_dev_modal_visible {
                             dismiss::DismissScanScope::RearmPreIdle
                         } else {
                             dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)

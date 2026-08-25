@@ -572,8 +572,9 @@ pub(crate) fn dismiss_scan_armed(
     scan_enabled: bool,
     prompt_blocked: bool,
     state_changed: bool,
+    pre_idle_dev_modal_visible: bool,
 ) -> bool {
-    state_changed && (scan_enabled || prompt_blocked)
+    pre_idle_dev_modal_visible || (state_changed && (scan_enabled || prompt_blocked))
 }
 
 #[cfg(test)]
@@ -655,7 +656,7 @@ mod tests {
     #[test]
     fn dev_channel_modal_dismissal_does_not_depend_on_prompt_state_3294() {
         assert!(
-            dismiss_scan_armed(true, false, true),
+            dismiss_scan_armed(true, false, true, false),
             "#3294: a new frame inside the startup latch must arm the scan with no dismissible state"
         );
         let hint = crate::backend::Backend::ClaudeCode
@@ -991,6 +992,7 @@ Should we add a dismiss_pattern?
             /* scan_enabled */ false,
             is_dismissible_prompt_state(AgentState::PermissionPrompt),
             /* state_changed */ true,
+            /* pre_idle_dev_modal_visible */ false,
         );
         assert!(
             armed,
@@ -1168,6 +1170,7 @@ WARNING: Loading development channels
                 /* scan_enabled (latch already off) */ false,
                 is_dismissible_prompt_state(st.get_state()),
                 /* state_changed */ true,
+                /* pre_idle_dev_modal_visible */ false,
             ),
             "precondition (#2473): a prompt-blocked frame re-arms the scan past the startup latch"
         );
@@ -2158,7 +2161,7 @@ WARNING: Loading development channels
         // ... but the timing layer refuses to arm: latch off + non-prompt state.
         for s in [AgentState::Idle, AgentState::Active] {
             assert!(
-                !dismiss_scan_armed(false, is_dismissible_prompt_state(s), true),
+                !dismiss_scan_armed(false, is_dismissible_prompt_state(s), true, false),
                 "#996: {s:?} + latched-off must NOT re-arm — no scan, no Enter, \
                  despite the matching phrase on screen"
             );
@@ -2172,15 +2175,19 @@ WARNING: Loading development channels
     fn dismiss_scan_arming_matrix_2473() {
         use crate::state::AgentState::*;
         // Startup window: latch ON + a new frame → armed.
-        assert!(dismiss_scan_armed(true, false, true));
+        assert!(dismiss_scan_armed(true, false, true, false));
         // No new frame (dedup hit) → never armed, even if prompt-blocked — a
         // cursor-blink redraw that doesn't change the dewrapped tail must not rescan.
-        assert!(!dismiss_scan_armed(true, true, false));
-        assert!(!dismiss_scan_armed(false, true, false));
+        assert!(!dismiss_scan_armed(true, true, false, false));
+        assert!(!dismiss_scan_armed(false, true, false, false));
         // Steady-state after startup: latch off + non-prompt → off.
-        assert!(!dismiss_scan_armed(false, false, true));
+        assert!(!dismiss_scan_armed(false, false, true, false));
         // Latch off + prompt-blocked → RE-ARMED (#2473 core).
-        assert!(dismiss_scan_armed(false, true, true));
+        assert!(dismiss_scan_armed(false, true, true, false));
+        // A complete, argv-owned development modal may repaint without changing
+        // the classified state. Re-arm only during the caller-proven pre-Idle
+        // window so a resize cannot permanently cancel the first stable write.
+        assert!(dismiss_scan_armed(false, false, false, true));
         // Exactly the states a dismiss_pattern targets re-arm; nothing else does.
         for s in [PermissionPrompt, InteractivePrompt, AwaitingOperator] {
             assert!(is_dismissible_prompt_state(s), "{s:?} must re-arm dismiss");
