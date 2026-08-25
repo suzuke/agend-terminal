@@ -1254,8 +1254,8 @@ pub(crate) fn append_batch_at(
 }
 
 /// Batch variant of [`append_checked`] (#1868): append ALL `events` atomically
-/// iff `precondition` — evaluated under the append lock against a FRESH on-disk
-/// replay — returns `Ok`. Closes the same TOCTOU as [`append_checked`] for the
+/// iff `precondition` — evaluated under the append lock against a fresh catalog
+/// snapshot — returns `Ok`. Closes the same TOCTOU as [`append_checked`] for the
 /// multi-event `update` arm (a status transition plus priority/desc/tags/owner
 /// events emitted as one batch). On precondition failure NO event is written and
 /// the reason is returned as `Ok(Err(reason))`; the outer `Err` is reserved for
@@ -1298,10 +1298,10 @@ where
     })
 }
 
-/// #2760 R2: append events that are **COMPUTED from the FRESH on-disk replay under
+/// #2760 R2: append events that are **COMPUTED from the fresh catalog snapshot under
 /// the append lock**. Unlike [`append_batch_checked_at`] (which GATES a fixed event
 /// set with a precondition), `compute(&state)` both re-validates authorization AND
-/// builds the events against the authoritative committed history — so a caller can
+/// builds the events against the authoritative committed state — so a caller can
 /// re-evaluate an ACL/governance policy, or build an idempotent UNION (e.g. the
 /// `plan_acks` list), against state that no concurrent writer can change between the
 /// decision and the write. This closes the authorization/predicate TOCTOU that a
@@ -1310,7 +1310,7 @@ where
 ///
 /// `compute` returns `Err(reason)` to REFUSE (no write; `Ok(Err(reason))`), an EMPTY
 /// vec for a computed no-op (idempotent; `Ok(Ok(vec![]))`), or the events to append.
-/// The outer `Err` is reserved for IO/replay failures. No `api::call` under the lock
+/// The outer `Err` is reserved for storage failures. No `api::call` under the lock
 /// (#1629) — `compute` must be pure decision + event construction.
 pub(crate) fn append_batch_computed_at<F>(
     board: &Path,
@@ -1324,21 +1324,19 @@ where
 }
 
 /// Append `event` atomically iff `precondition` — evaluated under the append
-/// lock against a FRESH on-disk replay — returns `Ok`. This closes the TOCTOU
+/// lock against a fresh catalog snapshot — returns `Ok`. This closes the TOCTOU
 /// where a caller validates task state, then appends after a concurrent writer
 /// has already mutated it (e.g. #t-21: two agents claiming the same Open task,
 /// both seeing it Open before either appends, both succeeding).
 ///
 /// The precondition runs inside the SAME critical section as the write, so the
-/// state it inspects is the authoritative committed history: any racing writer
+/// state it inspects is the authoritative committed state: any racing writer
 /// either committed before us (and is visible) or is blocked waiting for the
 /// lock (and will re-validate against OUR committed event next).
 ///
 /// On precondition failure NO event is written; the rejection reason is
-/// returned as `Ok(Err(reason))`. The outer `Err` is reserved for IO / replay
-/// failures. Replay/append semantics are otherwise unchanged — this reuses
-/// `replay_uncached` (lock-free) for the read and the same seq/cache plumbing
-/// as [`append_batch`].
+/// returned as `Ok(Err(reason))`. The outer `Err` is reserved for storage failures.
+/// Append semantics and sequence allocation are otherwise unchanged.
 // #2117 P1: non-test callers route via `append_checked_at` (board-resolved); this
 // home-default wrapper is retained for the symmetric storage API + test callers.
 #[allow(dead_code)]
@@ -1728,7 +1726,25 @@ fn replay_at_incumbent(board: &Path) -> anyhow::Result<TaskBoardState> {
     Ok(state)
 }
 
+#[cfg(test)]
+thread_local! {
+    static REPLAY_UNCACHED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_replay_uncached_calls() {
+    REPLAY_UNCACHED_CALLS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn replay_uncached_calls() -> u64 {
+    REPLAY_UNCACHED_CALLS.with(std::cell::Cell::get)
+}
+
 fn replay_uncached(board: &Path) -> anyhow::Result<TaskBoardState> {
+    #[cfg(test)]
+    REPLAY_UNCACHED_CALLS.with(|count| count.set(count.get() + 1));
+
     let mut state = TaskBoardState::default();
 
     let archive_dir = archive_dir(board);

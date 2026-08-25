@@ -1,6 +1,6 @@
 //! V1 of d-20260712065632138568-7: durable system-hygiene alerts live ON the
 //! task board — one active task per episode key, created/updated atomically
-//! under the board JSONL lock via `append_batch_checked` (fresh-replay
+//! under the board JSONL lock via `append_batch_checked` (fresh-catalog
 //! precondition). Task metadata is the ONLY durable episode authority: there
 //! is no separate receipt store to desync (create-then-crash or
 //! receipt-then-crash两store窗 impossible by construction).
@@ -185,7 +185,7 @@ pub fn upsert_system_hygiene_task(
         value: v,
     };
     // CAS loop. Every attempt validates its full assumption under the board
-    // lock against a fresh replay — "no active task" for create, the exact
+    // lock against a fresh catalog snapshot — "no active task" for create, the exact
     // `(task id, occurrences)` pair for update — and every rejection hands the
     // freshly observed state to the next attempt. An ID-only update check
     // would let two stale probes both commit `n+1` (lost update, REJECTED

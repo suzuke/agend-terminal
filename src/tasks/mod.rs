@@ -782,7 +782,8 @@ impl RoutedTask {
     }
 
     /// #2760 R2: like [`RoutedTask::with_revalidated_board`] but the append EVENTS
-    /// are COMPUTED from the FRESH under-lock replay ([`crate::task_events::append_batch_computed_at`]).
+    /// are COMPUTED from the fresh under-lock catalog snapshot
+    /// ([`crate::task_events::append_batch_computed_at`]).
     /// A route-only revalidation (board/incarnation) is NOT enough for a mutation
     /// whose authority or payload depends on current task CONTENT — ownership,
     /// status, metadata, the ack set. This runs the caller's `compute` under the

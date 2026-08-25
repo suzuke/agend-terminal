@@ -798,7 +798,17 @@ where
         }
         catch_up_board_locked(&mut inner, &board_id, board)?;
     }
-    let state = super::replay_uncached(board)?;
+    let state = {
+        let inner = catalog
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .boards
+            .get(&board_id)
+            .ok_or_else(|| anyhow::anyhow!("catalog board disappeared before commit"))?
+            .current_state()
+    };
     let events = match build(&state) {
         Ok(events) => events,
         Err(reason) => return Ok(Err(reason)),
@@ -1728,6 +1738,22 @@ impl BoardProjection {
 
     pub fn task_snapshots(&self) -> Vec<Arc<ProjectedTaskRecord>> {
         self.tasks.values().cloned().collect()
+    }
+
+    /// Bounded current-state view for commit preconditions. Production
+    /// preconditions inspect task fields, not the unbounded audit timeline;
+    /// retain only the catalog's recent-history ring on this compatibility
+    /// surface so a write never replays history while holding the board lock.
+    fn current_state(&self) -> TaskBoardState {
+        TaskBoardState {
+            tasks: self
+                .tasks
+                .iter()
+                .map(|(id, task)| (id.clone(), task.current_task_record()))
+                .collect(),
+            last_seq_per_instance: self.last_seq_per_instance.clone(),
+            events_folded: self.events_folded,
+        }
     }
 
     #[cfg(test)]

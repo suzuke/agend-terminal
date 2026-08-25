@@ -1749,6 +1749,53 @@ fn durable_line_ahead_of_catalog_is_folded_without_reminting_its_seq() {
 }
 
 #[test]
+fn checked_commit_uses_catalog_state_without_replaying_history() {
+    let home = tmp_home("commit-no-archive-replay");
+    let task_id = TaskId::from("t-20260825000000000000-4-3");
+    let writer = InstanceName::from("writer");
+    let archive = super::super::archive_dir(&home).join("0001.jsonl");
+    write_envelopes(&archive, &[envelope(1, created(&task_id, "archived"))]);
+
+    let projection =
+        load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("adopt archived board");
+    let key = std::fs::canonicalize(&home).expect("canonical home");
+    CATALOGS.lock().insert(
+        key.clone(),
+        Arc::new(StrictTaskCatalog::with_home(
+            Some(key.clone()),
+            Phase::Ready,
+            BTreeMap::from([(super::super::DEFAULT_PROJECT.to_string(), projection)]),
+        )),
+    );
+    super::super::reset_replay_uncached_calls();
+
+    let result = super::super::append_checked_at(
+        &home,
+        &writer,
+        TaskEvent::DescriptionUpdated {
+            task_id: task_id.clone(),
+            by: writer.clone(),
+            description: "updated".into(),
+        },
+        |state| {
+            let task = state.tasks.get(&task_id).ok_or("task missing")?;
+            (task.title == "archived")
+                .then_some(())
+                .ok_or_else(|| "catalog state mismatch".to_string())
+        },
+    )
+    .expect("checked commit");
+
+    assert!(result.is_ok());
+    assert_eq!(
+        super::super::replay_uncached_calls(),
+        0,
+        "commit must not replay task history"
+    );
+    CATALOGS.lock().remove(&key);
+}
+
+#[test]
 fn commit_refuses_building_catalog_without_writing_bytes() {
     let home = tmp_home("building-write-gate");
     let key = std::fs::canonicalize(&home).expect("canonical home");
