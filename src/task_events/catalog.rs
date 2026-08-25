@@ -8,7 +8,8 @@ use super::{
     DoneSource, HistoryEntry, InstanceName, PrId, TaskBoardState, TaskEvent, TaskEventEnvelope,
     TaskId, TaskRecord, TaskStatus,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -18,11 +19,19 @@ use std::sync::{Arc, RwLock};
 /// Enough recent activity for the task-board detail view without retaining an
 /// unbounded audit timeline in memory.
 pub const RECENT_HISTORY_LIMIT: usize = 16;
+const MANIFEST_SCHEMA: u32 = 1;
+const CHECKPOINT_SCHEMA: u32 = 1;
+const MANIFEST_FILE: &str = "MANIFEST.json";
+const CHECKPOINT_FILE: &str = "catalog.checkpoint.json";
 
 static CATALOGS: std::sync::LazyLock<
     parking_lot::Mutex<BTreeMap<PathBuf, Arc<StrictTaskCatalog>>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
 static SHADOW_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+std::thread_local! {
+    static BOARD_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Return the daemon-local shadow catalog for one AgEnD home.
 pub fn for_home(home: &Path) -> Arc<StrictTaskCatalog> {
@@ -46,7 +55,7 @@ pub(crate) fn shadow_divergence_count() -> u64 {
 }
 
 /// Canonical within-file fold order used by the incumbent replay.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct OrderKey {
     timestamp_ns: i64,
     instance: InstanceName,
@@ -76,7 +85,7 @@ pub enum OrderedApplyError {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct HotLogStamp {
     inode: u64,
     len: u64,
@@ -103,7 +112,7 @@ fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshne
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoardCursor {
     hot_log: HotLogStamp,
     live_offset: u64,
@@ -135,6 +144,33 @@ impl BoardCursor {
             },
         )
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ArchiveManifestV1 {
+    schema: u32,
+    adopted_at: String,
+    archives: Vec<ArchiveManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ArchiveManifestEntry {
+    file: String,
+    len: u64,
+    mtime_ns: i128,
+    digest_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CheckpointV1 {
+    schema: u32,
+    board: String,
+    cursor: BoardCursor,
+    tasks: Vec<ProjectedTaskRecord>,
+    last_seq_per_instance: BTreeMap<InstanceName, u64>,
+    events_folded: u64,
+    last_order_key: Option<OrderKey>,
+    written_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,7 +288,7 @@ impl StrictTaskCatalog {
                 let mut additions = Vec::with_capacity(names.len());
                 for name in names {
                     let path = &observed[&name];
-                    let board = build_board_projection(path)
+                    let board = load_board_projection(path, &name)
                         .map_err(|cause| self.mark_unhealthy(format!("{name}: {cause}")))?;
                     additions.push((name, board));
                 }
@@ -350,7 +386,7 @@ impl StrictTaskCatalog {
         let paths = board_paths(home).map_err(|cause| self.mark_unhealthy(cause))?;
         let mut boards = BTreeMap::new();
         for (name, path) in paths {
-            let board = build_board_projection(&path)
+            let board = load_board_projection(&path, &name)
                 .map_err(|cause| self.mark_unhealthy(format!("{name}: {cause}")))?;
             boards.insert(name, board);
         }
@@ -635,6 +671,8 @@ where
     let post_append_lines = hot_lines + envelopes.len();
     super::maybe_compact_events(board, post_append_lines);
     if post_append_lines > super::COMPACTION_HIGH_WATER {
+        let manifest = manifest_for_archives(board).map_err(anyhow::Error::msg)?;
+        write_manifest(board, &manifest).map_err(anyhow::Error::msg)?;
         catalog
             .rebuild_from_disk(&home)
             .map_err(|_| anyhow::anyhow!("task catalog rebuild after compaction failed"))?;
@@ -707,6 +745,213 @@ fn next_commit_timestamp(last: Option<&OrderKey>) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
+fn manifest_path(board: &Path) -> PathBuf {
+    super::archive_dir(board).join(MANIFEST_FILE)
+}
+
+fn checkpoint_path(board: &Path) -> PathBuf {
+    board.join(CHECKPOINT_FILE)
+}
+
+fn archive_paths(board: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = super::archive_dir(board);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = std::fs::read_dir(&dir)
+        .map_err(|err| format!("read {}: {err}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn modified_ns(metadata: &std::fs::Metadata) -> i128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+fn digest_file(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn manifest_for_archives(board: &Path) -> Result<ArchiveManifestV1, String> {
+    let mut archives = Vec::new();
+    for path in archive_paths(board)? {
+        let metadata =
+            std::fs::metadata(&path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+        archives.push(ArchiveManifestEntry {
+            file: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("non-UTF8 archive name: {}", path.display()))?
+                .to_string(),
+            len: metadata.len(),
+            mtime_ns: modified_ns(&metadata),
+            digest_sha256: digest_file(&path)?,
+        });
+    }
+    Ok(ArchiveManifestV1 {
+        schema: MANIFEST_SCHEMA,
+        adopted_at: chrono::Utc::now().to_rfc3339(),
+        archives,
+    })
+}
+
+fn write_manifest(board: &Path, manifest: &ArchiveManifestV1) -> Result<(), String> {
+    let path = manifest_path(board);
+    std::fs::create_dir_all(super::archive_dir(board))
+        .map_err(|err| format!("create manifest directory: {err}"))?;
+    let bytes = serde_json::to_vec(manifest).map_err(|err| format!("serialize manifest: {err}"))?;
+    crate::store::atomic_write(&path, &bytes)
+        .map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+pub(super) fn refresh_archive_manifest(board: &Path) -> anyhow::Result<()> {
+    let manifest = manifest_for_archives(board).map_err(anyhow::Error::msg)?;
+    write_manifest(board, &manifest).map_err(anyhow::Error::msg)
+}
+
+fn load_manifest(board: &Path) -> Result<Option<ArchiveManifestV1>, String> {
+    let path = manifest_path(board);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read {}: {err}", path.display())),
+    };
+    let manifest: ArchiveManifestV1 =
+        serde_json::from_slice(&bytes).map_err(|err| format!("parse {}: {err}", path.display()))?;
+    if manifest.schema != MANIFEST_SCHEMA {
+        return Err(format!(
+            "unsupported archive manifest schema {}",
+            manifest.schema
+        ));
+    }
+    verify_manifest_hints(board, &manifest)?;
+    Ok(Some(manifest))
+}
+
+fn verify_manifest_hints(board: &Path, manifest: &ArchiveManifestV1) -> Result<(), String> {
+    let paths = archive_paths(board)?;
+    if paths.len() != manifest.archives.len() {
+        return Err("archive manifest file set mismatch".to_string());
+    }
+    for (path, entry) in paths.iter().zip(&manifest.archives) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(entry.file.as_str()) {
+            return Err("archive manifest name mismatch".to_string());
+        }
+        let metadata =
+            std::fs::metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+        if metadata.len() != entry.len || modified_ns(&metadata) != entry.mtime_ns {
+            return Err(format!(
+                "archive manifest hint mismatch: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn scrub_manifest(board: &Path, manifest: &ArchiveManifestV1) -> Result<(), String> {
+    verify_manifest_hints(board, manifest)?;
+    for entry in &manifest.archives {
+        let path = super::archive_dir(board).join(&entry.file);
+        if digest_file(&path)? != entry.digest_sha256 {
+            return Err(format!("archive digest mismatch: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn write_checkpoint(
+    board: &Path,
+    board_id: &str,
+    projection: &BoardProjection,
+) -> Result<(), String> {
+    let checkpoint = CheckpointV1 {
+        schema: CHECKPOINT_SCHEMA,
+        board: board_id.to_string(),
+        cursor: projection
+            .cursor
+            .ok_or_else(|| "projection has no cursor".to_string())?,
+        tasks: projection
+            .tasks
+            .values()
+            .map(|task| task.as_ref().clone())
+            .collect(),
+        last_seq_per_instance: projection.last_seq_per_instance.clone(),
+        events_folded: projection.events_folded,
+        last_order_key: projection.last_order_key.clone(),
+        written_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let bytes =
+        serde_json::to_vec(&checkpoint).map_err(|err| format!("serialize checkpoint: {err}"))?;
+    crate::store::atomic_write(&checkpoint_path(board), &bytes)
+        .map_err(|err| format!("write checkpoint: {err}"))
+}
+
+fn load_checkpoint(board: &Path, board_id: &str) -> Result<Option<BoardProjection>, String> {
+    let path = checkpoint_path(board);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read {}: {err}", path.display())),
+    };
+    let checkpoint: CheckpointV1 =
+        serde_json::from_slice(&bytes).map_err(|err| format!("parse {}: {err}", path.display()))?;
+    if checkpoint.schema != CHECKPOINT_SCHEMA || checkpoint.board != board_id {
+        return Err("checkpoint schema or board mismatch".to_string());
+    }
+
+    let observed = hot_log_stamp(board)?;
+    let cursor = checkpoint.cursor.hot_log;
+    if observed.len < checkpoint.cursor.live_offset
+        || (cursor.inode != 0 && observed.inode != cursor.inode)
+    {
+        return Err("checkpoint hot-log cursor mismatch".to_string());
+    }
+
+    let mut projection = BoardProjection {
+        tasks: checkpoint
+            .tasks
+            .into_iter()
+            .map(|task| (task.id.clone(), Arc::new(task)))
+            .collect(),
+        last_seq_per_instance: checkpoint.last_seq_per_instance,
+        events_folded: checkpoint.events_folded,
+        last_order_key: checkpoint.last_order_key,
+        cursor: Some(checkpoint.cursor),
+    };
+    if observed.len > checkpoint.cursor.live_offset {
+        let (tail, consumed) = read_tail(board, checkpoint.cursor.live_offset, observed.len)?;
+        projection
+            .apply_ordered_batch(&tail)
+            .map_err(|err| format!("checkpoint tail is not canonical: {err:?}"))?;
+        projection.set_cursor(BoardCursor::from_folded_hot_log(
+            observed.inode,
+            checkpoint.cursor.live_offset + consumed,
+            observed.mtime_ns,
+        ));
+    } else {
+        projection.set_cursor(BoardCursor::from_folded_hot_log(
+            observed.inode,
+            observed.len,
+            observed.mtime_ns,
+        ));
+    }
+    Ok(Some(projection))
+}
+
 fn build_catalog(home: &Path) -> StrictTaskCatalog {
     let paths = match board_paths(home) {
         Ok(paths) => paths,
@@ -724,7 +969,7 @@ fn build_catalog(home: &Path) -> StrictTaskCatalog {
 
     let mut boards = BTreeMap::new();
     for (name, path) in paths {
-        match build_board_projection(&path) {
+        match load_board_projection(&path, &name) {
             Ok(board) => {
                 boards.insert(name, board);
             }
@@ -770,6 +1015,8 @@ fn board_paths(home: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
 }
 
 fn build_board_projection(board: &Path) -> Result<BoardProjection, String> {
+    #[cfg(test)]
+    BOARD_REBUILDS.with(|count| count.set(count.get() + 1));
     let replay = super::replay_strict_at_incumbent(board)
         .map_err(|err| format!("strict replay {}: {}", err.path.display(), err.cause))?;
     let mut projection = BoardProjection::from_replay(replay);
@@ -789,6 +1036,30 @@ fn build_board_projection(board: &Path) -> Result<BoardProjection, String> {
         stamp.mtime_ns,
     ));
     Ok(projection)
+}
+
+fn load_board_projection(board: &Path, board_id: &str) -> Result<BoardProjection, String> {
+    match load_manifest(board)? {
+        Some(manifest) => {
+            match load_checkpoint(board, board_id) {
+                Ok(Some(projection)) => return Ok(projection),
+                Ok(None) | Err(_) => {}
+            }
+            scrub_manifest(board, &manifest)?;
+            let projection = build_board_projection(board)?;
+            write_checkpoint(board, board_id, &projection)?;
+            Ok(projection)
+        }
+        None => {
+            // One-time adoption: prove the legacy bytes first, then publish the
+            // manifest and bounded checkpoint. A failed fold leaves no trust file.
+            let projection = build_board_projection(board)?;
+            let manifest = manifest_for_archives(board)?;
+            write_manifest(board, &manifest)?;
+            write_checkpoint(board, board_id, &projection)?;
+            Ok(projection)
+        }
+    }
 }
 
 fn rebuild_routes(inner: &mut CatalogInner) {
@@ -878,7 +1149,7 @@ fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelop
 
 /// Current task state stored by the catalog. Unlike [`TaskRecord`], this type
 /// is bounded with respect to the number of events applied to a task.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectedTaskRecord {
     pub id: TaskId,
     pub title: String,
@@ -1489,6 +1760,26 @@ mod tests {
             tags: Vec::new(),
             parent_id: None,
         }
+    }
+
+    fn write_envelopes(path: &Path, envelopes: &[TaskEventEnvelope]) {
+        let bytes = envelopes
+            .iter()
+            .map(|env| {
+                format!(
+                    "{}\n",
+                    serde_json::to_string(env).expect("serialize envelope")
+                )
+            })
+            .collect::<String>();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create event directory");
+        }
+        std::fs::write(path, bytes).expect("write envelopes");
+    }
+
+    fn rebuild_count() -> u64 {
+        BOARD_REBUILDS.with(std::cell::Cell::get)
     }
 
     fn replay_with_metadata_events(count: u64) -> TaskBoardState {
@@ -2829,5 +3120,127 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(log).expect("read log"), original);
+    }
+
+    #[test]
+    fn adoption_writes_manifest_and_checkpoint_without_existing_archive_dir() {
+        let home = tmp_home("adoption-files");
+        assert!(!super::super::archive_dir(&home).exists());
+
+        let projection =
+            load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("adopt empty board");
+
+        assert_eq!(projection.events_folded(), 0);
+        assert!(manifest_path(&home).is_file());
+        assert!(checkpoint_path(&home).is_file());
+        assert_eq!(
+            load_manifest(&home)
+                .expect("load manifest")
+                .expect("manifest")
+                .archives,
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn checkpoint_reload_skips_full_rebuild_and_folds_only_hot_tail() {
+        let home = tmp_home("checkpoint-tail");
+        let task_id = TaskId::from("t-20260825000000000000-6-1");
+        let writer = InstanceName::from("writer");
+        let first = envelope(1, created(&task_id, "checkpoint"));
+        write_envelopes(&super::super::log_path(&home), std::slice::from_ref(&first));
+
+        let before = rebuild_count();
+        let adopted =
+            load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("initial adoption");
+        assert_eq!(rebuild_count(), before + 1);
+        assert_eq!(adopted.task(&task_id).expect("task").description, "");
+
+        let update = envelope_at(
+            "2026-08-25T00:01:00Z",
+            2,
+            TaskEvent::DescriptionUpdated {
+                task_id: task_id.clone(),
+                by: writer,
+                description: "tail".into(),
+            },
+        );
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(super::super::log_path(&home))
+            .expect("open hot log");
+        use std::io::Write as _;
+        writeln!(
+            log,
+            "{}",
+            serde_json::to_string(&update).expect("serialize tail")
+        )
+        .expect("append tail");
+
+        let reloaded =
+            load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("checkpoint reload");
+        assert_eq!(rebuild_count(), before + 1, "must not replay full history");
+        assert_eq!(
+            reloaded.task(&task_id).expect("tail task").description,
+            "tail"
+        );
+    }
+
+    #[test]
+    fn invalid_checkpoint_is_scrubbed_rebuilt_and_replaced() {
+        let home = tmp_home("checkpoint-heal");
+        let task_id = TaskId::from("t-20260825000000000000-7-1");
+        write_envelopes(
+            &super::super::log_path(&home),
+            &[envelope(1, created(&task_id, "heal"))],
+        );
+        load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("adopt");
+
+        let path = checkpoint_path(&home);
+        let mut checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read checkpoint"))
+                .expect("parse checkpoint");
+        checkpoint["tasks"][0]["recent_history"][0]["kind"] =
+            serde_json::Value::String("future_kind".into());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&checkpoint).expect("serialize tamper"),
+        )
+        .expect("tamper checkpoint");
+
+        let before = rebuild_count();
+        let healed = load_board_projection(&home, super::super::DEFAULT_PROJECT)
+            .expect("rebuild invalid checkpoint");
+        assert_eq!(rebuild_count(), before + 1);
+        assert_eq!(healed.task(&task_id).expect("healed task").title, "heal");
+        let replaced: CheckpointV1 =
+            serde_json::from_slice(&std::fs::read(path).expect("read replacement"))
+                .expect("valid replacement");
+        assert_eq!(replaced.schema, CHECKPOINT_SCHEMA);
+    }
+
+    #[test]
+    fn manifest_digest_mismatch_fails_closed_when_rebuild_is_required() {
+        let home = tmp_home("manifest-digest");
+        let task_id = TaskId::from("t-20260825000000000000-8-1");
+        let archive = super::super::archive_dir(&home).join("0001.jsonl");
+        write_envelopes(&archive, &[envelope(1, created(&task_id, "archive"))]);
+        load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("adopt archive");
+
+        let manifest_file = manifest_path(&home);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_file).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["archives"][0]["digest_sha256"] = serde_json::Value::String("00".repeat(32));
+        std::fs::write(
+            &manifest_file,
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("tamper manifest");
+        std::fs::remove_file(checkpoint_path(&home)).expect("remove checkpoint");
+
+        let error = load_board_projection(&home, super::super::DEFAULT_PROJECT)
+            .expect_err("digest mismatch must fail closed");
+        assert!(error.contains("archive digest mismatch"), "{error}");
     }
 }

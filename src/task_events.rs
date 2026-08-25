@@ -643,6 +643,58 @@ pub struct HistoryEntry {
     pub kind: &'static str,
 }
 
+impl<'de> Deserialize<'de> for HistoryEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct OwnedHistoryEntry {
+            seq: u64,
+            timestamp: String,
+            instance: InstanceName,
+            kind: String,
+        }
+
+        let entry = OwnedHistoryEntry::deserialize(deserializer)?;
+        let kind = match entry.kind.as_str() {
+            "created" => "created",
+            "claimed" => "claimed",
+            "in_progress" => "in_progress",
+            "verified" => "verified",
+            "done" => "done",
+            "cancelled" => "cancelled",
+            "superseded" => "superseded",
+            "linked" => "linked",
+            "blocked" => "blocked",
+            "unblocked" => "unblocked",
+            "reopened" => "reopened",
+            "released" => "released",
+            "moved_to_backlog" => "moved_to_backlog",
+            "moved_to_review" => "moved_to_review",
+            "task_close_proposed" => "task_close_proposed",
+            "owner_assigned" => "owner_assigned",
+            "priority_changed" => "priority_changed",
+            "description_updated" => "description_updated",
+            "tags_set" => "tags_set",
+            "result_set" => "result_set",
+            "metadata_set" => "metadata_set",
+            "branch_linked" => "branch_linked",
+            unknown => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown task history kind: {unknown}"
+                )))
+            }
+        };
+        Ok(Self {
+            seq: entry.seq,
+            timestamp: entry.timestamp,
+            instance: entry.instance,
+            kind,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskRecord {
     pub id: TaskId,
@@ -2306,6 +2358,7 @@ fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
         let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
         crate::store::atomic_write(&archive_path, archived.as_bytes())?;
         crate::store::atomic_write(log_path, kept.as_bytes())?;
+        catalog::refresh_archive_manifest(board)?;
         // S1: compaction just rewrote (shrank) the hot log. Invalidate the
         // replay cache so the next reader replays the compacted file instead of
         // a stale entry — mirrors every append path (:1124/:1211/:1297). Today

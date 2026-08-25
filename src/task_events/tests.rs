@@ -449,8 +449,13 @@ fn compact_archives_older_than_keep_threshold() {
     let kept = fs::read_to_string(&log).unwrap();
     assert_eq!(kept.lines().count(), COMPACTION_KEEP);
     let arc = archive_dir(&home);
-    let entries: Vec<_> = fs::read_dir(&arc).unwrap().flatten().collect();
+    let entries: Vec<_> = fs::read_dir(&arc)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .collect();
     assert_eq!(entries.len(), 1, "exactly one archive file expected");
+    assert!(arc.join("MANIFEST.json").is_file());
     fs::remove_dir_all(&home).ok();
 }
 
