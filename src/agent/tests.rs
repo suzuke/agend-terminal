@@ -1939,14 +1939,12 @@ fn spawn_provenance_flag_matches_the_built_argv_3315() {
     }
 }
 
-/// #3329 RED: the executable identity validated for modal auto-dismissal must
-/// be the exact path later handed to `spawn_command`. Claude's installer flips
-/// `~/.local/bin/claude` between retained version binaries, so merely reading
-/// the canonical target for provenance while leaving argv[0] as the symlink
-/// permits a validation-to-exec swap.
+/// #3329: `build_command` pins the executable handed to `spawn_command`.
+/// Claude's installer flips `~/.local/bin/claude` between retained binaries;
+/// an already-built command must not silently follow that later swap.
 #[cfg(unix)]
 #[test]
-fn build_command_pins_the_validated_executable_across_symlink_swap_3329() {
+fn build_command_pins_the_executable_across_symlink_swap_3329() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     let root = resolve_test_home("spawn-path-swap-3329");
@@ -1988,16 +1986,15 @@ fn build_command_pins_the_validated_executable_across_symlink_swap_3329() {
         shutdown: None,
     };
 
-    let (cmd, _, provenance) = build_command(&config).expect("build_command");
+    let (cmd, _, _) = build_command(&config).expect("build_command");
     std::fs::remove_file(&launcher).expect("remove old launcher symlink");
     symlink(&replacement, &launcher).expect("flip launcher symlink");
 
     let argv0 = std::path::PathBuf::from(&cmd.get_argv()[0]);
-    assert_eq!(provenance.binary_version.as_deref(), Some("2.1.240"));
     assert_eq!(
         argv0,
         validated.canonicalize().expect("validated target"),
-        "the command must exec the concrete binary whose version armed the gate; \
+        "the command must exec the concrete binary resolved while it was built; \
          leaving argv[0] as {launcher:?} lets an updater swap it to {replacement:?}"
     );
 }

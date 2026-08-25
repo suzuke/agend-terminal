@@ -90,62 +90,22 @@ pub(crate) const MIN_STABLE_MS: u64 = 300;
 /// than an agent's lifetime.
 pub(crate) const ELIGIBILITY_EXPIRY_MS: u64 = 120_000;
 
-/// Claude CLI versions whose modal rendering has actually been validated
-/// against real captures. An unrecognised version DISABLES auto-answering
-/// rather than assuming the geometry still holds — the fleet auto-updates
-/// (2.1.235 -> .236 -> .237 -> .238 -> .240), and a silently changed
-/// modal must cost a hang plus an operator notice, never a stray keystroke.
-pub(crate) const VALIDATED_CLAUDE_VERSIONS: &[&str] = &["2.1.237", "2.1.238", "2.1.240", "2.1.241"];
-
-/// Read the version from an already-pinned concrete backend binary path.
-///
-/// LAYOUT-DEPENDENT, deliberately disclosed (r1 review N4): this returns the
-/// canonicalised file NAME, which is a version only because the installer lays
-/// binaries out as `.../claude/versions/<version>`. A homebrew or npm layout
-/// yields `claude`, which is not in the allowlist and therefore DISARMS. The
-/// direction is fail-closed, but the gate should be read as "a layout we have
-/// validated", not "the version".
-///
-/// `~/.local/bin/claude` is a SYMLINK that auto-update flips while the fleet is
-/// running, and old version binaries are retained on disk — so a process
-/// launched before a flip keeps executing the older one while a decision-time
-/// `claude --version` reports the newer. Canonicalising at SPAWN pins the
-/// concrete versioned file this generation runs, which is the only identity
-/// that can honestly gate its behaviour.
-pub(crate) fn spawned_binary_version(command: &std::path::Path) -> Option<String> {
-    Some(command.file_name()?.to_string_lossy().into_owned())
-}
-
 /// Facts about the command that was ACTUALLY built and spawned for this
-/// generation. Captured from the `CommandBuilder` itself and from the path
-/// `build_command` resolved, BEFORE the child is exec'd — not re-derived
-/// afterwards.
-///
-/// Re-deriving was the r1 defect: `Backend::spawn_flags` is not pure (it stats
-/// and re-parses the workspace mcp-config at call time) and `which::which` is a
-/// second, independent path resolution. Between the build and a later re-read,
-/// a config edit or an auto-update symlink flip can make the answer disagree
-/// with the process that is actually running — and it disagrees in the
-/// FAIL-OPEN direction: arming a generation whose argv never carried the flag,
-/// or one running a binary version we have never captured.
+/// generation. Captured from the `CommandBuilder` before the child is exec'd.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpawnProvenance {
     /// The built argv really contains `--dangerously-load-development-channels`.
     pub(crate) argv_has_dev_channel_flag: bool,
-    /// Version of the concrete binary this generation will exec, as resolved for
-    /// the command itself. `None` when it cannot be identified — which disarms.
-    pub(crate) binary_version: Option<String>,
 }
 
 impl SpawnProvenance {
-    /// Read the two facts off the command that is about to be spawned.
-    pub(crate) fn capture(cmd: &portable_pty::CommandBuilder, pinned: &std::path::Path) -> Self {
+    /// Read the daemon-owned flag off the command that is about to be spawned.
+    pub(crate) fn capture(cmd: &portable_pty::CommandBuilder) -> Self {
         Self {
             argv_has_dev_channel_flag: cmd
                 .get_argv()
                 .iter()
                 .any(|arg| arg == "--dangerously-load-development-channels"),
-            binary_version: spawned_binary_version(pinned),
         }
     }
 }
@@ -155,23 +115,8 @@ impl SpawnProvenance {
 /// PURE: a function of the captured provenance and nothing else. It touches no
 /// filesystem and resolves no paths, so it cannot disagree with the process that
 /// is running.
-pub(crate) fn armed_for_spawn(provenance: &SpawnProvenance, agent: &str) -> bool {
-    if !provenance.argv_has_dev_channel_flag {
-        return false;
-    }
-    let armed = version_is_validated(provenance.binary_version.as_deref());
-    if !armed {
-        tracing::info!(
-            agent,
-            version = ?provenance.binary_version,
-            "#3314: startup-modal auto-answer disarmed — unvalidated backend version"
-        );
-    }
-    armed
-}
-
-pub(crate) fn version_is_validated(version: Option<&str>) -> bool {
-    version.is_some_and(|v| VALIDATED_CLAUDE_VERSIONS.contains(&v))
+pub(crate) fn armed_for_spawn(provenance: &SpawnProvenance) -> bool {
+    provenance.argv_has_dev_channel_flag
 }
 
 /// Per-PTY write epochs, keyed by writer identity.

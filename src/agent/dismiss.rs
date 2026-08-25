@@ -1599,43 +1599,15 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 version-drift gate: an unrecognised backend version disarms rather
-    /// than assuming the modal still renders the way our captures recorded it.
-    /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 -> .240
-    /// — so this is a live concern, not a hypothetical.
+    /// #3367: Claude patch releases must not strand an otherwise eligible,
+    /// structurally complete startup modal.
     #[test]
-    fn only_validated_backend_versions_are_armed_3314() {
-        use crate::agent::dev_modal::{version_is_validated, VALIDATED_CLAUDE_VERSIONS};
-        assert!(
-            version_is_validated(Some("2.1.240")),
-            "#3314: the production-captured 2.1.240 modal must be armed"
-        );
-        assert!(
-            version_is_validated(Some("2.1.241")),
-            "#3329: the production-captured 2.1.241 modal must be armed"
-        );
-        assert!(version_is_validated(Some("2.1.238")));
-        assert!(version_is_validated(Some("2.1.237")));
-        assert!(
-            !version_is_validated(Some("2.1.239")),
-            "#3314: a version we have never captured must disarm"
-        );
-        assert!(
-            !version_is_validated(None),
-            "#3314: an unresolvable binary identity must disarm, not default open"
-        );
-        assert!(
-            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.240"),
-            "the production-captured version must be listed"
-        );
-        assert!(
-            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.241"),
-            "the current production-captured version must be listed"
-        );
-        assert!(
-            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.238"),
-            "the implementation-validated version must be listed"
-        );
+    fn claude_patch_version_does_not_control_arming_3367() {
+        use crate::agent::dev_modal::{armed_for_spawn, SpawnProvenance};
+        let updated = SpawnProvenance {
+            argv_has_dev_channel_flag: true,
+        };
+        assert!(armed_for_spawn(&updated));
     }
 
     /// #3314 startup-window expiry: past the bound, text carrying the modal is
@@ -2001,31 +1973,15 @@ WARNING: Loading development channels
         use crate::agent::dev_modal::{armed_for_spawn, SpawnProvenance};
         let armed = SpawnProvenance {
             argv_has_dev_channel_flag: true,
-            binary_version: Some("2.1.238".to_string()),
         };
-        assert!(armed_for_spawn(&armed, "t"));
-
-        // The argv fact alone is not enough: an unvalidated version disarms.
-        let unvalidated = SpawnProvenance {
-            argv_has_dev_channel_flag: true,
-            binary_version: Some("2.1.239".to_string()),
-        };
-        assert!(!armed_for_spawn(&unvalidated, "t"));
-
-        // An unidentifiable binary disarms rather than defaulting open.
-        let unknown = SpawnProvenance {
-            argv_has_dev_channel_flag: true,
-            binary_version: None,
-        };
-        assert!(!armed_for_spawn(&unknown, "t"));
+        assert!(armed_for_spawn(&armed));
 
         // And a generation whose argv never carried the flag can never be armed,
         // whatever is on disk — it cannot render this modal at all.
         let unflagged = SpawnProvenance {
             argv_has_dev_channel_flag: false,
-            binary_version: Some("2.1.238".to_string()),
         };
-        assert!(!armed_for_spawn(&unflagged, "t"));
+        assert!(!armed_for_spawn(&unflagged));
     }
 
     /// #3314 REVIEWER RED: the full static fingerprint is NOT a safety

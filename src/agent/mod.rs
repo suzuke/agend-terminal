@@ -884,11 +884,9 @@ fn build_command(
     let pinned_command = executable::resolve_and_pin(backend_command);
     let mut cmd = CommandBuilder::new(&pinned_command);
     cmd.args(&enriched_args);
-    // #3314 B1: capture the arming facts from the command we JUST built — the
-    // argv read back off the builder, and the path we resolved for it — before
-    // anything can exec or a config/symlink can move under us. Re-deriving them
-    // after the spawn is what made r1 fail open.
-    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &pinned_command);
+    // #3314 B1: capture the arming fact from the command we JUST built. Reading
+    // the argv back later could disagree with what this generation is running.
+    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd);
 
     // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
     // before any env injection below, or the explicit keys we set would be wiped.
@@ -1542,7 +1540,7 @@ pub(crate) fn spawn_agent_with_capture_home(
     let dismiss = prepare_dismiss_patterns(&dismiss);
     // #3314 B1: arming is a PURE function of the provenance captured from the
     // command that was actually built and spawned — never a post-spawn re-read.
-    let dev_modal_armed = dev_modal::armed_for_spawn(&spawn_provenance, name);
+    let dev_modal_armed = dev_modal::armed_for_spawn(&spawn_provenance);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);
