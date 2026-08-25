@@ -115,7 +115,7 @@ pub enum OrderedApplyError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct HotLogStamp {
-    inode: u64,
+    inode: [u8; 24],
     len: u64,
     mtime_ns: i128,
 }
@@ -147,7 +147,12 @@ pub struct BoardCursor {
 }
 
 impl BoardCursor {
+    #[cfg(test)]
     pub fn from_folded_hot_log(inode: u64, len: u64, mtime_ns: i128) -> Self {
+        Self::from_hot_log_identity(identity_from_u64(inode), len, mtime_ns)
+    }
+
+    fn from_hot_log_identity(inode: [u8; 24], len: u64, mtime_ns: i128) -> Self {
         Self {
             hot_log: HotLogStamp {
                 inode,
@@ -163,7 +168,7 @@ impl BoardCursor {
         self.live_offset
     }
 
-    fn classify_observed(&self, inode: u64, len: u64, mtime_ns: i128) -> HotLogFreshness {
+    fn classify_observed(&self, inode: [u8; 24], len: u64, mtime_ns: i128) -> HotLogFreshness {
         classify_hot_log(
             self.hot_log,
             HotLogStamp {
@@ -450,7 +455,7 @@ impl StrictTaskCatalog {
                     return Err(CatalogRouteError::Unreadable);
                 }
                 let folded_len = start + consumed;
-                next.set_cursor(BoardCursor::from_folded_hot_log(
+                next.set_cursor(BoardCursor::from_hot_log_identity(
                     observed.inode,
                     folded_len,
                     observed.mtime_ns,
@@ -867,7 +872,7 @@ where
     next.apply_ordered_batch(&envelopes)
         .map_err(|error| anyhow::anyhow!("catalog apply after durable append: {error:?}"))?;
     let stamp = hot_log_stamp(board).map_err(anyhow::Error::msg)?;
-    next.set_cursor(BoardCursor::from_folded_hot_log(
+    next.set_cursor(BoardCursor::from_hot_log_identity(
         stamp.inode,
         stamp.len,
         stamp.mtime_ns,
@@ -936,7 +941,7 @@ fn catch_up_board_locked(
                 .ok_or_else(|| anyhow::anyhow!("catalog board disappeared"))?;
             next.apply_ordered_batch(&envelopes)
                 .map_err(|error| anyhow::anyhow!("catalog catch-up: {error:?}"))?;
-            next.set_cursor(BoardCursor::from_folded_hot_log(
+            next.set_cursor(BoardCursor::from_hot_log_identity(
                 observed.inode,
                 start + consumed,
                 observed.mtime_ns,
@@ -967,7 +972,7 @@ fn catch_up_projection_locked(
             projection
                 .apply_ordered_batch(&envelopes)
                 .map_err(|error| format!("rebuild catch-up is not canonical: {error:?}"))?;
-            projection.set_cursor(BoardCursor::from_folded_hot_log(
+            projection.set_cursor(BoardCursor::from_hot_log_identity(
                 observed.inode,
                 end,
                 observed.mtime_ns,
@@ -1117,7 +1122,7 @@ pub(super) fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<
             .get(&board_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("catalog board disappeared during compaction"))?;
-        projection.set_cursor(BoardCursor::from_folded_hot_log(
+        projection.set_cursor(BoardCursor::from_hot_log_identity(
             stamp.inode,
             stamp.len,
             stamp.mtime_ns,
@@ -1230,7 +1235,7 @@ fn load_checkpoint(board: &Path, board_id: &str) -> Result<Option<BoardProjectio
     let observed = hot_log_stamp(board)?;
     let cursor = checkpoint.cursor.hot_log;
     if observed.len < checkpoint.cursor.live_offset
-        || (cursor.inode != 0 && observed.inode != cursor.inode)
+        || (cursor.inode != [0; 24] && observed.inode != cursor.inode)
     {
         return Err("checkpoint hot-log cursor mismatch".to_string());
     }
@@ -1251,13 +1256,13 @@ fn load_checkpoint(board: &Path, board_id: &str) -> Result<Option<BoardProjectio
         projection
             .apply_ordered_batch(&tail)
             .map_err(|err| format!("checkpoint tail is not canonical: {err:?}"))?;
-        projection.set_cursor(BoardCursor::from_folded_hot_log(
+        projection.set_cursor(BoardCursor::from_hot_log_identity(
             observed.inode,
             checkpoint.cursor.live_offset + consumed,
             observed.mtime_ns,
         ));
     } else {
-        projection.set_cursor(BoardCursor::from_folded_hot_log(
+        projection.set_cursor(BoardCursor::from_hot_log_identity(
             observed.inode,
             observed.len,
             observed.mtime_ns,
@@ -1351,7 +1356,7 @@ fn build_board_projection(board: &Path) -> Result<BoardProjection, String> {
     if stamp != before {
         return Err("hot log changed while rebuilding projection".to_string());
     }
-    projection.set_cursor(BoardCursor::from_folded_hot_log(
+    projection.set_cursor(BoardCursor::from_hot_log_identity(
         stamp.inode,
         stamp.len,
         stamp.mtime_ns,
@@ -1406,7 +1411,7 @@ fn hot_log_stamp(board: &Path) -> Result<HotLogStamp, String> {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HotLogStamp {
-                inode: 0,
+                inode: [0; 24],
                 len: 0,
                 mtime_ns: 0,
             });
@@ -1430,44 +1435,56 @@ fn hot_log_stamp(board: &Path) -> Result<HotLogStamp, String> {
 }
 
 #[cfg(unix)]
-fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<u64, String> {
+fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<[u8; 24], String> {
     use std::os::unix::fs::MetadataExt;
-    Ok(metadata.ino())
+    Ok(identity_from_u64(metadata.ino()))
 }
 
 #[cfg(windows)]
-fn file_identity(file: &std::fs::File, _metadata: &std::fs::Metadata) -> Result<u64, String> {
+fn file_identity(file: &std::fs::File, _metadata: &std::fs::Metadata) -> Result<[u8; 24], String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
     };
 
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let mut info = FILE_ID_INFO::default();
     // SAFETY: `file` owns a live handle and `info` is a correctly sized writable buffer.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
         return Err(format!(
             "read Windows file identity: {}",
             std::io::Error::last_os_error()
         ));
     }
-    let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
-    let mut hasher = Sha256::new();
-    hasher.update(info.dwVolumeSerialNumber.to_le_bytes());
-    hasher.update(file_index.to_le_bytes());
-    let digest = hasher.finalize();
-    let mut identity = [0_u8; 8];
-    identity.copy_from_slice(&digest[..8]);
-    Ok(u64::from_le_bytes(identity))
+    let mut identity = [0_u8; 24];
+    identity[..8].copy_from_slice(&info.VolumeSerialNumber.to_le_bytes());
+    identity[8..].copy_from_slice(&info.FileId.Identifier);
+    Ok(identity)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<u64, String> {
-    Ok(metadata
-        .created()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0))
+fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<[u8; 24], String> {
+    Ok(identity_from_u64(
+        metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0),
+    ))
+}
+
+fn identity_from_u64(value: u64) -> [u8; 24] {
+    let mut identity = [0_u8; 24];
+    identity[..8].copy_from_slice(&value.to_le_bytes());
+    identity
 }
 
 fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelope>, u64), String> {

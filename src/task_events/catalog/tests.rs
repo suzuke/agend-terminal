@@ -600,7 +600,7 @@ fn catalog_statuses_are_ready_only_ordered_and_fail_closed() {
 #[test]
 fn hot_log_freshness_shapes_are_fail_closed() {
     let cursor = HotLogStamp {
-        inode: 7,
+        inode: identity_from_u64(7),
         len: 10,
         mtime_ns: 100,
     };
@@ -610,7 +610,7 @@ fn hot_log_freshness_shapes_are_fail_closed() {
         classify_hot_log(
             cursor,
             HotLogStamp {
-                inode: 7,
+                inode: identity_from_u64(7),
                 len: 14,
                 mtime_ns: 101,
             },
@@ -621,7 +621,7 @@ fn hot_log_freshness_shapes_are_fail_closed() {
         classify_hot_log(
             cursor,
             HotLogStamp {
-                inode: 7,
+                inode: identity_from_u64(7),
                 len: 14,
                 mtime_ns: 100,
             },
@@ -630,22 +630,22 @@ fn hot_log_freshness_shapes_are_fail_closed() {
     );
     for stale in [
         HotLogStamp {
-            inode: 8,
+            inode: identity_from_u64(8),
             len: 10,
             mtime_ns: 100,
         },
         HotLogStamp {
-            inode: 8,
+            inode: identity_from_u64(8),
             len: 14,
             mtime_ns: 101,
         },
         HotLogStamp {
-            inode: 7,
+            inode: identity_from_u64(7),
             len: 9,
             mtime_ns: 101,
         },
         HotLogStamp {
-            inode: 7,
+            inode: identity_from_u64(7),
             len: 10,
             mtime_ns: 101,
         },
@@ -660,11 +660,11 @@ fn board_cursor_records_the_folded_hot_log_position() {
 
     assert_eq!(cursor.live_offset(), 10);
     assert_eq!(
-        cursor.classify_observed(7, 10, 100),
+        cursor.classify_observed(identity_from_u64(7), 10, 100),
         HotLogFreshness::Current
     );
     assert_eq!(
-        cursor.classify_observed(7, 14, 101),
+        cursor.classify_observed(identity_from_u64(7), 14, 101),
         HotLogFreshness::CatchUp { start: 10, end: 14 }
     );
 }
@@ -1368,7 +1368,8 @@ fn authority_fails_closed_when_replace_file_preserves_creation_time() {
     replacement.extend_from_slice(
         format!(
             "{}\n",
-            serde_json::to_string(&envelope(
+            serde_json::to_string(&envelope_at(
+                "2099-01-01T00:00:00Z",
                 2,
                 TaskEvent::DescriptionUpdated {
                     task_id: task_id.clone(),
@@ -1414,6 +1415,13 @@ fn authority_fails_closed_when_replace_file_preserves_creation_time() {
         catalog.route(&task_id),
         Err(CatalogRouteError::Unreadable)
     ));
+    match catalog.snapshot_advisory().0 {
+        Phase::Unhealthy { causes, .. } => assert!(
+            causes.iter().any(|cause| cause.contains("identity")),
+            "unexpected causes: {causes:?}"
+        ),
+        phase => panic!("unexpected phase: {phase:?}"),
+    }
 }
 
 #[test]
