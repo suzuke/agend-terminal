@@ -239,6 +239,7 @@ pub enum CatalogRouteError {
 
 pub struct StrictTaskCatalog {
     home: Option<PathBuf>,
+    refresh: parking_lot::Mutex<()>,
     inner: RwLock<CatalogInner>,
     rebuild_in_flight: AtomicBool,
 }
@@ -276,6 +277,7 @@ impl StrictTaskCatalog {
         }
         Self {
             home,
+            refresh: parking_lot::Mutex::new(()),
             inner: RwLock::new(CatalogInner {
                 phase,
                 boards,
@@ -347,6 +349,15 @@ impl StrictTaskCatalog {
     }
 
     fn refresh_all(&self, home: &Path, allow_new_board: bool) -> Result<(), CatalogRouteError> {
+        let _refresh = self.refresh.lock();
+        self.refresh_all_locked(home, allow_new_board)
+    }
+
+    fn refresh_all_locked(
+        &self,
+        home: &Path,
+        allow_new_board: bool,
+    ) -> Result<(), CatalogRouteError> {
         let observed = board_paths(home).map_err(|cause| self.mark_unhealthy(cause))?;
         let observed_names: BTreeSet<_> = observed.keys().cloned().collect();
         let known_names: BTreeSet<_> = self
@@ -363,13 +374,6 @@ impl StrictTaskCatalog {
                 return Err(self.mark_unhealthy(format!("missing boards: {}", names.join(", "))));
             }
             BoardSetFreshness::New { names } => {
-                {
-                    let mut inner = self
-                        .inner
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    inner.phase = Phase::Building;
-                }
                 let mut additions = Vec::with_capacity(names.len());
                 for name in names {
                     let path = &observed[&name];
@@ -798,6 +802,10 @@ where
         return Ok(Ok(Vec::new()));
     }
 
+    let _refresh = catalog.refresh.lock();
+    catalog
+        .refresh_all_locked(&home, true)
+        .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;
     let mut inner = catalog
         .inner
         .write()
@@ -870,6 +878,7 @@ where
     super::invalidate_replay_cache();
     drop(inner);
     drop(file_lock);
+    drop(_refresh);
 
     let post_append_lines = hot_lines + envelopes.len();
     super::maybe_compact_events(board, post_append_lines);

@@ -1322,7 +1322,7 @@ fn test_concurrent_creates_unique_ids() {
         .into_iter()
         .map(|h| {
             let r = h.join().expect("thread");
-            assert_eq!(r["status"], "created");
+            assert_eq!(r["status"], "created", "unexpected create response: {r}");
             r["id"].as_str().expect("id").to_string()
         })
         .collect();
