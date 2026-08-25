@@ -10,6 +10,13 @@ use std::path::Path;
 /// `pr_branch`: the PR's source branch (headRefName). Used to find the
 /// task assignee whose binding matches this branch — NOT the merge caller,
 /// because the merge caller is typically the orchestrator (unbound).
+///
+/// `task_id`: optional explicit task-board id passed by the merge caller
+/// (`repo(action=merge, ..., task_id)`). When present it SHORT-CIRCUITS the
+/// binding scan entirely: zero search, zero ambiguity — the task's own
+/// `assignee` is read via a single strict-routed lookup, and a missing /
+/// terminal / assignee-less task fails closed with a reason. Absent → the
+/// legacy stage-1 live-binding scan runs unchanged.
 pub(crate) fn post_merge_receipt_and_watch(
     home: &Path,
     repo: &str,
@@ -17,9 +24,15 @@ pub(crate) fn post_merge_receipt_and_watch(
     pr: u64,
     pr_branch: &str,
     merge_authority: &str,
+    task_id: Option<&str>,
 ) -> Value {
-    let Some((assignee, task_id)) = resolve_task_assignee_for_branch(home, repo, pr_branch) else {
-        return json!({"skipped": "no task-linked binding for PR branch"});
+    let (assignee, task_id) = match resolve_task_assignee(home, repo, pr_branch, task_id) {
+        Ok(pair) => pair,
+        // The Err already carries the SPECIFIC reason (explicit-id failures name
+        // the task and the failed check; the legacy scan keeps its generic
+        // binding wording) — surface it verbatim so the operator sees the cause
+        // without digging through the daemon log.
+        Err(reason) => return json!({"skipped": reason}),
     };
     let expiry =
         chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
@@ -73,6 +86,69 @@ pub(crate) fn post_merge_receipt_and_watch(
             "watch": "armed",
         })
     }
+}
+
+/// Two-stage resolve entry: an explicit `task_id` (from the merge caller)
+/// short-circuits to a single strict-routed task lookup; `None` falls through
+/// to the legacy live-binding scan, byte-identical to main. Parameter order
+/// `(home, repo, branch, task_id)` matches `resolve_task_assignee_for_branch`
+/// so the two adjacent `&str`s can't be transposed at call sites.
+///
+/// On failure returns `Err(reason)` — for the explicit-id path that reason is
+/// SPECIFIC (names the task and the failed check) and is surfaced verbatim in
+/// the MCP response; a caller passing `task_id` and getting skipped has a bug,
+/// and #3341's original symptom was exactly this skip being opaque. The
+/// legacy-scan path keeps its single generic reason.
+fn resolve_task_assignee(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    task_id: Option<&str>,
+) -> Result<(String, String), String> {
+    if let Some(id) = task_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return resolve_task_assignee_by_id(home, id, branch);
+    }
+    resolve_task_assignee_for_branch(home, repo, branch)
+        .ok_or_else(|| "no task-linked binding for PR branch".to_string())
+}
+
+/// Direct lookup path: read the task by id via the strict router
+/// (`tasks::load_routed` — fail-closed on duplicate/unreadable boards) and
+/// return `(assignee, task_id)`. The passed-in id is VERIFIED, not trusted:
+/// the task's own `branch` must equal the branch being merged, else Err —
+/// a mismatched hint means the CALLER is buggy and silently switching to the
+/// binding scan would only hide that. Every failure returns a SPECIFIC reason
+/// (Err) so the MCP response can show the operator which check failed.
+///
+/// Catalog migration registry (DESIGN-task-catalog-projection Appendix A):
+/// this `load_routed` call site converts 1:1 to `catalog.route(task_id)` at
+/// the P2 authority cutover — same fail-closed error set
+/// (NotFound/Ambiguous/Unreadable), signature already matches.
+fn resolve_task_assignee_by_id(
+    home: &Path,
+    task_id: &str,
+    branch: &str,
+) -> Result<(String, String), String> {
+    let routed = crate::tasks::load_routed(home, task_id)
+        .map_err(|_| format!("task_id '{task_id}' not found"))?;
+    let task = routed.task;
+    if task.branch.as_deref() != Some(branch) {
+        tracing::warn!(%task_id, %branch, task_branch = ?task.branch,
+            "post-merge watch resolve: task_id does not name the branch being merged");
+        return Err(format!(
+            "task_id '{task_id}' names branch '{}', not '{branch}'",
+            task.branch.as_deref().unwrap_or("<none>")
+        ));
+    }
+    if task.status.is_terminal() {
+        tracing::warn!(%task_id, status = %task.status, "post-merge watch resolve: task is terminal");
+        return Err(format!("task_id '{task_id}' is terminal ({})", task.status));
+    }
+    let assignee = task
+        .assignee
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| format!("task_id '{task_id}' has no assignee"))?;
+    Ok((assignee, task_id.to_string()))
 }
 
 /// Resolve the task assignee for a PR branch by scanning all bindings.
@@ -262,6 +338,10 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     };
     let force = args["force"].as_bool().unwrap_or(false);
     let force_reason = args["force_reason"].as_str().unwrap_or("");
+    // Task-id passthrough: an explicit task-board id lets the merge caller
+    // hand the post-merge watch its linkage directly — zero binding/board
+    // search, zero ambiguity. Optional; absent → legacy resolve unchanged.
+    let explicit_task_id = args["task_id"].as_str();
 
     if force && force_reason.is_empty() {
         return json!({"error": "force=true requires non-empty force_reason"});
@@ -464,6 +544,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
                     pr,
                     &pr_branch,
                     instance_name,
+                    explicit_task_id,
                 );
                 if let Some(obj) = resp.as_object_mut() {
                     obj.insert("post_merge".into(), diag);

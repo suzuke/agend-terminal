@@ -1068,6 +1068,7 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
         42,
         branch,
         "lead",
+        None,
     );
     assert_eq!(
         post_merge["receipt"], "persisted",

@@ -1887,7 +1887,10 @@ mod tests {
         if path == "src/mcp/handlers/restart.rs" && function == "phase1_gate" && kind == "call_at" {
             return "cross_daemon_successor_status";
         }
-        if path == "src/app/rpc.rs" && function == "call_task" && kind == "call_at" {
+        if path == "src/app/rpc.rs"
+            && matches!(function, "call_task" | "call_tool")
+            && kind == "call_at"
+        {
             return "app_thin_client_task_rpc";
         }
         if path == "src/mcp/handlers/instance_state/lifecycle.rs"
