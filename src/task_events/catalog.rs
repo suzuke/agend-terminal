@@ -1382,6 +1382,31 @@ mod tests {
     }
 
     #[test]
+    fn board_cursor_records_the_folded_hot_log_position() {
+        let cursor = BoardCursor::from_folded_hot_log(7, 10, 100);
+
+        assert_eq!(cursor.live_offset(), 10);
+        assert_eq!(
+            cursor.classify_observed(7, 10, 100),
+            HotLogFreshness::Current
+        );
+        assert_eq!(
+            cursor.classify_observed(7, 14, 101),
+            HotLogFreshness::CatchUp { start: 10, end: 14 }
+        );
+    }
+
+    #[test]
+    fn board_projection_keeps_its_optional_source_cursor() {
+        let mut projection = BoardProjection::default();
+        assert!(projection.cursor().is_none());
+
+        projection.set_cursor(BoardCursor::from_folded_hot_log(7, 10, 100));
+
+        assert_eq!(projection.cursor().map(BoardCursor::live_offset), Some(10));
+    }
+
+    #[test]
     fn board_set_freshness_compares_names_and_fails_closed_on_missing() {
         let known =
             std::collections::BTreeSet::from(["default".to_string(), "research".to_string()]);
