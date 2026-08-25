@@ -453,7 +453,9 @@ fn restore_node_reconciled(
                 if !agent_source.contains(name) {
                     return None;
                 }
-                placed.insert(name.to_string());
+                if !placed.insert(name.to_string()) {
+                    return None;
+                }
             }
             // For agent leaves (Some) and shell leaves (None), the closure
             // dispatches internally and returns None when unsupported.
