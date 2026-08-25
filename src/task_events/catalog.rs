@@ -683,7 +683,7 @@ impl StrictTaskCatalog {
         &self,
         board_id: &str,
         replay: &TaskBoardState,
-    ) -> Result<bool, CatalogRouteError> {
+    ) -> Result<Option<bool>, CatalogRouteError> {
         self.ensure_fresh()?;
         let inner = self
             .inner
@@ -695,7 +695,7 @@ impl StrictTaskCatalog {
         inner
             .boards
             .get(board_id)
-            .map(|board| board.matches_replay(replay))
+            .map(|board| board.matches_current_replay(replay))
             .ok_or(CatalogRouteError::NotFound)
     }
 
@@ -1301,6 +1301,30 @@ fn build_catalog(home: &Path) -> StrictTaskCatalog {
 
     let mut boards = BTreeMap::new();
     for (name, path) in paths {
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            return StrictTaskCatalog::with_home(
+                Some(home.to_path_buf()),
+                Phase::Unhealthy {
+                    since: chrono::Utc::now().to_rfc3339(),
+                    causes: vec![format!("{name}: create {}: {err}", path.display())],
+                },
+                boards,
+            );
+        }
+        let lock_path = super::log_path(&path).with_extension("jsonl.lock");
+        let _lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(lock) => lock,
+            Err(err) => {
+                return StrictTaskCatalog::with_home(
+                    Some(home.to_path_buf()),
+                    Phase::Unhealthy {
+                        since: chrono::Utc::now().to_rfc3339(),
+                        causes: vec![format!("{name}: lock {}: {err}", lock_path.display())],
+                    },
+                    boards,
+                );
+            }
+        };
         match load_board_projection(&path, &name) {
             Ok(board) => {
                 boards.insert(name, board);
@@ -1778,6 +1802,14 @@ impl BoardProjection {
                     .get(id)
                     .is_some_and(|replayed| task.matches_replay(replayed))
             })
+    }
+
+    fn matches_current_replay(&self, replay: &TaskBoardState) -> Option<bool> {
+        if self.events_folded > replay.events_folded {
+            None
+        } else {
+            Some(self.matches_replay(replay))
+        }
     }
 
     pub fn last_order_key(&self) -> Option<&OrderKey> {

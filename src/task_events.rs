@@ -1957,13 +1957,18 @@ fn compare_catalog_shadow(board: &Path, incumbent: Option<&TaskBoardState>) {
             Some(replay) => catalog
                 .board_matches_replay(&board_id, replay)
                 .map_err(|err| anyhow::anyhow!("{err:?}")),
-            None => Ok(matches!(
+            None => Ok(Some(matches!(
                 catalog.board(&board_id),
                 Err(crate::task_events::catalog::CatalogRouteError::Unreadable)
-            )),
+            ))),
         }
     });
-    if !matches!(shadow, Ok(true)) {
+    if matches!(shadow, Ok(None)) {
+        tracing::debug!(
+            board = %board.display(),
+            "task catalog shadow advanced after incumbent replay; comparison skipped"
+        );
+    } else if !matches!(shadow, Ok(Some(true))) {
         crate::task_events::catalog::record_shadow_divergence();
         tracing::error!(
             board = %board.display(),
