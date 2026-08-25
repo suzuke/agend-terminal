@@ -764,6 +764,16 @@ where
     let log_path = super::log_path(board);
     let lock_path = log_path.with_extension("jsonl.lock");
     let file_lock = crate::store::acquire_file_lock(&lock_path)?;
+    if super::recover_half_writes_under_lock(board) {
+        let projection = load_board_projection(board, &board_id)
+            .map_err(|cause| anyhow::anyhow!("task catalog recovery failed: {cause}"))?;
+        let mut inner = catalog
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.boards.insert(board_id.clone(), projection);
+        rebuild_routes(&mut inner);
+    }
     catalog
         .refresh_all(&home, true)
         .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;

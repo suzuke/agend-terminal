@@ -2229,7 +2229,6 @@ pub fn recover_half_writes(home: &Path) {
 
 /// #2117 board-root variant of [`recover_half_writes`].
 pub(crate) fn recover_half_writes_at(board: &Path) {
-    use std::io::Write;
     let path = log_path(board);
     if !path.exists() {
         return;
@@ -2241,8 +2240,15 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
     let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
         return;
     };
+    recover_half_writes_under_lock(board);
+}
+
+/// Variant for the catalog commit path, which already holds the board writer lock.
+pub(crate) fn recover_half_writes_under_lock(board: &Path) -> bool {
+    use std::io::Write;
+    let path = log_path(board);
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return;
+        return false;
     };
     let mut kept: Vec<&str> = Vec::new();
     let mut bad: Vec<&str> = Vec::new();
@@ -2257,7 +2263,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
         }
     }
     if bad.is_empty() {
-        return;
+        return false;
     }
     // Forensics: quarantine only the corrupt line(s) — never silently destroy.
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -2302,6 +2308,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
             "recovered corrupt task-event line(s) — quarantined + hot log rewritten with good lines only"
         );
     }
+    rewrite.is_ok()
 }
 
 // ── Compaction ─────────────────────────────────────────────────────
