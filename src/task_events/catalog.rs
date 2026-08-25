@@ -1481,6 +1481,7 @@ fn file_identity(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<
     ))
 }
 
+#[cfg(any(not(windows), test))]
 fn identity_from_u64(value: u64) -> [u8; 24] {
     let mut identity = [0_u8; 24];
     identity[..8].copy_from_slice(&value.to_le_bytes());
