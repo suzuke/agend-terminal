@@ -170,8 +170,10 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
 #[test]
 fn task_event_appends_have_one_catalog_commit_path() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let facade = std::fs::read_to_string(root.join("src/task_events.rs")).unwrap();
-    let catalog = std::fs::read_to_string(root.join("src/task_events/catalog.rs")).unwrap();
+    let facade =
+        std::fs::read_to_string(root.join("src/task_events.rs")).expect("read task-events facade");
+    let catalog = std::fs::read_to_string(root.join("src/task_events/catalog.rs"))
+        .expect("read task catalog");
     let needle = "crate::event_log::append_lines_under_lock";
 
     assert_eq!(
