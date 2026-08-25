@@ -217,7 +217,7 @@ pub(crate) fn def_pane_snapshot() -> Value {
 }
 
 pub(crate) fn def_instance() -> Value {
-    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances`; its `observed_status` is independent, and `confidence: weak` means screen-only uncertainty whose state may differ from `agent_state`. Pass `instance` for one instance's detail or `verbose`/`include_evidence` for the full evidence trail. action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Structural lifecycle stays on the standalone tools.",
+    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances`; its `observed_status` is independent, and `confidence: weak` means screen-only uncertainty whose state may differ from `agent_state`. `since_ms` is when that observed state began, not the last refresh. Pass `instance` for one instance's detail or `verbose`/`include_evidence` for the full evidence trail. action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Structural lifecycle stays on the standalone tools.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "pane_snapshot"]},
             "instance": {"type": "string", "description": "action=list: optional — return detail for this one instance. action=pane_snapshot: required — the instance to snapshot."},
@@ -1509,6 +1509,10 @@ mod tests {
             assert!(
                 description.contains("may differ from `agent_state`"),
                 "missing independent-observation caveat"
+            );
+            assert!(
+                description.contains("`since_ms` is when that observed state began"),
+                "missing stable since_ms meaning"
             );
         }
     }
