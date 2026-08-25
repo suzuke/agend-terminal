@@ -918,19 +918,16 @@ impl AppState {
                             // This sync is add-only: a gone agent's pane is retained
                             // for scrollback. Reconnect that leaf in place when the
                             // agent reappears, including inside an operator split.
-                            if self.ui.layout.find_agent_pane(&tab_name).is_some() {
-                                debug_assert!(self.ui.layout.replace_agent_pane(&tab_name, pane));
+                            if self
+                                .ui
+                                .layout
+                                .reconnect_or_append_agent_pane(&tab_name, pane)
+                            {
                                 tracing::info!(
                                     agent = %name,
                                     "reused retained pane for re-appeared remote agent (no duplicate)"
                                 );
                             } else {
-                                self.ui
-                                    .layout
-                                    .push_tab_preserve_focus(crate::layout::Tab::new(
-                                        tab_name.to_string(),
-                                        pane,
-                                    ));
                                 tracing::info!(
                                     agent = %name,
                                     "opened tab for newly-appeared remote agent"

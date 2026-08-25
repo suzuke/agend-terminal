@@ -173,15 +173,16 @@ impl Layout {
         self.tabs.push(tab);
     }
 
-    /// Replace an existing agent pane without changing its tab, split, or focus.
-    pub fn replace_agent_pane(&mut self, agent_name: &str, mut pane: Pane) -> bool {
+    /// Reconnect a retained agent pane in place, or append a tab for a new agent.
+    pub fn reconnect_or_append_agent_pane(&mut self, agent_name: &str, mut pane: Pane) -> bool {
         let Some((_, pane_id)) = self.find_agent_pane(agent_name) else {
+            self.push_tab_preserve_focus(Tab::new(agent_name.to_string(), pane));
             return false;
         };
         pane.id = pane_id;
-        let Some(existing) = self.find_pane_mut(pane_id) else {
-            return false;
-        };
+        let existing = self
+            .find_pane_mut(pane_id)
+            .expect("pane id returned by find_agent_pane must exist");
         *existing = pane;
         true
     }
@@ -436,7 +437,7 @@ mod tests {
         let mut fresh = leaf(99, "returning");
         fresh.display_name = Some("fresh".to_string());
 
-        assert!(layout.replace_agent_pane("returning", fresh));
+        assert!(layout.reconnect_or_append_agent_pane("returning", fresh));
 
         assert_eq!(layout.tabs.len(), 1, "must not append a duplicate tab");
         assert_eq!(layout.tabs[0].root().pane_count(), 2, "split is preserved");
@@ -450,6 +451,9 @@ mod tests {
             Some("fresh"),
             "the retained leaf carries the fresh connection"
         );
+
+        assert!(!layout.reconnect_or_append_agent_pane("new", leaf(3, "new")));
+        assert_eq!(layout.tabs.len(), 2, "a new agent still appends one tab");
     }
     #[test]
     fn move_pane_across_tabs_same_tab_rejected() {
