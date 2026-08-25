@@ -247,6 +247,52 @@ fn shadow_equivalence_detects_current_state_and_high_water_mismatches() {
 }
 
 #[test]
+fn newer_projection_is_not_compared_to_an_older_replay() {
+    let replay = replay_with_metadata_events(20);
+    let mut projection = BoardProjection::from_replay(replay.clone());
+    projection.events_folded += 1;
+
+    assert_eq!(projection.matches_current_replay(&replay), None);
+    assert_eq!(
+        BoardProjection::from_replay(replay.clone()).matches_current_replay(&replay),
+        Some(true)
+    );
+}
+
+#[test]
+fn initial_catalog_build_waits_for_the_board_writer() {
+    let home = tmp_home("initial-build-lock");
+    let task_id = TaskId::from("t-20260825000000000000-1-9");
+    super::super::append_at(
+        &home,
+        &InstanceName::from("writer"),
+        created(&task_id, "seed"),
+    )
+    .expect("seed board");
+    let lock_path = super::super::log_path(&home).with_extension("jsonl.lock");
+    let writer_lock = crate::store::acquire_file_lock(&lock_path).expect("hold writer lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let build_home = home.clone();
+    let builder = std::thread::spawn(move || {
+        tx.send(build_catalog(&build_home).snapshot_advisory().0)
+            .expect("send phase");
+    });
+
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "initial build must not read through an active writer"
+    );
+    drop(writer_lock);
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("build after writer releases"),
+        Phase::Ready
+    );
+    builder.join().expect("join builder");
+}
+
+#[test]
 fn projection_size_is_bounded_by_tasks_not_events() {
     let mut one_x = BoardProjection::from_replay(replay_with_metadata_events(100));
     let mut ten_x = BoardProjection::from_replay(replay_with_metadata_events(1_000));
