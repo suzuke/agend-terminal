@@ -761,13 +761,12 @@ where
     {
         anyhow::bail!("task catalog is not ready");
     }
-    catalog
-        .refresh_all(&home, true)
-        .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;
-
     let log_path = super::log_path(board);
     let lock_path = log_path.with_extension("jsonl.lock");
     let file_lock = crate::store::acquire_file_lock(&lock_path)?;
+    catalog
+        .refresh_all(&home, true)
+        .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;
     let mut inner = catalog
         .inner
         .write()
