@@ -488,6 +488,8 @@ fn run_app(
     let restore_start = std::time::Instant::now();
     let (task_rpc_tx, task_rpc_rx, task_rpc_worker) =
         rpc::spawn_task_worker(attached_run_dir.as_ref().expect("attached run dir"));
+    let (remote_state_rpc_tx, remote_state_rpc_rx, remote_state_rpc_worker) =
+        rpc::spawn_agent_state_worker(attached_run_dir.as_ref().expect("attached run dir"));
     let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
@@ -500,6 +502,7 @@ fn run_app(
         attached_mode,
         size_debug,
         task_rpc_tx: &task_rpc_tx,
+        remote_state_rpc_tx: &remote_state_rpc_tx,
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
@@ -523,9 +526,13 @@ fn run_app(
             recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
             recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps),
             recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
+            recv(remote_state_rpc_rx) -> outcome => state.handle_agent_state_rpc_outcome(outcome),
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
     };
+    drop(remote_state_rpc_tx);
+    drop(remote_state_rpc_rx);
+    let _ = remote_state_rpc_worker.join();
     drop(task_rpc_tx);
     let _ = task_rpc_worker.join();
     // Teardown gating rationale is documented on `app_teardown`.

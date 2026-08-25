@@ -125,6 +125,7 @@ pub(super) struct AppDeps<'a> {
     pub attached_mode: bool,
     pub size_debug: bool,
     pub task_rpc_tx: &'a crossbeam_channel::Sender<rpc::TaskRequest>,
+    pub remote_state_rpc_tx: &'a crossbeam_channel::Sender<rpc::AgentStateRequest>,
 }
 
 /// #2453 Slice 2: the extracted run_app loop/setup logic, method-by-method.
@@ -864,12 +865,31 @@ impl AppState {
         self.dirty = true;
     }
 
+    pub(super) fn handle_agent_state_rpc_outcome(
+        &mut self,
+        outcome: Result<rpc::AgentStateOutcome, crossbeam_channel::RecvError>,
+    ) {
+        match outcome {
+            Ok(Ok(states)) => self.remote_agent_states = states,
+            Ok(Err(error)) => {
+                self.remote_agent_states.clear();
+                tracing::warn!(error, "daemon agent-state snapshot unavailable");
+            }
+            Err(_) => {
+                self.remote_agent_states.clear();
+                tracing::warn!("daemon agent-state RPC worker stopped");
+            }
+        }
+        self.dirty = true;
+    }
+
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
         let AppDeps {
             home,
             fleet_path,
             wakeup_tx,
             attached_run_dir,
+            remote_state_rpc_tx,
             ..
         } = *deps;
         // #t-84833-10: periodic idle refresh — mark self.dirty so the cap above
@@ -892,15 +912,7 @@ impl AppState {
         if attached_run_dir.is_some()
             && self.last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
         {
-            if let Some(run_dir) = attached_run_dir {
-                match rpc::list_instances(run_dir) {
-                    Ok(states) => self.remote_agent_states = states,
-                    Err(error) => {
-                        self.remote_agent_states.clear();
-                        tracing::warn!(error, "daemon agent-state snapshot unavailable");
-                    }
-                }
-            }
+            let _ = remote_state_rpc_tx.try_send(rpc::AgentStateRequest::Refresh);
             {
                 // #910 PR3 of 4: daemon-registry truth via runtime
                 // helper. The state-transition log gate inside the
