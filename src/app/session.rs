@@ -1011,4 +1011,48 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn apply_session_layout_keeps_first_agent_leaf_and_drops_later_duplicate() {
+        let home = tmp_home("duplicate-agent-leaf");
+        let split = SessionNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(SessionNode::Leaf(SessionPane {
+                fleet_instance_name: Some("A".to_string()),
+                display_name: None,
+            })),
+            second: Box::new(SessionNode::Leaf(SessionPane {
+                fleet_instance_name: Some("B".to_string()),
+                display_name: None,
+            })),
+        };
+        let duplicate = SessionNode::Leaf(SessionPane {
+            fleet_instance_name: Some("A".to_string()),
+            display_name: None,
+        });
+        write_session(
+            &home,
+            vec![
+                ("original-split".to_string(), split),
+                ("A-duplicate".to_string(), duplicate),
+            ],
+        );
+
+        let agent_source: HashSet<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let mut layout = Layout::new();
+        let mut id_counter = 0usize;
+        let mut pb = synthetic_pane_builder(&mut id_counter);
+
+        assert!(apply_session_layout(
+            &home,
+            &agent_source,
+            &mut pb,
+            &mut layout
+        ));
+        assert_eq!(layout.tabs.len(), 1, "later duplicate tab must collapse");
+        assert_eq!(layout.tabs[0].name, "original-split");
+        assert_eq!(layout.tabs[0].root().pane_count(), 2);
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
