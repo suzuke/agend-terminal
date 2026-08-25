@@ -7663,6 +7663,7 @@ fn post_merge_named_authority_reaches_real_poller_delivery() {
         3139,
         "fix/post-merge-named",
         "lead",
+        None,
     );
     assert_eq!(
         diag["watch"], "armed",
@@ -7704,6 +7705,7 @@ fn post_merge_operator_reaches_assignee_real_poller_delivery() {
         3139,
         "fix/post-merge-operator",
         "",
+        None,
     );
     assert_eq!(diag["watch"], "armed", "operator watch must arm: {diag}");
     let watch_path = home.join("ci-watches").join(watch_filename_exact_head(

@@ -185,60 +185,21 @@ pub fn run(
     }
 }
 
-/// #1726: per-tick handlers that app-standalone INTENTIONALLY does not run,
-/// excluded from the otherwise-shared `build_default_handlers` set. Each is a
-/// deliberate, justified omission; the completeness invariant
-/// (`app_tick_handlers_cover_every_non_allowlisted_daemon_handler`) fails CI if a
-/// NEW handler is added to `build_default_handlers` but is neither run in app nor
-/// listed here — so additions are a conscious decision, not silent drift.
-///
-/// - `snapshot_rotation`: app owns session persistence via `session::save_session_if_changed`.
-/// - `thread_dump`: env-gated diagnostic, not needed in the interactive TUI.
-///
-/// #1694(a): `recovery_dispatcher` was REMOVED from this allowlist — the live
-/// daemon runs in app mode (`app::run_app`, never `run_core`), so allowlisting it
-/// out meant the #685 recovery ladder was silently dead in the live daemon (the
-/// #1720 class). It now runs in app mode: Stage1 (ESC-nudge to the PTY) needs no
-/// `crash_rx` at all (#2549: Stage2/3 were converged away — see
-/// `daemon/per_tick/recovery_dispatcher.rs`'s module doc). Stage1 stays
-/// shadow-gated-off by default — zero behavior change unless an operator opts in.
-///
-/// #2413 Phase B (live-fix): `shadow_observe` was REMOVED from this allowlist (same
-/// #1720/#685 class as `recovery_dispatcher` above). The original #2433 allowlisted it
-/// out, reasoning the plane was "run_core-only" — but the LIVE fleet daemon runs
-/// `agend-terminal app` (`run_app`), NEVER `run_core`, so that gated the whole Shadow
-/// Observer DEAD in production: `observed_status` stayed null on every agent even with
-/// the flag on. The fix is symmetric to #1694(a): the reducer driver now runs in app mode
-/// (un-allowlisted), and `run_app` starts the hook-event socket server (`shadow::start`)
-/// alongside the api-activity probe. Flag-OFF by default ⇒ zero behaviour change.
-/// Per-tick handlers ALWAYS allowlisted out of app-standalone (unconditional skips).
-/// `thread_dump` is an env-gated diagnostic not needed in the interactive TUI.
-///
-/// #2413 PR-B (#1720-class fix): `snapshot_rotation` was REMOVED from this list — see
-/// [`app_snapshot_rotation_enabled`]. The live daemon runs `run_app`, never `run_core`, so
-/// allowlisting `snapshot_rotation` out meant the live daemon NEVER wrote `<home>/snapshot.json`
-/// (it was weeks-stale), and `dispatch_idle` / inbox / handoff / reply — which read it — all
-/// operated on stale state. Same #1720 class already fixed for `recovery_dispatcher` (#1694a)
-/// and `shadow_observe` (#2413 Phase B). It now runs in app mode by default, reversible via the
-/// `AGEND_APP_SNAPSHOT=0` kill-switch.
+/// Test-only compatibility model for the pre-#3344 combined APP/daemon handler set.
+/// Production APP mode is now a permanent thin client and runs no daemon per-tick
+/// handlers; `run_core` owns them. This allowlist exists only for the legacy coverage
+/// tests below, where the env-gated `thread_dump` diagnostic remains excluded.
 #[cfg(test)]
 const APP_TICK_ALLOWLIST: &[&str] = &["thread_dump"];
 
-/// #2413 PR-B: whether app-standalone runs `snapshot_rotation` (writes `snapshot.json` every
-/// tick). **Default ON** — the #1720-class fix so the live daemon's snapshot-reading deciders
-/// (dispatch_idle / inbox / handoff / reply) see CURRENT state. The `AGEND_APP_SNAPSHOT=0`
-/// kill-switch restores the pre-PR-B behaviour (allowlisted out — no app-mode snapshot write),
-/// a reversible escape hatch since flipping the whole snapshot plane stale→live is a behaviour
-/// change with a broad blast radius.
+/// Test-only switch retained for the legacy handler-set compatibility tests.
 #[cfg(test)]
 fn app_snapshot_rotation_enabled() -> bool {
     std::env::var("AGEND_APP_SNAPSHOT").as_deref() != Ok("0")
 }
 
-/// Build the per-tick handler set app-standalone runs: the shared
-/// `build_default_handlers` minus `APP_TICK_ALLOWLIST` (and minus `snapshot_rotation` only when
-/// the `AGEND_APP_SNAPSHOT=0` kill-switch is set). Extracted so the completeness invariant can
-/// compare it against the full daemon set.
+/// Build the test-only pre-#3344 handler model. The production thin-client APP does
+/// not call this function.
 #[cfg(test)]
 fn app_tick_handlers(
     daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
@@ -488,6 +449,8 @@ fn run_app(
     let restore_start = std::time::Instant::now();
     let (task_rpc_tx, task_rpc_rx, task_rpc_worker) =
         rpc::spawn_task_worker(attached_run_dir.as_ref().expect("attached run dir"));
+    let (remote_state_rpc_tx, remote_state_rpc_rx, remote_state_rpc_worker) =
+        rpc::spawn_agent_state_worker(attached_run_dir.as_ref().expect("attached run dir"));
     let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
@@ -500,6 +463,7 @@ fn run_app(
         attached_mode,
         size_debug,
         task_rpc_tx: &task_rpc_tx,
+        remote_state_rpc_tx: &remote_state_rpc_tx,
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
@@ -523,9 +487,13 @@ fn run_app(
             recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
             recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps),
             recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
+            recv(remote_state_rpc_rx) -> outcome => state.handle_agent_state_rpc_outcome(outcome),
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
     };
+    drop(remote_state_rpc_tx);
+    drop(remote_state_rpc_rx);
+    let _ = remote_state_rpc_worker.join();
     drop(task_rpc_tx);
     let _ = task_rpc_worker.join();
     // Teardown gating rationale is documented on `app_teardown`.

@@ -273,8 +273,15 @@ fn post_merge_named_non_orchestrator_merge_developer_bound_arms_watch() {
     // Named merge authority (lead) has no binding and is not an orchestrator.
 
     // Named authority calls merge → post_merge resolves developer from PR branch.
-    let diag =
-        super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 99, "fix/feature-x", "lead");
+    let diag = super::merge::post_merge_receipt_and_watch(
+        &home,
+        REPO,
+        &sha,
+        99,
+        "fix/feature-x",
+        "lead",
+        None,
+    );
 
     assert_eq!(
         diag["receipt"], "persisted",
@@ -324,8 +331,15 @@ fn post_merge_operator_fallback_arms_assignee_handoff() {
     let source_repo = make_source_repo(&home);
     seed_binding_with_source(&home, "dev", "t-operator", "fix/operator-x", &source_repo);
 
-    let diag =
-        super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 103, "fix/operator-x", "");
+    let diag = super::merge::post_merge_receipt_and_watch(
+        &home,
+        REPO,
+        &sha,
+        103,
+        "fix/operator-x",
+        "",
+        None,
+    );
 
     assert_eq!(
         diag["watch"], "armed",
@@ -364,6 +378,7 @@ fn post_merge_no_branch_binding_skips_gracefully() {
         100,
         "fix/nobody-bound",
         "lead",
+        None,
     );
 
     assert!(
@@ -391,8 +406,15 @@ fn post_merge_ambiguous_binding_skips() {
         );
     }
 
-    let diag =
-        super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 101, "fix/shared", "lead");
+    let diag = super::merge::post_merge_receipt_and_watch(
+        &home,
+        REPO,
+        &sha,
+        101,
+        "fix/shared",
+        "lead",
+        None,
+    );
 
     assert!(
         diag["skipped"].as_str().is_some(),
@@ -413,8 +435,9 @@ fn post_merge_watch_failure_still_persists_receipt() {
     let watches_dir = home.join("ci-watches");
     std::fs::write(&watches_dir, b"blocker").unwrap();
 
-    let diag =
-        super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 102, "fix/test", "lead");
+    let diag = super::merge::post_merge_receipt_and_watch(
+        &home, REPO, &sha, 102, "fix/test", "lead", None,
+    );
 
     assert_eq!(
         diag["receipt"], "persisted",

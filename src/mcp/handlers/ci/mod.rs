@@ -157,6 +157,13 @@ mod exact_head_merge_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod notification_only_watch_tests;
 
+// Post-merge task-id passthrough — author-directed rework of the
+// release-before-merge ordering fix; tests in a sibling file.
+#[cfg(test)]
+#[path = "post_merge_task_id_passthrough_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod post_merge_task_id_passthrough_tests;
+
 // #2755 repo-checkout transactional submodule provisioning — real-entry tests in
 // a sibling file (test-named ⇒ file_size_invariant-exempt; keeps checkout.rs small).
 #[cfg(test)]

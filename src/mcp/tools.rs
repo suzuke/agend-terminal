@@ -101,7 +101,7 @@ pub(crate) fn def_inbox() -> Value {
 }
 
 pub(crate) fn def_list_instances() -> Value {
-    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
+    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. `observed_status` is an independent observation: `confidence: weak` means screen-only uncertainty, so its state may differ from `agent_state`; this is expected. `since_ms` is when that observed state began, not the last refresh. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
     "inputSchema": {"type": "object", "properties": {
         "instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"},
         "verbose": {"type": "boolean", "description": "#2475: include the per-instance `observed_status.evidence` trail (omitted by default to keep routine polls small)."},
@@ -217,7 +217,7 @@ pub(crate) fn def_pane_snapshot() -> Value {
 }
 
 pub(crate) fn def_instance() -> Value {
-    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances` (all active instances; pass `instance` for one instance's detail, `verbose`/`include_evidence` for the full evidence trail); action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Read-only only — structural lifecycle (create/delete/start/restart/move_pane) stays on the standalone tools, and the per-name `list_instances` / `pane_snapshot` tools remain available unchanged.",
+    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances`; its `observed_status` is independent, and `confidence: weak` means screen-only uncertainty whose state may differ from `agent_state`. `since_ms` is when that observed state began, not the last refresh. Pass `instance` for one instance's detail or `verbose`/`include_evidence` for the full evidence trail. action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Structural lifecycle stays on the standalone tools.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "pane_snapshot"]},
             "instance": {"type": "string", "description": "action=list: optional — return detail for this one instance. action=pane_snapshot: required — the instance to snapshot."},
@@ -409,7 +409,7 @@ pub(crate) fn def_repo() -> Value {
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
             "expected_head": {"type": "string", "description": "#6: optional exact full-SHA precondition. When provided, the branch HEAD must equal this value; mismatch returns structured error with zero mutation. Omitted preserves current behavior."},
             "checkout_purpose": {"type": "string", "enum": ["disposable_review"], "description": "Architecture-14 item 10: typed daemon-provisioned disposable review checkout. Requires bind=true, task_id, expected_head, and a newly-created branch."},
-            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
+            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). merge — optional explicit task-board id ('t-...') passed straight through to the post-merge receipt/watch so the actionable assignee is resolved from the task itself (zero binding scan); absent → legacy live-binding resolve. Absent → unattributed bind, existing warning behavior unchanged."},
             "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. release — required when `discard_nested_dirt=true` (confirms destructive intent)."},
             "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."},
             "discard_nested_dirt": {"type": "boolean", "description": "release: authorize discarding unpreservable nested-submodule working-tree dirt. Requires `force=true` and a matching `expected_nested_dirt_digest` (confirmation round-trip). The digest is returned in the refusal response when nested dirt blocks a release."},
@@ -1496,5 +1496,24 @@ mod tests {
                 .is_some_and(|s| s.contains("discard")),
             "audit_reason description must reference discard use"
         );
+    }
+
+    #[test]
+    fn instance_tool_describes_weak_observation_uncertainty_3349() {
+        for tool in [def_list_instances(), def_instance()] {
+            let description = tool["description"].as_str().expect("tool description");
+            assert!(
+                description.contains("weak"),
+                "missing weak-confidence caveat"
+            );
+            assert!(
+                description.contains("may differ from `agent_state`"),
+                "missing independent-observation caveat"
+            );
+            assert!(
+                description.contains("`since_ms` is when that observed state began"),
+                "missing stable since_ms meaning"
+            );
+        }
     }
 }
