@@ -27,7 +27,7 @@ use std::path::Path;
 pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
 
-    let state = crate::task_events::replay(home).map_err(|e| e.to_string())?;
+    let state = crate::task_events::projected_state(home).map_err(|e| e.to_string())?;
     let affected: Vec<crate::task_events::TaskId> = state
         .tasks
         .values()
@@ -91,7 +91,7 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
 pub fn cancel_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
 
-    let state = crate::task_events::replay(home).map_err(|e| e.to_string())?;
+    let state = crate::task_events::projected_state(home).map_err(|e| e.to_string())?;
     let affected: Vec<crate::task_events::TaskId> = state
         .tasks
         .values()
@@ -167,7 +167,7 @@ pub fn release_inprogress_orphans_with_live(
     live: &std::collections::HashSet<String>,
 ) -> Vec<crate::task_events::TaskId> {
     use crate::task_events::{InstanceName, TaskEvent};
-    let state = match crate::task_events::replay(home) {
+    let state = match crate::task_events::projected_state(home) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "boot orphan sweep: task_events replay failed — skipping");
@@ -397,7 +397,7 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
             .ok()
             .map(|c| c.instances.keys().cloned().collect())
             .unwrap_or_default();
-    let state = match crate::task_events::replay(home) {
+    let state = match crate::task_events::projected_state(home) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -482,7 +482,7 @@ const STALE_BLOCKED_WARN_THRESHOLD: usize = 10;
 /// #830: structured-recommendations health response. Pure pub fn so
 /// tests can drive it with synthesized inputs (no daemon spawn).
 ///
-/// `state` — `crate::task_events::replay(home)` output
+/// `state` — `crate::task_events::projected_state(home)` output
 /// `live` — `crate::runtime::list_live_agents(home)` — `None` when
 ///   the daemon is unreachable (surfaced as a degraded-mode hint in
 ///   the response).

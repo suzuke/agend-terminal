@@ -1529,7 +1529,7 @@ mod tests {
         // same-name redeploy. (This test previously asserted owner==None — that
         // pinned the orphan-on-disband behaviour #1903 fixes. Single-instance
         // delete still orphans-open — see full_delete_instance_orphans_owned_tasks.)
-        let state = crate::task_events::replay(&home).unwrap();
+        let state = crate::task_events::projected_state(&home).unwrap();
         for id in &[id1.as_str(), id2.as_str(), id3.as_str()] {
             let task = state
                 .tasks

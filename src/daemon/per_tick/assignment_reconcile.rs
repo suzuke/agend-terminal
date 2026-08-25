@@ -573,7 +573,7 @@ mod tests {
     }
 
     fn task_status(home: &Path, task_id: &str) -> crate::task_events::TaskStatus {
-        crate::task_events::replay(home)
+        crate::task_events::projected_state(home)
             .unwrap()
             .tasks
             .get(&TaskId::from(task_id))

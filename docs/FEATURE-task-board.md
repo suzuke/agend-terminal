@@ -4,9 +4,9 @@
 
 The task board is the fleet's shared work-tracking surface. It is built on an
 event-sourced model: every mutation is appended to `task_events.jsonl`, and the
-current state is reconstructed by replaying (folding) those events. This gives
-the board a complete audit trail, makes state reproducible, and provides the
-foundation for sweep, health, and dependency evaluation.
+current state is served from a bounded task catalog derived from those events.
+This gives the board a complete audit trail, makes state reproducible, and keeps
+warm queries independent of history size.
 
 ## Usage Scenarios
 
@@ -25,18 +25,19 @@ foundation for sweep, health, and dependency evaluation.
 - Operators can observe the global state at any time.
 - It is an append-only, replayable state machine — not a mutable JSON file.
 - `task_events.jsonl` is the canonical source; `tasks.json` is a legacy bridge.
-- All new reads go through replay-fold; all new writes go through event append.
+- All authority reads go through the catalog; all writes go through catalog commit.
 
 ## 2. Files and Modules
 
-- `src/task_events.rs` — event format definition and replay logic.
+- `src/task_events.rs` — event format and compatibility-shaped catalog views.
+- `src/task_events/catalog.rs` — bounded read authority, checkpoint, and commit path.
 - `src/tasks/mod.rs` — board surface and legacy data bridging.
 - `src/mcp/handlers/task.rs` — thin MCP handler that delegates to the `tasks` module.
 - `task_events.jsonl` — canonical event log.
 - `task_events_archive/` — historical archive directory.
 - `tasks.json` — legacy bridge file (read-only during migration).
-- `TaskBoardState` — the output of replay-fold.
-- `TaskRecord` — canonical read model from replay.
+- `TaskBoardState` — compatibility-shaped view produced from the catalog.
+- `ProjectedTaskRecord` — bounded canonical catalog record.
 - `TaskEvent` — the write model.
 - `TaskId` and `InstanceName` are newtypes to prevent ID mix-ups.
 - Replay fails on unknown event variants or unsupported schema versions (fail-closed).
@@ -45,7 +46,7 @@ foundation for sweep, health, and dependency evaluation.
 ## 3. Data Model
 
 - `Task` is the public structure exposed via MCP (uses string status for compatibility).
-- `TaskRecord` is the canonical view from replay (uses enum status).
+- `TaskRecord` is the compatibility view exposed from the catalog (uses enum status).
 - Key `TaskEvent` variants:
   - `Created` — carries title, description, priority, optional owner/due_at/depends_on/routed_to/branch/bind/eta_secs.
   - `Claimed` — sets the owner.
@@ -195,7 +196,7 @@ An opt-in pre-work alignment gate: require outside acks on a task's plan before 
 - The task owner and their team orchestrator can mutate.
 - System identities (`system:auto_orphan`, `system:task_sweep`, etc.) bypass ACL.
 - `force` mode is for historical cleanup, not a shortcut — it requires a reason.
-- ACL is evaluated on the replay snapshot (small TOCTOU window; canonical truth is the event log).
+- ACL is evaluated on the catalog snapshot and revalidated inside catalog commit.
 
 ## 15. Interactions with Other Subsystems
 
@@ -219,7 +220,7 @@ An opt-in pre-work alignment gate: require outside acks on a task's plan before 
 
 ## 17. Implementation Checklist
 
-- Any new event variant must update the replay fold.
+- Any new event variant must update the catalog fold.
 - Any new status must update list/health projections.
 - All writes must respect `append_batch` atomicity.
 - New actions must update the MCP schema.
@@ -232,4 +233,4 @@ An opt-in pre-work alignment gate: require outside acks on a task's plan before 
 
 ## 18. Summary
 
-The task board is the fleet's shared work protocol. Its semantics are maintained through events, not a single mutable file. The primary surface is `task create/list/get/claim/done/update/sweep/health/activity/metadata_set/metadata_get`, plus the opt-in `ack_plan` pre-work alignment gate (§10). Default listing is actionable-only. Dependencies are evaluated at the view layer. ACL is owner / orchestrator / system identity. Batch append and strict replay are the two most important invariants. When something looks wrong, check the event log before touching the view.
+The task board is the fleet's shared work protocol. Its semantics are maintained through events, not a single mutable file. The primary surface is `task create/list/get/claim/done/update/sweep/health/activity/metadata_set/metadata_get`, plus the opt-in `ack_plan` pre-work alignment gate (§10). Default listing is actionable-only. Dependencies are evaluated at the view layer. ACL is owner / orchestrator / system identity. Catalog commit and bounded projection are the two most important runtime invariants; the event log remains the durable audit source.

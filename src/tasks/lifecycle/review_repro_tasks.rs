@@ -47,7 +47,6 @@ fn write_envelope(home: &std::path::Path, seq: u64, ts: &str, event: TaskEvent) 
         .open(home.join(format!("task_events.{}", "jsonl")))
         .expect("open the event log");
     writeln!(f, "{line}").expect("write envelope line");
-    crate::task_events::invalidate_replay_cache();
 }
 
 /// FINDING #2 (high/correctness): `archive_done_tasks` (run at daemon boot)
@@ -104,7 +103,7 @@ fn archive_does_not_flip_completed_task_to_cancelled_tasks() {
     );
 
     // Sanity: the task is genuinely Done before the lifecycle pass.
-    let before = crate::task_events::replay(&home).expect("replay before");
+    let before = crate::task_events::projected_state(&home).expect("replay before");
     assert_eq!(
         before.tasks.get(&tid).map(|r| r.status),
         Some(TaskStatus::Done),
@@ -117,7 +116,7 @@ fn archive_does_not_flip_completed_task_to_cancelled_tasks() {
 
     // CORRECT: the completed task must NOT be recorded as Cancelled. The bug
     // emits a Cancelled event that replay applies unconditionally.
-    let after = crate::task_events::replay(&home).expect("replay after");
+    let after = crate::task_events::projected_state(&home).expect("replay after");
     let status = after.tasks.get(&tid).map(|r| r.status);
     assert_ne!(
         status,

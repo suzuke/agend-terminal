@@ -134,7 +134,7 @@ fn replay_folds_basic_lifecycle() {
         },
     )
     .unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     let task = state.tasks.get(&TaskId::from("t-X")).unwrap();
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.history.len(), 3);
@@ -158,7 +158,7 @@ fn invariant_4_forward_compat_fail_closed() {
         "event": {"kind": "Unblocked", "task_id": "t-X"}
     });
     fs::write(&log, format!("{line}\n")).unwrap();
-    let err = replay(&home).expect_err("must fail-closed on future schema");
+    let err = replay_for_test(&home).expect_err("must fail-closed on future schema");
     assert!(
         err.to_string().contains("forward-compat fail-closed"),
         "got: {err}"
@@ -179,19 +179,20 @@ fn replay_rejects_unknown_event_variant() {
         "event": {"kind": "TotallyMadeUpVariant", "task_id": "t-X"}
     });
     fs::write(&log, format!("{line}\n")).unwrap();
-    let err = replay(&home).expect_err("must fail-closed on unknown variant");
-    assert!(err.to_string().contains("replay aborts"), "got: {err}");
+    let err = replay_for_test(&home).expect_err("must fail-closed on unknown variant");
+    assert!(
+        err.to_string().contains("undeserializable envelope"),
+        "got: {err}"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
 // ── #1988: corrupt-line resilience ──────────────────────────────────
 
-/// #1988 shape 1 — a CORRUPT (non-JSON) line in the MIDDLE of a real board
-/// lifecycle (create → claim → update → done) must be SKIPPED, not abort the
-/// whole replay. Goes through the real producer (`append`) for the good lines
-/// and the real consumer (`replay`) — not a unit-injected `read_envelopes_strict`.
+/// A complete malformed record is hard corruption. Catalog authority and its
+/// write gate fail closed without mutating the evidence.
 #[test]
-fn replay_skips_corrupt_midfile_line_keeps_full_lifecycle() {
+fn catalog_refuses_complete_corrupt_midfile_line() {
     let home = tmp_home("corrupt-skip");
     let inst = InstanceName::from("dev-impl-1");
     let log = home.join("task_events.jsonl");
@@ -212,7 +213,7 @@ fn replay_skips_corrupt_midfile_line_keeps_full_lifecycle() {
         let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
         writeln!(f, "this is not valid json {{{{ truncated").unwrap();
     }
-    append(
+    let error = append(
         &home,
         &inst,
         TaskEvent::DescriptionUpdated {
@@ -221,46 +222,14 @@ fn replay_skips_corrupt_midfile_line_keeps_full_lifecycle() {
             description: "updated desc".into(),
         },
     )
-    .unwrap();
-    append(
-        &home,
-        &inst,
-        TaskEvent::Done {
-            task_id: "t-X".into(),
-            by: "agent".into(),
-            source: DoneSource::OperatorManual {
-                authored_at: chrono::Utc::now().to_rfc3339(),
-                result: Some("ok".into()),
-            },
-        },
-    )
-    .unwrap();
+    .expect_err("a complete malformed record must close the catalog write gate");
+    assert!(error.to_string().contains("catalog is unreadable"));
 
-    // The catalog write gate scrubs the malformed complete line before it
-    // accepts the next commit, preserving it under task_events.recovery.
     let raw = fs::read_to_string(&log).unwrap();
     assert!(
-        !raw.contains("not valid json"),
-        "catalog recovery must remove the bad line from the live log"
+        raw.contains("not valid json"),
+        "authority failure must preserve the corrupt evidence"
     );
-    let recovered = fs::read_dir(home.join("task_events.recovery"))
-        .unwrap()
-        .flatten()
-        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten().flatten())
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .any(|content| content.contains("not valid json"));
-    assert!(
-        recovered,
-        "scrubbed bytes must remain available for forensics"
-    );
-
-    // Replay still folds the full lifecycle after the scrub.
-    let state = replay(&home).expect("corrupt mid-line must NOT brick replay");
-    let task = state
-        .tasks
-        .get(&TaskId::from("t-X"))
-        .expect("task survives the corrupt line");
-    assert_eq!(task.status, TaskStatus::Done);
     fs::remove_dir_all(&home).ok();
 }
 
@@ -321,7 +290,7 @@ fn recover_half_writes_quarantines_torn_tail() {
         "torn tail preserved for forensics"
     );
     // The board still replays cleanly with the good events.
-    let state = replay(&home).expect("replay clean after recovery");
+    let state = replay_for_test(&home).expect("replay clean after recovery");
     assert_eq!(
         state.tasks.get(&TaskId::from("t-Y")).unwrap().status,
         TaskStatus::Done
@@ -360,64 +329,10 @@ fn recover_keeps_future_version_line_replay_still_fail_closed() {
         after.contains("\"schema_version\":999"),
         "recovery must keep the future-version line (it is valid JSON, not garbage)"
     );
-    let err = replay(&home).expect_err("future-version still fail-closed after recovery");
+    let err = replay_for_test(&home).expect_err("future-version still fail-closed after recovery");
     assert!(
         err.to_string().contains("forward-compat fail-closed"),
         "got: {err}"
-    );
-    fs::remove_dir_all(&home).ok();
-}
-
-/// #1990 item 4: a fail-closed replay (the board freezes while the per-tick
-/// callers swallow the Err) must surface ONE operator-visible event_log entry
-/// per boot — and a second fail-closed replay in the same boot must NOT emit a
-/// duplicate (latched). Serialized with the other latch-tripping tests so the
-/// process-global latch reset is uninterrupted.
-#[test]
-#[serial(task_replay_latch)]
-fn replay_fail_closed_surfaces_operator_event_once() {
-    let home = tmp_home("failclosed-visible");
-    REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
-    // A future-version record → replay fail-closes (#1992 forward-compat).
-    let line = serde_json::json!({
-        "schema_version": 999,
-        "seq": 1,
-        "timestamp": "2026-04-27T00:00:00Z",
-        "instance": "newer-daemon",
-        "event": {"kind": "Unblocked", "task_id": "t-X"}
-    });
-    fs::write(home.join("task_events.jsonl"), format!("{line}\n")).unwrap();
-    // Two fail-closed replays in the same boot (Err is not cached, so both
-    // re-run replay_uncached and reach the surface helper).
-    assert!(replay(&home).is_err());
-    assert!(replay(&home).is_err());
-    // Exactly one operator event was emitted (latched).
-    let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-    assert_eq!(
-        elog.matches("task_replay_fail_closed").count(),
-        1,
-        "fail-closed replay must surface exactly one operator event per boot, got: {elog}"
-    );
-    fs::remove_dir_all(&home).ok();
-}
-
-/// #1990 item 4 (reviewer-2 minor 1): the boundary that keeps disk jitter from
-/// becoming a false alarm — a transient IO-class replay error (no "fail-closed"
-/// substring) must NOT surface an operator event. Guards the substring
-/// classifier against over-firing.
-#[test]
-#[serial(task_replay_latch)]
-fn transient_io_error_does_not_surface_operator_event() {
-    let home = tmp_home("io-no-surface");
-    REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
-    // A bare IO-class error (what a vanished/locked file yields) — not the
-    // forward-compat "fail-closed" class.
-    let io_err = anyhow::anyhow!("No such file or directory (os error 2)");
-    surface_failclosed_replay_once(&home, &io_err);
-    let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-    assert!(
-        !elog.contains("task_replay_fail_closed"),
-        "a transient IO error must NOT surface an operator event (false-alarm guard): {elog}"
     );
     fs::remove_dir_all(&home).ok();
 }
@@ -493,7 +408,7 @@ fn retention_idle_instance_all_archived_no_seq_collision_gate() {
     // A appends again — must get a fresh, non-colliding seq.
     append(&home, &a, sample_event("t-A2")).unwrap();
 
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert!(
         state.tasks.contains_key(&TaskId::from("t-A2")),
         "re-appended transition was SILENTLY DROPPED (seq collision)"
@@ -539,7 +454,7 @@ fn retention_idle_instance_in_old_archive_segment_no_collision() {
         "precondition: A only in an OLD archive segment, not the hot log"
     );
     append(&home, &a, sample_event("t-A2")).unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert!(
         state.tasks.contains_key(&TaskId::from("t-A2")),
         "sidecar must cover A's high-water even from an OLD archive segment"
@@ -708,12 +623,14 @@ fn hysteresis_replay_lossless_across_compaction() {
     // append (HIGH_WATER+1) triggers a trim that archives the early slice.
     let existing = fs::read_to_string(&log).unwrap();
     let start = existing.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let first: TaskEventEnvelope = serde_json::from_str(existing.lines().next().unwrap()).unwrap();
+    let base = chrono::DateTime::parse_from_rfc3339(&first.timestamp).unwrap();
     let mut lines = existing;
     for i in start..=COMPACTION_HIGH_WATER {
         let env = TaskEventEnvelope {
             schema_version: SCHEMA_VERSION,
             seq: i as u64,
-            timestamp: format!("2026-06-21T{:02}:00:00Z", i % 24),
+            timestamp: (base + chrono::Duration::microseconds(i as i64)).to_rfc3339(),
             instance: InstanceName::from("filler"),
             emitter_id: None,
             event: sample_event(&format!("f-{i}")),
@@ -729,7 +646,7 @@ fn hysteresis_replay_lossless_across_compaction() {
         COMPACTION_KEEP,
         "crossing append must compact to KEEP (so t-early is archived)"
     );
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert!(
         state.tasks.contains_key(&TaskId::from("t-early")),
         "the archived early task must still replay (archive+hot fold = lossless)"
@@ -777,7 +694,7 @@ fn corrupt_sidecar_rebuilds_no_seq_collision() {
     // from the hot+archive scan → A's high-water recovered → non-colliding seq.
     append(&home, &a, sample_event("t-A2")).unwrap();
 
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert!(
         state.tasks.contains_key(&TaskId::from("t-A2")),
         "corrupt sidecar must rebuild → no seq collision → transition not dropped"
@@ -809,9 +726,9 @@ fn retention_replay_state_survives_compaction_zero_loss() {
     for i in 0..(keep + 4) {
         append(&home, &a, sample_event(&format!("t-{i}"))).unwrap();
     }
-    let before = replay(&home).unwrap();
+    let before = replay_for_test(&home).unwrap();
     compact_at_with_keep(&board, keep).unwrap();
-    let after = replay(&home).unwrap();
+    let after = replay_for_test(&home).unwrap();
     assert_eq!(
         before.tasks.keys().collect::<Vec<_>>(),
         after.tasks.keys().collect::<Vec<_>>(),
@@ -822,60 +739,6 @@ fn retention_replay_state_survives_compaction_zero_loss() {
         keep + 4,
         "all tasks present pre-compaction"
     );
-    fs::remove_dir_all(&home).ok();
-}
-
-/// S1: `compact_at` rewrites the hot log and MUST invalidate the replay
-/// cache (bump `REPLAY_GENERATION`), exactly like the append paths. Pre-fix
-/// it was correct-by-accident (the shorter file changed the `(len, mtime)`
-/// cache key); this asserts the explicit contract — the generation bump —
-/// which a future cache-key change can't silently break. DISCRIMINATING:
-/// without the added `invalidate_replay_cache()`, the generation is
-/// unchanged across `compact_at` and this fails.
-#[test]
-#[serial]
-fn compact_at_invalidates_replay_cache_s1() {
-    let home = tmp_home("compact-invalidate");
-    let inst = InstanceName::from("u");
-    // Direct-write > COMPACTION_KEEP lines so compact_at actually rewrites
-    // (mirrors compact_archives_older_than_keep_threshold).
-    let log = home.join("task_events.jsonl");
-    let mut lines = String::new();
-    for i in 1..=(COMPACTION_KEEP + 5) {
-        let env = TaskEventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            seq: i as u64,
-            timestamp: format!("2026-04-27T{:02}:00:00Z", i % 24),
-            instance: inst.clone(),
-            emitter_id: None,
-            event: TaskEvent::Unblocked {
-                task_id: format!("t-{i}").as_str().into(),
-            },
-        };
-        lines.push_str(&serde_json::to_string(&env).unwrap());
-        lines.push('\n');
-    }
-    fs::write(&log, lines).unwrap();
-    // Warm the replay cache for this board.
-    let _ = replay(&home).unwrap();
-    let gen_before = REPLAY_GENERATION.load(Ordering::Acquire);
-    compact(&home).unwrap();
-    let gen_after = REPLAY_GENERATION.load(Ordering::Acquire);
-    assert!(
-        gen_after > gen_before,
-        "compact_at must invalidate the replay cache (generation \
-             {gen_before} → {gen_after}); without the explicit bump the stale \
-             cache could outlive the compacted file"
-    );
-    // Sanity: compaction actually rewrote the hot log (kept exactly
-    // COMPACTION_KEEP lines — so the generation bump above came from a real
-    // rewrite, not a no-op) and a post-compact replay still succeeds.
-    assert_eq!(
-        fs::read_to_string(&log).unwrap().lines().count(),
-        COMPACTION_KEEP,
-        "compaction must shrink the hot log to COMPACTION_KEEP lines"
-    );
-    replay(&home).expect("post-compact replay must succeed");
     fs::remove_dir_all(&home).ok();
 }
 
@@ -892,7 +755,7 @@ fn invariant_1_idempotency() {
     let log = home.join("task_events.jsonl");
     let content = fs::read_to_string(&log).unwrap();
     fs::write(&log, format!("{content}{content}")).unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     // Idempotency invariant: two copies of the same envelope fold to
     // identical state as one copy.
     assert_eq!(state.events_folded, 1);
@@ -920,8 +783,8 @@ fn invariant_2_cross_process_determinism() {
         },
     )
     .unwrap();
-    let s1 = replay(&home).unwrap();
-    let s2 = replay(&home).unwrap();
+    let s1 = replay_for_test(&home).unwrap();
+    let s2 = replay_for_test(&home).unwrap();
     let j1 = serde_json::to_string(&s1).unwrap();
     let j2 = serde_json::to_string(&s2).unwrap();
     assert_eq!(j1, j2);
@@ -938,7 +801,7 @@ fn invariant_3_back_compat_v1_reader_parses_v1_envelope() {
     let home = tmp_home("backcompat");
     let inst = InstanceName::from("u");
     let _ = append(&home, &inst, sample_event("t-BC")).unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert!(state.tasks.contains_key(&TaskId::from("t-BC")));
     fs::remove_dir_all(&home).ok();
 }
@@ -971,7 +834,7 @@ fn invariant_3_v2_reader_parses_v1_envelope_explicit() {
         }
     });
     fs::write(&log, format!("{v1_line}\n")).unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     let task = state
         .tasks
         .get(&TaskId::from("t-V1"))
@@ -1032,7 +895,7 @@ fn invariant_6_snapshot_prefix_is_valid_state() {
     for n in 1..=lines.len() {
         let prefix: String = lines[..n].iter().map(|l| format!("{l}\n")).collect();
         fs::write(&log, &prefix).unwrap();
-        let state = replay(&home).unwrap_or_else(|_| panic!("prefix len {n} invalid"));
+        let state = replay_for_test(&home).unwrap_or_else(|_| panic!("prefix len {n} invalid"));
         assert_eq!(state.events_folded, n as u64);
         let task = state.tasks.get(&TaskId::from("t-P")).unwrap();
         let expected = match n {
@@ -1060,7 +923,9 @@ fn invariant_7_concurrent_reader_coherence() {
     let threads: Vec<_> = (0..8)
         .map(|_| {
             let h = Arc::clone(&home);
-            std::thread::spawn(move || serde_json::to_string(&replay(&h).unwrap()).unwrap())
+            std::thread::spawn(move || {
+                serde_json::to_string(&replay_for_test(&h).unwrap()).unwrap()
+            })
         })
         .collect();
     let results: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
@@ -1116,7 +981,7 @@ fn replay_sorts_chronologically_across_timezone_offsets() {
     content.push('\n');
     fs::write(&log, content).unwrap();
 
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     let task = state.tasks.get(&TaskId::from("t-TZ")).unwrap();
     assert_eq!(
         task.status,
@@ -1159,7 +1024,7 @@ fn replay_ordering_is_deterministic() {
         content.push('\n');
     }
     fs::write(&log, content).unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     let task = state.tasks.get(&TaskId::from("t-O")).unwrap();
     // Created applied before Claimed → final status Claimed.
     assert_eq!(task.status, TaskStatus::Claimed);
@@ -1433,7 +1298,7 @@ fn state_machine_exhaustive_transitions() {
     for (i, (start, evt, expected)) in table.iter().enumerate() {
         let (home, inst, tid) = prime(*start, &format!("sm_{i}"));
         emit(&home, &inst, &tid, evt);
-        let state = replay(&home).unwrap();
+        let state = replay_for_test(&home).unwrap();
         let actual = state.tasks.get(&tid).unwrap().status;
         assert_eq!(
             actual, *expected,
@@ -1455,7 +1320,7 @@ fn invariant_5_sweep_replay_associativity() {
     let inst = InstanceName::from("u");
     let sweep = InstanceName::from("system:task_sweep");
 
-    // Scenario A: replay(operator events) then add sweep events on top.
+    // Scenario A: replay_for_test(operator events) then add sweep events on top.
     let home_a = tmp_home("assoc_a");
     append(
         &home_a,
@@ -1525,7 +1390,7 @@ fn invariant_5_sweep_replay_associativity() {
         },
     )
     .unwrap();
-    let state_a = replay(&home_a).unwrap();
+    let state_a = replay_for_test(&home_a).unwrap();
 
     // Scenario B: same events but interleaved differently — sweep
     // events appear in the middle, not at the end. Replay's
@@ -1620,7 +1485,7 @@ fn invariant_5_sweep_replay_associativity() {
         content.push('\n');
     }
     fs::write(&log_b, content).unwrap();
-    let state_b = replay(&home_b).unwrap();
+    let state_b = replay_for_test(&home_b).unwrap();
 
     // Final task status & linked PRs identical regardless of file
     // order. Histories may differ in absolute timestamps but the
@@ -1731,7 +1596,7 @@ fn created_event_round_trips_bind_some_false_through_replay() {
         },
     )
     .unwrap();
-    let state = replay(&home).expect("replay");
+    let state = replay_for_test(&home).expect("replay");
     let task = state
         .tasks
         .get(&TaskId::from("t-rca"))
@@ -1773,7 +1638,7 @@ fn task_schema_dispatched_at_set_on_status_in_progress_transition() {
     )
     .unwrap();
     // Pre-claim: dispatched_at is None.
-    let pre = replay(&home).unwrap();
+    let pre = replay_for_test(&home).unwrap();
     let pre_t = pre.tasks.get(&tid).unwrap();
     assert!(pre_t.started_at.is_none(), "pre-claim: no dispatched_at");
 
@@ -1787,7 +1652,7 @@ fn task_schema_dispatched_at_set_on_status_in_progress_transition() {
     )
     .unwrap();
     // Post-claim, pre-in_progress: still None.
-    let mid = replay(&home).unwrap();
+    let mid = replay_for_test(&home).unwrap();
     assert!(mid.tasks.get(&tid).unwrap().started_at.is_none());
 
     append(
@@ -1800,7 +1665,7 @@ fn task_schema_dispatched_at_set_on_status_in_progress_transition() {
     )
     .unwrap();
     // Post-in_progress: dispatched_at is set.
-    let post = replay(&home).unwrap();
+    let post = replay_for_test(&home).unwrap();
     let post_t = post.tasks.get(&tid).unwrap();
     assert!(
         post_t.started_at.is_some(),
@@ -1856,7 +1721,7 @@ fn task_schema_dispatched_at_idempotent_on_subsequent_in_progress() {
         },
     )
     .unwrap();
-    let first_dispatched = replay(&home)
+    let first_dispatched = replay_for_test(&home)
         .unwrap()
         .tasks
         .get(&tid)
@@ -1897,7 +1762,7 @@ fn task_schema_dispatched_at_idempotent_on_subsequent_in_progress() {
         },
     )
     .unwrap();
-    let second_dispatched = replay(&home)
+    let second_dispatched = replay_for_test(&home)
         .unwrap()
         .tasks
         .get(&tid)
@@ -1938,7 +1803,12 @@ fn task_schema_eta_secs_round_trips_from_created_event() {
         },
     )
     .unwrap();
-    let task = replay(&home).unwrap().tasks.get(&tid).cloned().unwrap();
+    let task = replay_for_test(&home)
+        .unwrap()
+        .tasks
+        .get(&tid)
+        .cloned()
+        .unwrap();
     assert_eq!(task.eta_secs, Some(7200), "eta_secs must round-trip");
     std::fs::remove_dir_all(&home).ok();
 }
@@ -1987,7 +1857,7 @@ fn append_after_compaction_produces_correct_monotonic_seq() {
     );
 
     // Replay sees both events
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert!(state.tasks.contains_key(&TaskId::from("t-pre-compact")));
     assert!(state.tasks.contains_key(&TaskId::from("t-post-compact")));
     fs::remove_dir_all(&home).ok();
@@ -2039,7 +1909,7 @@ fn parent_id_round_trips_through_replay() {
         },
     )
     .unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     let parent = state.tasks.get(&TaskId::from("t-parent")).unwrap();
     assert_eq!(parent.parent_id, None);
     let child = state.tasks.get(&TaskId::from("t-child")).unwrap();
@@ -2066,7 +1936,7 @@ fn parent_id_v1_envelope_defaults_to_none() {
         }
     });
     fs::write(&log, format!("{v1_line}\n")).unwrap();
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     let task = state.tasks.get(&TaskId::from("t-old")).unwrap();
     assert_eq!(task.parent_id, None, "v1 envelope missing parent_id → None");
     fs::remove_dir_all(&home).ok();
@@ -2240,7 +2110,7 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
     )
     .unwrap();
 
-    let state = replay(&home).unwrap();
+    let state = replay_for_test(&home).unwrap();
     assert_eq!(
         state.tasks.get(&TaskId::from("t-root")).unwrap().status,
         TaskStatus::Cancelled
@@ -2328,8 +2198,8 @@ fn replay_cache_hit_returns_same_result() {
     let inst = InstanceName::from("a");
     append(&home, &inst, sample_event("t-1")).unwrap();
 
-    let r1 = replay(&home).unwrap();
-    let r2 = replay(&home).unwrap();
+    let r1 = replay_for_test(&home).unwrap();
+    let r2 = replay_for_test(&home).unwrap();
     assert_eq!(r1.tasks.len(), r2.tasks.len());
     assert_eq!(r1.events_folded, r2.events_folded);
     fs::remove_dir_all(&home).ok();
@@ -2341,12 +2211,12 @@ fn replay_cache_invalidated_after_append() {
     let inst = InstanceName::from("a");
     append(&home, &inst, sample_event("t-1")).unwrap();
 
-    let r1 = replay(&home).unwrap();
+    let r1 = replay_for_test(&home).unwrap();
     assert_eq!(r1.tasks.len(), 1);
 
     append(&home, &inst, sample_event("t-2")).unwrap();
 
-    let r2 = replay(&home).unwrap();
+    let r2 = replay_for_test(&home).unwrap();
     assert_eq!(r2.tasks.len(), 2, "cache must be invalidated after append");
     fs::remove_dir_all(&home).ok();
 }

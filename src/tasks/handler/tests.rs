@@ -139,7 +139,7 @@ fn reassign(home: &std::path::Path, task_id: &str, new_owner: &str) {
 fn inlock_precond_rejects_unauthorized_nonstatus_update_231() {
     let home = tmp_home("231-nonstatus-acl");
     create_task(&home, "t-231-a"); // owner = dev-agent
-    let state = crate::task_events::replay(&home).unwrap();
+    let state = crate::task_events::projected_state(&home).unwrap();
     let res = update_batch_precondition(
         &state,
         &home,
@@ -165,7 +165,7 @@ fn inlock_precond_rejects_status_update_after_owner_reassign_231() {
     let home = tmp_home("231-reassign");
     create_task(&home, "t-231-b"); // owner = dev-agent
     reassign(&home, "t-231-b", "other-owner");
-    let state = crate::task_events::replay(&home).unwrap();
+    let state = crate::task_events::projected_state(&home).unwrap();
     let res = update_batch_precondition(
         &state,
         &home,
@@ -192,7 +192,7 @@ fn inlock_precond_rejects_done_when_by_owner_drifted_231() {
     let home = tmp_home("231-by-drift");
     create_task(&home, "t-231-c"); // owner = dev-agent
     reassign(&home, "t-231-c", "new-owner");
-    let state = crate::task_events::replay(&home).unwrap();
+    let state = crate::task_events::projected_state(&home).unwrap();
     let res = update_batch_precondition(
         &state,
         &home,
@@ -216,7 +216,7 @@ fn inlock_precond_rejects_done_when_by_owner_drifted_231() {
 fn inlock_precond_allows_legitimate_authorized_update_231() {
     let home = tmp_home("231-control");
     create_task(&home, "t-231-d"); // owner = dev-agent
-    let state = crate::task_events::replay(&home).unwrap();
+    let state = crate::task_events::projected_state(&home).unwrap();
     let res = update_batch_precondition(
         &state,
         &home,
@@ -1112,7 +1112,7 @@ fn plan_ack_idempotent_reack_does_not_double_count_2249() {
 // ── Result / depends_on update semantics (spike t-…19288-1, fix t-…46182-4) ──
 
 fn task_result(home: &std::path::Path, task_id: &str) -> Option<String> {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .unwrap()
         .tasks
         .get(&crate::task_events::TaskId(task_id.into()))

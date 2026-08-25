@@ -1460,7 +1460,7 @@ teams:
             TickOutcome::AwaitReset
         );
 
-        let blocked = crate::task_events::replay(&home).expect("replay blocked");
+        let blocked = crate::task_events::projected_state(&home).expect("replay blocked");
         let blocked = blocked.tasks.get(&task_id).expect("task remains");
         assert_eq!(blocked.status, crate::task_events::TaskStatus::Blocked);
         assert_eq!(blocked.owner.as_ref(), Some(&owner));
@@ -1505,7 +1505,7 @@ teams:
             TickOutcome::NeedsOperator
         );
         assert_eq!(
-            crate::task_events::replay(&home)
+            crate::task_events::projected_state(&home)
                 .expect("replay raced")
                 .tasks
                 .get(&task_id)
@@ -1523,7 +1523,7 @@ teams:
                 .expect("recovery tick"),
             TickOutcome::Recovered
         );
-        let recovered = crate::task_events::replay(&home).expect("replay recovered");
+        let recovered = crate::task_events::projected_state(&home).expect("replay recovered");
         let recovered = recovered.tasks.get(&task_id).expect("task recovered");
         assert_eq!(recovered.status, crate::task_events::TaskStatus::InProgress);
         assert_eq!(recovered.owner.as_ref(), Some(&owner));
@@ -1642,7 +1642,7 @@ teams:
             TickOutcome::Detected,
             "a Recovered episode is history: a new same-key UsageLimit must start a fresh cycle"
         );
-        let after_one = crate::task_events::replay(&home).expect("replay tick1");
+        let after_one = crate::task_events::projected_state(&home).expect("replay tick1");
         assert_ne!(
             after_one.tasks.get(&task_id).expect("task").status,
             crate::task_events::TaskStatus::Blocked,
@@ -1655,7 +1655,7 @@ teams:
             super::observe_tick(&mut tick2, make_input(AgentState::UsageLimit)).expect("tick2");
         assert_eq!(outcome2, TickOutcome::AwaitReset);
         assert_eq!(
-            crate::task_events::replay(&home)
+            crate::task_events::projected_state(&home)
                 .expect("replay tick2")
                 .tasks
                 .get(&task_id)
@@ -1670,7 +1670,7 @@ teams:
         let outcome3 =
             super::observe_tick(&mut tick3, make_input(AgentState::Idle)).expect("tick3");
         assert_eq!(outcome3, TickOutcome::Recovered);
-        let healed = crate::task_events::replay(&home).expect("replay tick3");
+        let healed = crate::task_events::projected_state(&home).expect("replay tick3");
         let healed = healed.tasks.get(&task_id).expect("task");
         assert_eq!(
             healed.status,

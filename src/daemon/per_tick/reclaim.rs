@@ -266,7 +266,7 @@ fn do_reclaim(
     agent: &str,
     remaining: Duration,
 ) -> usize {
-    let board = crate::task_events::replay(home).unwrap_or_default();
+    let board = crate::task_events::projected_state(home).unwrap_or_default();
     let owned: Vec<crate::task_events::TaskId> = board
         .tasks
         .values()
@@ -554,7 +554,7 @@ mod tests {
     }
 
     fn task_status(home: &Path, task_id: &str) -> crate::task_events::TaskStatus {
-        let st = crate::task_events::replay(home).unwrap();
+        let st = crate::task_events::projected_state(home).unwrap();
         st.tasks
             .get(&crate::task_events::TaskId(task_id.to_string()))
             .unwrap()
@@ -562,7 +562,7 @@ mod tests {
     }
 
     fn task_owner(home: &Path, task_id: &str) -> Option<String> {
-        let st = crate::task_events::replay(home).unwrap();
+        let st = crate::task_events::projected_state(home).unwrap();
         st.tasks
             .get(&crate::task_events::TaskId(task_id.to_string()))
             .unwrap()

@@ -68,7 +68,6 @@ fn raw_append_envelope(home: &std::path::Path, instance: &str, seq: u64, event: 
     // The hot file changed out-of-band (len + mtime bump). Force any read-side
     // replay cache to re-read from disk so the test observes the true on-disk
     // state, exactly as a cross-process reader would.
-    invalidate_replay_cache();
 }
 
 /// FINDING #1 (high/correctness): SEQ_CACHE makes cross-process seq computation
@@ -101,7 +100,7 @@ fn seq_cache_cross_process_does_not_drop_real_event_tasks() {
     let _s3 = append(&home, &InstanceName::from(inst), created_event("t-c", inst))
         .expect("process-A second append");
 
-    let state = replay(&home).expect("replay folds full on-disk history");
+    let state = replay_for_test(&home).expect("replay folds full on-disk history");
 
     // The CORRECT outcome: all three creates survive. The bug drops t-c because
     // it was minted with a duplicate seq (2) that replay treats as already-seen.

@@ -29,8 +29,7 @@ fn tmp_home(tag: &str) -> PathBuf {
 }
 
 /// Seed a real (Created) task onto `project`'s board. `DEFAULT_PROJECT`/"default"
-/// → the home board. Does NOT touch the `task_index` — callers that want an index
-/// entry record it explicitly.
+/// maps to the home board; the catalog discovers it from the event log.
 fn seed_task_on_board(home: &Path, project: &str, task_id: &str) {
     append_batch_at(
         &board_root(home, project),
@@ -61,7 +60,6 @@ fn seed_task_on_board(home: &Path, project: &str, task_id: &str) {
 fn load_routed_finds_task_on_non_default_board_2760() {
     let home = tmp_home("non-default");
     seed_task_on_board(&home, "proj-x", "t-2760-x");
-    super::board_router::record_task_project(&home, "t-2760-x", "proj-x").expect("record index");
 
     let routed = load_routed(&home, "t-2760-x");
     match routed {
@@ -150,7 +148,6 @@ fn load_routed_unknown_id_is_notfound_2760() {
 fn link_branch_to_task_writes_to_project_board_not_default_2760() {
     let home = tmp_home("branch-link-proj");
     seed_task_on_board(&home, "proj-bl", "t-2760-bl");
-    super::board_router::record_task_project(&home, "t-2760-bl", "proj-bl").expect("record index");
 
     let linked = link_branch_to_task(&home, "t-2760-bl", "feat/2760-bl").expect("link ok");
     assert!(
@@ -160,7 +157,7 @@ fn link_branch_to_task_writes_to_project_board_not_default_2760() {
     );
 
     // BranchLinked landed on the PROJECT board.
-    let on_proj = crate::task_events::replay_at(&board_root(&home, "proj-bl"))
+    let on_proj = crate::task_events::projected_state_at(&board_root(&home, "proj-bl"))
         .expect("replay proj board")
         .tasks
         .get(&TaskId("t-2760-bl".to_string()))
@@ -172,10 +169,12 @@ fn link_branch_to_task_writes_to_project_board_not_default_2760() {
     );
 
     // The default board has NO copy — the write went ONLY to the routed board.
-    let default_has_it =
-        crate::task_events::replay_at(&board_root(&home, crate::task_events::DEFAULT_PROJECT))
-            .map(|s| s.tasks.contains_key(&TaskId("t-2760-bl".to_string())))
-            .unwrap_or(false);
+    let default_has_it = crate::task_events::projected_state_at(&board_root(
+        &home,
+        crate::task_events::DEFAULT_PROJECT,
+    ))
+    .map(|s| s.tasks.contains_key(&TaskId("t-2760-bl".to_string())))
+    .unwrap_or(false);
     assert!(
         !default_has_it,
         "no default-board copy — branch-link must not write to the default board"
@@ -188,8 +187,6 @@ fn link_branch_to_task_writes_to_project_board_not_default_2760() {
 fn link_branch_to_task_same_branch_is_idempotent_noop_2760() {
     let home = tmp_home("branch-link-idem");
     seed_task_on_board(&home, "proj-bl2", "t-2760-bl2");
-    super::board_router::record_task_project(&home, "t-2760-bl2", "proj-bl2")
-        .expect("record index");
     assert!(link_branch_to_task(&home, "t-2760-bl2", "feat/x").expect("first link"));
     assert!(
         !link_branch_to_task(&home, "t-2760-bl2", "feat/x").expect("second link"),
@@ -200,7 +197,7 @@ fn link_branch_to_task_same_branch_is_idempotent_noop_2760() {
 // ── #2760 item 1: route-local STRICT complete-record proof + locked EOF repair ──
 //
 // The router-only strict reader treats ANY complete (newline-terminated) malformed
-// record — in task_events OR task_index — as `Unreadable` (never a silent skip like
+// record in task_events as `Unreadable` (never a silent skip like
 // the fleet-wide `replay_at`), tolerating ONLY a final unterminated EOF fragment,
 // which it repairs once under the writer lock and then re-reads.
 
@@ -259,11 +256,11 @@ fn route_task_future_schema_event_record_is_unreadable_2760() {
     }
 }
 
-/// GREEN behaviour: a final unterminated EOF fragment (torn tail from a crash
-/// mid-append) is the ONE tolerable case — repaired under the writer lock, then the
-/// route resolves. The log is left newline-terminated with the fragment gone.
+/// A final unterminated EOF fragment is not part of the durable prefix. Authority
+/// reads resolve from the complete prefix without taking the writer lock; the
+/// next writer repairs the fragment before appending.
 #[test]
-fn route_task_repairs_final_eof_fragment_then_resolves_2760() {
+fn route_task_ignores_final_eof_fragment_then_resolves_2760() {
     let home = tmp_home("evt-eof");
     seed_task_on_board(&home, "default", "t-2760-eof");
     let log = events_log(&home, "default");
@@ -275,78 +272,31 @@ fn route_task_repairs_final_eof_fragment_then_resolves_2760() {
     );
 
     let routed = load_routed(&home, "t-2760-eof")
-        .expect("a torn EOF fragment must be repaired, then the route resolves");
+        .expect("a torn EOF fragment must not hide the durable task prefix");
     assert_eq!(routed.task.id, "t-2760-eof");
 
     let after = std::fs::read_to_string(&log).unwrap();
     assert!(
-        after.ends_with('\n') && !after.contains("torn half-written tail"),
-        "the torn fragment must be truncated out of the live log under the lock"
+        after.contains("torn half-written tail"),
+        "authority reads must not mutate storage or take the writer lock"
     );
-}
 
-/// RED: a COMPLETE (newline-terminated) malformed `task_index` record is
-/// `Unreadable` — it could hide a CONFLICTING project entry for the target id, so
-/// tolerating it would let an `Ambiguous` route slip through as unique. Pre-item-1
-/// the index read flagged it advisory and pressed on.
-#[test]
-fn route_task_complete_malformed_index_record_is_unreadable_2760() {
-    let home = tmp_home("idx-malformed");
-    seed_task_on_board(&home, "proj-i", "t-2760-idxbad");
-    super::board_router::record_task_project(&home, "t-2760-idxbad", "proj-i")
-        .expect("record index");
-    // A complete (trailing '\n') non-JSON index record.
-    append_raw(&home.join("task_index.jsonl"), "{not a valid index entry\n");
+    append_batch_at(
+        &board_root(&home, "default"),
+        &InstanceName::from("test:writer"),
+        vec![TaskEvent::DescriptionUpdated {
+            task_id: TaskId("t-2760-eof".to_string()),
+            by: InstanceName::from("test:writer"),
+            description: "after repair".to_string(),
+        }],
+    )
+    .expect("the next writer repairs the torn tail before appending");
 
-    match load_routed(&home, "t-2760-idxbad") {
-        Err(TaskRouteError::Unreadable { .. }) => {}
-        other => panic!(
-            "a complete-malformed task_index record must fail closed as Unreadable, got {other:?}"
-        ),
-    }
-}
-
-/// GREEN behaviour: a final unterminated EOF fragment in `task_index.jsonl` is
-/// repaired under the `task_index` lock, then the route resolves.
-#[test]
-fn route_task_repairs_index_eof_fragment_then_resolves_2760() {
-    let home = tmp_home("idx-eof");
-    seed_task_on_board(&home, "proj-ie", "t-2760-idxeof");
-    super::board_router::record_task_project(&home, "t-2760-idxeof", "proj-ie")
-        .expect("record index");
-    let index = home.join("task_index.jsonl");
-    append_raw(&index, "{torn index tail no newline");
-    assert!(!std::fs::read_to_string(&index).unwrap().ends_with('\n'));
-
-    let routed = load_routed(&home, "t-2760-idxeof")
-        .expect("a torn task_index EOF fragment must be repaired, then the route resolves");
-    assert_eq!(routed.task.id, "t-2760-idxeof");
-
-    let after = std::fs::read_to_string(&index).unwrap();
-    assert!(
-        after.ends_with('\n') && !after.contains("torn index tail"),
-        "the torn task_index fragment must be truncated out under the lock"
-    );
-}
-
-/// RED (forcing proof): a lone index entry that names a DIFFERENT board than the id
-/// physically occupies is a hard inconsistency → `Unreadable`, never trusting either
-/// side.
-#[test]
-fn route_task_index_physical_board_mismatch_is_unreadable_2760() {
-    let home = tmp_home("idx-mismatch");
-    seed_task_on_board(&home, "proj-real", "t-2760-mm");
-    // Index points at a board the id does NOT physically occupy.
-    super::board_router::record_task_project(&home, "t-2760-mm", "proj-wrong")
-        .expect("record index");
-
-    match load_routed(&home, "t-2760-mm") {
-        Err(TaskRouteError::Unreadable { .. }) => {}
-        other => panic!(
-            "an index entry naming a different board than the physical location must be \
-             Unreadable, got {other:?}"
-        ),
-    }
+    let repaired = std::fs::read_to_string(&log).unwrap();
+    assert!(!repaired.contains("torn half-written tail"));
+    assert!(repaired.ends_with('\n'));
+    let routed = load_routed(&home, "t-2760-eof").expect("repaired log remains readable");
+    assert_eq!(routed.task.description, "after repair");
 }
 
 // ── #2760 items 2+3+4: per-id lock + write-time revalidation + narrow ops ──
@@ -356,8 +306,8 @@ fn route_task_index_physical_board_mismatch_is_unreadable_2760() {
 // to that board (never the default board). The narrow external ops (usage-limit,
 // reclaim) carry no board path — they take a task-bound guard and return an outcome.
 
-/// Seed a Created+Claimed task OWNED by `owner` with `branch`, on `project`'s board,
-/// and record its index entry — the starting state for a reclaim / usage-limit
+/// Seed a Created+Claimed task OWNED by `owner` with `branch`, on `project`'s board —
+/// the starting state for a reclaim / usage-limit
 /// mutation (status `Claimed`, owner set, branch set).
 fn seed_owned_claimed(home: &Path, project: &str, id: &str, owner: &str, branch: &str) {
     let board = board_root(home, project);
@@ -387,11 +337,10 @@ fn seed_owned_claimed(home: &Path, project: &str, id: &str, owner: &str, branch:
         ],
     )
     .expect("seed owned+claimed task");
-    super::board_router::record_task_project(home, id, project).expect("record index");
 }
 
 fn record_on_board(home: &Path, project: &str, id: &str) -> crate::task_events::TaskRecord {
-    crate::task_events::replay_at(&board_root(home, project))
+    crate::task_events::projected_state_at(&board_root(home, project))
         .expect("replay board")
         .tasks
         .get(&TaskId(id.to_string()))
@@ -400,7 +349,7 @@ fn record_on_board(home: &Path, project: &str, id: &str) -> crate::task_events::
 }
 
 fn default_has_task(home: &Path, id: &str) -> bool {
-    crate::task_events::replay_at(&board_root(home, crate::task_events::DEFAULT_PROJECT))
+    crate::task_events::projected_state_at(&board_root(home, crate::task_events::DEFAULT_PROJECT))
         .map(|s| s.tasks.contains_key(&TaskId(id.to_string())))
         .unwrap_or(false)
 }
@@ -531,7 +480,6 @@ fn apply_usage_limit_block_stale_on_branch_mismatch_2760() {
 fn with_revalidated_board_refuses_when_route_became_ambiguous_2760() {
     let home = tmp_home("reval-ambig");
     seed_task_on_board(&home, "proj-rv", "t-2760-rv");
-    super::board_router::record_task_project(&home, "t-2760-rv", "proj-rv").expect("index");
     let routed = load_routed(&home, "t-2760-rv").expect("resolve");
 
     // A concurrent create lands the SAME id on another board → route now Ambiguous.

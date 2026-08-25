@@ -324,7 +324,7 @@ mod tests {
     }
 
     fn task_status_on_board(task_id: &str, board: &Path) -> Option<crate::task_events::TaskStatus> {
-        let state = crate::task_events::replay_at(board).unwrap();
+        let state = crate::task_events::projected_state_at(board).unwrap();
         state.tasks.get(&TaskId(task_id.into())).map(|r| r.status)
     }
 
@@ -605,8 +605,6 @@ mod tests {
         let home = tmp_home("assignee_close_project");
         let board = crate::task_events::board_root(&home, "proj-2498");
         seed_claimed_task_on_board("t-2498-project", "dev-agent", &board);
-        super::super::board_router::record_task_project(&home, "t-2498-project", "proj-2498")
-            .expect("record project index");
 
         let closed = auto_close_on_report(
             &home,
@@ -851,7 +849,7 @@ mod tests {
     }
 
     fn task_result(home: &Path, task_id: &str) -> Option<String> {
-        crate::task_events::replay(home)
+        crate::task_events::projected_state(home)
             .unwrap()
             .tasks
             .get(&TaskId(task_id.into()))

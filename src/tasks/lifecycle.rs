@@ -26,7 +26,7 @@ pub fn lifecycle_pass(home: &Path) -> (usize, usize, usize) {
 fn mark_stale_open_tasks(home: &Path) -> usize {
     let now = chrono::Utc::now();
     let stale_days = DEFAULT_STALE_DAYS;
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = crate::task_events::projected_state(home).unwrap_or_default();
     let emitter = crate::task_events::InstanceName::from("system:lifecycle");
     let mut count = 0;
 
@@ -84,7 +84,7 @@ fn cancel_stale_tasks(_home: &Path) -> usize {
 /// the active replay is a separate concern, deliberately not done here.
 fn archive_done_tasks(home: &Path) -> usize {
     let now = chrono::Utc::now();
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = crate::task_events::projected_state(home).unwrap_or_default();
     let archive_path = home.join("tasks-archive.jsonl");
     let already_archived = read_archived_task_ids(&archive_path);
 
@@ -228,7 +228,6 @@ mod tests {
                 .open(home.join(format!("task_events.{}", "jsonl")))
                 .unwrap();
             writeln!(f, "{}", serde_json::to_string(&env).unwrap()).unwrap();
-            crate::task_events::invalidate_replay_cache();
         };
         seed(
             1,
@@ -274,7 +273,7 @@ mod tests {
         assert_eq!(entries, 1, "no duplicate archive entries");
 
         // Terminal status is preserved (Done, never Cancelled).
-        let status = crate::task_events::replay(&home)
+        let status = crate::task_events::projected_state(&home)
             .unwrap()
             .tasks
             .get(&tid)
@@ -327,7 +326,6 @@ mod tests {
                 .open(home.join(format!("task_events.{}", "jsonl")))
                 .unwrap();
             writeln!(f, "{}", serde_json::to_string(&env).unwrap()).unwrap();
-            crate::task_events::invalidate_replay_cache();
         };
         seed(
             1,

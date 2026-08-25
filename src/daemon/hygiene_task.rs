@@ -310,7 +310,7 @@ mod tests {
     }
 
     fn board_state(home: &Path) -> TaskBoardState {
-        task_events::replay(home).expect("replay")
+        task_events::projected_state(home).expect("replay")
     }
 
     /// C1 (RED): concurrent double-fire for the SAME key must yield exactly

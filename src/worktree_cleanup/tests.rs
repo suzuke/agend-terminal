@@ -1413,7 +1413,7 @@ fn is_squash_gc_eligible_positive_cache_survives_default_advance_p3() {
 
 /// Board-side view of the hygiene tasks the sweep produced under `home`.
 fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .map(|s| {
             s.tasks
                 .values()

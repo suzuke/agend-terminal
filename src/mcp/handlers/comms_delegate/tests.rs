@@ -890,7 +890,7 @@ mod review_assignment_marker_tests {
             "owner mismatch must not create a store branch"
         );
         assert_eq!(
-            crate::task_events::replay(&home)
+            crate::task_events::projected_state(&home)
                 .unwrap()
                 .tasks
                 .get(&crate::task_events::TaskId("t-rev-1".into()))
@@ -1237,7 +1237,7 @@ mod review_assignment_marker_tests {
             "owner/repo",
         );
 
-        let state = crate::task_events::replay(&home).unwrap();
+        let state = crate::task_events::projected_state(&home).unwrap();
         assert_eq!(
             state
                 .tasks
@@ -1305,7 +1305,7 @@ mod review_assignment_marker_tests {
         );
 
         assert_eq!(
-            crate::task_events::replay(&home)
+            crate::task_events::projected_state(&home)
                 .unwrap()
                 .tasks
                 .get(&crate::task_events::TaskId("t-rev-1".into()))

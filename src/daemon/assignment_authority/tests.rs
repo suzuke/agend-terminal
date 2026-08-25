@@ -60,7 +60,7 @@ fn seed_open_task_as(home: &Path, task_id: &str, owner: &str) {
 }
 
 fn task_status(home: &Path, task_id: &str) -> crate::task_events::TaskStatus {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .unwrap()
         .tasks
         .get(&crate::task_events::TaskId::from(task_id))

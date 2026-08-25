@@ -5446,7 +5446,7 @@ fn mcp_terminal_report_settlement_refusal_is_disclosed_3295() {
         "{result}"
     );
 
-    let state = crate::task_events::replay_at(&home).expect("replay board");
+    let state = crate::task_events::projected_state_at(&home).expect("replay board");
     assert_eq!(
         state.tasks.get(&tid).map(|record| record.status),
         Some(crate::task_events::TaskStatus::Claimed),

@@ -70,6 +70,9 @@ anything the daemon can rebuild from scratch. No format commitment; any
 release may change or delete these. If deleting a tier (c) file changes
 behavior beyond a one-time rebuild cost, that's a bug — report it.
 
+Task-board `catalog.checkpoint.json` files are derived tier (c) artifacts.
+They may be deleted; the next catalog load rebuilds them from task events.
+
 ## Versioning mechanics (tier (a) fleet.yaml)
 
 - `FLEET_SCHEMA_VERSION` (`src/fleet/mod.rs`) is the version the daemon

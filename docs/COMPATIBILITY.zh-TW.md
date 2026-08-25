@@ -62,6 +62,9 @@ operator metadata——一個開放的 KV bag）。它們的相容性規則更�
 能從頭重建的東西。沒有格式保證；任何發行版都可能改動或刪除這些檔案。如果刪掉
 某個 tier (c) 檔案後，行為的改變超過一次性的重建成本，那就是 bug——請回報。
 
+Task board 的 `catalog.checkpoint.json` 是衍生的 tier (c) artifact，可以刪除；
+下次 catalog 載入時會從 task events 重新建立。
+
 ## Versioning mechanics (tier (a) fleet.yaml)
 
 - `FLEET_SCHEMA_VERSION`（`src/fleet/mod.rs`）是 daemon 讀寫所用的版本；

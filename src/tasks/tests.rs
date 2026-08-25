@@ -463,7 +463,7 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
     .expect("seed Created event");
 
     // Pre-condition: replay sees the ghost owner.
-    let pre = crate::task_events::replay(&home).expect("pre replay");
+    let pre = crate::task_events::projected_state(&home).expect("pre replay");
     assert_eq!(
         pre.tasks
             .get(&tid)
@@ -479,7 +479,7 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
     // live via `api::call`.
     reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
 
-    let post = crate::task_events::replay(&home).expect("post replay");
+    let post = crate::task_events::projected_state(&home).expect("post replay");
     let owner_after = post
         .tasks
         .get(&tid)
@@ -600,7 +600,7 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
     .expect("seed in_progress task");
 
     // Pre-condition: replay sees it in_progress + owned.
-    let pre = crate::task_events::replay(&home).expect("pre replay");
+    let pre = crate::task_events::projected_state(&home).expect("pre replay");
     let pre_rec = pre.tasks.get(&tid).expect("seeded task present");
     assert_eq!(pre_rec.status, TaskStatus::InProgress, "pre: in_progress");
     assert!(pre_rec.owner.is_some(), "pre: owned");
@@ -614,7 +614,7 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
     let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
     assert_eq!(released, vec![tid.clone()], "the stuck task is released");
 
-    let post = crate::task_events::replay(&home).expect("post replay");
+    let post = crate::task_events::projected_state(&home).expect("post replay");
     let post_rec = post.tasks.get(&tid).expect("task still present");
     assert_eq!(
         post_rec.status,
@@ -686,7 +686,7 @@ fn release_inprogress_orphans_preserves_exact_signed_binding() {
         "an exact signed durable binding must prevent release"
     );
 
-    let post = crate::task_events::replay(&home).expect("post replay");
+    let post = crate::task_events::projected_state(&home).expect("post replay");
     let post_rec = post.tasks.get(&tid).expect("task still present");
     assert_eq!(post_rec.status, TaskStatus::InProgress);
     assert_eq!(post_rec.owner.as_ref(), Some(&worker));
@@ -1421,7 +1421,7 @@ fn test_task_auto_unblock_when_all_deps_done() {
 /// Raw (unprojected) persisted status via an event-log replay of the task's board.
 fn raw_status_d63(home: &std::path::Path, id: &str) -> crate::task_events::TaskStatus {
     let routed = super::load_routed(home, id).expect("route task to its board");
-    crate::task_events::replay_at(routed.board().path())
+    crate::task_events::projected_state_at(routed.board().path())
         .expect("replay board")
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
@@ -2219,7 +2219,7 @@ fn cross_board_dep_detective_flags_but_does_not_release_in_progress_audit2_014()
     let board_a = super::board_router::route_task(&home, &a)
         .expect("route A's board")
         .1;
-    let persisted = crate::task_events::replay_at(&board_a)
+    let persisted = crate::task_events::projected_state_at(&board_a)
         .expect("replay A's board")
         .tasks
         .get(&crate::task_events::TaskId(a.clone()))
@@ -2290,7 +2290,7 @@ fn cross_board_dep_detective_release_toctou_skips_when_task_advances_audit2_014(
     let board_a = super::board_router::route_task(&home, &a)
         .expect("route A's board")
         .1;
-    let persisted = crate::task_events::replay_at(&board_a)
+    let persisted = crate::task_events::projected_state_at(&board_a)
         .expect("replay A's board")
         .tasks
         .get(&crate::task_events::TaskId(a.clone()))
@@ -2397,7 +2397,7 @@ fn cross_board_dep_derived_block_is_in_memory_not_persisted_2117_q2() {
     let board_a = super::board_router::route_task(&home, &a)
         .expect("route A's board")
         .1;
-    let persisted = crate::task_events::replay_at(&board_a)
+    let persisted = crate::task_events::projected_state_at(&board_a)
         .expect("replay A's board")
         .tasks
         .get(&crate::task_events::TaskId(a.clone()))
@@ -2609,7 +2609,7 @@ fn write_fleet_yaml(home: &std::path::Path, instances: &[&str]) {
 /// #2117 P1: two teams with distinct `source_repo`s get ISOLATED boards. A task
 /// created by teamA's member lands on teamA's board and is invisible to teamB's
 /// default (current-project) `list` — the new cross-board isolation. The
-/// `task_index` routes a later `done` to the right board, and `scope=fleet`
+/// the catalog routes a later `done` to the right board, and `scope=fleet`
 /// aggregates both.
 #[test]
 fn two_projects_get_isolated_boards_2117() {
@@ -2688,7 +2688,7 @@ teams:
         "fleet scope must see both boards' tasks: {all_ids:?}"
     );
 
-    // done routes via task_index to the task's board (cross-board O(1)).
+    // done routes through the bounded catalog to the task's board.
     let done = handle(
         &home,
         "devA",
@@ -3678,7 +3678,7 @@ fn migration_imports_legacy_tasks_to_event_log() {
     assert_eq!(report.skipped, 0);
 
     // Replay should observe 6 tasks at their pre-migration statuses.
-    let state = crate::task_events::replay(&home).unwrap();
+    let state = crate::task_events::projected_state(&home).unwrap();
     assert_eq!(state.tasks.len(), 6);
     let lookup = |id: &str| {
         state
@@ -3765,7 +3765,7 @@ fn migration_idempotent_on_second_run() {
 
     // Replay confirms exactly one TaskRecord (no duplicate Created
     // event accumulated across the two migration runs).
-    let state = crate::task_events::replay(&home).unwrap();
+    let state = crate::task_events::projected_state(&home).unwrap();
     assert_eq!(state.tasks.len(), 1);
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4878,19 +4878,21 @@ fn sweep_apply_routes_each_cancel_to_its_own_board_2760() {
     assert_eq!(count, 2, "both ids cancelled");
 
     // The project task's Cancelled landed on the PROJECT board, not the default.
-    let proj_rec = crate::task_events::replay_at(&crate::task_events::board_root(&home, "proj-sw"))
-        .expect("replay proj board")
-        .tasks
-        .get(&crate::task_events::TaskId(proj_id.clone()))
-        .cloned()
-        .expect("project task must exist on its own board");
+    let proj_rec =
+        crate::task_events::projected_state_at(&crate::task_events::board_root(&home, "proj-sw"))
+            .expect("replay proj board")
+            .tasks
+            .get(&crate::task_events::TaskId(proj_id.clone()))
+            .cloned()
+            .expect("project task must exist on its own board");
     assert_eq!(
         proj_rec.status,
         crate::task_events::TaskStatus::Cancelled,
         "project-board task cancelled on ITS board (not the default)"
     );
     let default_state =
-        crate::task_events::replay_at(&crate::task_events::board_root(&home, "default")).unwrap();
+        crate::task_events::projected_state_at(&crate::task_events::board_root(&home, "default"))
+            .unwrap();
     assert!(
         !default_state
             .tasks

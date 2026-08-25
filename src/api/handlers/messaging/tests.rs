@@ -2811,7 +2811,7 @@ fn seed_review_task(home: &std::path::Path, task_id: &str, reviewer: &str) {
 }
 
 fn task_status_of(home: &std::path::Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .unwrap_or_default()
         .tasks
         .get(&crate::task_events::TaskId(task_id.into()))
@@ -3274,7 +3274,7 @@ fn terminal_report_projects_result_via_track_dispatch() {
         Some(crate::task_events::TaskStatus::Done),
         "precondition: the real report entry auto-closed the task"
     );
-    let result = crate::task_events::replay(&home)
+    let result = crate::task_events::projected_state(&home)
         .unwrap()
         .tasks
         .get(&crate::task_events::TaskId("t-f1e".into()))
@@ -3930,7 +3930,7 @@ fn report_fields_on_kind_task_rejected_without_leaked_task() {
         "error code: {result}"
     );
     // The critical invariant: no task must have been created as a side effect.
-    let board = crate::task_events::replay(&home).unwrap_or_default();
+    let board = crate::task_events::projected_state(&home).unwrap_or_default();
     assert!(
         board.tasks.is_empty(),
         "rejected send must not leak a task — found {} task(s) on board",
@@ -4937,7 +4937,7 @@ fn task_status_3293(
     home: &std::path::Path,
     task_id: &str,
 ) -> Option<crate::task_events::TaskStatus> {
-    let state = crate::task_events::replay_at(home).expect("replay board");
+    let state = crate::task_events::projected_state_at(home).expect("replay board");
     state
         .tasks
         .get(&crate::task_events::TaskId(task_id.into()))
