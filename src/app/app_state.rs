@@ -915,24 +915,14 @@ impl AppState {
                         Ok(pane) => {
                             let tab_name = pane.agent_name.clone();
                             self.known_remote_agents.insert(tab_name.to_string());
-                            // #1591: this sync is add-only — a gone
-                            // agent's tab is RETAINED (stale output) so
-                            // scrollback survives. If a same-named agent
-                            // re-appears (recovery respawn / operator
-                            // create-after-delete churn), REUSE the
-                            // retained single-pane tab in place (the
-                            // fresh pane reconnects to the new instance;
-                            // the stale dead-connection pane is dropped)
-                            // instead of appending a DUPLICATE tab.
-                            // Preserves tab position + focus.
-                            if let Some(idx) =
-                                self.ui.layout.single_pane_tab_index_for_agent(&tab_name)
-                            {
-                                self.ui.layout.tabs[idx] =
-                                    crate::layout::Tab::new(tab_name.to_string(), pane);
+                            // This sync is add-only: a gone agent's pane is retained
+                            // for scrollback. Reconnect that leaf in place when the
+                            // agent reappears, including inside an operator split.
+                            if self.ui.layout.find_agent_pane(&tab_name).is_some() {
+                                debug_assert!(self.ui.layout.replace_agent_pane(&tab_name, pane));
                                 tracing::info!(
                                     agent = %name,
-                                    "reused retained tab for re-appeared remote agent (no duplicate)"
+                                    "reused retained pane for re-appeared remote agent (no duplicate)"
                                 );
                             } else {
                                 self.ui
