@@ -71,6 +71,14 @@ fn rebuild_count() -> u64 {
     BOARD_REBUILDS.with(std::cell::Cell::get)
 }
 
+fn reset_archive_bytes_read() {
+    ARCHIVE_BYTES_READ.with(|count| count.set(0));
+}
+
+fn archive_bytes_read() -> u64 {
+    ARCHIVE_BYTES_READ.with(std::cell::Cell::get)
+}
+
 fn replay_with_metadata_events(count: u64) -> TaskBoardState {
     let task_id = TaskId::from("t-20260824000000000000-1-1");
     let mut state = TaskBoardState::default();
@@ -240,8 +248,10 @@ fn shadow_equivalence_detects_current_state_and_high_water_mismatches() {
 
 #[test]
 fn projection_size_is_bounded_by_tasks_not_events() {
-    let one_x = BoardProjection::from_replay(replay_with_metadata_events(100));
-    let ten_x = BoardProjection::from_replay(replay_with_metadata_events(1_000));
+    let mut one_x = BoardProjection::from_replay(replay_with_metadata_events(100));
+    let mut ten_x = BoardProjection::from_replay(replay_with_metadata_events(1_000));
+    one_x.set_cursor(BoardCursor::from_folded_hot_log(1, 1, 1));
+    ten_x.set_cursor(BoardCursor::from_folded_hot_log(1, 1, 1));
     let one_x_bytes = serde_json::to_vec(&one_x).expect("serialize 1x projection");
     let ten_x_bytes = serde_json::to_vec(&ten_x).expect("serialize 10x projection");
 
@@ -259,6 +269,33 @@ fn projection_size_is_bounded_by_tasks_not_events() {
         "10x events grew bounded projection from {} to {} bytes",
         one_x_bytes.len(),
         ten_x_bytes.len()
+    );
+
+    let checkpoint_bytes = |projection: &BoardProjection| {
+        serde_json::to_vec(&CheckpointV1 {
+            schema: CHECKPOINT_SCHEMA,
+            board: super::super::DEFAULT_PROJECT.to_string(),
+            cursor: *projection.cursor().expect("cursor"),
+            tasks: projection
+                .task_snapshots()
+                .into_iter()
+                .map(|task| task.as_ref().clone())
+                .collect(),
+            last_seq_per_instance: projection.last_seq_per_instance.clone(),
+            events_folded: projection.events_folded,
+            last_order_key: projection.last_order_key.clone(),
+            written_at: "2026-08-25T00:00:00Z".into(),
+        })
+        .expect("serialize checkpoint")
+    };
+    let one_x_checkpoint = checkpoint_bytes(&one_x);
+    let ten_x_checkpoint = checkpoint_bytes(&ten_x);
+    let allowed_growth = one_x_checkpoint.len().div_ceil(20);
+    assert!(
+        ten_x_checkpoint.len() <= one_x_checkpoint.len() + allowed_growth,
+        "10x events grew checkpoint by more than 5%: {} -> {} bytes",
+        one_x_checkpoint.len(),
+        ten_x_checkpoint.len()
     );
 }
 
@@ -1468,6 +1505,22 @@ fn checkpoint_reload_skips_full_rebuild_and_folds_only_hot_tail() {
 }
 
 #[test]
+fn checkpoint_second_boot_reads_zero_archive_bytes() {
+    let home = tmp_home("checkpoint-zero-archive-read");
+    let task_id = TaskId::from("t-20260825000000000000-6-2");
+    let archive = super::super::archive_dir(&home).join("0001.jsonl");
+    write_envelopes(&archive, &[envelope(1, created(&task_id, "archive"))]);
+
+    load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("adopt archive");
+    reset_archive_bytes_read();
+    let reloaded =
+        load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("checkpoint reload");
+
+    assert_eq!(archive_bytes_read(), 0);
+    assert_eq!(reloaded.task(&task_id).expect("task").title, "archive");
+}
+
+#[test]
 fn invalid_checkpoint_is_scrubbed_rebuilt_and_replaced() {
     let home = tmp_home("checkpoint-heal");
     let task_id = TaskId::from("t-20260825000000000000-7-1");
@@ -1523,4 +1576,318 @@ fn manifest_digest_mismatch_fails_closed_when_rebuild_is_required() {
     let error = load_board_projection(&home, super::super::DEFAULT_PROJECT)
         .expect_err("digest mismatch must fail closed");
     assert!(error.contains("archive digest mismatch"), "{error}");
+}
+
+#[test]
+fn out_of_order_tail_fails_closed_then_background_rebuild_restores_authority() {
+    let home = tmp_home("out-of-order-rebuild");
+    let task_id = TaskId::from("t-20260825000000000000-3-5");
+    let writer = InstanceName::from("writer");
+    super::super::append_at(&home, &writer, created(&task_id, "known")).expect("seed");
+    let catalog = for_home(&home);
+    catalog.route(&task_id).expect("initial route");
+
+    let mut stale = envelope_from(
+        "external",
+        1,
+        TaskEvent::DescriptionUpdated {
+            task_id: task_id.clone(),
+            by: writer,
+            description: "stale".into(),
+        },
+    );
+    stale.timestamp = "2000-01-01T00:00:00Z".into();
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(super::super::log_path(&home))
+        .expect("open log");
+    use std::io::Write as _;
+    writeln!(log, "{}", serde_json::to_string(&stale).expect("serialize"))
+        .expect("append stale tail");
+    log.sync_all().expect("sync tail");
+
+    assert!(matches!(
+        catalog.route(&task_id),
+        Err(CatalogRouteError::Unreadable)
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while catalog.snapshot_advisory().0 != Phase::Ready && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(catalog.snapshot_advisory().0, Phase::Ready);
+    assert_eq!(
+        catalog.route(&task_id).expect("restored route").1.title,
+        "known"
+    );
+}
+
+#[test]
+fn durable_line_ahead_of_catalog_is_folded_without_reminting_its_seq() {
+    use std::io::Write as _;
+
+    let home = tmp_home("crash-after-fsync");
+    let task_id = TaskId::from("t-20260825000000000000-4-2");
+    let writer = InstanceName::from("writer");
+    super::super::append_at(&home, &writer, created(&task_id, "before")).expect("seed");
+    let catalog = for_home(&home);
+    catalog.route(&task_id).expect("initial route");
+
+    let durable = envelope_at(
+        "2099-01-01T00:00:00Z",
+        2,
+        TaskEvent::DescriptionUpdated {
+            task_id: task_id.clone(),
+            by: writer.clone(),
+            description: "durable".into(),
+        },
+    );
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(super::super::log_path(&home))
+        .expect("open log");
+    writeln!(
+        log,
+        "{}",
+        serde_json::to_string(&durable).expect("serialize")
+    )
+    .expect("append durable line");
+    log.sync_all().expect("durable point");
+
+    super::super::append_at(
+        &home,
+        &writer,
+        TaskEvent::TagsSet {
+            task_id: task_id.clone(),
+            tags: vec!["after-restart".into()],
+        },
+    )
+    .expect("catch up and commit");
+
+    let envelopes = super::super::stream_envelopes_at(&home).expect("stream");
+    assert_eq!(
+        envelopes.iter().map(|env| env.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let task = catalog.route(&task_id).expect("caught-up route").1;
+    assert_eq!(task.description, "durable");
+    assert_eq!(task.tags, vec!["after-restart"]);
+}
+
+#[test]
+fn commit_refuses_building_catalog_without_writing_bytes() {
+    let home = tmp_home("building-write-gate");
+    let key = std::fs::canonicalize(&home).expect("canonical home");
+    CATALOGS.lock().insert(
+        key.clone(),
+        Arc::new(StrictTaskCatalog::with_home(
+            Some(key.clone()),
+            Phase::Building,
+            BTreeMap::new(),
+        )),
+    );
+
+    let result = super::super::append_at(
+        &home,
+        &InstanceName::from("writer"),
+        created(&TaskId::from("t-20260825000000000000-5-3"), "must not land"),
+    );
+    assert!(result.is_err());
+    assert!(!super::super::log_path(&home).exists());
+    CATALOGS.lock().remove(&key);
+}
+
+#[test]
+fn future_checkpoint_schema_is_ignored_and_rebuilt() {
+    let home = tmp_home("checkpoint-schema");
+    let task_id = TaskId::from("t-20260825000000000000-7-2");
+    write_envelopes(
+        &super::super::log_path(&home),
+        &[envelope(1, created(&task_id, "schema"))],
+    );
+    load_board_projection(&home, super::super::DEFAULT_PROJECT).expect("adopt");
+
+    let path = checkpoint_path(&home);
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read checkpoint"))
+            .expect("parse checkpoint");
+    checkpoint["schema"] = serde_json::Value::from(CHECKPOINT_SCHEMA + 1);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&checkpoint).expect("serialize checkpoint"),
+    )
+    .expect("write future checkpoint");
+
+    let before = rebuild_count();
+    let rebuilt = load_board_projection(&home, super::super::DEFAULT_PROJECT)
+        .expect("rebuild future checkpoint");
+    assert_eq!(rebuild_count(), before + 1);
+    assert_eq!(
+        rebuilt.task(&task_id).expect("rebuilt task").title,
+        "schema"
+    );
+    let replaced: CheckpointV1 =
+        serde_json::from_slice(&std::fs::read(path).expect("read replacement"))
+            .expect("valid replacement");
+    assert_eq!(replaced.schema, CHECKPOINT_SCHEMA);
+}
+
+#[test]
+fn archive_adoption_runs_in_background_and_publishes_ready_catalog() {
+    let home = tmp_home("background-adoption");
+    let task_id = TaskId::from("t-20260825000000000000-9-1");
+    let archive = super::super::archive_dir(&home).join("0001.jsonl");
+    write_envelopes(&archive, &[envelope(1, created(&task_id, "adopted"))]);
+
+    let catalog = for_home(&home);
+    if catalog.snapshot_advisory().0 == Phase::Building {
+        assert!(matches!(
+            catalog.route(&task_id),
+            Err(CatalogRouteError::Unreadable)
+        ));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while catalog.snapshot_advisory().0 == Phase::Building && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+
+    assert_eq!(catalog.snapshot_advisory().0, Phase::Ready);
+    assert_eq!(
+        catalog.route(&task_id).expect("adopted route").1.title,
+        "adopted"
+    );
+    assert!(manifest_path(&home).is_file());
+    assert!(checkpoint_path(&home).is_file());
+}
+
+#[test]
+fn rebuild_retries_rotation_and_publishes_concurrent_tail() {
+    let home = tmp_home("rebuild-concurrent");
+    let task_id = TaskId::from("t-20260825000000000000-9-2");
+    let writer = InstanceName::from("writer");
+    write_envelopes(
+        &super::super::log_path(&home),
+        &[envelope(1, created(&task_id, "before"))],
+    );
+    let catalog =
+        StrictTaskCatalog::with_home(Some(home.clone()), Phase::Building, BTreeMap::new());
+
+    catalog
+        .rebuild_from_disk_with_hook(&home, |attempt| {
+            if attempt != 0 {
+                return;
+            }
+            let update = envelope_at(
+                "2026-08-25T00:01:00Z",
+                2,
+                TaskEvent::DescriptionUpdated {
+                    task_id: task_id.clone(),
+                    by: writer.clone(),
+                    description: "after".into(),
+                },
+            );
+            let log_path = super::super::log_path(&home);
+            let mut bytes = std::fs::read(&log_path).expect("read first snapshot");
+            bytes.extend_from_slice(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&update).expect("serialize update")
+                )
+                .as_bytes(),
+            );
+            crate::store::atomic_write(&log_path, &bytes).expect("rotate concurrent log");
+        })
+        .expect("second rebuild attempt stabilizes");
+
+    assert_eq!(catalog.snapshot_advisory().0, Phase::Ready);
+    assert_eq!(
+        catalog
+            .route(&task_id)
+            .expect("rebuilt route")
+            .1
+            .description,
+        "after"
+    );
+}
+
+#[test]
+fn rebuild_fails_closed_after_three_rotations() {
+    let home = tmp_home("rebuild-attempt-budget");
+    let task_id = TaskId::from("t-20260825000000000000-9-3");
+    write_envelopes(
+        &super::super::log_path(&home),
+        &[envelope(1, created(&task_id, "unstable"))],
+    );
+    let catalog =
+        StrictTaskCatalog::with_home(Some(home.clone()), Phase::Building, BTreeMap::new());
+
+    assert!(matches!(
+        catalog.rebuild_from_disk_with_hook(&home, |_| {
+            let log_path = super::super::log_path(&home);
+            let bytes = std::fs::read(&log_path).expect("read log");
+            crate::store::atomic_write(&log_path, &bytes).expect("rotate log");
+        }),
+        Err(CatalogRouteError::Unreadable)
+    ));
+    let Phase::Unhealthy { causes, .. } = catalog.snapshot_advisory().0 else {
+        panic!("rebuild must publish Unhealthy after its bounded retries");
+    };
+    assert!(causes[0].contains("exhausted 3 attempts"), "{causes:?}");
+}
+
+#[test]
+fn compaction_catches_up_external_tail_before_rotating_hot_log() {
+    use std::io::Write as _;
+
+    let home = tmp_home("compact-catch-up");
+    let task_id = TaskId::from("t-20260825000000000000-9-4");
+    let writer = InstanceName::from("writer");
+    super::super::append_at(&home, &writer, created(&task_id, "before")).expect("seed");
+    let catalog = for_home(&home);
+    catalog.route(&task_id).expect("initial route");
+
+    let update = envelope_at(
+        "2099-01-01T00:00:00Z",
+        2,
+        TaskEvent::DescriptionUpdated {
+            task_id: task_id.clone(),
+            by: writer,
+            description: "external tail".into(),
+        },
+    );
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(super::super::log_path(&home))
+        .expect("open log");
+    writeln!(
+        log,
+        "{}",
+        serde_json::to_string(&update).expect("serialize")
+    )
+    .expect("append external update");
+    log.sync_all().expect("sync update");
+
+    compact_at_with_keep(&home, 1).expect("compact");
+    assert_eq!(
+        catalog
+            .route(&task_id)
+            .expect("route after compact")
+            .1
+            .description,
+        "external tail"
+    );
+    let before = rebuild_count();
+    let checkpoint = load_board_projection(&home, super::super::DEFAULT_PROJECT)
+        .expect("post-compaction checkpoint");
+    assert_eq!(
+        rebuild_count(),
+        before,
+        "checkpoint must avoid archive replay"
+    );
+    assert_eq!(
+        checkpoint
+            .task(&task_id)
+            .expect("checkpoint task")
+            .description,
+        "external tail"
+    );
 }

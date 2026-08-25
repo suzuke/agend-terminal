@@ -2333,44 +2333,7 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
 /// per-instance seq sidecar is independent of this rewrite, so an instance whose
 /// events are all archived keeps a correct seq high-water ([`next_seq_under_lock`]).
 fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
-    let log_path = log_path(board);
-    if !log_path.exists() {
-        return Ok(());
-    }
-    let suffix = chrono::Utc::now().format("%Y%m%dT%H%M%S%6fZ").to_string();
-
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        let content = std::fs::read_to_string(log_path)?;
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() <= keep {
-            return Ok(Vec::new());
-        }
-        let split = lines.len() - keep;
-        let archived: String = lines[..split].iter().map(|l| format!("{l}\n")).collect();
-        let kept: String = lines[split..].iter().map(|l| format!("{l}\n")).collect();
-
-        let archive = archive_dir(
-            log_path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("log_path has no parent"))?,
-        );
-        std::fs::create_dir_all(&archive)?;
-        let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
-        crate::store::atomic_write(&archive_path, archived.as_bytes())?;
-        crate::store::atomic_write(log_path, kept.as_bytes())?;
-        catalog::refresh_archive_manifest(board)?;
-        // S1: compaction just rewrote (shrank) the hot log. Invalidate the
-        // replay cache so the next reader replays the compacted file instead of
-        // a stale entry — mirrors every append path (:1124/:1211/:1297). Today
-        // this is correct-by-ACCIDENT (the shorter file changes the
-        // `(len, mtime)` cache key → key miss); the explicit bump makes it
-        // correct-by-CONTRACT and survives any future cache-key change.
-        invalidate_replay_cache();
-        // We've already rewritten the hot file — return no extra lines
-        // to append. (H10: no SEQ_CACHE to invalidate — `max_seq_for_instance`
-        // always re-scans the on-disk file, so the atomic replace is observed.)
-        Ok(Vec::new())
-    })
+    catalog::compact_at_with_keep(board, keep)
 }
 
 /// Opportunistic, non-fatal hot-log compaction after an append (mirrors

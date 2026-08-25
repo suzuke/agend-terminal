@@ -183,15 +183,12 @@ fn task_event_appends_have_one_catalog_commit_path() {
     );
     assert_eq!(
         facade.matches(needle).count(),
-        1,
-        "task_events.rs may lock the log only for its compaction rewrite"
+        0,
+        "task_events.rs must not write the task-event log directly"
     );
-    let compaction = facade
-        .find("fn compact_at_with_keep")
-        .expect("compaction implementation");
-    let lock = facade.find(needle).expect("compaction writer lock");
-    assert!(
-        lock > compaction,
-        "the remaining facade lock must belong to compaction, not an event append"
+    assert_eq!(
+        catalog.matches(needle).count(),
+        1,
+        "catalog may lock the task-event log only for its compaction rewrite"
     );
 }

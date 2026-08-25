@@ -708,12 +708,14 @@ fn hysteresis_replay_lossless_across_compaction() {
     // append (HIGH_WATER+1) triggers a trim that archives the early slice.
     let existing = fs::read_to_string(&log).unwrap();
     let start = existing.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let first: TaskEventEnvelope = serde_json::from_str(existing.lines().next().unwrap()).unwrap();
+    let base = chrono::DateTime::parse_from_rfc3339(&first.timestamp).unwrap();
     let mut lines = existing;
     for i in start..=COMPACTION_HIGH_WATER {
         let env = TaskEventEnvelope {
             schema_version: SCHEMA_VERSION,
             seq: i as u64,
-            timestamp: format!("2026-06-21T{:02}:00:00Z", i % 24),
+            timestamp: (base + chrono::Duration::microseconds(i as i64)).to_rfc3339(),
             instance: InstanceName::from("filler"),
             emitter_id: None,
             event: sample_event(&format!("f-{i}")),
