@@ -777,15 +777,18 @@ where
     catalog
         .refresh_all(&home, true)
         .map_err(|_| anyhow::anyhow!("task catalog is unreadable"))?;
-    let mut inner = catalog
-        .inner
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if inner.phase != Phase::Ready {
-        anyhow::bail!("task catalog is not ready");
+    // Keep the board lock, but do not hold the catalog lock while `build`
+    // checks dependencies: a cross-board check may commit to another board.
+    {
+        let mut inner = catalog
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            anyhow::bail!("task catalog is not ready");
+        }
+        catch_up_board_locked(&mut inner, &board_id, board)?;
     }
-
-    catch_up_board_locked(&mut inner, &board_id, board)?;
     let state = super::replay_uncached(board)?;
     let events = match build(&state) {
         Ok(events) => events,
@@ -793,6 +796,14 @@ where
     };
     if events.is_empty() {
         return Ok(Ok(Vec::new()));
+    }
+
+    let mut inner = catalog
+        .inner
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if inner.phase != Phase::Ready {
+        anyhow::bail!("task catalog is not ready");
     }
 
     let count = events.len();
