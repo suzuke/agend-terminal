@@ -479,6 +479,28 @@ mod tests {
             "#1591: retained tab now carries the fresh (reconnected) pane"
         );
     }
+
+    #[test]
+    fn replace_reappeared_agent_inside_split_without_duplicate_tab() {
+        let mut layout = Layout::new();
+        layout.push_tab_preserve_focus(Tab::new("team".to_string(), leaf(1, "peer")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "returning"));
+        layout.tabs[0].focus_id = 2;
+        let mut fresh = leaf(99, "returning");
+        fresh.display_name = Some("fresh".to_string());
+
+        assert!(layout.replace_agent_pane("returning", fresh));
+
+        assert_eq!(layout.tabs.len(), 1, "must not append a duplicate tab");
+        assert_eq!(layout.tabs[0].root().pane_count(), 2, "split is preserved");
+        assert!(layout.find_agent_pane("peer").is_some(), "peer is preserved");
+        assert_eq!(layout.tabs[0].focus_id, 2, "focused pane id is preserved");
+        assert_eq!(
+            layout.find_pane_mut(2).unwrap().display_name.as_deref(),
+            Some("fresh"),
+            "the retained leaf carries the fresh connection"
+        );
+    }
     #[test]
     fn move_pane_across_tabs_same_tab_rejected() {
         let mut layout = Layout::new();
