@@ -1222,6 +1222,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(path, format!("{rewritten}\n")).expect("rewrite task event log");
+        crate::task_events::catalog::rebuild_for_test(home);
     }
 
     #[test]

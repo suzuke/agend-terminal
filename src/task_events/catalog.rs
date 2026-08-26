@@ -64,6 +64,14 @@ pub fn for_home(home: &Path) -> Arc<StrictTaskCatalog> {
     catalog
 }
 
+#[cfg(test)]
+pub fn rebuild_for_test(home: &Path) {
+    let key = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    CATALOGS
+        .lock()
+        .insert(key.clone(), Arc::new(build_catalog(&key)));
+}
+
 fn needs_background_adoption(home: &Path) -> bool {
     board_paths(home).is_ok_and(|boards| {
         boards.values().any(|board| {
