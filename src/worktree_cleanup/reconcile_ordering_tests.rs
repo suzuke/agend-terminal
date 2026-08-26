@@ -53,7 +53,7 @@ fn git_in(dir: &Path, args: &[&str]) {
 }
 
 fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
-    let tasks = crate::task_events::replay(home);
+    let tasks = crate::task_events::projected_state(home);
     let Ok(board) = tasks else { return vec![] };
     board
         .tasks
@@ -171,7 +171,7 @@ fn reconcile_runs_before_fetch_loop_ordering() {
         .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .and_then(|v| v["timestamp"].as_str().map(String::from))
         .expect("reconcile event must have timestamp");
-    let task_list = crate::task_events::replay(&home).expect("replay tasks");
+    let task_list = crate::task_events::projected_state(&home).expect("replay tasks");
     let hygiene_ts = task_list
         .tasks
         .values()

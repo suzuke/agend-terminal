@@ -85,7 +85,7 @@ fn write_binding(home: &Path, repo: &Path) {
 }
 
 fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .map(|state| {
             state
                 .tasks

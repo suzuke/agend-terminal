@@ -167,7 +167,7 @@ pub(super) fn create_with_supersession(
     };
 
     if seqs.is_empty() {
-        let state = match crate::task_events::replay_at(&board) {
+        let state = match crate::task_events::projected_state_at(&board) {
             Ok(state) => state,
             Err(error) => {
                 return serde_json::json!({
@@ -189,7 +189,6 @@ pub(super) fn create_with_supersession(
         };
         let task = super::handler::read_task_record_at(&board, &existing_id)
             .map(|record| super::record_to_task(&record));
-        let _ = super::board_router::record_task_project(home, &existing_id, project);
         drop(id_locks);
         super::task_terminal_cleanup(home, predecessor_id);
         return serde_json::json!({
@@ -200,7 +199,6 @@ pub(super) fn create_with_supersession(
         });
     }
 
-    let _ = super::board_router::record_task_project(home, successor_id, project);
     let task = super::handler::read_task_record_at(&board, successor_id)
         .map(|record| super::record_to_task(&record));
     drop(id_locks);

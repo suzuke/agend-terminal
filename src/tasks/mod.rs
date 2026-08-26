@@ -504,7 +504,7 @@ impl<'a> DepResolver<'a> {
             return None;
         }
         let map = self.board_cache.entry(board.clone()).or_insert_with(|| {
-            crate::task_events::replay_at(&board)
+            crate::task_events::projected_state_at(&board)
                 .map(|st| {
                     st.tasks
                         .iter()
@@ -1155,8 +1155,8 @@ pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, Task
     })
 }
 
-/// Return all tasks as typed structs. **PR3 cutover** — sources state
-/// from `task_events::replay()` instead of the legacy `tasks.json`.
+/// Return all tasks as typed structs. Sources authoritative state from the
+/// task catalog instead of replaying history or reading legacy `tasks.json`.
 /// Dep-derived blocking is computed in-memory at this call (option (a)
 /// per m-42); explicit operator-emitted Blocked/Unblocked events are
 /// honoured by replay's `apply()` as before.
@@ -1173,7 +1173,7 @@ pub fn list_all(home: &Path) -> Vec<Task> {
 /// board, cached per pass). For single-project deployments every dep is on this
 /// same board → no cross-board read → byte-identical.
 pub(crate) fn list_all_at(home: &Path, board: &Path) -> Vec<Task> {
-    let state = crate::task_events::replay_at(board).unwrap_or_default();
+    let state = crate::task_events::projected_state_at(board).unwrap_or_default();
     let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
     apply_dependency_eval_in_memory(&mut tasks, home, board);
     tasks
@@ -1275,7 +1275,7 @@ pub fn link_branch_to_task(home: &Path, task_id: &str, branch: &str) -> anyhow::
 /// until the next maintenance pass retries.
 pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
     let now = chrono::Utc::now();
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = crate::task_events::projected_state(home).unwrap_or_default();
     let emitter = crate::task_events::InstanceName::from("system:overdue_sweep");
     let mut released = Vec::new();
 
@@ -1365,7 +1365,7 @@ pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileRep
         // derived view (`list_all_at`/`list_all_boards`) would relabel an
         // InProgress task with an unsatisfied dep to `Blocked` before we ever
         // see it, hiding it from both the Claimed and InProgress arms below.
-        let state = match crate::task_events::replay_at(&board) {
+        let state = match crate::task_events::projected_state_at(&board) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -1526,7 +1526,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             skipped: 0,
         });
     }
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = crate::task_events::projected_state(home).unwrap_or_default();
     let migrator = crate::task_events::InstanceName::from("system:legacy_migration");
     let mut events: Vec<crate::task_events::TaskEvent> = Vec::new();
     let mut migrated = 0usize;
@@ -1633,8 +1633,8 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
     }
     // PR4 — retire tasks.json: rename the live file to a `.legacy_pre_v2`
     // sidecar so the operator can archeologically inspect the
-    // pre-migration state, but the daemon's read path (now via
-    // `task_events::replay()`) no longer touches it. Idempotent: if the
+    // pre-migration state, but the daemon's catalog read path no longer
+    // touches it. Idempotent: if the
     // file is already absent the rename silently no-ops. Only triggers
     // when the migration found legacy data — otherwise leaving the empty
     // file in place avoids surprising the operator with sudden file

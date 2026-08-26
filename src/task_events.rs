@@ -1179,33 +1179,6 @@ fn archive_dir(board: &Path) -> PathBuf {
     board.join("task_events_archive")
 }
 
-/// CR-2026-06-14 (#2212 orphan-prune follow-up): does `board` have ANY on-disk
-/// event bytes — a non-empty hot log or a non-empty archive segment?
-///
-/// `replay_at` SKIPS corrupt (non-JSON) lines (#1988 half-write tolerance), so a
-/// board whose ENTIRE log is garbage replays to `Ok(empty)` — indistinguishable
-/// BY STATE from a board that genuinely holds no tasks (terminal tasks stay in
-/// `state.tasks`, so a readable non-empty board always replays ≥1 task). The
-/// orphan-prune ([`crate::tasks::board_router::live_task_ids`]) uses this to
-/// disambiguate: an empty replay WITH on-disk bytes is an unreadable/corrupt
-/// board, not an empty one, so its index entries must NOT be treated as orphans.
-/// Cheap O(1) metadata stats; no parse.
-pub(crate) fn board_has_event_bytes(board: &Path) -> bool {
-    let nonempty = |p: &Path| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false);
-    if nonempty(&log_path(board)) {
-        return true;
-    }
-    if let Ok(entries) = std::fs::read_dir(archive_dir(board)) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") && nonempty(&p) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Append one event, returning the newly assigned monotonic seq#.
 ///
 /// The seq is computed by tail-scanning the hot log under the same lock
@@ -1429,78 +1402,36 @@ pub(crate) fn append_done_if_legal_at(
     }
 }
 
-/// Tail-scan the hot log for the highest seq# this instance has emitted.
-/// Returns `(max_seq, nonblank_line_count)` — the line count is folded into the
-/// SAME scan (free) so the append path can hand it to [`maybe_compact_events`] as
-/// a hysteresis hint, avoiding a second full read of the hot log per append.
-/// Best-effort: malformed lines are skipped because [`replay`] is the
-/// strict reader; here we just need the high-water mark.
-///
-/// H10 (CR-2026-06-14): ALWAYS scan the on-disk hot log — never short-circuit on
-/// a process-local cache. Every caller runs inside an `append_lines_under_lock`
-/// closure (under the cross-process append flock), but a cache is process-local:
-/// a high-water mark cached before ANOTHER process (e.g. the daemon's
-/// auto_close/sweep/lifecycle vs the MCP `tasks::handle`) appended the same
-/// instance is a STALE high-water → the next append here would mint a seq `<=` an
-/// already-persisted one, and replay's idempotency skip (`seq <= last_seen`)
-/// would SILENTLY DROP the real task transition. The on-disk file is the only
-/// source of truth all appenders share. The scan is cheap because task-event
-/// appends are agent/human-paced (not a hot loop), batches share one scan, and
-/// `compact_at` (now wired via [`maybe_compact_events`]) bounds the hot log to
-/// `COMPACTION_KEEP`. Because compaction ARCHIVES the older slice OUT of the hot
-/// log, this hot-only scan no longer sees an instance whose events were all
-/// archived — so callers go through [`next_seq_under_lock`], which maxes this
-/// scan with the per-instance seq sidecar (which survives compaction) to keep
-/// the high-water correct. A cross-process-correct approach must re-read on
-/// change anyway; the previous process-local cache was O(1) only by trusting
-/// stale cross-process state — the exact bug avoided here.
+// ── Per-instance seq high-water sidecar (retention seq-safety) ────────
+//
+// The sidecar survives compaction and is read under the cross-process append
+// flock. Missing/corrupt state is rebuilt once from the authoritative history.
+#[cfg(test)]
 fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Result<(u64, usize)> {
     let content = match std::fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(e) => return Err(e.into()),
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(err) => return Err(err.into()),
     };
-    let mut max = 0u64;
-    let mut lines = 0usize;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
+    let mut max = 0;
+    let mut lines = 0;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
         lines += 1;
-        if let Ok(env) = serde_json::from_str::<TaskEventEnvelope>(line) {
-            if &env.instance == instance && env.seq > max {
-                max = env.seq;
+        if let Ok(envelope) = serde_json::from_str::<TaskEventEnvelope>(line) {
+            if &envelope.instance == instance {
+                max = max.max(envelope.seq);
             }
         }
     }
     Ok((max, lines))
 }
 
-// ── Per-instance seq high-water sidecar (retention seq-safety) ────────
-//
-// `compact_at` archives the older slice of the hot log, but
-// `max_seq_for_instance` scans ONLY the hot log (H10's cross-process
-// contract). So once ALL of an instance's events have been archived, the
-// hot scan returns 0 and the next append would mint a seq `<=` an
-// already-persisted one — replay's idempotency skip (`seq <= last_seen`)
-// would then SILENTLY DROP the real transition. (This is exactly why
-// `compact` was left dead: an unbounded hot log keeps the full history in
-// one file, so the hot scan was always complete.)
-//
-// Fix: persist a per-instance high-water in a small sidecar that survives
-// compaction. It is a DERIVED CACHE of the authoritative event log, not a
-// new source of truth — any load failure (missing / corrupt) rebuilds it
-// from a full hot+archive scan, so it can never wedge. The committed
-// high-water is `max(sidecar, hot-scan)`: the hot-scan term keeps it
-// crash-safe (a crash between the sidecar write and the hot append leaves
-// the sidecar AHEAD, never behind → at worst a seq gap, never a collision).
 fn seq_sidecar_path(board: &Path) -> PathBuf {
     board.join(format!("{LOG_NAME}_seq.json"))
 }
 
 /// Best-effort scan of hot log + every archive segment for the max seq per
-/// instance. Lenient parse (skip torn lines — replay is the strict reader),
-/// mirroring [`max_seq_for_instance`]. Used to (re)build the sidecar.
+/// instance. Used only to (re)build a missing or corrupt sidecar.
 fn scan_seq_highwater(board: &Path) -> BTreeMap<String, u64> {
     let mut hw: BTreeMap<String, u64> = BTreeMap::new();
     let mut absorb = |path: &Path| {
@@ -1551,257 +1482,77 @@ fn write_seq_highwater(board: &Path, hw: &BTreeMap<String, u64>) -> anyhow::Resu
 }
 
 /// Compute the start seq for `instance`'s batch of `count` events and persist
-/// the bumped high-water — all under the caller's append lock. The high-water
-/// is `max(sidecar, hot-scan)` (archive-safe + crash-safe). The sidecar is
+/// the bumped high-water — all under the caller's append lock. The sidecar is
 /// written BEFORE the caller appends the lines, so a crash can only leave it
 /// ahead of the hot log (a harmless seq gap), never behind (a collision →
 /// silent replay drop).
 ///
-/// Returns `(start_seq, hot_lines_pre_append)`: the second value is the hot-log
-/// line count from the same scan, which the caller adds `count` to and hands to
-/// [`maybe_compact_events`] as the post-append hysteresis hint (so the common
-/// path needs no extra hot-log read).
 fn next_seq_under_lock(
     board: &Path,
-    log_path: &Path,
     instance: &InstanceName,
     count: u64,
-) -> anyhow::Result<(u64, usize)> {
+    catalog_floor: u64,
+) -> anyhow::Result<u64> {
     let mut hw = load_seq_highwater(board);
-    let (hot_max, hot_lines) = max_seq_for_instance(log_path, instance)?;
-    let prev = hw.get(instance.as_str()).copied().unwrap_or(0).max(hot_max);
+    let prev = hw
+        .get(instance.as_str())
+        .copied()
+        .unwrap_or(0)
+        .max(catalog_floor);
     let start = prev + 1;
     hw.insert(instance.as_str().to_string(), start + count - 1);
     write_seq_highwater(board, &hw)?;
-    Ok((start, hot_lines))
+    Ok(start)
 }
 
-// ── Replay cache ─────────────────────────────────────────────────────
-// Read-side cache: avoids full-file replay when nothing has changed.
-// Keyed on (home, generation, file_len, mtime_ns):
-// - generation: process-wide monotonic counter, catches in-process
-//   concurrent appends (fixes Linux ext4 mtime ms-granularity flake)
-// - file_len + mtime_ns: catch external modifications (cross-process
-//   writes, compaction, tests truncating the log)
+// ── Catalog-backed projection reads ───────────────────────────────
 
-static REPLAY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-type ReplayCacheKey = (std::path::PathBuf, u64, u64, i64);
-
-struct ReplayCacheEntry {
-    key: ReplayCacheKey,
-    state: TaskBoardState,
+/// Return the default board's bounded catalog projection.
+pub fn projected_state(home: &Path) -> anyhow::Result<TaskBoardState> {
+    projected_state_at(&board_root(home, DEFAULT_PROJECT))
 }
 
-// #2117 P0: per-board-keyed map (was a single global `Option`). The map key is
-// the board root; the entry's `key` field still carries the full freshness tuple
-// (path, generation, len, mtime). Single-board (default) keeps exactly one entry
-// → byte-identical; P1 multi-board can't cross-contaminate state between boards.
-static REPLAY_CACHE: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<PathBuf, ReplayCacheEntry>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-fn replay_cache_key(board: &Path) -> ReplayCacheKey {
-    let gen = REPLAY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    let log = log_path(board);
-    let (log_len, mtime_ns) = std::fs::metadata(&log)
-        .ok()
-        .map(|m| {
-            let len = m.len();
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            (len, mtime)
-        })
-        .unwrap_or((0, 0));
-    (board.to_path_buf(), gen, log_len, mtime_ns)
+/// Board-root variant of [`projected_state`]. This compatibility-shaped view
+/// does not scan event history; the catalog remains the authority.
+pub(crate) fn projected_state_at(board: &Path) -> anyhow::Result<TaskBoardState> {
+    let (home, board_id) = catalog::board_identity(board)?;
+    catalog::for_home(&home)
+        .board_state(&board_id)
+        .map_err(|error| anyhow::anyhow!("task catalog is unreadable: {error:?}"))
 }
 
-pub fn invalidate_replay_cache() {
-    REPLAY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
-
-// ── Replay: strict reader (forward-compat fail-closed) ─────────────
-
-/// Fold the entire on-disk event history (archive + hot file) into a
-/// `TaskBoardState`. Strict: any envelope whose `schema_version` exceeds
-/// [`SCHEMA_VERSION`] aborts the replay (forward-compat fail-closed),
-/// and any line that fails to deserialize as a known [`TaskEvent`]
-/// variant aborts (per dev-reviewer-2 must-have: replay must NOT silently
-/// skip unknown envelopes).
-/// #1990 item 4: process-global once-per-boot latch. The per-tick task-board
-/// readers (cron gate in `cron_tick.rs`, idle watchdog) swallow a fail-closed
-/// replay error into a read-gate, so without this the board silently freezes and
-/// the operator has no cause to look at. Boot-scoped (a restart re-alerts — the
-/// cause either healed or still blocks).
-static REPLAY_FAILCLOSED_EVENT_EMITTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// #1990 item 4 (follows the #1972 crash-budget surface pattern): when [`replay`]
-/// fail-closes on a forward-incompatible record (#1992 — a future-version or
-/// unknown-variant envelope), make it OPERATOR-VISIBLE. The daemon keeps running
-/// while the per-tick callers swallow the `Err`, so an operator otherwise sees a
-/// frozen task board with no explanation. The fix is dual: ERROR-log every
-/// occurrence (greppable) and emit ONE `event_log` entry per boot (latched so
-/// per-tick callers can't spam). Observation only: the fail-closed `Err` still
-/// propagates unchanged, so no recovery semantics change (same discipline as
-/// #1972). A transient IO error (not the "fail-closed" class) is left alone.
-///
-/// Classification is by the `"fail-closed"` substring of the error — a contract
-/// pinned at `read_envelopes_strict`'s two `bail!` sites; keep them in lockstep.
-/// Known limitation (#1990 item 4, reviewer-2 minor 2): only failures that flow
-/// through [`replay`] are surfaced; the timeline queries `envelopes_for_task` /
-/// `stream_envelopes` fail-close without surfacing. The board-freeze alert here
-/// is the primary operator signal, so that narrower timeline-query gap is
-/// accepted rather than expanding scope.
-fn surface_failclosed_replay_once(board: &Path, err: &anyhow::Error) {
-    let msg = err.to_string();
-    // stringly-allow: `err` is an `anyhow::Error` from replay with no typed
-    // variant for the fail-closed condition; the message text is the only signal
-    // for the once-per-boot board-freeze alert gate.
-    if !msg.contains("fail-closed") {
-        return;
-    }
-    tracing::error!(
-        error = %msg,
-        "task-board replay FAIL-CLOSED — the board will not advance until resolved (upgrade the daemon to a version that understands this log, or quarantine the offending record)"
-    );
-    if !REPLAY_FAILCLOSED_EVENT_EMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::event_log::log(
-            board,
-            "task_replay_fail_closed",
-            "task-board",
-            &format!(
-                "task-board replay fail-closed — the board is frozen until resolved: {msg}. \
-                 Fix: upgrade the daemon to a version that understands this log, or quarantine \
-                 the offending record. Further failures this boot log at error level only."
-            ),
-        );
-    }
-}
-
+// Test-only compatibility names keep the historical behavioral suite useful
+// without restoring a production replay authority path.
+#[cfg(test)]
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
     replay_at(&board_root(home, DEFAULT_PROJECT))
 }
 
-/// #2117 board-root variant of [`replay`].
+#[cfg(test)]
 pub(crate) fn replay_at(board: &Path) -> anyhow::Result<TaskBoardState> {
-    let incumbent = replay_at_incumbent(board);
-    compare_catalog_shadow(board, incumbent.as_ref().ok());
-    incumbent
-}
-
-fn replay_at_incumbent(board: &Path) -> anyhow::Result<TaskBoardState> {
-    let key = replay_cache_key(board);
-    {
-        let cache = REPLAY_CACHE.lock();
-        if let Some(entry) = cache.get(board) {
-            if entry.key == key {
-                return Ok(entry.state.clone());
-            }
-        }
-    }
-
-    let state = match replay_uncached(board) {
-        Ok(s) => s,
-        Err(e) => {
-            // #1990 item 4: surface the fail-closed stall before the per-tick
-            // caller swallows the Err into a read-gate.
-            surface_failclosed_replay_once(board, &e);
-            return Err(e);
-        }
-    };
-
-    REPLAY_CACHE.lock().insert(
-        board.to_path_buf(),
-        ReplayCacheEntry {
-            key,
-            state: state.clone(),
-        },
-    );
-
-    Ok(state)
+    replay_strict_at_incumbent(board)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.path.display(), error.cause))
 }
 
 #[cfg(test)]
-thread_local! {
-    static REPLAY_UNCACHED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+pub(crate) fn invalidate_replay_cache() {}
 
-#[cfg(test)]
-fn reset_replay_uncached_calls() {
-    REPLAY_UNCACHED_CALLS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-fn replay_uncached_calls() -> u64 {
-    REPLAY_UNCACHED_CALLS.with(std::cell::Cell::get)
-}
-
-fn replay_uncached(board: &Path) -> anyhow::Result<TaskBoardState> {
-    #[cfg(test)]
-    REPLAY_UNCACHED_CALLS.with(|count| count.set(count.get() + 1));
-
-    let mut state = TaskBoardState::default();
-
-    let archive_dir = archive_dir(board);
-    if archive_dir.is_dir() {
-        let mut archives: Vec<PathBuf> = std::fs::read_dir(&archive_dir)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-            .collect();
-        archives.sort();
-        for path in archives {
-            let mut envelopes = Vec::new();
-            read_envelopes_strict(&path, &mut envelopes)?;
-            sort_envelopes(&mut envelopes);
-            for env in &envelopes {
-                state.apply(env);
-            }
-        }
-    }
-
-    let log_path = log_path(board);
-    if log_path.exists() {
-        let mut envelopes = Vec::new();
-        read_envelopes_strict(&log_path, &mut envelopes)?;
-        sort_envelopes(&mut envelopes);
-        for env in &envelopes {
-            state.apply(env);
-        }
-    }
-
-    Ok(state)
-}
-
-// ── #2760 item 1: router-only STRICT replay (route-local complete-record proof) ──
+// ── Strict historical fold for catalog build, scrub, and tests ──
 //
-// `replay_uncached` (above) is the FLEET-WIDE reader: it SKIPS a non-JSON line as a
-// tolerated half-write (#1988) and serves the rest. That leniency is right for a
-// display/list read but WRONG for the per-id ROUTER authority: a skipped record
-// could be the very `Created`/`Cancelled` event that decides whether the target id
-// lives on THIS board, so a silent skip turns a real hit into a false miss (or a
-// real duplicate into a false unique). `replay_strict_at` is the router-ONLY reader
-// that fails closed instead:
+// Production authority reads use `task_events::catalog`. This scanner remains
+// only for the catalog's bounded rebuild path and forensic regression tests. It:
 //   - ANY complete (newline-terminated) malformed record — non-JSON, a
 //     `schema_version` newer than supported, or a well-formed-but-undeserializable
-//     envelope — is a hard `StrictReplayError` (the router maps it to `Unreadable`).
+//     envelope — is a hard `StrictReplayError`.
 //   - ONLY a final unterminated EOF fragment on the LIVE log is tolerable: a crash
 //     mid-`append_lines_under_lock` (append-in-place, no tmp+rename) leaves exactly
 //     such a torn tail. It is repaired ONCE under the SAME writer lock (quarantine +
 //     truncate-to-last-newline + fsync), then the scan re-runs on the clean file.
 //   - Archives are written tmp+rename (atomic), so a torn tail there is real
 //     corruption, NOT a repairable fragment → `StrictReplayError`.
-// The fleet-wide `replay`/`replay_uncached`/`read_envelopes_strict` path is
-// deliberately UNCHANGED (this is additive — no fleet-wide behaviour change).
+// Authority never calls this on a warm query.
 
-/// #2760 item 1: why the router-only strict replay refused to anchor a route — the
-/// board's committed history could not be proven complete. The router maps this to
-/// [`crate::tasks::TaskRouteError::Unreadable`].
+/// Why a strict historical fold could not prove the committed history complete.
 #[derive(Debug)]
 pub(crate) struct StrictReplayError {
     pub path: PathBuf,
@@ -1850,9 +1601,8 @@ enum StrictScan {
     LiveFragment,
 }
 
-/// One strict scan of `board` (archives then live log), no repair. Mirrors
-/// [`replay_uncached`]'s per-file sort+apply so a corruption-free board yields the
-/// SAME state as the lenient reader.
+/// One strict scan of `board` (archives then live log), no repair. This is the
+/// rebuild/test path; production reads use the catalog.
 fn replay_strict_scan(board: &Path) -> Result<StrictScan, StrictReplayError> {
     let mut state = TaskBoardState::default();
     let malformed = |path: &Path, cause: String| StrictReplayError {
@@ -1923,13 +1673,6 @@ fn replay_strict_scan(board: &Path) -> Result<StrictScan, StrictReplayError> {
     Ok(StrictScan::Complete(state))
 }
 
-/// #2760 item 1: the router-only strict replay. See the module comment above.
-pub(crate) fn replay_strict_at(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
-    let incumbent = replay_strict_at_incumbent(board);
-    compare_catalog_shadow(board, incumbent.as_ref().ok());
-    incumbent
-}
-
 fn replay_strict_at_incumbent(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
     match replay_strict_scan(board)? {
         StrictScan::Complete(state) => Ok(state),
@@ -1946,37 +1689,6 @@ fn replay_strict_at_incumbent(board: &Path) -> Result<TaskBoardState, StrictRepl
                 }),
             }
         }
-    }
-}
-
-fn compare_catalog_shadow(board: &Path, incumbent: Option<&TaskBoardState>) {
-    let identity = crate::task_events::catalog::board_identity(board);
-    let shadow = identity.and_then(|(home, board_id)| {
-        let catalog = crate::task_events::catalog::for_home(&home);
-        match incumbent {
-            Some(replay) => catalog
-                .board_matches_replay(&board_id, replay)
-                .map_err(|err| anyhow::anyhow!("{err:?}")),
-            None => Ok(Some(matches!(
-                catalog.board(&board_id),
-                Err(crate::task_events::catalog::CatalogRouteError::Unreadable)
-            ))),
-        }
-    });
-    if matches!(shadow, Ok(None)) {
-        tracing::debug!(
-            board = %board.display(),
-            "task catalog shadow advanced after incumbent replay; comparison skipped"
-        );
-    } else if !matches!(shadow, Ok(Some(true))) {
-        crate::task_events::catalog::record_shadow_divergence();
-        tracing::error!(
-            board = %board.display(),
-            incumbent_ok = incumbent.is_some(),
-            shadow = ?shadow,
-            divergence_count = crate::task_events::catalog::shadow_divergence_count(),
-            "task catalog board shadow diverged from incumbent replay"
-        );
     }
 }
 
@@ -2027,7 +1739,6 @@ fn repair_live_trailing_fragment(board: &Path) -> Result<(), StrictReplayError> 
     f.sync_all()
         .map_err(|e| err(format!("fsync after truncate: {e}")))?;
     crate::store::fsync_parent_dir(&path);
-    invalidate_replay_cache();
     tracing::warn!(
         tag = "#2760-eof-fragment-repaired",
         board = %board.display(),

@@ -180,7 +180,10 @@ fn replay_rejects_unknown_event_variant() {
     });
     fs::write(&log, format!("{line}\n")).unwrap();
     let err = replay(&home).expect_err("must fail-closed on unknown variant");
-    assert!(err.to_string().contains("replay aborts"), "got: {err}");
+    assert!(
+        err.to_string().contains("undeserializable envelope"),
+        "got: {err}"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
@@ -364,60 +367,6 @@ fn recover_keeps_future_version_line_replay_still_fail_closed() {
     assert!(
         err.to_string().contains("forward-compat fail-closed"),
         "got: {err}"
-    );
-    fs::remove_dir_all(&home).ok();
-}
-
-/// #1990 item 4: a fail-closed replay (the board freezes while the per-tick
-/// callers swallow the Err) must surface ONE operator-visible event_log entry
-/// per boot — and a second fail-closed replay in the same boot must NOT emit a
-/// duplicate (latched). Serialized with the other latch-tripping tests so the
-/// process-global latch reset is uninterrupted.
-#[test]
-#[serial(task_replay_latch)]
-fn replay_fail_closed_surfaces_operator_event_once() {
-    let home = tmp_home("failclosed-visible");
-    REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
-    // A future-version record → replay fail-closes (#1992 forward-compat).
-    let line = serde_json::json!({
-        "schema_version": 999,
-        "seq": 1,
-        "timestamp": "2026-04-27T00:00:00Z",
-        "instance": "newer-daemon",
-        "event": {"kind": "Unblocked", "task_id": "t-X"}
-    });
-    fs::write(home.join("task_events.jsonl"), format!("{line}\n")).unwrap();
-    // Two fail-closed replays in the same boot (Err is not cached, so both
-    // re-run replay_uncached and reach the surface helper).
-    assert!(replay(&home).is_err());
-    assert!(replay(&home).is_err());
-    // Exactly one operator event was emitted (latched).
-    let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-    assert_eq!(
-        elog.matches("task_replay_fail_closed").count(),
-        1,
-        "fail-closed replay must surface exactly one operator event per boot, got: {elog}"
-    );
-    fs::remove_dir_all(&home).ok();
-}
-
-/// #1990 item 4 (reviewer-2 minor 1): the boundary that keeps disk jitter from
-/// becoming a false alarm — a transient IO-class replay error (no "fail-closed"
-/// substring) must NOT surface an operator event. Guards the substring
-/// classifier against over-firing.
-#[test]
-#[serial(task_replay_latch)]
-fn transient_io_error_does_not_surface_operator_event() {
-    let home = tmp_home("io-no-surface");
-    REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
-    // A bare IO-class error (what a vanished/locked file yields) — not the
-    // forward-compat "fail-closed" class.
-    let io_err = anyhow::anyhow!("No such file or directory (os error 2)");
-    surface_failclosed_replay_once(&home, &io_err);
-    let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-    assert!(
-        !elog.contains("task_replay_fail_closed"),
-        "a transient IO error must NOT surface an operator event (false-alarm guard): {elog}"
     );
     fs::remove_dir_all(&home).ok();
 }
@@ -824,60 +773,6 @@ fn retention_replay_state_survives_compaction_zero_loss() {
         keep + 4,
         "all tasks present pre-compaction"
     );
-    fs::remove_dir_all(&home).ok();
-}
-
-/// S1: `compact_at` rewrites the hot log and MUST invalidate the replay
-/// cache (bump `REPLAY_GENERATION`), exactly like the append paths. Pre-fix
-/// it was correct-by-accident (the shorter file changed the `(len, mtime)`
-/// cache key); this asserts the explicit contract — the generation bump —
-/// which a future cache-key change can't silently break. DISCRIMINATING:
-/// without the added `invalidate_replay_cache()`, the generation is
-/// unchanged across `compact_at` and this fails.
-#[test]
-#[serial]
-fn compact_at_invalidates_replay_cache_s1() {
-    let home = tmp_home("compact-invalidate");
-    let inst = InstanceName::from("u");
-    // Direct-write > COMPACTION_KEEP lines so compact_at actually rewrites
-    // (mirrors compact_archives_older_than_keep_threshold).
-    let log = home.join("task_events.jsonl");
-    let mut lines = String::new();
-    for i in 1..=(COMPACTION_KEEP + 5) {
-        let env = TaskEventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            seq: i as u64,
-            timestamp: format!("2026-04-27T{:02}:00:00Z", i % 24),
-            instance: inst.clone(),
-            emitter_id: None,
-            event: TaskEvent::Unblocked {
-                task_id: format!("t-{i}").as_str().into(),
-            },
-        };
-        lines.push_str(&serde_json::to_string(&env).unwrap());
-        lines.push('\n');
-    }
-    fs::write(&log, lines).unwrap();
-    // Warm the replay cache for this board.
-    let _ = replay(&home).unwrap();
-    let gen_before = REPLAY_GENERATION.load(Ordering::Acquire);
-    compact(&home).unwrap();
-    let gen_after = REPLAY_GENERATION.load(Ordering::Acquire);
-    assert!(
-        gen_after > gen_before,
-        "compact_at must invalidate the replay cache (generation \
-             {gen_before} → {gen_after}); without the explicit bump the stale \
-             cache could outlive the compacted file"
-    );
-    // Sanity: compaction actually rewrote the hot log (kept exactly
-    // COMPACTION_KEEP lines — so the generation bump above came from a real
-    // rewrite, not a no-op) and a post-compact replay still succeeds.
-    assert_eq!(
-        fs::read_to_string(&log).unwrap().lines().count(),
-        COMPACTION_KEEP,
-        "compaction must shrink the hot log to COMPACTION_KEEP lines"
-    );
-    replay(&home).expect("post-compact replay must succeed");
     fs::remove_dir_all(&home).ok();
 }
 

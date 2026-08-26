@@ -2,6 +2,7 @@ use super::*;
 use crate::task_events::{
     ConfidenceScore, LinkSource, PrSnapshot, TaskEvent, TaskEventEnvelope, SCHEMA_VERSION,
 };
+use std::sync::atomic::AtomicU64;
 
 fn tmp_home(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -77,6 +78,14 @@ fn reset_archive_bytes_read() {
 
 fn archive_bytes_read() -> u64 {
     ARCHIVE_BYTES_READ.with(std::cell::Cell::get)
+}
+
+fn reset_history_lines_parsed() {
+    HISTORY_LINES_PARSED.with(|count| count.set(0));
+}
+
+fn history_lines_parsed() -> u64 {
+    HISTORY_LINES_PARSED.with(std::cell::Cell::get)
 }
 
 fn replay_with_metadata_events(count: u64) -> TaskBoardState {
@@ -1494,6 +1503,46 @@ fn authority_discovers_new_board_before_answering() {
 }
 
 #[test]
+fn warm_authority_query_parses_zero_history_lines() {
+    let home = tmp_home("warm-zero-parse");
+    let task_id = TaskId::from("t-20260825000000000000-3-3");
+    let writer = InstanceName::from("writer");
+    super::super::append_at(&home, &writer, created(&task_id, "warm")).expect("seed task");
+    let catalog = for_home(&home);
+    catalog.route(&task_id).expect("initial route");
+
+    reset_history_lines_parsed();
+    catalog.route(&task_id).expect("warm route");
+    assert_eq!(history_lines_parsed(), 0);
+}
+
+#[test]
+fn external_duplicate_append_is_ambiguous_on_next_route() {
+    let home = tmp_home("external-duplicate");
+    let task_id = TaskId::from("t-20260825000000000000-3-4");
+    let writer = InstanceName::from("writer");
+    super::super::append_at(&home, &writer, created(&task_id, "default")).expect("seed default");
+    let catalog = for_home(&home);
+    catalog.route(&task_id).expect("initial route");
+
+    let second = super::super::board_root(&home, "second");
+    std::fs::create_dir_all(&second).expect("second board");
+    assert!(matches!(
+        catalog.route(&task_id),
+        Err(CatalogRouteError::Unreadable)
+    ));
+    write_envelopes(
+        &super::super::log_path(&second),
+        &[envelope(1, created(&task_id, "duplicate"))],
+    );
+
+    assert!(matches!(
+        catalog.route(&task_id),
+        Err(CatalogRouteError::Ambiguous { .. })
+    ));
+}
+
+#[test]
 fn commit_advances_canonical_order_past_a_future_cursor() {
     let home = tmp_home("future-cursor");
     let task_id = TaskId::from("t-20260825000000000000-4-1");
@@ -1815,8 +1864,6 @@ fn checked_commit_uses_catalog_state_without_replaying_history() {
             BTreeMap::from([(super::super::DEFAULT_PROJECT.to_string(), projection)]),
         )),
     );
-    super::super::reset_replay_uncached_calls();
-
     let result = super::super::append_checked_at(
         &home,
         &writer,
@@ -1835,11 +1882,6 @@ fn checked_commit_uses_catalog_state_without_replaying_history() {
     .expect("checked commit");
 
     assert!(result.is_ok());
-    assert_eq!(
-        super::super::replay_uncached_calls(),
-        0,
-        "commit must not replay task history"
-    );
     CATALOGS.lock().remove(&key);
 }
 

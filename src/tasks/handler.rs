@@ -25,7 +25,7 @@ pub(super) fn read_task_record_at(
     board: &Path,
     id: &str,
 ) -> Option<crate::task_events::TaskRecord> {
-    let state = crate::task_events::replay_at(board).ok()?;
+    let state = crate::task_events::projected_state_at(board).ok()?;
     state
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
@@ -323,7 +323,6 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     }
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
-            let _ = super::board_router::record_task_project(home, &id, &project);
             if args["project"].as_str().is_some() {
                 crate::daemon::task_sweep::note_explicit_project(home, &project);
             }
@@ -2338,7 +2337,7 @@ fn cascade_cancel_children(
     // locks (which would require sorted multi-lock acquisition); the children are
     // all on this one board and the batch append rides its board writer lock. The
     // pre-#2760 batch semantics are unchanged.
-    let Ok(state) = crate::task_events::replay_at(board) else {
+    let Ok(state) = crate::task_events::projected_state_at(board) else {
         return;
     };
     let parent_tid = crate::task_events::TaskId(parent_id.to_string());

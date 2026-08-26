@@ -1,8 +1,7 @@
-//! Bounded task-state projection for the catalog shadow path.
+//! Bounded task-state catalog for task-board authority reads and writes.
 //!
-//! This P2 shadow deliberately has no authority yet: it projects incumbent
-//! replay results into O(tasks) state and verifies that every catalog read is
-//! fresh before it can be compared with the incumbent answer.
+//! The append-only event log remains the durable audit source. Warm authority
+//! reads use this O(tasks) projection and never replay history on demand.
 
 use super::{
     DoneSource, HistoryEntry, InstanceName, PrId, TaskBoardState, TaskEvent, TaskEventEnvelope,
@@ -13,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Enough recent activity for the task-board detail view without retaining an
@@ -27,14 +26,14 @@ const CHECKPOINT_FILE: &str = "catalog.checkpoint.json";
 static CATALOGS: std::sync::LazyLock<
     parking_lot::Mutex<BTreeMap<PathBuf, Arc<StrictTaskCatalog>>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
-static SHADOW_DIVERGENCES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 std::thread_local! {
     static BOARD_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ARCHIVE_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HISTORY_LINES_PARSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Return the daemon-local shadow catalog for one AgEnD home.
+/// Return the daemon-local task catalog for one AgEnD home.
 pub fn for_home(home: &Path) -> Arc<StrictTaskCatalog> {
     let key = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let mut catalogs = CATALOGS.lock();
@@ -72,14 +71,6 @@ fn needs_background_adoption(home: &Path) -> bool {
                 && archive_paths(board).is_ok_and(|archives| !archives.is_empty())
         })
     })
-}
-
-pub(crate) fn record_shadow_divergence() {
-    SHADOW_DIVERGENCES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn shadow_divergence_count() -> u64 {
-    SHADOW_DIVERGENCES.load(Ordering::Relaxed)
 }
 
 /// Canonical within-file fold order used by the incumbent replay.
@@ -130,7 +121,9 @@ enum HotLogFreshness {
 fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshness {
     if observed == cursor {
         HotLogFreshness::Current
-    } else if observed.inode == cursor.inode && observed.len > cursor.len {
+    } else if (observed.inode == cursor.inode || (cursor.inode == [0; 24] && cursor.len == 0))
+        && observed.len > cursor.len
+    {
         HotLogFreshness::CatchUp {
             start: cursor.len,
             end: observed.len,
@@ -144,6 +137,8 @@ fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshne
 pub struct BoardCursor {
     hot_log: HotLogStamp,
     live_offset: u64,
+    #[serde(default)]
+    hot_events: u64,
 }
 
 impl BoardCursor {
@@ -152,7 +147,17 @@ impl BoardCursor {
         Self::from_hot_log_identity(identity_from_u64(inode), len, mtime_ns)
     }
 
+    #[cfg(test)]
     fn from_hot_log_identity(inode: [u8; 24], len: u64, mtime_ns: i128) -> Self {
+        Self::from_hot_log_identity_with_events(inode, len, mtime_ns, 0)
+    }
+
+    fn from_hot_log_identity_with_events(
+        inode: [u8; 24],
+        len: u64,
+        mtime_ns: i128,
+        hot_events: u64,
+    ) -> Self {
         Self {
             hot_log: HotLogStamp {
                 inode,
@@ -160,12 +165,17 @@ impl BoardCursor {
                 mtime_ns,
             },
             live_offset: len,
+            hot_events,
         }
     }
 
     #[cfg(test)]
     pub fn live_offset(&self) -> u64 {
         self.live_offset
+    }
+
+    fn hot_events(&self) -> u64 {
+        self.hot_events
     }
 
     fn classify_observed(&self, inode: [u8; 24], len: u64, mtime_ns: i128) -> HotLogFreshness {
@@ -466,10 +476,13 @@ impl StrictTaskCatalog {
                     return Err(CatalogRouteError::Unreadable);
                 }
                 let folded_len = start + consumed;
-                next.set_cursor(BoardCursor::from_hot_log_identity(
+                let hot_events = next.cursor().map(BoardCursor::hot_events).unwrap_or(0)
+                    + envelopes.len() as u64;
+                next.set_cursor(BoardCursor::from_hot_log_identity_with_events(
                     observed.inode,
                     folded_len,
                     observed.mtime_ns,
+                    hot_events,
                 ));
                 inner.boards.insert(board_id.to_string(), next);
                 rebuild_routes(&mut inner);
@@ -627,7 +640,6 @@ impl StrictTaskCatalog {
         }
     }
 
-    #[cfg(test)]
     pub fn route(
         &self,
         task_id: &TaskId,
@@ -665,7 +677,6 @@ impl StrictTaskCatalog {
         (route, Some(revision))
     }
 
-    #[cfg(test)]
     pub fn all_tasks(&self) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
         self.all_tasks_with_revision().0
     }
@@ -681,6 +692,14 @@ impl StrictTaskCatalog {
         if inner.phase != Phase::Ready {
             return (Err(CatalogRouteError::Unreadable), None);
         }
+        if let Some(boards) = inner.duplicates.values().next() {
+            return (
+                Err(CatalogRouteError::Ambiguous {
+                    boards: boards.clone(),
+                }),
+                Some(catalog_revision(&inner)),
+            );
+        }
         let tasks = inner
             .boards
             .values()
@@ -689,20 +708,7 @@ impl StrictTaskCatalog {
         (Ok(tasks), Some(catalog_revision(&inner)))
     }
 
-    /// Per-board event counts for detecting whether a shadow comparison crossed
-    /// a catalog refresh boundary.
-    pub(crate) fn current_revision(&self) -> Result<CatalogRevision, CatalogRouteError> {
-        self.ensure_fresh()?;
-        let inner = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.phase != Phase::Ready {
-            return Err(CatalogRouteError::Unreadable);
-        }
-        Ok(catalog_revision(&inner))
-    }
-
+    #[cfg(test)]
     pub fn board(
         &self,
         board_id: &str,
@@ -722,12 +728,7 @@ impl StrictTaskCatalog {
             .ok_or(CatalogRouteError::NotFound)
     }
 
-    /// Compare one incumbent board replay with the bounded shadow projection.
-    pub(crate) fn board_matches_replay(
-        &self,
-        board_id: &str,
-        replay: &TaskBoardState,
-    ) -> Result<Option<bool>, CatalogRouteError> {
+    pub fn board_state(&self, board_id: &str) -> Result<TaskBoardState, CatalogRouteError> {
         self.ensure_fresh()?;
         let inner = self
             .inner
@@ -739,7 +740,7 @@ impl StrictTaskCatalog {
         inner
             .boards
             .get(board_id)
-            .map(|board| board.matches_current_replay(replay))
+            .map(BoardProjection::current_state)
             .ok_or(CatalogRouteError::NotFound)
     }
 
@@ -874,8 +875,12 @@ where
     }
 
     let count = events.len();
-    let (start_seq, hot_lines) =
-        super::next_seq_under_lock(board, &log_path, instance, count as u64)?;
+    let catalog_floor = inner
+        .boards
+        .get(&board_id)
+        .and_then(|projection| projection.last_seq_for(instance))
+        .unwrap_or(0);
+    let start_seq = super::next_seq_under_lock(board, instance, count as u64, catalog_floor)?;
     let timestamp = next_commit_timestamp(
         inner
             .boards
@@ -926,22 +931,23 @@ where
     next.apply_ordered_batch(&envelopes)
         .map_err(|error| anyhow::anyhow!("catalog apply after durable append: {error:?}"))?;
     let stamp = hot_log_stamp(board).map_err(anyhow::Error::msg)?;
-    next.set_cursor(BoardCursor::from_hot_log_identity(
+    let post_append_events =
+        next.cursor().map(BoardCursor::hot_events).unwrap_or(0) + envelopes.len() as u64;
+    next.set_cursor(BoardCursor::from_hot_log_identity_with_events(
         stamp.inode,
         stamp.len,
         stamp.mtime_ns,
+        post_append_events,
     ));
     inner.boards.insert(board_id.clone(), next);
     rebuild_routes(&mut inner);
 
-    super::invalidate_replay_cache();
     drop(inner);
     drop(file_lock);
     drop(_refresh);
 
-    let post_append_lines = hot_lines + envelopes.len();
-    super::maybe_compact_events(board, post_append_lines);
-    if post_append_lines > super::COMPACTION_HIGH_WATER {
+    super::maybe_compact_events(board, post_append_events as usize);
+    if post_append_events as usize > super::COMPACTION_HIGH_WATER {
         let manifest = manifest_for_archives(board).map_err(anyhow::Error::msg)?;
         write_manifest(board, &manifest).map_err(anyhow::Error::msg)?;
         catalog
@@ -995,10 +1001,12 @@ fn catch_up_board_locked(
                 .ok_or_else(|| anyhow::anyhow!("catalog board disappeared"))?;
             next.apply_ordered_batch(&envelopes)
                 .map_err(|error| anyhow::anyhow!("catalog catch-up: {error:?}"))?;
-            next.set_cursor(BoardCursor::from_hot_log_identity(
+            let hot_events = cursor.hot_events() + envelopes.len() as u64;
+            next.set_cursor(BoardCursor::from_hot_log_identity_with_events(
                 observed.inode,
                 start + consumed,
                 observed.mtime_ns,
+                hot_events,
             ));
             inner.boards.insert(board_id.to_string(), next);
             rebuild_routes(inner);
@@ -1026,10 +1034,12 @@ fn catch_up_projection_locked(
             projection
                 .apply_ordered_batch(&envelopes)
                 .map_err(|error| format!("rebuild catch-up is not canonical: {error:?}"))?;
-            projection.set_cursor(BoardCursor::from_hot_log_identity(
+            let hot_events = cursor.hot_events() + envelopes.len() as u64;
+            projection.set_cursor(BoardCursor::from_hot_log_identity_with_events(
                 observed.inode,
                 end,
                 observed.mtime_ns,
+                hot_events,
             ));
             Ok(true)
         }
@@ -1169,17 +1179,17 @@ pub(super) fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<
         )?;
         crate::store::atomic_write(log_path, kept.as_bytes())?;
         refresh_archive_manifest(board)?;
-        super::invalidate_replay_cache();
         let stamp = hot_log_stamp(board).map_err(anyhow::Error::msg)?;
         let mut projection = inner
             .boards
             .get(&board_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("catalog board disappeared during compaction"))?;
-        projection.set_cursor(BoardCursor::from_hot_log_identity(
+        projection.set_cursor(BoardCursor::from_hot_log_identity_with_events(
             stamp.inode,
             stamp.len,
             stamp.mtime_ns,
+            kept.lines().filter(|line| !line.trim().is_empty()).count() as u64,
         ));
         inner.boards.insert(board_id.clone(), projection);
         Ok(Vec::new())
@@ -1310,16 +1320,19 @@ fn load_checkpoint(board: &Path, board_id: &str) -> Result<Option<BoardProjectio
         projection
             .apply_ordered_batch(&tail)
             .map_err(|err| format!("checkpoint tail is not canonical: {err:?}"))?;
-        projection.set_cursor(BoardCursor::from_hot_log_identity(
+        let hot_events = checkpoint.cursor.hot_events() + tail.len() as u64;
+        projection.set_cursor(BoardCursor::from_hot_log_identity_with_events(
             observed.inode,
             checkpoint.cursor.live_offset + consumed,
             observed.mtime_ns,
+            hot_events,
         ));
     } else {
-        projection.set_cursor(BoardCursor::from_hot_log_identity(
+        projection.set_cursor(BoardCursor::from_hot_log_identity_with_events(
             observed.inode,
             observed.len,
             observed.mtime_ns,
+            checkpoint.cursor.hot_events(),
         ));
     }
     if hot_log_stamp(board)? != observed {
@@ -1434,10 +1447,12 @@ fn build_board_projection(board: &Path) -> Result<BoardProjection, String> {
     if stamp != before {
         return Err("hot log changed while rebuilding projection".to_string());
     }
-    projection.set_cursor(BoardCursor::from_hot_log_identity(
+    let hot_events = read_tail(board, 0, stamp.len)?.0.len() as u64;
+    projection.set_cursor(BoardCursor::from_hot_log_identity_with_events(
         stamp.inode,
         stamp.len,
         stamp.mtime_ns,
+        hot_events,
     ));
     Ok(projection)
 }
@@ -1567,6 +1582,9 @@ fn identity_from_u64(value: u64) -> [u8; 24] {
 }
 
 fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelope>, u64), String> {
+    if start == end {
+        return Ok((Vec::new(), 0));
+    }
     let path = super::log_path(board);
     let mut file =
         std::fs::File::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
@@ -1584,6 +1602,8 @@ fn read_tail(board: &Path, start: u64, end: u64) -> Result<(Vec<TaskEventEnvelop
         text.len()
     };
     let mut envelopes = Vec::with_capacity(complete.len());
+    #[cfg(test)]
+    HISTORY_LINES_PARSED.with(|count| count.set(count.get() + complete.len() as u64));
     for line in complete {
         envelopes.push(super::parse_envelope_strict(line)?);
     }
@@ -1678,10 +1698,6 @@ impl From<TaskRecord> for ProjectedTaskRecord {
 }
 
 impl ProjectedTaskRecord {
-    pub(crate) fn matches_task_record(&self, task: &TaskRecord) -> bool {
-        self.matches_replay(task)
-    }
-
     pub(crate) fn current_task_record(&self) -> TaskRecord {
         TaskRecord {
             id: self.id.clone(),
@@ -1711,6 +1727,7 @@ impl ProjectedTaskRecord {
         }
     }
 
+    #[cfg(test)]
     fn matches_replay(&self, task: &TaskRecord) -> bool {
         let recent_start = task.history.len().saturating_sub(RECENT_HISTORY_LIMIT);
         self.id == task.id
@@ -1752,7 +1769,7 @@ impl ProjectedTaskRecord {
     }
 }
 
-/// One board's bounded shadow snapshot, built from the incumbent replay.
+/// One board's bounded catalog snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct BoardProjection {
     tasks: BTreeMap<TaskId, Arc<ProjectedTaskRecord>>,
@@ -1824,7 +1841,6 @@ impl BoardProjection {
         }
     }
 
-    #[cfg(test)]
     pub fn last_seq_for(&self, instance: &InstanceName) -> Option<u64> {
         self.last_seq_per_instance.get(instance).copied()
     }
@@ -1836,6 +1852,7 @@ impl BoardProjection {
 
     /// Compare the bounded shadow with the incumbent replay without cloning
     /// its unbounded audit history.
+    #[cfg(test)]
     pub fn matches_replay(&self, replay: &TaskBoardState) -> bool {
         self.events_folded == replay.events_folded
             && self.last_seq_per_instance == replay.last_seq_per_instance
@@ -1848,6 +1865,7 @@ impl BoardProjection {
             })
     }
 
+    #[cfg(test)]
     fn matches_current_replay(&self, replay: &TaskBoardState) -> Option<bool> {
         if self.events_folded > replay.events_folded {
             None
