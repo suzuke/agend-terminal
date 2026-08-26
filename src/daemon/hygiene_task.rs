@@ -44,7 +44,10 @@ impl HygieneUpsert {
 
 /// Find the ACTIVE (not Done/Cancelled/Superseded) task carrying `key` in
 /// `system_alert_key` metadata, plus its current occurrence count.
-fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
+fn find_active(
+    state: &TaskBoardState,
+    key: &str,
+) -> Option<(TaskId, u64, Option<serde_json::Value>)> {
     state.tasks.values().find_map(|t| {
         if t.status.is_terminal() {
             return None;
@@ -55,7 +58,7 @@ fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
                 .get(OCCURRENCES_META)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1);
-            (t.id.clone(), n)
+            (t.id.clone(), n, t.metadata.get(EVIDENCE_META).cloned())
         })
     })
 }
@@ -167,7 +170,7 @@ fn new_task_id() -> TaskId {
 
 /// Atomically create-or-update the hygiene task for `key`. `title` is used
 /// only on create; `evidence` (a JSON object with exact repo/branch/reason
-/// fields) replaces the previous evidence on update. CAS loop: each attempt
+/// fields) replaces different previous evidence on update. CAS loop: each attempt
 /// is individually atomic and validates the exact state its write assumes;
 /// rejections hand back the fresh state, so W concurrent writers converge in
 /// ≤W serialized rounds (bounded by `ATTEMPTS`, overrun = loud error).
@@ -194,13 +197,13 @@ pub fn upsert_system_hygiene_task(
     // generous multiple and overrunning it is a loud error, never a silent
     // drop.
     const ATTEMPTS: usize = 16;
-    let mut probe: Option<(TaskId, u64)> = None;
+    let mut probe: Option<(TaskId, u64, Option<serde_json::Value>)> = None;
     for _ in 0..ATTEMPTS {
         let now = chrono::Utc::now().to_rfc3339();
         match probe.take() {
             None => {
                 let task_id = new_task_id();
-                let mut seen: Option<(TaskId, u64)> = None;
+                let mut seen = None;
                 let create = vec![
                     TaskEvent::Created {
                         task_id: task_id.clone(),
@@ -242,25 +245,26 @@ pub fn upsert_system_hygiene_task(
                     }
                 }
             }
-            Some((tid, n)) => {
+            Some((tid, n, current_evidence)) => {
                 // r2: deterministic stale-probe rendezvous — no-op in
                 // production, lets tests pin writers at the same probed `n`.
                 #[cfg(test)]
                 test_sync::wait_if_armed(home);
-                let update = vec![
-                    meta(&tid, EVIDENCE_META, evidence.clone()),
-                    meta(&tid, LAST_SEEN_META, now.into()),
-                    meta(&tid, OCCURRENCES_META, (n + 1).into()),
-                ];
+                let mut update = Vec::with_capacity(3);
+                if current_evidence.as_ref() != Some(&evidence) {
+                    update.push(meta(&tid, EVIDENCE_META, evidence.clone()));
+                }
+                update.push(meta(&tid, LAST_SEEN_META, now.into()));
+                update.push(meta(&tid, OCCURRENCES_META, (n + 1).into()));
                 let tid_check = tid.clone();
-                let mut seen: Option<(TaskId, u64)> = None;
+                let mut seen = None;
                 match task_events::append_batch_checked(home, &emitter, update, |state| {
                     match find_active(state, key) {
                         // CAS: identity AND the count our `n+1` was computed
                         // from must both still hold — exactly one commit per
                         // observed `n` can succeed (r2a commit replays the
                         // identity-only lost-update RED).
-                        Some((t, cur)) if t == tid_check && cur == n => Ok(()),
+                        Some((t, cur, _)) if t == tid_check && cur == n => Ok(()),
                         other => {
                             seen = other;
                             Err("episode state moved since probe".to_string())
@@ -268,7 +272,7 @@ pub fn upsert_system_hygiene_task(
                     }
                 })? {
                     Ok(_) => return Ok(HygieneUpsert::Updated(tid)),
-                    // Fresh (tid, n) → CAS-retry; None (closed) → create path.
+                    // Fresh episode state → CAS-retry; None (closed) → create path.
                     Err(_) => {
                         probe = seen;
                         continue;
