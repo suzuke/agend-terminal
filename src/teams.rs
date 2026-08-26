@@ -182,11 +182,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
         .map(std::path::PathBuf::from);
     // #2509: independent of `source_repo` — lets the operator fix board-ACL
     // routing without touching worktree/dispatch identity.
-    let project_id = args["project_id"].as_str().map(String::from).or_else(|| {
-        source_repo
-            .as_deref()
-            .map(crate::tasks::stable_project_id_from_source_repo)
-    });
+    let project_id = args["project_id"].as_str().map(String::from);
 
     // #2855: fail-closed identifier validation before any membership check or
     // roster write — validation semantics must win over membership-shaped
@@ -1744,23 +1740,6 @@ mod tests {
             team.source_repo.as_deref(),
             Some(std::path::Path::new("/tmp/my-repo"))
         );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn team_create_pins_stable_board_identity() {
-        let home = tmp_home("create_pinned_board");
-        let result = create(
-            &home,
-            &serde_json::json!({
-                "name": "dev",
-                "members": ["alice"],
-                "repository_path": "Owner/Repo.git"
-            }),
-        );
-        assert_eq!(result["status"], "created");
-        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
-        assert_eq!(fleet.teams["dev"].project_id.as_deref(), Some("owner_repo"));
         std::fs::remove_dir_all(&home).ok();
     }
 

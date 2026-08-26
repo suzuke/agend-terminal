@@ -56,9 +56,8 @@ fn team_references(home: &Path) -> Result<Vec<(String, String)>, String> {
     let mut references = Vec::new();
     for (name, team) in fleet.teams {
         if let Some(project) = team.project_id {
-            references.push((project_slug(&project), name.clone()));
-        }
-        if let Some(repo) = team.source_repo {
+            references.push((project_slug(&project), name));
+        } else if let Some(repo) = team.source_repo {
             references.push((
                 super::board_router::project_id_from_source_repo(&repo),
                 name,
