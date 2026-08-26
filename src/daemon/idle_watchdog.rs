@@ -885,7 +885,7 @@ fn scan_fleet_vantage(
 
 /// #1141: Check if there's work the fleet should be doing.
 /// Returns true if open/claimed/in_progress tasks exist OR pending dispatches exist.
-/// Fail-open: if no task board file exists, assumes work may be expected.
+/// Fail-open when the authoritative catalog cannot be read.
 fn has_expected_work(home: &Path) -> bool {
     // Check pending dispatch sidecars first (cheap).
     let pending = crate::daemon::dispatch_idle::list_pending(home);
@@ -1265,6 +1265,7 @@ mod tests {
         write_activity_at(&home, "dev", stale_dev);
         write_activity_at(&home, "lead", stale_lead);
         write_activity_at(&home, "reviewer", stale_reviewer);
+        seed_task(&home, "t-fleet-idle", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
@@ -1320,6 +1321,7 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
+        seed_task(&home, "t-fleet-investigation", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
@@ -1555,6 +1557,7 @@ mod tests {
         write_activity_at(&home, "lead", stale);
         write_activity_at(&home, "demo-lead", stale);
         write_activity_at(&home, "conflict-test-1", stale);
+        seed_task(&home, "t-fleet-ghost-filter", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
@@ -1618,6 +1621,7 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
+        seed_task(&home, "t-snooze-expired", "dev");
         // Snooze with PAST timestamp (already expired)
         let past = chrono::Utc::now() - chrono::Duration::seconds(10);
         snooze_fleet_idle(&home, past, "test").unwrap();
