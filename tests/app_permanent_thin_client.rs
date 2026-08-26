@@ -38,3 +38,20 @@ fn app_has_no_owned_daemon_or_maintenance_path() {
     assert!(pane.contains("if connected.load(Ordering::Acquire)"));
     assert!(render.contains(" [DISCONNECTED]"));
 }
+
+#[test]
+fn remote_agent_state_refresh_is_scheduled_before_select() {
+    let source = include_str!("../src/app/app_state.rs");
+    let pre_select = source
+        .split_once("pub(super) fn pre_select")
+        .expect("pre_select method")
+        .1
+        .split_once("pub(super) fn handle_wakeup")
+        .expect("next method")
+        .0;
+
+    assert!(
+        pre_select.contains("request_remote_agent_state_refresh"),
+        "remote state refresh must run before select so continuous events cannot starve it"
+    );
+}
