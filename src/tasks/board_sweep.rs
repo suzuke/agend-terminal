@@ -423,6 +423,37 @@ mod tests {
     }
 
     #[test]
+    fn retired_board_rejects_late_task_writes() {
+        let home = home("late-write");
+        task(&home, "dead", "t-dead", true);
+        let result = retire(&home, &["dead".to_string()], "test");
+        assert!(result[0].error.is_none(), "{:?}", result[0].error);
+
+        let late = crate::task_events::append_at(
+            &board_root(&home, "dead"),
+            &InstanceName("late".into()),
+            TaskEvent::Created {
+                task_id: TaskId("t-late".into()),
+                title: "late".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+            },
+        );
+        assert!(late.is_err(), "retired board must reject late writes");
+        assert!(!board_root(&home, "dead").exists());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn apply_requires_confirmation_and_reason() {
         let home = home("contract");
         assert!(handle(&home, &serde_json::json!({"apply": true}))["error"].is_string());
