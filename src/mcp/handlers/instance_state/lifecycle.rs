@@ -44,22 +44,38 @@ pub(crate) fn delete_with_runtime_or_legacy(
     name: &str,
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
     skip_exit_wait: bool,
-) {
+) -> Result<(), String> {
     if let Some(context) = delete_context {
-        crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait);
+        let (_, observed_exit) =
+            crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait);
+        if !observed_exit {
+            return Err("child exit was not confirmed; durable teardown refused".to_string());
+        }
+    } else if crate::daemon::find_active_run_dir(home).is_none() {
+        return Ok(());
     } else {
         let mut params = json!({"name": name});
         if skip_exit_wait {
             params["no_wait"] = json!(true);
         }
-        let _ = crate::api::call(
+        let response = crate::api::call(
             home,
             &json!({
                 "method": crate::api::method::DELETE,
                 "params": params,
             }),
-        );
+        )
+        .map_err(|error| format!("instance termination request failed: {error}"))?;
+        if response["ok"].as_bool() != Some(true) {
+            return Err(format!(
+                "instance termination was not confirmed: {}",
+                response["error"]
+                    .as_str()
+                    .unwrap_or("unknown daemon response")
+            ));
+        }
     }
+    Ok(())
 }
 
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
@@ -165,7 +181,7 @@ pub(crate) fn full_delete_instance_with_runtime(
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    delete_with_runtime_or_legacy(home, name, delete_context, false);
+    delete_with_runtime_or_legacy(home, name, delete_context, false)?;
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");

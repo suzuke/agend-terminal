@@ -81,8 +81,17 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
         externals: ctx.externals,
         notifier: ctx.notifier,
     };
-    crate::agent_ops::delete_instance(ctx.home, name, &delete_context, skip_exit_wait);
-    json!({"ok": true})
+    let (_, observed_exit) = crate::agent_ops::delete_instance_with_exit_status(
+        ctx.home,
+        name,
+        &delete_context,
+        skip_exit_wait,
+    );
+    if observed_exit {
+        json!({"ok": true})
+    } else {
+        json!({"ok": false, "error": "child exit was not confirmed"})
+    }
 }
 
 /// Parse the SPAWN-RPC `env` field into a `HashMap` of process env vars.

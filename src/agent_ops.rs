@@ -317,6 +317,15 @@ pub fn delete_instance(
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
 ) -> DeleteOutcome {
+    delete_instance_with_exit_status(home, name, context, skip_exit_wait).0
+}
+
+pub(crate) fn delete_instance_with_exit_status(
+    home: &Path,
+    name: &str,
+    context: &DeleteContext<'_>,
+    skip_exit_wait: bool,
+) -> (DeleteOutcome, bool) {
     // The public runtime entry owns the complete deletion fence even for an
     // external agent. External-first resolution must not bypass transport
     // invalidation: a queued job for the same name can otherwise outlive the
@@ -339,7 +348,7 @@ pub(crate) fn delete_instance_under_guard(
     name: &str,
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
-) -> DeleteOutcome {
+) -> (DeleteOutcome, bool) {
     // The full-delete caller already owns DeleteFence; do not nest a second
     // lifecycle or transport guard around this body.
     delete_instance_impl(home, name, context, skip_exit_wait)
@@ -350,7 +359,7 @@ fn delete_instance_impl(
     name: &str,
     context: &DeleteContext<'_>,
     skip_exit_wait: bool,
-) -> DeleteOutcome {
+) -> (DeleteOutcome, bool) {
     // Match the API adapter's external-first behavior.  External agents have
     // no managed registry/config entry and therefore need no notifier event.
     if agent::lock_external(context.externals)
@@ -358,10 +367,10 @@ fn delete_instance_impl(
         .is_some()
     {
         crate::event_log::log(home, "delete", name, "external agent deleted");
-        return DeleteOutcome::External;
+        return (DeleteOutcome::External, true);
     }
 
-    crate::daemon::lifecycle::delete_transaction_under_guard(
+    let observed_exit = crate::daemon::lifecycle::delete_transaction_under_guard(
         home,
         name,
         context.registry,
@@ -375,7 +384,7 @@ fn delete_instance_impl(
             name: name.to_string(),
         });
     }
-    DeleteOutcome::Managed
+    (DeleteOutcome::Managed, observed_exit)
 }
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,34 @@ fn tmp_home(tag: &str) -> PathBuf {
 }
 
 #[test]
+fn full_delete_preserves_durable_state_when_termination_is_unconfirmed_3385() {
+    let home = tmp_home("termination_unconfirmed");
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join(".daemon"), format!("{}:0", std::process::id())).unwrap();
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "instances:\n  victim:\n    backend: claude\n").unwrap();
+    let workspace = crate::paths::workspace_dir(&home).join("victim");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("evidence"), "keep").unwrap();
+
+    let error = super::full_delete_instance(&home, "victim").unwrap_err();
+
+    assert!(error.contains("termination request failed"), "{error}");
+    assert!(
+        std::fs::read_to_string(&fleet_path)
+            .unwrap()
+            .contains("victim"),
+        "fleet entry must remain retryable when termination is unconfirmed"
+    );
+    assert!(
+        workspace.join("evidence").exists(),
+        "workspace must not be removed when termination is unconfirmed"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn name_residual_anywhere_clean_home_returns_empty() {
     let home = tmp_home("clean");
     assert!(name_residual_anywhere(&home, "ghost", None).is_empty());
