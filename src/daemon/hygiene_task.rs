@@ -380,6 +380,39 @@ mod tests {
         assert_eq!(hygiene_count, 1);
     }
 
+    #[test]
+    fn unchanged_evidence_is_not_appended_again_3388() {
+        let home = tmp_home("evidence-dedup");
+        let evidence = ev("same");
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", evidence.clone()).unwrap();
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", evidence).unwrap();
+
+        let evidence_events = std::fs::read_to_string(home.join("task_events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<task_events::TaskEventEnvelope>(line).unwrap())
+            .filter(|envelope| {
+                matches!(
+                    &envelope.event,
+                    TaskEvent::MetadataSet { key, .. } if key == EVIDENCE_META
+                )
+            })
+            .count();
+        assert_eq!(
+            evidence_events, 1,
+            "unchanged evidence must only be written when the episode is created"
+        );
+
+        let state = board_state(&home);
+        let task = state
+            .tasks
+            .values()
+            .find(|task| task.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .unwrap();
+        assert_eq!(task.metadata[OCCURRENCES_META], 2);
+        assert!(task.metadata.contains_key(LAST_SEEN_META));
+    }
+
     /// r4 (codex REJECTED@1beac4e6): overlapping arms — a STALE guard's Drop
     /// must not clear a newer generation. Policy: arm() replaces; superseded
     /// guard drop is a gen-compared no-op.
