@@ -242,6 +242,9 @@ pub enum CatalogRouteError {
     Ambiguous { boards: Vec<String> },
 }
 
+pub(crate) type CatalogRevision = BTreeMap<String, u64>;
+type CatalogSnapshot<T> = (Result<T, CatalogRouteError>, Option<CatalogRevision>);
+
 pub struct StrictTaskCatalog {
     home: Option<PathBuf>,
     refresh: parking_lot::Mutex<()>,
@@ -254,6 +257,14 @@ struct CatalogInner {
     boards: BTreeMap<String, BoardProjection>,
     index: BTreeMap<TaskId, String>,
     duplicates: BTreeMap<TaskId, Vec<String>>,
+}
+
+fn catalog_revision(inner: &CatalogInner) -> CatalogRevision {
+    inner
+        .boards
+        .iter()
+        .map(|(board_id, board)| (board_id.clone(), board.events_folded))
+        .collect()
 }
 
 impl StrictTaskCatalog {
@@ -616,52 +627,71 @@ impl StrictTaskCatalog {
         }
     }
 
+    #[cfg(test)]
     pub fn route(
         &self,
         task_id: &TaskId,
     ) -> Result<(String, Arc<ProjectedTaskRecord>), CatalogRouteError> {
-        self.ensure_fresh()?;
-        let inner = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.phase != Phase::Ready {
-            return Err(CatalogRouteError::Unreadable);
-        }
-        if let Some(boards) = inner.duplicates.get(task_id) {
-            return Err(CatalogRouteError::Ambiguous {
-                boards: boards.clone(),
-            });
-        }
-        let board_id = inner
-            .index
-            .get(task_id)
-            .ok_or(CatalogRouteError::NotFound)?;
-        let task = inner.boards[board_id]
-            .task_snapshot(task_id)
-            .expect("catalog index must reference its source record");
-        Ok((board_id.clone(), task))
+        self.route_with_revision(task_id).0
     }
 
-    pub fn all_tasks(&self) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
-        self.ensure_fresh()?;
+    pub(crate) fn route_with_revision(
+        &self,
+        task_id: &TaskId,
+    ) -> CatalogSnapshot<(String, Arc<ProjectedTaskRecord>)> {
+        if let Err(error) = self.ensure_fresh() {
+            return (Err(error), None);
+        }
         let inner = self
             .inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.phase != Phase::Ready {
-            return Err(CatalogRouteError::Unreadable);
+            return (Err(CatalogRouteError::Unreadable), None);
         }
-        Ok(inner
+        let revision = catalog_revision(&inner);
+        let route = if let Some(boards) = inner.duplicates.get(task_id) {
+            Err(CatalogRouteError::Ambiguous {
+                boards: boards.clone(),
+            })
+        } else if let Some(board_id) = inner.index.get(task_id) {
+            let task = inner.boards[board_id]
+                .task_snapshot(task_id)
+                .expect("catalog index must reference its source record");
+            Ok((board_id.clone(), task))
+        } else {
+            Err(CatalogRouteError::NotFound)
+        };
+        (route, Some(revision))
+    }
+
+    #[cfg(test)]
+    pub fn all_tasks(&self) -> Result<Vec<Arc<ProjectedTaskRecord>>, CatalogRouteError> {
+        self.all_tasks_with_revision().0
+    }
+
+    pub(crate) fn all_tasks_with_revision(&self) -> CatalogSnapshot<Vec<Arc<ProjectedTaskRecord>>> {
+        if let Err(error) = self.ensure_fresh() {
+            return (Err(error), None);
+        }
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return (Err(CatalogRouteError::Unreadable), None);
+        }
+        let tasks = inner
             .boards
             .values()
             .flat_map(BoardProjection::task_snapshots)
-            .collect())
+            .collect();
+        (Ok(tasks), Some(catalog_revision(&inner)))
     }
 
     /// Per-board event counts for detecting whether a shadow comparison crossed
     /// a catalog refresh boundary.
-    pub(crate) fn revision(&self) -> Result<BTreeMap<String, u64>, CatalogRouteError> {
+    pub(crate) fn current_revision(&self) -> Result<CatalogRevision, CatalogRouteError> {
         self.ensure_fresh()?;
         let inner = self
             .inner
@@ -670,11 +700,7 @@ impl StrictTaskCatalog {
         if inner.phase != Phase::Ready {
             return Err(CatalogRouteError::Unreadable);
         }
-        Ok(inner
-            .boards
-            .iter()
-            .map(|(board_id, board)| (board_id.clone(), board.events_folded))
-            .collect())
+        Ok(catalog_revision(&inner))
     }
 
     pub fn board(

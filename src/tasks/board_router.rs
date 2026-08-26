@@ -629,26 +629,27 @@ pub(super) fn route_task(
     home: &Path,
     task_id: &str,
 ) -> Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError> {
-    route_task_with_shadow_interleave(home, task_id, || {}).0
+    route_task_with_shadow_interleaves(home, task_id, || {}, || {}).0
 }
 
-fn route_task_with_shadow_interleave(
+fn route_task_with_shadow_interleaves(
     home: &Path,
     task_id: &str,
     after_incumbent: impl FnOnce(),
+    after_shadow: impl FnOnce(),
 ) -> (
     Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError>,
     bool,
 ) {
     let catalog = crate::task_events::catalog::for_home(home);
-    let revision_before = catalog.revision();
+    let revision_before = catalog.current_revision();
     let incumbent = route_task_incumbent(home, task_id);
     after_incumbent();
-    let shadow = catalog.route(&TaskId(task_id.to_string()));
-    let revision_after = catalog.revision();
+    let (shadow, shadow_revision) = catalog.route_with_revision(&TaskId(task_id.to_string()));
+    after_shadow();
     let catalog_advanced = matches!(
-        (&revision_before, &revision_after),
-        (Ok(before), Ok(after)) if before != after
+        (&revision_before, &shadow_revision),
+        (Ok(before), Some(shadow)) if before != shadow
     );
     let diverged = if catalog_advanced {
         tracing::debug!(
@@ -847,14 +848,13 @@ fn list_all_strict_with_shadow_interleave(
     after_incumbent: impl FnOnce(),
 ) -> (Result<Vec<Task>, TaskRouteError>, bool) {
     let catalog = crate::task_events::catalog::for_home(home);
-    let revision_before = catalog.revision();
+    let revision_before = catalog.current_revision();
     let incumbent = list_all_strict_incumbent(home);
     after_incumbent();
-    let shadow = catalog.all_tasks();
-    let revision_after = catalog.revision();
+    let (shadow, shadow_revision) = catalog.all_tasks_with_revision();
     let catalog_advanced = matches!(
-        (&revision_before, &revision_after),
-        (Ok(before), Ok(after)) if before != after
+        (&revision_before, &shadow_revision),
+        (Ok(before), Some(shadow)) if before != shadow
     );
     let diverged = if catalog_advanced {
         tracing::debug!("task catalog strict-list shadow comparison skipped after refresh");
@@ -1345,10 +1345,14 @@ mod tests {
     fn route_shadow_skips_temporal_skew_when_catalog_advances() {
         let home = tmp_home("route-shadow-temporal-skew");
         seed_live_task(&home, DEFAULT_PROJECT, "T-route-skew");
-        let (result, diverged) =
-            route_task_with_shadow_interleaves(&home, "T-route-skew", || {
+        let (result, diverged) = route_task_with_shadow_interleaves(
+            &home,
+            "T-route-skew",
+            || {
                 advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-route-skew");
-            }, || {});
+            },
+            || {},
+        );
 
         assert!(result.is_ok());
         assert!(
@@ -1366,7 +1370,10 @@ mod tests {
         let (_, diverged) =
             route_task_with_shadow_interleaves(&home, "T-stable-mismatch", || {}, || {});
 
-        assert!(diverged, "an unchanged catalog revision must record divergence");
+        assert!(
+            diverged,
+            "an unchanged catalog revision must record divergence"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
