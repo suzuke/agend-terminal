@@ -938,6 +938,19 @@ mod tests {
         .expect("seed live task");
     }
 
+    fn advance_task_after_incumbent(home: &Path, project: &str, task_id: &str) {
+        use crate::task_events::{append_batch_at, InstanceName, TaskEvent};
+        append_batch_at(
+            &board_root(home, project),
+            &InstanceName::from("test:advance"),
+            vec![TaskEvent::InProgress {
+                task_id: TaskId(task_id.to_string()),
+                by: InstanceName::from("test:advance"),
+            }],
+        )
+        .expect("advance task");
+    }
+
     /// Pure dedup: keep the FIRST entry per task_id, preserving order — exactly
     /// mirroring `lookup_task_project`'s first-match.
     #[test]
@@ -1270,6 +1283,46 @@ mod tests {
             merged.tasks.keys().collect::<Vec<_>>(),
             default_only.tasks.keys().collect::<Vec<_>>(),
             "single-project replay_all_boards must be byte-identical to replay(home)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial_test::serial(catalog_shadow_counter)]
+    fn route_shadow_skips_temporal_skew_when_catalog_advances() {
+        let home = tmp_home("route-shadow-temporal-skew");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-route-skew");
+        let before = crate::task_events::catalog::shadow_divergence_count();
+
+        let result = route_task_with_shadow_interleave(&home, "T-route-skew", || {
+            advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-route-skew");
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            crate::task_events::catalog::shadow_divergence_count(),
+            before,
+            "a catalog advance between incumbent replay and shadow read is not divergence"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial_test::serial(catalog_shadow_counter)]
+    fn strict_list_shadow_skips_temporal_skew_when_catalog_advances() {
+        let home = tmp_home("list-shadow-temporal-skew");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-list-skew");
+        let before = crate::task_events::catalog::shadow_divergence_count();
+
+        let result = list_all_strict_with_shadow_interleave(&home, || {
+            advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-list-skew");
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            crate::task_events::catalog::shadow_divergence_count(),
+            before,
+            "a catalog advance between incumbent replay and shadow read is not divergence"
         );
         std::fs::remove_dir_all(&home).ok();
     }
