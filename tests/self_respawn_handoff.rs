@@ -783,6 +783,39 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
     Some(reply.is_object())
 }
 
+/// #3383: closing the permanent thin-client app must not tear down the daemon.
+/// Notifications remain daemon-owned, so there is no app-restart delivery gap.
+#[cfg(unix)]
+#[test]
+fn thin_client_exit_keeps_detached_daemon_serving_3383() {
+    let home = std::env::temp_dir().join(format!("agend-3383-app-exit-{}", std::process::id()));
+    let mut child = boot_app_under_pty(&home);
+
+    let daemon_pid = match wait_for_single_active(&home, Duration::from_secs(30), |pid| {
+        api_status_once(&home, pid) == Some(true)
+    }) {
+        Some(pid) => pid,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_test_home(&home);
+            panic!("app did not start a serving detached daemon");
+        }
+    };
+
+    child.kill().expect("stop thin-client app");
+    child.wait().expect("reap thin-client app");
+    let daemon_still_serves =
+        pid_alive(daemon_pid) && api_status_once(&home, daemon_pid) == Some(true);
+
+    cleanup_test_home(&home);
+
+    assert!(
+        daemon_still_serves,
+        "closing the thin client must leave the same detached daemon serving"
+    );
+}
+
 /// Permanent-thin-client regression: starting `app` without a daemon must boot a
 /// detached daemon, and `restart_daemon` must use that daemon's normal self-respawn
 /// lifecycle. The app process remains only a client throughout.
