@@ -46,6 +46,14 @@ pub(crate) fn project_id_from_source_repo(repo: &Path) -> String {
     project_slug(&raw)
 }
 
+/// Pin a new team's board identity to its forge slug when available. Local
+/// checkout paths remain a fallback for repositories without a usable origin.
+pub(crate) fn stable_project_id_from_source_repo(repo: &Path) -> String {
+    crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(repo)
+        .map(|slug| project_slug(&slug))
+        .unwrap_or_else(|| project_id_from_source_repo(repo))
+}
+
 /// #2509: a team's resolved project id — explicit `project_id` override
 /// (slugged for the same filesystem/path-escape safety as the source_repo
 /// derivation) takes priority over the `source_repo`-derived guess.

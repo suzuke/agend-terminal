@@ -72,6 +72,12 @@ pub fn rebuild_for_test(home: &Path) {
         .insert(key.clone(), Arc::new(build_catalog(&key)));
 }
 
+/// Rebuild after a rare operator board-set change such as guarded retirement.
+/// This is not a query path; callers have already moved the board atomically.
+pub(crate) fn rebuild_after_board_change(home: &Path) -> Result<(), CatalogRouteError> {
+    for_home(home).rebuild_from_disk(home)
+}
+
 fn needs_background_adoption(home: &Path) -> bool {
     board_paths(home).is_ok_and(|boards| {
         boards.values().any(|board| {

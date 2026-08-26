@@ -4,6 +4,7 @@ mod acl;
 mod activity;
 pub mod auto_close;
 mod board_router;
+mod board_sweep;
 mod handler;
 pub mod lifecycle;
 mod orphan;
@@ -263,7 +264,7 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // the strict `load_routed` / `caller_can_mutate_task` above instead.
 pub(crate) use board_router::{
     list_all_boards, list_all_boards_checked, list_all_strict, project_id_from_source_repo,
-    resolve_target_project,
+    resolve_target_project, stable_project_id_from_source_repo,
 };
 // #2760: the per-board mutation ACL is no longer re-exported for external callers
 // (reclaim now routes through the strict `caller_can_mutate_task` above). It stays
