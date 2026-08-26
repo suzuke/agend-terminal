@@ -895,12 +895,7 @@ fn has_expected_work(home: &Path) -> bool {
     {
         return true;
     }
-    // Only suppress when we can confirm the task board is empty.
-    // If the event log doesn't exist, we can't determine → fail-open.
-    let log_path = home.join("task_events.jsonl");
-    if !log_path.exists() {
-        return true;
-    }
+    // Only suppress when the authoritative projection confirms the board is empty.
     match crate::task_events::projected_state(home) {
         Ok(state) => state.tasks.values().any(|r| {
             matches!(

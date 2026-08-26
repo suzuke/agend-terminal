@@ -598,6 +598,13 @@ fn minimal_task_value(v: &mut Value) {
     obj.retain(|k, _| KEEP.contains(&k.as_str()));
 }
 
+fn catalog_unreadable(error: impl std::fmt::Display) -> Value {
+    serde_json::json!({
+        "error": format!("task catalog unreadable: {error}"),
+        "code": "task_catalog_unreadable",
+    })
+}
+
 /// #2475 Phase 2: single-task detail fetch. The terse-by-default `list` caps
 /// `description`/`result`; `get` is the companion that returns ONE task's FULL
 /// record by id, so a caller can pull the full text of just the task it cares
@@ -615,10 +622,11 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
     // unreadable board fails closed instead of the old arbitrary first-hit scan.
     let (task, project) = if let Some(project) = args["project"].as_str() {
         let board = crate::task_events::board_root(home, project);
-        match super::list_all_at(home, &board)
-            .into_iter()
-            .find(|t| t.id == id)
-        {
+        let tasks = match super::list_all_at_checked(home, &board) {
+            Ok(tasks) => tasks,
+            Err(error) => return catalog_unreadable(error),
+        };
+        match tasks.into_iter().find(|t| t.id == id) {
             Some(t) => (t, project.to_string()),
             None => return serde_json::json!({"error": format!("task not found: {id}")}),
         }
@@ -627,10 +635,11 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
             // Re-read via `list_all_at` on the ROUTED board so the response keeps
             // the dep-derived status (in-memory blocking), matching pre-#2760 `get`.
             Ok(rt) => {
-                match super::list_all_at(home, rt.board().path())
-                    .into_iter()
-                    .find(|t| t.id == id)
-                {
+                let tasks = match super::list_all_at_checked(home, rt.board().path()) {
+                    Ok(tasks) => tasks,
+                    Err(error) => return catalog_unreadable(error),
+                };
+                match tasks.into_iter().find(|t| t.id == id) {
                     Some(t) => (t, rt.board().project().to_string()),
                     None => return serde_json::json!({"error": format!("task not found: {id}")}),
                 }

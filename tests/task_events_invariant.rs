@@ -139,9 +139,9 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Cut at first `#[cfg(test)]` so test fixtures aren't checked
-        // (they may emit hand-crafted envelopes for fail-closed asserts).
-        let cutoff = content.find("#[cfg(test)]").unwrap_or(content.len());
+        // Cut at the file's test module so earlier test-only items do not hide
+        // production code that follows them.
+        let cutoff = content.rfind("\nmod tests {").unwrap_or(content.len());
         let prod = &content[..cutoff];
         for (i, line) in prod.lines().enumerate() {
             let trim = line.trim_start();
@@ -215,7 +215,7 @@ fn task_authority_has_no_legacy_replay_or_index_path() {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let cutoff = content.find("#[cfg(test)]").unwrap_or(content.len());
+        let cutoff = content.rfind("\nmod tests {").unwrap_or(content.len());
         for (line_no, line) in content[..cutoff].lines().enumerate() {
             if line.trim_start().starts_with("//") {
                 continue;

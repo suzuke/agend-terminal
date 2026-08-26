@@ -618,18 +618,22 @@ pub(crate) fn fleet_facts(
             (name, (backend, state, is_live, healthy))
         })
         .collect::<HashMap<_, _>>();
-    let active_owners = crate::tasks::list_all_boards(home)
-        .into_iter()
-        .flat_map(|(_, tasks)| tasks)
-        .filter(|task| {
-            matches!(
-                task.status,
-                crate::task_events::TaskStatus::Claimed
-                    | crate::task_events::TaskStatus::InProgress
-            )
-        })
-        .filter_map(|task| task.assignee)
-        .collect::<HashSet<_>>();
+    let active_owners = crate::tasks::list_all_boards_checked(home)
+        .ok()
+        .map(|boards| {
+            boards
+                .into_iter()
+                .flat_map(|(_, tasks)| tasks)
+                .filter(|task| {
+                    matches!(
+                        task.status,
+                        crate::task_events::TaskStatus::Claimed
+                            | crate::task_events::TaskStatus::InProgress
+                    )
+                })
+                .filter_map(|task| task.assignee)
+                .collect::<HashSet<_>>()
+        });
     let required_backend = task.and_then(|task| {
         task.metadata
             .get("backend_lock")
@@ -668,7 +672,10 @@ pub(crate) fn fleet_facts(
                 healthy: is_healthy && !state.is_error(),
                 idle: state == AgentState::Idle,
                 bound: crate::binding::read(home, name).is_some(),
-                has_active_task: active_owners.contains(name),
+                // An unreadable catalog cannot prove the candidate task-free.
+                has_active_task: active_owners
+                    .as_ref()
+                    .is_none_or(|owners| owners.contains(name)),
                 current_usage_limit: state == AgentState::UsageLimit,
                 routing_compatible,
             })

@@ -7,14 +7,12 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-
 /// #1990: on-disk schema version for `binding.json`. The file has always carried
 /// a bare `version` field (written by [`bind_full`]) but did NOT go through the
 /// `SchemaVersioned` trait, so it had no future-version guard — this const is
 /// that guard (see [`parse_binding_guarded`]). Additive field adds don't need a
 /// bump; only a non-additive change to an existing field does.
 const BINDING_SCHEMA_VERSION: u64 = 1;
-
 pub(crate) mod release_guard;
 pub(crate) use release_guard::{
     acquire_agent_mutation_lock, acquire_binding_file_lock, guarded_binding_disk_fresh,
@@ -29,12 +27,13 @@ pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;
 #[allow(unused_imports)]
 pub use unbind_compat::unbind;
+#[cfg(test)]
+mod catalog_tests;
 mod reaper_notify;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod reaper_notify_tests;
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
-
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
 /// (`version` > [`BINDING_SCHEMA_VERSION`]) → `None`. This guards only the
 /// DAEMON-SIDE readers that route through [`read`]: they treat a future-version
@@ -205,24 +204,22 @@ pub(crate) fn agent_has_active_ci_watch_on_branch(home: &Path, agent: &str, bran
 /// binding repair. `pub(crate)` — shared with `force_release`'s repair path.
 pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
     use crate::task_events::TaskStatus;
-    match crate::tasks::list_all_strict(home) {
-        Ok(tasks) => tasks.iter().any(|t| {
-            t.branch.as_deref() == Some(branch)
-                && matches!(
-                    t.status,
-                    TaskStatus::Open
-                        | TaskStatus::Claimed
-                        | TaskStatus::InProgress
-                        | TaskStatus::InReview
-                        | TaskStatus::Blocked
-                        | TaskStatus::Verified
-                )
-        }),
-        Err(error) => {
-            tracing::warn!(%error, branch, "task catalog unreadable; preserving branch binding");
-            true
-        }
-    }
+    let Ok(tasks) = crate::tasks::list_all_strict(home) else {
+        tracing::warn!(branch, "task catalog unreadable; preserving branch binding");
+        return true;
+    };
+    tasks.iter().any(|t| {
+        t.branch.as_deref() == Some(branch)
+            && matches!(
+                t.status,
+                TaskStatus::Open
+                    | TaskStatus::Claimed
+                    | TaskStatus::InProgress
+                    | TaskStatus::InReview
+                    | TaskStatus::Blocked
+                    | TaskStatus::Verified
+            )
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1833,18 +1830,6 @@ mod tests {
         assert!(err.contains("#2158"), "{err}");
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&wt).ok();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn unreadable_catalog_conservatively_preserves_branch_binding() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let home = tmp_home("unreadable-catalog-branch");
-        let invalid = std::ffi::OsString::from_vec(vec![b'b', 0xff]);
-        std::fs::create_dir_all(home.join("boards").join(invalid)).unwrap();
-
-        assert!(branch_has_active_task(&home, "feat/keep"));
     }
 
     /// (ii) binding-change audit: a bind emits `binding_changed` and an unbind emits
