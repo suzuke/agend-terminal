@@ -398,8 +398,8 @@ mod tests {
             handle.child = Arc::new(Mutex::new(Box::new(NeverExitingChild)));
         }
         let workspace = crate::paths::workspace_dir(ctx.home).join(name);
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("evidence"), "keep").unwrap();
+        std::fs::create_dir_all(&workspace).expect("create workspace evidence directory");
+        std::fs::write(workspace.join("evidence"), "keep").expect("write workspace evidence");
 
         let response = handle_delete(&json!({"name": name}), &ctx);
         assert_eq!(response["ok"], json!(false), "{response:?}");

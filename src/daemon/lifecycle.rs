@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum time we wait for a child to actually transition to exited after
-/// kill before force-removing the registry entry. Bounded so a stuck child
-/// doesn't freeze the delete API; force-fallback is logged.
+/// kill before refusing the teardown. Bounded so a stuck child doesn't freeze
+/// the delete API; the registry entry is retained for a later retry.
 pub const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Poll interval while waiting for child exit. Short enough to be responsive,
@@ -79,8 +79,7 @@ impl Drop for DeleteFence {
 
 /// Wait up to [`CHILD_EXIT_TIMEOUT`] for the child to transition to exited.
 /// Returns `true` if the child exited within the budget; `false` if the
-/// timeout fired (caller should force-remove the registry entry anyway and log
-/// a warning).
+/// timeout fired (caller must preserve the registry entry and refuse teardown).
 pub fn wait_for_child_exit(child: &ChildArc) -> bool {
     let deadline = std::time::Instant::now() + CHILD_EXIT_TIMEOUT;
     loop {
@@ -120,7 +119,7 @@ fn drop_active_binding(name: &str) {
 /// unnecessary overhead.
 ///
 /// Returns `true` if the cleanup observed the child exiting cleanly; `false`
-/// if [`CHILD_EXIT_TIMEOUT`] fired and we force-removed anyway. When
+/// if [`CHILD_EXIT_TIMEOUT`] fired and teardown was refused. When
 /// `skip_exit_wait` is `true`, always returns `true` (optimistic).
 pub fn delete_transaction(
     home: &Path,
@@ -194,7 +193,22 @@ pub(crate) fn delete_transaction_under_guard(
         true
     };
 
-    // Step 4: registry remove (after child exit confirmed or timeout).
+    if !waited_ok {
+        crate::event_log::log(
+            home,
+            "delete",
+            name,
+            "delete: child kill timeout — retained registry entry",
+        );
+        tracing::warn!(
+            agent = %name,
+            timeout_secs = CHILD_EXIT_TIMEOUT.as_secs(),
+            "delete_transaction: child did not exit within timeout, retained for retry"
+        );
+        return false;
+    }
+
+    // Step 4: registry remove after child exit is confirmed.
     // #P1-2607-followup (reviewer4, PR #2620): must go through
     // `remove_and_unregister`, not a bare `reg.remove`, so the removed
     // handle's `write_actor` registration (lazy-spawn: no thread for a
@@ -216,22 +230,9 @@ pub(crate) fn delete_transaction_under_guard(
     crate::ipc::remove_port(&super::run_dir(home), name);
 
     // Step 8: event log.
-    let detail = if waited_ok {
-        "delete: child exited cleanly"
-    } else {
-        "delete: child kill timeout — force-removed registry entry"
-    };
-    crate::event_log::log(home, "delete", name, detail);
+    crate::event_log::log(home, "delete", name, "delete: child exited cleanly");
 
-    if !waited_ok {
-        tracing::warn!(
-            agent = %name,
-            timeout_secs = CHILD_EXIT_TIMEOUT.as_secs(),
-            "delete_transaction: child did not exit within timeout, force-removed"
-        );
-    }
-
-    waited_ok
+    true
 }
 
 /// RAII rollback guard for `agent::spawn_agent`'s ordered mutations.

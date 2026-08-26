@@ -52,6 +52,8 @@ pub(crate) fn delete_with_runtime_or_legacy(
             return Err("child exit was not confirmed; durable teardown refused".to_string());
         }
     } else if crate::daemon::find_active_run_dir(home).is_none() {
+        // With no daemon transaction available there is no live child whose
+        // exit can be observed; retain the established offline-cleanup path.
         return Ok(());
     } else {
         let mut params = json!({"name": name});
