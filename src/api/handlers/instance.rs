@@ -271,7 +271,40 @@ mod tests {
     use parking_lot::Mutex;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::io;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct NeverExitingChild;
+
+    impl portable_pty::ChildKiller for NeverExitingChild {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::Child for NeverExitingChild {
+        fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
 
     fn test_ctx_with_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
         let home = Box::new(std::env::temp_dir().join(format!(
@@ -351,6 +384,52 @@ mod tests {
             }
             reg.remove(&id);
         }
+    }
+
+    #[test]
+    fn delete_timeout_remains_fail_closed_across_retry_3385() {
+        let name = "delete-timeout-retry";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        {
+            let mut reg = agent::lock_registry(ctx.registry);
+            let handle = reg.get_mut(&id).expect("spawned handle");
+            let _ = handle.child.lock().kill();
+            handle.child = Arc::new(Mutex::new(Box::new(NeverExitingChild)));
+        }
+        let workspace = crate::paths::workspace_dir(ctx.home).join(name);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("evidence"), "keep").unwrap();
+
+        let response = handle_delete(&json!({"name": name}), &ctx);
+        assert_eq!(response["ok"], json!(false), "{response:?}");
+        assert!(
+            agent::lock_registry(ctx.registry).contains_key(&id),
+            "a timeout must retain the child handle for retry"
+        );
+
+        let delete_context = crate::agent_ops::DeleteContext {
+            registry: ctx.registry,
+            configs: ctx.configs,
+            externals: ctx.externals,
+            notifier: ctx.notifier,
+        };
+        let retry = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+            ctx.home,
+            name,
+            Some(&delete_context),
+        );
+        assert!(retry.is_err(), "retry must remain fail-closed: {retry:?}");
+        assert!(
+            crate::fleet::resolve_uuid(ctx.home, name).is_some(),
+            "fleet evidence must survive an unconfirmed retry"
+        );
+        assert!(
+            workspace.join("evidence").exists(),
+            "workspace evidence must survive an unconfirmed retry"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
     }
 
     /// Slice-2 RED: the API kill producer must publish Crashed before the PTY
