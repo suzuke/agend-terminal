@@ -999,6 +999,11 @@ mod tests {
         .expect("advance task");
     }
 
+    fn seed_stable_route_mismatch(home: &Path, task_id: &str) {
+        seed_live_task(home, DEFAULT_PROJECT, task_id);
+        record_task_project(home, task_id, "wrong-project").expect("seed mismatched index");
+    }
+
     /// Pure dedup: keep the FIRST entry per task_id, preserving order — exactly
     /// mirroring `lookup_task_project`'s first-match.
     #[test]
@@ -1340,14 +1345,46 @@ mod tests {
     fn route_shadow_skips_temporal_skew_when_catalog_advances() {
         let home = tmp_home("route-shadow-temporal-skew");
         seed_live_task(&home, DEFAULT_PROJECT, "T-route-skew");
-        let (result, diverged) = route_task_with_shadow_interleave(&home, "T-route-skew", || {
-            advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-route-skew");
-        });
+        let (result, diverged) =
+            route_task_with_shadow_interleaves(&home, "T-route-skew", || {
+                advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-route-skew");
+            }, || {});
 
         assert!(result.is_ok());
         assert!(
             !diverged,
             "a catalog advance between incumbent replay and shadow read is not divergence"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn route_shadow_records_stable_divergence() {
+        let home = tmp_home("route-shadow-stable-divergence");
+        seed_stable_route_mismatch(&home, "T-stable-mismatch");
+
+        let (_, diverged) =
+            route_task_with_shadow_interleaves(&home, "T-stable-mismatch", || {}, || {});
+
+        assert!(diverged, "an unchanged catalog revision must record divergence");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn route_shadow_late_write_does_not_hide_stable_divergence() {
+        let home = tmp_home("route-shadow-late-write");
+        seed_stable_route_mismatch(&home, "T-late-mismatch");
+
+        let (_, diverged) = route_task_with_shadow_interleaves(
+            &home,
+            "T-late-mismatch",
+            || {},
+            || advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-late-mismatch"),
+        );
+
+        assert!(
+            diverged,
+            "a write after the shadow snapshot must not hide its stable divergence"
         );
         std::fs::remove_dir_all(&home).ok();
     }
