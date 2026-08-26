@@ -241,10 +241,11 @@ fn retire(home: &Path, confirmed: &[String], audit_reason: &str) -> Vec<RetireOu
             });
             continue;
         }
+        drop(_board_lock);
 
-        if let Err(error) = crate::task_events::catalog::rebuild_after_board_change(home) {
+        if let Err(error) = crate::task_events::catalog::rebuild_after_board_change_locked(home) {
             let rollback = std::fs::rename(&destination, &source);
-            let _ = crate::task_events::catalog::rebuild_after_board_change(home);
+            let _ = crate::task_events::catalog::rebuild_after_board_change_locked(home);
             outcomes.push(RetireOutcome {
                 project: project.clone(),
                 moved_to: None,

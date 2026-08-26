@@ -73,9 +73,9 @@ pub fn rebuild_for_test(home: &Path) {
 }
 
 /// Rebuild after a rare operator board-set change such as guarded retirement.
-/// This is not a query path; callers have already moved the board atomically.
-pub(crate) fn rebuild_after_board_change(home: &Path) -> Result<(), CatalogRouteError> {
-    for_home(home).rebuild_from_disk(home)
+/// The caller already holds the board-set lock across the atomic move.
+pub(crate) fn rebuild_after_board_change_locked(home: &Path) -> Result<(), CatalogRouteError> {
+    for_home(home).rebuild_from_disk_with_hook_locked(home, |_| {})
 }
 
 fn needs_background_adoption(home: &Path) -> bool {
@@ -523,6 +523,16 @@ impl StrictTaskCatalog {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn rebuild_from_disk_with_hook(
+        &self,
+        home: &Path,
+        after_offline_build: impl FnMut(usize),
+    ) -> Result<(), CatalogRouteError> {
+        let _board_set_lock = super::acquire_board_set_lock(home)
+            .map_err(|error| self.mark_unhealthy(format!("lock board set: {error}")))?;
+        self.rebuild_from_disk_with_hook_locked(home, after_offline_build)
+    }
+
+    fn rebuild_from_disk_with_hook_locked(
         &self,
         home: &Path,
         mut after_offline_build: impl FnMut(usize),
