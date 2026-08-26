@@ -414,11 +414,12 @@ mod tests {
             externals: ctx.externals,
             notifier: ctx.notifier,
         };
-        let retry = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
-            ctx.home,
-            name,
-            Some(&delete_context),
-        );
+        let retry =
+            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                ctx.home,
+                name,
+                Some(&delete_context),
+            );
         assert!(retry.is_err(), "retry must remain fail-closed: {retry:?}");
         assert!(
             crate::fleet::resolve_uuid(ctx.home, name).is_some(),
