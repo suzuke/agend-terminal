@@ -1173,10 +1173,14 @@ pub fn list_all(home: &Path) -> Vec<Task> {
 /// board, cached per pass). For single-project deployments every dep is on this
 /// same board → no cross-board read → byte-identical.
 pub(crate) fn list_all_at(home: &Path, board: &Path) -> Vec<Task> {
-    let state = crate::task_events::projected_state_at(board).unwrap_or_default();
+    list_all_at_checked(home, board).unwrap_or_default()
+}
+
+pub(crate) fn list_all_at_checked(home: &Path, board: &Path) -> anyhow::Result<Vec<Task>> {
+    let state = crate::task_events::projected_state_at(board)?;
     let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
     apply_dependency_eval_in_memory(&mut tasks, home, board);
-    tasks
+    Ok(tasks)
 }
 
 /// #1942: link a git `branch` to an existing task by emitting a `BranchLinked`

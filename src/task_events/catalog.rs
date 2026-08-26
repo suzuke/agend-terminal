@@ -1429,7 +1429,11 @@ fn board_paths(home: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
         if !file_type.is_dir() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "boards dir contains a non-UTF-8 board name".to_string())?
+            .to_string();
         boards.insert(name, entry.path());
     }
     Ok(boards)

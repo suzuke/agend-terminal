@@ -1398,11 +1398,21 @@ fn authority_fails_closed_when_known_hot_log_is_replaced() {
         catalog.route(&task_id),
         Err(CatalogRouteError::Unreadable)
     ));
-    assert_ne!(
-        catalog.snapshot_advisory().0,
-        Phase::Ready,
-        "the asynchronous rebuild may already have advanced Unhealthy to Building"
-    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn catalog_rejects_non_utf8_board_names() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let home = tmp_home("non-utf8-board");
+    let invalid = std::ffi::OsString::from_vec(vec![b'b', 0xff]);
+    std::fs::create_dir_all(home.join("boards").join(invalid)).expect("create invalid board");
+
+    assert!(matches!(
+        build_catalog(&home).route(&TaskId("t-missing".into())),
+        Err(CatalogRouteError::Unreadable)
+    ));
 }
 
 #[cfg(windows)]

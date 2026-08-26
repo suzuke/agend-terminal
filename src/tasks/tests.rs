@@ -20,6 +20,23 @@ fn tmp_home(name: &str) -> std::path::PathBuf {
     dir
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn fleet_list_reports_unreadable_catalog_instead_of_an_empty_board() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let home = tmp_home("fleet-list-unreadable");
+    let invalid = std::ffi::OsString::from_vec(vec![b'b', 0xff]);
+    std::fs::create_dir_all(home.join("boards").join(invalid)).unwrap();
+
+    let response = handle(
+        &home,
+        "agent",
+        &serde_json::json!({"action": "list", "scope": "fleet"}),
+    );
+    assert_eq!(response["code"], "task_catalog_unreadable");
+}
+
 /// #78445-2 (d): the central `task_terminal_cleanup` seam clears BOTH obligation
 /// stores for the closed task — the dispatch_idle sidecar AND the dispatch_tracking
 /// rows — and is task_id-scoped so a co-dispatcher's OTHER task rows survive. All

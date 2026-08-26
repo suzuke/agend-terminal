@@ -444,7 +444,16 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
         std::collections::HashMap::new();
     let tasks: Vec<Task> = if fleet_scope {
         let mut all = Vec::new();
-        for (project, ts) in super::board_router::list_all_boards(home) {
+        let boards = match super::board_router::list_all_boards_checked(home) {
+            Ok(boards) => boards,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("task catalog unreadable: {error}"),
+                    "code": "task_catalog_unreadable",
+                })
+            }
+        };
+        for (project, ts) in boards {
             for t in &ts {
                 project_of.insert(t.id.clone(), project.clone());
             }
@@ -456,7 +465,15 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
             .as_str()
             .map(String::from)
             .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
-        super::list_all_at(home, &crate::task_events::board_root(home, &project))
+        match super::list_all_at_checked(home, &crate::task_events::board_root(home, &project)) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("task catalog unreadable: {error}"),
+                    "code": "task_catalog_unreadable",
+                })
+            }
+        }
     };
     let mut filtered: Vec<Task> = tasks
         .iter()

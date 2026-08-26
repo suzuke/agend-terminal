@@ -205,18 +205,24 @@ pub(crate) fn agent_has_active_ci_watch_on_branch(home: &Path, agent: &str, bran
 /// binding repair. `pub(crate)` — shared with `force_release`'s repair path.
 pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
     use crate::task_events::TaskStatus;
-    crate::tasks::list_all(home).iter().any(|t| {
-        t.branch.as_deref() == Some(branch)
-            && matches!(
-                t.status,
-                TaskStatus::Open
-                    | TaskStatus::Claimed
-                    | TaskStatus::InProgress
-                    | TaskStatus::InReview
-                    | TaskStatus::Blocked
-                    | TaskStatus::Verified
-            )
-    })
+    match crate::tasks::list_all_strict(home) {
+        Ok(tasks) => tasks.iter().any(|t| {
+            t.branch.as_deref() == Some(branch)
+                && matches!(
+                    t.status,
+                    TaskStatus::Open
+                        | TaskStatus::Claimed
+                        | TaskStatus::InProgress
+                        | TaskStatus::InReview
+                        | TaskStatus::Blocked
+                        | TaskStatus::Verified
+                )
+        }),
+        Err(error) => {
+            tracing::warn!(%error, branch, "task catalog unreadable; preserving branch binding");
+            true
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1827,6 +1833,18 @@ mod tests {
         assert!(err.contains("#2158"), "{err}");
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_catalog_conservatively_preserves_branch_binding() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = tmp_home("unreadable-catalog-branch");
+        let invalid = std::ffi::OsString::from_vec(vec![b'b', 0xff]);
+        std::fs::create_dir_all(home.join("boards").join(invalid)).unwrap();
+
+        assert!(branch_has_active_task(&home, "feat/keep"));
     }
 
     /// (ii) binding-change audit: a bind emits `binding_changed` and an unbind emits

@@ -237,6 +237,22 @@ pub(crate) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
         .collect()
 }
 
+pub(crate) fn list_all_boards_checked(
+    home: &Path,
+) -> Result<Vec<(String, Vec<Task>)>, TaskRouteError> {
+    enumerate_projects(home)?
+        .into_iter()
+        .map(|project| {
+            super::list_all_at_checked(home, &board_root(home, &project))
+                .map(|tasks| (project, tasks))
+                .map_err(|error| TaskRouteError::Unreadable {
+                    path: home.to_path_buf(),
+                    cause: error.to_string(),
+                })
+        })
+        .collect()
+}
+
 /// #2117 completeness: read EVERY project board and merge into ONE aggregate
 /// `TaskBoardState` (its `tasks` map is the union across boards). The
 /// multi-board view for `task action=health`. Task ids are globally unique and
