@@ -629,10 +629,34 @@ pub(super) fn route_task(
     home: &Path,
     task_id: &str,
 ) -> Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError> {
-    let incumbent = route_task_incumbent(home, task_id);
+    route_task_with_shadow_interleave(home, task_id, || {}).0
+}
+
+fn route_task_with_shadow_interleave(
+    home: &Path,
+    task_id: &str,
+    after_incumbent: impl FnOnce(),
+) -> (
+    Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError>,
+    bool,
+) {
     let catalog = crate::task_events::catalog::for_home(home);
+    let revision_before = catalog.revision();
+    let incumbent = route_task_incumbent(home, task_id);
+    after_incumbent();
     let shadow = catalog.route(&TaskId(task_id.to_string()));
-    if !route_shadow_matches(&incumbent, &shadow) {
+    let revision_after = catalog.revision();
+    let catalog_advanced = matches!(
+        (&revision_before, &revision_after),
+        (Ok(before), Ok(after)) if before != after
+    );
+    let diverged = if catalog_advanced {
+        tracing::debug!(
+            task_id,
+            "task catalog route shadow comparison skipped after refresh"
+        );
+        false
+    } else if !route_shadow_matches(&incumbent, &shadow) {
         crate::task_events::catalog::record_shadow_divergence();
         tracing::error!(
             task_id,
@@ -641,8 +665,11 @@ pub(super) fn route_task(
             divergence_count = crate::task_events::catalog::shadow_divergence_count(),
             "task catalog route shadow diverged from incumbent"
         );
-    }
-    incumbent
+        true
+    } else {
+        false
+    };
+    (incumbent, diverged)
 }
 
 fn route_shadow_matches(
@@ -812,9 +839,27 @@ pub(super) fn replay_all_boards(home: &Path) -> anyhow::Result<crate::task_event
 /// Returns ALL tasks across every project board. Callers that need
 /// branch-filtered subsets should filter the result.
 pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> {
+    list_all_strict_with_shadow_interleave(home, || {}).0
+}
+
+fn list_all_strict_with_shadow_interleave(
+    home: &Path,
+    after_incumbent: impl FnOnce(),
+) -> (Result<Vec<Task>, TaskRouteError>, bool) {
+    let catalog = crate::task_events::catalog::for_home(home);
+    let revision_before = catalog.revision();
     let incumbent = list_all_strict_incumbent(home);
-    let shadow = crate::task_events::catalog::for_home(home).all_tasks();
-    if !list_shadow_matches(&incumbent, &shadow) {
+    after_incumbent();
+    let shadow = catalog.all_tasks();
+    let revision_after = catalog.revision();
+    let catalog_advanced = matches!(
+        (&revision_before, &revision_after),
+        (Ok(before), Ok(after)) if before != after
+    );
+    let diverged = if catalog_advanced {
+        tracing::debug!("task catalog strict-list shadow comparison skipped after refresh");
+        false
+    } else if !list_shadow_matches(&incumbent, &shadow) {
         crate::task_events::catalog::record_shadow_divergence();
         tracing::error!(
             incumbent = ?incumbent,
@@ -822,8 +867,11 @@ pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> 
             divergence_count = crate::task_events::catalog::shadow_divergence_count(),
             "task catalog strict-list shadow diverged from incumbent"
         );
-    }
-    incumbent
+        true
+    } else {
+        false
+    };
+    (incumbent, diverged)
 }
 
 fn list_shadow_matches(
@@ -1292,16 +1340,13 @@ mod tests {
     fn route_shadow_skips_temporal_skew_when_catalog_advances() {
         let home = tmp_home("route-shadow-temporal-skew");
         seed_live_task(&home, DEFAULT_PROJECT, "T-route-skew");
-        let before = crate::task_events::catalog::shadow_divergence_count();
-
-        let result = route_task_with_shadow_interleave(&home, "T-route-skew", || {
+        let (result, diverged) = route_task_with_shadow_interleave(&home, "T-route-skew", || {
             advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-route-skew");
         });
 
         assert!(result.is_ok());
-        assert_eq!(
-            crate::task_events::catalog::shadow_divergence_count(),
-            before,
+        assert!(
+            !diverged,
             "a catalog advance between incumbent replay and shadow read is not divergence"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -1312,16 +1357,13 @@ mod tests {
     fn strict_list_shadow_skips_temporal_skew_when_catalog_advances() {
         let home = tmp_home("list-shadow-temporal-skew");
         seed_live_task(&home, DEFAULT_PROJECT, "T-list-skew");
-        let before = crate::task_events::catalog::shadow_divergence_count();
-
-        let result = list_all_strict_with_shadow_interleave(&home, || {
+        let (result, diverged) = list_all_strict_with_shadow_interleave(&home, || {
             advance_task_after_incumbent(&home, DEFAULT_PROJECT, "T-list-skew");
         });
 
         assert!(result.is_ok());
-        assert_eq!(
-            crate::task_events::catalog::shadow_divergence_count(),
-            before,
+        assert!(
+            !diverged,
             "a catalog advance between incumbent replay and shadow read is not divergence"
         );
         std::fs::remove_dir_all(&home).ok();

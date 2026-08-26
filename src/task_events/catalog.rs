@@ -659,6 +659,24 @@ impl StrictTaskCatalog {
             .collect())
     }
 
+    /// Per-board event counts for detecting whether a shadow comparison crossed
+    /// a catalog refresh boundary.
+    pub(crate) fn revision(&self) -> Result<BTreeMap<String, u64>, CatalogRouteError> {
+        self.ensure_fresh()?;
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+        Ok(inner
+            .boards
+            .iter()
+            .map(|(board_id, board)| (board_id.clone(), board.events_folded))
+            .collect())
+    }
+
     pub fn board(
         &self,
         board_id: &str,
