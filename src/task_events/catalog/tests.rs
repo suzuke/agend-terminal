@@ -2032,6 +2032,45 @@ fn rebuild_retries_rotation_and_publishes_concurrent_tail() {
 }
 
 #[test]
+fn rebuild_serializes_with_board_set_changes() {
+    let home = tmp_home("rebuild-board-set-lock");
+    write_envelopes(&super::super::log_path(&home), &[]);
+    let catalog = std::sync::Arc::new(StrictTaskCatalog::with_home(
+        Some(home.clone()),
+        Phase::Building,
+        BTreeMap::new(),
+    ));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker_catalog = std::sync::Arc::clone(&catalog);
+    let worker_home = home.clone();
+    let rebuild = std::thread::spawn(move || {
+        worker_catalog.rebuild_from_disk_with_hook(&worker_home, |attempt| {
+            if attempt == 0 {
+                entered_tx.send(()).expect("signal rebuild snapshot");
+                release_rx.recv().expect("release rebuild snapshot");
+            }
+        })
+    });
+    entered_rx.recv().expect("rebuild reached offline snapshot");
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let lock_home = home.clone();
+    let contender = std::thread::spawn(move || {
+        let _lock = super::super::acquire_board_set_lock(&lock_home).expect("lock board set");
+        locked_tx.send(()).expect("signal board-set lock");
+    });
+    let raced = locked_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_ok();
+    release_tx.send(()).expect("release rebuild");
+    rebuild.join().expect("join rebuild").expect("rebuild");
+    contender.join().expect("join board-set contender");
+
+    assert!(!raced, "board-set mutation must wait for catalog rebuild");
+}
+
+#[test]
 fn rebuild_fails_closed_after_three_rotations() {
     let home = tmp_home("rebuild-attempt-budget");
     let task_id = TaskId::from("t-20260825000000000000-9-3");
