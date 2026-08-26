@@ -61,6 +61,9 @@ pub(super) struct AppState {
     /// that a fleet.yaml reload (daemon tick is 10s) feels timely but long
     /// enough that the readdir cost is trivial.
     pub(super) last_remote_sync: std::time::Instant,
+    /// Throttle for daemon-authoritative pane-state refreshes. Kept separate
+    /// from roster discovery so continuous UI events cannot starve it.
+    pub(super) last_remote_state_sync: std::time::Instant,
     /// #1479: throttled, change-gated session.json persistence. Graceful exit
     /// already saves; this periodically persists the current layout so a
     /// kill -9 / power loss preserves what's on screen.
@@ -165,6 +168,7 @@ impl AppState {
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
+            last_remote_state_sync: std::time::Instant::now(),
             last_session_save: std::time::Instant::now(),
             last_session_json: None,
             last_draw: None,
@@ -367,6 +371,7 @@ impl AppState {
         // its baselines from HERE — without this, the first loop iteration could
         // trigger an immediate remote sync / session save the old code never did.
         self.last_remote_sync = std::time::Instant::now();
+        self.last_remote_state_sync = std::time::Instant::now();
         self.last_session_save = std::time::Instant::now();
         // #freeze-4 boot phase anchors (see `AppState::booting`).
         self.boot_start = std::time::Instant::now();
@@ -903,7 +908,6 @@ impl AppState {
             fleet_path,
             wakeup_tx,
             attached_run_dir,
-            remote_state_rpc_tx,
             ..
         } = *deps;
         // #t-84833-10: periodic idle refresh — mark self.dirty so the cap above
@@ -926,7 +930,6 @@ impl AppState {
         if attached_run_dir.is_some()
             && self.last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
         {
-            let _ = remote_state_rpc_tx.try_send(rpc::AgentStateRequest::Refresh);
             {
                 // #910 PR3 of 4: daemon-registry truth via runtime
                 // helper. The state-transition log gate inside the
@@ -999,9 +1002,22 @@ impl AppState {
         }
     }
 
+    fn request_remote_agent_state_refresh(&mut self, deps: &AppDeps<'_>) {
+        if deps.attached_run_dir.is_some()
+            && self.last_remote_state_sync.elapsed() >= std::time::Duration::from_secs(2)
+            && deps
+                .remote_state_rpc_tx
+                .try_send(rpc::AgentStateRequest::Refresh)
+                .is_ok()
+        {
+            self.last_remote_state_sync = std::time::Instant::now();
+        }
+    }
+
     /// Per-iteration housekeeping before the select!: scratch-shell reap,
     /// pending resize, and the badge/flush sync throttles.
     pub(super) fn pre_select(&mut self, terminal: &mut DefaultTerminal, deps: &AppDeps<'_>) {
+        self.request_remote_agent_state_refresh(deps);
         self.close_dead_scratch_shell(deps);
         self.apply_pending_resize(terminal, deps);
         self.sync_badges(deps);
