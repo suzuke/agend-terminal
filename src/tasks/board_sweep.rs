@@ -387,6 +387,31 @@ mod tests {
     }
 
     #[test]
+    fn project_id_reference_takes_priority_over_source_repo_fallback() {
+        let home = home("project-id-priority");
+        task(&home, "owner_repo", "t-current", true);
+        task(&home, "checkout_repo", "t-obsolete", true);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  owners:\n    members: [lead]\n    project_id: owner_repo\n    source_repo: /tmp/checkout/repo\n",
+        )
+        .unwrap();
+
+        let reports = scan(&home).unwrap();
+        assert!(!reports
+            .iter()
+            .find(|report| report.project == "owner_repo")
+            .unwrap()
+            .candidate());
+        assert!(reports
+            .iter()
+            .find(|report| report.project == "checkout_repo")
+            .unwrap()
+            .candidate());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn confirmed_terminal_board_is_moved_and_catalog_is_rebuilt() {
         let home = home("retire");
         task(&home, "dead", "t-dead", true);
