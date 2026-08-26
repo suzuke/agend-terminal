@@ -141,21 +141,52 @@ struct RetireOutcome {
 }
 
 fn retire(home: &Path, confirmed: &[String], audit_reason: &str) -> Vec<RetireOutcome> {
-    let reports = match scan(home) {
-        Ok(reports) => reports,
-        Err(error) => {
-            return confirmed
-                .iter()
-                .map(|project| RetireOutcome {
-                    project: project.clone(),
-                    moved_to: None,
-                    error: Some(error.clone()),
-                })
-                .collect()
-        }
-    };
     let mut outcomes = Vec::new();
     for project in confirmed {
+        let _board_set_lock = match crate::task_events::acquire_board_set_lock(home) {
+            Ok(lock) => lock,
+            Err(error) => {
+                outcomes.push(RetireOutcome {
+                    project: project.clone(),
+                    moved_to: None,
+                    error: Some(format!("lock board set: {error}")),
+                });
+                continue;
+            }
+        };
+        let source = board_root(home, project);
+        if !source.is_dir() {
+            outcomes.push(RetireOutcome {
+                project: project.clone(),
+                moved_to: None,
+                error: Some("no such board".to_string()),
+            });
+            continue;
+        }
+        let _board_lock = match crate::store::acquire_file_lock(
+            &crate::task_events::board_event_lock_path(&source),
+        ) {
+            Ok(lock) => lock,
+            Err(error) => {
+                outcomes.push(RetireOutcome {
+                    project: project.clone(),
+                    moved_to: None,
+                    error: Some(format!("lock board '{project}': {error}")),
+                });
+                continue;
+            }
+        };
+        let reports = match scan(home) {
+            Ok(reports) => reports,
+            Err(error) => {
+                outcomes.push(RetireOutcome {
+                    project: project.clone(),
+                    moved_to: None,
+                    error: Some(error),
+                });
+                continue;
+            }
+        };
         let Some(report) = reports.iter().find(|report| &report.project == project) else {
             outcomes.push(RetireOutcome {
                 project: project.clone(),
@@ -190,7 +221,6 @@ fn retire(home: &Path, confirmed: &[String], audit_reason: &str) -> Vec<RetireOu
             });
             continue;
         }
-        let source = board_root(home, project);
         let destination = destination_root.join(project);
         if destination.exists() {
             outcomes.push(RetireOutcome {

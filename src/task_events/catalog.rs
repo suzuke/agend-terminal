@@ -816,6 +816,10 @@ where
     F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
 {
     let (home, board_id) = board_identity(board)?;
+    let board_set_lock = super::acquire_board_set_lock(&home)?;
+    if home.join("boards-retired").join(&board_id).exists() {
+        anyhow::bail!("task board '{board_id}' is retired");
+    }
     // The legacy append path created a new project board lazily. Preserve that
     // behavior before catalog discovery so the board is folded before commit.
     std::fs::create_dir_all(board)?;
@@ -832,6 +836,7 @@ where
     let log_path = super::log_path(board);
     let lock_path = log_path.with_extension("jsonl.lock");
     let file_lock = crate::store::acquire_file_lock(&lock_path)?;
+    drop(board_set_lock);
     if super::recover_half_writes_under_lock(board) {
         let projection = load_board_projection(board, &board_id)
             .map_err(|cause| anyhow::anyhow!("task catalog recovery failed: {cause}"))?;
@@ -1149,10 +1154,11 @@ pub(super) fn refresh_archive_manifest(board: &Path) -> anyhow::Result<()> {
 }
 
 pub(super) fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
-    if !super::log_path(board).exists() {
+    let (home, board_id) = board_identity(board)?;
+    let _board_set_lock = super::acquire_board_set_lock(&home)?;
+    if home.join("boards-retired").join(&board_id).exists() || !super::log_path(board).exists() {
         return Ok(());
     }
-    let (home, board_id) = board_identity(board)?;
     let catalog = for_home(&home);
     catalog
         .refresh_all(&home, true)

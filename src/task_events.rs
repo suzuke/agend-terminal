@@ -1170,9 +1170,12 @@ fn log_path(board: &Path) -> PathBuf {
     board.join(format!("{LOG_NAME}.jsonl"))
 }
 
-#[cfg(all(test, unix))]
 pub(crate) fn board_event_lock_path(board: &Path) -> PathBuf {
     log_path(board).with_extension("jsonl.lock")
+}
+
+pub(crate) fn acquire_board_set_lock(home: &Path) -> anyhow::Result<crate::store::FileFlockGuard> {
+    crate::store::acquire_file_lock(&home.join(".locks/task-board-set.lock"))
 }
 
 fn archive_dir(board: &Path) -> PathBuf {
