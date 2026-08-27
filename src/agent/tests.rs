@@ -5551,14 +5551,20 @@ fn codex_resume_argv_places_mcp_overrides_before_the_resume_subcommand_3317() {
         .iter()
         .position(|a| a.starts_with("mcp_servers.agend-terminal."))
         .unwrap_or_else(|| panic!("#3317: resume argv must register the bridge; argv={argv:?}"));
-    let resume_at = argv
-        .iter()
-        .position(|a| a == "resume")
-        .unwrap_or_else(|| panic!("codex resume argv must contain the subcommand; argv={argv:?}"));
+    // #3398: this argv has no session locator, so it no longer carries a
+    // subcommand at all. The ordering guarantee is what #3317 pins, so assert it
+    // wherever a subcommand exists and assert the absence of the global fallback
+    // that #3398 removed.
+    if let Some(resume_at) = argv.iter().position(|a| a == "resume") {
+        assert!(
+            first_mcp < resume_at,
+            "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
+             `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
+        );
+    }
     assert!(
-        first_mcp < resume_at,
-        "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
-         `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
+        !argv.iter().any(|a| a == "--last"),
+        "#3398: a locator-less codex resume must not adopt the cwd's last thread; argv={argv:?}"
     );
     if let Some(base) = home.parent() {
         std::fs::remove_dir_all(base).ok();

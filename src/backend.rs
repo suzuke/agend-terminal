@@ -515,11 +515,11 @@ impl Backend {
                 // touches the operator's global codex config. Must precede the
                 // `resume` subcommand (`-c` is a global option). Primary fix; the
                 // #1069 dismiss below stays as a fallback (see its comment).
+                // #3398: no global `resume --last` — these args serve the
+                // locator-less spawn, where it would adopt another instance's thread.
                 args: &[
                     "-c",
                     "check_for_update_on_startup=false",
-                    "resume",
-                    "--last",
                     "--dangerously-bypass-approvals-and-sandbox",
                 ],
                 ready_pattern: "OpenAI Codex|›",
