@@ -441,6 +441,10 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
             panic!("first boot never became the single active daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must register the probe before restart"
+    );
 
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
@@ -591,6 +595,10 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
             panic!("first boot never became the single active daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must register the probe before restart"
+    );
     set_mode_active(&home);
 
     // Commit happens (successor answers Phase-1), then the successor dies before
@@ -654,6 +662,10 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
             panic!("first boot never became the single active daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must register the probe before restart"
+    );
     set_mode_active(&home);
 
     let _ = trigger_restart(&home, old_pid);
@@ -1009,6 +1021,10 @@ fn app_mode_restart_routes_to_detached_daemon_2453() {
             panic!("app did not start its detached daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "detached daemon must register the probe before restart"
+    );
 
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
