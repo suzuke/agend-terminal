@@ -260,6 +260,10 @@ fn resolve_active_run_dir(home: &Path) -> Option<PathBuf> {
 }
 
 fn mode_after_rpc_failure(run_dir: &Path) -> crate::runtime::AgentListMode {
+    // The old generation may disappear just after this check while its
+    // successor is already live, so one pessimistic Fallback cycle is
+    // possible; non-Live results remain roster-safe because they never
+    // reconcile panes.
     if crate::daemon::read_daemon_pid(run_dir)
         .map(crate::process::is_pid_alive)
         .unwrap_or(false)

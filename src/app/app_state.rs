@@ -1080,6 +1080,9 @@ impl AppState {
         let Some(names) = self.pending_remote_roster_names.take() else {
             return;
         };
+        // A healthy Live snapshot owns this roster pass and refreshes the
+        // idle-sync throttle, preventing the fallback poll from starving the
+        // Live path with a competing reconciliation.
         self.reconcile_remote_roster(&names, crate::runtime::AgentListMode::Live, deps);
         self.last_remote_sync = std::time::Instant::now();
     }
@@ -1237,6 +1240,22 @@ mod tests {
             error: "daemon stuck".into(),
             mode: crate::runtime::AgentListMode::FallbackDaemonStuck,
         })));
+        assert_eq!(
+            state.daemon_list_mode,
+            crate::runtime::AgentListMode::FallbackDaemonStuck
+        );
+        assert!(state.pending_remote_roster_names.is_none());
+    }
+
+    #[test]
+    fn fallback_agent_state_snapshot_updates_mode_without_queueing_roster() {
+        let mut state = AppState::new();
+        state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
+            snapshot: HashMap::new(),
+            names: HashSet::from(["stale-agent".to_string()]),
+            mode: crate::runtime::AgentListMode::FallbackDaemonStuck,
+        })));
+
         assert_eq!(
             state.daemon_list_mode,
             crate::runtime::AgentListMode::FallbackDaemonStuck
