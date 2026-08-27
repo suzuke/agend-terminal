@@ -945,7 +945,8 @@ pub(crate) fn codex_mcp_config_args(home: &Path, instance_name: Option<&str>) ->
 /// workspace. Codex resolves project identity using the canonical filesystem
 /// path, so the argv must use that same path (not a symlink or `/tmp` alias).
 /// This changes only the child process's effective config; it never writes the
-/// operator's `$CODEX_HOME/config.toml`.
+/// operator's `$CODEX_HOME/config.toml`. The full-table override intentionally
+/// exposes only this managed workspace to the child invocation.
 pub(crate) fn codex_project_trust_args(workspace: &Path) -> anyhow::Result<Vec<String>> {
     let canonical = std::fs::canonicalize(workspace).map_err(|error| {
         anyhow::anyhow!(

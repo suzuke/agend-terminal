@@ -19,6 +19,8 @@ pub(crate) use receipt::{
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;
 #[cfg(test)]
+pub(crate) use registry::save_session_locator;
+#[cfg(test)]
 pub(crate) use registry::test_support;
 
 pub(crate) use registry::{

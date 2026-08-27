@@ -5779,6 +5779,39 @@ fn codex_resume_argv_places_invocation_project_trust_before_resume_3402() {
     }
 }
 
+/// #3402: the NativeShared attach branch is assembled separately from preset
+/// spawns, so pin the production `build_command` route through a saved locator.
+#[test]
+fn codex_remote_attach_argv_carries_invocation_project_trust_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-remote", "home");
+    let name = "codex-3402-remote";
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-3402.sock"),
+        Some("thread-3402".to_string()),
+    );
+    crate::transport::save_session_locator(&home, name, &locator).expect("save Codex locator");
+
+    let argv = codex_argv_3317(&home, &workspace, name, crate::backend::SpawnMode::Resume);
+    let trust_at = argv
+        .iter()
+        .position(|arg| arg.starts_with("projects={"))
+        .unwrap_or_else(|| panic!("#3402: remote trust override missing; argv={argv:?}"));
+    let remote_at = argv
+        .iter()
+        .position(|arg| arg == "--remote")
+        .expect("remote endpoint flag");
+    let resume_at = argv
+        .iter()
+        .position(|arg| arg == "resume")
+        .expect("remote resume subcommand");
+    assert!(remote_at < trust_at, "#3402: argv={argv:?}");
+    assert!(trust_at < resume_at, "#3402: argv={argv:?}");
+
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
 /// #3402 RED: constructing a managed spawn must never persist trust into the
 /// operator's config. The pre-existing bytes are the invariant.
 #[test]
