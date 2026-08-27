@@ -1930,7 +1930,7 @@ mod tests {
             return "cross_daemon_successor_status";
         }
         if path == "src/app/rpc.rs"
-            && matches!(function, "call_task" | "call_tool")
+            && matches!(function, "call_task" | "call_tool" | "call_tool_at")
             && kind == "call_at"
         {
             return "app_thin_client_task_rpc";
