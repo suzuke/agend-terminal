@@ -1356,7 +1356,11 @@ fn drain_persists_delivering_for_reclaim_after_abandoned_turn_3395() {
     reclaim_stale_delivering(&home);
 
     let redelivered = drain(&home, agent);
-    assert_eq!(redelivered.len(), 1, "reclaim must make the lost payload available");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "reclaim must make the lost payload available"
+    );
     assert_eq!(redelivered[0].id.as_deref(), Some("m-3395-message"));
     assert_eq!(redelivered[0].delivery_count, 2);
     assert!(redelivered[0].delivering_at.is_some());

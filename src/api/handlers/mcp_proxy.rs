@@ -611,7 +611,10 @@ mod tests {
             None,
             slow,
         );
-        assert_eq!(resp["ok"], true, "inbox timeout must not look retryable: {resp}");
+        assert_eq!(
+            resp["ok"], true,
+            "inbox timeout must not look retryable: {resp}"
+        );
         assert_eq!(resp["status"], "accepted_in_progress", "got {resp}");
         assert!(
             resp.get("error").is_none(),
