@@ -1104,3 +1104,112 @@ fn b4_corrupt_markers_fails_closed_not_silent_empty() {
         );
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+fn live_terminal_commit_retires_matching_assignment_before_return() {
+    let home = tmp_home("p3-live-terminal");
+    let task_id = "t-p3-live-terminal";
+    seed_open_task(&home, task_id);
+
+    let mut record = mk_record(
+        "o/r",
+        "feat/p3",
+        "reviewer",
+        42,
+        "2026-08-27T00:00:00Z",
+    );
+    record.task_id = task_id.to_string();
+    persist(&home, &record).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/p3",
+        "reviewer",
+        "2026-08-27T00:00:01Z",
+    )
+    .unwrap();
+
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("finisher"),
+        crate::task_events::TaskEvent::Done {
+            task_id: crate::task_events::TaskId::from(task_id),
+            by: crate::task_events::InstanceName::from("finisher"),
+            source: crate::task_events::DoneSource::OperatorManual {
+                authored_at: "2026-08-27T00:00:02Z".into(),
+                result: Some("done".into()),
+            },
+        },
+    )
+    .unwrap();
+
+    assert!(
+        list_active(&home, "o/r", "feat/p3").is_empty(),
+        "the live terminal commit must retire authority synchronously"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn duplicate_terminal_event_key_is_a_durable_no_op() {
+    let home = tmp_home("p3-terminal-dedupe");
+    let task_id = "t-p3-terminal-dedupe";
+    seed_open_task(&home, task_id);
+
+    let mut first = mk_record(
+        "o/r",
+        "feat/p3",
+        "reviewer-a",
+        42,
+        "2026-08-27T00:00:00Z",
+    );
+    first.task_id = task_id.to_string();
+    persist(&home, &first).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/p3",
+        "reviewer-a",
+        "2026-08-27T00:00:01Z",
+    )
+    .unwrap();
+
+    assert_eq!(
+        retire_for_terminal_event(
+            &home,
+            "default",
+            task_id,
+            "finisher",
+            7,
+            "2026-08-27T00:00:02Z",
+        )
+        .unwrap(),
+        1
+    );
+
+    let mut successor = mk_record(
+        "o/r",
+        "feat/p3",
+        "reviewer-b",
+        42,
+        "2026-08-27T00:00:03Z",
+    );
+    successor.task_id = task_id.to_string();
+    persist(&home, &successor).unwrap();
+
+    assert_eq!(
+        retire_for_terminal_event(
+            &home,
+            "default",
+            task_id,
+            "finisher",
+            7,
+            "2026-08-27T00:00:04Z",
+        )
+        .unwrap(),
+        0,
+        "a replayed terminal key must not retire a later assignment"
+    );
+    assert_eq!(list_active(&home, "o/r", "feat/p3").len(), 1);
+    std::fs::remove_dir_all(&home).ok();
+}

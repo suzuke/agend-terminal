@@ -466,62 +466,24 @@ mod tests {
         p
     }
 
-    /// #3336: the memo must resolve each DISTINCT task id at most once per pass.
-    /// `load_routed` costs ~4.7s (13 board replays, `replay_strict_at` uncached) and
-    /// the reconcile inner loop hits it once per ACTIVE ASSIGNMENT RECORD — this
-    /// store's 360 record files carry only 2 distinct ids, so the repeat was pure waste.
-    ///
-    /// Proof that the second lookup does NOT touch disk: resolve once against a real
-    /// home, then DELETE the home. A non-memoized second call would now route against
-    /// a missing board and answer differently (or `None`); a memoized one returns the
-    /// first answer verbatim.
     #[test]
-    fn task_terminal_memo_resolves_each_id_once_per_pass() {
-        let home = tmp_home("memo");
-        let tid = "t-memo-1";
-        crate::task_events::append(
-            &home,
-            &InstanceName("creator".into()),
-            TaskEvent::Created {
-                task_id: TaskId(tid.into()),
-                title: "t".into(),
-                description: String::new(),
-                priority: "normal".into(),
-                owner: None,
-                due_at: None,
-                depends_on: Vec::new(),
-                routed_to: None,
-                branch: None,
-                bind: None,
-                eta_secs: None,
-                tags: vec![],
-                parent_id: None,
-            },
-        )
-        .expect("seed task");
+    fn reconcile_uses_one_catalog_status_batch_per_pass() {
+        let home = tmp_home("one-status-batch");
+        seed_open_task(&home, "t-rev-1");
 
-        let mut memo = TaskTerminalMemo::default();
-        let first = memo.status_of(&home, tid);
-        assert!(first.is_some(), "a freshly created task must route");
-        assert_eq!(memo.seen.len(), 1, "one distinct id → one memo entry");
+        let a = mk("o/r", "feat/a", "reviewer-a", 41, "2026-08-27T00:00:00Z");
+        let b = mk("o/r", "feat/b", "reviewer-b", 42, "2026-08-27T00:00:00Z");
+        store::persist(&home, &a).unwrap();
+        store::persist(&home, &b).unwrap();
 
-        // Disk is gone: only the memo can answer now.
+        crate::task_events::catalog::reset_status_batch_queries_for_test();
+        let _ = reconcile_all_collect(&home, "2026-08-27T00:01:00Z");
+        assert_eq!(
+            crate::task_events::catalog::status_batch_queries_for_test(),
+            1,
+            "one safety pass must issue exactly one catalog batch query"
+        );
         std::fs::remove_dir_all(&home).ok();
-        let second = memo.status_of(&home, tid);
-        assert_eq!(
-            second, first,
-            "repeat lookup must come from the memo, not disk"
-        );
-        assert_eq!(memo.seen.len(), 1, "a repeat must not add an entry");
-
-        // A DIFFERENT id is a real (now-failing) lookup and is cached as such —
-        // an unroutable id collapses to None, the fail-closed "preserve" answer.
-        let other = memo.status_of(&home, "t-memo-2");
-        assert_eq!(
-            other, None,
-            "unroutable id must collapse to None (preserve)"
-        );
-        assert_eq!(memo.seen.len(), 2, "a distinct id adds exactly one entry");
     }
 
     fn mk(repo: &str, branch: &str, target: &str, pr: u64, created: &str) -> ActiveAssignment {
