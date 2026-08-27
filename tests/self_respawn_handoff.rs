@@ -192,6 +192,23 @@ fn ls_lists_probe_within(home: &Path, budget: Duration) -> bool {
     false
 }
 
+fn daemon_log_contains_within(home: &Path, needle: &str, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let found = std::fs::read_dir(home).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_name().to_string_lossy().starts_with("daemon.")
+                    && std::fs::read_to_string(entry.path()).is_ok_and(|log| log.contains(needle))
+            })
+        });
+        if found {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
 /// Set operator mode to Active via the real `mode` CLI (api MODE → signed
 /// operator-mode.json + immediate in-memory update). REQUIRED before triggering
 /// restart: a fresh daemon with no signed operator-mode.json locks down to
@@ -245,7 +262,7 @@ fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     // The real restart_daemon tool call.
     let req = serde_json::json!({
         "method": "mcp_tool",
-        "params": { "tool": "restart_daemon", "arguments": {} },
+        "params": { "tool": "restart_daemon", "instance": "probe", "arguments": {} },
     });
     writeln!(writer, "{req}").ok()?;
     writer.flush().ok();
@@ -318,6 +335,12 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
 
     // The successor's agents must be re-spawned (probe served by the new pid).
     let served = new_pid.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    let requester_resumed = new_pid.is_some()
+        && daemon_log_contains_within(
+            &home,
+            "fresh-restart self-kick injected agent=probe",
+            Duration::from_secs(30),
+        );
     let single_after = active_pids(&home).len() == 1;
 
     // The original child handle is the OLD daemon (now exited 0); reap it.
@@ -330,6 +353,10 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     assert!(
         served,
         "successor must re-spawn agents (probe served by new pid)"
+    );
+    assert!(
+        requester_resumed,
+        "successor must self-kick exactly the restart_daemon requester"
     );
     assert!(
         single_after,
