@@ -1,6 +1,6 @@
-//! Review-repro guard (app-tui batch): the `Overlay::ConfirmClose` handler in
-//! `src/app/overlay.rs` must kill the underlying agent of EVERY closed pane —
-//! including shell / non-fleet panes whose `fleet_instance_name` is `None`.
+//! Review-repro guards for the `Overlay::ConfirmClose` lifecycle boundary.
+//! Closing layout must reap local shell children, but a fleet pane is only a
+//! view onto a daemon-owned instance and must never delete that instance.
 //!
 //! Bug: the handler collects only `fleet_instance_name` values into `names`
 //! and runs `full_delete_instance` per name in a background thread. A pane
@@ -55,5 +55,32 @@ fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
          `super::kill_agent(ctx.home, ctx.registry, &name)` (mirror the \
          scratch-shell overlay arm). Found agent_name={references_agent_name}, \
          kill_agent={references_kill} in the ConfirmClose block."
+    );
+}
+
+#[test]
+fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
+    let src = include_str!("../overlay.rs");
+
+    let start = src
+        .find("Overlay::ConfirmClose { target } => match key.code {")
+        .expect("ConfirmClose handler arm must exist in overlay.rs");
+    let rel_end = src[start..]
+        .find("Overlay::TabList { ref mut selected } => match key.code {")
+        .expect("TabList arm must follow ConfirmClose and bound its block");
+    let block = &src[start..start + rel_end];
+
+    assert!(
+        !block.contains("full_delete_instance"),
+        "destructive lifecycle bug: Close pane/tab is a layout operation, but its \
+         ConfirmClose handler calls full_delete_instance. A disconnected or \
+         control-plane-missing pane can therefore erase fleet/team membership, \
+         watches, worktree, and workspace while the backend session is still \
+         alive. Permanent deletion must remain behind the explicit delete_instance \
+         control surface."
+    );
+    assert!(
+        !block.contains("reconcile_after_close"),
+        "layout close must not run deployment deletion reconciliation"
     );
 }
