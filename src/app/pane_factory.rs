@@ -617,13 +617,12 @@ pub(super) enum AttachOutcome {
     Ready {
         pane_id: usize,
         instance_id: crate::types::InstanceId,
+        /// True only for a direct/local shell with no fleet.yaml identity.
+        unmanaged: bool,
         rx: crossbeam_channel::Receiver<Vec<u8>>,
         dump: Vec<u8>,
         /// The real spawn cwd (worktree-resolved for agents) → update the pane.
         work_dir: std::path::PathBuf,
-        /// The agent's (deduped) name — used to kill the orphan if its pane was
-        /// closed while the attach was in flight (F1).
-        name: String,
     },
     Failed {
         pane_id: usize,
@@ -789,6 +788,7 @@ fn finish_attach(
     dump: Vec<u8>,
     work_dir: std::path::PathBuf,
     name: String,
+    unmanaged: bool,
 ) -> AttachOutcome {
     let shutting_down = super::app_shutdown_flag().load(std::sync::atomic::Ordering::SeqCst);
     if reap_late_registration_if_shutdown(registry, instance_id, shutting_down) {
@@ -801,10 +801,10 @@ fn finish_attach(
     AttachOutcome::Ready {
         pane_id,
         instance_id,
+        unmanaged,
         rx,
         dump,
         work_dir,
-        name,
     }
 }
 
@@ -925,6 +925,7 @@ pub(super) fn run_attach(
                         dump,
                         work_dir,
                         deduped_name,
+                        false,
                     )
                 }
                 Err(e) => AttachOutcome::Failed {
@@ -961,9 +962,16 @@ pub(super) fn run_attach(
             SpawnIdentity::UnmanagedLocalShell,
             None,
         ) {
-            Ok((instance_id, rx, dump)) => {
-                finish_attach(registry, pane_id, instance_id, rx, dump, work_dir, name)
-            }
+            Ok((instance_id, rx, dump)) => finish_attach(
+                registry,
+                pane_id,
+                instance_id,
+                rx,
+                dump,
+                work_dir,
+                name,
+                true,
+            ),
             Err(e) => AttachOutcome::Failed {
                 pane_id,
                 name,
@@ -1585,10 +1593,10 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
+                unmanaged: true,
                 rx: sub_rx,
                 dump: b"DUMP-XYZ".to_vec(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             fwd_tx,
             &wakeup_tx,
@@ -1656,10 +1664,10 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
+                unmanaged: true,
                 rx: sub_rx,
                 dump: Vec::new(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             job.fwd_tx,
             &wakeup_tx,
@@ -1731,10 +1739,10 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
+                unmanaged: true,
                 rx: sub_rx,
                 dump: Vec::new(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             job.fwd_tx,
             &wakeup_tx,
@@ -1871,10 +1879,10 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id,
                 instance_id,
+                unmanaged: true,
                 rx: sub_rx,
                 dump: Vec::new(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             fwd_tx,
             &wakeup_tx,

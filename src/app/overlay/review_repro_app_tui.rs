@@ -56,6 +56,10 @@ fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
 #[test]
 fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
     let src = include_str!("../overlay.rs");
+    let production = src
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("overlay production section");
 
     let start = src
         .find("Overlay::ConfirmClose { target } => match key.code {")
@@ -70,9 +74,12 @@ fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
         "full_delete_instance",
         "instance_state::lifecycle",
         "reconcile_after_close",
+        "remove_instance",
+        "delete_transaction",
+        "kill_agent(",
     ] {
         assert!(
-            !src.contains(forbidden),
+            !production.contains(forbidden),
             "destructive lifecycle bug: app/overlay.rs must not reference \
              `{forbidden}` anywhere. A helper outside the ConfirmClose block \
              could otherwise hide destructive fleet deletion behind one-hop \

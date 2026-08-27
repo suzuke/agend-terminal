@@ -1146,15 +1146,21 @@ mod tests {
         );
 
         assert!(layout.tabs.is_empty(), "the tab view should close");
-        assert!(
-            registry.lock().contains_key(&id),
-            "closing a fleet view must not remove its managed process"
-        );
-        assert_eq!(
-            std::fs::read(&fleet_path).expect("fleet still exists"),
-            fleet_bytes.as_bytes(),
-            "closing a fleet view must not mutate fleet.yaml"
-        );
+        // The incident path used a fire-and-forget delete thread. Poll across
+        // a bounded window so an asynchronous regression cannot pass merely
+        // because the assertions raced ahead of the destructive worker.
+        for _ in 0..20 {
+            assert!(
+                registry.lock().contains_key(&id),
+                "closing a fleet view must not remove its managed process"
+            );
+            assert_eq!(
+                std::fs::read(&fleet_path).expect("fleet still exists"),
+                fleet_bytes.as_bytes(),
+                "closing a fleet view must not mutate fleet.yaml"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let handle = crate::agent::remove_and_unregister(&registry, &id).expect("cleanup handle");
         crate::daemon::terminate_agents_parallel(vec![("managed".to_string(), handle.child)]);
         std::fs::remove_dir_all(home).ok();

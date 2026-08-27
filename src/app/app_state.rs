@@ -823,7 +823,6 @@ impl AppState {
         deps: &AppDeps<'_>,
     ) {
         let AppDeps {
-            home,
             registry,
             wakeup_tx,
             ..
@@ -840,12 +839,19 @@ impl AppState {
             if let Some(fwd_tx) = self.pending_fwd.remove(&pane_id) {
                 if let Some(pane) = self.ui.layout.find_pane_mut(pane_id) {
                     pane_factory::apply_attach_outcome(pane, registry, outcome, fwd_tx, wakeup_tx);
-                } else if let pane_factory::AttachOutcome::Ready { name, .. } = &outcome {
+                } else if let pane_factory::AttachOutcome::Ready {
+                    instance_id,
+                    unmanaged,
+                    ..
+                } = &outcome
+                {
                     // F1 (r4): the pane was closed while the attach was in
-                    // flight → the agent is already spawned + registered with
-                    // no host pane. Kill it so it doesn't run orphaned until
-                    // quit (fwd_tx already removed above → forwarder/rx drop).
-                    kill_agent(home, registry, name);
+                    // flight. Reap only a TUI-local unmanaged shell; managed
+                    // fleet agents are daemon-owned lifecycle state and closing
+                    // their view must not delete them.
+                    if *unmanaged {
+                        kill_unmanaged_agent(registry, *instance_id);
+                    }
                 }
             }
         }
@@ -1033,8 +1039,74 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::remote_attach_candidates;
+    use super::*;
     use std::collections::HashSet;
+
+    fn closed_before_attach_registry_survives(unmanaged: bool) -> bool {
+        let home = std::env::temp_dir().join(format!(
+            "app_state_late_attach_{}_{}_{}",
+            std::process::id(),
+            unmanaged,
+            crate::types::InstanceId::new()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let fleet_path = home.join("fleet.yaml");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let instance_id = crate::types::InstanceId::new();
+        registry.lock().insert(
+            instance_id,
+            crate::agent::mk_test_handle("late-shell", instance_id),
+        );
+
+        let mut state = AppState::new();
+        let pane_id = 42;
+        let (fwd_tx, _fwd_rx) = crossbeam_channel::unbounded();
+        state.pending_fwd.insert(pane_id, fwd_tx);
+
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+        let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attached_run_dir = None;
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+        let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+            crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+        let deps = AppDeps {
+            home: &home,
+            fleet_path: &fleet_path,
+            registry: &registry,
+            wakeup_tx: &wakeup_tx,
+            app_restart_gate: &app_restart_gate,
+            daemon_binary_stale: &daemon_binary_stale,
+            telegram_status: TelegramStatus::NotConfigured,
+            attached_run_dir: &attached_run_dir,
+            attached_mode: false,
+            size_debug: false,
+            task_rpc_tx: &task_rpc_tx,
+            remote_state_rpc_tx: &remote_state_rpc_tx,
+        };
+        let (_sub_tx, sub_rx) = crossbeam_channel::unbounded();
+        state.handle_attach_outcome(
+            Ok(pane_factory::AttachOutcome::Ready {
+                pane_id,
+                instance_id,
+                unmanaged,
+                rx: sub_rx,
+                dump: Vec::new(),
+                work_dir: home.clone(),
+            }),
+            &deps,
+        );
+
+        let survives = registry.lock().contains_key(&instance_id);
+        if let Some(handle) = crate::agent::remove_and_unregister(&registry, &instance_id) {
+            crate::daemon::terminate_agents_parallel(vec![(
+                "late-shell".to_string(),
+                handle.child,
+            )]);
+        }
+        std::fs::remove_dir_all(home).ok();
+        survives
+    }
 
     #[test]
     fn retained_disconnected_agent_is_reconnect_candidate() {
@@ -1045,5 +1117,15 @@ mod tests {
             remote_attach_candidates(&current, &known, |name| name == "returning"),
             vec!["returning"]
         );
+    }
+
+    #[test]
+    fn closed_before_attach_reaps_unmanaged_shell_by_instance_id() {
+        assert!(!closed_before_attach_registry_survives(true));
+    }
+
+    #[test]
+    fn closed_before_attach_preserves_managed_agent() {
+        assert!(closed_before_attach_registry_survives(false));
     }
 }
