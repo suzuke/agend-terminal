@@ -154,6 +154,17 @@ fn assert_cli_envelope(requests: &[Value], tool: &str) {
     );
 }
 
+fn assert_list_envelope(requests: &[Value]) {
+    assert_eq!(requests.len(), 1, "schema lookup must make exactly one request");
+    let request = &requests[0];
+    assert_eq!(request["method"], "mcp_tools_list");
+    assert_eq!(request["params"]["instance"], "red-cli");
+    assert!(
+        request["request_id"].as_str().is_some(),
+        "schema lookup must add a UUID request_id: {request}"
+    );
+}
+
 #[test]
 fn unknown_tool_is_a_tool_error_and_forwards_cli_transport() {
     let daemon = MockDaemon::new(response("unknown_tool"));
@@ -409,6 +420,42 @@ fn packaged_tarball_reaches_shared_wire_and_cli_modules() {
             "packaged source must contain {path}; listing was:\n{listing}"
         );
     }
+}
+
+#[test]
+fn schema_name_filters_live_role_filtered_tool_list() {
+    let daemon = MockDaemon::new(response("tool_list"));
+    let home = daemon.home.clone();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "schema",
+            "send",
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    let requests = daemon.finish();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "schema lookup must succeed: {}",
+        combined(&output)
+    );
+    assert!(
+        combined(&output).contains("Send a message to an instance")
+            && combined(&output).contains("\"name\": \"send\""),
+        "schema must be selected from the live list, not synthesized: {}",
+        combined(&output)
+    );
+    assert!(
+        !combined(&output).contains("Read pending messages"),
+        "schema must return only the requested live definition: {}",
+        combined(&output)
+    );
+    assert_list_envelope(&requests);
 }
 
 #[test]
