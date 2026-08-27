@@ -370,22 +370,27 @@ pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
 /// standalone bridge call that never traversed the api `mcp_tool` ingress) maps
 /// to `None` → default-deny in the handler.
 pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
-    let requester_id = if ctx
-        .runtime
-        .is_some_and(|runtime| runtime.capability == crate::api::RestartCapability::App)
-        && !ctx.instance_name.is_empty()
-    {
-        match crate::agent::resolve_instance(ctx.home, ctx.instance_name) {
-            Ok((id, _)) => Some(id),
-            Err(_) => {
-                return json!({
-                    "ok": false,
-                    "error": "restart_daemon requires the managed caller's stable InstanceId; fleet intact — no restart"
-                });
+    let requester_id = match (
+        ctx.runtime.map(|runtime| runtime.capability),
+        ctx.instance_name.is_empty(),
+    ) {
+        (Some(crate::api::RestartCapability::App), false) => {
+            match crate::agent::resolve_instance(ctx.home, ctx.instance_name) {
+                Ok((id, _)) => Some(id),
+                Err(_) => {
+                    return json!({
+                        "ok": false,
+                        "error": "restart_daemon requires the managed caller's stable InstanceId; fleet intact — no restart"
+                    });
+                }
             }
         }
-    } else {
-        None
+        (Some(crate::api::RestartCapability::Daemon), false) => {
+            crate::agent::resolve_instance(ctx.home, ctx.instance_name)
+                .ok()
+                .map(|(id, _)| id)
+        }
+        _ => None,
     };
     dispatch_restart_daemon_with_requester(ctx, requester_id)
 }

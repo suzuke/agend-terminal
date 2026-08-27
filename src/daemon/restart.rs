@@ -154,6 +154,11 @@ pub const RESTART_HANDOFF_ENV: &str = "AGEND_RESTART_HANDOFF";
 /// reconciles that MUST NOT run in a two-daemon overlap window).
 pub const SUCCESSOR_HANDOFF_ENV: &str = "AGEND_SUCCESSOR_HANDOFF";
 
+/// Exact managed caller to self-kick after a committed daemon handoff. The
+/// successor spawn explicitly sets or removes this value, so a later restart
+/// cannot inherit stale requester authority.
+pub const SUCCESSOR_REQUESTER_ENV: &str = "AGEND_SUCCESSOR_REQUESTER";
+
 /// True unless `AGEND_RESTART_HANDOFF=0`. Read at restart time (handler) and at
 /// daemon exit (to choose `exit(0)` vs `exit(42)`).
 ///
@@ -180,6 +185,11 @@ pub fn successor_handoff_marker() -> Option<(u32, String)> {
         return None;
     }
     Some((pid, token.to_string()))
+}
+
+/// Parse the one-shot requester carried by a legitimate handoff successor.
+pub fn successor_requester_id() -> Option<crate::types::InstanceId> {
+    crate::types::InstanceId::parse(&std::env::var(SUCCESSOR_REQUESTER_ENV).ok()?)
 }
 
 /// Build the `AGEND_SUCCESSOR_HANDOFF` env VALUE (`<old_pid>:<token>`) for a

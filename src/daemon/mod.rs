@@ -670,6 +670,7 @@ enum FleetSource {
     HandoffDeferred {
         fleet_path: PathBuf,
         opts: crate::bootstrap::PrepareOptions,
+        resume_requester: Option<crate::types::InstanceId>,
     },
 }
 
@@ -709,6 +710,7 @@ pub fn run_successor_handoff(home: &Path, fleet_path: &Path) -> anyhow::Result<(
         FleetSource::HandoffDeferred {
             fleet_path: fleet_path.to_path_buf(),
             opts: crate::bootstrap::PrepareOptions::default(),
+            resume_requester: crate::daemon::restart::successor_requester_id(),
         },
     )
 }
@@ -777,15 +779,19 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     // resolve. `_handoff_lock` holds the flock for the daemon's lifetime on the
     // handoff path (None on the normal path, where `prepare`'s `OwnedFleet`
     // already holds it).
-    let (agents, _handoff_lock) = match source {
+    let (agents, _handoff_lock, resume_requester) = match source {
         FleetSource::Resolved { agents, .. } => {
             // Normal boot: the flock is already held by `prepare`'s `OwnedFleet`,
             // so the post-lock GC/migration runs here — the same early point as
             // before the #1814 Stage-2 split (behavior unchanged).
             init_daemon_services_post_lock(home)?;
-            (agents, None::<crate::bootstrap::DaemonLock>)
+            (agents, None::<crate::bootstrap::DaemonLock>, None)
         }
-        FleetSource::HandoffDeferred { fleet_path, opts } => {
+        FleetSource::HandoffDeferred {
+            fleet_path,
+            opts,
+            resume_requester,
+        } => {
             write_control_ready(home);
             // §3.9 FIX2 test seam: pass Phase-1 (api stays up to answer STATUS
             // for a moment) then die BEFORE acquiring the flock — exercises the
@@ -829,7 +835,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             crate::bootstrap::boot_hygiene_sweeps(home);
             let (_config, agents, _telegram) =
                 crate::bootstrap::resolve_fleet_and_reconcile(home, &fleet_path, &opts)?;
-            (agents, Some(lock))
+            (agents, Some(lock), resume_requester)
         }
     };
 
@@ -846,6 +852,9 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     crate::daemon::shadow::start(home);
 
     spawn_fleet_agents(home, &agents, &ctx);
+    if let Some(requester_id) = resume_requester {
+        spawn_handoff_requester_self_kick(home, &agents, &ctx, requester_id);
+    }
 
     // #boot-orphan-live-lease: the initial full spawn is a synchronous barrier
     // (each successful agent is registered and ready before it returns). Take an
@@ -1241,6 +1250,44 @@ fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
             tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
         }
     });
+}
+
+/// Resume exactly the managed caller that committed this daemon handoff. The
+/// requester UUID crosses the predecessor/successor boundary explicitly; a
+/// cold boot has no value and therefore schedules no first turn.
+fn spawn_handoff_requester_self_kick(
+    home: &Path,
+    agents: &[AgentDef],
+    ctx: &DaemonContext,
+    requester_id: crate::types::InstanceId,
+) {
+    let Some(name) = crate::fleet::resolve_name_by_uuid(home, &requester_id.full()) else {
+        tracing::warn!(%requester_id, "restart requester absent from fleet — skipping self-kick");
+        return;
+    };
+    let Some(def) = agents.iter().find(|def| def.0 == name) else {
+        tracing::warn!(agent = %name, %requester_id, "restart requester absent from resolved fleet — skipping self-kick");
+        return;
+    };
+    if !ctx.registry.lock().contains_key(&requester_id) {
+        tracing::warn!(agent = %name, %requester_id, "restart requester did not spawn — skipping self-kick");
+        return;
+    }
+    let ready_timeout = def
+        .6
+        .as_ref()
+        .map(|backend| backend.preset().ready_timeout_secs)
+        .unwrap_or(60)
+        .saturating_add(15);
+    crate::agent::spawn_self_kick_bootstrap(
+        Arc::clone(&ctx.registry),
+        requester_id,
+        name,
+        home.to_path_buf(),
+        std::time::Duration::from_secs(ready_timeout),
+        crate::agent::BootstrapRegistrationState::AlreadyRegistered,
+        Some(Arc::clone(&ctx.shutdown)),
+    );
 }
 
 /// #2935: post-select dispatch for the serve loop. Runs the periodic maintenance

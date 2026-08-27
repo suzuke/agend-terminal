@@ -158,7 +158,11 @@ pub struct SuccessorHandle {
 /// predecessor to exit) or aborts (kills this successor). The child inherits
 /// the predecessor's env (incl. `AGEND_RESTART_HANDOFF=1`), so the successor will
 /// itself self-respawn on a later restart.
-pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<SuccessorHandle> {
+pub fn spawn_successor_handoff(
+    home: &Path,
+    handoff_value: &str,
+    requester_id: Option<crate::types::InstanceId>,
+) -> Result<SuccessorHandle> {
     let exe = std::env::current_exe().context("resolve current_exe for successor spawn")?;
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
 
@@ -167,6 +171,14 @@ pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<Succe
     // Explicit set OVERRIDES any inherited stale value (the predecessor may
     // itself have been a successor carrying an old AGEND_SUCCESSOR_HANDOFF).
     cmd.env(crate::daemon::restart::SUCCESSOR_HANDOFF_ENV, handoff_value);
+    match requester_id {
+        Some(id) => {
+            cmd.env(crate::daemon::restart::SUCCESSOR_REQUESTER_ENV, id.full());
+        }
+        None => {
+            cmd.env_remove(crate::daemon::restart::SUCCESSOR_REQUESTER_ENV);
+        }
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
