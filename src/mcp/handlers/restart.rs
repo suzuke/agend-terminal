@@ -35,7 +35,7 @@ pub(super) fn handle_restart_daemon_with_shutdown(
 ) -> Value {
     use crate::api::RestartCapability;
     match capability {
-        Some(RestartCapability::Daemon) => daemon_restart_strategy(home, shutdown),
+        Some(RestartCapability::Daemon) => daemon_restart_strategy(home, shutdown, requester_id),
         Some(RestartCapability::App) => app_restart_strategy(app_restart, post_flush, requester_id),
         Some(RestartCapability::Unsupported) | None => unsupported_fail_closed(),
     }
@@ -237,6 +237,7 @@ fn unsupported_fail_closed() -> Value {
 fn daemon_restart_strategy(
     home: &Path,
     shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    requester_id: Option<crate::types::InstanceId>,
 ) -> Value {
     // #1814: self-respawn is the DEFAULT (Stage 4). By default the daemon owns
     // its own respawn (spawn successor → Phase-1 health gate → abort-stay-alive
@@ -257,7 +258,7 @@ fn daemon_restart_strategy(
         "#1814 restart_daemon path selected"
     );
     if self_respawn {
-        return handle_self_respawn(home);
+        return handle_self_respawn(home, requester_id);
     }
 
     // #851 fail-closed: refuse the request when no supervisor will
@@ -314,12 +315,13 @@ fn daemon_restart_strategy(
 /// `handle_restart_daemon`'s capability dispatch (`RestartCapability::Daemon`) —
 /// so this never runs in app/owned mode and the `RESTART_PENDING.store(true)` on
 /// commit always has a run_core consumer.
-fn handle_self_respawn(home: &Path) -> Value {
+fn handle_self_respawn(home: &Path, requester_id: Option<crate::types::InstanceId>) -> Value {
     let old_pid = std::process::id();
     let handoff_value = crate::daemon::restart::make_handoff_value(old_pid);
     let mut succ = match crate::bootstrap::daemon_spawn::spawn_successor_handoff(
         home,
         &handoff_value,
+        requester_id,
     ) {
         Ok(s) => s,
         Err(e) => {
