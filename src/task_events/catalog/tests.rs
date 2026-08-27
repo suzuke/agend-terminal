@@ -733,6 +733,18 @@ fn catalog_catch_up_does_not_replay_terminal_side_effects() {
         "catch-up must not replay live terminal side effects"
     );
 
+    assert!(
+        checkpoint_path(&home).is_file(),
+        "catch-up must persist a checkpoint for the reload path"
+    );
+    rebuild_for_test(&home);
+    assert_eq!(
+        assignments::list_active(&home, "o/r", "feat/p3").len(),
+        1,
+        "checkpoint reload must not emit terminal side effects"
+    );
+
+    std::fs::remove_file(checkpoint_path(&home)).expect("remove checkpoint to force full replay");
     rebuild_for_test(&home);
     assert_eq!(
         assignments::list_active(&home, "o/r", "feat/p3").len(),
