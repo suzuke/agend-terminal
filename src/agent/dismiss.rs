@@ -1822,14 +1822,11 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 wiring pins (the #1644/#1530-F2 source-grep convention, used here
-    /// because `pty_read_loop` and `Pane::resize_pty` need a live PTY, registry
-    /// and pane to drive). The semantics above are proven by real tests; these
-    /// prove the production CALL SITES exist, which no amount of gate-object
-    /// testing can. Deleting either wiring point would otherwise leave every
-    /// other test in this file green.
+    /// #3314 wiring pin (the #1644/#1530-F2 source-grep convention). The
+    /// semantics above are proven by real tests; this proves the production
+    /// write chokepoint exists, which no amount of gate-object testing can.
     #[test]
-    fn production_wires_teardown_cancel_and_resize_bump_3314() {
+    fn production_wires_teardown_cancel_and_write_bump_3314() {
         let agent_src = include_str!("mod.rs");
         assert!(
             agent_src.contains("dev_modal::arm_generation(pty_writer"),
@@ -1841,12 +1838,6 @@ WARNING: Loading development channels
         assert!(
             agent_src.contains("actor_write::record_successful_write"),
             "#3314: write_with_timeout must bump the epoch after successful PTY writes"
-        );
-        let pane_src = include_str!("../layout/pane.rs");
-        assert!(
-            pane_src.contains("dev_modal::note_pty_resize(&handle.pty_writer)"),
-            "#3314: a resize repaints the child and must invalidate a candidate; \
-             resize is not a byte write, so it needs its own call site"
         );
     }
 
@@ -1923,23 +1914,15 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 r2 RED-3 (P1-C): two PTY paths bypass the epoch entirely, which
-    /// falsifies the "single chokepoint" claim. VTerm answers terminal queries by
-    /// writing straight through `writer.try_lock()`, and the TUI bridge resizes
-    /// the master directly on a client TAG_RESIZE.
+    /// #3314 r2 RED-3 (P1-C): VTerm answers terminal queries by writing straight
+    /// through `writer.try_lock()`, bypassing the normal write chokepoint.
     #[test]
-    fn direct_pty_paths_must_invalidate_the_epoch_3314() {
+    fn direct_pty_write_paths_must_invalidate_the_epoch_3314() {
         let vterm = include_str!("../vterm.rs");
         assert!(
             vterm.contains("note_pty_write"),
             "#3314 P1-C: VTerm's terminal-query responses write directly to the \
              PTY and must invalidate an in-flight startup-modal candidate"
-        );
-        let bridge = include_str!("../daemon/tui_bridge.rs");
-        assert!(
-            bridge.contains("note_pty_resize"),
-            "#3314 P1-C: a TUI client resize repaints the child and must \
-             invalidate an in-flight startup-modal candidate"
         );
     }
 

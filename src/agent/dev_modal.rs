@@ -19,8 +19,9 @@
 //! Safety therefore comes from facts the daemon OWNS, not from the frame:
 //!
 //! * `armed` — this generation's argv actually carried the flag.
-//! * `epoch` — every writer that can reach this PTY bumps it; a modal candidate
-//!   is invalidated by any input, attach or resize since it was first seen.
+//! * `epoch` — every byte writer and PTY output path bumps it; a modal candidate
+//!   is invalidated by any input or output since it was first seen. A silent
+//!   geometry change does not alter the observed frame and remains valid.
 //! * one-shot — at most one answer per process generation, spent only on a
 //!   SUCCESSFUL enqueue, and never reset.
 //!
@@ -223,17 +224,6 @@ pub(crate) fn note_pty_output(writer: &crate::agent::PtyWriter) {
     note_pty_write(writer);
 }
 
-/// A geometry change on this PTY. NOT a byte write, so it does not pass through
-/// `write_with_timeout` and needs its own call site (`Pane::resize_pty`).
-///
-/// The initial baseline resize needs no special case: a bump with no candidate
-/// in flight is a no-op by construction, because there is nothing to invalidate.
-/// That is the exemption, structurally rather than as a flag someone has to
-/// remember to clear.
-pub(crate) fn note_pty_resize(writer: &crate::agent::PtyWriter) {
-    note_pty_write(writer);
-}
-
 /// Snapshot handed to the writer thread so it can re-check IMMEDIATELY before
 /// the syscall. It cannot close W3 — a check and a syscall are not atomic with
 /// respect to another process's output — but it does close the much wider
@@ -423,7 +413,7 @@ impl DevModalGate {
     }
 
     /// Record that SOMETHING reached this PTY: a daemon inject, the trust-dismiss
-    /// CR, our own CR, a TUI attach or resize, or a socket client's data frame.
+    /// CR, our own CR, a child repaint, or a socket client's data frame.
     /// Any of those invalidate an in-flight candidate, because the frame we were
     /// waiting on is no longer one nobody has touched.
     /// Test seam: production bumps the epoch at the PTY write chokepoint

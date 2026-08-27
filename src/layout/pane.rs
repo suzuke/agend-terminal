@@ -444,12 +444,6 @@ impl Pane {
                 let redraw = redraw_seq_after_resize(self.backend.as_ref());
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(&self.instance_id) {
-                    // #3314: a geometry change repaints the child, so any
-                    // startup-modal candidate observed before it is no longer a
-                    // frame nobody has touched. Resize is NOT a byte write, so
-                    // it does not pass through `write_with_timeout` and needs
-                    // this explicit call site.
-                    crate::agent::dev_modal::note_pty_resize(&handle.pty_writer);
                     {
                         let master = handle.pty_master.lock();
                         let _ = master.resize(portable_pty::PtySize {
@@ -530,6 +524,37 @@ mod tests {
             None,
             "a backend-less pane must emit nothing"
         );
+    }
+
+    /// A Claude startup modal schedules its confirmation before the TUI may
+    /// attach and resize the pane. Claude emits no redraw input on resize, so a
+    /// resize with no subsequent PTY output must not strand that confirmation.
+    #[test]
+    fn claude_resize_without_repaint_keeps_dev_modal_barrier_valid() {
+        let registry: AgentRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let instance_id = crate::types::InstanceId::new();
+        let handle = crate::agent::mk_test_handle("claude-resize", instance_id);
+        let writer = Arc::clone(&handle.pty_writer);
+        let epoch = crate::agent::dev_modal::arm_epoch(&writer);
+        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+            true,
+            epoch,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let barrier = gate.write_barrier();
+        agent::lock_registry(&registry).insert(instance_id, handle);
+
+        let mut pane = leaf(1, "claude-resize");
+        pane.instance_id = instance_id;
+        pane.backend = Some(Backend::ClaudeCode);
+        pane.resize_pty(&registry, 120, 40);
+
+        assert!(
+            barrier.still_valid(),
+            "a resize with no child repaint must not cancel the only scheduled startup-modal confirmation"
+        );
+        crate::agent::dev_modal::disarm_epoch(&writer);
     }
 
     fn leaf(id: usize, name: &str) -> Pane {
