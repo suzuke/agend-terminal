@@ -1289,10 +1289,10 @@ mod tests {
         dir
     }
 
-    /// #3389: guard the handlers whose absence previously caused live-daemon
-    /// regressions. `run_core` executes this canonical pipeline directly.
+    /// #3389: pin the complete handler set executed by `run_core`. Exact
+    /// equality catches additions, removals, renames, duplicates, and reorders.
     #[test]
-    fn run_core_pipeline_contains_critical_handlers_3389() {
+    fn run_core_pipeline_matches_canonical_handler_set_3389() {
         let names: Vec<&str> = crate::daemon::build_default_handlers(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         ))
@@ -1300,12 +1300,51 @@ mod tests {
         .map(|h| h.name())
         .collect();
 
-        for required in ["recovery_dispatcher", "shadow_observe", "snapshot_rotation"] {
-            assert!(
-                names.contains(&required),
-                "run_core pipeline must contain {required} — got {names:?}"
-            );
-        }
+        assert_eq!(
+            names,
+            [
+                "hang_detection",
+                "backend_exit_detection",
+                "recovery_dispatcher",
+                "respawn_watchdog",
+                "watchdog",
+                "external_liveness",
+                "tool_call_provenance",
+                "canonical_heartbeat",
+                "shadow_observe",
+                "snapshot_rotation",
+                "check_schedules",
+                "ci_watch_poll",
+                "pr_state_scan",
+                "assignment_reconcile",
+                "inbox_maintenance",
+                "offline_unread_alert",
+                "notification_watchdogs",
+                "notification_flush",
+                "log_rotation",
+                "thread_dump",
+                "hourly_gc",
+                "worktree_registry_sweep",
+                "ephemeral_reap",
+                "checkout_txn_recover",
+                "context_thresholds",
+                "inject_delivery",
+                "claude_self_kick",
+                "anti_stall",
+                "idle_watchdog",
+                "decision_timeout",
+                "helper_staleness",
+                "mcp_registry",
+                "waiting_on_stale",
+                "conflict_notify",
+                "canonical_drift",
+                "auto_release",
+                "dispatch_idle",
+                "retention",
+                "reclaim_usage_limit",
+            ],
+            "run_core production handler set changed; update this invariant only after reviewing the lifecycle impact"
+        );
     }
 
     /// #3389: exercise snapshot rotation through the canonical `run_core` handler
