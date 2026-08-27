@@ -4822,6 +4822,24 @@ fn opencode_attach_command_uses_one_model_parse_result() {
     .is_err());
 }
 
+/// #3398: a codex spawn with no session locator (no `home`, so
+/// `prepare_codex_tui_session` never runs and `codex_attach_locator` returns `None`)
+/// falls back to the `Backend::Codex` preset args. A global `resume --last` there
+/// adopts whatever thread the cwd used last — another fleet instance's when they
+/// share one. Exact-vector so the subcommand cannot reappear at any position; the
+/// locator path is pinned by `codex_managed_tui_resume_targets_the_persisted_thread`.
+#[test]
+fn codex_resume_preset_without_a_locator_starts_isolated_3398() {
+    assert_eq!(
+        Backend::Codex.preset_spawn_args(crate::backend::SpawnMode::Resume),
+        vec![
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
+}
+
 #[test]
 fn codex_managed_tui_resume_targets_the_persisted_thread() {
     let locator = crate::transport::SessionLocator::codex(
