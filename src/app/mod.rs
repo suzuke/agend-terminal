@@ -958,13 +958,27 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
 /// Unmanaged shells are intentionally absent from fleet.yaml, so the managed
 /// name-based delete transaction cannot resolve them. Remove the exact UUID
 /// entry first, then terminate and reap the owned child.
+fn kill_unmanaged_agents(
+    registry: &AgentRegistry,
+    instance_ids: impl IntoIterator<Item = crate::types::InstanceId>,
+) {
+    let drained: Vec<(String, crate::daemon::ChildHandle)> = instance_ids
+        .into_iter()
+        .filter_map(|instance_id| agent::remove_and_unregister(registry, &instance_id))
+        .map(|handle| (handle.name.to_string(), handle.child))
+        .collect();
+    if drained.is_empty() {
+        return;
+    }
+    // fire-and-forget: registry removal is complete; child termination uses a
+    // fixed grace window and must not freeze the TUI render thread.
+    std::thread::spawn(move || {
+        crate::daemon::terminate_agents_parallel(drained);
+    });
+}
+
 fn kill_unmanaged_agent(registry: &AgentRegistry, instance_id: crate::types::InstanceId) {
-    let drained: Vec<(String, crate::daemon::ChildHandle)> =
-        agent::remove_and_unregister(registry, &instance_id)
-            .map(|handle| (handle.name.to_string(), handle.child))
-            .into_iter()
-            .collect();
-    crate::daemon::terminate_agents_parallel(drained);
+    kill_unmanaged_agents(registry, [instance_id]);
 }
 
 /// Whether the agent's child process is still running.

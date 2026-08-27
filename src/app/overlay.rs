@@ -432,9 +432,7 @@ pub(super) fn handle_key(
                     nonfleet_agents = Vec::new();
                 }
                 // Reap non-fleet shell panes by UUID, mirroring ScratchShell Esc.
-                for instance_id in nonfleet_agents {
-                    super::kill_unmanaged_agent(ctx.registry, instance_id);
-                }
+                super::kill_unmanaged_agents(ctx.registry, nonfleet_agents);
             }
             _ => {
                 *overlay = Overlay::None;
@@ -1114,9 +1112,14 @@ mod tests {
             .lock()
             .insert(id, crate::agent::mk_test_handle("scratch", id));
 
+        let started = std::time::Instant::now();
         let layout = confirm_close_tab(&home, &registry, close_test_pane(id, "scratch", None));
 
         assert!(layout.tabs.is_empty(), "the tab view should close");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "closing a shell view must not wait for the 2s child-termination grace window"
+        );
         assert!(
             !registry.lock().contains_key(&id),
             "the unmanaged registry entry must be removed and reaped"

@@ -40,7 +40,7 @@ fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
     );
 
     let references_instance_id = block.contains("instance_id");
-    let references_kill = block.contains("kill_unmanaged_agent");
+    let references_kill = block.contains("kill_unmanaged_agents(");
 
     assert!(
         references_instance_id && references_kill,
@@ -49,7 +49,7 @@ fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
          == None). Use each pane's authoritative registry `instance_id`; unmanaged \
          shells are absent from fleet.yaml and cannot be resolved by name. Found \
          instance_id={references_instance_id}, \
-         kill_agent={references_kill} in the ConfirmClose block."
+         batched_kill={references_kill} in the ConfirmClose block."
     );
 }
 
