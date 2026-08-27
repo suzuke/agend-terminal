@@ -386,7 +386,6 @@ mod tests {
 
     #[test]
     fn fast_tools_get_short_timeout() {
-        assert_eq!(tool_timeout("inbox"), Duration::from_secs(5));
         assert_eq!(tool_timeout("list_instances"), Duration::from_secs(5));
         assert_eq!(tool_timeout("health"), Duration::from_secs(5));
     }
@@ -404,6 +403,7 @@ mod tests {
 
     #[test]
     fn default_tools_get_30s() {
+        assert_eq!(tool_timeout("inbox"), Duration::from_secs(30));
         assert_eq!(tool_timeout("send"), Duration::from_secs(30));
         assert_eq!(tool_timeout("task"), Duration::from_secs(30));
         assert_eq!(tool_timeout("unknown_tool"), Duration::from_secs(30));
@@ -480,6 +480,7 @@ mod tests {
             "start_instance",
             "repo",
             "restart_daemon",
+            "inbox",
         ] {
             assert!(
                 is_side_effect_tool(t, None),
@@ -488,7 +489,6 @@ mod tests {
         }
         // Read / idempotent tools → false (keep retryable error).
         for t in [
-            "inbox",
             "list_instances",
             "pane_snapshot",
             "binding_state",
@@ -575,7 +575,7 @@ mod tests {
             json!({})
         };
         let resp = handle_mcp_tool_inner(
-            "inbox",
+            "pane_snapshot",
             json!({}),
             "caller".to_string(),
             Duration::from_millis(20),
@@ -589,6 +589,33 @@ mod tests {
         assert!(
             resp["error"].as_str().unwrap_or("").contains("timed out"),
             "got {resp}"
+        );
+    }
+
+    /// #3395: inbox drain persists delivery state before returning its payload.
+    /// A proxy timeout therefore must not look retry-safe: the background drain
+    /// may already have consumed the unread row, and an immediate retry cannot
+    /// recover the payload. The persisted `delivering_at` row is recovered by
+    /// the existing reclaim TTL instead.
+    #[test]
+    fn inbox_drain_timeout_returns_accepted_in_progress_3395() {
+        let slow = |_: &str, _: &Value, _: &str| {
+            std::thread::sleep(Duration::from_millis(300));
+            json!({"messages": []})
+        };
+        let resp = handle_mcp_tool_inner(
+            "inbox",
+            json!({}),
+            "caller".to_string(),
+            Duration::from_millis(20),
+            None,
+            slow,
+        );
+        assert_eq!(resp["ok"], true, "inbox timeout must not look retryable: {resp}");
+        assert_eq!(resp["status"], "accepted_in_progress", "got {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "no error field means the agent will not resend the drain: {resp}"
         );
     }
 

@@ -1317,6 +1317,54 @@ fn reclaim_redelivers_after_turn_death() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// #3395: the real drain entry point must persist an in-flight delivery before
+/// returning its payload, so the existing reclaim TTL can recover a dead turn.
+#[test]
+fn drain_persists_delivering_for_reclaim_after_abandoned_turn_3395() {
+    let home = tmp_home("3395-drain-reclaim");
+    let agent = "a-3395";
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("recover this message")
+            .id("m-3395-message")
+            .build(),
+    )
+    .unwrap();
+
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1, "the first drain must return the peer update");
+    assert!(first[0].delivering_at.is_some());
+    assert!(first[0].read_at.is_none());
+
+    let persisted: InboxMessage = serde_json::from_str(
+        fs::read_to_string(inbox_path(&home, agent))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        persisted.delivering_at.is_some() && persisted.read_at.is_none(),
+        "an abandoned drain must remain reclaimable on disk: {persisted:?}"
+    );
+
+    set_row_delivering_at_for_test(&home, agent, "m-3395-message", &secs_ago(660));
+    reclaim_stale_delivering(&home);
+
+    let redelivered = drain(&home, agent);
+    assert_eq!(redelivered.len(), 1, "reclaim must make the lost payload available");
+    assert_eq!(redelivered[0].id.as_deref(), Some("m-3395-message"));
+    assert_eq!(redelivered[0].delivery_count, 2);
+    assert!(redelivered[0].delivering_at.is_some());
+    assert!(redelivered[0].read_at.is_none());
+
+    fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn reclaim_settles_legacy_stale_pr_merged_delivering_row() {
     let home = tmp_home("reclaim-pr-merged-settle");
