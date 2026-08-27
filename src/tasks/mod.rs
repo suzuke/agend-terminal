@@ -47,6 +47,26 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
 
+pub(crate) fn task_terminal_cleanup_event(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+) -> anyhow::Result<()> {
+    task_terminal_cleanup(home, task_id);
+    // Assignment authority already owns its branch lock while cancelling the
+    // review task and will retire that same authority before returning.
+    if instance == "system:review-assignment" {
+        return Ok(());
+    }
+    crate::daemon::assignment_authority::retire_for_terminal_event(
+        home, board, task_id, instance, seq, now,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn settle_completion_receipt(
     home: &Path,
     task_id: &str,

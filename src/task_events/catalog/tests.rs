@@ -630,12 +630,24 @@ fn catalog_statuses_are_ready_only_ordered_and_fail_closed() {
     assert_eq!(
         ready.statuses(&requested),
         Ok(vec![
-            (unique_id, Some(TaskStatus::Claimed)),
-            (missing_id, None),
-            (
-                TaskId::from("t-20260824000000000000-1-1"),
-                Some(TaskStatus::Claimed),
-            ),
+            TaskStatusSnapshot {
+                task_id: unique_id,
+                board: "a-board".into(),
+                status: Some(TaskStatus::Claimed),
+                terminal_event: None,
+            },
+            TaskStatusSnapshot {
+                task_id: missing_id,
+                board: String::new(),
+                status: None,
+                terminal_event: None,
+            },
+            TaskStatusSnapshot {
+                task_id: TaskId::from("t-20260824000000000000-1-1"),
+                board: "a-board".into(),
+                status: Some(TaskStatus::Claimed),
+                terminal_event: None,
+            },
         ])
     );
     assert_eq!(
@@ -650,6 +662,84 @@ fn catalog_statuses_are_ready_only_ordered_and_fail_closed() {
             boards: vec!["a-board".into(), "b-board".into()],
         })
     );
+}
+
+#[test]
+fn catalog_catch_up_does_not_replay_terminal_side_effects() {
+    use crate::daemon::assignment_authority as assignments;
+    use crate::daemon::pr_state::ReviewClass;
+    use crate::mcp::handlers::comms_gates::ReviewAuthor;
+    use std::io::Write;
+
+    let home = tmp_home("catch-up-no-side-effects");
+    let task_id = TaskId::from("t-20260827000000000000-1-1");
+    crate::task_events::append(
+        &home,
+        &InstanceName::from("creator"),
+        created(&task_id, "task"),
+    )
+    .expect("seed live task");
+
+    let mut assignment = assignments::ActiveAssignment::new_pending(
+        "o/r",
+        "feat/p3",
+        "reviewer",
+        42,
+        "lead",
+        &task_id.0,
+        ReviewClass::Single,
+        ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-08-27T00:00:00Z",
+    );
+    assignment.task_id = task_id.0.clone();
+    assignments::persist(&home, &assignment).expect("assignment persists");
+
+    let mut done = envelope_from(
+        "finisher",
+        1,
+        TaskEvent::Done {
+            task_id: task_id.clone(),
+            by: InstanceName::from("finisher"),
+            source: DoneSource::OperatorManual {
+                authored_at: "2026-08-27T00:00:01Z".into(),
+                result: None,
+            },
+        },
+    );
+    done.timestamp = "2099-08-27T00:00:01Z".into();
+    let log_path = super::super::log_path(&home);
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .expect("task event log opens for append");
+    writeln!(
+        log,
+        "{}",
+        serde_json::to_string(&done).expect("done event serializes")
+    )
+    .expect("done event appends");
+    log.sync_all().expect("done event is durable");
+
+    let snapshots = for_home(&home)
+        .statuses(std::slice::from_ref(&task_id))
+        .expect("catch up projection");
+    assert_eq!(snapshots[0].status, Some(TaskStatus::Done));
+    assert_eq!(
+        assignments::list_active(&home, "o/r", "feat/p3").len(),
+        1,
+        "catch-up must not replay live terminal side effects"
+    );
+
+    rebuild_for_test(&home);
+    assert_eq!(
+        assignments::list_active(&home, "o/r", "feat/p3").len(),
+        1,
+        "full replay must not emit terminal side effects"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]

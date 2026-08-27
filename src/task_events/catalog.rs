@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 /// unbounded audit timeline in memory.
 pub const RECENT_HISTORY_LIMIT: usize = 16;
 const MANIFEST_SCHEMA: u32 = 1;
-const CHECKPOINT_SCHEMA: u32 = 1;
+const CHECKPOINT_SCHEMA: u32 = 2;
 const MANIFEST_FILE: &str = "MANIFEST.json";
 const CHECKPOINT_FILE: &str = "catalog.checkpoint.json";
 
@@ -31,6 +31,17 @@ std::thread_local! {
     static BOARD_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ARCHIVE_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HISTORY_LINES_PARSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STATUS_BATCH_QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_status_batch_queries_for_test() {
+    STATUS_BATCH_QUERIES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn status_batch_queries_for_test() -> u64 {
+    STATUS_BATCH_QUERIES.with(std::cell::Cell::get)
 }
 
 /// Return the daemon-local task catalog for one AgEnD home.
@@ -768,11 +779,12 @@ impl StrictTaskCatalog {
             .ok_or(CatalogRouteError::NotFound)
     }
 
-    #[cfg(test)]
-    pub fn statuses(
+    pub(crate) fn statuses(
         &self,
         task_ids: &[TaskId],
-    ) -> Result<Vec<(TaskId, Option<TaskStatus>)>, CatalogRouteError> {
+    ) -> Result<Vec<TaskStatusSnapshot>, CatalogRouteError> {
+        #[cfg(test)]
+        STATUS_BATCH_QUERIES.with(|count| count.set(count.get() + 1));
         self.ensure_fresh()?;
         let inner = self
             .inner
@@ -789,13 +801,23 @@ impl StrictTaskCatalog {
                     boards: boards.clone(),
                 });
             }
-            let status = inner.index.get(task_id).map(|board_id| {
-                inner.boards[board_id]
-                    .task(task_id)
-                    .expect("catalog index must reference its source record")
-                    .status
+            let snapshot = inner.index.get(task_id).map(|board_id| {
+                let task = inner.boards[board_id]
+                    .task_snapshot(task_id)
+                    .expect("catalog index must reference its source record");
+                TaskStatusSnapshot {
+                    task_id: task_id.clone(),
+                    board: board_id.clone(),
+                    status: Some(task.status),
+                    terminal_event: task.terminal_event.clone(),
+                }
             });
-            statuses.push((task_id.clone(), status));
+            statuses.push(snapshot.unwrap_or_else(|| TaskStatusSnapshot {
+                task_id: task_id.clone(),
+                board: String::new(),
+                status: None,
+                terminal_event: None,
+            }));
         }
         Ok(statuses)
     }
@@ -813,6 +835,14 @@ impl StrictTaskCatalog {
             .collect();
         (inner.phase.clone(), snapshots)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskStatusSnapshot {
+    pub(crate) task_id: TaskId,
+    pub(crate) board: String,
+    pub(crate) status: Option<TaskStatus>,
+    pub(crate) terminal_event: Option<(InstanceName, u64)>,
 }
 
 /// The single production task-event commit path. Existing task-event append
@@ -974,6 +1004,29 @@ where
     drop(inner);
     drop(file_lock);
     drop(_refresh);
+
+    for envelope in envelopes.iter().filter(|envelope| {
+        matches!(
+            envelope.event,
+            TaskEvent::Done { .. } | TaskEvent::Cancelled { .. } | TaskEvent::Superseded { .. }
+        )
+    }) {
+        if let Err(error) = crate::tasks::task_terminal_cleanup_event(
+            &home,
+            &board_id,
+            &envelope.event.task_id().0,
+            &envelope.instance.0,
+            envelope.seq,
+            &envelope.timestamp,
+        ) {
+            tracing::error!(
+                task_id = %envelope.event.task_id(),
+                board = %board_id,
+                %error,
+                "terminal assignment retirement failed after task commit"
+            );
+        }
+    }
 
     super::maybe_compact_events(board, post_append_events as usize);
     if post_append_events as usize > super::COMPACTION_HIGH_WATER {
@@ -1680,6 +1733,8 @@ pub struct ProjectedTaskRecord {
     pub metadata: BTreeMap<String, serde_json::Value>,
     pub history_len: u64,
     pub last_folded_event: Option<(InstanceName, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_event: Option<(InstanceName, u64)>,
     pub recent_history: VecDeque<HistoryEntry>,
 }
 
@@ -1690,6 +1745,17 @@ impl From<TaskRecord> for ProjectedTaskRecord {
             .history
             .last()
             .map(|entry| (entry.instance.clone(), entry.seq));
+        let terminal_event = task
+            .status
+            .is_terminal()
+            .then(|| {
+                task.history
+                    .iter()
+                    .rev()
+                    .find(|entry| matches!(entry.kind, "done" | "cancelled" | "superseded"))
+                    .map(|entry| (entry.instance.clone(), entry.seq))
+            })
+            .flatten();
         let recent_history = task
             .history
             .into_iter()
@@ -1726,6 +1792,7 @@ impl From<TaskRecord> for ProjectedTaskRecord {
             metadata: task.metadata,
             history_len,
             last_folded_event,
+            terminal_event,
             recent_history,
         }
     }
@@ -1987,6 +2054,14 @@ impl BoardProjection {
 
         if let Some(task) = self.tasks.get_mut(&task_id) {
             let task = Arc::make_mut(task);
+            if matches!(
+                env.event,
+                TaskEvent::Done { .. } | TaskEvent::Cancelled { .. } | TaskEvent::Superseded { .. }
+            ) {
+                task.terminal_event = Some((env.instance.clone(), env.seq));
+            } else if !task.status.is_terminal() {
+                task.terminal_event = None;
+            }
             task.history_len += 1;
             task.last_folded_event = Some((env.instance.clone(), env.seq));
             task.recent_history.push_back(HistoryEntry {
@@ -2061,6 +2136,7 @@ impl BoardProjection {
                         metadata: BTreeMap::new(),
                         history_len: 0,
                         last_folded_event: None,
+                        terminal_event: None,
                         recent_history: VecDeque::new(),
                     })
                 });

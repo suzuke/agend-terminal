@@ -1,7 +1,7 @@
 //! t-…-17 C12: per-tick reconciler for the durable reviewer-assignment authority
 //! ([`crate::daemon::assignment_authority`]).
 //!
-//! Every tick (cadence `new(1)` = one 10 s base tick) this converges the store
+//! At boot and every 60 base ticks this converges the store
 //! against reality for each active `(repo,branch)`:
 //!   - **A10a** terminal restart-repair: CAS-tombstone any record whose stored
 //!     `pr_number` is already in the RETAINED terminal-marker set (catches the A7
@@ -34,8 +34,8 @@ use crate::daemon::assignment_authority as store;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// C12 per-tick handler. `new(1)` runs every tick (~10 s); a larger cadence divides
-/// that down. Registered in [`crate::daemon::per_tick::build_default_handlers`].
+/// C12 per-tick handler. `new(60)` runs at boot and then at a low-frequency
+/// safety cadence. Registered in [`crate::daemon::per_tick::build_default_handlers`].
 pub(crate) struct AssignmentReconcileHandler {
     cadence: u64,
     tick: AtomicU64,
@@ -164,55 +164,55 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     workset.extend(store::active_branches(home));
     workset.extend(crate::daemon::pr_state::list_state_identities(home));
 
+    let task_ids = workset
+        .iter()
+        .flat_map(|(repo, branch)| store::list_active(home, repo, branch))
+        .map(|record| crate::task_events::TaskId(record.task_id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let terminal_tasks = match crate::task_events::catalog::for_home(home).statuses(&task_ids) {
+        Ok(statuses) => statuses
+            .into_iter()
+            .filter(|snapshot| snapshot.status.is_some_and(|status| status.is_terminal()))
+            .map(|snapshot| {
+                if let Some((instance, seq)) = snapshot.terminal_event {
+                    if let Err(error) = store::retire_for_terminal_event(
+                        home,
+                        &snapshot.board,
+                        &snapshot.task_id.0,
+                        &instance.0,
+                        seq,
+                        now,
+                    ) {
+                        tracing::error!(
+                            task_id = %snapshot.task_id,
+                            %error,
+                            "terminal assignment safety retirement failed"
+                        );
+                    }
+                }
+                snapshot.task_id.0
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "assignment safety sweep could not read task catalog"
+            );
+            std::collections::HashSet::new()
+        }
+    };
+
     let mut wakes = ReconcileWakes::default();
-    // #3336: ONE memo per pass, shared by every branch. See `TaskTerminalMemo`.
-    let mut task_status = TaskTerminalMemo::default();
     for (repo, branch) in workset {
-        let branch_wakes = reconcile_branch(home, &repo, &branch, now, &mut task_status);
+        let branch_wakes = reconcile_branch(home, &repo, &branch, now, &terminal_tasks);
         wakes
             .assignment_targets
             .extend(branch_wakes.assignment_targets);
         wakes.continuations.extend(branch_wakes.continuations);
     }
     wakes
-}
-
-/// #3336: `crate::tasks::load_routed` costs ~4.7 s per call — `route_task` replays
-/// EVERY project board (13 here) and `replay_strict_at` has no cache at all. The
-/// inner loop below called it once per ACTIVE ASSIGNMENT RECORD, and this store's
-/// 360 record files carry only 2 DISTINCT task ids, so the same 13-board scan was
-/// repeated for every record. Worse, `reconcile_pass` runs inside the maintenance
-/// tick, which the owned-mode TUI executes ON THE MAIN LOOP (`app::run_app`'s
-/// `select!` tick arm) — so each repeat froze the whole UI.
-///
-/// Memoize per PASS. The call site reads exactly one thing (`status.is_terminal()`),
-/// so the memo stores exactly that, and `None` collapses EVERY `TaskRouteError`
-/// (Ambiguous / Unreadable / NotFound) into the same fail-closed "preserve the
-/// assignment" branch the `if let Ok(..)` already produced — behaviour is unchanged.
-///
-/// Freshness: all records in one pass now share the routing observed at that id's
-/// FIRST lookup in the pass, instead of re-routing per record. A pass already spans
-/// seconds, so per-record re-routing bought no real freshness; at worst a task that
-/// turns terminal mid-pass retires its assignment on the next tick.
-///
-/// This does NOT fix the underlying 4.7 s (that needs the #3336 board-index and
-/// strict-replay-cache work) — it stops paying it once per record.
-#[derive(Default)]
-struct TaskTerminalMemo {
-    seen: std::collections::HashMap<String, Option<crate::task_events::TaskStatus>>,
-}
-
-impl TaskTerminalMemo {
-    fn status_of(&mut self, home: &Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
-        if let Some(hit) = self.seen.get(task_id) {
-            return *hit;
-        }
-        let resolved = crate::tasks::load_routed(home, task_id)
-            .ok()
-            .map(|routed| routed.task.status);
-        self.seen.insert(task_id.to_string(), resolved);
-        resolved
-    }
 }
 
 /// One branch. Returns the targets to WAKE (A3). No lock is held across the calls
@@ -222,7 +222,7 @@ fn reconcile_branch(
     repo: &str,
     branch: &str,
     now: &str,
-    task_status: &mut TaskTerminalMemo,
+    terminal_tasks: &std::collections::HashSet<String>,
 ) -> ReconcileWakes {
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
@@ -274,28 +274,8 @@ fn reconcile_branch(
         // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
         // valid review — retire the assignment instead of re-nudging it.
         // Fail-closed: route error or unknown task_id → preserve.
-        if let Some(status) = task_status.status_of(home, &record.task_id) {
-            if status.is_terminal() {
-                if store::retire_if_id_matches(
-                    home,
-                    repo,
-                    branch,
-                    &record.target,
-                    record.assignment_id,
-                    now,
-                )
-                .unwrap_or(false)
-                {
-                    tracing::info!(
-                        assignment_id = %record.assignment_id,
-                        target = %record.target,
-                        task_id = %record.task_id,
-                        task_status = %status,
-                        "assignment retired: owning task is terminal"
-                    );
-                }
-                continue;
-            }
+        if terminal_tasks.contains(&record.task_id) {
+            continue;
         }
         // Classify against the LIVE pr_state for THIS record's generation (its
         // pr_number). A pr_state for a different generation, or none, ⇒ Unengaged.
@@ -1025,7 +1005,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// T28 — the reconciler handler is registered at cadence `new(1)` and its `run`
+    /// T28 — the reconciler handler is registered at low-frequency cadence and its `run`
     /// actually drives the reconcile when the cadence permits (a lease-due Unengaged
     /// record is repaired). Cross-checked by a source-pin on the registration.
     #[test]
@@ -1034,13 +1014,13 @@ mod tests {
             AssignmentReconcileHandler::new(1).name(),
             "assignment_reconcile"
         );
-        // Source-pin: registered in build_default_handlers at new(1) (~10s).
+        // Source-pin: registered in build_default_handlers at new(60) (~10m).
         let src = std::fs::read_to_string("src/daemon/per_tick/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/per_tick/mod.rs"))
             .expect("per_tick/mod.rs readable");
         assert!(
-            src.contains("AssignmentReconcileHandler::new(1)"),
-            "reconciler must be registered at new(1) cadence in build_default_handlers"
+            src.contains("AssignmentReconcileHandler::new(60)"),
+            "reconciler must be registered at new(60) cadence in build_default_handlers"
         );
 
         // Functional: run() reconciles when the cadence gate opens (new(1) = always).

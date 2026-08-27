@@ -269,6 +269,17 @@ fn markers_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
     branch_dir(home, repo, branch).join("markers.json")
 }
 
+fn terminal_retirements_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
+    branch_dir(home, repo, branch).join("terminal_retirements.json")
+}
+
+fn is_metadata_json(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("markers.json" | "terminal_retirements.json")
+    )
+}
+
 /// The per-`(repo,branch)` assignment lock sidecar. A `.lock` (not `.json`) so it
 /// is excluded from `list_active`; a SEPARATE file from any record so the atomic
 /// tmp→rename of a record can't invalidate a flock held on it.
@@ -352,6 +363,29 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, val: &T) -> std::io::Resu
     std::fs::rename(&tmp, path)?;
     crate::store::fsync_parent_dir(path);
     Ok(())
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+struct TerminalRetirementKey {
+    board: String,
+    task_id: String,
+    instance: String,
+    seq: u64,
+}
+
+fn read_terminal_retirements(
+    path: &Path,
+) -> anyhow::Result<std::collections::BTreeSet<TerminalRetirementKey>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "corrupt terminal retirement ledger {}: {error}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Read one authority record. Three-state (B4): `Ok(None)` = genuinely ABSENT
@@ -551,7 +585,7 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+        if is_metadata_json(&path) {
             continue;
         }
         // Lossy: skip both absent + corrupt (this feeds ack-scan / reconcile-loop /
@@ -603,7 +637,7 @@ fn list_active_checked(
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+        if is_metadata_json(&path) {
             continue;
         }
         // `Err` (corrupt) propagates ⇒ caller keeps the existing reserved set.
@@ -657,7 +691,7 @@ pub(crate) fn probe_branch_authority(home: &Path, repo: &str, branch: &str) -> B
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+        if is_metadata_json(&path) {
             continue;
         }
         match read_record(&path) {
@@ -718,8 +752,7 @@ pub(crate) fn lookup_by_assignment_id_strict(
             let path = row
                 .map_err(|e| anyhow::anyhow!("unreadable assignment row: {e}"))?
                 .path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json")
-                || path.file_name().and_then(|n| n.to_str()) == Some("markers.json")
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path)
             {
                 continue;
             }
@@ -769,8 +802,7 @@ pub(crate) fn legacy_active_assignments_strict(
             let path = row
                 .map_err(|e| anyhow::anyhow!("unreadable assignment row: {e}"))?
                 .path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json")
-                || path.file_name().and_then(|n| n.to_str()) == Some("markers.json")
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path)
             {
                 continue;
             }
@@ -1014,6 +1046,53 @@ pub(crate) fn revoke(
 /// failure at any point preserves the authority — fail closed. Retry after
 /// interruption converges: supersede is idempotent on an already-superseded
 /// row, so re-running after a crash between supersede and delete is safe.
+fn retire_under_lock(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    expected_id: uuid::Uuid,
+    now: &str,
+    cleanup_tasks: &mut Vec<String>,
+) -> anyhow::Result<bool> {
+    let path = record_file(home, repo, branch, target);
+    let record = match read_record(&path) {
+        Ok(Some(record)) if record.assignment_id == expected_id => record,
+        _ => return Ok(false),
+    };
+
+    let cancelled = crate::tasks::cancel_review_assignment_task(
+        home,
+        &record.task_id,
+        &record.target,
+        "review assignment authority retired",
+    )?;
+    if cancelled {
+        cleanup_tasks.push(record.task_id.clone());
+    }
+
+    let successor = format!("retired-{}", expected_id);
+    let outcome = crate::inbox::storage::supersede_by_nonce_strict(
+        home,
+        target,
+        &record.delivery_nonce,
+        &successor,
+    )?;
+
+    if outcome.was_read {
+        let nonce = revocation_nonce(expected_id);
+        if !revocation_nonce_present(home, target, &nonce) {
+            crate::inbox::storage::enqueue(
+                home,
+                target,
+                build_revocation_notice(&record, now, &nonce),
+            )?;
+        }
+    }
+
+    remove_if_assignment_matches_strict(&path, expected_id)
+}
+
 pub(crate) fn retire_if_id_matches(
     home: &Path,
     repo: &str,
@@ -1022,60 +1101,78 @@ pub(crate) fn retire_if_id_matches(
     expected_id: uuid::Uuid,
     now: &str,
 ) -> anyhow::Result<bool> {
-    let mut cleanup_task = None;
-    let result = (|| {
+    let mut cleanup_tasks = Vec::new();
+    let result = {
         let _lock = lock_branch(home, repo, branch)?;
-        let path = record_file(home, repo, branch, target);
-        let record = match read_record(&path) {
-            Ok(Some(r)) if r.assignment_id == expected_id => r,
-            _ => return Ok(false), // absent, corrupt, or replaced — no-op
-        };
-
-        if crate::tasks::cancel_review_assignment_task(
+        retire_under_lock(
             home,
-            &record.task_id,
-            &record.target,
-            "review assignment authority retired",
-        )? {
-            cleanup_task = Some(record.task_id.clone());
-        }
-
-        // Step 1: durably supersede the stale inbox row. If this fails the
-        // authority stays intact — the reviewer may still pick it up, which is
-        // strictly better than a dangling actionable row with no authority.
-        let successor = format!("retired-{}", expected_id);
-        let outcome = crate::inbox::storage::supersede_by_nonce_strict(
-            home,
+            repo,
+            branch,
             target,
-            &record.delivery_nonce,
-            &successor,
-        )?;
-
-        // Step 2: if the reviewer had already read the assignment, enqueue a
-        // deterministic revocation notice so they learn it was retracted.
-        // Stable nonce + any-state dedup: if a prior attempt already enqueued
-        // the notice (but delete failed), the nonce is already present and we
-        // skip the duplicate append.
-        if outcome.was_read {
-            let nonce = revocation_nonce(expected_id);
-            if !revocation_nonce_present(home, target, &nonce) {
-                crate::inbox::storage::enqueue(
-                    home,
-                    target,
-                    build_revocation_notice(&record, now, &nonce),
-                )?;
-            }
-        }
-
-        // Step 3: NOW safe to delete the authority — the stale inbox state has
-        // been durably superseded (or was already non-actionable).
-        let removed = remove_if_assignment_matches_strict(&path, expected_id)?;
-        Ok(removed)
-    })();
-    if let Some(task_id) = cleanup_task {
+            expected_id,
+            now,
+            &mut cleanup_tasks,
+        )
+    };
+    for task_id in cleanup_tasks {
         crate::tasks::task_terminal_cleanup(home, &task_id);
     }
     result
+}
+
+pub(crate) fn retire_for_terminal_event(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+) -> anyhow::Result<usize> {
+    let key = TerminalRetirementKey {
+        board: board.to_string(),
+        task_id: task_id.to_string(),
+        instance: instance.to_string(),
+        seq,
+    };
+    let branches = active_branches(home)
+        .into_iter()
+        .filter(|(repo, branch)| {
+            list_active(home, repo, branch)
+                .iter()
+                .any(|record| record.task_id == task_id)
+        })
+        .collect::<Vec<_>>();
+    let mut retired = 0;
+    let mut cleanup_tasks = Vec::new();
+    for (repo, branch) in branches {
+        let _lock = lock_branch(home, &repo, &branch)?;
+        let ledger_path = terminal_retirements_file(home, &repo, &branch);
+        let mut ledger = read_terminal_retirements(&ledger_path)?;
+        if ledger.contains(&key) {
+            continue;
+        }
+        let records = list_active(home, &repo, &branch)
+            .into_iter()
+            .filter(|record| record.task_id == task_id)
+            .collect::<Vec<_>>();
+        for record in records {
+            retired += usize::from(retire_under_lock(
+                home,
+                &repo,
+                &branch,
+                &record.target,
+                record.assignment_id,
+                now,
+                &mut cleanup_tasks,
+            )?);
+        }
+        ledger.insert(key.clone());
+        atomic_write_json(&ledger_path, &ledger)?;
+    }
+    for cleanup_task in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &cleanup_task);
+    }
+    Ok(retired)
 }
 
 /// The revoke body WITHOUT acquiring the branch lock — the caller MUST already
@@ -1529,7 +1626,7 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+            if is_metadata_json(&path) {
                 continue;
             }
             if let Some(r) = read_record(&path).ok().flatten() {
@@ -1680,7 +1777,7 @@ fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<A
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+            if is_metadata_json(&path) {
                 continue;
             }
             if let Some(r) = read_record(&path).ok().flatten() {

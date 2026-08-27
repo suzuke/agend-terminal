@@ -428,7 +428,7 @@ pub(crate) fn build_default_handlers(
         // regardless). Bounded work: one pass over the (few) active assignment
         // branches; a store with no reviewer assignments does a single empty
         // read_dir. Runs in app mode too (the live daemon is app-mode).
-        Box::new(AssignmentReconcileHandler::new(1)),
+        Box::new(AssignmentReconcileHandler::new(60)),
         Box::new(InboxMaintenanceHandler::new(60)),
         // #2604: offline-target unread-obligation escalation. Same 60-tick
         // cadence as the inbox sweep it races — an offline/nonexistent target's

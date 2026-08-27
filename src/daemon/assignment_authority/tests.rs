@@ -1111,23 +1111,10 @@ fn live_terminal_commit_retires_matching_assignment_before_return() {
     let task_id = "t-p3-live-terminal";
     seed_open_task(&home, task_id);
 
-    let mut record = mk_record(
-        "o/r",
-        "feat/p3",
-        "reviewer",
-        42,
-        "2026-08-27T00:00:00Z",
-    );
+    let mut record = mk_record("o/r", "feat/p3", "reviewer", 42, "2026-08-27T00:00:00Z");
     record.task_id = task_id.to_string();
     persist(&home, &record).unwrap();
-    durable_enqueue(
-        &home,
-        "o/r",
-        "feat/p3",
-        "reviewer",
-        "2026-08-27T00:00:01Z",
-    )
-    .unwrap();
+    durable_enqueue(&home, "o/r", "feat/p3", "reviewer", "2026-08-27T00:00:01Z").unwrap();
 
     crate::task_events::append(
         &home,
@@ -1156,13 +1143,7 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
     let task_id = "t-p3-terminal-dedupe";
     seed_open_task(&home, task_id);
 
-    let mut first = mk_record(
-        "o/r",
-        "feat/p3",
-        "reviewer-a",
-        42,
-        "2026-08-27T00:00:00Z",
-    );
+    let mut first = mk_record("o/r", "feat/p3", "reviewer-a", 42, "2026-08-27T00:00:00Z");
     first.task_id = task_id.to_string();
     persist(&home, &first).unwrap();
     durable_enqueue(
@@ -1187,13 +1168,7 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
         1
     );
 
-    let mut successor = mk_record(
-        "o/r",
-        "feat/p3",
-        "reviewer-b",
-        42,
-        "2026-08-27T00:00:03Z",
-    );
+    let mut successor = mk_record("o/r", "feat/p3", "reviewer-b", 42, "2026-08-27T00:00:03Z");
     successor.task_id = task_id.to_string();
     persist(&home, &successor).unwrap();
 
