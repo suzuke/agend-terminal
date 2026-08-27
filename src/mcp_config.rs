@@ -1037,12 +1037,12 @@ fn codex_mcp_config_args_from(
 /// survives on the target. Windows paths routinely contain `\U` / `\d` / …
 /// which a double-quoted basic string interprets as escapes and then fails
 /// to parse. Single-quoted literal strings don't interpret anything, so they
-/// round-trip any path. Fall back to an escaped basic string only if the
-/// value contains a `'`, which a single-line literal can't represent.
+/// round-trip ordinary paths. Fall back to a JSON-escaped basic string if the
+/// value contains a `'` or an ASCII control character; JSON string escaping is
+/// compatible with TOML basic strings for these values.
 fn toml_string_value(s: &str) -> String {
-    if s.contains('\'') {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
+    if s.contains('\'') || s.chars().any(|ch| ch.is_ascii_control()) {
+        serde_json::to_string(s).expect("serializing a string cannot fail")
     } else {
         format!("'{s}'")
     }
