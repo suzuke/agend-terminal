@@ -372,7 +372,7 @@ static ALL_TOOLS: [ToolEntry; 32] = [
         name: "inbox",
         definition: super::tools::def_inbox,
         handler: super::handlers::dispatch::dispatch_inbox,
-        class: ToolClass::FAST_RETRY_SAFE,
+        class: ToolClass::SIDE_EFFECT,
     },
     // ── Instance ──
     ToolEntry {

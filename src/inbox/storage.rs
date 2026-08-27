@@ -767,34 +767,33 @@ fn supersede_by_nonce_inner(
     inner
 }
 
-/// Drain unread messages: mark them with `read_at` and write back.
-/// Returns only the messages that were previously unread.
+/// Drain unread messages: persist ordinary rows as in-flight (`delivering_at`)
+/// and write back. Returns only the messages that were previously unread.
 ///
-/// Soft-delete semantics: messages stay in the JSONL file with `read_at`
-/// set; [`sweep_expired`] removes them later based on TTL rules.
+/// A row stays in the JSONL file while it is in-flight; [`ack`] or the
+/// implicit next drain sets `read_at` after the agent confirms consumption.
+/// [`reclaim_stale_delivering`] returns an abandoned row to unread.
 /// #1940: byte budget for one drain's returned batch — kept under
 /// `request_dedup::PER_ENTRY_CAP_BYTES` (64 KiB) so the response is always
 /// dedup-cacheable (never `Oversized`). That is the whole fix: the bridge (#842)
 /// retries a lost transport with the SAME `request_id`, and `request_dedup`
 /// returns the cached response — but only if it was cacheable. An uncapped drain
 /// that exceeded 64 KiB was cached as `Oversized`, so the retry got a
-/// deterministic error and the (already `read_at`-set) content was lost.
+/// deterministic error and the in-flight batch could not be recovered before
+/// the reclaimable `delivering` state was added.
 pub(crate) const DRAIN_BATCH_BUDGET_BYTES: usize = 48 * 1024;
 
-/// Drain unread messages: mark `read_at` and write back.
+/// Drain unread messages: move ordinary rows to `delivering` and write back.
 /// Uses atomic tmp+fsync+rename for crash safety.
 ///
-/// #1940 (mark-read ≠ delivered — the #1888 class on the DELIVERY side): the MCP
-/// response can be lost AFTER drain() has persisted `read_at`. The recovery is
-/// the bridge's same-`request_id` retry + `request_dedup` cache, which is
-/// already in place; the ONLY hole was that an oversized (>64 KiB) response was
-/// cached as `Oversized` and could not be re-served. So (d): cap the returned
-/// batch under the dedup per-entry cap, leaving the remainder UNREAD for the next
-/// drain (a message is never split — at least one is always returned). A
-/// per-agent `.draining` re-serve snapshot was evaluated and REJECTED: it cannot
-/// distinguish a timeout-retry from a normal next poll without a client cursor,
-/// so it either starves new messages (re-serve within a TTL) or double-delivers
-/// (re-serve once / concurrent) — both break the inbox's exactly-once contract.
+/// #3395 (delivery ≠ processed): the MCP response can be lost AFTER drain()
+/// persists `delivering_at`. Keeping the row in `delivering` lets the existing
+/// reclaim TTL return an abandoned batch to unread instead of silently losing
+/// the payload. The bridge's same-`request_id` retry + `request_dedup` cache can
+/// still recover a lost transport immediately; the (d) byte cap above keeps
+/// that recovery from being defeated by an `Oversized` response. A per-agent
+/// `.draining` re-serve snapshot was evaluated and REJECTED: without a client
+/// cursor it cannot distinguish a timeout retry from a normal next poll.
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path_resolved(home, name);
 

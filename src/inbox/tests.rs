@@ -1335,7 +1335,7 @@ fn drain_persists_delivering_for_reclaim_after_abandoned_turn_3395() {
     .unwrap();
 
     let first = drain(&home, agent);
-    assert_eq!(first.len(), 1, "the first drain must return the peer update");
+    assert_eq!(first.len(), 1, "the first drain must return the message");
     assert!(first[0].delivering_at.is_some());
     assert!(first[0].read_at.is_none());
 
