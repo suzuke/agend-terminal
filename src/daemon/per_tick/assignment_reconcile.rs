@@ -275,6 +275,21 @@ fn reconcile_branch(
         // valid review — retire the assignment instead of re-nudging it.
         // Fail-closed: route error or unknown task_id → preserve.
         if terminal_tasks.contains(&record.task_id) {
+            if let Err(error) = store::retire_if_id_matches(
+                home,
+                repo,
+                branch,
+                &record.target,
+                record.assignment_id,
+                now,
+            ) {
+                tracing::error!(
+                    assignment_id = %record.assignment_id,
+                    task_id = %record.task_id,
+                    %error,
+                    "terminal assignment safety retirement failed"
+                );
+            }
             continue;
         }
         // Classify against the LIVE pr_state for THIS record's generation (its
