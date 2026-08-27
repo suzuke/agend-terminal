@@ -417,10 +417,9 @@ mod tests {
     /// [`MIGRATED_TRACKER_NAMES`] doc).
     ///
     /// Every tracker moved off the supervisor `run_loop` MUST be registered in
-    /// `build_default_handlers`. The existing `app_tick_handlers_cover_*`
-    /// invariant CANNOT catch a dropped migration: a forgotten tracker is absent
-    /// from BOTH the daemon and app sets, so their set-difference stays empty and
-    /// that test stays green. This one pins the full expected set against the
+    /// `build_default_handlers`. A generic handler-set check cannot catch a
+    /// forgotten migration because the tracker would never enter the set. This
+    /// test pins the full expected set against the
     /// registered handler names directly, so dropping (or never adding) a tracker
     /// fails CI. It also asserts the pinned names keep their original RELATIVE
     /// order — handler order in the `build_default_handlers` Vec is load-bearing.

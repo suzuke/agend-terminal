@@ -185,41 +185,6 @@ pub fn run(
     }
 }
 
-/// Test-only compatibility model for the pre-#3344 combined APP/daemon handler set.
-/// Production APP mode is now a permanent thin client and runs no daemon per-tick
-/// handlers; `run_core` owns them. This allowlist exists only for the legacy coverage
-/// tests below, where the env-gated `thread_dump` diagnostic remains excluded.
-#[cfg(test)]
-const APP_TICK_ALLOWLIST: &[&str] = &["thread_dump"];
-
-/// Test-only switch retained for the legacy handler-set compatibility tests.
-#[cfg(test)]
-fn app_snapshot_rotation_enabled() -> bool {
-    std::env::var("AGEND_APP_SNAPSHOT").as_deref() != Ok("0")
-}
-
-/// Build the test-only pre-#3344 handler model. The production thin-client APP does
-/// not call this function.
-#[cfg(test)]
-fn app_tick_handlers(
-    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
-) -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
-    let mut handlers = crate::daemon::build_default_handlers(daemon_binary_stale);
-    let skip_snapshot = !app_snapshot_rotation_enabled();
-    handlers.retain(|h| {
-        let name = h.name();
-        if APP_TICK_ALLOWLIST.contains(&name) {
-            return false;
-        }
-        // #2413 PR-B: snapshot_rotation runs by default; the kill-switch skips it.
-        if skip_snapshot && name == "snapshot_rotation" {
-            return false;
-        }
-        true
-    });
-    handlers
-}
-
 /// Main event loop for the TUI app.
 ///
 /// M5 note: this function is 550+ lines with 15+ locals. Extraction to
@@ -1324,164 +1289,32 @@ mod tests {
         dir
     }
 
-    /// #1726 completeness invariant — the guard that closes the recurring
-    /// #1002 / #982 / #1719 "app silently drops a handler" class. Compares two
-    /// independently-built `name()` sets (the full daemon pipeline vs app's actual
-    /// run set), so it has teeth and is not a tautology: a NEW handler added to
-    /// `build_default_handlers` lands in `all`, and unless app runs it OR it is
-    /// allowlisted, `missing` is non-empty → CI red.
+    /// #3389: guard the handlers whose absence previously caused live-daemon
+    /// regressions. `run_core` executes this canonical pipeline directly.
     #[test]
-    fn app_tick_handlers_cover_every_non_allowlisted_daemon_handler() {
-        use std::collections::HashSet;
-        let stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let all: HashSet<&str> = crate::daemon::build_default_handlers(stale)
-            .iter()
-            .map(|h| h.name())
-            .collect();
-        let app: HashSet<&str> =
-            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .iter()
-                .map(|h| h.name())
-                .collect();
+    fn run_core_pipeline_contains_critical_handlers_3389() {
+        let names: Vec<&str> = crate::daemon::build_default_handlers(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ))
+        .iter()
+        .map(|h| h.name())
+        .collect();
 
-        // Positive: every non-allowlisted daemon handler must run in app.
-        // #2413 PR-B: `snapshot_rotation` is CONDITIONALLY run (default-ON, kill-switched by
-        // `AGEND_APP_SNAPSHOT=0`), so it is exempt from the "must always run" check regardless
-        // of the ambient env — its default-on + reversibility is pinned separately by
-        // `snapshot_rotation_runs_in_app_mode_by_default_1720`.
-        let missing: Vec<&str> = all
-            .difference(&app)
-            .filter(|n| !APP_TICK_ALLOWLIST.contains(n))
-            .filter(|n| **n != "snapshot_rotation")
-            .copied()
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "app-standalone must run these per_tick handlers (or add to APP_TICK_ALLOWLIST \
-             with a justification): {missing:?}"
-        );
-        // Negative probe: no stale allowlist entry — every allowlisted name must
-        // still exist in the daemon set (catches a renamed/removed handler).
-        for a in APP_TICK_ALLOWLIST {
+        for required in ["recovery_dispatcher", "shadow_observe", "snapshot_rotation"] {
             assert!(
-                all.contains(a),
-                "stale APP_TICK_ALLOWLIST entry '{a}' — handler renamed or removed?"
-            );
-            assert!(
-                !app.contains(a),
-                "allowlisted handler '{a}' must NOT run in app-standalone"
+                names.contains(&required),
+                "run_core pipeline must contain {required} — got {names:?}"
             );
         }
     }
 
-    /// #1694(a): the #685 recovery ladder must RUN in app mode — the live daemon
-    /// is app-standalone (`run_app`), never `run_core`, so allowlisting
-    /// `recovery_dispatcher` out left the whole ladder silently dead in production
-    /// (the #1720 / #1002 class). This pins it back IN the app run set.
-    #[test]
-    fn recovery_dispatcher_runs_in_app_mode_1694a() {
-        let names: Vec<&str> =
-            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .iter()
-                .map(|h| h.name())
-                .collect();
-        assert!(
-            names.contains(&"recovery_dispatcher"),
-            "recovery_dispatcher must RUN in app mode (#1694a) — got {names:?}"
-        );
-        assert!(
-            !APP_TICK_ALLOWLIST.contains(&"recovery_dispatcher"),
-            "recovery_dispatcher must NOT be allowlisted out of app mode (#1694a)"
-        );
-    }
-
-    /// #2413 Phase B live-fix: the Shadow Observer reducer driver must RUN in app mode —
-    /// the live fleet daemon is app-standalone (`run_app`), never `run_core`, so
-    /// allowlisting `shadow_observe` out (as #2433 did) left `observed_status` null on
-    /// every agent in production even with the flag on (the #1720/#685 class, same as
-    /// `recovery_dispatcher` #1694a). This pins it IN the app run set so a future edit
-    /// can't silently re-gate it to run_core-only. Goes through the REAL app-mode entry
-    /// (`app_tick_handlers` = the set `run_app` actually executes), not a direct
-    /// `handler.run()` — the unit-call seam is exactly what let DUAL/CI miss the gap.
-    #[test]
-    fn shadow_observe_runs_in_app_mode_2413() {
-        let names: Vec<&str> =
-            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .iter()
-                .map(|h| h.name())
-                .collect();
-        assert!(
-            names.contains(&"shadow_observe"),
-            "shadow_observe (the reducer driver) must RUN in app mode (#2413 live-fix) — \
-             got {names:?}"
-        );
-        assert!(
-            !APP_TICK_ALLOWLIST.contains(&"shadow_observe"),
-            "shadow_observe must NOT be allowlisted out of app mode (#2413 live-fix)"
-        );
-    }
-
-    /// #2413 PR-B (#1720-class fix): `snapshot_rotation` must RUN in app mode BY DEFAULT so
-    /// the live daemon writes `snapshot.json` every tick (it was allowlisted out → weeks-stale
-    /// → dispatch_idle/inbox/handoff/reply read stale state). Reversible: `AGEND_APP_SNAPSHOT=0`
-    /// restores the allowlisted-out behaviour. Pins both the default-on and the kill-switch.
-    #[test]
-    #[serial_test::serial(app_snapshot_killswitch)]
-    fn snapshot_rotation_runs_in_app_mode_by_default_1720() {
-        struct EnvGuard(Option<String>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("AGEND_APP_SNAPSHOT", v),
-                    None => std::env::remove_var("AGEND_APP_SNAPSHOT"),
-                }
-            }
-        }
-        let _g = EnvGuard(std::env::var("AGEND_APP_SNAPSHOT").ok());
-        let names = |stale| {
-            app_tick_handlers(stale)
-                .iter()
-                .map(|h| h.name())
-                .collect::<Vec<_>>()
-        };
-
-        // Default (unset) → snapshot_rotation RUNS in app mode.
-        std::env::remove_var("AGEND_APP_SNAPSHOT");
-        assert!(
-            names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .contains(&"snapshot_rotation"),
-            "snapshot_rotation must RUN in app mode by default (#1720 live-fix)"
-        );
-        assert!(
-            !APP_TICK_ALLOWLIST.contains(&"snapshot_rotation"),
-            "snapshot_rotation must NOT be unconditionally allowlisted out (#1720 live-fix)"
-        );
-
-        // Kill-switch `=0` → reverts to the old allowlisted-out behaviour.
-        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
-        assert!(
-            !names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .contains(&"snapshot_rotation"),
-            "AGEND_APP_SNAPSHOT=0 must restore the allowlisted-out behaviour (no app snapshot write)"
-        );
-    }
-
-    /// #2413 PR-B (#1720 live-fix) — END-TO-END verification on a /tmp home, driving the REAL
-    /// app-mode handler set + real `snapshot.json` + real `dispatch_idle` gate. The
-    /// operator-evidence proof of (a)(b)(c) with the `AGEND_APP_SNAPSHOT` on/off contrast:
-    ///   (a) app mode WRITES `snapshot.json` with the PROMOTED operated state (it was
-    ///       allowlisted out → weeks-stale → all snapshot readers saw stale state);
-    ///   (b) at a REAL false-idle (raw screen Idle + a high-confidence Active
-    ///       `observed_status`), `dispatch_idle` does NOT mis-fire — whereas a stale/raw
-    ///       `idle` snapshot WOULD — and the shared busy-gate `agent_is_busy`
-    ///       (inbox/handoff/reply) reads the agent as BUSY;
-    ///   (c) `AGEND_APP_SNAPSHOT=0` reverts (app does not write) — the reversible escape hatch.
+    /// #3389: exercise snapshot rotation through the canonical `run_core` handler
+    /// pipeline, then verify its operated-state consumers.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(shadow_observer)]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn pr_b_end_to_end_operated_state_app_mode_1720() {
+    fn run_core_snapshot_preserves_operated_state_1720() {
         use crate::daemon::dispatch_idle;
         use crate::daemon::shadow::evidence::{Authority, Confidence};
         use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
@@ -1505,14 +1338,9 @@ mod tests {
                 "AGEND_OBSERVED_DISPATCH",
                 std::env::var("AGEND_OBSERVED_DISPATCH").ok(),
             ),
-            G(
-                "AGEND_APP_SNAPSHOT",
-                std::env::var("AGEND_APP_SNAPSHOT").ok(),
-            ),
         );
         std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
         std::env::remove_var("AGEND_OBSERVED_DISPATCH"); // default-ON
-        std::env::remove_var("AGEND_APP_SNAPSHOT"); // default-ON
 
         let home = std::env::temp_dir().join(format!("agend-pr-b-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
@@ -1537,9 +1365,8 @@ mod tests {
         let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let stale = || Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Run ONLY the app-set's snapshot_rotation handler (proves it IS in the real app set
-        // AND that running it writes snapshot.json). Returns whether the app set contained it.
-        let run_app_snapshot = || {
+        // Run snapshot_rotation from the exact pipeline owned by `run_core`.
+        let run_core_snapshot = || {
             let ctx = crate::daemon::per_tick::TickContext {
                 home: &home,
                 registry: &registry,
@@ -1547,7 +1374,7 @@ mod tests {
                 configs: &configs,
             };
             let mut ran = false;
-            for h in app_tick_handlers(stale()) {
+            for h in crate::daemon::build_default_handlers(stale()) {
                 if h.name() == "snapshot_rotation" {
                     h.run(&ctx);
                     ran = true;
@@ -1556,15 +1383,15 @@ mod tests {
             ran
         };
 
-        // ══ (a)+(b): ON (default) — app writes snapshot.json with the PROMOTED operated state ══
+        // The daemon writes snapshot.json with the promoted operated state.
         assert!(
-            run_app_snapshot(),
-            "(a) app mode runs snapshot_rotation by default (un-allowlisted)"
+            run_core_snapshot(),
+            "run_core pipeline must run snapshot_rotation"
         );
         assert_eq!(
             agent_state_of(&home, "victim").as_deref(),
             Some("active"),
-            "(a)+(b) app mode wrote snapshot.json with the PROMOTED operated state (false-idle → active)"
+            "run_core wrote snapshot.json with the promoted operated state (false-idle → active)"
         );
         assert!(
             agent_is_busy(&home, "victim"),
@@ -1636,13 +1463,6 @@ mod tests {
             "(b-baseline) a stale 'idle' snapshot MIS-FIRES (the bug PR-B fixes for the live daemon)"
         );
 
-        // ══ (c): AGEND_APP_SNAPSHOT=0 reverts — app does NOT write the snapshot ══
-        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
-        assert!(
-            !run_app_snapshot(),
-            "(c) AGEND_APP_SNAPSHOT=0 reverts: app mode does NOT run snapshot_rotation"
-        );
-
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1669,13 +1489,9 @@ mod tests {
         );
     }
 
-    /// #1726 must-verify: app-standalone runs these handlers with EMPTY
-    /// externals/configs (it has no external-agent / AgentConfig registry) and a
-    /// possibly-empty registry. None may panic — `run_handlers` has catch_unwind,
-    /// but we want a clean no-op degrade, so we call each `run()` directly (no
-    /// catch) and a panic fails the test.
+    /// The canonical daemon handlers must degrade cleanly with empty registries.
     #[test]
-    fn app_tick_handlers_no_panic_on_empty_context() {
+    fn run_core_handlers_no_panic_on_empty_context() {
         let home = tmp_home("tick-empty-ctx");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -1686,7 +1502,9 @@ mod tests {
             externals: &externals,
             configs: &configs,
         };
-        for h in app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false))) {
+        for h in crate::daemon::build_default_handlers(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )) {
             h.run(&ctx); // panic here = test failure
         }
         std::fs::remove_dir_all(&home).ok();

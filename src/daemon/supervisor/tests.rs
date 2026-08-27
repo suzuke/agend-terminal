@@ -4107,22 +4107,19 @@ fn supervisor_tick_loop_has_catch_unwind() {
 
 /// #986 source-pin (INVERTED from #1002 Phase 2): the supervisor's per-tick
 /// loop must NOT scan pr_state. The `PrStateScanHandler` per-tick handler is the
-/// SINGLE scanner+worker in EVERY mode — it runs in `run_core`'s handler vec
-/// (daemon) AND in `app::app_tick_handlers` (app standalone, attached AND owned,
-/// since `pr_state_scan` is not in `APP_TICK_ALLOWLIST`). The #1002-era direct
-/// supervisor scan was a vestigial belt from when the handler was run_core-only;
-/// with the handler now live in every mode it was a redundant second scanner +
-/// (post-#986) a second gh-poll worker. This pin guards against re-adding it.
+/// SINGLE scanner+worker in the daemon — it runs in `run_core`'s canonical
+/// handler pipeline. The #1002-era direct supervisor scan was a redundant second
+/// scanner + (post-#986) a second gh-poll worker. This pin guards against
+/// re-adding it.
 #[test]
 fn pr_state_scan_wired_into_supervisor_loop() {
     let source = std::fs::read_to_string("src/daemon/supervisor.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/supervisor.rs"))
         .expect("source file must be readable from test cwd");
     // #986: the supervisor loop must NOT scan pr_state. `PrStateScanHandler`
-    // is the SINGLE scanner+worker in ALL modes (run_core handler vec + app
-    // `app_tick_handlers`, both attached and owned). A supervisor scan would be
-    // a redundant SECOND scanner + a SECOND gh-poll worker. Guard against
-    // re-adding it. The needle is assembled from fragments so this assertion's
+    // is the SINGLE scanner+worker in the run_core handler pipeline. A supervisor
+    // scan would be a redundant SECOND scanner + a SECOND gh-poll worker. Guard
+    // against re-adding it. The needle is assembled from fragments so this assertion's
     // own source does not match (the file never contains the verbatim call).
     let needle = format!("{}{}", "scan_and", "_emit");
     assert!(

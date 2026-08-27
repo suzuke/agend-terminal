@@ -438,13 +438,9 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             // 10s cadence. The trackers keep their internal TICKS_PER_SCAN
             // throttle, so the effective scan cadence is unchanged.
             // #986: the supervisor loop NO LONGER scans pr_state directly. The
-            // `PrStateScanHandler` per-tick handler is the SINGLE scanner in ALL
-            // modes — it runs in run_core's handler vec (daemon) AND in
-            // `app::app_tick_handlers` (app standalone, both attached and owned,
-            // since `pr_state_scan` is not in `APP_TICK_ALLOWLIST`). The old direct
-            // scan here was a vestigial app-mode belt from when the handler was
-            // run_core-only; with the handler now live in every mode it was a
-            // redundant SECOND scanner + (post-#986) a SECOND gh-poll worker. The
+            // `PrStateScanHandler` per-tick handler is the SINGLE scanner in the
+            // run_core handler pipeline. The old direct scan here was redundant:
+            // a SECOND scanner + (post-#986) a SECOND gh-poll worker. The
             // handler owns the single snapshot cache + worker.
             // Source-pin: `pr_state_scan_wired_into_supervisor_loop` asserts the
             // supervisor does NOT scan (guards against re-adding it here).

@@ -349,13 +349,8 @@ pub(crate) fn dispatch_exit_event_guarded(
     }
 }
 
-/// Build the canonical per-tick handler pipeline. Shared by `run_core` (daemon)
-/// and `app::run_app` (owned `agend-terminal app`) so both run the IDENTICAL set
-/// — the single source of truth that closes the recurring "app hand-picks a
-/// subset → silently drops a handler" class (#1002 / #982 / #1719). App filters
-/// only an explicit allowlist (see `app::APP_TICK_ALLOWLIST`), and a completeness
-/// invariant fails CI if a new handler lands here but neither runs in app nor is
-/// allowlisted.
+/// Build the canonical per-tick handler pipeline executed by daemon `run_core`.
+/// APP mode is a permanent thin client and does not run daemon handlers (#3344).
 ///
 /// #2538: relocated verbatim from `daemon::mod` (that grandfathered file was at
 /// its LOC ceiling with zero slack) — every `per_tick::X` reference below became

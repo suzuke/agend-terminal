@@ -2,9 +2,8 @@
 //!
 //! Runs the [`crate::ephemeral_tracking::reap_sweep`] every ~1 min (6 ticks):
 //! removes + terminates any worker that is terminal, past its max-wall-TTL (the
-//! day-1 cost guard), or whose process is already gone. Runs in BOTH app and
-//! `run_core` (the live daemon is app-mode; this handler is NOT in
-//! `APP_TICK_ALLOWLIST`). Idle cost: one read of a usually-tiny JSON sidecar.
+//! day-1 cost guard), or whose process is already gone. Runs in the daemon's
+//! `run_core` handler pipeline. Idle cost: one read of a usually-tiny JSON sidecar.
 
 use super::{PerTickHandler, TickContext};
 
