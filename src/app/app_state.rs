@@ -459,16 +459,16 @@ impl AppState {
     }
 
     pub(super) fn close_dead_scratch_shell(&mut self, deps: &AppDeps<'_>) {
-        let AppDeps { home, registry, .. } = *deps;
+        let AppDeps { registry, .. } = *deps;
         // Auto-close the scratch shell overlay once its backing process
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
         // 50ms `default` arm of the main `select!` below guarantees this
         // runs at least every 50ms even without new PTY output.
         if let Overlay::ScratchShell { pane } = &self.ui.overlay {
-            if !agent_is_alive(registry, &pane.agent_name) {
-                let name = pane.agent_name.clone();
+            if !agent_is_alive(registry, pane.instance_id) {
+                let instance_id = pane.instance_id;
                 self.ui.overlay = Overlay::None;
-                kill_agent(home, registry, &name);
+                kill_unmanaged_agent(registry, instance_id);
             }
         }
     }

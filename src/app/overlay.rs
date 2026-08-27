@@ -384,14 +384,14 @@ pub(super) fn handle_key(
                 // deletion remains behind the explicit `delete_instance`
                 // control surface. Dropping the Pane closes its bridge client.
                 //
-                // CR-2026-06-14 (resource-leak): also capture each closed pane's
-                // `agent_name` so a NON-fleet local shell pane still has its PTY
-                // child killed. A scratch shell's registry entry (PTY master +
-                // child) would otherwise leak for the whole TUI session.
-                let nonfleet_agents: Vec<crate::types::AgentName>;
+                // Also capture each closed pane's authoritative registry id so
+                // a non-fleet local shell still has its PTY child reaped. These
+                // shells are intentionally absent from fleet.yaml, so name-based
+                // managed deletion cannot resolve them.
+                let nonfleet_agents: Vec<crate::types::InstanceId>;
                 if is_tab {
                     let idx = ctx.layout.active;
-                    let panes: Vec<(crate::types::AgentName, Option<String>)> = ctx
+                    let panes: Vec<(crate::types::InstanceId, Option<String>)> = ctx
                         .layout
                         .tabs
                         .get(idx)
@@ -400,7 +400,7 @@ pub(super) fn handle_key(
                             t.root().pane_ids().into_iter().filter_map(|id| {
                                 t.root()
                                     .find_pane(id)
-                                    .map(|p| (p.agent_name.clone(), p.fleet_instance_name.clone()))
+                                    .map(|p| (p.instance_id, p.fleet_instance_name.clone()))
                             })
                         })
                         .collect();
@@ -413,29 +413,27 @@ pub(super) fn handle_key(
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
                     let fid = tab.focus_id;
-                    let (agent_name, fleet_name): (
-                        Option<crate::types::AgentName>,
+                    let (instance_id, fleet_name): (
+                        Option<crate::types::InstanceId>,
                         Option<String>,
                     ) = tab
                         .root()
                         .find_pane(fid)
-                        .map(|p| (Some(p.agent_name.clone()), p.fleet_instance_name.clone()))
+                        .map(|p| (Some(p.instance_id), p.fleet_instance_name.clone()))
                         .unwrap_or((None, None));
                     if tab.close_focused().is_some() {
                         outcome.needs_resize = true;
                     }
-                    nonfleet_agents = match (agent_name, fleet_name) {
+                    nonfleet_agents = match (instance_id, fleet_name) {
                         (Some(a), None) => vec![a],
                         _ => Vec::new(),
                     };
                 } else {
                     nonfleet_agents = Vec::new();
                 }
-                // Kill non-fleet (shell) panes' PTY children on the UI thread —
-                // `kill_agent` only drops the registry PTY master (fast, no
-                // blocking IO), mirroring the `ScratchShell` Esc arm.
-                for name in &nonfleet_agents {
-                    super::kill_agent(ctx.home, ctx.registry, name);
+                // Reap non-fleet shell panes by UUID, mirroring ScratchShell Esc.
+                for instance_id in nonfleet_agents {
+                    super::kill_unmanaged_agent(ctx.registry, instance_id);
                 }
             }
             _ => {
@@ -994,14 +992,14 @@ pub(super) fn handle_key(
         }
         Overlay::ScratchShell { pane } => match key.code {
             KeyCode::Esc => {
-                // Capture the agent name before dropping the pane so we can
+                // Capture the registry key before dropping the pane so we can
                 // kill the shell process. The registry owns the PTY master;
-                // kill_agent drops it, the forwarder thread sees rx close,
+                // removing it drops the handle, the forwarder sees rx close,
                 // and exits. The pane (and its subscriber rx) drop with the
                 // overlay.
-                let name = pane.agent_name.clone();
+                let instance_id = pane.instance_id;
                 *overlay = Overlay::None;
-                super::kill_agent(ctx.home, ctx.registry, &name);
+                super::kill_unmanaged_agent(ctx.registry, instance_id);
             }
             _ => {
                 let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
@@ -1051,8 +1049,115 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    fn close_test_pane(
+        id: crate::types::InstanceId,
+        name: &str,
+        fleet_name: Option<&str>,
+    ) -> crate::layout::Pane {
+        crate::layout::Pane {
+            agent_name: name.into(),
+            instance_id: id,
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: fleet_name.map(str::to_string),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        }
+    }
+
+    fn confirm_close_tab(
+        home: &Path,
+        registry: &crate::agent::AgentRegistry,
+        pane: crate::layout::Pane,
+    ) -> crate::layout::Layout {
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new("close-test".to_string(), pane));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut overlay = Overlay::ConfirmClose {
+            target: CloseTarget::Tab,
+        };
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry,
+            home,
+            fleet_path: home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+        };
+        handle_key(&mut overlay, press(KeyCode::Char('y')), &mut ctx);
+        layout
+    }
+
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn confirm_close_reaps_unmanaged_shell_by_instance_id() {
+        let home = dec_home("confirm_close_unmanaged");
+        let id = crate::types::InstanceId::new();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry
+            .lock()
+            .insert(id, crate::agent::mk_test_handle("scratch", id));
+
+        let layout = confirm_close_tab(&home, &registry, close_test_pane(id, "scratch", None));
+
+        assert!(layout.tabs.is_empty(), "the tab view should close");
+        assert!(
+            !registry.lock().contains_key(&id),
+            "the unmanaged registry entry must be removed and reaped"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn confirm_close_preserves_managed_fleet_state() {
+        let home = dec_home("confirm_close_fleet");
+        let id = crate::types::InstanceId::new();
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        let fleet_bytes = format!(
+            "instances:\n  managed:\n    id: '{}'\n    backend: claude\n",
+            id
+        );
+        std::fs::write(&fleet_path, &fleet_bytes).expect("write fleet fixture");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry
+            .lock()
+            .insert(id, crate::agent::mk_test_handle("managed", id));
+
+        let layout = confirm_close_tab(
+            &home,
+            &registry,
+            close_test_pane(id, "managed", Some("managed")),
+        );
+
+        assert!(layout.tabs.is_empty(), "the tab view should close");
+        assert!(
+            registry.lock().contains_key(&id),
+            "closing a fleet view must not remove its managed process"
+        );
+        assert_eq!(
+            std::fs::read(&fleet_path).expect("fleet still exists"),
+            fleet_bytes.as_bytes(),
+            "closing a fleet view must not mutate fleet.yaml"
+        );
+        let handle = crate::agent::remove_and_unregister(&registry, &id).expect("cleanup handle");
+        crate::daemon::terminate_agents_parallel(vec![("managed".to_string(), handle.child)]);
+        std::fs::remove_dir_all(home).ok();
     }
 
     fn task_overlay() -> Overlay {

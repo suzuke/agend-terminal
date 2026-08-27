@@ -229,7 +229,7 @@ pub(super) fn handle_delete_instance_with_runtime(
     // orphans its tasks. Restrict an identified caller to deleting itself or a
     // member of a team it orchestrates — a peer can no longer remove another
     // agent by naming it. Anonymous (no sender: operator-direct / standalone)
-    // keeps full authority (the TUI close path calls `full_delete_instance`).
+    // keeps full authority for explicit local/operator lifecycle calls.
     //
     // ACL improvement: also allow the instance's CREATOR (the caller that ran
     // `create_instance` for it, stamped as `created_by` in fleet.yaml — the

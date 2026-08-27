@@ -953,6 +953,20 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
     crate::daemon::lifecycle::delete_transaction(home, name, registry, None, false);
 }
 
+/// Reap a TUI-local shell by its authoritative registry key.
+///
+/// Unmanaged shells are intentionally absent from fleet.yaml, so the managed
+/// name-based delete transaction cannot resolve them. Remove the exact UUID
+/// entry first, then terminate and reap the owned child.
+fn kill_unmanaged_agent(registry: &AgentRegistry, instance_id: crate::types::InstanceId) {
+    let drained: Vec<(String, crate::daemon::ChildHandle)> =
+        agent::remove_and_unregister(registry, &instance_id)
+            .map(|handle| (handle.name.to_string(), handle.child))
+            .into_iter()
+            .collect();
+    crate::daemon::terminate_agents_parallel(drained);
+}
+
 /// Whether the agent's child process is still running.
 ///
 /// Used by the scratch shell overlay to self-close when the user exits the
@@ -964,11 +978,9 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
 /// would wedge the whole UI if another thread panicked while holding the child
 /// lock (parking_lot leaves it locked). Transient contention just keeps the
 /// overlay open for that tick — Esc still works.
-fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
+fn agent_is_alive(registry: &AgentRegistry, instance_id: crate::types::InstanceId) -> bool {
     let reg = agent::lock_registry(registry);
-    // #1441: registry is UUID-keyed; the overlay only knows the display name,
-    // so locate the handle by name (no fleet.yaml on the scratch-shell path).
-    let Some(handle) = reg.values().find(|h| h.name.as_str() == name) else {
+    let Some(handle) = reg.get(&instance_id) else {
         return false;
     };
     // Bind to a local so the child-lock's temporary MutexGuard drops

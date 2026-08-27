@@ -11,13 +11,10 @@
 //! child under the pane's UUID. Nothing iterates closed-pane agents, so the
 //! orphaned shell child + fd leak for the whole TUI session.
 //!
-//! Driving the real close path deterministically requires spawning a real PTY
-//! child and a fleet.yaml/working-dir cleanup in a fire-and-forget thread, so
-//! this pins the fix as a SOURCE INVARIANT (mirrors the `send_to_registry` /
-//! `broadcast_registry` body-scan tests in `src/agent/tests.rs`): the
-//! ConfirmClose handler block must reference an agent-name-based kill path
-//! (`agent_name` + `kill_agent`), exactly as the scratch-shell overlay arm
-//! does via `super::kill_agent(ctx.home, ctx.registry, &name)`.
+//! The behavioral tests in `overlay.rs` drive the real close entry point with a
+//! registry-backed PTY and fleet fixture. These source invariants additionally
+//! keep destructive lifecycle APIs out of the overlay module and require the
+//! unmanaged path to use the pane's authoritative `instance_id`.
 
 #[test]
 fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
@@ -42,18 +39,16 @@ fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
          boundaries may have drifted — re-locate the arm"
     );
 
-    let references_agent_name = block.contains("agent_name");
-    let references_kill = block.contains("kill_agent");
+    let references_instance_id = block.contains("instance_id");
+    let references_kill = block.contains("kill_unmanaged_agent");
 
     assert!(
-        references_agent_name && references_kill,
+        references_instance_id && references_kill,
         "resource-leak: the ConfirmClose handler must kill EVERY closed pane's \
          underlying agent, including shell / non-fleet panes (fleet_instance_name \
-         == None). It currently collects only `fleet_instance_name` into `names`, \
-         so a closed shell pane leaks its PTY child + fd for the whole TUI \
-         session. Capture each closed pane's `agent_name` and fall back to \
-         `super::kill_agent(ctx.home, ctx.registry, &name)` (mirror the \
-         scratch-shell overlay arm). Found agent_name={references_agent_name}, \
+         == None). Use each pane's authoritative registry `instance_id`; unmanaged \
+         shells are absent from fleet.yaml and cannot be resolved by name. Found \
+         instance_id={references_instance_id}, \
          kill_agent={references_kill} in the ConfirmClose block."
     );
 }
@@ -70,17 +65,19 @@ fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
         .expect("TabList arm must follow ConfirmClose and bound its block");
     let block = &src[start..start + rel_end];
 
-    assert!(
-        !block.contains("full_delete_instance"),
-        "destructive lifecycle bug: Close pane/tab is a layout operation, but its \
-         ConfirmClose handler calls full_delete_instance. A disconnected or \
-         control-plane-missing pane can therefore erase fleet/team membership, \
-         watches, worktree, and workspace while the backend session is still \
-         alive. Permanent deletion must remain behind the explicit delete_instance \
-         control surface."
-    );
-    assert!(
-        !block.contains("reconcile_after_close"),
-        "layout close must not run deployment deletion reconciliation"
-    );
+    assert!(block.contains("fleet_instance_name"), "slice sanity");
+    for forbidden in [
+        "full_delete_instance",
+        "instance_state::lifecycle",
+        "reconcile_after_close",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "destructive lifecycle bug: app/overlay.rs must not reference \
+             `{forbidden}` anywhere. A helper outside the ConfirmClose block \
+             could otherwise hide destructive fleet deletion behind one-hop \
+             indirection. Permanent deletion belongs only to the explicit \
+             delete_instance control surface."
+        );
+    }
 }
