@@ -211,6 +211,9 @@ pub enum RestartCapability {
     Daemon,
     /// `agend-terminal app` (combined TUI+daemon, `run_app`): fail-closed in R1.
     /// The staged owner-restart strategy is a later slice (decision d-…2329422433-1).
+    /// No shipped composition root constructs this yet; keep the typed capability
+    /// reserved until that owner-restart slice is wired.
+    #[allow(dead_code)]
     App,
     /// Any other API-server owner (e.g. `verify`) — default-deny. A DISTINCT
     /// value from `App` even though R1 routes both to a fail-closed response.

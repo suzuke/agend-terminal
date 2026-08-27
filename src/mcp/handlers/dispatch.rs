@@ -372,8 +372,10 @@ pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
 pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
     let requester_id = match (ctx.runtime, ctx.instance_name.is_empty()) {
         (Some(runtime), false)
-            if runtime.capability == crate::api::RestartCapability::App
-                || runtime.capability == crate::api::RestartCapability::Daemon =>
+            if matches!(
+                runtime.capability,
+                crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon
+            ) =>
         {
             match crate::api::handlers::mcp_proxy::live_requester_id(
                 &runtime.registry,

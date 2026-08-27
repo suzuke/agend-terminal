@@ -73,6 +73,10 @@ fn is_side_effect_tool(tool: &str, action: Option<&str>) -> bool {
 /// have been launched with a fleet override that is not `$AGEND_HOME/fleet.yaml`;
 /// disk resolution here would therefore consult the wrong fleet. A restart is
 /// allowed only for an exact live handle name (or its exact UUID key).
+///
+/// The API cookie authenticates access to the local daemon, not the asserted
+/// `instance` field. This is the same claimed-identity boundary used by the role
+/// gate above; ambiguity fails closed, but a caller can name another live peer.
 pub(crate) fn live_requester_id(
     registry: &crate::agent::AgentRegistry,
     instance: &str,
@@ -170,12 +174,12 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
             ),
         });
     }
-    let requester_id = if tool == "restart_daemon"
-        && !instance.is_empty()
-        && (ctx.capability == crate::api::RestartCapability::App
-            || ctx.capability == crate::api::RestartCapability::Daemon)
-    {
-        match live_requester_id(ctx.registry, &instance) {
+    let requester_id = match (tool, ctx.capability, instance.is_empty()) {
+        (
+            "restart_daemon",
+            crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon,
+            false,
+        ) => match live_requester_id(ctx.registry, &instance) {
             Some(id) => Some(id),
             None => {
                 return json!({
@@ -183,9 +187,8 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
                     "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
                 })
             }
-        }
-    } else {
-        None
+        },
+        _ => None,
     };
     let timeout = tool_timeout(tool);
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
@@ -1765,7 +1768,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn restart_daemon_unresolved_live_requester_fails_closed() {
+    fn restart_daemon_external_requester_without_stable_id_fails_closed() {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
@@ -1788,6 +1791,13 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Default::default();
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
+        externals.lock().insert(
+            "operator".to_string(),
+            crate::agent::ExternalAgentHandle {
+                backend_command: "external-test".to_string(),
+                pid: std::process::id(),
+            },
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         let ctx = HandlerCtx {
             registry: &registry,
@@ -1812,7 +1822,7 @@ mod tests {
 
         assert_eq!(
             response["ok"], false,
-            "unresolved caller must fail: {response}"
+            "external caller without stable InstanceId must fail: {response}"
         );
         assert!(
             response["error"]
