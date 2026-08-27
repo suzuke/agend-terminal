@@ -73,7 +73,7 @@ fn is_side_effect_tool(tool: &str, action: Option<&str>) -> bool {
 /// have been launched with a fleet override that is not `$AGEND_HOME/fleet.yaml`;
 /// disk resolution here would therefore consult the wrong fleet. A restart is
 /// allowed only for an exact live handle name (or its exact UUID key).
-fn live_requester_id(
+pub(crate) fn live_requester_id(
     registry: &crate::agent::AgentRegistry,
     instance: &str,
 ) -> Option<crate::types::InstanceId> {
@@ -171,20 +171,19 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         });
     }
     let requester_id = match (tool, ctx.capability, instance.is_empty()) {
-        ("restart_daemon", crate::api::RestartCapability::App, false) => {
-            match live_requester_id(ctx.registry, &instance) {
-                Some(id) => Some(id),
-                None => {
-                    return json!({
-                        "ok": false,
-                        "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
-                    })
-                }
+        (
+            "restart_daemon",
+            crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon,
+            false,
+        ) => match live_requester_id(ctx.registry, &instance) {
+            Some(id) => Some(id),
+            None => {
+                return json!({
+                    "ok": false,
+                    "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
+                })
             }
-        }
-        ("restart_daemon", crate::api::RestartCapability::Daemon, false) => {
-            live_requester_id(ctx.registry, &instance)
-        }
+        },
         _ => None,
     };
     let timeout = tool_timeout(tool);
@@ -1590,9 +1589,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&home).unwrap();
+        let operator_id = crate::types::InstanceId::new();
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  operator:\n    role_kind: orchestrator\n",
+            format!(
+                "instances:\n  operator:\n    id: {}\n    role_kind: orchestrator\n",
+                operator_id.full()
+            ),
         )
         .unwrap();
 
@@ -1607,6 +1610,10 @@ mod tests {
         crate::daemon::RESTART_PENDING.store(false, Ordering::Release);
         let shutdown = Arc::new(AtomicBool::new(false));
         let registry: crate::agent::AgentRegistry = Default::default();
+        registry.lock().insert(
+            operator_id,
+            crate::agent::mk_test_handle("operator", operator_id),
+        );
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
         let ctx = HandlerCtx {
@@ -1674,9 +1681,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&home).unwrap();
+        let operator_id = crate::types::InstanceId::new();
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  operator:\n    role_kind: orchestrator\n",
+            format!(
+                "instances:\n  operator:\n    id: {}\n    role_kind: orchestrator\n",
+                operator_id.full()
+            ),
         )
         .unwrap();
 
@@ -1690,6 +1701,10 @@ mod tests {
         let previous_restart_pending = crate::daemon::RESTART_PENDING.load(Ordering::Acquire);
         crate::daemon::RESTART_PENDING.store(false, Ordering::Release);
         let registry: crate::agent::AgentRegistry = Default::default();
+        registry.lock().insert(
+            operator_id,
+            crate::agent::mk_test_handle("operator", operator_id),
+        );
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
         let ctx = HandlerCtx {
@@ -1744,6 +1759,66 @@ mod tests {
         assert!(
             !marker_exists,
             "missing authority must not write restart-requested"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restart_daemon_unresolved_live_requester_fails_closed() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-mcp-restart-unresolved-requester-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  operator:\n    role_kind: orchestrator\n",
+        )
+        .unwrap();
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &home,
+            capability: crate::api::RestartCapability::Daemon,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: Some(shutdown),
+        };
+        let response = handle_mcp_tool(
+            &json!({
+                "tool": "restart_daemon",
+                "instance": "operator",
+                "arguments": {}
+            }),
+            &ctx,
+        );
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], false,
+            "unresolved caller must fail: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live handle"),
+            "failure must identify the missing live requester identity: {response}"
         );
     }
 

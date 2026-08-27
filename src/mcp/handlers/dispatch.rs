@@ -370,25 +370,25 @@ pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
 /// standalone bridge call that never traversed the api `mcp_tool` ingress) maps
 /// to `None` → default-deny in the handler.
 pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
-    let requester_id = match (
-        ctx.runtime.map(|runtime| runtime.capability),
-        ctx.instance_name.is_empty(),
-    ) {
-        (Some(crate::api::RestartCapability::App), false) => {
-            match crate::agent::resolve_instance(ctx.home, ctx.instance_name) {
-                Ok((id, _)) => Some(id),
-                Err(_) => {
+    let requester_id = match (ctx.runtime, ctx.instance_name.is_empty()) {
+        (Some(runtime), false)
+            if matches!(
+                runtime.capability,
+                crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon
+            ) =>
+        {
+            match crate::api::handlers::mcp_proxy::live_requester_id(
+                &runtime.registry,
+                ctx.instance_name,
+            ) {
+                Some(id) => Some(id),
+                None => {
                     return json!({
                         "ok": false,
-                        "error": "restart_daemon requires the managed caller's stable InstanceId; fleet intact — no restart"
+                        "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
                     });
                 }
             }
-        }
-        (Some(crate::api::RestartCapability::Daemon), false) => {
-            crate::agent::resolve_instance(ctx.home, ctx.instance_name)
-                .ok()
-                .map(|(id, _)| id)
         }
         _ => None,
     };
@@ -670,6 +670,42 @@ mod tests {
         assert!(
             resp["error"].as_str().unwrap_or("").contains("app"),
             "App route must return the app-mode fail-close message — got {resp}"
+        );
+    }
+
+    #[test]
+    fn dispatch_restart_daemon_requires_live_daemon_requester() {
+        static EMPTY_SENDER: Option<Sender> = None;
+        let home = std::env::temp_dir();
+        let args = json!({});
+        let runtime = RuntimeContext {
+            registry: Default::default(),
+            configs: Default::default(),
+            externals: Default::default(),
+            capability: crate::api::RestartCapability::Daemon,
+            app_restart: None,
+            post_flush: None,
+            notifier: None,
+            shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        };
+        let ctx = HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "fleet-only-requester",
+            sender: &EMPTY_SENDER,
+            runtime: Some(&runtime),
+        };
+        let resp = dispatch_restart_daemon(&ctx);
+        assert_eq!(
+            resp["ok"], false,
+            "unresolved daemon caller must fail: {resp}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live handle"),
+            "daemon path must require a live requester identity: {resp}"
         );
     }
 

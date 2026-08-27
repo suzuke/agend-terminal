@@ -33,8 +33,12 @@ fn restart_request_real_dispatch_carries_stable_instance_id() {
 
     let gate = AppRestartGate::new();
     let (tx, rx) = crossbeam_channel::bounded::<AppRestartRequest>(1);
+    let registry: crate::agent::AgentRegistry = Default::default();
+    registry
+        .lock()
+        .insert(id, crate::agent::mk_test_handle("lead", id));
     let runtime = RuntimeContext {
-        registry: Default::default(),
+        registry,
         configs: Default::default(),
         externals: Default::default(),
         capability: crate::api::RestartCapability::App,
