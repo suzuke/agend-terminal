@@ -111,6 +111,7 @@ pub(crate) fn delete_with_runtime_or_legacy(
 /// state for `auto_start_fleet` to resurrect on next reconcile. `detail`
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
+#[cfg(test)]
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
     full_delete_instance_with_runtime(home, name, None)
 }

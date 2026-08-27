@@ -10,10 +10,6 @@ use crate::agent::AgentRegistry;
 use crate::backend::Backend;
 use crate::layout::{Layout, Pane, SplitDir, Tab};
 
-fn should_delete_fleet_instance(pane_disconnected: bool, same_name_is_live: bool) -> bool {
-    !pane_disconnected || !same_name_is_live
-}
-
 /// An item in the new-tab selection menu.
 pub struct MenuItem {
     pub label: String,
@@ -381,139 +377,65 @@ pub(super) fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let is_tab = matches!(target, CloseTarget::Tab);
                 *overlay = Overlay::None;
-                // Sprint 53 Smoke 2 r1 (operator m-16 override): TUI close
-                // path delegates to the canonical full-delete flow
-                // `mcp::handlers::instance::full_delete_instance`. DRY with
-                // the MCP `delete_instance` MCP tool — same side-effect set
-                // (PTY kill via delete_transaction, fleet.yaml removal,
-                // Telegram topic delete, working-dir cleanup, team removal).
+                // Pane/tab close is a VIEW operation. Fleet panes are remote
+                // views onto daemon-owned instances, so dropping one must never
+                // call the destructive instance lifecycle (fleet/team removal,
+                // worktree/workspace cleanup, topic/watch deletion). Permanent
+                // deletion remains behind the explicit `delete_instance`
+                // control surface. Dropping the Pane closes its bridge client.
                 //
-                // Layered on top, `deployments::reconcile_after_close` runs
-                // afterwards so deployment-store metadata + custom-directory
-                // subdirs (the actual Smoke 2 leak) get cleaned via
-                // `cleanup_deployment_dirs` — `full_delete_instance` only
-                // covers the per-instance working_dir which, for custom
-                // `directory:` deployments, was the user-provided-dir branch
-                // of `cleanup_working_dir` and only stripped agend files.
-                // #1363: remove pane/tab from layout FIRST for instant
-                // UI response, then run the blocking delete + cleanup
-                // in a background thread.
-                let fleet_panes: Vec<(String, bool)>;
                 // CR-2026-06-14 (resource-leak): also capture each closed pane's
-                // `agent_name` so a NON-fleet (shell) pane — `fleet_instance_name
-                // == None`, never in `names` — still has its PTY child killed.
-                // `full_delete_instance` only tears down FLEET instances; a
-                // scratch shell's registry entry (PTY master + child) would
-                // otherwise leak for the whole TUI session (`Pane` has no `Drop`).
+                // `agent_name` so a NON-fleet local shell pane still has its PTY
+                // child killed. A scratch shell's registry entry (PTY master +
+                // child) would otherwise leak for the whole TUI session.
                 let nonfleet_agents: Vec<crate::types::AgentName>;
                 if is_tab {
                     let idx = ctx.layout.active;
-                    let panes: Vec<(crate::types::AgentName, Option<String>, bool)> = ctx
+                    let panes: Vec<(crate::types::AgentName, Option<String>)> = ctx
                         .layout
                         .tabs
                         .get(idx)
                         .into_iter()
                         .flat_map(|t| {
                             t.root().pane_ids().into_iter().filter_map(|id| {
-                                t.root().find_pane(id).map(|p| {
-                                    (
-                                        p.agent_name.clone(),
-                                        p.fleet_instance_name.clone(),
-                                        p.is_disconnected(),
-                                    )
-                                })
+                                t.root()
+                                    .find_pane(id)
+                                    .map(|p| (p.agent_name.clone(), p.fleet_instance_name.clone()))
                             })
-                        })
-                        .collect();
-                    fleet_panes = panes
-                        .iter()
-                        .filter_map(|(_, f, disconnected)| {
-                            f.clone().map(|name| (name, *disconnected))
                         })
                         .collect();
                     nonfleet_agents = panes
                         .into_iter()
-                        .filter(|(_, f, _)| f.is_none())
-                        .map(|(a, _, _)| a)
+                        .filter(|(_, f)| f.is_none())
+                        .map(|(a, _)| a)
                         .collect();
                     let _ = ctx.layout.close_tab(idx);
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
                     let fid = tab.focus_id;
-                    let (agent_name, fleet_name, disconnected): (
+                    let (agent_name, fleet_name): (
                         Option<crate::types::AgentName>,
                         Option<String>,
-                        bool,
                     ) = tab
                         .root()
                         .find_pane(fid)
-                        .map(|p| {
-                            (
-                                Some(p.agent_name.clone()),
-                                p.fleet_instance_name.clone(),
-                                p.is_disconnected(),
-                            )
-                        })
-                        .unwrap_or((None, None, false));
+                        .map(|p| (Some(p.agent_name.clone()), p.fleet_instance_name.clone()))
+                        .unwrap_or((None, None));
                     if tab.close_focused().is_some() {
                         outcome.needs_resize = true;
                     }
-                    fleet_panes = fleet_name
-                        .clone()
-                        .map(|name| vec![(name, disconnected)])
-                        .unwrap_or_default();
                     nonfleet_agents = match (agent_name, fleet_name) {
                         (Some(a), None) => vec![a],
                         _ => Vec::new(),
                     };
                 } else {
-                    fleet_panes = Vec::new();
                     nonfleet_agents = Vec::new();
                 }
                 // Kill non-fleet (shell) panes' PTY children on the UI thread —
                 // `kill_agent` only drops the registry PTY master (fast, no
-                // blocking IO), mirroring the `ScratchShell` Esc arm. Fleet panes
-                // are torn down by `full_delete_instance` in the thread below.
+                // blocking IO), mirroring the `ScratchShell` Esc arm.
                 for name in &nonfleet_agents {
                     super::kill_agent(ctx.home, ctx.registry, name);
-                }
-                if !fleet_panes.is_empty() {
-                    let home = ctx.home.to_path_buf();
-                    // fire-and-forget: blocking delete + deployment
-                    // cleanup runs off the UI thread
-                    std::thread::spawn(move || {
-                        let live_names =
-                            if fleet_panes.iter().any(|(_, disconnected)| *disconnected) {
-                                let (agents, mode) =
-                                    crate::runtime::list_agents_with_fallback_with_mode(&home);
-                                (mode == crate::runtime::AgentListMode::Live).then(|| {
-                                    agents.into_iter().collect::<std::collections::HashSet<_>>()
-                                })
-                            } else {
-                                None
-                            };
-                        let names: Vec<String> = fleet_panes
-                            .into_iter()
-                            .filter(|(name, disconnected)| {
-                                should_delete_fleet_instance(
-                                    *disconnected,
-                                    live_names.as_ref().is_some_and(|live| live.contains(name)),
-                                )
-                            })
-                            .map(|(name, _)| name)
-                            .collect();
-                        for name in &names {
-                            if let Err(detail) =
-                                crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
-                                    &home, name,
-                                )
-                            {
-                                tracing::warn!(name, detail = %detail,
-                                    "TUI close: residual state — operator may need manual cleanup");
-                            }
-                        }
-                        let _ = crate::deployments::reconcile_after_close(&home, &names);
-                    });
                 }
             }
             _ => {
@@ -1124,12 +1046,6 @@ fn submit_task_request(
 mod tests {
     use super::*;
 
-    #[test]
-    fn disconnected_stale_pane_does_not_delete_live_same_name_successor() {
-        assert!(!should_delete_fleet_instance(true, true));
-        assert!(should_delete_fleet_instance(false, true));
-        assert!(should_delete_fleet_instance(true, false));
-    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use parking_lot::Mutex;
     use std::collections::HashMap;

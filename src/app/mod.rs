@@ -303,8 +303,8 @@ fn render_active_overlay(
         }
         Overlay::ConfirmClose { target } => {
             let msg = match target {
-                CloseTarget::Pane => "Close pane? (y/n)",
-                CloseTarget::Tab => "Close tab and kill all agents? (y/n)",
+                CloseTarget::Pane => "Close pane view? (does not delete fleet agent) (y/n)",
+                CloseTarget::Tab => "Close tab view? (does not delete fleet agents) (y/n)",
             };
             render::render_confirm(frame, msg);
         }

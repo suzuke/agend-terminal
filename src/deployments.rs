@@ -1105,6 +1105,7 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
 /// know which specific names were removed. Kept in the signature so a
 /// future optimization can target only deployments touching those names
 /// without changing the call site.
+#[cfg(test)]
 pub fn reconcile_after_close(home: &Path, removed_names: &[String]) -> Vec<String> {
     let _ = removed_names;
     reconcile_orphan_deployments(home)
