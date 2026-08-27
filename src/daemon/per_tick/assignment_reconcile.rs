@@ -2091,6 +2091,80 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn cascade_cancelled_child_assignment_is_retired() {
+        let home = tmp_home("cascade-cancel-retire");
+        let parent = TaskId::from("t-parent-cancel-1");
+        let child = TaskId::from("t-child-cancel-1");
+        let inst = InstanceName::from("orchestrator");
+        crate::task_events::append_batch_at(
+            &home,
+            &inst,
+            vec![
+                TaskEvent::Created {
+                    task_id: parent.clone(),
+                    title: "parent".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Created {
+                    task_id: child.clone(),
+                    title: "child review".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: Some(parent.clone()),
+                },
+                TaskEvent::Cancelled {
+                    task_id: parent,
+                    by: inst.clone(),
+                    reason: "parent cancelled".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/cascade",
+            "reviewer-child",
+            10,
+            "lead",
+            &child.0,
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Please review child",
+            None,
+            None,
+            "2026-07-22T02:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+
+        let wakes = reconcile_all_collect(&home, "2026-07-22T02:00:01Z");
+        assert!(wakes.is_empty());
+        assert!(
+            store::get(&home, "o/r", "feat/cascade", "reviewer-child").is_none(),
+            "a child cancelled by parent cascade must not strand its assignment"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Actionable-unread row: lease-due reconciliation fires exactly one wake
     /// without nonce rotation or supersede. A second tick within 60s is bounded.
     #[test]
