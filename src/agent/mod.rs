@@ -845,19 +845,11 @@ fn build_command(
         _ => None,
     };
 
-    // #3317: register the bridge on the child argv so fleet tools do not depend
-    // on project trust. #3402: also grant the canonical managed workspace trust
-    // for this invocation so its project-local config/hooks/policies load. Both
-    // are child-only overrides; neither writes global Codex config. `home` is
-    // required (it is what the bridge receives as `AGEND_HOME`); an ad-hoc Codex
-    // spawn without one is unchanged.
+    // #3317/#3402: child-only bridge + canonical workspace trust overrides.
+    // `home` is required; an ad-hoc Codex spawn without one is unchanged.
     let codex_config_args: Vec<String> = match (detected_backend.as_ref(), *home) {
         (Some(Backend::Codex), Some(h)) => {
-            let mut config_args = crate::mcp_config::codex_mcp_config_args(h, Some(name));
-            if let Some(workspace) = *working_dir {
-                config_args.extend(crate::mcp_config::codex_project_trust_args(workspace)?);
-            }
-            config_args
+            crate::mcp_config::codex_managed_config_args(h, Some(name), *working_dir)?
         }
         _ => Vec::new(),
     };

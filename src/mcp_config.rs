@@ -956,6 +956,19 @@ pub(crate) fn codex_project_trust_args(workspace: &Path) -> anyhow::Result<Vec<S
     Ok(codex_project_trust_args_from(&canonical.to_string_lossy()))
 }
 
+/// Compose all child-only Codex overrides for a managed fleet spawn.
+pub(crate) fn codex_managed_config_args(
+    home: &Path,
+    instance_name: Option<&str>,
+    workspace: Option<&Path>,
+) -> anyhow::Result<Vec<String>> {
+    let mut args = codex_mcp_config_args(home, instance_name);
+    if let Some(workspace) = workspace {
+        args.extend(codex_project_trust_args(workspace)?);
+    }
+    Ok(args)
+}
+
 fn codex_project_trust_args_from(path: &str) -> Vec<String> {
     vec![
         "-c".to_string(),
