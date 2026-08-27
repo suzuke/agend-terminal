@@ -415,13 +415,14 @@ impl DevModalGate {
         generation_over: Arc<std::sync::atomic::AtomicBool>,
         deleted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
+        let candidate_epoch = Arc::new(AtomicU64::new(epoch.load(Ordering::SeqCst)));
         Self {
             armed,
             spent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch,
             generation_over,
             deleted,
-            candidate_epoch: Arc::new(AtomicU64::new(u64::MAX)),
+            candidate_epoch,
             candidate: None,
         }
     }

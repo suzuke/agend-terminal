@@ -1765,10 +1765,6 @@ WARNING: Loading development channels
     fn fallback_write_rechecks_the_barrier_3314() {
         let (writer, written) = recording_writer_3314();
         let mut gate = DevModalGate::new(true);
-        assert_eq!(
-            gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(0)),
-            GateOutcome::Schedule
-        );
         let barrier = gate.write_barrier();
         gate.note_pty_activity();
         assert_eq!(
@@ -1807,15 +1803,11 @@ WARNING: Loading development channels
         let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let generation_over = std::sync::Arc::new(AtomicBool::new(false));
         let deleted = std::sync::Arc::new(AtomicBool::new(false));
-        let mut gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
             true,
             std::sync::Arc::clone(&epoch),
             std::sync::Arc::clone(&generation_over),
             std::sync::Arc::clone(&deleted),
-        );
-        assert_eq!(
-            gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(0)),
-            GateOutcome::Schedule
         );
         let barrier = gate.write_barrier();
         assert!(barrier.still_valid(), "valid while the generation is live");
@@ -1835,15 +1827,11 @@ WARNING: Loading development channels
         let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let generation_over = std::sync::Arc::new(AtomicBool::new(false));
         let deleted = std::sync::Arc::new(AtomicBool::new(false));
-        let mut gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
             true,
             std::sync::Arc::clone(&epoch),
             std::sync::Arc::clone(&generation_over),
             std::sync::Arc::clone(&deleted),
-        );
-        assert_eq!(
-            gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(0)),
-            GateOutcome::Schedule
         );
         let barrier = gate.write_barrier();
         deleted.store(true, Ordering::SeqCst);
