@@ -1894,6 +1894,16 @@ mod tests {
     }
 
     #[test]
+    fn toml_string_value_escapes_control_characters_3402() {
+        for value in ["workspace\nline", "it's\r\na workspace"] {
+            let rendered = toml_string_value(value);
+            let parsed: toml::Value = toml::from_str(&format!("value={rendered}"))
+                .expect("control characters must remain valid TOML");
+            assert_eq!(parsed["value"].as_str(), Some(value));
+        }
+    }
+
+    #[test]
     fn opencode_concurrent_configure_keeps_json_valid() {
         // Same race test against configure_opencode — opencode.json is
         // read→mutate→atomic_write under a flock.
