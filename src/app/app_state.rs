@@ -6,6 +6,26 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RemoteRosterNames {
+    to_add: std::collections::HashSet<String>,
+    gone: std::collections::HashSet<String>,
+}
+
+fn reconcile_remote_roster_names(
+    current: &std::collections::HashSet<String>,
+    known: &std::collections::HashSet<String>,
+    mode: crate::runtime::AgentListMode,
+) -> RemoteRosterNames {
+    if !matches!(mode, crate::runtime::AgentListMode::Live) {
+        return RemoteRosterNames::default();
+    }
+    RemoteRosterNames {
+        to_add: current.difference(known).cloned().collect(),
+        gone: known.difference(current).cloned().collect(),
+    }
+}
+
 fn remote_attach_candidates(
     current: &std::collections::HashSet<String>,
     known: &std::collections::HashSet<String>,
@@ -18,6 +38,21 @@ fn remote_attach_candidates(
         .collect();
     candidates.sort();
     candidates
+}
+
+fn reconcile_remote_roster_candidates(
+    current: &std::collections::HashSet<String>,
+    known: &std::collections::HashSet<String>,
+    mode: crate::runtime::AgentListMode,
+    is_disconnected: impl Fn(&str) -> bool,
+) -> RemoteRosterNames {
+    let mut names = reconcile_remote_roster_names(current, known, mode);
+    if matches!(mode, crate::runtime::AgentListMode::Live) {
+        names.to_add = remote_attach_candidates(current, known, is_disconnected)
+            .into_iter()
+            .collect();
+    }
+    names
 }
 use crate::channel::TelegramStatus;
 
@@ -50,6 +85,9 @@ pub(super) struct AppState {
     /// entries intentionally remain unknown to render; they must not become
     /// a locally invented `Idle` state.
     pub(super) remote_agent_states: rpc::AgentStateSnapshot,
+    /// Successful Live state snapshots waiting for the next pre-select roster
+    /// reconciliation. Non-Live outcomes never populate this queue.
+    pub(super) pending_remote_roster_names: Option<std::collections::HashSet<String>>,
     /// Placeholder forwarder senders, keyed by pane id, retained until the
     /// matching AttachOutcome is applied (or the pane is closed first).
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
@@ -165,6 +203,7 @@ impl AppState {
             },
             known_remote_agents: std::collections::HashSet::new(),
             remote_agent_states: HashMap::new(),
+            pending_remote_roster_names: None,
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
@@ -862,8 +901,16 @@ impl AppState {
         outcome: Result<rpc::TaskOutcome, crossbeam_channel::RecvError>,
     ) {
         let (items, notice) = match outcome {
-            Ok(Ok(items)) => (Some(items), None),
-            Ok(Err(error)) => (None, Some(error)),
+            Ok(rpc::TaskOutcome::Snapshot(items))
+            | Ok(rpc::TaskOutcome::MutationApplied { snapshot: items }) => (Some(items), None),
+            Ok(rpc::TaskOutcome::MutationAppliedRefreshFailed { error }) => (
+                None,
+                Some(format!(
+                    "task mutation applied; refresh failed; state may be stale: {error}"
+                )),
+            ),
+            Ok(rpc::TaskOutcome::MutationFailedUnknown { error }) => (None, Some(error)),
+            Ok(rpc::TaskOutcome::Failed { error }) => (None, Some(error)),
             Err(_) => (None, Some("task RPC worker stopped".to_string())),
         };
         if let Some(items) = items {
@@ -895,13 +942,22 @@ impl AppState {
         outcome: Result<rpc::AgentStateOutcome, crossbeam_channel::RecvError>,
     ) {
         match outcome {
-            Ok(Ok(states)) => self.remote_agent_states = states,
+            Ok(Ok(result)) => {
+                self.remote_agent_states = result.snapshot;
+                self.daemon_list_mode = result.mode;
+                self.pending_remote_roster_names =
+                    matches!(result.mode, crate::runtime::AgentListMode::Live)
+                        .then_some(result.names);
+            }
             Ok(Err(error)) => {
                 self.remote_agent_states.clear();
-                tracing::warn!(error, "daemon agent-state snapshot unavailable");
+                self.pending_remote_roster_names = None;
+                self.daemon_list_mode = error.mode;
+                tracing::warn!(error = %error.error, "daemon agent-state snapshot unavailable");
             }
             Err(_) => {
                 self.remote_agent_states.clear();
+                self.pending_remote_roster_names = None;
                 tracing::warn!("daemon agent-state RPC worker stopped");
             }
         }
@@ -911,8 +967,6 @@ impl AppState {
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
         let AppDeps {
             home,
-            fleet_path,
-            wakeup_tx,
             attached_run_dir,
             ..
         } = *deps;
@@ -946,66 +1000,88 @@ impl AppState {
                 let (agents, mode) = crate::runtime::list_agents_with_fallback_with_mode(home);
                 self.daemon_list_mode = mode;
                 let current: std::collections::HashSet<String> = agents.into_iter().collect();
-                let to_add =
-                    remote_attach_candidates(&current, &self.known_remote_agents, |name| {
-                        self.ui.layout.agent_pane_is_disconnected(name)
-                    });
-                for name in &to_add {
-                    let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
-                    match pane_factory::create_remote_pane(
-                        name,
-                        home,
-                        fleet_path,
-                        &mut self.ui.layout,
-                        dc.saturating_sub(2),
-                        dr.saturating_sub(4),
-                        wakeup_tx,
-                    ) {
-                        Ok(pane) => {
-                            let tab_name = pane.agent_name.clone();
-                            self.known_remote_agents.insert(tab_name.to_string());
-                            // This sync is add-only: a gone agent's pane is retained
-                            // for scrollback. Reconnect that leaf in place when the
-                            // agent reappears, including inside an operator split.
-                            if self
-                                .ui
-                                .layout
-                                .reconnect_or_append_agent_pane(&tab_name, pane)
-                            {
-                                tracing::info!(
-                                    agent = %name,
-                                    "reused retained pane for re-appeared remote agent (no duplicate)"
-                                );
-                            } else {
-                                tracing::info!(
-                                    agent = %name,
-                                    "opened tab for newly-appeared remote agent"
-                                );
-                            }
-                            self.needs_resize = true;
-                        }
-                        Err(e) => tracing::warn!(
-                            agent = %name,
-                            error = %e,
-                            "remote pane attach failed during sync",
-                        ),
-                    }
-                }
-                let gone: Vec<String> = self
-                    .known_remote_agents
-                    .difference(&current)
-                    .cloned()
-                    .collect();
-                for name in &gone {
-                    tracing::warn!(
-                        agent = %name,
-                        "daemon-side agent gone; pane retained with stale output",
-                    );
-                    self.known_remote_agents.remove(name);
-                }
+                self.reconcile_remote_roster(&current, mode, deps);
                 self.last_remote_sync = std::time::Instant::now();
             }
         }
+    }
+
+    fn reconcile_remote_roster(
+        &mut self,
+        current: &std::collections::HashSet<String>,
+        mode: crate::runtime::AgentListMode,
+        deps: &AppDeps<'_>,
+    ) {
+        let AppDeps {
+            home,
+            fleet_path,
+            wakeup_tx,
+            ..
+        } = *deps;
+        let names =
+            reconcile_remote_roster_candidates(current, &self.known_remote_agents, mode, |name| {
+                self.ui.layout.agent_pane_is_disconnected(name)
+            });
+        let mut to_add: Vec<String> = names.to_add.into_iter().collect();
+        to_add.sort();
+        for name in &to_add {
+            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
+            match pane_factory::create_remote_pane(
+                name,
+                home,
+                fleet_path,
+                &mut self.ui.layout,
+                dc.saturating_sub(2),
+                dr.saturating_sub(4),
+                wakeup_tx,
+            ) {
+                Ok(pane) => {
+                    let tab_name = pane.agent_name.clone();
+                    self.known_remote_agents.insert(tab_name.to_string());
+                    // This sync is add-only: a gone agent's pane is retained
+                    // for scrollback. Reconnect that leaf in place when the
+                    // agent reappears, including inside an operator split.
+                    if self
+                        .ui
+                        .layout
+                        .reconnect_or_append_agent_pane(&tab_name, pane)
+                    {
+                        tracing::info!(
+                            agent = %name,
+                            "reused retained pane for re-appeared remote agent (no duplicate)"
+                        );
+                    } else {
+                        tracing::info!(
+                            agent = %name,
+                            "opened tab for newly-appeared remote agent"
+                        );
+                    }
+                    self.needs_resize = true;
+                }
+                Err(e) => tracing::warn!(
+                    agent = %name,
+                    error = %e,
+                    "remote pane attach failed during sync",
+                ),
+            }
+        }
+        let mut gone: Vec<String> = names.gone.into_iter().collect();
+        gone.sort();
+        for name in &gone {
+            tracing::warn!(
+                agent = %name,
+                "daemon-side agent gone; pane retained with stale output",
+            );
+            self.known_remote_agents.remove(name);
+        }
+    }
+
+    fn reconcile_pending_remote_roster(&mut self, deps: &AppDeps<'_>) {
+        let Some(names) = self.pending_remote_roster_names.take() else {
+            return;
+        };
+        self.reconcile_remote_roster(&names, crate::runtime::AgentListMode::Live, deps);
+        self.last_remote_sync = std::time::Instant::now();
     }
 
     fn request_remote_agent_state_refresh(&mut self, deps: &AppDeps<'_>) {
@@ -1023,6 +1099,7 @@ impl AppState {
     /// Per-iteration housekeeping before the select!: scratch-shell reap,
     /// pending resize, and the badge/flush sync throttles.
     pub(super) fn pre_select(&mut self, terminal: &mut DefaultTerminal, deps: &AppDeps<'_>) {
+        self.reconcile_pending_remote_roster(deps);
         self.request_remote_agent_state_refresh(deps);
         self.close_dead_scratch_shell(deps);
         self.apply_pending_resize(terminal, deps);
@@ -1140,6 +1217,31 @@ mod tests {
             assert!(fallback.to_add.is_empty());
             assert!(fallback.gone.is_empty());
         }
+    }
+
+    #[test]
+    fn agent_state_outcome_updates_mode_and_queues_only_live_names() {
+        let mut state = AppState::new();
+        state.handle_agent_state_rpc_outcome(Ok(Ok(rpc::AgentStateSnapshotResult {
+            snapshot: HashMap::new(),
+            names: HashSet::from(["live-agent".to_string()]),
+            mode: crate::runtime::AgentListMode::Live,
+        })));
+        assert_eq!(state.daemon_list_mode, crate::runtime::AgentListMode::Live);
+        assert_eq!(
+            state.pending_remote_roster_names,
+            Some(HashSet::from(["live-agent".to_string()]))
+        );
+
+        state.handle_agent_state_rpc_outcome(Ok(Err(rpc::AgentStateError {
+            error: "daemon stuck".into(),
+            mode: crate::runtime::AgentListMode::FallbackDaemonStuck,
+        })));
+        assert_eq!(
+            state.daemon_list_mode,
+            crate::runtime::AgentListMode::FallbackDaemonStuck
+        );
+        assert!(state.pending_remote_roster_names.is_none());
     }
 
     #[test]

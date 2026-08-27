@@ -412,10 +412,9 @@ fn run_app(
     trace_tty_size(size_debug, "startup-baseline");
     // restart-freeze RCA anchor: boot critical path start (pure tracing).
     let restore_start = std::time::Instant::now();
-    let (task_rpc_tx, task_rpc_rx, task_rpc_worker) =
-        rpc::spawn_task_worker(attached_run_dir.as_ref().expect("attached run dir"));
+    let (task_rpc_tx, task_rpc_rx, task_rpc_worker) = rpc::spawn_task_worker(&home);
     let (remote_state_rpc_tx, remote_state_rpc_rx, remote_state_rpc_worker) =
-        rpc::spawn_agent_state_worker(attached_run_dir.as_ref().expect("attached run dir"));
+        rpc::spawn_agent_state_worker(&home);
     let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
@@ -1142,13 +1141,31 @@ mod tests {
             metadata: std::collections::BTreeMap::new(),
         };
 
-        state.handle_task_rpc_outcome(Ok(Ok(vec![task])));
+        state.handle_task_rpc_outcome(Ok(rpc::TaskOutcome::Snapshot(vec![task])));
 
         let Overlay::Tasks { row, items, .. } = &state.ui.overlay else {
             panic!("task overlay remains open");
         };
         assert_eq!(*row, 0);
         assert_eq!(items.len(), 1);
+
+        state.handle_task_rpc_outcome(Ok(rpc::TaskOutcome::MutationAppliedRefreshFailed {
+            error: "refresh offline".into(),
+        }));
+        let Overlay::Tasks {
+            items,
+            pending,
+            notice,
+            ..
+        } = &state.ui.overlay
+        else {
+            panic!("task overlay remains open");
+        };
+        assert!(!pending);
+        assert_eq!(items.len(), 1);
+        assert!(notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("mutation applied")));
     }
 
     /// #t-84833-10: the redraw count under a wakeup flood is bounded by the FRAME

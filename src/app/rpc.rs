@@ -1,8 +1,8 @@
 //! Bounded daemon RPC used by the permanent APP thin client.
 
 use serde_json::Value;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 pub(super) type AgentStateSnapshot = HashMap<String, Option<crate::state::AgentState>>;
 
@@ -15,26 +15,62 @@ pub(super) enum TaskRequest {
     Mutate(Value),
 }
 
-pub(super) type TaskOutcome = Result<Vec<crate::tasks::Task>, String>;
+#[derive(Debug)]
+pub(super) enum TaskOutcome {
+    Snapshot(Vec<crate::tasks::Task>),
+    MutationApplied { snapshot: Vec<crate::tasks::Task> },
+    MutationAppliedRefreshFailed { error: String },
+    MutationFailedUnknown { error: String },
+    Failed { error: String },
+}
 
-pub(super) type AgentStateOutcome = Result<AgentStateSnapshot, String>;
+#[derive(Debug)]
+pub(super) struct AgentStateSnapshotResult {
+    pub(super) snapshot: AgentStateSnapshot,
+    pub(super) names: HashSet<String>,
+    pub(super) mode: crate::runtime::AgentListMode,
+}
+
+#[derive(Debug)]
+pub(super) struct AgentStateError {
+    pub(super) error: String,
+    pub(super) mode: crate::runtime::AgentListMode,
+}
+
+pub(super) type AgentStateOutcome = Result<AgentStateSnapshotResult, AgentStateError>;
 
 pub(super) fn spawn_task_worker(
-    run_dir: &Path,
+    home: &Path,
 ) -> (
     crossbeam_channel::Sender<TaskRequest>,
     crossbeam_channel::Receiver<TaskOutcome>,
     std::thread::JoinHandle<()>,
 ) {
+    spawn_task_worker_inner(home, resolve_active_run_dir, call_tool_at)
+}
+
+fn spawn_task_worker_inner<R, C>(
+    home: &Path,
+    resolver: R,
+    caller: C,
+) -> (
+    crossbeam_channel::Sender<TaskRequest>,
+    crossbeam_channel::Receiver<TaskOutcome>,
+    std::thread::JoinHandle<()>,
+)
+where
+    R: Fn(&Path) -> Option<PathBuf> + Send + Sync + 'static,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String> + Send + Sync + 'static,
+{
     let (request_tx, request_rx) = crossbeam_channel::bounded(1);
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
-    let run_dir = run_dir.to_path_buf();
+    let home = home.to_path_buf();
     // fire-and-forget: false; run_app joins the returned handle after dropping the sender.
     let worker = std::thread::Builder::new()
         .name("app-task-rpc".into())
         .spawn(move || {
             while let Ok(request) = request_rx.recv() {
-                let outcome = execute(&run_dir, request);
+                let outcome = execute_with(&home, request, &resolver, &caller);
                 if outcome_tx.send(outcome).is_err() {
                     break;
                 }
@@ -44,22 +80,62 @@ pub(super) fn spawn_task_worker(
     (request_tx, outcome_rx, worker)
 }
 
+#[cfg(test)]
+fn spawn_agent_state_worker_with_seams<R, C>(
+    home: &Path,
+    resolver: R,
+    caller: C,
+) -> (
+    crossbeam_channel::Sender<AgentStateRequest>,
+    crossbeam_channel::Receiver<AgentStateOutcome>,
+    std::thread::JoinHandle<()>,
+)
+where
+    R: Fn(&Path) -> Option<PathBuf> + Send + Sync + 'static,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String> + Send + Sync + 'static,
+{
+    spawn_agent_state_worker_inner(home, resolver, caller)
+}
+
 pub(super) fn spawn_agent_state_worker(
-    run_dir: &Path,
+    home: &Path,
 ) -> (
     crossbeam_channel::Sender<AgentStateRequest>,
     crossbeam_channel::Receiver<AgentStateOutcome>,
     std::thread::JoinHandle<()>,
 ) {
+    spawn_agent_state_worker_inner(home, resolve_active_run_dir, call_tool_at)
+}
+
+fn spawn_agent_state_worker_inner<R, C>(
+    home: &Path,
+    resolver: R,
+    caller: C,
+) -> (
+    crossbeam_channel::Sender<AgentStateRequest>,
+    crossbeam_channel::Receiver<AgentStateOutcome>,
+    std::thread::JoinHandle<()>,
+)
+where
+    R: Fn(&Path) -> Option<PathBuf> + Send + Sync + 'static,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String> + Send + Sync + 'static,
+{
     let (request_tx, request_rx) = crossbeam_channel::bounded(1);
     let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
-    let run_dir = run_dir.to_path_buf();
+    let home = home.to_path_buf();
     // fire-and-forget: false; run_app joins the returned handle after dropping the sender.
     let worker = std::thread::Builder::new()
         .name("app-agent-state-rpc".into())
         .spawn(move || {
             while let Ok(AgentStateRequest::Refresh) = request_rx.recv() {
-                if outcome_tx.send(list_instances(&run_dir)).is_err() {
+                let outcome = match resolver(&home) {
+                    Some(run_dir) => list_instances_with_caller(&run_dir, &caller),
+                    None => Err(AgentStateError {
+                        error: "no active daemon (run dir not found)".to_string(),
+                        mode: crate::runtime::AgentListMode::FallbackDaemonAbsent,
+                    }),
+                };
+                if outcome_tx.send(outcome).is_err() {
                     break;
                 }
             }
@@ -68,21 +144,67 @@ pub(super) fn spawn_agent_state_worker(
     (request_tx, outcome_rx, worker)
 }
 
-fn execute(run_dir: &Path, request: TaskRequest) -> TaskOutcome {
-    if let TaskRequest::Mutate(arguments) = request {
-        call_task(run_dir, arguments)
-            .map_err(|error| format!("task write failed or timed out; outcome unknown: {error}"))?;
+fn execute_with<R, C>(home: &Path, request: TaskRequest, resolver: &R, caller: &C) -> TaskOutcome
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let Some(run_dir) = resolver(home) else {
+        return TaskOutcome::Failed {
+            error: "no active daemon (run dir not found)".to_string(),
+        };
+    };
+    match request {
+        TaskRequest::List => match list_tasks_with_caller(&run_dir, caller) {
+            Ok(snapshot) => TaskOutcome::Snapshot(snapshot),
+            Err(error) => TaskOutcome::Failed { error },
+        },
+        TaskRequest::Mutate(arguments) => {
+            if let Err(error) = call_task_with_caller(&run_dir, arguments, caller) {
+                return TaskOutcome::MutationFailedUnknown {
+                    error: format!("task write failed or timed out; outcome unknown: {error}"),
+                };
+            }
+            match list_tasks_with_caller(&run_dir, caller) {
+                Ok(snapshot) => TaskOutcome::MutationApplied { snapshot },
+                Err(error) => TaskOutcome::MutationAppliedRefreshFailed { error },
+            }
+        }
     }
-    let result = call_task(
+}
+
+#[cfg(test)]
+fn execute_with_seams<R, C>(
+    home: &Path,
+    request: TaskRequest,
+    resolver: R,
+    caller: C,
+) -> TaskOutcome
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    execute_with(home, request, &resolver, &caller)
+}
+
+fn list_tasks_with_caller<C>(run_dir: &Path, caller: &C) -> Result<Vec<crate::tasks::Task>, String>
+where
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let result = call_task_with_caller(
         run_dir,
         serde_json::json!({"action": "list", "include_history": true, "verbose": true}),
+        caller,
     )?;
     serde_json::from_value(result["tasks"].clone())
         .map_err(|error| format!("invalid task list from daemon: {error}"))
 }
 
-fn call_task(run_dir: &Path, arguments: Value) -> Result<Value, String> {
-    call_tool(
+fn call_task_with_caller<C>(run_dir: &Path, arguments: Value, caller: &C) -> Result<Value, String>
+where
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    caller(
         run_dir,
         "task",
         arguments,
@@ -90,30 +212,65 @@ fn call_task(run_dir: &Path, arguments: Value) -> Result<Value, String> {
     )
 }
 
-pub(super) fn list_instances(run_dir: &Path) -> Result<AgentStateSnapshot, String> {
-    let result = call_tool(
+fn list_instances_with_caller<C>(
+    run_dir: &Path,
+    caller: &C,
+) -> Result<AgentStateSnapshotResult, AgentStateError>
+where
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let result = call_tool_with_caller(
         run_dir,
         "list_instances",
         serde_json::json!({}),
         std::time::Duration::from_secs(5),
-    )?;
+        caller,
+    )
+    .map_err(|error| AgentStateError {
+        error,
+        mode: mode_after_rpc_failure(run_dir),
+    })?;
     let instances = result["instances"]
         .as_array()
-        .ok_or_else(|| "invalid list_instances response: missing instances".to_string())?;
+        .ok_or_else(|| AgentStateError {
+            error: "invalid list_instances response: missing instances".to_string(),
+            mode: mode_after_rpc_failure(run_dir),
+        })?;
     let mut states = HashMap::new();
+    let mut names = HashSet::new();
     for instance in instances {
         let Some(name) = instance["name"].as_str() else {
             continue;
         };
+        names.insert(name.to_string());
         states.insert(
             name.to_string(),
             instance["agent_state"].as_str().and_then(parse_agent_state),
         );
     }
-    Ok(states)
+    Ok(AgentStateSnapshotResult {
+        snapshot: states,
+        names,
+        mode: crate::runtime::AgentListMode::Live,
+    })
 }
 
-fn call_tool(
+fn resolve_active_run_dir(home: &Path) -> Option<PathBuf> {
+    crate::daemon::find_active_run_dir(home)
+}
+
+fn mode_after_rpc_failure(run_dir: &Path) -> crate::runtime::AgentListMode {
+    if crate::daemon::read_daemon_pid(run_dir)
+        .map(crate::process::is_pid_alive)
+        .unwrap_or(false)
+    {
+        crate::runtime::AgentListMode::FallbackDaemonStuck
+    } else {
+        crate::runtime::AgentListMode::FallbackDaemonAbsent
+    }
+}
+
+fn call_tool_at(
     run_dir: &Path,
     tool: &str,
     arguments: Value,
@@ -136,6 +293,19 @@ fn call_tool(
             .unwrap_or("daemon rejected MCP tool request")
             .to_string())
     }
+}
+
+fn call_tool_with_caller<C>(
+    run_dir: &Path,
+    tool: &str,
+    arguments: Value,
+    timeout: std::time::Duration,
+    caller: &C,
+) -> Result<Value, String>
+where
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    caller(run_dir, tool, arguments, timeout)
 }
 
 fn parse_agent_state(raw: &str) -> Option<crate::state::AgentState> {
@@ -176,22 +346,32 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let resolver = {
             let resolved = Arc::clone(&resolved);
-            Arc::new(move |_home: &std::path::Path| {
-                resolved.lock().unwrap().pop_front()
-            })
+            move |_home: &std::path::Path| {
+                resolved
+                    .lock()
+                    .expect("resolver mutex not poisoned")
+                    .pop_front()
+            }
         };
         let caller = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |run_dir: &std::path::Path,
-                          _tool: &str,
-                          _arguments: Value,
-                          _timeout: std::time::Duration| {
-                calls.lock().unwrap().push(run_dir.to_path_buf());
-                let name = run_dir.file_name().unwrap().to_string_lossy().to_string();
+            move |run_dir: &std::path::Path,
+                  _tool: &str,
+                  _arguments: Value,
+                  _timeout: std::time::Duration| {
+                calls
+                    .lock()
+                    .expect("calls mutex not poisoned")
+                    .push(run_dir.to_path_buf());
+                let name = run_dir
+                    .file_name()
+                    .expect("test run directory has a name")
+                    .to_string_lossy()
+                    .to_string();
                 Ok(serde_json::json!({
                     "instances": [{"name": name, "agent_state": "idle"}]
                 }))
-            })
+            }
         };
         let (_tx, rx, worker) = super::spawn_agent_state_worker_with_seams(
             std::path::Path::new("/home"),
@@ -199,15 +379,26 @@ mod tests {
             caller,
         );
         // The seam is request-driven: no wall-clock waits or daemon required.
-        _tx.send(AgentStateRequest::Refresh).unwrap();
-        _tx.send(AgentStateRequest::Refresh).unwrap();
-        let first = rx.recv().unwrap().unwrap();
-        let second = rx.recv().unwrap().unwrap();
+        _tx.send(AgentStateRequest::Refresh)
+            .expect("state worker request channel open");
+        _tx.send(AgentStateRequest::Refresh)
+            .expect("state worker request channel open");
+        let first = rx
+            .recv()
+            .expect("state worker returned first outcome")
+            .expect("first state refresh succeeded");
+        let second = rx
+            .recv()
+            .expect("state worker returned second outcome")
+            .expect("second state refresh succeeded");
         assert!(first.snapshot.contains_key("old-generation"));
         assert!(second.snapshot.contains_key("new-generation"));
-        assert_eq!(&*calls.lock().unwrap(), &[old, new]);
+        assert_eq!(
+            &*calls.lock().expect("calls mutex not poisoned"),
+            &[old, new]
+        );
         drop(_tx);
-        worker.join().unwrap();
+        worker.join().expect("state worker joined cleanly");
     }
 
     #[test]
@@ -219,8 +410,11 @@ mod tests {
                   tool: &str,
                   _arguments: Value,
                   _timeout: std::time::Duration| {
-                calls.lock().unwrap().push(tool.to_string());
-                if calls.lock().unwrap().len() == 1 {
+                calls
+                    .lock()
+                    .expect("calls mutex not poisoned")
+                    .push(tool.to_string());
+                if calls.lock().expect("calls mutex not poisoned").len() == 1 {
                     Ok(serde_json::json!({"ok": true}))
                 } else {
                     Err("successor list unavailable".to_string())
@@ -237,13 +431,19 @@ mod tests {
             outcome,
             TaskOutcome::MutationAppliedRefreshFailed { .. }
         ));
-        assert_eq!(&*calls.lock().unwrap(), &["task", "task"]);
+        assert_eq!(
+            &*calls.lock().expect("calls mutex not poisoned"),
+            &["task", "task"]
+        );
     }
 
     #[test]
     fn app_task_rpc_uses_the_bounded_cross_process_call() {
         let source = include_str!("rpc.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source);
         assert!(production.contains("crate::api::call_at("));
         assert!(production.contains("std::time::Duration::from_secs(10)"));
     }
