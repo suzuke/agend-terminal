@@ -3699,6 +3699,25 @@ fn pty_read_loop_answers_one_static_dev_modal_frame_3333() {
 }
 
 #[test]
+fn pty_read_loop_rearms_after_repaint_preserves_dev_modal() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (modal, std::time::Duration::ZERO),
+        (b"\x1b[?25h", std::time::Duration::from_millis(25)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "a late child repaint that leaves the complete modal visible must restart the stability window instead of stranding the prompt"
+    );
+}
+
+#[test]
 fn pty_read_loop_answers_dev_modal_inside_trust_cooldown_3314() {
     let _guard = R8_DISMISS_TEST_LOCK
         .lock()

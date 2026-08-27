@@ -431,18 +431,37 @@ pub fn try_prepared_dismiss_dialog(
                 return true;
             }
             let worker_flight_key = flight_key.clone();
-            // fire-and-forget: dialog-dismiss keystroke writer is short-lived
-            // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
-            // on any exit (incl. panic), armed at thread entry below.
+            // fire-and-forget: dialog-dismiss keystroke writer is bounded by the
+            // startup eligibility window. It normally waits 300ms; complete
+            // repaints restart that stability wait inside this SAME worker. H2:
+            // in-flight slot freed by InFlightGuard on any exit (incl. panic),
+            // armed at thread entry below.
             if std::thread::Builder::new()
                 .name("dismiss-dialog".into())
                 .spawn(move || {
                     // #1886 follow-up: arm the in-flight removal as a Drop guard at
                     // thread entry so a panic / early-return still frees the slot.
                     let _guard = InFlightGuard(worker_flight_key);
-                    std::thread::sleep(std::time::Duration::from_millis(
+                    let stable_for = std::time::Duration::from_millis(
                         crate::agent::dev_modal::MIN_STABLE_MS,
-                    ));
+                    );
+                    if let Some(barrier) = barrier.as_ref() {
+                        if !barrier.wait_until_stable(
+                            stable_for,
+                            std::time::Duration::from_millis(
+                                crate::agent::dev_modal::ELIGIBILITY_EXPIRY_MS
+                                    .saturating_sub(now.0),
+                            ),
+                        ) {
+                            tracing::debug!(
+                                agent = %agent,
+                                "#3314: startup-modal stability wait cancelled"
+                            );
+                            return;
+                        }
+                    } else {
+                        std::thread::sleep(stable_for);
+                    }
                     // #3314 W3: re-check as late as we can. This closes the wide
                     // decide-then-sleep-then-write window, but a check and a
                     // syscall cannot be atomic with respect to another process's
@@ -1746,6 +1765,10 @@ WARNING: Loading development channels
     fn fallback_write_rechecks_the_barrier_3314() {
         let (writer, written) = recording_writer_3314();
         let mut gate = DevModalGate::new(true);
+        assert_eq!(
+            gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(0)),
+            GateOutcome::Schedule
+        );
         let barrier = gate.write_barrier();
         gate.note_pty_activity();
         assert_eq!(
@@ -1784,11 +1807,15 @@ WARNING: Loading development channels
         let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let generation_over = std::sync::Arc::new(AtomicBool::new(false));
         let deleted = std::sync::Arc::new(AtomicBool::new(false));
-        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+        let mut gate = crate::agent::dev_modal::DevModalGate::with_epoch(
             true,
             std::sync::Arc::clone(&epoch),
             std::sync::Arc::clone(&generation_over),
             std::sync::Arc::clone(&deleted),
+        );
+        assert_eq!(
+            gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(0)),
+            GateOutcome::Schedule
         );
         let barrier = gate.write_barrier();
         assert!(barrier.still_valid(), "valid while the generation is live");
@@ -1808,11 +1835,15 @@ WARNING: Loading development channels
         let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let generation_over = std::sync::Arc::new(AtomicBool::new(false));
         let deleted = std::sync::Arc::new(AtomicBool::new(false));
-        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+        let mut gate = crate::agent::dev_modal::DevModalGate::with_epoch(
             true,
             std::sync::Arc::clone(&epoch),
             std::sync::Arc::clone(&generation_over),
             std::sync::Arc::clone(&deleted),
+        );
+        assert_eq!(
+            gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(0)),
+            GateOutcome::Schedule
         );
         let barrier = gate.write_barrier();
         deleted.store(true, Ordering::SeqCst);

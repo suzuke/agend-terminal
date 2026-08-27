@@ -19,9 +19,10 @@
 //! Safety therefore comes from facts the daemon OWNS, not from the frame:
 //!
 //! * `armed` — this generation's argv actually carried the flag.
-//! * `epoch` — every byte writer and PTY output path bumps it; a modal candidate
-//!   is invalidated by any input or output since it was first seen. A silent
-//!   geometry change does not alter the observed frame and remains valid.
+//! * `epoch` — every byte writer and PTY output path bumps it. A complete modal
+//!   repaint re-arms the same bounded worker at the new epoch; input or output
+//!   that leaves no complete modal keeps the candidate stale and cancels it. A
+//!   silent geometry change does not alter the observed frame and remains valid.
 //! * one-shot — at most one answer per process generation, spent only on a
 //!   SUCCESSFUL enqueue, and never reset.
 //!
@@ -231,7 +232,7 @@ pub(crate) fn note_pty_output(writer: &crate::agent::PtyWriter) {
 #[derive(Clone)]
 pub(crate) struct WriteBarrier {
     epoch: Arc<AtomicU64>,
-    epoch_at_enqueue: u64,
+    candidate_epoch: Arc<AtomicU64>,
     /// This GENERATION is over — set when the read loop exits for any reason
     /// (EOF, read error, shutdown). Distinct from `deleted`: a child that simply
     /// exited is not a deleted instance, and conflating them would mislabel a
@@ -242,13 +243,40 @@ pub(crate) struct WriteBarrier {
 }
 
 impl WriteBarrier {
+    /// Wait until the latest complete-modal frame has remained untouched for
+    /// `stable_for`. Repaints restart this one worker's window; output that
+    /// removes the modal leaves `candidate_epoch` stale and cancels it.
+    pub(crate) fn wait_until_stable(
+        &self,
+        stable_for: std::time::Duration,
+        max_wait: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + max_wait;
+        let mut observed_epoch = self.epoch.load(Ordering::SeqCst);
+        loop {
+            std::thread::sleep(stable_for);
+            if self.generation_over.load(Ordering::SeqCst)
+                || self.deleted.load(Ordering::SeqCst)
+                || std::time::Instant::now() >= deadline
+            {
+                return false;
+            }
+            let current_epoch = self.epoch.load(Ordering::SeqCst);
+            if current_epoch != observed_epoch {
+                observed_epoch = current_epoch;
+                continue;
+            }
+            return self.candidate_epoch.load(Ordering::SeqCst) == current_epoch;
+        }
+    }
+
     /// May the enqueued keystroke still be written? Checked immediately before
     /// the syscall — see the W3 note in this module's docs for what it does NOT
     /// close.
     pub(crate) fn still_valid(&self) -> bool {
         !self.generation_over.load(Ordering::SeqCst)
             && !self.deleted.load(Ordering::SeqCst)
-            && self.epoch.load(Ordering::SeqCst) == self.epoch_at_enqueue
+            && self.epoch.load(Ordering::SeqCst) == self.candidate_epoch.load(Ordering::SeqCst)
     }
 }
 
@@ -366,6 +394,7 @@ pub(crate) struct DevModalGate {
     epoch: Arc<AtomicU64>,
     generation_over: Arc<std::sync::atomic::AtomicBool>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
+    candidate_epoch: Arc<AtomicU64>,
     candidate: Option<Candidate>,
 }
 
@@ -392,6 +421,7 @@ impl DevModalGate {
             epoch,
             generation_over,
             deleted,
+            candidate_epoch: Arc::new(AtomicU64::new(u64::MAX)),
             candidate: None,
         }
     }
@@ -406,7 +436,7 @@ impl DevModalGate {
     pub(crate) fn write_barrier(&self) -> WriteBarrier {
         WriteBarrier {
             epoch: Arc::clone(&self.epoch),
-            epoch_at_enqueue: self.epoch.load(Ordering::SeqCst),
+            candidate_epoch: Arc::clone(&self.candidate_epoch),
             generation_over: Arc::clone(&self.generation_over),
             deleted: Arc::clone(&self.deleted),
         }
@@ -440,10 +470,10 @@ impl DevModalGate {
             self.candidate = None;
             return GateOutcome::Refuse(Refused::NoCompleteModal);
         };
+        let current_epoch = self.epoch.load(Ordering::SeqCst);
+        self.candidate_epoch.store(current_epoch, Ordering::SeqCst);
         match self.candidate {
-            Some(prev)
-                if prev.digest == digest && prev.epoch_at == self.epoch.load(Ordering::SeqCst) =>
-            {
+            Some(prev) if prev.digest == digest && prev.epoch_at == current_epoch => {
                 if now.0.saturating_sub(prev.first_seen.0) >= MIN_STABLE_MS {
                     GateOutcome::Enqueue
                 } else {
@@ -454,7 +484,7 @@ impl DevModalGate {
                 self.candidate = Some(Candidate {
                     digest,
                     first_seen: now,
-                    epoch_at: self.epoch.load(Ordering::SeqCst),
+                    epoch_at: current_epoch,
                 });
                 GateOutcome::Schedule
             }
