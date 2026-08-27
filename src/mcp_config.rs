@@ -1895,7 +1895,7 @@ mod tests {
 
     #[test]
     fn toml_string_value_escapes_control_characters_3402() {
-        for value in ["workspace\nline", "it's\r\na workspace"] {
+        for value in ["workspace\nline", "it's\r\na workspace", "delete\u{7f}me"] {
             let rendered = toml_string_value(value);
             let parsed: toml::Value = toml::from_str(&format!("value={rendered}"))
                 .expect("control characters must remain valid TOML");
