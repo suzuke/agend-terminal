@@ -1144,8 +1144,8 @@ mod tests {
         let inbox = json!({"tool": "inbox"});
         assert_eq!(
             method_wait_timeout(method::MCP_TOOL, &inbox),
-            Duration::from_secs(5),
-            "mcp_tool(inbox) → 5s via tool_timeout"
+            Duration::from_secs(30),
+            "mcp_tool(inbox) → 30s via tool_timeout"
         );
         // Unknown method → DEFAULT_WAIT_TIMEOUT fallback
         assert_eq!(
