@@ -941,6 +941,31 @@ pub(crate) fn codex_mcp_config_args(home: &Path, instance_name: Option<&str>) ->
     codex_mcp_config_args_from(&bridge_cmd, &bridge_args, &home_path(home), instance_name)
 }
 
+/// Build the invocation-only Codex project-trust override for a managed
+/// workspace. Codex resolves project identity using the canonical filesystem
+/// path, so the argv must use that same path (not a symlink or `/tmp` alias).
+/// This changes only the child process's effective config; it never writes the
+/// operator's `$CODEX_HOME/config.toml`.
+pub(crate) fn codex_project_trust_args(workspace: &Path) -> anyhow::Result<Vec<String>> {
+    let canonical = std::fs::canonicalize(workspace).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize Codex workspace '{}' for invocation trust: {error}",
+            workspace.display()
+        )
+    })?;
+    Ok(codex_project_trust_args_from(&canonical.to_string_lossy()))
+}
+
+fn codex_project_trust_args_from(path: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        format!(
+            "projects={{{}={{trust_level='trusted'}}}}",
+            toml_string_value(path)
+        ),
+    ]
+}
+
 /// Pure core of [`codex_mcp_config_args`]: no filesystem, no process state, so
 /// the exact argv and TOML encoding are unit-testable for Windows paths,
 /// apostrophes and spaces.
@@ -1799,6 +1824,35 @@ mod tests {
         assert_eq!(
             args[3],
             r"mcp_servers.agend-terminal.args=['serve', 'C:\x']"
+        );
+    }
+
+    #[test]
+    fn codex_project_trust_override_is_valid_toml_and_preserves_windows_path_3402() {
+        let path = r"C:\Users\alice\Agend Workspace";
+        let args = codex_project_trust_args_from(path);
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                r"projects={'C:\Users\alice\Agend Workspace'={trust_level='trusted'}}"
+            ]
+        );
+        let parsed: toml::Value = toml::from_str(&args[1]).expect("valid TOML override");
+        assert_eq!(
+            parsed["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn codex_project_trust_override_escapes_apostrophe_path_3402() {
+        let path = r"C:\Users\alice\it's workspace";
+        let args = codex_project_trust_args_from(path);
+        let parsed: toml::Value = toml::from_str(&args[1]).expect("valid TOML override");
+        assert_eq!(
+            parsed["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
         );
     }
 

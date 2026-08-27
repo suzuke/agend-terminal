@@ -742,14 +742,15 @@ fn codex_remote_command_args(
     locator: &crate::transport::SessionLocator,
     args: &[String],
     spawn_mode: crate::backend::SpawnMode,
-    // #3317: per-invocation `-c` overrides registering the agend MCP bridge.
+    // #3317/#3402: per-invocation `-c` overrides for the fleet MCP bridge and
+    // canonical workspace trust.
     // Placed with the existing `check_for_update_on_startup` override — after
     // the endpoint flags, BEFORE the `resume` subcommand — because `-c` is a
     // global option on codex 0.148 and only gained a per-subcommand form later.
-    mcp_args: &[String],
+    config_args: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut enriched = crate::transport::codex_attach_args(locator)?;
-    enriched.extend(mcp_args.iter().cloned());
+    enriched.extend(config_args.iter().cloned());
     enriched.extend([
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),
@@ -844,13 +845,20 @@ fn build_command(
         _ => None,
     };
 
-    // #3317: codex ignores its project-local `.codex/config.toml` until the
-    // directory is a trusted project, so a new instance would boot with no fleet
-    // tools. Register the bridge on the child argv instead — no global write, no
-    // trust dependency. `home` is required (it is what the bridge receives as
-    // `AGEND_HOME`); an ad-hoc codex spawn without one is unchanged.
-    let codex_mcp_args: Vec<String> = match (detected_backend.as_ref(), *home) {
-        (Some(Backend::Codex), Some(h)) => crate::mcp_config::codex_mcp_config_args(h, Some(name)),
+    // #3317: register the bridge on the child argv so fleet tools do not depend
+    // on project trust. #3402: also grant the canonical managed workspace trust
+    // for this invocation so its project-local config/hooks/policies load. Both
+    // are child-only overrides; neither writes global Codex config. `home` is
+    // required (it is what the bridge receives as `AGEND_HOME`); an ad-hoc Codex
+    // spawn without one is unchanged.
+    let codex_config_args: Vec<String> = match (detected_backend.as_ref(), *home) {
+        (Some(Backend::Codex), Some(h)) => {
+            let mut config_args = crate::mcp_config::codex_mcp_config_args(h, Some(name));
+            if let Some(workspace) = *working_dir {
+                config_args.extend(crate::mcp_config::codex_project_trust_args(workspace)?);
+            }
+            config_args
+        }
         _ => Vec::new(),
     };
 
@@ -859,7 +867,7 @@ fn build_command(
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
         opencode_attach_command_args(locator, args)?
     } else if let Some(locator) = codex_locator.as_ref() {
-        codex_remote_command_args(locator, args, *spawn_mode, &codex_mcp_args)?
+        codex_remote_command_args(locator, args, *spawn_mode, &codex_config_args)?
     } else {
         let preset = detected_backend
             .as_ref()
@@ -870,9 +878,9 @@ fn build_command(
             .zip(*working_dir)
             .map(|(b, wd)| b.spawn_flags(wd))
             .unwrap_or_default();
-        // #3317: the overrides lead, so they precede the preset's own `resume`
-        // subcommand on a Resume spawn. Empty for every non-codex backend.
-        codex_mcp_args
+        // #3317/#3402: overrides lead, so they precede any Codex subcommand.
+        // Empty for every non-Codex backend.
+        codex_config_args
             .iter()
             .cloned()
             .chain(preset)

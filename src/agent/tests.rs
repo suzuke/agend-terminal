@@ -5807,6 +5807,33 @@ fn codex_invocation_project_trust_does_not_mutate_global_config_3402() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_invocation_project_trust_resolves_workspace_symlink_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-symlink", "home");
+    let alias = home.join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &alias).expect("workspace symlink");
+    let argv = codex_argv_3317(
+        &home,
+        &alias,
+        "codex-3402-symlink",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let override_arg = codex_project_override_3402(&argv);
+    assert!(
+        override_arg.contains(&canonical.to_string_lossy().to_string()),
+        "#3402: override must use symlink target; override={override_arg}"
+    );
+    assert!(
+        !override_arg.contains(&alias.to_string_lossy().to_string()),
+        "#3402: alias must not become a distinct project identity; override={override_arg}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
 /// #3317: the Codex trust-dismiss matcher must NOT exist.
 ///
 /// Measured at codex 0.149.0: the "Do you trust the contents of this
