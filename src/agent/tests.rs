@@ -3718,6 +3718,28 @@ fn pty_read_loop_rearms_after_repaint_preserves_dev_modal() {
 }
 
 #[test]
+fn pty_read_loop_holds_back_when_modal_vanishes_after_repaint() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (modal, std::time::Duration::ZERO),
+        (b"\x1b[?25h", std::time::Duration::from_millis(250)),
+        (
+            b"\x1b[2J\x1b[H$ the modal is gone\r\n",
+            std::time::Duration::from_millis(100),
+        ),
+    ]);
+
+    assert!(
+        written.lock().is_empty(),
+        "a repaint followed by the modal vanishing must not be answered"
+    );
+}
+
+#[test]
 fn pty_read_loop_answers_dev_modal_inside_trust_cooldown_3314() {
     let _guard = R8_DISMISS_TEST_LOCK
         .lock()
