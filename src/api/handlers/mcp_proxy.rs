@@ -170,12 +170,12 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
             ),
         });
     }
-    let requester_id = match (tool, ctx.capability, instance.is_empty()) {
-        (
-            "restart_daemon",
-            crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon,
-            false,
-        ) => match live_requester_id(ctx.registry, &instance) {
+    let requester_id = if tool == "restart_daemon"
+        && !instance.is_empty()
+        && (ctx.capability == crate::api::RestartCapability::App
+            || ctx.capability == crate::api::RestartCapability::Daemon)
+    {
+        match live_requester_id(ctx.registry, &instance) {
             Some(id) => Some(id),
             None => {
                 return json!({
@@ -183,8 +183,9 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
                     "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
                 })
             }
-        },
-        _ => None,
+        }
+    } else {
+        None
     };
     let timeout = tool_timeout(tool);
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
