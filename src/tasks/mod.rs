@@ -213,6 +213,9 @@ pub(crate) fn cancel_review_assignment_task(
             ))
         }
     };
+    if routed.task.status.is_terminal() {
+        return Ok(false);
+    }
     let task_id_owned = task_id.to_string();
     let target_owned = target.to_string();
     let reason_owned = reason.to_string();
