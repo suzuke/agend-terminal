@@ -164,6 +164,82 @@ fn parse_agent_state(raw: &str) -> Option<crate::state::AgentState> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn agent_state_worker_resolves_each_request_against_successor_without_sleep() {
+        let old = std::path::PathBuf::from("/run/old-generation");
+        let new = std::path::PathBuf::from("/run/new-generation");
+        let resolved = Arc::new(Mutex::new(VecDeque::from([old.clone(), new.clone()])));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let resolver = {
+            let resolved = Arc::clone(&resolved);
+            Arc::new(move |_home: &std::path::Path| {
+                resolved.lock().unwrap().pop_front()
+            })
+        };
+        let caller = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |run_dir: &std::path::Path,
+                          _tool: &str,
+                          _arguments: Value,
+                          _timeout: std::time::Duration| {
+                calls.lock().unwrap().push(run_dir.to_path_buf());
+                let name = run_dir.file_name().unwrap().to_string_lossy().to_string();
+                Ok(serde_json::json!({
+                    "instances": [{"name": name, "agent_state": "idle"}]
+                }))
+            })
+        };
+        let (_tx, rx, worker) = super::spawn_agent_state_worker_with_seams(
+            std::path::Path::new("/home"),
+            resolver,
+            caller,
+        );
+        // The seam is request-driven: no wall-clock waits or daemon required.
+        _tx.send(AgentStateRequest::Refresh).unwrap();
+        _tx.send(AgentStateRequest::Refresh).unwrap();
+        let first = rx.recv().unwrap().unwrap();
+        let second = rx.recv().unwrap().unwrap();
+        assert!(first.snapshot.contains_key("old-generation"));
+        assert!(second.snapshot.contains_key("new-generation"));
+        assert_eq!(&*calls.lock().unwrap(), &[old, new]);
+        drop(_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn mutate_applied_refresh_failed_is_distinct_and_does_not_replay_write() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let caller = {
+            let calls = Arc::clone(&calls);
+            move |_run_dir: &std::path::Path,
+                  tool: &str,
+                  _arguments: Value,
+                  _timeout: std::time::Duration| {
+                calls.lock().unwrap().push(tool.to_string());
+                if calls.lock().unwrap().len() == 1 {
+                    Ok(serde_json::json!({"ok": true}))
+                } else {
+                    Err("successor list unavailable".to_string())
+                }
+            }
+        };
+        let outcome = super::execute_with_seams(
+            std::path::Path::new("/home"),
+            TaskRequest::Mutate(serde_json::json!({"action": "update", "id": "t-1"})),
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            caller,
+        );
+        assert!(matches!(
+            outcome,
+            TaskOutcome::MutationAppliedRefreshFailed { .. }
+        ));
+        assert_eq!(&*calls.lock().unwrap(), &["task", "task"]);
+    }
+
     #[test]
     fn app_task_rpc_uses_the_bounded_cross_process_call() {
         let source = include_str!("rpc.rs");

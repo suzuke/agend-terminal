@@ -1120,6 +1120,29 @@ mod tests {
     }
 
     #[test]
+    fn only_live_snapshot_reconciles_both_add_and_gone_sets() {
+        let current = HashSet::from(["steady".to_string(), "new".to_string()]);
+        let known = HashSet::from(["steady".to_string(), "gone".to_string()]);
+
+        let live = super::reconcile_remote_roster_names(
+            &current,
+            &known,
+            crate::runtime::AgentListMode::Live,
+        );
+        assert_eq!(live.to_add, HashSet::from(["new".to_string()]));
+        assert_eq!(live.gone, HashSet::from(["gone".to_string()]));
+
+        for mode in [
+            crate::runtime::AgentListMode::FallbackDaemonStuck,
+            crate::runtime::AgentListMode::FallbackDaemonAbsent,
+        ] {
+            let fallback = super::reconcile_remote_roster_names(&current, &known, mode);
+            assert!(fallback.to_add.is_empty());
+            assert!(fallback.gone.is_empty());
+        }
+    }
+
+    #[test]
     fn closed_before_attach_reaps_unmanaged_shell_by_instance_id() {
         assert!(!closed_before_attach_registry_survives(true));
     }
