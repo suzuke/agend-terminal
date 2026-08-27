@@ -1425,14 +1425,14 @@ WARNING: Loading development channels
         assert_eq!(gen.bytes().as_slice(), b"\r");
     }
 
-    /// #3314: resize/teardown-shaped repaints after the first CR add nothing.
+    /// #3314: output/teardown-shaped activity after the first CR adds nothing.
     /// The one-shot is never reset, so there is no path back.
     #[test]
     fn repaints_after_the_first_cr_add_no_bytes_3314() {
         let mut gen = Generation3314::new("3314-repaint", true);
         assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
         for _ in 0..5 {
-            gen.note_activity(); // attach / resize / any writer
+            gen.note_activity(); // child output / any writer
             assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
         }
         assert_eq!(gen.bytes().as_slice(), b"\r");

@@ -233,6 +233,38 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// A fleet pane reaches this branch through `PaneSource::Remote`. A silent
+    /// resize changes geometry but writes no bytes, so it must not invalidate a
+    /// queued Claude development-channel confirmation. Any child repaint still
+    /// invalidates through the PTY read loop, and `TAG_DATA` still goes through
+    /// the normal write chokepoint.
+    #[test]
+    fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
+        let src = include_str!("tui_bridge.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
+        let resize_arm = prod
+            .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
+            .expect("production TAG_RESIZE arm must exist")
+            .1
+            .split_once("_ => break,")
+            .expect("TAG_RESIZE arm must end before the fallback arm")
+            .0;
+
+        assert!(
+            resize_arm.contains("pty_master.lock().resize"),
+            "TAG_RESIZE must still resize the child PTY"
+        );
+        assert!(
+            resize_arm.contains("c.vterm.resize"),
+            "TAG_RESIZE must still resize the daemon VTerm"
+        );
+        assert!(
+            !resize_arm.contains("dev_modal::") && !resize_arm.contains("note_pty_write"),
+            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
+        );
+    }
+
     /// #1617-class invariant: `serve_tui_accept_loop` must NEVER hold the
     /// global registry lock across the blocking initial-dump `write_frame`.
     /// A non-draining TUI client would otherwise pin the registry forever and
