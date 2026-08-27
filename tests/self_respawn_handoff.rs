@@ -32,6 +32,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+const PROBE_ID: &str = "11111111-1111-4111-8111-111111111111";
+const SIBLING_ID: &str = "22222222-2222-4222-8222-222222222222";
+const MISMATCH_ID: &str = "33333333-3333-4333-8333-333333333333";
+const SELF_KICK_PROBE: &str = "fresh-restart self-kick injected agent=probe";
+const SELF_KICK_SIBLING: &str = "fresh-restart self-kick injected agent=sibling";
+
 fn bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("agend-terminal")
 }
@@ -55,7 +61,7 @@ enum SuccessorFault {
 /// Boot a real daemon with self-respawn ON, NO external-supervisor env, and a
 /// single no-auth shell probe agent (fleet size 1). `fault` injects a successor
 /// failure seam for the abort-path tests.
-fn boot(home: &Path, fault: SuccessorFault) -> Child {
+fn write_test_fleet(home: &Path) {
     // Define `probe` via fleet.yaml (NOT `--agents`) so BOTH the first boot AND
     // the handoff successor resolve it IDENTICALLY to a shell agent. The
     // `--agents probe:/bin/sh` path registers a DEFAULT fleet entry (no
@@ -67,9 +73,20 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
     std::fs::create_dir_all(home).ok();
     std::fs::write(
         home.join("fleet.yaml"),
-        "instances:\n  probe:\n    backend: shell\n    command: /bin/sh\n",
+        format!(
+            "instances:\n  probe:\n    id: {PROBE_ID}\n    backend: shell\n    command: /bin/sh\n  sibling:\n    id: {SIBLING_ID}\n    backend: shell\n    command: /bin/sh\n"
+        ),
     )
     .expect("write fleet.yaml");
+}
+
+fn boot_with_handoff_env(
+    home: &Path,
+    fault: SuccessorFault,
+    requester: Option<&str>,
+    handoff: Option<&str>,
+) -> Child {
+    write_test_fleet(home);
     let mut cmd = Command::new(bin());
     cmd.env("AGEND_HOME", home)
         .env("AGEND_RESTART_HANDOFF", "1")
@@ -85,6 +102,7 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         .env_remove("XPC_SERVICE_NAME")
         .env_remove("INVOCATION_ID")
         .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .env_remove("AGEND_SUCCESSOR_REQUESTER")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN")
@@ -92,6 +110,12 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         .args(["start", "--foreground"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(requester) = requester {
+        cmd.env("AGEND_SUCCESSOR_REQUESTER", requester);
+    }
+    if let Some(handoff) = handoff {
+        cmd.env("AGEND_SUCCESSOR_HANDOFF", handoff);
+    }
     match fault {
         SuccessorFault::None => {}
         SuccessorFault::OnLaunch => {
@@ -110,6 +134,11 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         }
     }
     cmd.spawn().expect("daemon must spawn")
+}
+
+/// Boot a normal real daemon with no inherited handoff requester authority.
+fn boot(home: &Path, fault: SuccessorFault) -> Child {
+    boot_with_handoff_env(home, fault, None, None)
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -192,6 +221,43 @@ fn ls_lists_probe_within(home: &Path, budget: Duration) -> bool {
     false
 }
 
+fn daemon_log_occurrences(home: &Path, needle: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    std::fs::read_dir(home).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                if !entry.file_name().to_string_lossy().starts_with("daemon.") {
+                    return None;
+                }
+                let path = std::fs::canonicalize(entry.path()).ok()?;
+                if !seen.insert(path.clone()) {
+                    return None;
+                }
+                std::fs::read_to_string(path).ok()
+            })
+            .map(|log| log.matches(needle).count())
+            .sum()
+    })
+}
+
+fn daemon_log_occurrences_within(
+    home: &Path,
+    needle: &str,
+    minimum: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let occurrences = daemon_log_occurrences(home, needle);
+        if occurrences >= minimum {
+            return occurrences;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    daemon_log_occurrences(home, needle)
+}
+
 /// Set operator mode to Active via the real `mode` CLI (api MODE → signed
 /// operator-mode.json + immediate in-memory update). REQUIRED before triggering
 /// restart: a fresh daemon with no signed operator-mode.json locks down to
@@ -245,7 +311,7 @@ fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     // The real restart_daemon tool call.
     let req = serde_json::json!({
         "method": "mcp_tool",
-        "params": { "tool": "restart_daemon", "arguments": {} },
+        "params": { "tool": "restart_daemon", "instance": "probe", "arguments": {} },
     });
     writeln!(writer, "{req}").ok()?;
     writer.flush().ok();
@@ -281,6 +347,7 @@ fn cleanup_test_home(home: &Path) {
 /// is the brick-class fix: restart can't strand the control plane even with no
 /// supervisor to respawn the process.
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_succeeds_with_no_external_supervisor() {
     let home = std::env::temp_dir().join(format!("agend-selfrespawn-ok-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
@@ -318,6 +385,16 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
 
     // The successor's agents must be re-spawned (probe served by the new pid).
     let served = new_pid.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    let requester_kicks = if new_pid.is_some() {
+        daemon_log_occurrences_within(&home, SELF_KICK_PROBE, 1, Duration::from_secs(30))
+    } else {
+        0
+    };
+    // A duplicate scheduler should surface promptly after the first injection;
+    // allow it a bounded stabilization window before asserting exactly once.
+    std::thread::sleep(Duration::from_secs(2));
+    let requester_kicks = requester_kicks.max(daemon_log_occurrences(&home, SELF_KICK_PROBE));
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
     let single_after = active_pids(&home).len() == 1;
 
     // The original child handle is the OLD daemon (now exited 0); reap it.
@@ -331,6 +408,14 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
         served,
         "successor must re-spawn agents (probe served by new pid)"
     );
+    assert_eq!(
+        requester_kicks, 1,
+        "successor must self-kick the restart_daemon requester exactly once"
+    );
+    assert_eq!(
+        sibling_kicks, 0,
+        "successor must not self-kick a sibling of the restart requester"
+    );
     assert!(
         single_after,
         "exactly one active run dir after handoff (no double-bind / duplication)"
@@ -341,6 +426,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
 /// crash-on-launch), the predecessor must NOT shut down — the SAME pid keeps
 /// serving and `restart_daemon` reports ok:false. No brick, agents intact.
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
     let home = std::env::temp_dir().join(format!("agend-selfrespawn-fail-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
@@ -368,6 +454,8 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
     std::thread::sleep(Duration::from_secs(2));
     let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
     let still_serves = ls_lists_probe_within(&home, Duration::from_secs(10));
+    let requester_kicks = daemon_log_occurrences(&home, SELF_KICK_PROBE);
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
 
     let _ = d1.kill();
     let _ = d1.wait();
@@ -396,6 +484,86 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
         still_serves,
         "predecessor must keep serving its agents after abort"
     );
+    assert_eq!(
+        requester_kicks, 0,
+        "aborted handoff must not self-kick the requester"
+    );
+    assert_eq!(
+        sibling_kicks, 0,
+        "aborted handoff must not self-kick a sibling"
+    );
+}
+
+/// A normal cold boot must ignore an inherited requester value. Only a
+/// committed `AGEND_SUCCESSOR_HANDOFF` may authorize a post-boot resume.
+#[test]
+#[serial_test::serial(self_respawn_handoff)]
+fn cold_boot_with_stale_requester_wakes_nobody() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-selfrespawn-cold-requester-{}",
+        std::process::id()
+    ));
+    let mut daemon = boot_with_handoff_env(&home, SuccessorFault::None, Some(PROBE_ID), None);
+
+    let active = wait_for_single_active(&home, Duration::from_secs(30), pid_alive);
+    let served = active.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(2));
+    let requester_kicks = daemon_log_occurrences(&home, SELF_KICK_PROBE);
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    cleanup_test_home(&home);
+
+    assert!(
+        served,
+        "cold boot must serve its fleet before the wake assertion"
+    );
+    assert_eq!(
+        requester_kicks, 0,
+        "cold boot must not consume a stale requester"
+    );
+    assert_eq!(sibling_kicks, 0, "cold boot must not wake a sibling");
+}
+
+/// A legitimate handoff marker with a requester UUID absent from the fleet
+/// must still promote and serve, but must fail closed with zero synthetic wake.
+#[test]
+#[serial_test::serial(self_respawn_handoff)]
+fn handoff_with_mismatched_requester_wakes_nobody() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-selfrespawn-mismatch-requester-{}",
+        std::process::id()
+    ));
+    let mut daemon = boot_with_handoff_env(
+        &home,
+        SuccessorFault::None,
+        Some(MISMATCH_ID),
+        Some("999999:test-mismatch"),
+    );
+
+    let active = wait_for_single_active(&home, Duration::from_secs(30), pid_alive);
+    let served = active.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(2));
+    let requester_kicks = daemon_log_occurrences(&home, SELF_KICK_PROBE);
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    cleanup_test_home(&home);
+
+    assert!(
+        served,
+        "mismatched handoff must still promote and serve its fleet"
+    );
+    assert_eq!(
+        requester_kicks, 0,
+        "UUID mismatch must fail closed with zero wake"
+    );
+    assert_eq!(
+        sibling_kicks, 0,
+        "UUID mismatch must not redirect wake to a sibling"
+    );
 }
 
 /// #1814 FIX2 (reviewer race High): the successor passes Phase-1 (answers a
@@ -405,6 +573,7 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
 /// predecessor (SAME pid) is still the single active daemon, still serving, a
 /// while after the commit window.
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     let home = std::env::temp_dir().join(format!(
         "agend-selfrespawn-postphase1-{}",
@@ -469,6 +638,7 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
 /// brick. (`SELF_RESPAWN_SETTLE_SECS=12` widens the recheck window so the
 /// cross-process death lands inside it deterministically.)
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     let home =
         std::env::temp_dir().join(format!("agend-selfrespawn-teardown-{}", std::process::id()));
@@ -555,6 +725,7 @@ fn boot_capturing_stderr(home: &Path) -> Child {
 /// become a second daemon. (§3.9: real binaries competing for the real flock,
 /// no mock.)
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
     let home = std::env::temp_dir().join(format!("agend-1814-dualbind-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
@@ -787,6 +958,7 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
 /// Notifications remain daemon-owned, so there is no app-restart delivery gap.
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn thin_client_exit_keeps_detached_daemon_serving_3383() {
     let home = std::env::temp_dir().join(format!("agend-3383-app-exit-{}", std::process::id()));
     let mut child = boot_app_under_pty(&home);
@@ -821,6 +993,7 @@ fn thin_client_exit_keeps_detached_daemon_serving_3383() {
 /// lifecycle. The app process remains only a client throughout.
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn app_mode_restart_routes_to_detached_daemon_2453() {
     let home = std::env::temp_dir().join(format!("agend-2453-reexec-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
