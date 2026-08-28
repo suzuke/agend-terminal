@@ -96,6 +96,11 @@ fn selectors(backend: &Backend) -> &'static [SessionSelector] {
         sel("--resume", Some("-r"), SelectorValue::Optional),
         sel("--from-pr", None, SelectorValue::Optional),
         sel("--teleport", None, SelectorValue::Optional),
+        // `--session-id <uuid>  Use a specific session ID for the conversation
+        // (must be a valid UUID)`. Stored args replay on every spawn, so a fixed
+        // id names ONE transcript for the life of the instance — a fresh restart
+        // that kept it would return to that conversation.
+        sel("--session-id", None, SelectorValue::Required),
     ];
     const KIRO: &[SessionSelector] = &[
         sel("--resume", Some("-r"), SelectorValue::None),
@@ -113,6 +118,14 @@ fn selectors(backend: &Backend) -> &'static [SessionSelector] {
     const GROK: &[SessionSelector] = &[
         sel("--continue", Some("-c"), SelectorValue::None),
         sel("--resume", Some("-r"), SelectorValue::Optional),
+        // `-s, --session-id <SESSION_ID>  Use a specific session UUID for a
+        // **new** conversation (must be a valid UUID and must not already exist
+        // ...). With `--resume`/`--continue`, only valid together with
+        // `--fork-session` (names the forked session). Does not resume existing
+        // sessions`. Legal exactly once either way, and stored args replay on
+        // every spawn: kept, it names the fork that is being removed, or it
+        // re-requests a UUID the previous spawn already created.
+        sel("--session-id", Some("-s"), SelectorValue::Required),
     ];
     const NONE: &[SessionSelector] = &[];
     match backend {
@@ -150,6 +163,25 @@ fn coupled_flags(backend: &Backend) -> &'static [&'static str] {
         // `grok --help`: `--fork-session` is coupled to `--resume`/`--continue`
         // and `--restore-code` applies "when resuming".
         Backend::Grok => &["--fork-session", "--restore-code"],
+        _ => &[],
+    }
+}
+
+/// Flags whose single positional carries more than one meaning, so a fresh
+/// restart cannot decide it. Kept beside [`coupled_flags`] for the same reason:
+/// it is a property of the VALUE, not a spelling the matrix can express.
+///
+/// Both silent choices are wrong. Keeping `--cloud <session_id>` reattaches the
+/// agent to an existing cloud session on a restart that promised a new one;
+/// dropping it discards a description the operator meant to keep. Refusing by
+/// name is the only answer that neither strands nor destroys. The BARE form
+/// takes no value and creates a new cloud session, so it is not a pin.
+fn ambiguous_when_valued(backend: &Backend) -> &'static [&'static str] {
+    match backend {
+        // `claude --help`: `--cloud [description|session_id|url]  Create a cloud
+        // session with the given description, or attach to an existing one by
+        // session ID or claude.ai/code URL`.
+        Backend::ClaudeCode => &["--cloud"],
         _ => &[],
     }
 }
@@ -369,8 +401,9 @@ pub fn sanitize_for_fresh(
 ) -> Result<Vec<String>, SessionArgsError> {
     let matrix = selectors(backend);
     let coupled = coupled_flags(backend);
+    let ambiguous = ambiguous_when_valued(backend);
     let is_codex = matches!(backend, Backend::Codex);
-    if matrix.is_empty() && coupled.is_empty() && !is_codex {
+    if matrix.is_empty() && coupled.is_empty() && ambiguous.is_empty() && !is_codex {
         return Ok(args.to_vec());
     }
 
@@ -434,7 +467,10 @@ pub fn sanitize_for_fresh(
                 }
                 continue;
             }
-            if tok == "resume" {
+            // `codex --help` declares TWO session subcommands and `codex fork
+            // --help` gives `[OPTIONS] [SESSION_ID] [PROMPT]` with `--last` —
+            // the same shape as `resume`, and the same kind of pin.
+            if tok == "resume" || tok == "fork" {
                 if !subcommand_slot_open || unresolved_unknown {
                     return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
                 }
@@ -457,6 +493,26 @@ pub fn sanitize_for_fresh(
 
         if coupled.contains(&tok.as_str()) {
             deferred_coupled.push(tok.clone());
+            index += 1;
+            continue;
+        }
+
+        if let Some(flag) = ambiguous.iter().find(|f| {
+            tok == *f
+                || tok
+                    .strip_prefix(*f)
+                    .is_some_and(|rest| rest.starts_with('='))
+        }) {
+            let inline_value = tok.len() > flag.len();
+            let value_follows = args
+                .get(index + 1)
+                .filter(|_| index + 1 < boundary)
+                .is_some_and(|v| !v.is_empty() && v != "--" && !v.starts_with('-'));
+            if inline_value || value_follows {
+                return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
+            }
+            // Bare: a new cloud session, not a pin.
+            out.push(tok.clone());
             index += 1;
             continue;
         }
