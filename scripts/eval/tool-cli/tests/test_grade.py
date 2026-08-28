@@ -257,6 +257,21 @@ class FinalStateLoader(unittest.TestCase):
         self.assertEqual(state["sent_ledger"], [],
                          "agent->agent sends are not recorded in sent_ledger")
 
+    def test_fixture_fleet_yaml_is_committed_and_not_ignored(self):
+        # The repo-level .gitignore excludes every `fleet.yaml` (the operator's live
+        # one); the fixture's copy is the only source of the uuid<->name map, so an
+        # ignored, untracked fixture passes locally and fails in every fresh checkout.
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+        root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=HERE,
+                              capture_output=True, text=True, check=True).stdout.strip()
+        rel = os.path.relpath(os.path.join(SAMPLE, "fleet.yaml"), root)
+        ignored = subprocess.run(["git", "check-ignore", "-q", rel], cwd=root).returncode == 0
+        self.assertFalse(ignored, "%s is swallowed by an ignore rule" % rel)
+        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", rel], cwd=root,
+                                 capture_output=True).returncode == 0
+        self.assertTrue(tracked, "%s must be committed with the rest of the fixture" % rel)
+
     def test_missing_final_state_is_empty_not_fatal(self):
         state = grade.load_final_state("/nonexistent/final_state")
         self.assertEqual(state["inbox"], {})
