@@ -840,7 +840,10 @@ fn main() -> anyhow::Result<()> {
         Ok(cli) => cli,
         Err(error)
             if tool_requested
-                && !matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) =>
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
         {
             eprintln!("{error}");
             eprintln!("Usage: agend-terminal tool <NAME> [--action <A>] [--json <JSON|-|@FILE>] [--arg K=V]...");

@@ -155,7 +155,11 @@ fn assert_cli_envelope(requests: &[Value], tool: &str) {
 }
 
 fn assert_list_envelope(requests: &[Value]) {
-    assert_eq!(requests.len(), 1, "schema lookup must make exactly one request");
+    assert_eq!(
+        requests.len(),
+        1,
+        "schema lookup must make exactly one request"
+    );
     let request = &requests[0];
     assert_eq!(request["method"], "mcp_tools_list");
     assert_eq!(request["params"]["instance"], "red-cli");
@@ -428,13 +432,7 @@ fn schema_name_filters_live_role_filtered_tool_list() {
     let home = daemon.home.clone();
     let output = run_tool(
         &home,
-        &[
-            "tool",
-            "schema",
-            "send",
-            "--home",
-            home.to_str().unwrap(),
-        ],
+        &["tool", "schema", "send", "--home", home.to_str().unwrap()],
     );
     let requests = daemon.finish();
 
