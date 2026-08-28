@@ -1053,3 +1053,91 @@ fn malformed_session_selector_refuses_without_deleting_3414() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3414 D2 helper: a self-kick delivery the OLD session accepted but never
+/// acknowledged, recorded far enough in the past to be past the watchdog's
+/// acknowledgement window.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn seed_overdue_self_kick_receipt(home: &std::path::Path, instance: &str) {
+    let store = crate::transport::ReceiptStore::for_instance(home, instance).expect("store");
+    let mut envelope = crate::transport::DeliveryEnvelope::new(
+        instance,
+        crate::transport::SessionLocator::claude(
+            "http://127.0.0.1:1/".to_string(),
+            "dead-session".to_string(),
+            "token".to_string(),
+        ),
+        crate::transport::DeliveryKind::Notification,
+        "[AGEND-RESUME] recover your own state",
+        None,
+    );
+    envelope.self_kick = true;
+    store.record_queued(&envelope).expect("queued");
+    let mut accepted = crate::transport::DeliveryReceipt::for_state(
+        &envelope,
+        crate::transport::DeliveryState::ProtocolAccepted,
+    );
+    accepted.recorded_at = "2020-01-01T00:00:00Z".to_string();
+    store.record(accepted).expect("accepted");
+}
+
+/// #3414 RED (D2): `mode=fresh` destroys the session, so every transport
+/// delivery receipt keyed to it becomes unresolvable — the consumer that owed
+/// the acknowledgement no longer exists. Restart deletes through
+/// `delete_instance_under_guard`, whose contract is that the CALLER already
+/// owns the `DeleteFence` fronting the transport delivery cleanup; restart
+/// owned none, so the dead session's `ProtocolAccepted` self-kick survived and
+/// the watchdog escalated it to every channel as an unacknowledged delivery on
+/// an instance the operator had deliberately restarted.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_clears_dead_session_self_kick_receipt_3414() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-d2-fresh", "[]");
+    seed_overdue_self_kick_receipt(&home, "dev");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    let store = crate::transport::ReceiptStore::for_instance(&home, "dev").expect("store");
+    assert!(
+        store.pending_deliveries().expect("pending").is_empty(),
+        "#3414: a fresh restart must not leave a nonterminal receipt keyed to the session it destroyed"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::self_kick_watchdog_pass(&home, "dev").expect("watchdog"),
+        0,
+        "#3414: the watchdog must not escalate an acknowledgement the operator's fresh restart made impossible"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 D2 negative control: `mode=resume` restores the SAME session, so its
+/// receipts stay resolvable and must survive. This pins the cleanup to the
+/// fresh path rather than making restart a blanket delivery-state wipe.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn resume_restart_preserves_live_session_receipt_3414() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-d2-resume", "[]");
+    seed_overdue_self_kick_receipt(&home, "dev");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "resume", "force": true}),
+        Some(&runtime),
+    );
+
+    let store = crate::transport::ReceiptStore::for_instance(&home, "dev").expect("store");
+    assert_eq!(
+        store.pending_deliveries().expect("pending").len(),
+        1,
+        "#3414: a resume restart keeps the session, so its pending receipt must not be discarded"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
