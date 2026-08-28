@@ -234,20 +234,67 @@ fn codex_global(token: &str) -> Option<&'static CodexGlobal> {
 /// Promoting them to top level yields an argv the CLI rejects.
 const CODEX_RESUME_OWNED_FLAGS: &[&str] = &["--last", "--all", "--include-non-interactive"];
 
-/// Consume the Codex `resume` subcommand and everything it owns.
-/// Returns the index just past it, or an error when the grammar is ambiguous.
-fn codex_consume_resume(args: &[String], start: usize, boundary: usize) -> Result<usize, ()> {
+/// Consume the Codex `resume` subcommand and everything it owns, pushing the
+/// tokens that must SURVIVE into `out`.
+///
+/// The installed CLI accepts globals interspersed after the subcommand, so the
+/// scan cannot stop at the first flag: it walks the full command grammar,
+/// keeping unrelated globals (with their declared arity) and dropping
+/// resume-owned flags and resume's session-id positional.
+///
+/// Returns the index just past the resume invocation, or `Err` when the
+/// grammar cannot be resolved — a second positional is the PROMPT, and a
+/// valued global with no usable value would shift the window.
+fn codex_consume_resume(
+    args: &[String],
+    start: usize,
+    boundary: usize,
+    out: &mut Vec<String>,
+) -> Result<usize, ()> {
     let mut positionals = 0usize;
     let mut probe = start + 1;
     while probe < boundary {
         let tok = &args[probe];
+
         if CODEX_RESUME_OWNED_FLAGS.contains(&tok.as_str()) {
             probe += 1;
             continue;
         }
+
+        if let Some(global) = codex_global(tok) {
+            out.push(tok.clone());
+            probe += 1;
+            match global.arity {
+                GlobalArity::Flag => {}
+                GlobalArity::One => {
+                    let value = args
+                        .get(probe)
+                        .filter(|_| probe < boundary)
+                        .filter(|v| !v.starts_with('-'))
+                        .ok_or(())?;
+                    out.push(value.clone());
+                    probe += 1;
+                }
+                GlobalArity::Variadic => {
+                    let first = probe;
+                    while probe < boundary && !args[probe].starts_with('-') {
+                        out.push(args[probe].clone());
+                        probe += 1;
+                    }
+                    if probe == first {
+                        return Err(());
+                    }
+                }
+            }
+            continue;
+        }
+
+        // An unknown flag is grammar we did not transcribe; end the scope
+        // rather than guess what owns what.
         if tok.starts_with('-') {
             break;
         }
+
         positionals += 1;
         if positionals > 1 {
             // The second positional is the PROMPT. Dropping it loses user
@@ -263,10 +310,15 @@ fn codex_consume_resume(args: &[String], start: usize, boundary: usize) -> Resul
 /// Strip this backend's declared session selectors from `args`.
 ///
 /// Only tokens before the first bare `--` are inspected. The delimiter and
-/// everything after it are copied byte-for-byte, as are all unrelated flags.
+/// everything after it are copied byte-for-byte, as are all unrelated flags
+/// (model, config, and anything this backend does not declare as a selector).
 ///
 /// Fails closed — the caller must abandon the restart WITHOUT touching the
 /// live instance — when a selector's grammar cannot be resolved unambiguously.
+/// How many argv slots a Codex global owns, exactly as `codex --help` prints
+/// it. Typed rather than a flat name list: `-i, --image <FILE>...` is greedy
+/// and every other valued global takes exactly one, so a single shared rule
+/// would have to infer arity — the mistake this table exists to remove.
 pub fn sanitize_for_fresh(
     backend: &Backend,
     args: &[String],
@@ -325,7 +377,7 @@ pub fn sanitize_for_fresh(
                 continue;
             }
             if tok == "resume" {
-                let next = codex_consume_resume(args, index, boundary)
+                let next = codex_consume_resume(args, index, boundary, &mut out)
                     .map_err(|()| err(backend, tok, SessionArgsErrorReason::Ambiguous))?;
                 removed_selector = true;
                 index = next;
