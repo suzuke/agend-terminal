@@ -608,6 +608,35 @@ fn spawn_crossterm_event_reader() -> crossbeam_channel::Receiver<Event> {
     event_rx
 }
 
+/// How long teardown may spend joining the unmanaged-child reapers.
+///
+/// One grace window plus a small margin: `terminate_agents_parallel` gives each
+/// child `daemon::SHUTDOWN_GRACE` (2s) and reaps in parallel, so a healthy reap
+/// finishes inside that and this only bites on a child that ignores SIGTERM.
+const REAP_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_600);
+
+/// How long teardown may then spend joining the attach workers.
+const ATTACH_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// Deadlines for teardown's two join groups, from one start instant.
+///
+/// SEPARATE budgets, deliberately, rather than the single shared deadline this
+/// replaced. The reap join runs first, and with one deadline a reap that used the
+/// whole window handed the attach join an already-expired one — and
+/// `bounded_join_attach_workers` detaches on an expired deadline, so every attach
+/// worker would be abandoned. That is exactly the failure this file's reaper
+/// ownership exists to prevent, just relocated to the other group.
+///
+/// The documented total is REAP_JOIN_BUDGET + ATTACH_JOIN_BUDGET = 4.1s of
+/// worst-case join time at quit. Nothing bounds app quit below that: the only
+/// wall-clock consumers nearby are `bounded_join_attach_workers`'s own test
+/// (which injects its own deadline) and overlay's close-path assertion (which
+/// bounds CLOSE, not quit, and stays asynchronous).
+fn teardown_join_deadlines(start: std::time::Instant) -> (std::time::Instant, std::time::Instant) {
+    let reap_deadline = start + REAP_JOIN_BUDGET;
+    (reap_deadline, reap_deadline + ATTACH_JOIN_BUDGET)
+}
+
 /// #render-first phase-(b) F2: join app workers, but DETACH any that haven't
 /// finished by the shared `deadline` — a worker wedged mid-spawn (fork/exec /
 /// skills / subscribe) must not hang quit (that would move the restore freeze to
@@ -645,15 +674,15 @@ fn app_teardown(
     // this before every other teardown side effect also covers render errors.
     notification_queue::flush_pending_activity_at_teardown(home);
     session::save_session(home, layout);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let detached_reapers = bounded_join_attach_workers(reap_workers, deadline);
+    let (reap_deadline, attach_deadline) = teardown_join_deadlines(std::time::Instant::now());
+    let detached_reapers = bounded_join_attach_workers(reap_workers, reap_deadline);
     if detached_reapers > 0 {
         tracing::warn!(
             detached = detached_reapers,
             "detached unmanaged child reaper(s) still running at app quit"
         );
     }
-    let detached = bounded_join_attach_workers(attach_workers, deadline);
+    let detached = bounded_join_attach_workers(attach_workers, attach_deadline);
     if detached > 0 {
         tracing::warn!(
             detached,
