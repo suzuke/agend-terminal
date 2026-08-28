@@ -755,8 +755,18 @@ mod tests {
     /// nothing pinned the wiring.
     ///
     /// Scoped to `respawn_agent_worker`'s body so it reads the call site rather
-    /// than the file, and asserts both directions: the sanitized args are used,
-    /// and the stored args are not handed to the spawn under any spelling.
+    /// than the file: the sanitizer runs before the spawn, the spawn takes its
+    /// result, the body names no stored-args field, and nothing rebinds
+    /// `fresh_args` between the two.
+    ///
+    /// SECONDARY, and the r1 re-review is why this says so. The earlier wording
+    /// claimed the stored args could not reach the spawn "under any spelling",
+    /// which a source predicate cannot promise: an alias and a helper both
+    /// walked past it. The rebinding rule closes those two shapes, and another
+    /// spelling will eventually walk past this one too. What actually holds the
+    /// contract is `crash_respawn_spawn_argv_carries_no_session_pin_3414`, which
+    /// reads the argv the kernel saw. This guard stays because it is free and
+    /// fails at the call site, not because it is sufficient.
     #[test]
     fn crash_respawn_spawns_with_the_sanitized_args_3414() {
         let source = include_str!("crash_respawn.rs");
@@ -787,7 +797,12 @@ mod tests {
         let Some(spawn) = body.find("args: &fresh_args,") else {
             return false;
         };
-        sanitize < spawn && !body.contains("config.args")
+        // Exactly one binding: a second `let fresh_args` after the sanitizer is
+        // how both re-review bypasses reached the spawn while every literal the
+        // guard looks for stayed in place.
+        sanitize < spawn
+            && !body.contains("config.args")
+            && body.matches("let fresh_args").count() == 1
     }
 
     /// RED: a mutation that replaces the sanitizer with a clone of the stored
@@ -1390,6 +1405,101 @@ mod deleted_gate_tests_1913 {
                 .any(|pending| pending.key() == key),
             "a missing registry must not strand a Ready recovery as Pending"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The stored session pin the victim carries into its crash.
+    const VICTIM_SESSION: &str = "cb80bb9d-3613-4c0d-9097-788b1941f5db";
+
+    /// #3414 r2: what the respawned PROCESS was actually exec'd with.
+    ///
+    /// Every guard above this one reads source text, and the re-review showed
+    /// what that buys: a bypass spelled through an alias or a helper hands the
+    /// stored args to the spawn and still reads as clean. Only the argv the
+    /// kernel saw settles it.
+    ///
+    /// The victim's stored args carry both a session pin and an unrelated flag,
+    /// the real crash-respawn worker runs to a real spawn through the existing
+    /// gate seam, and the backend command is a script that records its own argv.
+    /// `--model x` must survive and neither `--resume` nor the session id may
+    /// appear — a Fresh spawn that reattaches to the session it crashed in is
+    /// the #3414 defect itself.
+    ///
+    /// Unix-only: the fixture is a shell script. The production path it drives
+    /// is platform-independent, and every source-level guard above still runs
+    /// everywhere.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(crash_respawn_gate)]
+    fn crash_respawn_spawn_argv_carries_no_session_pin_3414() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tmp_home("argv");
+        let argv_path = home.join("spawn-argv.txt");
+        let fake_backend = home.join("fake-backend.sh");
+        std::fs::write(
+            &fake_backend,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 2\n",
+                argv_path.display()
+            ),
+        )
+        .expect("write fake backend");
+        std::fs::set_permissions(&fake_backend, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake backend");
+
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        crate::agent::crash_disposition::owner_ledger()
+            .register_generation(handle.id, handle.generation);
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
+        let ctx = DaemonContext {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            ..make_ctx(Arc::clone(&reg))
+        };
+        {
+            let mut configs = ctx.configs.lock();
+            let config = configs.get_mut(VICTIM).expect("victim config");
+            config.backend = Some(crate::backend::Backend::ClaudeCode);
+            config.backend_command = fake_backend.display().to_string();
+            config.args = vec![
+                "--resume".to_string(),
+                VICTIM_SESSION.to_string(),
+                "--model".to_string(),
+                "x".to_string(),
+            ];
+        }
+        let (entered_rx, release_tx, done_rx) = worker_gate();
+
+        handle_crash_respawn(&home, VICTIM, &ctx);
+
+        entered_rx.recv().expect("respawn worker entered gate");
+        release_tx.send(()).expect("release respawn worker");
+        done_rx.recv().expect("respawn worker completed");
+
+        let recorded = std::fs::read_to_string(&argv_path).unwrap_or_else(|e| {
+            panic!("the respawn must have EXEC'd the backend and recorded its argv: {e}")
+        });
+        let argv: Vec<&str> = recorded.lines().collect();
+        let model_at = argv
+            .iter()
+            .position(|token| *token == "--model")
+            .unwrap_or_else(|| panic!("--model must survive a crash respawn; argv={argv:?}"));
+        assert_eq!(
+            argv.get(model_at + 1),
+            Some(&"x"),
+            "--model must keep its value; argv={argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--resume"),
+            "a crash respawn is Fresh: the session selector must not reach the process; argv={argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|token| token.contains(VICTIM_SESSION)),
+            "the pinned session id must not reach the process; argv={argv:?}"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 }
