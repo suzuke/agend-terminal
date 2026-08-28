@@ -1269,6 +1269,60 @@ mod tests {
         drop(keep_tx); // release the parked thread (cleanup)
     }
 
+    /// #3420 RED: a close-pane reap must be registered with app-owned teardown
+    /// state before the asynchronous termination handoff. The production close
+    /// path currently drops that JoinHandle, so this guard is expected to fail
+    /// until the minimal ownership path is implemented.
+    #[test]
+    fn close_pane_reap_is_registered_for_app_teardown_3420() {
+        let source = include_str!("mod.rs");
+        let helper_start = source
+            .find("fn kill_unmanaged_agents(")
+            .expect("unmanaged close reaper helper present");
+        let helper_end = source[helper_start..]
+            .find("\nfn kill_unmanaged_agent(")
+            .map(|end| helper_start + end)
+            .expect("single-agent helper follows plural helper");
+        let helper = &source[helper_start..helper_end];
+        assert!(
+            helper.contains("reap_workers"),
+            "close-pane reaper must receive app-owned JoinHandle storage"
+        );
+        assert!(
+            helper.contains("reap_workers.push"),
+            "close-pane reaper must register its JoinHandle before returning"
+        );
+
+        let overlay = include_str!("overlay.rs");
+        assert!(
+            overlay
+                .contains("kill_unmanaged_agents(ctx.registry, nonfleet_agents, ctx.reap_workers)"),
+            "ConfirmClose must pass the app-owned reaper collection"
+        );
+    }
+
+    /// #3420 RED: close-then-quit must drain unmanaged reapers before attach
+    /// workers under the same absolute deadline. The current teardown only
+    /// joins attach workers, so this ordering guard is expected to fail first.
+    #[test]
+    fn app_teardown_joins_reapers_before_attach_workers_3420() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn app_teardown(")
+            .expect("app_teardown present");
+        let body = &source[start..];
+        let reap = body
+            .find("bounded_join_attach_workers(reap_workers")
+            .expect("teardown must join unmanaged reaper handles");
+        let attach = body
+            .find("bounded_join_attach_workers(attach_workers")
+            .expect("teardown must join attach workers");
+        assert!(
+            reap < attach,
+            "unmanaged child reapers must join before attach workers"
+        );
+    }
+
     /// restart-freeze 真嫌#1 (t-…55279) source-scan invariant: `app_teardown`'s
     /// Owned-mode cleanup must (1) flip the shutdown flag so PTY-close handlers
     /// fast-return, then (2) tear agents down through the shared parallel core
