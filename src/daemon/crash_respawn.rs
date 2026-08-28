@@ -781,7 +781,13 @@ mod tests {
     }
 
     fn spawn_source_is_sanitized(body: &str) -> bool {
-        body.contains("args: &fresh_args,") && !body.contains("args: &config.args")
+        let Some(sanitize) = body.find("let fresh_args = match fresh_respawn_args(&config)") else {
+            return false;
+        };
+        let Some(spawn) = body.find("args: &fresh_args,") else {
+            return false;
+        };
+        sanitize < spawn && !body.contains("config.args")
     }
 
     /// RED: a mutation that replaces the sanitizer with a clone of the stored
@@ -807,23 +813,15 @@ mod tests {
     #[test]
     fn crash_respawn_production_region_makes_no_memory_claim_3415() {
         let source = include_str!("crash_respawn.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let production = source
-            .split_once(&cfg_test)
-            .map_or(source, |(before, _)| before);
-        let offenders: Vec<&str> = production
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                !trimmed.starts_with("//")
-                    && crate::agent::UNVERIFIABLE_MEMORY_CLAIMS
-                        .iter()
-                        .any(|claim| line.to_lowercase().contains(*claim))
-            })
-            .collect();
+        let production = production_source(source);
+        let offenders = memory_claim_offenders(production);
         assert!(
             production.contains("fn respawn_notice("),
             "#3415: the production slice must include the respawn notice"
+        );
+        assert!(
+            production.contains("respawn_notice(&reason)"),
+            "#3415: the production slice must include the notice call at the real write site"
         );
         assert!(
             production.contains("write_to_pty"),
@@ -832,6 +830,43 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "#3415: no daemon-authored line here may assert what the agent remembers — found: {offenders:?}"
+        );
+    }
+
+    fn production_source(source: &str) -> &str {
+        let test_module = ["\nmod ", "tests {"].concat();
+        source
+            .find(&test_module)
+            .map_or(source, |boundary| &source[..boundary])
+    }
+
+    fn memory_claim_offenders(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && crate::agent::UNVERIFIABLE_MEMORY_CLAIMS
+                        .iter()
+                        .any(|claim| line.to_lowercase().contains(*claim))
+            })
+            .collect()
+    }
+
+    /// The production slice and the scanner must catch a memory claim inserted
+    /// inline at the PTY write site, not only a bad `respawn_notice` helper.
+    #[test]
+    fn crash_respawn_guard_catches_inline_write_site_memory_claim_mutation_3415() {
+        let mutated = r#"
+            fn respawn_agent_worker() {
+                let msg = format!("Agent restarted; you have lost your in-memory context.");
+                let _ = write_to_pty(msg.as_bytes());
+            }
+        "#;
+        let offenders = memory_claim_offenders(production_source(mutated));
+        assert!(
+            !offenders.is_empty(),
+            "the production-region guard must kill an inline write-site memory-claim mutation"
         );
     }
 
