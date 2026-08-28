@@ -1355,11 +1355,19 @@ mod tests {
         let home = tmp_home("close_then_quit_3420");
         let id = crate::types::InstanceId::new();
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry
-            .lock()
-            .insert(id, crate::agent::mk_test_handle("scratch-3420", id));
+        registry.lock().insert(
+            id,
+            crate::agent::mk_sigterm_immune_test_handle("scratch-3420", id),
+        );
         let child = Arc::clone(&registry.lock().get(&id).expect("fixture registered").child);
         let mut reap_workers = Vec::new();
+
+        // Let the shell install its signal traps before anything signals it. The
+        // reaper fires stage-1 SIGTERM within a millisecond of the close, and a
+        // signal that lands mid-exec takes the DEFAULT action — the trap has not
+        // been installed yet. A real pane has always been running for a while by
+        // the time the operator closes it.
+        std::thread::sleep(std::time::Duration::from_millis(250));
 
         kill_unmanaged_agents(&registry, [id], &mut reap_workers);
         assert_eq!(

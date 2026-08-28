@@ -3154,6 +3154,52 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
 /// construct the same minimal live handle.
 #[cfg(test)]
 pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
+    #[cfg(not(target_os = "windows"))]
+    let cmd = CommandBuilder::new("true");
+    #[cfg(target_os = "windows")]
+    let cmd = {
+        let mut c = CommandBuilder::new("cmd");
+        c.args(["/c", "findstr", ".*"]);
+        c
+    };
+    mk_test_handle_over(name, id, cmd, "true")
+}
+
+/// #3420: an `AgentHandle` whose child stays alive until something SIGKILLs it.
+///
+/// A test that asserts a child was reaped BEFORE some call returned cannot use
+/// [`mk_test_handle`]: its `true` child exits on its own within milliseconds, so
+/// the closing `try_wait` reports `Ok(Some(_))` even when nothing waited for the
+/// reaper. This child ignores SIGTERM instead, so it survives
+/// `terminate_agents_parallel`'s stage-1 signal AND its whole `SHUTDOWN_GRACE`
+/// window; only the post-grace SIGKILL ends it. Being dead afterwards is then
+/// evidence that the caller waited.
+///
+/// `trap "" TERM HUP` installs SIG_IGN, which no later signal can clear. HUP is
+/// as load-bearing as TERM here: the close path drops the `AgentHandle` — and
+/// with it the PTY master — before the reaper runs, and closing the controlling
+/// terminal SIGHUPs the session. Trapping only TERM leaves the child dying to
+/// that hangup instead, which is the same vacuity in a new costume. The inner
+/// `sleep` is a separate process without the trap, so it dies to the group
+/// signal and the loop simply restarts it, leaving the shell reachable only by
+/// SIGKILL.
+#[cfg(all(test, unix))]
+pub(crate) fn mk_sigterm_immune_test_handle(
+    name: &str,
+    id: crate::types::InstanceId,
+) -> AgentHandle {
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.args(["-c", "trap \"\" TERM HUP; while :; do sleep 300; done"]);
+    mk_test_handle_over(name, id, cmd, "sh")
+}
+
+#[cfg(test)]
+fn mk_test_handle_over(
+    name: &str,
+    id: crate::types::InstanceId,
+    mut cmd: CommandBuilder,
+    backend_command: &str,
+) -> AgentHandle {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -3162,14 +3208,6 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
             pixel_height: 0,
         })
         .expect("openpty");
-    #[cfg(not(target_os = "windows"))]
-    let mut cmd = CommandBuilder::new("true");
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = CommandBuilder::new("cmd");
-        c.args(["/c", "findstr", ".*"]);
-        c
-    };
     cmd.cwd(std::env::temp_dir());
     let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
     drop(pair.slave);
@@ -3189,7 +3227,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         id,
         name: name.to_string().into(),
         declared_backend: None,
-        backend_command: "true".to_string(),
+        backend_command: backend_command.to_string(),
         pty_writer,
         pty_master,
         core,
