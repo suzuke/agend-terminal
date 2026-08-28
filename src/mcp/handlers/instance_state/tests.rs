@@ -1031,3 +1031,83 @@ fn create_instance_logs_persisted_provenance_3418() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// RAII cleanup for the `SPAWN_OVERRIDE` test seam. The positive test above
+/// clears the override before its assertions, so it cannot leak; the negative
+/// test below asserts on absence and would leak the override into every later
+/// test in this binary if an assertion panicked first.
+struct SpawnOverrideGuard;
+
+impl Drop for SpawnOverrideGuard {
+    fn drop(&mut self) {
+        *crate::mcp::handlers::instance_state::spawn::SPAWN_OVERRIDE.lock() = None;
+    }
+}
+
+/// #3418 negative direction: the success marker must NOT be emitted when the
+/// create does not survive. A failed SPAWN calls `rollback_fleet_entry_on_failure`
+/// (spawn.rs:457) and removes the entry again, so a log claiming persistence
+/// would be asserting a state that was undone — the same unverified-assertion
+/// class as #3415. This pins the placement decision itself: move the
+/// `tracing::info!` up to the `add_instance_to_yaml` boundary and this fails.
+///
+/// Uses the same `SPAWN_OVERRIDE` seam as the positive test, returning
+/// `ok:false` so the real rollback arm runs rather than a synthetic one.
+#[test]
+#[tracing_test::traced_test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_logs_no_provenance_when_rolled_back_3418() {
+    use crate::mcp::handlers::instance_state::spawn::SPAWN_OVERRIDE;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("3418-rollback");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    fn spawn_refused(
+        _: &std::path::Path,
+        _: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({"ok": false, "error": "spawn refused (3418 negative path)"}))
+    }
+    *SPAWN_OVERRIDE.lock() = Some((home.clone(), spawn_refused));
+    let _override_cleanup = SpawnOverrideGuard;
+
+    let result = handle_create_instance(
+        &home,
+        &serde_json::json!({
+            "name": "rolled-3418",
+            "backend": "claude",
+            "args": "--resume ffffffff-0000-0000-0000-000000000000",
+            "topic_binding": "skip"
+        }),
+        "creator-3418-neg",
+        Some(&runtime),
+    );
+
+    assert!(
+        result["error"].is_string(),
+        "precondition: a refused SPAWN must surface an error, got {result}"
+    );
+
+    // The entry must be GONE — this is what makes the log-absence assertion
+    // meaningful rather than vacuous.
+    let entry_present = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .map(|fleet| fleet.instances.contains_key("rolled-3418"))
+        .unwrap_or(false);
+    assert!(
+        !entry_present,
+        "precondition: a refused SPAWN must roll the fleet.yaml entry back"
+    );
+
+    assert!(
+        !logs_contain("create_instance persisted"),
+        "#3418: the success marker must NOT be emitted for a create that was \
+         rolled back — logging provenance for an entry that no longer exists is \
+         the #3415 unverified-assertion class"
+    );
+    assert!(
+        !logs_contain("caller=creator-3418-neg"),
+        "#3418: no provenance fields may leak from the rolled-back create"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
