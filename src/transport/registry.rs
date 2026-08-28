@@ -381,12 +381,12 @@ pub(crate) fn codex_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<
 /// `session_id` and keeps `endpoint_url` / `username` / `password` / `model`.
 /// With no session id the resident adapter's `POST /session` creates a new one.
 pub(crate) fn opencode_locator_for_spawn(
-    locator: SessionLocator,
+    mut locator: SessionLocator,
     spawn_mode: crate::backend::SpawnMode,
 ) -> SessionLocator {
-    // RED baseline: today the locator is reused verbatim, so a fresh restart
-    // silently reattaches to the previous OpenCode session.
-    let _ = spawn_mode;
+    if spawn_mode == crate::backend::SpawnMode::Fresh {
+        locator.session_id = None;
+    }
     locator
 }
 
@@ -395,13 +395,17 @@ pub(crate) fn prepare_opencode_tui_session(
     instance: &str,
     working_dir: Option<&Path>,
     args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
 ) -> anyhow::Result<SessionLocator> {
-    let mut locator = locator_for_instance(
-        home,
-        instance,
-        Some(&Backend::OpenCode),
-        TransportMode::NativeShared,
-    )?;
+    let mut locator = opencode_locator_for_spawn(
+        locator_for_instance(
+            home,
+            instance,
+            Some(&Backend::OpenCode),
+            TransportMode::NativeShared,
+        )?,
+        spawn_mode,
+    );
     if let Some(model) = parse_opencode_model_args(args)?.model {
         locator.model = Some(model);
     }

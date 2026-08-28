@@ -1351,7 +1351,13 @@ pub(crate) fn spawn_agent_with_capture_home(
         .is_some_and(|backend| matches!(backend, Backend::OpenCode));
     if is_opencode {
         if let Some(home_path) = *home {
-            crate::transport::prepare_opencode_tui_session(home_path, name, *working_dir, args)?;
+            crate::transport::prepare_opencode_tui_session(
+                home_path,
+                name,
+                *working_dir,
+                args,
+                *spawn_mode,
+            )?;
         }
     }
     let is_codex = Backend::from_command(backend_command)
