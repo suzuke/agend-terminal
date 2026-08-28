@@ -110,7 +110,13 @@ REQUIRED_META = (
     ("exit_code", _is_int),
     ("turns", _is_int),
     ("timed_out", lambda v: isinstance(v, bool)),
+    ("invalid_reason", lambda v: v is None or isinstance(v, str)),
 )
+
+#: The fields that say WHICH experiment a run belongs to.
+IDENTITY_FIELDS = ("git_head", "binary_sha256", "model_requested", "model_resolved",
+                   "fleet_sha256", "claude_version", "seed_sha256", "prompt_sha256",
+                   "system_prompt_sha256")
 
 
 def frozen_order(pair, arm):
@@ -877,6 +883,7 @@ def grade_run(run_dir, scenarios_dir=None):
         "pair": meta.get("pair"),
         "invalid": False,
         "invalid_reason": None,
+        "identity": {field: meta.get(field) for field in IDENTITY_FIELDS},
         "run_dir": os.path.abspath(run_dir),
     }
 
@@ -1091,17 +1098,43 @@ def aggregate(runs_dir, scenarios_dir=None):
             plan_flags.append("manifest_incomplete")
             manifest = None
     if manifest is not None:
-        rows = manifest.get("plan")
-        declared = None
-        if isinstance(rows, list):
-            declared = [(row.get("scenario"), row.get("pair"), row.get("arm"),
-                         row.get("order_in_pair"), row.get("dir"))
-                        for row in rows if isinstance(row, dict)]
-        expected = [(scenario, pair, arm, frozen_order(pair, arm),
-                     "%s/pair-%02d/%s" % (scenario, pair, arm))
+        # The rows are compared RAW: a junk row used to be filtered out before the
+        # comparison, so 210 good rows plus one were still 210 (#3412 A\u2075 review).
+        expected = [{"scenario": scenario, "pair": pair, "arm": arm,
+                     "order_in_pair": frozen_order(pair, arm),
+                     "dir": "%s/pair-%02d/%s" % (scenario, pair, arm)}
                     for (scenario, pair, arm) in FROZEN_PLAN]
-        if declared != expected or manifest.get("total_runs") != len(FROZEN_PLAN):
+        if manifest.get("plan") != expected:
             plan_flags.append("manifest_plan_mismatch")
+        # Present is not the same as right.
+        if (manifest.get("model") != FROZEN_MODEL
+                or not _is_str(manifest.get("git_head"))
+                or not isinstance(manifest.get("binary_sha256"), dict)
+                or not isinstance(manifest.get("prompt_sha256"), dict)
+                or manifest.get("total_runs") != len(FROZEN_PLAN)):
+            plan_flags.append("manifest_identity_invalid")
+        # Every run must be a run OF the experiment the manifest describes.
+        if any(g["identity"].get("git_head") != manifest.get("git_head")
+               or g["identity"].get("binary_sha256") != manifest.get("binary_sha256")
+               or g["identity"].get("model_requested") != manifest.get("model")
+               or g["identity"].get("model_resolved") != manifest.get("model")
+               for g in valid):
+            plan_flags.append("manifest_identity_mismatch")
+
+    # One experiment, not several: fleet and CLI version are matrix-wide, seed and
+    # prompt are per scenario, the system prompt is per arm. A split in any of
+    # them means the runs came from more than one setup.
+    scoped = collections.defaultdict(set)
+    for g in valid:
+        identity = g["identity"]
+        for field in ("fleet_sha256", "claude_version"):
+            scoped[("matrix", field)].add(json.dumps(identity.get(field)))
+        for field in ("seed_sha256", "prompt_sha256"):
+            scoped[(g["scenario"], field)].add(json.dumps(identity.get(field)))
+        scoped[((g["scenario"], g["arm"]), "system_prompt_sha256")].add(
+            json.dumps(identity.get("system_prompt_sha256")))
+    if any(len(values) > 1 for values in scoped.values()):
+        plan_flags.append("run_identity_split")
     missing_cells = sorted(FROZEN_PLAN_CELLS - observed_cells, key=str)
     unexpected_cells = sorted(observed_cells - FROZEN_PLAN_CELLS, key=str)
     plan_gate = {

@@ -46,23 +46,25 @@ pilot_safety reads False. The old tree fails on exactly the disagreement this
 round removes, not on anything it measured.
 
 Fixing all of it changed frozen files, so grade.py is now
-62e219d47b6aa3f7ee6c8f0e9d9e5dcde4d28a4b8b506486206dd43a714497cf and matrix.sh is
-c7d3c0d5bb876e447dd97ab9c0ee806d38613abb6b82d687f10ddf191fbb5ab4; this harness is a NEW commit A'.
+d86632cb44296c4b1e7b53d88c3c3dc34c37ecf3b60c6bd3bd6ada9444310f3a and matrix.sh is
+d922a6a34e329a4a72dca78c53f7d5eaa2dd996345676f3539ca61cd4a2bc829; this harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
 edits after commit A — if one is needed, the matrix restarts from zero under a
 new commit A'." These results therefore do NOT carry forward as results under the
 current freeze. They stand as the record of what was run under the old one.
 
-Measured, not assumed: re-grading the surviving E2 raw tree with the FIXED grader
-reproduces runs/E2-20260828T090026Z/summary.json in every value it already had —
-the only difference is the `plan_gate` key the third round added, which PASSES on
-that tree (210 cells, none missing, none unexpected, none duplicated, and its
-manifest's plan equal to the frozen one in order). report.py is deliberately
-unchanged, so the two reports below still re-render byte for byte from the
-summaries they were made from; the plan gate lives in summary.json only, and
-putting it in the renderer would break exactly that property. So the fixes are
-result-invariant on the data that still exists — evidence about what a re-run
+Measured, not assumed: re-grading the surviving E2 raw tree reproduces every
+MEASUREMENT runs/E2-20260828T090026Z/summary.json already had — 210 valid runs,
+N=60, b=c=0, and the rate, critical and mixing gates all still passing. What it no
+longer reproduces is the overall verdict: the `plan_gate` added later flags
+manifest_plan_mismatch on that tree, because its manifest still says
+order_in_pair "only" on the 90 control rows. Correcting ONLY those 90 fields in a
+copy — no run, no stream, no measurement touched — puts every gate back to green.
+report.py is deliberately unchanged, so the two reports below still re-render byte
+for byte from the summaries they were made from; the plan gate lives in
+summary.json only, and putting it in the renderer would break exactly that
+property. So the fixes are measurement-invariant on the data that still exists — evidence about what a re-run
 would be expected to show, not a substitute for the re-run SPEC section 6
 requires. E1 (20260828T063955Z) cannot be re-graded at all: its raw run tree was
 in a worktree that has since been released.
