@@ -927,3 +927,82 @@ mod codex_interspersed_globals_3414 {
         );
     }
 }
+
+/// Fourth supplemental RED (lead review of the interspersed-global GREEN).
+/// Four remaining holes, all of which turn an unresolvable argv into a
+/// DIFFERENT valid one — the exact failure this pre-delete contract exists to
+/// prevent, because by the time the child is spawned the old instance is gone.
+#[cfg(test)]
+mod codex_position_and_equals_3414 {
+    use super::tests_support::*;
+    use super::*;
+
+    /// Installed CLI accepts the equals form inside the subcommand:
+    /// `codex resume --model=gpt sess` reaches the CODEX_HOME lookup.
+    /// `codex_global()` matched exact tokens only, so `--model=gpt` ended the
+    /// scan and BOTH it and `sess` were preserved — promoting the session id to
+    /// a fresh-session prompt.
+    #[test]
+    fn codex_equals_global_inside_resume_scope_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--model=gpt", "sess"]),
+            v(&["--model=gpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--config=k=v", "--last"]),
+            v(&["--config=k=v"])
+        );
+    }
+
+    /// An unknown flag INSIDE the resume scope must fail closed. Breaking out
+    /// and letting the outer loop preserve what follows is itself a guess: the
+    /// tokens after it may be that flag's values or resume's positionals, and
+    /// picking either rewrites the argv.
+    #[test]
+    fn codex_unknown_flag_inside_resume_fails_closed_3414() {
+        assert_eq!(
+            reason(Backend::Codex, &["resume", "--unknown-thing", "sess"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        assert_eq!(
+            reason(Backend::Codex, &["resume", "sess", "--unknown-thing"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+    }
+
+    /// The same ambiguity exists BEFORE the subcommand: with an unknown flag in
+    /// front, `resume` may be that flag's VALUE or the subcommand, and nothing
+    /// in the transcribed grammar decides it.
+    #[test]
+    fn codex_unknown_flag_before_resume_fails_closed_3414() {
+        assert_eq!(
+            reason(Backend::Codex, &["--future-global", "resume"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        // With no `resume` anywhere there is nothing to resolve, so an unknown
+        // flag is simply preserved — fail-closed applies to the decision, not
+        // to every unfamiliar token.
+        assert_eq!(
+            ok(Backend::Codex, &["--future-global", "x"]),
+            v(&["--future-global", "x"])
+        );
+    }
+
+    /// `resume` is a subcommand only at the first non-global command position.
+    /// After an ordinary positional the slot is taken, so a later literal
+    /// `resume` is an argument — stripping it converted an ambiguous argv into
+    /// a different, valid fresh prompt.
+    #[test]
+    fn codex_resume_after_a_positional_is_not_the_subcommand_3414() {
+        assert_eq!(
+            reason(Backend::Codex, &["existing-prompt", "resume"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        // Still the subcommand when the slot is genuinely open, including
+        // after globals that own their values.
+        assert_eq!(
+            ok(Backend::Codex, &["--model", "gpt", "resume", "sess"]),
+            v(&["--model", "gpt"])
+        );
+    }
+}
