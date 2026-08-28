@@ -1322,10 +1322,12 @@ mod tests {
         drop(keep_tx); // release the parked thread (cleanup)
     }
 
-    /// #3420 RED: a close-pane reap must be registered with app-owned teardown
-    /// state before the asynchronous termination handoff. The production close
-    /// path currently drops that JoinHandle, so this guard is expected to fail
-    /// until the minimal ownership path is implemented.
+    /// #3420: a close-pane reap is registered with app-owned teardown state
+    /// SYNCHRONOUSLY, before the off-thread termination runs —
+    /// `kill_unmanaged_agents` pushes the reaper's `JoinHandle` into
+    /// `reap_workers` on the close path, so close-then-quit cannot abandon the
+    /// child. Written RED while the close path still dropped that handle; it now
+    /// pins the shipped ownership.
     #[test]
     fn close_pane_reap_is_registered_for_app_teardown_3420() {
         let source = include_str!("mod.rs");
@@ -1402,21 +1404,16 @@ mod tests {
         );
     }
 
-    /// RED: the two wiring guards below slice `app_teardown` to the END OF FILE,
-    /// so their searched needles are also present in this test module's own
-    /// source. A guard that can be satisfied by its own text is not reading the
-    /// production it claims to pin: delete the production call it looks for and
-    /// the assertion still finds the string, in the test that was written to
-    /// catch exactly that deletion.
-    ///
-    /// The slice must stop where `app_teardown` does. Asserted here on the exact
-    /// expression the guards use today, so this fails until the slice is bounded.
     /// The production body of `app_teardown`, and nothing after it.
     ///
     /// `app_teardown` is the last production item before
     /// `fn is_text_composing_input`, so that is where the slice ends. Reading to
-    /// EOF instead pulls this whole test module in, and every needle below then
-    /// matches its own source.
+    /// EOF instead would pull this whole test module in, and every needle below
+    /// would then match its own source — a guard that can be satisfied by its
+    /// own text is not reading the production it claims to pin. The two wiring
+    /// guards below slice through this helper for that reason, and
+    /// `teardown_wiring_guards_must_not_read_their_own_source_3420` (written RED
+    /// against the earlier end-of-file slice) keeps the bound honest.
     fn teardown_production_body(source: &str) -> &str {
         let start = source
             .find("fn app_teardown(")
@@ -1468,9 +1465,11 @@ mod tests {
         );
     }
 
-    /// #3420 RED: close-then-quit must drain unmanaged reapers before attach
-    /// workers under the same absolute deadline. The current teardown only
-    /// joins attach workers, so this ordering guard is expected to fail first.
+    /// #3420: close-then-quit drains unmanaged reapers BEFORE attach workers,
+    /// each group against its own deadline (`teardown_join_deadlines`). Written
+    /// RED while teardown joined only attach workers; it now pins the shipped
+    /// order, and `teardown_joins_each_group_against_its_own_deadline_3420` pins
+    /// the budgets.
     #[test]
     fn app_teardown_joins_reapers_before_attach_workers_3420() {
         let source = include_str!("mod.rs");
