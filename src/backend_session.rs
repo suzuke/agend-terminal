@@ -1096,3 +1096,82 @@ mod codex_empty_equals_3414 {
         );
     }
 }
+
+/// Sixth supplemental RED. The equals helper only recognised the LONG form, so
+/// every short inline spelling was treated as untranscribed grammar — which
+/// poisons the later `resume` decision and refuses a legal restart.
+///
+/// All of these parse on the installed binary (each reaches the CODEX_HOME
+/// runtime error, and the trailing `--last` is accepted, which proves `resume`
+/// really is the subcommand — the inline value already satisfied the global):
+///
+/// ```text
+/// codex -m=gpt  resume sess --last      codex -mgpt   resume sess --last
+/// codex -c=k=v  resume sess --last      codex -ck=v   resume sess --last
+/// codex -i=a.png resume sess --last     codex -ia.png resume sess --last
+/// codex -m=     resume sess
+/// ```
+#[cfg(test)]
+mod codex_short_inline_globals_3414 {
+    use super::tests_support::*;
+    use super::*;
+
+    #[test]
+    fn codex_short_equals_globals_are_inline_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["-m=gpt", "resume", "sess"]),
+            v(&["-m=gpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["-c=k=v", "resume", "sess"]),
+            v(&["-c=k=v"])
+        );
+        // Empty short equals is accepted by the CLI, same as the long form.
+        assert_eq!(ok(Backend::Codex, &["-m=", "resume", "sess"]), v(&["-m="]));
+    }
+
+    /// Glued short values carry no `=` at all.
+    #[test]
+    fn codex_glued_short_globals_are_inline_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["-mgpt", "resume", "sess"]),
+            v(&["-mgpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["-ck=v", "resume", "sess"]),
+            v(&["-ck=v"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["-C/tmp", "resume", "sess"]),
+            v(&["-C/tmp"])
+        );
+    }
+
+    /// An inline value already satisfies the variadic `<FILE>...`, so it must
+    /// NOT greedily consume what follows — `--last` being accepted after
+    /// `resume sess` proves the CLI reaches the subcommand.
+    #[test]
+    fn codex_inline_variadic_does_not_swallow_the_subcommand_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["-i=a.png", "resume", "sess"]),
+            v(&["-i=a.png"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["-ia.png", "resume", "sess"]),
+            v(&["-ia.png"])
+        );
+    }
+
+    /// Same recognition inside the resume scope.
+    #[test]
+    fn codex_short_inline_globals_inside_resume_scope_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "-m=gpt", "sess"]),
+            v(&["-m=gpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "-mgpt", "sess", "--last"]),
+            v(&["-mgpt"])
+        );
+    }
+}
