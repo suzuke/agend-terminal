@@ -238,8 +238,9 @@ pub(crate) struct GoverningDecision {
 }
 
 /// Resolve one exact decision as an active, unsuperseded leaf. The entire
-/// decision directory is scanned so malformed/newer records or multiple
-/// reverse `supersedes` links cannot be hidden by the normal list path.
+/// decision directory is scanned so malformed/newer records, records filed
+/// under a name that is not their id, or multiple reverse `supersedes` links
+/// cannot be hidden by the normal list path.
 pub(crate) fn resolve_governing_decision(
     home: &Path,
     id: &str,
@@ -279,6 +280,19 @@ pub(crate) fn resolve_governing_decision(
             .map_err(|e| anyhow::anyhow!("decision record '{}' is corrupt: {e}", path.display()))?;
         if decision.schema_version > SCHEMA_VERSION {
             anyhow::bail!("decision record '{}' uses a newer schema", path.display())
+        }
+        // Every record must live under its own id. A record filed under another
+        // name is the tamper shape this scan exists to expose: it can claim the
+        // resolved id (or any other) while the normal by-id path never sees it.
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if decision.id != stem {
+            anyhow::bail!(
+                "decision record '{}' has mismatched record identity",
+                path.display()
+            )
         }
         if decision.supersedes.as_deref() == Some(id) {
             reverse.push(decision);
