@@ -311,7 +311,7 @@ fn handle_mcp_tool_counted(
                 timeout_response(tool, action.as_deref(), timeout, key)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                json!({"ok": false, "error": format!("tool '{tool}' thread panicked")})
+                json!({"ok": false, "status": "handler_errored", "error": format!("tool '{tool}' thread panicked")})
             }
         },
         Err(e) => {
