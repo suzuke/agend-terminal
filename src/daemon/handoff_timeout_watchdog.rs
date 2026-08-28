@@ -1375,6 +1375,8 @@ mod tests {
                 owner: None,
                 depends_on: Vec::new(),
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
                 branch: None,
                 due_at: None,
                 routed_to: None,

@@ -90,10 +90,6 @@ pub(super) fn create_with_supersession(
     let typed_predecessor = crate::task_events::TaskId(predecessor_id.to_string());
     let typed_successor = crate::task_events::TaskId(successor_id.to_string());
     let plan_reason = args["plan_ack_reason"].as_str().unwrap_or("").to_string();
-    let review_class = args["review_class"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
     let append = crate::task_events::append_batch_computed_at(&board, emitter, |state| {
         let Some(current) = state.tasks.get(&typed_predecessor) else {
             return Err(format!(
@@ -132,14 +128,6 @@ pub(super) fn create_with_supersession(
                 by: emitter.clone(),
                 key: "plan_ack_reason".to_string(),
                 value: serde_json::json!(plan_reason),
-            });
-        }
-        if let Some(review_class) = review_class {
-            events.push(crate::task_events::TaskEvent::MetadataSet {
-                task_id: typed_successor.clone(),
-                by: emitter.clone(),
-                key: "review_class".to_string(),
-                value: serde_json::json!(review_class),
             });
         }
         events.push(crate::task_events::TaskEvent::Superseded {

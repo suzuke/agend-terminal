@@ -68,6 +68,7 @@ pub(crate) fn def_send() -> Value {
             "second_reviewer": {"type": "boolean", "description": "Signal dual review (§3.5)"},
             "second_reviewer_reason": {"type": "string"},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: durable review threshold for a PR-producing (branch) dispatch — `single` (§3.6, one VERIFIED) or `dual` (§3.5, two distinct VERIFIED). Fail-closed AUTHORITY: a merge-authority (branch) dispatch is REJECTED unless the referenced or auto-created task carries a resolvable review_class. On an auto-create dispatch (empty task_id) this value seeds the created task's metadata; when task_id references an existing task, that task's review_class metadata is the authority and must not be contradicted (second_reviewer=true is consistency-evidence only: single+true is a mismatch → reject)."},
+            "governing_decision_id": {"type": "string", "description": "#3419: exact active unsuperseded leaf decision governing the auto-created task; creation resolves and persists its typed review authority atomically."},
             "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: number of distinct non-assignee acks a plan (set via `task action=metadata_set metadata_key=plan`) needs before the task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior. Only meaningful when this send auto-creates a task (empty task_id) — forwarded into that task's create; ignored when task_id references an existing task."},
             "plan_ack_reason": {"type": "string", "description": "Required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
             "review_assignment": {"type": "boolean", "description": "t-…-17/task66: mark this dispatch a DURABLE typed reviewer assignment (fail-closed). Requires explicit task_id, branch, nonzero pr_number, and exact full reviewed_head matching current PR state. Authority = the sole current orchestrator of the exactly-one owning team; the reviewer target must differ from review_author."},
@@ -235,6 +236,7 @@ pub(crate) fn def_decision() -> Value {
             "action": {"type": "string", "enum": ["post", "list", "update", "answer", "archive_batch"]},
             "title": {"type": "string"}, "content": {"type": "string", "description": "Decision body (alias: text — #2037). For a question, the prompt text."}, "text": {"type": "string", "description": "Alias of `content` (#2037)."},
             "scope": {"type": "string", "enum": ["project", "fleet"]},
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "Create-only typed review authority for tasks governed by this decision."},
             "tags": {"type": "array", "items": {"type": "string"}},
             "ttl_days": {"type": "number"}, "supersedes": {"type": "string"},
             "id": {"type": "string"}, "archive": {"type": "boolean"},
@@ -292,7 +294,8 @@ pub(crate) fn def_task() -> Value {
             "scope": {"type": "string", "enum": ["fleet"], "description": "#2117 P1: list scope. `fleet` aggregates tasks across ALL project boards (each task tagged with its project id). Equivalent to `project=all`."},
             "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: create only — number of distinct non-assignee `ack_plan` calls needed before this task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior."},
             "plan_ack_reason": {"type": "string", "description": "#2249: create only — required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
-            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: create only — durable review-threshold AUTHORITY for a PR-producing task. `single` (§3.6) or `dual` (§3.5). Persisted into Task.metadata; the dispatch/poll fail-closed gate reads it (absent/unknown → Unresolved → the merge-authority dispatch is rejected + the poller emits a [review-class-unresolved] re-arm diagnostic, never a silent default)."}
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: create only — durable review-threshold AUTHORITY for a PR-producing task. `single` (§3.6) or `dual` (§3.5). Persisted into Task.metadata; the dispatch/poll fail-closed gate reads it (absent/unknown → Unresolved → the merge-authority dispatch is rejected + the poller emits a [review-class-unresolved] re-arm diagnostic, never a silent default)."},
+            "governing_decision_id": {"type": "string", "description": "#3419: create only — exact active unsuperseded leaf decision governing this task; its typed review authority is inherited atomically when review_class is omitted."}
         }, "required": ["action"]}})
 }
 
@@ -1140,7 +1143,8 @@ mod tests {
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
             ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
-            ("send", "review_class", "comms_delegate.rs maybe_auto_bind_lease → resolve_dispatch_review_class authority/fallback (atomic reject on unresolved) + maybe_auto_create_task create_args seed (#2745)"),
+            ("send", "review_class", "comms_delegate.rs preflight_branch_authority → tasks/governance::resolve_dispatch_authority + maybe_auto_create_task create_args seed (#3419/#2745)"),
+            ("send", "governing_decision_id", "comms_delegate.rs maybe_auto_create_task → tasks/handler.rs governed Created authority (#3419)"),
             ("send", "bind", "comms_delegate/mod.rs dispatch_should_skip_auto_bind → skip auto-bind when false (#6 d-4)"),
             ("send", "review_assignment", "comms_gates/dispatch.rs run_dispatch_pre_checks parse → comms_delegate.rs handle_delegate_task validate_review_assignment_marker fail-closed gate (t-…-17)"),
             ("send", "pr_number", "comms_delegate.rs validate_review_assignment_marker — mandatory nonzero generation identity, atomic reject if missing/zero (t-…-17 B18/B19)"),
@@ -1187,11 +1191,13 @@ mod tests {
             ("task", "plan_ack_required", "tasks/handler.rs handle_create validation + metadata seed; handle_update in_progress gate chokepoint (#2249)"),
             ("task", "plan_ack_reason", "tasks/handler.rs handle_create validation + metadata seed (#2249)"),
             ("task", "review_class", "tasks/handler.rs handle_create → Task.metadata review_class seed; dispatch/poll fail-closed authority (#2745)"),
+            ("task", "governing_decision_id", "tasks/handler.rs handle_create → TaskEvent::Created governing authority (#3419)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),
             ("decision", "content", "decisions.rs post/update"),
             ("decision", "scope", "decisions.rs post"),
+            ("decision", "review_class", "decisions.rs post → immutable typed Decision.review_class (#3419)"),
             ("decision", "tags", "decisions.rs post/list-filter/update"),
             ("decision", "ttl_days", "decisions.rs post/update"),
             ("decision", "supersedes", "decisions.rs post archives prior"),

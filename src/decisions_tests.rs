@@ -224,6 +224,7 @@ fn make_test_decision(author: &str) -> Decision {
         archived: false,
         supersedes: None,
         working_directory: None,
+        review_class: None,
         schema_version: SCHEMA_VERSION,
         needs_answer: false,
         status: None,

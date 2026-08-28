@@ -5,6 +5,7 @@ mod activity;
 pub mod auto_close;
 mod board_router;
 mod board_sweep;
+pub(crate) mod governance;
 mod handler;
 pub mod lifecycle;
 mod orphan;
@@ -1598,6 +1599,8 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             bind: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         });
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3

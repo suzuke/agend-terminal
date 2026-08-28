@@ -208,6 +208,8 @@ mod review_assignment_marker_tests {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         };
         crate::task_events::append(
             home,
@@ -333,6 +335,8 @@ mod review_assignment_marker_tests {
                 eta_secs: None,
                 tags: Vec::new(),
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();

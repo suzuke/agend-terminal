@@ -1466,6 +1466,8 @@ fn t1018_a_closed_task_id_swept_silently() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
@@ -1552,6 +1554,8 @@ fn t1018_a_live_dispatch_still_fires() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();

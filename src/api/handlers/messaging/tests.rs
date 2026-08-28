@@ -2800,6 +2800,8 @@ fn seed_review_task(home: &std::path::Path, task_id: &str, reviewer: &str) {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,
@@ -3144,6 +3146,8 @@ fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_diffe
                     eta_secs: None,
                     tags: Vec::new(),
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 crate::task_events::TaskEvent::Claimed {
                     task_id: crate::task_events::TaskId::from("t-disposable-review"),
@@ -3479,6 +3483,8 @@ fn reissued_review_receipt_retargets_disposable_binding_and_closes_successor_s1(
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         }];
         if claimed {
             events.push(TaskEvent::Claimed {
@@ -4923,6 +4929,8 @@ fn seed_claimed_task_3293(
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,

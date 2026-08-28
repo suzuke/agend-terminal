@@ -49,6 +49,8 @@ fn created(task_id: &TaskId, title: &str) -> TaskEvent {
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     }
 }
 
@@ -107,6 +109,8 @@ fn replay_with_metadata_events(count: u64) -> TaskBoardState {
             eta_secs: Some(60),
             tags: vec!["catalog".into()],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )));
     for seq in 2..=count + 1 {
@@ -372,6 +376,8 @@ fn task_snapshots_replace_only_the_changed_record() {
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     let mut projection = BoardProjection::from_sorted_envelopes(&[
         envelope(1, create(changed_id.clone(), "changed")),
@@ -444,6 +450,8 @@ fn advisory_catalog_snapshot_is_phase_labelled_and_pointer_only() {
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     let first = BoardProjection::from_sorted_envelopes(&[envelope(1, create(first_id.clone()))])
         .expect("first board");
@@ -488,6 +496,8 @@ fn catalog_route_is_ready_only_and_rejects_duplicate_ids() {
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     let first = BoardProjection::from_sorted_envelopes(&[
         envelope(1, create(unique_id.clone())),
@@ -551,6 +561,8 @@ fn catalog_list_reads_are_ready_only_ordered_and_pointer_only() {
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     let first = BoardProjection::from_sorted_envelopes(&[envelope(1, create(first_id.clone()))])
         .expect("first board");
@@ -601,6 +613,8 @@ fn catalog_statuses_are_ready_only_ordered_and_fail_closed() {
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     let first = BoardProjection::from_sorted_envelopes(&[
         envelope(1, create(unique_id.clone())),
@@ -965,6 +979,8 @@ fn incremental_apply_matches_incumbent_replay() {
             eta_secs: Some(60),
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
         TaskEvent::Created {
             task_id: child_id.clone(),
@@ -980,6 +996,8 @@ fn incremental_apply_matches_incumbent_replay() {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: Some(task_id.clone()),
+            governing_decision_id: None,
+            review_class: None,
         },
         TaskEvent::Claimed {
             task_id: task_id.clone(),
@@ -1142,6 +1160,8 @@ fn incremental_apply_dedupes_per_instance_and_bounds_history() {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     );
     let mut projection = BoardProjection::default();
@@ -1213,6 +1233,8 @@ fn ordered_apply_rejects_non_advancing_keys_without_mutation() {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     );
     let stale = envelope_at(
@@ -1332,6 +1354,8 @@ fn canonical_initial_fold_matches_replay_and_seeds_order_cursor() {
                 eta_secs: None,
                 tags: Vec::new(),
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         ),
     ];
@@ -1403,6 +1427,8 @@ fn canonical_batch_is_atomic_and_matches_sequential_apply() {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     );
     let valid = vec![

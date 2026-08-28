@@ -1625,7 +1625,7 @@ fn test_dispatch_dedup_rejects_same_branch() {
     crate::tasks::handle(
         &home,
         "sender",
-        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x", "review_class": "single"}),
     );
     let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
@@ -1664,7 +1664,7 @@ fn test_dispatch_dedup_force_bypasses_branch_gate() {
     crate::tasks::handle(
         &home,
         "sender",
-        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x", "review_class": "single"}),
     );
     let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
@@ -1676,9 +1676,11 @@ fn test_dispatch_dedup_force_bypasses_branch_gate() {
             "instance": "target",
             "message": "force override",
             "request_kind": "task",
-            "task_id": "t-test-force",
+            "task_id": tid,
             "branch": "feat/x",
             "bind": false,
+            "repository": "owner/repo",
+            "review_class": "single",
             "force": true,
             "force_reason": "re-dispatch after fix"
         }),
@@ -1719,7 +1721,9 @@ fn test_dispatch_dedup_different_branch_passes() {
             "message": "different branch work",
             "request_kind": "task",
             "task_id": "t-test-diff",
-            "branch": "feat/y"
+            "branch": "feat/y",
+            "repository": "owner/repo",
+            "review_class": "single"
         }),
         "sender",
     );
@@ -3779,6 +3783,8 @@ teams:
                 "request_kind": "task",
                 "branch": branch,
                 "bind": false,
+                "repository": "owner/repo",
+                "review_class": "single",
             }),
             "sender",
         )
@@ -3861,6 +3867,8 @@ teams:
             "request_kind": "task",
             "branch": "fix/3141-a",
             "bind": false,
+            "repository": "owner/repo",
+            "review_class": "single",
             "force": true,
             "force_reason": "operator-approved retry",
         }),
@@ -3882,6 +3890,8 @@ teams:
             "task_id": first_task_id,
             "branch": "fix/3141-a",
             "bind": false,
+            "repository": "owner/repo",
+            "review_class": "single",
         }),
         "sender",
     );
@@ -5395,6 +5405,8 @@ fn mcp_terminal_report_settlement_refusal_is_disclosed_3295() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             crate::task_events::TaskEvent::Claimed {
                 task_id: tid.clone(),

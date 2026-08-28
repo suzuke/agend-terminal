@@ -147,6 +147,10 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
             });
         }
     }
+    let authority = match super::governance::resolve_creation_authority(home, args) {
+        Ok(authority) => authority,
+        Err(error) => return error,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
@@ -217,6 +221,8 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         parent_id: args["parent_id"]
             .as_str()
             .map(|s| crate::task_events::TaskId(s.to_string())),
+        governing_decision_id: authority.governing_decision_id.clone(),
+        review_class: authority.review_class,
     };
     // #2117 P1: route create to the caller's current project board (or an
     // explicit `project` arg override). Single-project → DEFAULT → board == home
@@ -359,13 +365,10 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
                     },
                 );
             }
-            // #2745 (decision d-…-11): seed the durable `review_class` authority
-            // for a PR-producing task. Stored verbatim; validity ({single,dual})
-            // is enforced fail-closed downstream at dispatch/poll time via
-            // `ReviewClass::parse_fail_closed` (an unknown/typo resolves Unresolved
-            // → refuse-to-arm + diagnostic, never a silent default). Absent → no
-            // key (the common non-PR task), byte-identical to pre-#2745.
-            if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
+            // Preserve the legacy explicit invalid value for ungoverned tasks;
+            // governed creation rejects it before the Created append. Valid
+            // classes are already projected atomically from Created above.
+            if let Some(rc) = authority.legacy_review_class_raw.as_deref() {
                 let _ = crate::task_events::append_at(
                     &board,
                     &emitter,
@@ -2066,6 +2069,15 @@ fn metadata_write_outcome(
         }))
     };
     match key {
+        // #3419: these fields are immutable authority captured in Created.
+        // Generic metadata writes must never forge, downgrade, or even
+        // rewrite the same value after creation.
+        "review_class" | "governing_decision_id" => {
+            MetadataWriteOutcome::Denied(serde_json::json!({
+                "error": format!("{key} is create-only task authority"),
+                "code": "create_only_metadata",
+            }))
+        }
         // I1: plan_acks is system-managed (only `ack_plan` / the reopen-reset write
         // it) — a direct metadata_set is rejected for EVERY identity.
         "plan_acks" => MetadataWriteOutcome::Denied(serde_json::json!({

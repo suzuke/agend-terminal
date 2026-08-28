@@ -2699,6 +2699,8 @@ fn seed_task_with_branch(home: &Path, id: &str, branch: &str) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("seed task");

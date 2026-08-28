@@ -3503,6 +3503,40 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
 }
 
 #[test]
+fn task_linked_watch_rejects_review_class_divergence_3419() {
+    let home = watch_test_home("task-linked-review-class-mismatch-3419");
+    let created = crate::tasks::handle(
+        &home,
+        "dev-1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed watch task",
+            "review_class": "dual",
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id").to_string();
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/governed",
+            "task_id": task_id,
+            "review_class": "single",
+        }),
+        "dev-1",
+    );
+    assert_eq!(
+        response["code"], "watch_review_class_mismatch",
+        "{response}"
+    );
+    assert!(
+        !crate::daemon::ci_watch::ci_watches_dir(&home).exists(),
+        "watch divergence must be rejected before watch-file creation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
     let home = watch_test_home("review-class-change-pr-gate");
     let args = serde_json::json!({"repository": "o/r", "branch": "feat/x"});

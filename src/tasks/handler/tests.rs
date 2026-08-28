@@ -40,6 +40,8 @@ fn create_task(home: &std::path::Path, task_id: &str) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("create task");
@@ -71,7 +73,9 @@ fn governed_create_persists_atomic_authority_3419() {
     let task_id = created["id"].as_str().expect("task id");
     let task = read_task_record(&home, task_id).expect("created task");
     assert_eq!(
-        task.metadata.get("governing_decision_id").and_then(|v| v.as_str()),
+        task.metadata
+            .get("governing_decision_id")
+            .and_then(|v| v.as_str()),
         Some(decision_id),
         "Created must atomically persist the governing decision id: {created}"
     );
@@ -107,7 +111,10 @@ fn governed_create_rejects_review_class_mismatch_3419() {
         }),
     );
     assert_eq!(created["code"], "governing_decision_review_class_mismatch");
-    assert!(created["id"].is_null(), "mismatch must not create a task: {created}");
+    assert!(
+        created["id"].is_null(),
+        "mismatch must not create a task: {created}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -181,6 +188,8 @@ fn cascade_cancel_settles_each_child_dispatch_tracking_78445_2() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: parent.map(|p| crate::task_events::TaskId(p.into())),
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .expect("seed");
@@ -1250,6 +1259,8 @@ fn seed_claimed(home: &std::path::Path, task_id: &str, owner: &str) {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,

@@ -254,6 +254,8 @@ fn seed_claimed_task(home: &std::path::Path, assignee: &str) {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,

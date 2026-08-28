@@ -5288,6 +5288,8 @@ fn seed_disposable_task(home: &Path, task_id: &str, branch: &str, terminal: bool
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -5406,6 +5408,8 @@ fn active_task_branch_mismatch_preserves_review_branch() {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -5727,6 +5731,8 @@ fn seed_active_task_for_branch(home: &Path, task_id: &str, branch: &str) {
             owner: None,
             depends_on: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
             branch: Some(branch.to_string()),
             due_at: None,
             routed_to: None,

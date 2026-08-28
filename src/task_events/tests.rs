@@ -31,6 +31,8 @@ fn sample_event(id: &str) -> TaskEvent {
         eta_secs: None,
         tags: vec![],
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     }
 }
 
@@ -1088,6 +1090,8 @@ fn fixture_with_seeded_task(tag: &str) -> (PathBuf, InstanceName, TaskId) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1176,6 +1180,8 @@ fn state_machine_exhaustive_transitions() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             "Claimed" => TaskEvent::Claimed {
                 task_id: tid.clone(),
@@ -1371,6 +1377,8 @@ fn invariant_5_sweep_replay_associativity() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1452,6 +1460,8 @@ fn invariant_5_sweep_replay_associativity() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         },
         // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1625,6 +1635,8 @@ fn created_event_round_trips_bind_some_false_through_replay() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1666,6 +1678,8 @@ fn task_schema_dispatched_at_set_on_status_in_progress_transition() {
             eta_secs: Some(60),
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1732,6 +1746,8 @@ fn task_schema_dispatched_at_idempotent_on_subsequent_in_progress() {
             eta_secs: Some(60),
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1832,6 +1848,8 @@ fn task_schema_eta_secs_round_trips_from_created_event() {
             eta_secs: Some(7200),
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1913,6 +1931,8 @@ fn parent_id_round_trips_through_replay() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1933,6 +1953,8 @@ fn parent_id_round_trips_through_replay() {
             eta_secs: None,
             tags: vec![],
             parent_id: Some(TaskId::from("t-parent")),
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1990,6 +2012,8 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2010,6 +2034,8 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
             eta_secs: None,
             tags: vec![],
             parent_id: Some(TaskId::from("t-root")),
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2030,6 +2056,8 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
             eta_secs: None,
             tags: vec![],
             parent_id: Some(TaskId::from("t-root")),
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2059,6 +2087,8 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
             eta_secs: None,
             tags: vec![],
             parent_id: Some(TaskId::from("t-root")),
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2092,6 +2122,8 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
             eta_secs: None,
             tags: vec![],
             parent_id: Some(TaskId::from("t-root")),
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2121,6 +2153,8 @@ fn cascade_cancel_cancels_open_and_claimed_children() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
