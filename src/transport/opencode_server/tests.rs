@@ -1559,12 +1559,8 @@ mod fresh_restart_resident_session_3414 {
                 while !worker_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let c = Arc::clone(&worker_created);
                             let mut known_ids = issued.clone();
-                            if let Ok(extra) = c.lock().clone().try_into() {
-                                let extra: Vec<String> = extra;
-                                known_ids.extend(extra);
-                            }
+                            known_ids.extend(worker_created.lock().clone());
                             Self::serve_one(stream, known_ids, Arc::clone(&worker_created));
                             issued = worker_created.lock().clone();
                             if let Some(known) = known.clone() {
