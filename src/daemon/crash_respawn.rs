@@ -807,6 +807,51 @@ mod tests {
         );
     }
 
+    /// RED (r2, from the re-review): the same bypass spelled through an ALIAS.
+    /// Nothing here reads `config.args`, the sanitizer call is left standing
+    /// exactly where the guard looks for it, and the SPAWN still takes a local
+    /// called `fresh_args` — which is now the stored args. The shipped predicate
+    /// accepts it.
+    #[test]
+    fn crash_respawn_spawn_guard_kills_aliased_stored_args_mutation_3414() {
+        let mutated = r#"
+            fn respawn_agent_worker(config: AgentConfig) {
+                let fresh_args = match fresh_respawn_args(&config) {
+                    Ok(args) => args,
+                    Err(error) => return,
+                };
+                let AgentConfig { args: stored, .. } = &config;
+                let fresh_args = stored.clone();
+                spawn_agent(&SpawnConfig { args: &fresh_args, });
+            }
+        "#;
+        assert!(
+            !spawn_source_is_sanitized(mutated),
+            "the spawn guard must reject a bypass that rebinds fresh_args from an alias"
+        );
+    }
+
+    /// RED (r2): and through a HELPER. The rebinding call site names no field at
+    /// all, and the helper that clones the stored args sits OUTSIDE the sliced
+    /// body, where this guard never looks.
+    #[test]
+    fn crash_respawn_spawn_guard_kills_helper_stored_args_mutation_3414() {
+        let mutated = r#"
+            fn respawn_agent_worker(config: AgentConfig) {
+                let fresh_args = match fresh_respawn_args(&config) {
+                    Ok(args) => args,
+                    Err(error) => return,
+                };
+                let fresh_args = stored_args_for_respawn(&config);
+                spawn_agent(&SpawnConfig { args: &fresh_args, });
+            }
+        "#;
+        assert!(
+            !spawn_source_is_sanitized(mutated),
+            "the spawn guard must reject a bypass that rebinds fresh_args from a helper"
+        );
+    }
+
     /// #3415 RED: a guard on one function is stepped around by the next inline
     /// `format!`. The production region of this file must make no such claim
     /// anywhere, however it is spelled.
