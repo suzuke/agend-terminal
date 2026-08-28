@@ -1487,6 +1487,50 @@ mod tests {
     /// `resize` and the accept loop supplies the real one. The scan follows it
     /// there — same invariant, new address.
     #[test]
+    fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
+        let src = include_str!("tui_bridge.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
+        let resize_arm = prod
+            .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
+            .expect("production TAG_RESIZE arm must exist")
+            .1
+            .split_once("_ => break,")
+            .expect("TAG_RESIZE arm must end before the fallback arm")
+            .0;
+        assert!(
+            resize_arm.contains("resize("),
+            "the TAG_RESIZE arm must still apply a resize"
+        );
+
+        let resize_effect = prod
+            .split_once("|cols, rows| {")
+            .expect("the accept loop must supply the real resize effect")
+            .1
+            .split_once("\n                    );")
+            .expect("the resize effect closure must close the forward_tui_input call")
+            .0;
+        assert!(
+            resize_effect.contains("pty_master.lock().resize"),
+            "TAG_RESIZE must still resize the child PTY"
+        );
+        assert!(
+            resize_effect.contains("c.vterm.resize"),
+            "TAG_RESIZE must still resize the daemon VTerm"
+        );
+        // #3421 item1: the negative is asserted over the WHOLE production region,
+        // not over these two slices. A module-level helper called from the resize
+        // path used to sit outside both and escape; the positives above stay
+        // slice-scoped because they are statements about those slices.
+        let touches = super::modal_state_touches_in_production(prod);
+        assert!(
+            touches.is_empty(),
+            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal \
+             confirmation, and nothing in this file's production region may touch \
+             modal state — found: {touches:?}"
+        );
+    }
+
     /// #3421 item1 RED: the guard below scopes its NEGATIVE assertions to two
     /// slices — the `TAG_RESIZE` match arm and the resize-effect closure — so a
     /// module-level helper that touches `dev_modal::` or `note_pty_write` and is
@@ -1535,50 +1579,6 @@ mod tests {
             !violations.is_empty(),
             "a module-level helper touching modal state must be caught wherever it \
              sits in the production region, not only inside the resize slices"
-        );
-    }
-
-    fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
-        let src = include_str!("tui_bridge.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
-        let resize_arm = prod
-            .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
-            .expect("production TAG_RESIZE arm must exist")
-            .1
-            .split_once("_ => break,")
-            .expect("TAG_RESIZE arm must end before the fallback arm")
-            .0;
-        assert!(
-            resize_arm.contains("resize("),
-            "the TAG_RESIZE arm must still apply a resize"
-        );
-
-        let resize_effect = prod
-            .split_once("|cols, rows| {")
-            .expect("the accept loop must supply the real resize effect")
-            .1
-            .split_once("\n                    );")
-            .expect("the resize effect closure must close the forward_tui_input call")
-            .0;
-        assert!(
-            resize_effect.contains("pty_master.lock().resize"),
-            "TAG_RESIZE must still resize the child PTY"
-        );
-        assert!(
-            resize_effect.contains("c.vterm.resize"),
-            "TAG_RESIZE must still resize the daemon VTerm"
-        );
-        // #3421 item1: the negative is asserted over the WHOLE production region,
-        // not over these two slices. A module-level helper called from the resize
-        // path used to sit outside both and escape; the positives above stay
-        // slice-scoped because they are statements about those slices.
-        let touches = super::modal_state_touches_in_production(prod);
-        assert!(
-            touches.is_empty(),
-            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal \
-             confirmation, and nothing in this file's production region may touch \
-             modal state — found: {touches:?}"
         );
     }
 
