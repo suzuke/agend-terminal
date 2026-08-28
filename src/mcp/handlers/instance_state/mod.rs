@@ -607,6 +607,42 @@ pub(super) fn handle_restart_instance_with_runtime(
         None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
     };
 
+    // #3414 PREFLIGHT — must stay HERE: after `resolve_instance` (it needs the
+    // DECLARED backend + stored args) and before EVERY destructive step below
+    // (draft wait, inbox requeue, DELETE, SPAWN, self-kick arming). Fixing this
+    // at `restart_spawn_params` is too late: by then the instance is gone.
+    //
+    // `mode=fresh` is a statement about the SESSION, not merely about the
+    // preset. `SpawnMode` only selects `Backend::preset_spawn_args`, so a
+    // session pin living in the CALLER args (the observed `--resume <uuid>`)
+    // was never inspected and survived every fresh restart.
+    //
+    // Grammar comes from `resolved.backend` — the DECLARED identity — never
+    // from `backend_command`, whose basename misclassifies wrappers (#2744).
+    // Unresolvable grammar fails closed: guessing would either strand the
+    // operator on the old session or silently drop a real value, and the live
+    // instance is still running at this point.
+    let sanitized_args = if mode == "resume" {
+        resolved.args.clone()
+    } else {
+        match crate::backend_session::sanitize_for_fresh(&resolved.backend, &resolved.args) {
+            Ok(args) => args,
+            Err(error) => {
+                return json!({
+                    "error": format!(
+                        "refusing fresh restart: {error}. Fix the instance's stored args \
+                         (or restart with mode=resume) — the running instance was left untouched."
+                    ),
+                    "name": name,
+                    "code": "fresh_session_args_invalid",
+                    "backend": error.backend,
+                    "token": error.token,
+                    "reason": error.reason.as_str(),
+                });
+            }
+        }
+    };
+
     // t-95913-5: the operator's unsent keystrokes live ONLY in the input line of
     // the process we're about to kill — a fresh OR resume restart destroys them
     // (`--continue` restores the conversation, not the input line). If the pane
@@ -642,7 +678,7 @@ pub(super) fn handle_restart_instance_with_runtime(
     let spawn_params = restart_spawn_params(
         name,
         &resolved.backend_command,
-        &resolved.args,
+        &sanitized_args,
         resolved.working_directory.as_deref(),
         &resolved.env,
         mode,
