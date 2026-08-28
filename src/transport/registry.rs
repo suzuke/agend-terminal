@@ -373,6 +373,23 @@ pub(crate) fn codex_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<
     Ok(CodexNativeShared::remote_attach_args(locator))
 }
 
+/// #3414: which OpenCode session the next spawn should attach to.
+///
+/// Sibling of [`codex_thread_for_spawn`]. `mode=fresh` must produce a NEW
+/// conversation, but the managed loopback server's endpoint and credentials
+/// are still valid and expensive to re-establish — so Fresh clears ONLY
+/// `session_id` and keeps `endpoint_url` / `username` / `password` / `model`.
+/// With no session id the resident adapter's `POST /session` creates a new one.
+pub(crate) fn opencode_locator_for_spawn(
+    locator: SessionLocator,
+    spawn_mode: crate::backend::SpawnMode,
+) -> SessionLocator {
+    // RED baseline: today the locator is reused verbatim, so a fresh restart
+    // silently reattaches to the previous OpenCode session.
+    let _ = spawn_mode;
+    locator
+}
+
 pub(crate) fn prepare_opencode_tui_session(
     home: &Path,
     instance: &str,
@@ -987,5 +1004,94 @@ mod tests {
             0o700
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[cfg(test)]
+mod session_contract_3414_tests {
+    use super::*;
+    use crate::backend::SpawnMode;
+
+    /// Built through the PRODUCTION constructor rather than a literal, so the
+    /// test cannot drift from the real locator shape.
+    #[allow(clippy::expect_used)]
+    fn opencode_locator() -> SessionLocator {
+        let home = std::env::temp_dir().join(format!("agend-3414-loc-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let mut locator = default_opencode_locator(&home, "dev").expect("default opencode locator");
+        locator.session_id = Some("sess-existing".to_string());
+        locator.endpoint_url = Some("http://127.0.0.1:41999".to_string());
+        locator.username = Some("opencode".to_string());
+        locator.password = Some("secret".to_string());
+        std::fs::remove_dir_all(&home).ok();
+        locator
+    }
+
+    #[allow(clippy::expect_used)]
+    fn codex_locator() -> SessionLocator {
+        let home = std::env::temp_dir().join(format!("agend-3414-cx-{}", std::process::id()));
+        let mut locator = default_codex_locator(&home, "dev");
+        locator.thread_id = Some("thread-1".to_string());
+        locator
+    }
+
+    /// #3414: Fresh must start a NEW OpenCode conversation. Clearing the whole
+    /// locator would also throw away a healthy managed server — so only
+    /// `session_id` is cleared and endpoint/auth are retained for reuse.
+    #[test]
+    fn opencode_fresh_clears_only_session_id_3414() {
+        let prepared = opencode_locator_for_spawn(opencode_locator(), SpawnMode::Fresh);
+        assert_eq!(
+            prepared.session_id, None,
+            "#3414: fresh must not reattach to the previous OpenCode session"
+        );
+        assert_eq!(
+            prepared.endpoint_url.as_deref(),
+            Some("http://127.0.0.1:41999"),
+            "#3414: the managed endpoint is still valid and must be reused"
+        );
+        assert_eq!(prepared.username.as_deref(), Some("opencode"));
+        assert_eq!(prepared.password.as_deref(), Some("secret"));
+    }
+
+    /// Resume is the whole point of keeping the locator: the session id stays.
+    #[test]
+    fn opencode_resume_retains_session_id_3414() {
+        let prepared = opencode_locator_for_spawn(opencode_locator(), SpawnMode::Resume);
+        assert_eq!(prepared.session_id.as_deref(), Some("sess-existing"));
+        assert_eq!(
+            prepared.endpoint_url.as_deref(),
+            Some("http://127.0.0.1:41999")
+        );
+    }
+
+    /// Codex defends in two INDEPENDENT layers, and both must hold:
+    /// the typed thread selector already returns None on Fresh, and the caller
+    /// args must additionally lose a `resume` pin. Either alone would leave a
+    /// path back into the old conversation.
+    #[test]
+    fn codex_fresh_defends_in_both_layers_3414() {
+        let locator = codex_locator();
+        assert_eq!(
+            codex_thread_for_spawn(&locator, SpawnMode::Fresh),
+            None,
+            "layer 1: the typed thread selector must not resume on fresh"
+        );
+        assert_eq!(
+            codex_thread_for_spawn(&locator, SpawnMode::Resume).as_deref(),
+            Some("thread-1"),
+            "layer 1: resume still attaches"
+        );
+
+        let args: Vec<String> = ["resume", "thread-1", "--model", "gpt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            crate::backend_session::sanitize_for_fresh(&Backend::Codex, &args)
+                .expect("codex resume grammar resolves"),
+            vec!["--model".to_string(), "gpt".to_string()],
+            "layer 2: a caller `resume` pin must not survive a fresh restart"
+        );
     }
 }
