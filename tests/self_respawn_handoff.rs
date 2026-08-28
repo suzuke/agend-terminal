@@ -283,8 +283,13 @@ fn hex(bytes: &[u8]) -> String {
 /// the daemon's real wire protocol: the NDJSON cookie handshake
 /// (`{"auth":"<hex>"}` → `{"ok":true}`) FIRST, then the `mcp_tool` request. The
 /// cookie file is raw 32 bytes (see `auth_cookie::issue`); hex-encode it for the
-/// handshake. Best-effort: on the happy path the predecessor may exit before the
-/// reply lands, so commit-expecting callers poll process state, not the reply.
+/// handshake. The reply is MANDATORY, not best-effort: every caller asserts the
+/// restart was ACCEPTED — `assert_restart_accepted` here, an explicit `expect`
+/// on the abort path — so a `None` is a test failure rather than a tolerated
+/// outcome. #3421 item 3 closed exactly the gap the old wording described: call
+/// sites that discarded the reply could not tell an accepted restart from a
+/// refused one. Callers still poll process state as well, because an accepted
+/// reply says the restart was admitted, not that the successor is up.
 fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     let run_dir = home.join("run").join(active_pid.to_string());
     let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
