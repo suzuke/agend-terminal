@@ -1067,6 +1067,64 @@ class Aggregation(TempCase):
         self.assertFalse(split_seed["plan_gate"]["pass"])
         self.assertIn("run_identity_split", split_seed["plan_gate"]["flags"])
 
+    # ---- A⁶ review: every manifest field, and the frozen tree as the binding ----
+
+    #: (field, a value that must be refused). One row per field the manifest
+    #: carries — the reviews asked for each to be covered individually.
+    MANIFEST_FIELD_PROBES = (
+        ("schema", 2),
+        ("schema", True),
+        ("stamp", ""),
+        ("created_at", ""),
+        ("dry_run", True),
+        ("jobs", 0),
+        ("missing_scenarios", ["S07"]),
+        ("model", "claude-other"),
+        ("git_head", ""),
+        ("binary_sha256", {"agend-terminal": "0" * 64}),
+        ("prompt_sha256", {"base": "0" * 64, "mcp": "0" * 64, "cli": "0" * 64}),
+        ("total_runs", 209),
+    )
+
+    def test_every_manifest_field_is_validated_by_value(self):
+        for field, bad in self.MANIFEST_FIELD_PROBES:
+            with self.subTest(field=field, bad=bad):
+                self.setUp()
+                runs, scen = self.frozen_matrix()
+                write_manifest(runs, **{field: bad})
+                summary = grade.aggregate(runs, scen)
+                self.assertFalse(summary["plan_gate"]["pass"],
+                                 "manifest %s=%r must be refused" % (field, bad))
+                self.assertFalse(summary["pilot_safety"])
+
+    def test_a_dropped_manifest_field_is_refused_individually(self):
+        for field in ("schema", "stamp", "created_at", "dry_run", "jobs",
+                      "missing_scenarios", "model", "git_head", "binary_sha256",
+                      "prompt_sha256", "total_runs", "plan"):
+            with self.subTest(field=field):
+                self.setUp()
+                runs, scen = self.frozen_matrix()
+                write_manifest(runs, **{field: DROP})
+                summary = grade.aggregate(runs, scen)
+                self.assertIn("manifest_incomplete", summary["plan_gate"]["flags"])
+
+    def test_the_prompt_and_seed_a_run_names_must_be_the_frozen_ones(self):
+        """Constant across runs is not the same as CORRECT.
+
+        Every one of the real 210 runs records prompt_sha256 = sha256 of its
+        scenario's prompt.txt and seed_sha256 = sha256 of its seed.sh, so the
+        frozen tree can be the binding rather than mere agreement between runs.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [])
+        write_run(runs, "S01", "cli", 1, [], meta_extra={"seed_sha256": "c" * 64})
+        summary = grade.aggregate(runs, scen)
+        reasons = sorted(e["reason"] for e in summary["invalid"])
+        self.assertEqual(reasons, ["prompt_not_frozen", "seed_not_frozen"],
+                         "the fixture's placeholder hashes are not the frozen files")
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})

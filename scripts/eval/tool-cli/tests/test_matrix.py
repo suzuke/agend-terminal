@@ -10,6 +10,9 @@ import subprocess
 import tempfile
 import unittest
 
+#: meta_extra sentinel: drop the key rather than set it.
+DROP_SENTINEL = object()
+
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MATRIX = os.path.join(HERE, "matrix.sh")
 
@@ -116,8 +119,17 @@ class MatrixAuthority(unittest.TestCase):
         meta = {"schema": 1, "scenario": "S01", "arm": "mcp", "pair": 1,
                 "order_in_pair": "first", "model_requested": "claude-fable-5",
                 "model_resolved": "claude-fable-5", "git_head": self._head(),
+                "claude_version": "2.0.0-test",
+                "binary_sha256": {"agend-terminal": "0" * 64,
+                                  "agend-mcp-bridge": "0" * 64},
+                "system_prompt_sha256": "0" * 64, "prompt_sha256": "0" * 64,
+                "fence": True, "fleet_sha256": "0" * 64, "seed_sha256": "0" * 64,
+                "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
+                "duration_ms": 1000, "exit_code": 0, "turns": 3, "timed_out": False,
                 "invalid_reason": None}
         meta.update(meta_extra)
+        for key in [k for k, v in meta_extra.items() if v is DROP_SENTINEL]:
+            meta.pop(key, None)
         with open(os.path.join(planned, "metadata.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
         return planned
@@ -151,6 +163,28 @@ class MatrixAuthority(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0,
                             "a manifest whose plan is not this matrix's must not be "
                             "overwritten on the strength of three matching fields:\n"
+                            + proc.stdout + proc.stderr)
+
+
+    def test_resume_validates_the_whole_metadata_contract(self):
+        """Identity matched and the stream was there; the record was still partial.
+
+        The planted run is built to pass every identity check resume already
+        makes — it even carries the binaries from this matrix's own manifest —
+        and differs only by a missing SPEC-required field.
+        """
+        first = dry_run(self.out)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        with open(os.path.join(self.out, "manifest.json"), "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        planned = self._plant(turns=DROP_SENTINEL,
+                              binary_sha256=manifest["binary_sha256"])
+        with open(os.path.join(planned, "stream.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"type": "system", "subtype": "init", "model": "claude-fable-5"}\n')
+
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a run missing SPEC-required metadata did not complete:\n"
                             + proc.stdout + proc.stderr)
 
 
