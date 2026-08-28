@@ -151,9 +151,11 @@ GIT_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 # The manifest is this tree's account of itself. One already here must describe
 # THIS matrix, or the tree belongs to another run and is not ours to overwrite.
 if [ -f "$OUT/manifest.json" ]; then
-  MF_CHECK_PLAN="$PLAN" python3 -c '
+  python3 -c '
 import json, os, sys
-path, stamp, model, head = sys.argv[1:]
+here, path, stamp, model, head = sys.argv[1:]
+sys.path.insert(0, here)
+import grade
 try:
     with open(path, "r", encoding="utf-8") as fh:
         manifest = json.load(fh)
@@ -162,21 +164,13 @@ except (OSError, ValueError) as exc:
 bad = ["%s=%r (want %r)" % (key, manifest.get(key), want)
        for key, want in (("stamp", stamp), ("model", model), ("git_head", head))
        if manifest.get(key) != want]
-expected = []
-for line in os.environ["MF_CHECK_PLAN"].splitlines():
-    if not line.strip():
-        continue
-    scenario, pair, arm, order = line.split("\t")
-    expected.append({"scenario": scenario, "pair": int(pair), "arm": arm,
-                     "order_in_pair": order,
-                     "dir": "%s/pair-%02d/%s" % (scenario, int(pair), arm)})
-if manifest.get("plan") != expected:
-    bad.append("plan does not match this matrix")
-if manifest.get("total_runs") != len(expected):
-    bad.append("total_runs=%r (want %r)" % (manifest.get("total_runs"), len(expected)))
+# the same field/value table the grader applies to a finished tree
+bad += ["%s is not what this matrix records" % field
+        for field, ok in grade.MANIFEST_CONTRACT
+        if field not in manifest or not ok(manifest[field])]
 if bad:
     sys.exit("; ".join(bad))
-' "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
+' "$HERE" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
     || die "refusing to overwrite $OUT/manifest.json: it does not describe this matrix"
 fi
 
@@ -241,7 +235,9 @@ echo "manifest: $OUT/manifest.json"
 resume_matches() {  # rundir scenario pair arm order
   python3 -c '
 import json, os, sys
-run_dir, scenario, pair, arm, order, model, head, manifest_path = sys.argv[1:]
+here, run_dir, scenario, pair, arm, order, model, head, manifest_path = sys.argv[1:]
+sys.path.insert(0, here)
+import grade
 try:
     with open(os.path.join(run_dir, "metadata.json"), "r", encoding="utf-8") as fh:
         meta = json.load(fh)
@@ -258,27 +254,25 @@ except (OSError, ValueError):
     manifest = {}
 if manifest.get("binary_sha256") is not None and meta.get("binary_sha256") != manifest["binary_sha256"]:
     bad.append("binary_sha256 does not match the manifest")
-# A skipped run is a run that HAPPENED: it produced a stream, and that stream
-# says which model answered.
-stream_model, stream_path = None, os.path.join(run_dir, "stream.jsonl")
+events, stream_path = [], os.path.join(run_dir, "stream.jsonl")
 if not os.path.exists(stream_path):
     bad.append("no stream.jsonl")
 else:
     with open(stream_path, "r", encoding="utf-8") as fh:
         for line in fh:
             try:
-                event = json.loads(line)
+                events.append(json.loads(line))
             except ValueError:
-                continue
-            if isinstance(event, dict) and event.get("type") == "system" \
-                    and event.get("subtype") == "init":
-                stream_model = event.get("model")
-                break
-    if stream_model != model:
-        bad.append("stream model=%r (want %r)" % (stream_model, model))
+                pass
+# A skipped run is a run claimed to have happened, so it must be one the grader
+# would accept: the whole metadata contract, and a stream that names the model.
+reason = grade.detect_invalid(meta, run_dir, None, False,
+                              os.path.join(here, "scenarios"), events)
+if reason:
+    bad.append("would not grade: %s" % reason)
 if bad:
     sys.exit("; ".join(bad))
-' "$1" "$2" "$3" "$4" "$5" "$MODEL" "$GIT_HEAD" "$OUT/manifest.json"
+' "$HERE" "$1" "$2" "$3" "$4" "$5" "$MODEL" "$GIT_HEAD" "$OUT/manifest.json"
 }
 
 QUEUE="$OUT/.queue"

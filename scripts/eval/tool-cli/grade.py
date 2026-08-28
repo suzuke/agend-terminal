@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import importlib.util
 import json
 import os
@@ -80,6 +81,20 @@ ARMS = ("mcp", "cli")
 
 def _is_str(value):
     return isinstance(value, str) and value.strip() != ""
+
+
+def _is_hex64(value):
+    return _is_str(value) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def file_sha256(path):
+    """sha256 of a frozen file, or None when it is not there."""
+    if not os.path.exists(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        digest.update(fh.read())
+    return digest.hexdigest()
 
 
 def _is_int(value):
@@ -145,11 +160,38 @@ def _frozen_plan():
 FROZEN_PLAN = _frozen_plan()
 FROZEN_PLAN_CELLS = frozenset(FROZEN_PLAN)
 
-#: What matrix.sh records about the run it is describing. A tree with no account
-#: of itself, or a partial one, is not a matrix we can accept.
-MANIFEST_FIELDS = ("schema", "stamp", "created_at", "dry_run", "git_head", "model",
-                   "jobs", "binary_sha256", "prompt_sha256", "missing_scenarios",
-                   "total_runs", "plan")
+def frozen_plan_rows():
+    """The manifest rows this plan must produce, in order."""
+    return [{"scenario": scenario, "pair": pair, "arm": arm,
+             "order_in_pair": frozen_order(pair, arm),
+             "dir": "%s/pair-%02d/%s" % (scenario, pair, arm)}
+            for (scenario, pair, arm) in FROZEN_PLAN]
+
+
+def frozen_prompt_digests():
+    """sha256 of the three frozen system-prompt files."""
+    return {name: file_sha256(os.path.join(HERE, "prompts", "%s.txt" % name))
+            for name in ("base", "mcp", "cli")}
+
+
+#: What matrix.sh records about the run it is describing, and what each field has
+#: to BE. Presence was never the question — a complete manifest can still
+#: describe another experiment (#3412 A\u2076 review).
+MANIFEST_CONTRACT = (
+    ("schema", lambda v: _is_int(v) and v == 1),
+    ("stamp", _is_str),
+    ("created_at", _is_str),
+    ("dry_run", lambda v: v is False),
+    ("jobs", lambda v: _is_int(v) and v >= 1),
+    ("missing_scenarios", lambda v: v == []),
+    ("model", lambda v: v == FROZEN_MODEL),
+    ("git_head", _is_str),
+    ("binary_sha256", lambda v: isinstance(v, dict) and all(
+        _is_hex64(v.get(name)) for name in ("agend-terminal", "agend-mcp-bridge"))),
+    ("prompt_sha256", lambda v: v == frozen_prompt_digests()),
+    ("total_runs", lambda v: v == len(FROZEN_PLAN)),
+    ("plan", lambda v: v == frozen_plan_rows()),
+)
 
 MIXING_DENOMINATOR = 45
 CONFIRMATION_SCENARIOS = ("S01", "S02", "S03", "S04", "S05", "S06")
@@ -835,6 +877,15 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
         return "scenario_declaration_invalid"
     if arm not in declared:
         return "arm_not_declared"
+    # Agreement between runs is not correctness: 210 runs can agree on a prompt
+    # hash that is not the prompt. The frozen tree is the binding.
+    scenario_dir = os.path.join(scenarios_dir or "", meta.get("scenario") or "")
+    if meta.get("prompt_sha256") != file_sha256(os.path.join(scenario_dir, "prompt.txt")):
+        return "prompt_not_frozen"
+    if meta.get("seed_sha256") != file_sha256(os.path.join(scenario_dir, "seed.sh")):
+        return "seed_not_frozen"
+    if not _is_hex64(meta.get("fleet_sha256")):
+        return "metadata_incomplete"
     cell = (meta.get("scenario"), meta.get("pair"), arm)
     if cell in FROZEN_PLAN_CELLS and meta.get("order_in_pair") != frozen_order(cell[1], arm):
         return "order_in_pair_mismatch"
@@ -1094,25 +1145,17 @@ def aggregate(runs_dir, scenarios_dir=None):
                 manifest = json.load(fh)
         except ValueError:
             manifest = None
-        if not isinstance(manifest, dict) or any(f not in manifest for f in MANIFEST_FIELDS):
+        if not isinstance(manifest, dict) or any(
+                field not in manifest for field, _ in MANIFEST_CONTRACT):
             plan_flags.append("manifest_incomplete")
             manifest = None
     if manifest is not None:
-        # The rows are compared RAW: a junk row used to be filtered out before the
-        # comparison, so 210 good rows plus one were still 210 (#3412 A\u2075 review).
-        expected = [{"scenario": scenario, "pair": pair, "arm": arm,
-                     "order_in_pair": frozen_order(pair, arm),
-                     "dir": "%s/pair-%02d/%s" % (scenario, pair, arm)}
-                    for (scenario, pair, arm) in FROZEN_PLAN]
-        if manifest.get("plan") != expected:
-            plan_flags.append("manifest_plan_mismatch")
-        # Present is not the same as right.
-        if (manifest.get("model") != FROZEN_MODEL
-                or not _is_str(manifest.get("git_head"))
-                or not isinstance(manifest.get("binary_sha256"), dict)
-                or not isinstance(manifest.get("prompt_sha256"), dict)
-                or manifest.get("total_runs") != len(FROZEN_PLAN)):
-            plan_flags.append("manifest_identity_invalid")
+        # The plan rows are compared RAW: a junk row used to be filtered out
+        # before the comparison, so 210 good rows plus one were still 210.
+        for field, ok in MANIFEST_CONTRACT:
+            if not ok(manifest[field]):
+                plan_flags.append("manifest_plan_mismatch" if field == "plan"
+                                  else "manifest_identity_invalid")
         # Every run must be a run OF the experiment the manifest describes.
         if any(g["identity"].get("git_head") != manifest.get("git_head")
                or g["identity"].get("binary_sha256") != manifest.get("binary_sha256")

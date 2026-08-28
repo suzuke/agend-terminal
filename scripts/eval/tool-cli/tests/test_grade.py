@@ -7,6 +7,7 @@ by a REAL daemon (release binary, hermetic AGEND_HOME under $TMPDIR) on
 copy — not against invented ones.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -92,6 +93,27 @@ def task_event(seq, instance, kind, task_id, **fields):
 DROP = object()
 
 
+def sha_of(path):
+    if not os.path.exists(path):
+        return "0" * 64
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def scenario_file_sha(base, scenario, name):
+    """The digest a run records for its scenario's frozen file.
+
+    Fixtures put runs either in <tmp>/runs or in <tmp> itself, with scenarios
+    alongside; look in both.
+    """
+    base = os.path.abspath(base)
+    for root in (os.path.join(os.path.dirname(base), "scenarios"),
+                 os.path.join(base, "scenarios")):
+        path = os.path.join(root, scenario, name)
+        if os.path.exists(path):
+            return sha_of(path)
+    return "0" * 64
+
+
 def expected_order(pair, arm):
     """The order run.sh derives and matrix.sh plans: parity x arm."""
     first_arm = "mcp" if pair % 2 else "cli"
@@ -108,8 +130,10 @@ def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
             "model_resolved": "claude-fable-5", "claude_version": "2.0.0-test",
             "git_head": "0" * 40,
             "binary_sha256": {"agend-terminal": "0" * 64, "agend-mcp-bridge": "0" * 64},
-            "system_prompt_sha256": "0" * 64, "prompt_sha256": "0" * 64,
-            "fleet_sha256": "0" * 64, "seed_sha256": "0" * 64,
+            "system_prompt_sha256": "0" * 64,
+            "prompt_sha256": scenario_file_sha(base, scenario, "prompt.txt"),
+            "fleet_sha256": "0" * 64,
+            "seed_sha256": scenario_file_sha(base, scenario, "seed.sh"),
             "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
             "duration_ms": 1000, "fence": True, "exit_code": 0,
             "turns": 3, "timed_out": False, "invalid_reason": None}
@@ -157,6 +181,11 @@ def write_scenarios(base, spec):
         with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as fh:
             json.dump({"id": scenario, "title": scenario, "arms": arms,
                        "pairs": 10, "roles_required": True}, fh)
+        # the frozen files a run's prompt_sha256 / seed_sha256 are bound to
+        with open(os.path.join(directory, "prompt.txt"), "w", encoding="utf-8") as fh:
+            fh.write("prompt for %s\n" % scenario)
+        with open(os.path.join(directory, "seed.sh"), "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n# seed %s\n" % scenario)
     return root
 
 
@@ -178,7 +207,9 @@ def write_manifest(runs_dir, **overrides):
                 "dry_run": False, "git_head": "0" * 40, "model": "claude-fable-5",
                 "jobs": 3, "binary_sha256": {"agend-terminal": "0" * 64,
                                              "agend-mcp-bridge": "0" * 64},
-                "prompt_sha256": {"base": "0" * 64, "mcp": "0" * 64, "cli": "0" * 64},
+                "prompt_sha256": {name: sha_of(os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "prompts", "%s.txt" % name)) for name in ("base", "mcp", "cli")},
                 "missing_scenarios": [], "total_runs": 210,
                 "plan": frozen_manifest_rows()}
     manifest.update(overrides)
@@ -480,6 +511,10 @@ class Aggregation(TempCase):
                       "    return Verdict(ok)\n" % (mcp_ok, cli_ok))
             with open(os.path.join(directory, "expect.py"), "w", encoding="utf-8") as fh:
                 fh.write(source)
+            with open(os.path.join(directory, "prompt.txt"), "w", encoding="utf-8") as fh:
+                fh.write("prompt for %s\n" % scenario)
+            with open(os.path.join(directory, "seed.sh"), "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n# seed %s\n" % scenario)
             os.makedirs(runs, exist_ok=True)
             for arm in ("mcp", "cli"):
                 write_run(runs, scenario, arm, pair, [])
@@ -1055,6 +1090,8 @@ class Aggregation(TempCase):
         self.assertFalse(split_fleet["plan_gate"]["pass"])
         self.assertIn("run_identity_split", split_fleet["plan_gate"]["flags"])
 
+        # A seed that differs from the frozen seed.sh has a sharper answer than
+        # "the runs disagree": that run is not a run of this scenario at all.
         self.setUp()
         runs, scen = self.frozen_matrix()
         victim = os.path.join(runs, "S03-mcp-p5", "metadata.json")
@@ -1063,9 +1100,9 @@ class Aggregation(TempCase):
         meta["seed_sha256"] = "b" * 64
         with open(victim, "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
-        split_seed = grade.aggregate(runs, scen)
-        self.assertFalse(split_seed["plan_gate"]["pass"])
-        self.assertIn("run_identity_split", split_seed["plan_gate"]["flags"])
+        reseeded = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in reseeded["invalid"]], ["seed_not_frozen"])
+        self.assertFalse(reseeded["pilot_safety"])
 
     # ---- A⁶ review: every manifest field, and the frozen tree as the binding ----
 
@@ -1118,12 +1155,13 @@ class Aggregation(TempCase):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
         os.makedirs(runs, exist_ok=True)
-        write_run(runs, "S01", "mcp", 1, [])
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"prompt_sha256": "d" * 64})
         write_run(runs, "S01", "cli", 1, [], meta_extra={"seed_sha256": "c" * 64})
         summary = grade.aggregate(runs, scen)
         reasons = sorted(e["reason"] for e in summary["invalid"])
         self.assertEqual(reasons, ["prompt_not_frozen", "seed_not_frozen"],
-                         "the fixture's placeholder hashes are not the frozen files")
+                         "a hash that is not the frozen file is refused, however "
+                         "consistent the rest of the matrix is")
 
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
