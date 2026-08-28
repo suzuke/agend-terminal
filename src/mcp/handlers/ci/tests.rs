@@ -5322,8 +5322,8 @@ fn merge_force_refuses_while_audit_lock_is_held() {
         "no unlocked fallback append may occur while the lock is held, found: {written}"
     );
 
-    let result = called
-        .expect("force-merge must refuse at the audit gate, not proceed into the merge call");
+    let result =
+        called.expect("force-merge must refuse at the audit gate, not proceed into the merge call");
     let err = result["error"].as_str().unwrap_or_default();
     assert!(
         err.contains("audit"),
