@@ -748,6 +748,43 @@ mod tests {
         );
     }
 
+    /// #3414: the helper being correct is not the contract — the SPAWN using it
+    /// is. Found by mutation: with the four grammar guards and both notice
+    /// guards in place, reverting this one field to `&config.args` left every
+    /// test green, because they all exercised `fresh_respawn_args` directly and
+    /// nothing pinned the wiring.
+    ///
+    /// Scoped to `respawn_agent_worker`'s body so it reads the call site rather
+    /// than the file, and asserts both directions: the sanitized args are used,
+    /// and the stored args are not handed to the spawn under any spelling.
+    #[test]
+    fn crash_respawn_spawns_with_the_sanitized_args_3414() {
+        let source = include_str!("crash_respawn.rs");
+        let start = source
+            .find("fn respawn_agent_worker(")
+            .expect("respawn worker present");
+        let rest = &source[start..];
+        // End at the next TOP-LEVEL item. Running to EOF would pull this test
+        // module in, and the negative assertion below would then match its own
+        // source — the guard would fail on itself rather than on the code.
+        let cfg_test = ["\n#[cfg(", "test)]"].concat();
+        let end = ["\nfn ", "\nmod ", &cfg_test]
+            .iter()
+            .filter_map(|marker| rest[1..].find(*marker).map(|offset| offset + 1))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("args: &fresh_args,"),
+            "the respawn SPAWN must receive the sanitized args"
+        );
+        assert!(
+            !body.contains("args: &config.args"),
+            "the respawn SPAWN must not receive the instance's stored args — that is \
+             the state #3414 exists to remove"
+        );
+    }
+
     /// #3415 RED: a guard on one function is stepped around by the next inline
     /// `format!`. The production region of this file must make no such claim
     /// anywhere, however it is spelled.
