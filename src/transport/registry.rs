@@ -1016,11 +1016,26 @@ mod session_contract_3414_tests {
     use super::*;
     use crate::backend::SpawnMode;
 
+    /// Unique per CALL, not per process: cargo runs these tests in parallel
+    /// threads of ONE process, so a pid-keyed directory is shared and each
+    /// test's `remove_dir_all` pulls it out from under the other. That made
+    /// `opencode_resume_retains_session_id_3414` flaky — observed failing once
+    /// and passing on the immediate rerun.
+    #[allow(clippy::expect_used)]
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "agend-3414-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
     /// Built through the PRODUCTION constructor rather than a literal, so the
     /// test cannot drift from the real locator shape.
     #[allow(clippy::expect_used)]
     fn opencode_locator() -> SessionLocator {
-        let home = std::env::temp_dir().join(format!("agend-3414-loc-{}", std::process::id()));
+        let home = scratch_home("loc");
         std::fs::create_dir_all(&home).expect("scratch home");
         let mut locator = default_opencode_locator(&home, "dev").expect("default opencode locator");
         locator.session_id = Some("sess-existing".to_string());
@@ -1033,7 +1048,7 @@ mod session_contract_3414_tests {
 
     #[allow(clippy::expect_used)]
     fn codex_locator() -> SessionLocator {
-        let home = std::env::temp_dir().join(format!("agend-3414-cx-{}", std::process::id()));
+        let home = scratch_home("cx");
         let mut locator = default_codex_locator(&home, "dev");
         locator.thread_id = Some("thread-1".to_string());
         locator
