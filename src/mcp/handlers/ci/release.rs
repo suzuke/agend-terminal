@@ -205,6 +205,32 @@ fn absent_binding_legacy_release(
             "code": "managed_release_unverified_linkage",
         });
     };
+    // d-20260828133340829430-17: a PRESENT source_repo is a claim about the same
+    // identity Git just resolved above, so hold it to that answer. Until now this
+    // arm ignored the field entirely — authority here is the marker's agent plus
+    // verified linkage — which left the same tamper fail-closed on the bound path
+    // (compared against the signed binding) and a no-op here. A claim that
+    // contradicts verified Git identity is corruption, and corruption stays
+    // fail-closed.
+    //
+    // Only PRESENT-and-divergent refuses. An ABSENT source line is the pre-#2860
+    // legacy shape this arm exists to admit, and an explicit blank was already
+    // refused above as empty identity; neither reaches here as a comparison. A
+    // claimed path that cannot be canonicalized (it no longer exists, as with a
+    // tampered value) cannot equal the verified source, so it refuses.
+    if let Some(claimed) = mk_source.as_deref() {
+        let claimed_canonical = std::fs::canonicalize(claimed).ok();
+        if claimed_canonical.as_deref() != Some(source_canonical.as_path()) {
+            return json!({
+                "error": format!(
+                    "legacy marker for '{marker_agent}': marker source '{claimed}' contradicts the \
+                     verified linked source '{}' — refusing",
+                    source_canonical.display()
+                ),
+                "code": "managed_release_source_mismatch",
+            });
+        }
+    }
     // The checked-out branch must equal the marker's branch identity (pre-gate;
     // the canonical transaction re-validates marker identity post-seam).
     let head_branch = match crate::git_helpers::git_cmd(
