@@ -76,6 +76,11 @@ pub struct RuntimeConfig {
     /// `default_true` also fills the field for configs written before it existed.
     #[serde(default = "default_true")]
     pub observed_badge: bool,
+    /// #3411 Phase 0a: opt-in fence for the experimental generic tool CLI.
+    /// This is deliberately nested so the experimental surface is explicit in
+    /// runtime-config.json and can be enabled only by the operator CLI.
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
     /// written before this field reads back as 0 (≤ CURRENT, loads normally);
     /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
@@ -93,6 +98,14 @@ pub struct RuntimeConfig {
     /// Higher context-window percent at which the handoff watchdog escalates to the operator.
     #[serde(default = "default_context_handoff_escalate")]
     pub context_handoff_escalate_pct: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    /// Generic `agend-terminal tool` transport is off unless the operator
+    /// explicitly enables it in an isolated environment.
+    #[serde(default)]
+    pub tool_cli_enabled: bool,
 }
 
 impl SchemaVersioned for RuntimeConfig {
@@ -150,6 +163,7 @@ impl Default for RuntimeConfig {
             copy_on_select: true,
             dim_unfocused_panes: true,
             observed_badge: true,
+            experimental: ExperimentalConfig::default(),
             context_alert_pct: default_context_alert(),
             context_handoff_pct: default_context_handoff(),
             context_handoff_escalate_pct: default_context_handoff_escalate(),
@@ -450,6 +464,13 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use on/off)")),
             };
         }
+        "experimental.tool_cli_enabled" => {
+            config.experimental.tool_cli_enabled = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(format!("invalid boolean: {value} (use true/false)")),
+            };
+        }
         "context_alert_pct" => {
             config.context_alert_pct = value
                 .parse()
@@ -515,6 +536,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "copy_on_select" => Ok(config.copy_on_select.to_string()),
         "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
         "observed_badge" => Ok(config.observed_badge.to_string()),
+        "experimental.tool_cli_enabled" => Ok(config.experimental.tool_cli_enabled.to_string()),
         "context_alert_pct" => Ok(config.context_alert_pct.to_string()),
         "context_handoff_pct" => Ok(config.context_handoff_pct.to_string()),
         "context_handoff_escalate_pct" => Ok(config.context_handoff_escalate_pct.to_string()),
@@ -540,7 +562,8 @@ pub fn keys() -> Vec<String> {
         // #1990: `schema_version` is on-disk metadata, not an operator-settable
         // key — keep it out of the `config` MCP tool's key list (set/get_key
         // reject it, so it must not appear as settable).
-        .filter(|k| k != "schema_version")
+        .filter(|k| k != "schema_version" && k != "experimental")
+        .chain(std::iter::once("experimental.tool_cli_enabled".to_string()))
         .collect()
 }
 

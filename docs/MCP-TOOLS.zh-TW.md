@@ -228,7 +228,7 @@ Drain 或管理 caller 的 durable inbox。
 讀取 runtime configuration。動作：`get`、`list`；MCP 不支援寫入。
 
 - `get` 需要 `key`。
-- 目前的 keys：`dev_idle_threshold_secs`、`fleet_idle_threshold_secs`、`fleet_idle_ack_ttl_secs`、`hang_auto_recovery_enabled`、`usage_limit_propagation_enabled`、`idle_watchdog_enabled`、`show_pane_state`、`copy_on_select`、`dim_unfocused_panes`、`observed_badge`、`context_alert_pct`、`context_handoff_pct`、`context_handoff_escalate_pct`。
+- 目前的 keys：`dev_idle_threshold_secs`、`fleet_idle_threshold_secs`、`fleet_idle_ack_ttl_secs`、`hang_auto_recovery_enabled`、`usage_limit_propagation_enabled`、`idle_watchdog_enabled`、`show_pane_state`、`copy_on_select`、`dim_unfocused_panes`、`observed_badge`、`context_alert_pct`、`context_handoff_pct`、`context_handoff_escalate_pct`、`experimental.tool_cli_enabled`。
 - 以 `agend-terminal admin config-set <KEY> <VALUE>` 修改值。
 
 ### `restart_daemon`
@@ -246,6 +246,10 @@ Drain 或管理 caller 的 durable inbox。
 Daemon 是 tool registry、authorization、task state 與 side effect 的唯一權威。
 `agend-mcp-bridge` 是 near-zero-state relay；它沒有本地 tool implementation，
 也沒有 filesystem fallback。
+
+實驗性的 `agend-terminal tool <NAME>` 指令使用相同的 daemon handler、名稱、
+參數與 instance claim。單一 instance 應一次使用一種 invocation surface；與
+使用另一種 surface 的 peer 協作時，請做機械式轉譯。
 
 ```text
 MCP client

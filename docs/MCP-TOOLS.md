@@ -228,7 +228,7 @@ Operator-only PREPARE step for a persisted usage-limit takeover episode. It writ
 Read runtime configuration. Actions: `get`, `list`; MCP mutation is not supported.
 
 - `get` requires `key`.
-- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`.
+- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`, `experimental.tool_cli_enabled`.
 - Change a value with `agend-terminal admin config-set <KEY> <VALUE>`.
 
 ### `restart_daemon`
@@ -246,6 +246,11 @@ Request a graceful daemon restart. Parameters: none.
 The daemon is the only authority for the tool registry, authorization, task
 state, and side effects. `agend-mcp-bridge` is a near-zero-state relay; it has
 no local tool implementation or filesystem fallback.
+
+The experimental `agend-terminal tool <NAME>` command uses the same daemon
+handlers, names, arguments, and instance claim as MCP. An instance should use
+one invocation surface at a time; translate mechanically when coordinating
+with a peer using the other surface.
 
 ```text
 MCP client

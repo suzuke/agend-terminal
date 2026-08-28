@@ -156,6 +156,18 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
     };
+    // #3411 Phase 0a: the CLI rides the existing MCP tool handler, but its
+    // transport is an explicitly fenced experimental surface.  Check the
+    // daemon-owned flag before role resolution or handler dispatch so the
+    // default-off path has no tool side effects.
+    if params.get("transport").and_then(Value::as_str) == Some("cli")
+        && !crate::runtime_config::get().experimental.tool_cli_enabled
+    {
+        return json!({
+            "ok": false,
+            "error": "tool CLI disabled: experimental.tool_cli_enabled is false"
+        });
+    }
     let args = params["arguments"].clone();
     let action = args
         .get("action")

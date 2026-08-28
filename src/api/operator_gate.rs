@@ -258,6 +258,7 @@ pub(crate) fn check_operation_allowed(
             "idle_watchdog_enabled",
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
+            "experimental.tool_cli_enabled",
         ];
         let key = params
             .get("arguments")

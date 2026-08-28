@@ -85,6 +85,34 @@ agend-terminal status                                       # alias of `list` (k
 
 當 `mode != live` 時，單純（非 JSON）的 `list` 會在 stderr 加上一行提示，讓互動式執行此指令的 operator 不必重跑 `--json` 也能看到 fallback 狀態。
 
+### `tool`（實驗性，Phase 0a）
+
+隱藏的 `tool` 指令是與 `agend-mcp-bridge` 使用相同 daemon MCP tools 的通用
+Bash 介面。daemon 圍欄預設關閉；operator 可在隔離環境以以下指令開啟：
+
+```
+agend-terminal admin config-set experimental.tool_cli_enabled true
+```
+
+從即時、依角色過濾的目錄與 schema 發現工具：
+
+```
+agend-terminal tool list
+agend-terminal tool schema send
+agend-terminal tool task --action get --arg id=t-123
+agend-terminal tool send --json - <<'EOF'
+{"instance":"ane-review","request_kind":"query","message":"..."}
+EOF
+```
+
+`--json` 接受內嵌 JSON object、`-`（stdin）或 `@FILE`。重複的
+`--arg K=V` 會以字串覆寫 JSON object，最後由 `--action` 覆寫 `action`。
+含引號、換行、`$` 或反引號的值必須使用帶引號的 `--json -` heredoc
+（`<<'EOF'`）。同一 instance 不應混用兩種 invocation surface。
+
+Exit code：`0` 完成（含 `accepted_in_progress`，不可重送）、`1` tool error、
+`2` refused／未執行、`3` 格式錯誤、`4` 結果不明（重送前先用唯讀 tool 查狀態）。
+
 ### `admin`
 
 Operator 端的維護子指令。具破壞性的路徑會提示 `[y/N]`，除非提供 `--yes`（供腳本化的復原任務使用）。

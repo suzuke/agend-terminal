@@ -591,6 +591,12 @@ pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
             if key.is_empty() {
                 return json!({"error": "key is required for get"});
             }
+            if key == "experimental.tool_cli_enabled" {
+                return json!({
+                    "key": key,
+                    "value": crate::runtime_config::list()["experimental"]["tool_cli_enabled"]
+                });
+            }
             match crate::runtime_config::get_key(key) {
                 Ok(v) => json!({"key": key, "value": v}),
                 Err(e) => json!({"error": e}),

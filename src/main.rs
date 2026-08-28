@@ -66,6 +66,7 @@ mod layout;
 mod logging;
 mod mcp;
 mod mcp_config;
+mod mcp_wire;
 pub(crate) mod merge_receipt;
 mod mouse_forward;
 mod notification_queue;
@@ -105,6 +106,7 @@ mod team_ops;
 mod teams;
 mod thread_census;
 mod token_cost;
+mod tool_cli;
 mod transport;
 #[cfg(feature = "tray")]
 mod tray;
@@ -118,7 +120,7 @@ mod worktree_cleanup;
 #[allow(dead_code)]
 mod worktree_pool;
 
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Cross-platform user home directory with temp_dir fallback.
@@ -357,6 +359,32 @@ enum Commands {
         /// Fleet instance whose durable channel locator and receipt log are used.
         #[arg(long)]
         instance: String,
+    },
+    /// Experimental generic MCP tool front end. The daemon-side fence is
+    /// closed by default; enable it only in an isolated test environment.
+    #[command(hide = true, name = "tool")]
+    Tool {
+        /// MCP tool name, or `list` / `schema` for live discovery.
+        #[arg(value_name = "NAME", index = 1)]
+        name: Option<String>,
+        /// Tool name following the `schema` discovery command.
+        #[arg(value_name = "SCHEMA_NAME", index = 2)]
+        second_name: Option<String>,
+        /// Action passed through as the JSON `action` argument.
+        #[arg(long)]
+        action: Option<String>,
+        /// JSON object, `-` for stdin, or `@FILE`.
+        #[arg(long, value_name = "JSON|-|@FILE")]
+        json: Option<String>,
+        /// String-valued argument override. Repeat for multiple arguments.
+        #[arg(long = "arg", value_name = "K=V")]
+        args: Vec<String>,
+        /// Daemon home directory (defaults to `$AGEND_HOME`).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Caller-supplied UUID for safe state-check/resend workflows.
+        #[arg(long)]
+        request_id: Option<String>,
     },
     /// Send input to an agent
     Inject {
@@ -805,7 +833,21 @@ fn main() -> anyhow::Result<()> {
     let process_entry = std::time::Instant::now();
     load_dotenv();
 
-    let cli = Cli::parse();
+    // `tool` owns its own exit-code contract (usage is 3, not clap's usual 2)
+    // so malformed tool invocations are handled by the generic front end.
+    let tool_requested = std::env::args().nth(1).as_deref() == Some("tool");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if tool_requested
+                && !matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) =>
+        {
+            eprintln!("{error}");
+            eprintln!("Usage: agend-terminal tool <NAME> [--action <A>] [--json <JSON|-|@FILE>] [--arg K=V]...");
+            std::process::exit(3);
+        }
+        Err(error) => error.exit(),
+    };
 
     // App mode redirects tracing to a log file (stderr is owned by ratatui).
     // The daemon child path (`start --foreground`, including the spawn_detached
@@ -1109,6 +1151,31 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::ChannelBridge { instance }) => {
             transport::claude_channel::run_channel_server(&home, &instance)?;
+        }
+        Some(Commands::Tool {
+            name,
+            second_name,
+            action,
+            json,
+            args,
+            home: tool_home,
+            request_id,
+        }) => {
+            let code = tool_cli::run(
+                &home,
+                tool_cli::ToolArgs {
+                    name,
+                    second_name,
+                    action,
+                    json,
+                    args,
+                    home: tool_home,
+                    request_id,
+                },
+            );
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Commands::Inject { name, text }) => {
             let text = text.join(" ");

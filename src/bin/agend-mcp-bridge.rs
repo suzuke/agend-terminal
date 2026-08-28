@@ -23,10 +23,12 @@
 //! - stdin/stdout: NDJSON JSON-RPC (MCP spec, one JSON object per line)
 //! - daemon: NDJSON over TCP loopback with cookie auth
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[path = "../mcp_wire.rs"]
+mod mcp_wire;
 
 /// Window for bridge-side `tools/call` content-dedup (#1000). Empirically
 /// the LLM double-fire produces calls within ~84 ms of each other; 500 ms
@@ -74,7 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
 
     // Lazy persistent TCP connection to daemon API.
-    let mut conn: Option<(BufReader<TcpStream>, TcpStream)> = None;
+    let mut conn: Option<mcp_wire::Client> = None;
 
     // #1000: bridge-side content-dedup state. Single most-recent
     // `tools/call` is enough — LLM double-fire shows up as consecutive
@@ -237,15 +239,16 @@ fn proxy_tool_call(
     instance: &str,
     tool: &str,
     args: &serde_json::Value,
-    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
+    conn: &mut Option<mcp_wire::Client>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let envelope = serde_json::json!({
-        "method": "mcp_tool",
-        "params": {"tool": tool, "arguments": args, "instance": instance}
-    });
+    let envelope = mcp_wire::mcp_tool_envelope(instance, tool, args);
     let resp = proxy_request(home, conn, &envelope)?;
     if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
+        if mcp_wire::classify_response(&resp) == mcp_wire::ResponseClass::Accepted {
+            Ok(resp)
+        } else {
+            Ok(resp["result"].clone())
+        }
     } else {
         let msg = resp["error"].as_str().unwrap_or("daemon error");
         Err(msg.into())
@@ -276,7 +279,7 @@ fn proxy_tool_call(
 fn proxy_tools_list_with_retry(
     home: &Path,
     instance: &str,
-    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
+    conn: &mut Option<mcp_wire::Client>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // test-only seam (see fn doc): prod always falls through to the 30_000 default.
     let timeout_ms: u64 = std::env::var("AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS")
@@ -288,8 +291,7 @@ fn proxy_tools_list_with_retry(
     // #2300 P0: pass the caller's instance so the daemon can subset the tool
     // list by role (mirrors the tool-call path). Empty → daemon serves the full
     // surface (default-all-open).
-    let envelope =
-        serde_json::json!({"method": "mcp_tools_list", "params": {"instance": instance}});
+    let envelope = mcp_wire::tools_list_envelope(instance);
     loop {
         match proxy_request(home, conn, &envelope) {
             Ok(resp) => {
@@ -317,9 +319,8 @@ fn proxy_tools_list_with_retry(
 ///
 /// The persistent connection in `conn` may be silently closed by the daemon
 /// after idle (post-auth read timeout) or by intervening network state. The
-/// first attempt's transport failure is therefore not surfaced — the
-/// connection is dropped, reopened, and the request retried exactly once.
-/// A second failure propagates so genuine errors are not masked.
+/// shared wire client drops the connection and retries transport failures
+/// exactly once. A second failure propagates so genuine errors are not masked.
 ///
 /// #842: a UUIDv4 `request_id` is injected into the envelope before the
 /// first attempt and **reused verbatim** on the retry — the retry IS the
@@ -328,137 +329,22 @@ fn proxy_tools_list_with_retry(
 /// reached us isn't replayed as a fresh side-effect call.
 fn proxy_request(
     home: &Path,
-    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
+    conn: &mut Option<mcp_wire::Client>,
     envelope: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let envelope_with_id = envelope_with_request_id(envelope);
-    let mut last_err: Option<Box<dyn std::error::Error>> = None;
-    for attempt in 0..2 {
-        match try_proxy_once(home, conn, &envelope_with_id) {
-            Ok(v) => return Ok(v),
-            Err(e) if attempt == 0 && is_retriable_io(&*e) => {
-                *conn = None;
-                last_err = Some(e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| "proxy retry exhausted".into()))
+    let client = conn.get_or_insert_with(mcp_wire::Client::default);
+    client
+        .request_with_retry(home, envelope)
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
 }
 
 /// Clone `envelope` with a freshly-minted `request_id` (UUIDv4) iff the
 /// caller didn't already set one. The whole point of the field is for
 /// the daemon to recognize the retry — generated once, sent twice on
 /// the retry path is exactly the right shape.
+#[cfg(test)]
 fn envelope_with_request_id(envelope: &serde_json::Value) -> serde_json::Value {
-    if envelope
-        .get("request_id")
-        .and_then(|v| v.as_str())
-        .is_some()
-    {
-        return envelope.clone();
-    }
-    let mut cloned = envelope.clone();
-    if let Some(obj) = cloned.as_object_mut() {
-        obj.insert(
-            "request_id".to_string(),
-            serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
-        );
-    }
-    cloned
-}
-
-fn try_proxy_once(
-    home: &Path,
-    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
-    envelope: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    ensure_connection(home, conn)?;
-    let (ref mut r, ref mut w) = conn
-        .as_mut()
-        .expect("connection established by ensure_connection");
-
-    writeln!(w, "{envelope}")?;
-    w.flush()?;
-
-    let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
-        return Err("daemon closed connection".into());
-    }
-
-    Ok(serde_json::from_str(line.trim())?)
-}
-
-/// Identify transport-level failures that justify a transparent reconnect.
-/// Classification goes through `io::ErrorKind` so it's portable across
-/// macOS / Linux / Windows error message wording. Application-level errors
-/// (bad JSON shape, daemon ok=false, our `"daemon closed connection"`
-/// sentinel for clean EOF) are also retriable since each represents a
-/// dropped peer; everything else propagates so a real bug isn't masked.
-fn is_retriable_io(err: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(io_err) = err.downcast_ref::<io::Error>() {
-        use io::ErrorKind::*;
-        return matches!(
-            io_err.kind(),
-            BrokenPipe
-                | ConnectionReset
-                | ConnectionAborted
-                | NotConnected
-                | UnexpectedEof
-                | WouldBlock
-                | TimedOut
-        );
-    }
-    // Our own EOF sentinel from `try_proxy_once`.
-    err.to_string().contains("daemon closed connection")
-}
-
-fn ensure_connection(
-    home: &Path,
-    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if conn.is_some() {
-        return Ok(());
-    }
-    *conn = Some(connect_daemon(home)?);
-    Ok(())
-}
-
-fn connect_daemon(
-    home: &Path,
-) -> Result<(BufReader<TcpStream>, TcpStream), Box<dyn std::error::Error>> {
-    let run_dir = find_run_dir(home)?;
-    let port = read_port_file(&run_dir)?;
-    let cookie = read_cookie_file(&run_dir)?;
-
-    let stream = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
-
-    let writer = stream.try_clone()?;
-    let mut rdr = BufReader::new(stream);
-
-    // Cookie handshake — include PID for daemon-side telemetry observability.
-    // Active peer-process invalidation is intentionally daemon-owned; see the
-    // bridge contract in docs/MCP-TOOLS.md.
-    let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
-    let pid = std::process::id();
-    let mut w = writer.try_clone()?;
-    writeln!(w, r#"{{"auth":"{hex}","pid":{pid}}}"#)?;
-    w.flush()?;
-
-    let mut resp = String::new();
-    rdr.read_line(&mut resp)?;
-    let auth_ok = serde_json::from_str::<serde_json::Value>(resp.trim())
-        .ok()
-        .and_then(|v| v.get("ok")?.as_bool())
-        .unwrap_or(false);
-    if !auth_ok {
-        return Err(format!("auth rejected: {}", resp.trim()).into());
-    }
-
-    Ok((rdr, writer))
+    mcp_wire::with_request_id(envelope)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +384,11 @@ fn write_message(stdout: &mut io::Stdout, json: &str) -> io::Result<()> {
 // Minimal filesystem helpers (NO crate:: dependencies — zero state)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+fn find_run_dir(home: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    mcp_wire::find_run_dir(home).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+}
+
 fn home_dir() -> PathBuf {
     if let Ok(h) = std::env::var("AGEND_HOME") {
         return PathBuf::from(h);
@@ -510,64 +401,6 @@ fn home_dir() -> PathBuf {
     } else {
         legacy
     }
-}
-
-fn find_run_dir(home: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let run_base = home.join("run");
-    for entry in std::fs::read_dir(&run_base)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let p = entry.path();
-            if p.join("api.port").exists() {
-                // Liveness check: the run dir is named with the daemon PID. Skip a
-                // STALE dir whose PID is dead (crashed daemon not yet swept) —
-                // otherwise the bridge reads a dead daemon's port + cookie and
-                // burns its connect-retry budget (or, if the port was reused,
-                // handshakes against an unrelated process). Mirrors the
-                // daemon-side `find_active_run_dir` liveness contract.
-                let alive = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .map(pid_is_alive)
-                    .unwrap_or(true); // non-PID-named dir: keep prior accept behavior
-                if !alive {
-                    continue;
-                }
-                return Ok(p);
-            }
-        }
-    }
-    Err("no active daemon run dir".into())
-}
-
-/// True if `pid` is a live process. Unix uses `kill(pid, 0)`; non-unix has no
-/// portable equivalent here, so it conservatively returns true (the daemon-side
-/// run-dir sweep stays the backstop) — the bug + fix are platform-agnostic but
-/// this liveness primitive is unix-only.
-fn pid_is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        pid != 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
-fn read_port_file(run_dir: &Path) -> Result<u16, Box<dyn std::error::Error>> {
-    Ok(std::fs::read_to_string(run_dir.join("api.port"))?
-        .trim()
-        .parse()?)
-}
-
-fn read_cookie_file(run_dir: &Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let mut f = std::fs::File::open(run_dir.join("api.cookie"))?;
-    let mut buf = [0u8; 32];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 fn extract_id(body: &str) -> String {

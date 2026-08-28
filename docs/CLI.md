@@ -85,6 +85,42 @@ agend-terminal status                                       # alias of `list` (k
 
 Plain (non-JSON) `list` adds a one-line stderr hint when `mode != live` so an operator running the command interactively sees the fallback state without re-running with `--json`.
 
+### `tool` (experimental, Phase 0a)
+
+The hidden `tool` command is a generic Bash front end for the same daemon MCP
+tools used by `agend-mcp-bridge`. The daemon fence is off by default; an
+operator may enable it in an isolated environment with:
+
+```
+agend-terminal admin config-set experimental.tool_cli_enabled true
+```
+
+Use the live role-filtered catalogue and schemas rather than copying tool
+definitions into scripts:
+
+```
+agend-terminal tool list
+agend-terminal tool schema send
+agend-terminal tool task --action get --arg id=t-123
+agend-terminal tool send --json - <<'EOF'
+{"instance":"ane-review","request_kind":"query","message":"..."}
+EOF
+```
+
+`--json` accepts an inline JSON object, `-` for stdin, or `@FILE`. Repeated
+`--arg K=V` values are strings and override the JSON object; `--action` then
+overrides its `action` member. Values containing quotes, newlines, `$`, or
+backticks must use a quoted `--json -` heredoc (`<<'EOF'`).
+
+The command sends the same tool name, arguments, and instance claim as MCP,
+with `transport:"cli"`. Do not mix invocation surfaces within an instance.
+Exit codes are: `0` completed (including `accepted_in_progress`, which must
+not be resent), `1` tool error, `2` refused/not executed, `3` malformed usage,
+and `4` indeterminate (check state with a read-only tool before resending).
+
+For agent automation, allow the command family explicitly, for example
+`Bash(agend-terminal tool:*)`.
+
 ### `admin`
 
 Operator-side housekeeping subcommands. Destructive paths prompt `[y/N]` unless `--yes` is supplied (intended for scripted recovery jobs).
