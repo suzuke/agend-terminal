@@ -155,9 +155,12 @@ const CLIENT_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// and a peer that trickles a byte at a time faster than `RETIREMENT_POLL`, which
 /// keeps `read` in its `Ok` arm forever. `retired` is therefore consulted before
 /// EVERY read rather than in the timeout arm — the cookie is at most
-/// `COOKIE_LEN` bytes, so that is a bounded number of checks per connection. The
-/// overall budget is unchanged, EOF and a wrong cookie are still refusals, and a
-/// complete cookie still goes through the existing constant-time `verify`.
+/// `COOKIE_LEN` bytes, so that is a bounded number of checks per connection, plus
+/// one final check after the cookie is complete — without it, a cookie delivered
+/// by a single read would be verified against a check made before that read even
+/// started. The overall budget is unchanged, EOF and a wrong cookie are still
+/// refusals, and a complete cookie still goes through the existing constant-time
+/// `verify`.
 ///
 /// `retired` is injected rather than derived here so a test can pin the exact
 /// interleaving of checks and reads without a sleep; the accept loop passes the
@@ -186,6 +189,13 @@ fn read_and_verify_tui_cookie(
                     || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return false,
         }
+    }
+    // The fill loop can exit without ever re-checking: a cookie that arrives in
+    // one read is checked only BEFORE that read. Retirement during an in-flight
+    // read would then go unnoticed and a correct cookie would authenticate onto
+    // the retired generation, so the last word before `verify` is this check.
+    if retired() {
+        return false;
     }
     crate::auth_cookie::verify(cookie, &got)
 }
