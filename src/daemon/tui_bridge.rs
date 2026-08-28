@@ -369,6 +369,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// A connected loopback pair plus a SECOND handle on the server side.
@@ -444,50 +445,202 @@ mod tests {
     /// that sends 1 of the 32 cookie bytes pins the whole loop for the auth
     /// budget — a retired bridge keeps accepting for ~10s after the successor
     /// took the name. Measured at 8cd95769 by an independent reviewer: ~10.17s.
+    ///
+    /// The injected predicate is what makes this deterministic instead of a
+    /// race: it reports "not retired" for the FIRST check and retired for every
+    /// one after it, so an entry-only check cannot satisfy the test — it would
+    /// see a live bridge, enter `read`, and burn the whole budget on a peer that
+    /// never sends its 31st byte. No sleep is involved.
     #[test]
     fn stalled_auth_peer_does_not_outlive_retirement() {
-        let run_dir = scratch_run_dir("stalled-auth");
-        publish_port(&run_dir, "agent", 4242);
         let pair = socket_pair();
-        let cookie: crate::auth_cookie::Cookie = [7u8; 32];
-
-        let mut stalled = pair.peer;
         let mut server = pair.server;
-        let dir = run_dir.clone();
-        let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
-        let auth = std::thread::spawn(move || {
-            started_tx.send(()).ok();
-            super::read_and_verify_tui_cookie(&mut server, &cookie, &dir, "agent", 4242)
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("auth thread must start");
+        let mut stalled = pair.peer;
+        let cookie: crate::auth_cookie::Cookie = [7u8; crate::auth_cookie::COOKIE_LEN];
 
-        // One byte of the 32, then silence: the read is now genuinely in flight.
+        // One byte of the 32, then silence: the read is genuinely in flight.
         stalled.write_all(&[7u8]).unwrap();
         stalled.flush().unwrap();
 
-        // Let the helper take several read timeouts INSIDE its loop before the
-        // bridge is retired. This is what makes the test non-vacuous: at entry
-        // the port file still named this bridge, so an entry-only precheck
-        // cannot satisfy it — only a check between reads can.
-        std::thread::sleep(super::RETIREMENT_POLL * 3);
+        let checks = AtomicUsize::new(0);
+        let retired = || checks.fetch_add(1, Ordering::SeqCst) > 0;
 
-        let retired_at = Instant::now();
-        publish_port(&run_dir, "agent", 4343);
+        let started = Instant::now();
+        let accepted = super::read_and_verify_tui_cookie(&mut server, &cookie, &retired);
+        let elapsed = started.elapsed();
 
-        let accepted = auth.join().unwrap();
-        // Measured from the RETIREMENT, not from the start of the read.
-        let elapsed = retired_at.elapsed();
+        assert!(!accepted, "a partial cookie must never authenticate");
+        assert!(
+            checks.load(Ordering::SeqCst) >= 2,
+            "retirement must be re-checked BETWEEN reads, not only on entry; the read saw {} \
+             check(s)",
+            checks.load(Ordering::SeqCst)
+        );
+        assert!(
+            elapsed <= Duration::from_secs(1),
+            "a retired bridge must abandon an in-flight stalled auth read promptly rather than \
+             hold the serialized accept loop for the whole auth budget; took {elapsed:?}"
+        );
+    }
+
+    /// #3373 follow-up, second shape of the same hole: a peer that TRICKLES the
+    /// cookie keeps `read` in its `Ok` arm and never reaches a read timeout, so
+    /// a retirement check that lives in the timeout arm is never consulted at
+    /// all. The bytes here are the CORRECT cookie, which is what makes the
+    /// failure severe: such an implementation does not merely stall, it
+    /// AUTHENTICATES a client onto a dead generation. The assertion is on the
+    /// outcome, not on a clock — the trickle interval only has to stay under
+    /// `RETIREMENT_POLL`, and drifting slower is safe for the fixed code.
+    #[test]
+    fn trickling_auth_peer_does_not_outlive_retirement() {
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let mut peer = pair.peer;
+        let cookie: crate::auth_cookie::Cookie = [7u8; crate::auth_cookie::COOKIE_LEN];
+
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..crate::auth_cookie::COOKIE_LEN {
+                if peer.write_all(&[7u8]).is_err() || peer.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(super::RETIREMENT_POLL / 4);
+            }
+        });
+
+        let checks = AtomicUsize::new(0);
+        let retired = || checks.fetch_add(1, Ordering::SeqCst) > 0;
+
+        let accepted = super::read_and_verify_tui_cookie(&mut server, &cookie, &retired);
+        let _ = trickle.join();
+
+        assert!(
+            !accepted,
+            "a retired bridge must refuse a client even when its cookie is correct — the \
+             successor owns the name"
+        );
+    }
+
+    /// The two tests above drive the predicate directly; this one pins the
+    /// PRODUCTION signal behind it — the real `is_retired` over a real port
+    /// file — so the wiring cannot rot into something only a test predicate
+    /// satisfies.
+    #[test]
+    fn a_republished_port_file_ends_an_in_flight_auth_read() {
+        let run_dir = scratch_run_dir("auth-wiring");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let mut stalled = pair.peer;
+        let cookie: crate::auth_cookie::Cookie = [7u8; crate::auth_cookie::COOKIE_LEN];
+
+        stalled.write_all(&[7u8]).unwrap();
+        stalled.flush().unwrap();
+
+        let successor_dir = run_dir.clone();
+        let successor = std::thread::spawn(move || {
+            // Long enough that the read is unambiguously in flight; the bridge
+            // is NOT retired at entry, so an entry-only check would still see a
+            // live port file here.
+            std::thread::sleep(super::RETIREMENT_POLL * 2);
+            publish_port(&successor_dir, "agent", 4343);
+            Instant::now()
+        });
+
+        let dir = run_dir.clone();
+        let accepted = super::read_and_verify_tui_cookie(&mut server, &cookie, &|| {
+            super::is_retired(&dir, "agent", 4242)
+        });
+        let returned_at = Instant::now();
+        let retired_at = successor.join().unwrap();
 
         drop(stalled);
         std::fs::remove_dir_all(&run_dir).ok();
         assert!(!accepted, "a partial cookie must never authenticate");
         assert!(
-            elapsed <= Duration::from_secs(1),
-            "a retired bridge must abandon an in-flight stalled auth read promptly rather than \
-             hold the serialized accept loop for the whole auth budget; took {elapsed:?} after \
-             retirement"
+            returned_at >= retired_at,
+            "the read must still have been in flight when the successor published its port"
+        );
+        assert!(
+            returned_at.duration_since(retired_at) <= Duration::from_secs(1),
+            "took {:?} after retirement",
+            returned_at.duration_since(retired_at)
+        );
+    }
+
+    /// Cookie framing semantics, now pinned on the production path: exactly the
+    /// cookie authenticates, a mismatch does not, and a truncated stream does
+    /// not. `auth_cookie::read_and_verify_tui` was their previous home; the
+    /// retirement-aware read replaces its only production caller.
+    #[test]
+    fn cookie_read_accepts_the_exact_cookie_and_rejects_mismatch_or_eof() {
+        let cookie: crate::auth_cookie::Cookie = [0x5a; crate::auth_cookie::COOKIE_LEN];
+        let live = || false;
+
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let mut peer = pair.peer;
+        peer.write_all(&cookie).unwrap();
+        peer.flush().unwrap();
+        assert!(
+            super::read_and_verify_tui_cookie(&mut server, &cookie, &live),
+            "the exact cookie must authenticate"
+        );
+
+        let mut wrong = cookie;
+        wrong[crate::auth_cookie::COOKIE_LEN - 1] ^= 0xFF;
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let mut peer = pair.peer;
+        peer.write_all(&wrong).unwrap();
+        peer.flush().unwrap();
+        assert!(
+            !super::read_and_verify_tui_cookie(&mut server, &cookie, &live),
+            "a flipped byte must be refused"
+        );
+
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let mut peer = pair.peer;
+        peer.write_all(&cookie[..crate::auth_cookie::COOKIE_LEN - 1])
+            .unwrap();
+        peer.flush().unwrap();
+        drop(peer);
+        assert!(
+            !super::read_and_verify_tui_cookie(&mut server, &cookie, &live),
+            "a truncated cookie followed by EOF must be refused"
+        );
+    }
+
+    /// #3373, the accept loop's own write: the version byte and the initial
+    /// dump go out on the SERIALIZED accept thread, before the per-client
+    /// forwarder exists. Unbounded, a client that never reads its greeting
+    /// wedges the whole loop — the same harm as the stalled auth read, one step
+    /// later. Greeting such a client must fail closed and promptly.
+    #[test]
+    fn a_client_that_never_reads_cannot_wedge_the_initial_greeting() {
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let peer = pair.peer;
+        socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
+        socket2::SockRef::from(&server).set_send_buffer_size(4096).unwrap();
+
+        // Under `framing::DEFAULT_FRAME_LIMIT` so the frame is genuinely
+        // written rather than refused, and far over the shrunk buffers so it
+        // cannot complete against a peer that never reads.
+        let dump = vec![0x41; 256 * 1024];
+
+        let started = Instant::now();
+        let greeted = super::greet_authenticated_client(&mut server, &dump);
+        let elapsed = started.elapsed();
+
+        drop(peer);
+        assert!(
+            !greeted,
+            "a client that never takes its greeting must be refused, not waited on"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "the serialized accept loop must not park in the greeting write; took {elapsed:?}"
         );
     }
 
