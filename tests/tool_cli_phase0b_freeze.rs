@@ -130,6 +130,40 @@ fn acceptance_table_metadata_is_frozen() {
     );
 }
 
+/// (c2) The restart boundary is written into the frozen contract, not just into
+/// a task description.
+///
+/// SPEC section 6 already says a grader/prompt/table edit restarts the matrix
+/// under a new commit A'. What it did not say is how MANY runs that authorizes
+/// and WHEN they may start — so "restart from zero" could be read as a standing
+/// licence to keep running matrices under the same A' until one passes, which is
+/// exactly the shape that turns a safety gate into a lottery. The boundary is
+/// pinned here because SPEC.txt is frozen: changing it forces a re-freeze and a
+/// new A'.
+#[test]
+fn spec_pins_exactly_one_run_after_dual_review() {
+    let spec = std::fs::read_to_string(eval_dir().join("SPEC.txt")).expect("read SPEC.txt");
+    let section = spec
+        .split_once("6. Confirmation matrix")
+        .expect("SPEC section 6 present")
+        .1
+        .split_once("\n7. Scenario definitions")
+        .expect("section 6 ends before section 7")
+        .0;
+    for needle in [
+        "EXACTLY ONE",
+        "210-run",
+        "dual",
+        "VERIFIED",
+        "before both verdicts exist",
+    ] {
+        assert!(
+            section.contains(needle),
+            "SPEC section 6 must state the restart authority in full — missing {needle:?}"
+        );
+    }
+}
+
 /// (d) No scenario can smuggle in a critical class outside the taxonomy.
 #[test]
 fn expect_scripts_only_emit_taxonomy_critical_classes() {
