@@ -664,6 +664,7 @@ pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
 pub(crate) fn in_progress_error() -> Value {
     json!({
         "ok": false,
+        "status": "in_progress",
         "error": "in_progress (duplicate request_id still executing on another session)"
     })
 }
@@ -671,6 +672,7 @@ pub(crate) fn in_progress_error() -> Value {
 pub(crate) fn oversized_error() -> Value {
     json!({
         "ok": false,
+        "status": "oversized",
         "error": "duplicate request_id; original response exceeded cache size cap"
     })
 }
@@ -678,6 +680,7 @@ pub(crate) fn oversized_error() -> Value {
 pub(crate) fn handler_errored(detail: &str) -> Value {
     json!({
         "ok": false,
+        "status": "handler_errored",
         "error": format!("duplicate request_id; original handler failed: {detail}")
     })
 }
