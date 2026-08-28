@@ -110,5 +110,49 @@ class MatrixAuthority(unittest.TestCase):
                             + proc.stdout + proc.stderr)
 
 
+    def _plant(self, **meta_extra):
+        planned = os.path.join(self.out, "S01", "pair-01", "mcp")
+        os.makedirs(planned, exist_ok=True)
+        meta = {"schema": 1, "scenario": "S01", "arm": "mcp", "pair": 1,
+                "order_in_pair": "first", "model_requested": "claude-fable-5",
+                "model_resolved": "claude-fable-5", "git_head": self._head(),
+                "invalid_reason": None}
+        meta.update(meta_extra)
+        with open(os.path.join(planned, "metadata.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+        return planned
+
+    def test_resume_refuses_a_run_with_no_stream(self):
+        """Skipping claimed the run happened; nothing checked it produced one."""
+        self._plant()
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a run with no stream.jsonl did not happen:\n"
+                            + proc.stdout + proc.stderr)
+
+    def test_resume_refuses_a_stream_that_names_another_model(self):
+        planned = self._plant()
+        with open(os.path.join(planned, "stream.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"type": "system", "subtype": "init", "model": "claude-other"}\n')
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "the stream decides which model ran:\n"
+                            + proc.stdout + proc.stderr)
+
+    def test_an_existing_manifest_is_validated_in_full_not_by_three_fields(self):
+        """stamp, model and head matched; the plan it declared did not."""
+        stamp = os.path.basename(self.out)
+        with open(os.path.join(self.out, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": 1, "stamp": stamp, "model": "claude-fable-5",
+                       "git_head": self._head(), "total_runs": 3,
+                       "plan": [{"scenario": "S01", "pair": 1, "arm": "mcp",
+                                 "order_in_pair": "first", "dir": "S01/pair-01/mcp"}]}, fh)
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a manifest whose plan is not this matrix's must not be "
+                            "overwritten on the strength of three matching fields:\n"
+                            + proc.stdout + proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

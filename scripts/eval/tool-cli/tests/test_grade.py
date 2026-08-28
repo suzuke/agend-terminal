@@ -997,6 +997,76 @@ class Aggregation(TempCase):
         self.assertFalse(summary["plan_gate"]["pass"])
         self.assertIn("manifest_incomplete", summary["plan_gate"]["flags"])
 
+    # ---- A⁵ review: required invalid_reason, full manifest values, one identity ----
+
+    def test_invalid_reason_must_be_present(self):
+        """SPEC.txt:68 lists it. Absent read as "nothing to report"."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"invalid_reason": DROP})
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]], ["metadata_incomplete"])
+
+    def test_a_junk_plan_row_cannot_hide_among_the_210(self):
+        """Non-dict rows were filtered out before comparing, so they were free."""
+        runs, scen = self.frozen_matrix()
+        write_manifest(runs, plan=frozen_manifest_rows() + ["not-a-row"])
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_plan_mismatch", summary["plan_gate"]["flags"])
+
+    def test_the_manifest_identity_values_are_checked_not_just_present(self):
+        """A complete manifest can still describe another experiment."""
+        runs, scen = self.frozen_matrix()
+        write_manifest(runs, model="claude-other")
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_identity_invalid", summary["plan_gate"]["flags"])
+
+    def test_every_run_must_carry_the_manifest_identity(self):
+        """The manifest said one head and binary; nothing checked the runs agreed."""
+        runs, scen = self.frozen_matrix()
+        victim = os.path.join(runs, "S01-mcp-p1", "metadata.json")
+        with open(victim, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["git_head"] = "f" * 40
+        with open(victim, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_identity_mismatch", summary["plan_gate"]["flags"])
+
+    def test_the_matrix_must_be_one_experiment_not_several(self):
+        """fleet identity is matrix-wide; seed identity is per scenario.
+
+        A matrix assembled from two different fleets, or a scenario whose runs
+        were seeded from two different seed scripts, is not one experiment — and
+        nothing said so.
+        """
+        runs, scen = self.frozen_matrix()
+        victim = os.path.join(runs, "S02-cli-p4", "metadata.json")
+        with open(victim, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["fleet_sha256"] = "a" * 64
+        with open(victim, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+        split_fleet = grade.aggregate(runs, scen)
+        self.assertFalse(split_fleet["plan_gate"]["pass"])
+        self.assertIn("run_identity_split", split_fleet["plan_gate"]["flags"])
+
+        self.setUp()
+        runs, scen = self.frozen_matrix()
+        victim = os.path.join(runs, "S03-mcp-p5", "metadata.json")
+        with open(victim, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["seed_sha256"] = "b" * 64
+        with open(victim, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+        split_seed = grade.aggregate(runs, scen)
+        self.assertFalse(split_seed["plan_gate"]["pass"])
+        self.assertIn("run_identity_split", split_seed["plan_gate"]["flags"])
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
