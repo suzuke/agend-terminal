@@ -1054,6 +1054,68 @@ fn malformed_session_selector_refuses_without_deleting_3414() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3414 RED (preflight side-effect): malformed fresh args must be rejected
+/// before operator-recovery bookkeeping runs. The old ordering cleared the
+/// persisted `failed_escalated` latch before the typed sanitizer, changing the
+/// escalation store even though the restart was refused.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn malformed_session_selector_preserves_escalation_runtime_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-preflight-side-effect", "[\"--resume=\"]");
+    crate::daemon::escalation_persist::persist(
+        &home,
+        "dev",
+        &crate::health::PersistedEscalation {
+            total_crashes: 4,
+            crash_times_epoch_ms: vec![111, 222],
+            last_crash_notification_epoch_ms: Some(333),
+            last_hung_notification_epoch_ms: Some(444),
+            hung_since_epoch_ms: Some(555),
+            failed_escalated: true,
+        },
+    );
+    let escalation_path = home.join("health_escalation.json");
+    let escalation_before = std::fs::read(&escalation_path).expect("escalation store");
+    let fleet_before =
+        std::fs::read(crate::fleet::fleet_yaml_path(&home)).expect("fleet.yaml");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let refused = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    assert_eq!(refused["code"], "fresh_session_args_invalid");
+    assert_eq!(
+        std::fs::read(&escalation_path).expect("escalation store after refusal"),
+        escalation_before,
+        "#3414: rejected preflight must not rewrite escalation persistence"
+    );
+    assert_eq!(
+        std::fs::read(crate::fleet::fleet_yaml_path(&home)).expect("fleet.yaml after refusal"),
+        fleet_before,
+        "#3414: rejected preflight must not rewrite the live instance config"
+    );
+    assert!(
+        !crate::agent::deleting::is_deleting(&home, "dev"),
+        "#3414: rejected preflight must not enter the delete window"
+    );
+    assert!(
+        LAST_SPAWN_ARGS.lock().is_none(),
+        "#3414: rejected preflight must not reach SPAWN or arm self-kick"
+    );
+    assert!(
+        runtime.registry.lock().is_empty(),
+        "#3414: rejected preflight must not mutate runtime registry state"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3414 D2 helper: a self-kick delivery the OLD session accepted but never
 /// acknowledged, recorded far enough in the past to be past the watchdog's
 /// acknowledgement window.
