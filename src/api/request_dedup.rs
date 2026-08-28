@@ -706,6 +706,27 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[test]
+    fn dedup_error_envelopes_are_indeterminate_on_wire() {
+        let cases = [
+            ("in_progress", in_progress_error()),
+            ("oversized", oversized_error()),
+            ("handler_errored", handler_errored("handler failed")),
+        ];
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(name, response)| {
+                let actual = crate::mcp_wire::classify_response(&response);
+                (actual != crate::mcp_wire::ResponseClass::Indeterminate)
+                    .then_some((name, actual, response))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "dedup error envelopes must be indeterminate: {mismatches:?}"
+        );
+    }
+
     /// #868 — spin-wait helper used by the in-progress / over-cap
     /// coordination tests below. Replaces the old `thread::sleep(50ms)`
     /// gating which flaked on slow macOS GH-runners (#856 + #866 + #867).

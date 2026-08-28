@@ -104,6 +104,16 @@ fn mcp_tool(
     )
 }
 
+fn run_tool_cli(home: &Path, args: &[String]) -> std::process::Output {
+    Command::cargo_bin("agend-terminal")
+        .unwrap()
+        .env("AGEND_HOME", home)
+        .env("AGEND_INSTANCE_NAME", "probe")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn home_contains(home: &Path, needle: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(home) else {
         return false;
@@ -281,6 +291,99 @@ fn non_operator_config_set_remains_refused_for_experimental_key() {
                 .unwrap_or("")
                 .contains("not available"),
         "refusal must be actionable: {response}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+#[serial]
+fn real_daemon_oversized_same_request_id_replay_is_indeterminate() {
+    let home = hermetic_home("oversized-replay");
+    std::fs::create_dir_all(&home).unwrap();
+    let enabled = Command::cargo_bin("agend-terminal")
+        .unwrap()
+        .env("AGEND_HOME", &home)
+        .args([
+            "admin",
+            "config-set",
+            "experimental.tool_cli_enabled",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        enabled.status.success(),
+        "test must enable the experimental CLI fence: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+
+    let harness = AgendHarness::spawn_with(home.clone(), minimal_fleet(), "start").unwrap();
+    let operator = hex_file(&run_dir_of(&harness).join("api.operator"));
+    let created = mcp_tool(
+        &harness,
+        &operator,
+        "probe",
+        "task",
+        json!({
+            "action": "create",
+            "title": "oversized replay target",
+            "description": "x".repeat(70 * 1024),
+        }),
+        None,
+    );
+    assert_eq!(
+        created["ok"], true,
+        "large task creation must succeed: {created}"
+    );
+    let task_id = created["result"]["id"]
+        .as_str()
+        .expect("large task creation must return an id")
+        .to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let get_json = serde_json::to_string(&json!({
+        "action": "get",
+        "id": task_id,
+    }))
+    .unwrap();
+    let args = vec![
+        "tool".to_string(),
+        "task".to_string(),
+        "--json".to_string(),
+        get_json,
+        "--request-id".to_string(),
+        request_id,
+        "--home".to_string(),
+        home.to_string_lossy().into_owned(),
+    ];
+
+    let first = run_tool_cli(&home, &args);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "first large task get must execute successfully: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        first.stdout.len() > 64 * 1024,
+        "first task get must exceed the dedup cache cap: {} bytes",
+        first.stdout.len()
+    );
+
+    let replay = run_tool_cli(&home, &args);
+    assert_eq!(
+        replay.status.code(),
+        Some(4),
+        "oversized same-request-id replay must be indeterminate, not a refused exit 2: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&replay.stdout).contains("\"status\": \"oversized\""),
+        "oversized replay must identify its indeterminate status: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
     );
 
     drop(harness);
