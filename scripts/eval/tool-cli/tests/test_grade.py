@@ -854,12 +854,9 @@ class Aggregation(TempCase):
     def test_the_manifest_plan_must_be_the_frozen_plan(self):
         """A tree can carry a manifest that describes a different experiment."""
         runs, scen = self.frozen_matrix()
-        manifest = {"schema": 1, "total_runs": 209,
-                    "plan": [{"scenario": s, "pair": p, "arm": a,
-                              "dir": "%s/pair-%02d/%s" % (s, p, a)}
-                             for (s, p, a) in self.FROZEN_CELLS[:-1]]}
-        with open(os.path.join(runs, "manifest.json"), "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh)
+        # a COMPLETE manifest whose plan describes 209 runs — the identity fields
+        # are all there, so what fails is the plan itself
+        write_manifest(runs, plan=frozen_manifest_rows()[:-1], total_runs=209)
         summary = grade.aggregate(runs, scen)
         self.assertFalse(summary["plan_gate"]["pass"])
         self.assertIn("manifest_plan_mismatch", summary["plan_gate"]["flags"])

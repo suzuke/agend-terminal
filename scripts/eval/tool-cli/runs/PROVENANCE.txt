@@ -27,9 +27,27 @@ environment, and resume skipped any directory holding a metadata.json without
 reading it. The summary therefore gained a `plan_gate`, which means a new run's
 summary.json is not key-comparable to the two below.
 
+A fourth round asked for four more: multiplicity counted over ALL discovered runs
+with the observed count required to BE 210; one order_in_pair per cell agreed by
+plan, run and resume; invalid_reason and schema typed strictly (a number used to
+become the run's own reason, and True passed as schema 1); and a mandatory,
+complete manifest, with matrix.sh refusing to overwrite a run directory or a
+manifest it cannot account for.
+
+The order fix is the one worth reading twice, because it changes how the runs
+BELOW grade. matrix.sh planned "only" for the single-arm controls while run.sh
+recorded "first"/"second" by parity, so those two disagreed for all 90 control
+runs. SPEC.txt:65 types metadata order_in_pair ("first"|"second"), so the parity
+value is now what plan, manifest and run all carry. The consequence for the two
+runs below: all 210 of E2's runs are still valid and every measurement is
+unchanged (n=60, b=c=0, rate/critical/mixing still pass), but its MANIFEST still
+says "only" on those 90 rows, so the plan gate flags manifest_plan_mismatch and
+pilot_safety reads False. The old tree fails on exactly the disagreement this
+round removes, not on anything it measured.
+
 Fixing all of it changed frozen files, so grade.py is now
-65d944972855f5b960a98ef2d8c9f12167c282bbf76aa1587d051e8e439dcb37 and matrix.sh is
-a5d70a792bd08af30818971b88f89e49c3678b4a68c8456c049d7f97913ad21e; this harness is a NEW commit A'.
+62e219d47b6aa3f7ee6c8f0e9d9e5dcde4d28a4b8b506486206dd43a714497cf and matrix.sh is
+c7d3c0d5bb876e447dd97ab9c0ee806d38613abb6b82d687f10ddf191fbb5ab4; this harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
 edits after commit A — if one is needed, the matrix restarts from zero under a

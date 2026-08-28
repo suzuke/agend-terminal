@@ -91,7 +91,7 @@ def _is_int(value):
 #: have. model_requested/model_resolved are checked separately, with their own
 #: reasons. Extra keys are fine — this is a floor, not a schema.
 REQUIRED_META = (
-    ("schema", lambda v: v == 1),
+    ("schema", lambda v: _is_int(v) and v == 1),
     ("scenario", _is_str),
     ("pair", lambda v: _is_int(v) and v >= 1),
     ("order_in_pair", lambda v: v in ("first", "second", "only")),
@@ -113,6 +113,15 @@ REQUIRED_META = (
 )
 
 
+def frozen_order(pair, arm):
+    """Which arm goes first in a pair: odd -> mcp, even -> cli (run.sh's rule).
+
+    Single-arm scenarios record it too — SPEC.txt:65 gives metadata only
+    ("first"|"second") — so plan, run and resume all name the same value.
+    """
+    return "first" if arm == ("mcp" if pair % 2 else "cli") else "second"
+
+
 def _frozen_plan():
     """SPEC section 6's plan, in the order matrix.sh lays it down."""
     plan = []
@@ -129,6 +138,12 @@ def _frozen_plan():
 
 FROZEN_PLAN = _frozen_plan()
 FROZEN_PLAN_CELLS = frozenset(FROZEN_PLAN)
+
+#: What matrix.sh records about the run it is describing. A tree with no account
+#: of itself, or a partial one, is not a matrix we can accept.
+MANIFEST_FIELDS = ("schema", "stamp", "created_at", "dry_run", "git_head", "model",
+                   "jobs", "binary_sha256", "prompt_sha256", "missing_scenarios",
+                   "total_runs", "plan")
 
 MIXING_DENOMINATOR = 45
 CONFIRMATION_SCENARIOS = ("S01", "S02", "S03", "S04", "S05", "S06")
@@ -773,7 +788,11 @@ def load_expect(scenarios_dir, scenario):
 
 def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=None,
                    events=None):
+    # SPEC.txt:68 types this null|string. Anything else used to become the run's
+    # own account of why it was excluded (#3412 A\u2374 review).
     reason = meta.get("invalid_reason")
+    if reason is not None and not isinstance(reason, str):
+        return "metadata_incomplete"
     if reason:
         return reason
     if meta.get("timed_out"):
@@ -810,6 +829,9 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
         return "scenario_declaration_invalid"
     if arm not in declared:
         return "arm_not_declared"
+    cell = (meta.get("scenario"), meta.get("pair"), arm)
+    if cell in FROZEN_PLAN_CELLS and meta.get("order_in_pair") != frozen_order(cell[1], arm):
+        return "order_in_pair_mismatch"
     return None
 
 
@@ -987,8 +1009,10 @@ def aggregate(runs_dir, scenarios_dir=None):
     # Two runs claiming one (scenario, pair, arm) used to collapse into whichever
     # arrived last. Which one is the real run is not the grader's to guess, so
     # both go (#3412 r2 review).
+    # Every discovered run occupies its cell, whatever its verdict: a second copy
+    # marked invalid is still a second copy (#3412 A\u2374 review).
     cells_seen = collections.Counter(
-        (g["scenario"], g["pair"], g["arm"]) for g in graded if not g["invalid"])
+        (g["scenario"], g["pair"], g["arm"]) for g in graded)
     duplicate_cells = sorted((cell for cell, count in cells_seen.items() if count > 1),
                              key=str)
     for g in graded:
@@ -1054,22 +1078,35 @@ def aggregate(runs_dir, scenarios_dir=None):
     observed_cells = set(observed)
     plan_flags = []
     manifest_path = os.path.join(runs_dir, "manifest.json")
-    if os.path.exists(manifest_path):
-        declared_cells = None
+    manifest = None
+    if not os.path.exists(manifest_path):
+        plan_flags.append("manifest_missing")
+    else:
         try:
             with open(manifest_path, "r", encoding="utf-8") as fh:
-                rows = json.load(fh).get("plan")
-            if isinstance(rows, list):
-                declared_cells = [(row.get("scenario"), row.get("pair"), row.get("arm"))
-                                  for row in rows if isinstance(row, dict)]
-        except (ValueError, AttributeError):
-            declared_cells = None
-        if declared_cells != list(FROZEN_PLAN):
+                manifest = json.load(fh)
+        except ValueError:
+            manifest = None
+        if not isinstance(manifest, dict) or any(f not in manifest for f in MANIFEST_FIELDS):
+            plan_flags.append("manifest_incomplete")
+            manifest = None
+    if manifest is not None:
+        rows = manifest.get("plan")
+        declared = None
+        if isinstance(rows, list):
+            declared = [(row.get("scenario"), row.get("pair"), row.get("arm"),
+                         row.get("order_in_pair"), row.get("dir"))
+                        for row in rows if isinstance(row, dict)]
+        expected = [(scenario, pair, arm, frozen_order(pair, arm),
+                     "%s/pair-%02d/%s" % (scenario, pair, arm))
+                    for (scenario, pair, arm) in FROZEN_PLAN]
+        if declared != expected or manifest.get("total_runs") != len(FROZEN_PLAN):
             plan_flags.append("manifest_plan_mismatch")
     missing_cells = sorted(FROZEN_PLAN_CELLS - observed_cells, key=str)
     unexpected_cells = sorted(observed_cells - FROZEN_PLAN_CELLS, key=str)
     plan_gate = {
-        "pass": not (missing_cells or unexpected_cells or duplicate_cells or plan_flags),
+        "pass": not (missing_cells or unexpected_cells or duplicate_cells or plan_flags)
+                and len(observed) == len(FROZEN_PLAN),
         "expected_runs": len(FROZEN_PLAN),
         "observed_runs": len(observed),
         "missing": [list(cell) for cell in missing_cells],

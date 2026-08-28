@@ -127,7 +127,15 @@ for spec in $MIXING; do
   fi
   p=1
   while [ "$p" -le "$pairs" ]; do
-    add_run "$name" "$p" "$arm" only
+    # run.sh derives order from parity x arm for every scenario, and SPEC §3
+    # types metadata order_in_pair ("first"|"second"), so a single-arm scenario
+    # records it too. Planning "only" here made the plan and the run disagree.
+    if [ $((p % 2)) -eq 1 ]; then
+      [ "$arm" = mcp ] && o=first || o=second
+    else
+      [ "$arm" = cli ] && o=first || o=second
+    fi
+    add_run "$name" "$p" "$arm" "$o"
     p=$((p + 1))
   done
 done
@@ -139,6 +147,26 @@ STAMP="$(basename "$OUT")"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 GIT_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+# The manifest is this tree's account of itself. One already here must describe
+# THIS matrix, or the tree belongs to another run and is not ours to overwrite.
+if [ -f "$OUT/manifest.json" ]; then
+  python3 -c '
+import json, sys
+path, stamp, model, head = sys.argv[1:]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+except (OSError, ValueError) as exc:
+    sys.exit("unreadable manifest.json: %s" % exc)
+bad = ["%s=%r (want %r)" % (key, manifest.get(key), want)
+       for key, want in (("stamp", stamp), ("model", model), ("git_head", head))
+       if manifest.get(key) != want]
+if bad:
+    sys.exit("; ".join(bad))
+' "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
+    || die "refusing to overwrite $OUT/manifest.json: it does not describe this matrix"
+fi
 
 MF_OUT="$OUT" MF_STAMP="$STAMP" MF_MODEL="$MODEL" MF_GIT="$GIT_HEAD" \
 MF_REPO="$REPO" MF_HERE="$HERE" MF_PLAN="$PLAN" MF_MISSING="$MISSING" \
@@ -198,21 +226,21 @@ echo "manifest: $OUT/manifest.json"
 
 # ── resume bookkeeping (computed for --dry-run too, so the plan a dry run
 # prints is exactly the work a real run would do) ───────────────────────────
-resume_matches() {  # rundir scenario pair arm
+resume_matches() {  # rundir scenario pair arm order
   python3 -c '
 import json, os, sys
-run_dir, scenario, pair, arm, model, head = sys.argv[1:]
+run_dir, scenario, pair, arm, order, model, head = sys.argv[1:]
 try:
     with open(os.path.join(run_dir, "metadata.json"), "r", encoding="utf-8") as fh:
         meta = json.load(fh)
 except (OSError, ValueError) as exc:
     sys.exit("unreadable metadata.json: %s" % exc)
 want = {"scenario": scenario, "arm": arm, "pair": int(pair),
-        "model_requested": model, "git_head": head}
+        "order_in_pair": order, "model_requested": model, "git_head": head}
 bad = ["%s=%r (want %r)" % (k, meta.get(k), v) for k, v in want.items() if meta.get(k) != v]
 if bad:
     sys.exit("; ".join(bad))
-' "$1" "$2" "$3" "$4" "$MODEL" "$GIT_HEAD"
+' "$1" "$2" "$3" "$4" "$5" "$MODEL" "$GIT_HEAD"
 }
 
 QUEUE="$OUT/.queue"
@@ -225,11 +253,15 @@ while IFS=$'\t' read -r scenario pair arm order; do
     # Skipping a directory means claiming its run already happened, for THIS
     # matrix. Read it before believing that: a stale tree from another head, a
     # copied directory or a hand-written file used to count as complete.
-    if ! resume_matches "$rundir" "$scenario" "$pair" "$arm"; then
+    if ! resume_matches "$rundir" "$scenario" "$pair" "$arm" "$order"; then
       echo "resume refused: $scenario/pair-$(printf '%02d' "$pair")/$arm holds a metadata.json that is not this matrix's run" >&2
       exit 1
     fi
     skipped=$((skipped + 1)); continue
+  fi
+  if [ -d "$rundir" ] && [ -n "$(ls -A "$rundir" 2>/dev/null)" ]; then
+    echo "refusing to overwrite: $scenario/pair-$(printf '%02d' "$pair")/$arm exists without a metadata.json" >&2
+    exit 1
   fi
   printf '%s\t%s\t%s\n' "$scenario" "$pair" "$rundir" >> "$QUEUE"
   queued=$((queued + 1))

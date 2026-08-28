@@ -2,8 +2,8 @@
   "files": {
     "SPEC.txt": "8f1895fa97891f7c11a87d16af9c4b9af4e86759a989f553d0ae86dd574f2bb7",
     "acceptance_table.json": "f81e5d5798a5911ef25a2cb73eb9b2d8d100d1bd022c68650b08a790a581d358",
-    "grade.py": "65d944972855f5b960a98ef2d8c9f12167c282bbf76aa1587d051e8e439dcb37",
-    "matrix.sh": "a5d70a792bd08af30818971b88f89e49c3678b4a68c8456c049d7f97913ad21e",
+    "grade.py": "62e219d47b6aa3f7ee6c8f0e9d9e5dcde4d28a4b8b506486206dd43a714497cf",
+    "matrix.sh": "c7d3c0d5bb876e447dd97ab9c0ee806d38613abb6b82d687f10ddf191fbb5ab4",
     "prompts/base.txt": "9fa193ec79a170c20e6c3334750c309ac2482c18a97c1a16459339e2cfca4bdc",
     "prompts/cli.txt": "7707b0d6f5e7e1d64a7bc3bbe022abd141c0f29d995bc2315be29b06c06e1ad8",
     "prompts/mcp.txt": "76441b9c96cb0e41340e1d20487cdcbac549512d6547f15418857b7b886dc21b",
