@@ -660,3 +660,78 @@ mod installed_help_fixtures_3414 {
         );
     }
 }
+
+/// Second supplemental RED (lead review of 1998b30f). `codex --help` declares
+/// exactly one variadic global — `-i, --image <FILE>...` — and the flat
+/// one-value list inferred its arity, which is the same mistake the first
+/// matrix made with selector arity.
+#[cfg(test)]
+mod codex_global_arity_3414 {
+    use super::tests_support::*;
+    use super::*;
+
+    /// A greedy `<FILE>...` consumes every following non-flag token, so an
+    /// image literally named `resume` is a FILENAME, not the subcommand.
+    /// Consuming only one value left it at subcommand position, where it was
+    /// silently dropped — deleting a real argument the operator passed.
+    #[test]
+    fn codex_variadic_image_values_named_resume_are_preserved_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["-i", "first.png", "resume"]),
+            v(&["-i", "first.png", "resume"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["--image", "a.png", "resume", "b.png"]),
+            v(&["--image", "a.png", "resume", "b.png"])
+        );
+        // The real subcommand still works when it is actually in that
+        // position — a variadic ends at the next flag.
+        assert_eq!(
+            ok(Backend::Codex, &["-i", "a.png", "--model", "gpt", "resume"]),
+            v(&["-i", "a.png", "--model", "gpt"])
+        );
+    }
+
+    /// A valued global whose value is missing or is itself a flag cannot be
+    /// resolved. Guessing lets a LATER token be reclassified as the
+    /// subcommand, so this fails closed instead — before any delete.
+    #[test]
+    fn codex_malformed_valued_global_does_not_reclassify_later_tokens_3414() {
+        assert_eq!(
+            reason(Backend::Codex, &["-m", "--oss", "resume"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        assert_eq!(
+            reason(Backend::Codex, &["--model"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        assert_eq!(
+            reason(Backend::Codex, &["-i", "--search", "resume"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+    }
+
+    /// Equals forms carry their own value and must pass through untouched,
+    /// without the parser looking for a separate value token.
+    #[test]
+    fn codex_equals_forms_are_preserved_and_do_not_consume_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["--model=gpt", "resume", "s1"]),
+            v(&["--model=gpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["--config=k=v", "--search"]),
+            v(&["--config=k=v", "--search"])
+        );
+    }
+
+    /// Valueless globals must not swallow the following token.
+    #[test]
+    fn codex_valueless_globals_do_not_consume_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["--search", "resume", "s1"]),
+            v(&["--search"])
+        );
+        assert_eq!(ok(Backend::Codex, &["--oss", "resume"]), v(&["--oss"]));
+    }
+}
