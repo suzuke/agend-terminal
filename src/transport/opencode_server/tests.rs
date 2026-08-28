@@ -1494,3 +1494,105 @@ fn _server_thread(listener: TcpListener) -> thread::JoinHandle<()> {
         let _ = _read_request_line(&listener);
     })
 }
+
+/// #3414 RED (lead review of 06faebad). Clearing `locator.session_id` in
+/// `prepare_opencode_tui_session` is not enough: `resident_adapter` returns an
+/// ALREADY-RESIDENT worker for the same key and drops the freshly prepared
+/// locator on the floor, so the old session id survives a fresh restart.
+///
+/// The fix only ever worked for the cold path — no resident worker — which is
+/// exactly the case a RESTART is not.
+mod fresh_restart_resident_session_3414 {
+    use super::super::*;
+    use crate::backend::SpawnMode;
+
+    #[allow(clippy::expect_used)]
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "agend-3414-resident-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).expect("scratch home");
+        home
+    }
+
+    /// Seed the resident map with a worker already holding a stale session, the
+    /// state a live OpenCode instance is in when a restart arrives. `join: None`
+    /// keeps the fixture free of a real event-loop thread.
+    #[allow(clippy::expect_used)]
+    fn seed_resident(home: &std::path::Path, instance: &str, session_id: &str) {
+        let mut adapter = OpenCodeNativeShared::new(home, instance);
+        let locator = SessionLocator::opencode(
+            "http://127.0.0.1:41999".to_string(),
+            Some(session_id.to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        adapter.locator = Some(locator);
+        resident_workers().lock().insert(
+            resident_key(home, instance),
+            ResidentWorker {
+                adapter: Arc::new(Mutex::new(adapter)),
+                stop: Arc::new(AtomicBool::new(false)),
+                join: None,
+            },
+        );
+    }
+
+    fn drop_resident(home: &std::path::Path, instance: &str) {
+        resident_workers()
+            .lock()
+            .remove(&resident_key(home, instance));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn fresh_restart_does_not_reuse_a_resident_session_3414() {
+        let home = scratch_home("fresh");
+        seed_resident(&home, "dev", "stale-session");
+
+        let prepared = crate::transport::prepare_opencode_tui_session(
+            &home,
+            "dev",
+            None,
+            &[],
+            SpawnMode::Fresh,
+        )
+        .expect("fresh preparation");
+
+        assert_eq!(
+            prepared.session_id, None,
+            "#3414: a fresh restart must not inherit the resident worker's session"
+        );
+        drop_resident(&home, "dev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The mirror: Resume is the whole point of keeping a resident worker, so it
+    /// must still reuse the session it already has.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn resume_restart_still_reuses_the_resident_session_3414() {
+        let home = scratch_home("resume");
+        seed_resident(&home, "dev", "stale-session");
+
+        let prepared = crate::transport::prepare_opencode_tui_session(
+            &home,
+            "dev",
+            None,
+            &[],
+            SpawnMode::Resume,
+        )
+        .expect("resume preparation");
+
+        assert_eq!(
+            prepared.session_id.as_deref(),
+            Some("stale-session"),
+            "#3414: resume must keep attaching to the existing session"
+        );
+        drop_resident(&home, "dev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
