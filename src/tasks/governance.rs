@@ -9,6 +9,15 @@ use crate::task_events::TaskRecord;
 use serde_json::{json, Value};
 use std::path::Path;
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+type AuthorityResolvedHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+static AUTHORITY_RESOLVED_HOOK: OnceLock<Mutex<Option<AuthorityResolvedHook>>> = OnceLock::new();
+
 #[derive(Debug, Clone)]
 pub(crate) struct TaskCreationAuthority {
     pub governing_decision_id: Option<String>,
@@ -16,6 +25,52 @@ pub(crate) struct TaskCreationAuthority {
     /// Invalid legacy explicit values remain visible to old task consumers;
     /// governed creation never uses this escape hatch and rejects instead.
     pub legacy_review_class_raw: Option<String>,
+}
+
+fn requested_governing_decision_id(args: &Value) -> Result<Option<&str>, Value> {
+    let Some(value) = args.get("governing_decision_id") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(raw) = value.as_str() else {
+        return Err(json!({
+            "error": "governing_decision_id must be a non-empty string",
+            "code": "invalid_governing_decision_id",
+        }));
+    };
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err(json!({
+            "error": "governing_decision_id must be a non-empty string",
+            "code": "invalid_governing_decision_id",
+        }));
+    }
+    Ok(Some(id))
+}
+
+#[cfg(test)]
+pub(crate) fn install_authority_resolved_hook(hook: AuthorityResolvedHook) {
+    let hooks = AUTHORITY_RESOLVED_HOOK.get_or_init(|| Mutex::new(None));
+    let mut slot = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(hook);
+}
+
+#[cfg(test)]
+fn fire_authority_resolved_hook(home: &Path) {
+    let Some(hooks) = AUTHORITY_RESOLVED_HOOK.get() else {
+        return;
+    };
+    let hook = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        hook(home);
+    }
 }
 
 fn explicit_review_class(args: &Value) -> Result<(Option<ReviewClass>, Option<String>), Value> {
@@ -49,33 +104,13 @@ pub(crate) fn resolve_creation_authority(
     args: &Value,
 ) -> Result<TaskCreationAuthority, Value> {
     let (explicit_class, legacy_raw) = explicit_review_class(args)?;
-    let Some(raw_decision_id) = args.get("governing_decision_id") else {
+    let Some(decision_id) = requested_governing_decision_id(args)? else {
         return Ok(TaskCreationAuthority {
             governing_decision_id: None,
             review_class: explicit_class,
             legacy_review_class_raw: legacy_raw,
         });
     };
-    if raw_decision_id.is_null() {
-        return Ok(TaskCreationAuthority {
-            governing_decision_id: None,
-            review_class: explicit_class,
-            legacy_review_class_raw: legacy_raw,
-        });
-    }
-    let Some(raw_decision_id) = raw_decision_id.as_str() else {
-        return Err(json!({
-            "error": "governing_decision_id must be a non-empty string",
-            "code": "invalid_governing_decision_id",
-        }));
-    };
-    let decision_id = raw_decision_id.trim();
-    if decision_id.is_empty() {
-        return Err(json!({
-            "error": "governing_decision_id must be a non-empty string",
-            "code": "invalid_governing_decision_id",
-        }));
-    }
     if legacy_raw.is_some() {
         return Err(json!({
             "error": "governed task review_class must be exactly 'single' or 'dual'",
@@ -103,11 +138,14 @@ pub(crate) fn resolve_creation_authority(
             }));
         }
     }
-    Ok(TaskCreationAuthority {
+    let authority = TaskCreationAuthority {
         governing_decision_id: Some(decision_id.to_string()),
         review_class: explicit_class.or(decision.review_class),
         legacy_review_class_raw: None,
-    })
+    };
+    #[cfg(test)]
+    fire_authority_resolved_hook(home);
+    Ok(authority)
 }
 
 fn metadata_class(record: &TaskRecord) -> Result<Option<ReviewClass>, Value> {
