@@ -134,6 +134,24 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
 /// version this replaced.
 const AUTH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Close a client connection, whichever handle this is.
+///
+/// `shutdown` rather than `drop`, because every accepted connection is held by
+/// two handles — the output forwarder's clone and the input thread's — so
+/// dropping one closes nothing and leaves the pane looking connected.
+///
+/// `Both` first, then `Write` if that fails. Once the peer has half-closed and
+/// this side has read the EOF, macOS refuses `Both` with ENOTCONN while `Write`
+/// on the same socket still succeeds and still delivers the FIN. Measured:
+/// `Both` → `Err(NotConnected)`, `Write` → `Ok(())`, peer read → `Ok(0)`. A
+/// single `Both` therefore silently leaves exactly the connections this work
+/// exists to end.
+fn close_client(stream: &std::net::TcpStream) {
+    if stream.shutdown(std::net::Shutdown::Both).is_err() {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+}
+
 /// How long a framed write to a TUI client may stall before this bridge gives up
 /// on that client.
 ///
@@ -240,7 +258,7 @@ fn start_client_thread(
 ) -> std::io::Result<()> {
     let started = spawn();
     if started.is_err() {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        close_client(stream);
     }
     started
 }
@@ -271,7 +289,7 @@ fn forward_tui_output(
         .set_write_timeout(Some(CLIENT_WRITE_BUDGET))
         .is_err()
     {
-        let _ = write_stream.shutdown(std::net::Shutdown::Both);
+        close_client(&write_stream);
         return;
     }
     // Checked at the TOP of every iteration, not only when the channel goes
@@ -288,7 +306,7 @@ fn forward_tui_output(
             // retained pane observe EOF, flip `connected` false, and become a
             // reconnect candidate.
             if is_retired(&run_dir, &name, port) {
-                let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                close_client(&write_stream);
                 break;
             }
         }
@@ -299,7 +317,7 @@ fn forward_tui_output(
                 // merely leave this loop: the input thread holds another handle,
                 // so dropping ours closes nothing.
                 if framing::write_frame(&mut write_stream, &data).is_err() {
-                    let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                    close_client(&write_stream);
                     break;
                 }
             }
@@ -310,7 +328,7 @@ fn forward_tui_output(
                 // NOT enough — the input thread holds another on the same
                 // connection — so close it explicitly or the pane keeps a live
                 // socket to a dead generation.
-                let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                close_client(&write_stream);
                 break;
             }
         }
@@ -354,7 +372,7 @@ fn forward_tui_input(
             _ => break,
         }
     }
-    let _ = reader.shutdown(std::net::Shutdown::Both);
+    close_client(&reader);
 }
 
 pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
@@ -485,7 +503,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             Ok(handle) => handle,
             Err(e) => {
                 tracing::warn!(agent = name, error = %e, "TUI client handle unavailable");
-                let _ = read_stream.shutdown(std::net::Shutdown::Both);
+                close_client(&read_stream);
                 continue;
             }
         };
