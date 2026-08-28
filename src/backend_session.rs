@@ -728,6 +728,20 @@ mod codex_global_arity_3414 {
 
     /// A greedy `<FILE>...` consumes every following non-flag token, so an
     /// image literally named `resume` is a FILENAME, not the subcommand.
+    ///
+    /// Proven against the installed CLI rather than argued from the help text:
+    ///
+    /// ```text
+    /// $ env CODEX_HOME=/tmp/nonexistent codex -i resume resume --last
+    /// error: unexpected argument '--last' found
+    /// Usage: codex [OPTIONS] [PROMPT]
+    ///        codex [OPTIONS] <COMMAND> [ARGS]
+    /// ```
+    ///
+    /// The rejection carries TOP-LEVEL usage, not `codex resume` usage — so
+    /// both `resume` tokens were swallowed by `-i`, and the parser never
+    /// reached the subcommand. `--last` is resume-owned, which is why it is
+    /// unexpected at top level.
     /// Consuming only one value left it at subcommand position, where it was
     /// silently dropped — deleting a real argument the operator passed.
     #[test]
