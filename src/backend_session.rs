@@ -1060,3 +1060,37 @@ mod codex_position_and_equals_3414 {
         );
     }
 }
+
+/// Fifth supplemental RED. `--model=` is not unknown grammar: it is the known
+/// `long=VALUE` inline form, and an empty string is still a VALUE clap accepts
+/// (`codex resume --model= sess` reaches the CODEX_HOME lookup). Refusing it
+/// was the sanitizer inventing a stricter contract than the CLI it models.
+#[cfg(test)]
+mod codex_empty_equals_3414 {
+    use super::tests_support::*;
+    use super::*;
+
+    /// Inside the resume scope: the global survives untouched and must not
+    /// consume the next token, so the session id is still removed.
+    #[test]
+    fn codex_empty_equals_global_inside_resume_is_preserved_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--model=", "sess"]),
+            v(&["--model="])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--config=", "--last"]),
+            v(&["--config="])
+        );
+    }
+
+    /// Same at top level: the empty-equals global is preserved and the resume
+    /// invocation is still recognised and removed.
+    #[test]
+    fn codex_empty_equals_global_before_resume_is_preserved_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["--model=", "resume", "sess"]),
+            v(&["--model="])
+        );
+    }
+}
