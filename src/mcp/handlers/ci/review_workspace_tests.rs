@@ -1013,6 +1013,155 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// A fixture root the PUBLIC release entry can actually accept.
+///
+/// `validate_release_path` refuses `/tmp`, `/var` and `/private` outright, and
+/// on macOS `std::env::temp_dir()` canonicalizes into `/private/var/folders/...`
+/// — so every `tmp_home` fixture in this file is unreachable through
+/// `handle_release_repo` by construction. That is why no test has ever driven
+/// checkout and the public release against each other.
+///
+/// Anchored at `CARGO_MANIFEST_DIR`'s PARENT for the reason documented on
+/// `release_guard_tmp` in `ci/tests.rs`: it is compile-time stable, so a sibling
+/// test that reassigns `$HOME` mid-run cannot move it underneath us.
+#[cfg(unix)]
+fn releasable_home(tag: &str) -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = manifest.parent().unwrap_or(manifest).join(format!(
+        ".agend-roundtrip-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture root");
+    dir
+}
+
+/// The public round trip this lane is named for: `repo action=checkout` and
+/// `repo action=release`, the two entries an agent actually calls, driven end to
+/// end against each other.
+///
+/// The asymmetry that opened this lane was that checkout's `.agend-managed`
+/// marker omitted `source_repo` while the canonical release transaction requires
+/// a non-empty, canonically-equal one under lock — so a perfectly valid managed
+/// checkout could not be released through the public entry. #2860 (dd54e3c9) put
+/// the field in, but nothing pinned the pairing: every existing test drives ONE
+/// side, or writes a marker by hand. The sibling test above releases through
+/// `handle_release_worktree`; this one goes through `handle_release_repo`, which
+/// is a different entry that routes daemon-managed paths into the strict managed
+/// transaction.
+///
+/// The marker assertion is not decoration. It is the exact field whose absence
+/// broke the round trip, so reverting it in checkout's marker body must fail this
+/// test — that is what makes a test which passes on a fixed tree worth keeping.
+#[test]
+#[cfg(unix)]
+fn checkout_then_public_repo_release_round_trip_marker_symmetry() {
+    let home = releasable_home("home");
+    let parent = releasable_home("src");
+    let source = setup_source_repo(&parent, "seed");
+    let expected = get_sha(&source, "main");
+    remove_origin(&source);
+    seed_origin_view(&source, "main", &expected);
+    seed_terminal_task(&home, "task-roundtrip", "review/roundtrip", false);
+
+    let checkout = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "review/roundtrip",
+            "bind": true,
+            "task_id": "task-roundtrip",
+            "expected_head": &expected,
+            "from_ref": "main",
+            "checkout_purpose": "disposable_review",
+        }),
+        "roundtrip-agent",
+    );
+    assert!(
+        checkout.get("error").is_none(),
+        "checkout must succeed: {checkout}"
+    );
+    let worktree_path = checkout["path"]
+        .as_str()
+        .expect("checkout returns the worktree path")
+        .to_string();
+
+    // The identity the release transaction validates under lock. `source_repo`
+    // must be present AND canonically equal to the source the binding recorded;
+    // an empty or divergent value is what made the public release refuse.
+    let marker = std::fs::read_to_string(
+        std::path::Path::new(&worktree_path).join(crate::worktree_pool::MANAGED_MARKER),
+    )
+    .expect("managed marker must exist after a bound checkout");
+    let marker_source = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("source_repo="))
+        .map(str::trim)
+        .unwrap_or_default();
+    let source_canonical = std::fs::canonicalize(&source).expect("canonical source");
+    assert_eq!(
+        marker_source,
+        source_canonical.display().to_string(),
+        "checkout's marker must carry the canonical source_repo the release \
+         transaction requires; marker was: {marker:?}"
+    );
+
+    finish_task(&home, "task-roundtrip");
+
+    let released =
+        super::handle_release_repo(&home, &json!({ "path": worktree_path }), "roundtrip-agent");
+    assert_eq!(
+        released["error"],
+        serde_json::Value::Null,
+        "public repo release must succeed for a worktree public repo checkout \
+         created: {released}"
+    );
+    assert_eq!(
+        released["released"].as_bool(),
+        Some(true),
+        "release must report success: {released}"
+    );
+    assert_eq!(
+        released["delegated_to_canonical"].as_bool(),
+        Some(true),
+        "a daemon-managed path must route through the canonical transaction, not \
+         the unmanaged fallback: {released}"
+    );
+    assert_eq!(
+        released["worktree_removed"].as_bool(),
+        Some(true),
+        "{released}"
+    );
+    assert_eq!(
+        released["binding_removed"].as_bool(),
+        Some(true),
+        "{released}"
+    );
+    assert_eq!(
+        released["branch_deleted"].as_bool(),
+        Some(true),
+        "a terminal disposable-review branch must be deleted: {released}"
+    );
+    assert!(
+        !std::path::Path::new(&worktree_path).exists(),
+        "the worktree directory must be gone: {released}"
+    );
+    assert!(
+        crate::binding::read(&home, "roundtrip-agent").is_none(),
+        "the binding must be gone: {released}"
+    );
+    assert!(
+        !crate::git_helpers::git_ok(&source, &["rev-parse", "--verify", "review/roundtrip"]),
+        "the disposable review branch must be deleted: {released}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 #[cfg(unix)]
 fn checkout_disposable_review_rejects_preexisting_branch_without_mutation() {
