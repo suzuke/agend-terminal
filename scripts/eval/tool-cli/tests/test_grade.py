@@ -1226,6 +1226,27 @@ class Aggregation(TempCase):
         self.assertEqual([e["reason"] for e in summary["invalid"]],
                          ["system_prompt_not_frozen"])
 
+    def test_a_uniformly_foreign_system_prompt_is_still_caught(self):
+        """The shape the review named: every run agrees, and all are wrong.
+
+        Per-arm agreement holds perfectly here — which is exactly why agreement
+        was never the check.
+        """
+        runs, scen = self.frozen_matrix()
+        for cell in self.FROZEN_CELLS:
+            scenario, pair, arm = cell
+            path = os.path.join(runs, "%s-%s-p%s" % (scenario, arm, pair), "metadata.json")
+            with open(path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            meta["system_prompt_sha256"] = "f" * 64
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh)
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(summary["valid_runs"], 0)
+        self.assertEqual({e["reason"] for e in summary["invalid"]},
+                         {"system_prompt_not_frozen"})
+        self.assertFalse(summary["pilot_safety"])
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})

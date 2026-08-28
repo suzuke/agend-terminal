@@ -19,6 +19,14 @@ MATRIX = os.path.join(HERE, "matrix.sh")
 sys.path.insert(0, HERE)
 import grade  # noqa: E402  (the harness under test)
 
+#: The release binaries a real matrix runs. A conforming run records their
+#: digests, so the control below can only exist in a built tree.
+RELEASE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))),
+                       "target", "release")
+BUILT = all(os.path.exists(os.path.join(RELEASE, name))
+            for name in ("agend-terminal", "agend-mcp-bridge"))
+NEEDS_BUILD = "needs target/release binaries: a conforming run records their digests"
+
 
 def dry_run(out_dir, env_extra=None):
     env = dict(os.environ)
@@ -119,14 +127,20 @@ class MatrixAuthority(unittest.TestCase):
     def _plant(self, **meta_extra):
         planned = os.path.join(self.out, "S01", "pair-01", "mcp")
         os.makedirs(planned, exist_ok=True)
+        scenarios = os.path.join(HERE, "scenarios")
+        # A run this matrix would accept, so a probe can break exactly one field.
         meta = {"schema": 1, "scenario": "S01", "arm": "mcp", "pair": 1,
                 "order_in_pair": "first", "model_requested": "claude-fable-5",
                 "model_resolved": "claude-fable-5", "git_head": self._head(),
                 "claude_version": "2.0.0-test",
-                "binary_sha256": {"agend-terminal": "0" * 64,
-                                  "agend-mcp-bridge": "0" * 64},
-                "system_prompt_sha256": "0" * 64, "prompt_sha256": "0" * 64,
-                "fence": True, "fleet_sha256": "0" * 64, "seed_sha256": "0" * 64,
+                "binary_sha256": {name: grade.file_sha256(os.path.join(RELEASE, name))
+                                  for name in ("agend-terminal", "agend-mcp-bridge")},
+                "system_prompt_sha256": grade.frozen_system_prompt_digest("mcp"),
+                "prompt_sha256": grade.file_sha256(
+                    os.path.join(scenarios, "S01", "prompt.txt")),
+                "fence": True, "fleet_sha256": grade.frozen_fleet_digest(),
+                "seed_sha256": grade.file_sha256(
+                    os.path.join(scenarios, "S01", "seed.sh")),
                 "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
                 "duration_ms": 1000, "exit_code": 0, "turns": 3, "timed_out": False,
                 "invalid_reason": None}
@@ -136,6 +150,24 @@ class MatrixAuthority(unittest.TestCase):
         with open(os.path.join(planned, "metadata.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
         return planned
+
+    def _plant_with_stream(self, **meta_extra):
+        planned = self._plant(**meta_extra)
+        with open(os.path.join(planned, "stream.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"type": "system", "subtype": "init", "model": "claude-fable-5",'
+                     ' "claude_code_version": "2.0.0-test"}\n')
+        return planned
+
+    @unittest.skipUnless(BUILT, NEEDS_BUILD)
+    def test_a_conforming_run_is_skipped(self):
+        """The control the refusals are measured against.
+
+        Without it "resume refused" proves only that something was wrong.
+        """
+        self._plant_with_stream()
+        proc = dry_run(self.out)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("1 already complete", proc.stdout)
 
     def test_resume_refuses_a_run_with_no_stream(self):
         """Skipping claimed the run happened; nothing checked it produced one."""
@@ -244,6 +276,21 @@ class MatrixAuthority(unittest.TestCase):
                             + proc.stdout + proc.stderr)
         self.assertIn("binary_sha256", proc.stdout + proc.stderr,
                       "the refusal must say which field it could not account for")
+
+
+    @unittest.skipUnless(BUILT, NEEDS_BUILD)
+    def test_resume_refuses_a_run_with_a_foreign_system_prompt(self):
+        """Resume runs the grader's contract, so this must refuse there too.
+
+        Everything else in the planted run is what this matrix would accept —
+        the control above proves that — so the system prompt is the only thing
+        that can refuse it.
+        """
+        self._plant_with_stream(system_prompt_sha256="f" * 64)
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a run given another system prompt is not this matrix's:\n"
+                            + proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":
