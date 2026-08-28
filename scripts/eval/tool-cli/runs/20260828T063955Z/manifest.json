@@ -1,0 +1,1492 @@
+{
+  "schema": 1,
+  "stamp": "20260828T063955Z",
+  "created_at": "2026-08-28T06:39:56.320621+00:00",
+  "dry_run": false,
+  "git_head": "7e0f65001eeffede7770902f829c9008757934f2",
+  "model": "claude-fable-5",
+  "jobs": 3,
+  "binary_sha256": {
+    "agend-terminal": "c745a25c799ed4cadb17961d4ae71a123036409c6cc9443f43ad103c0752c04d",
+    "agend-mcp-bridge": "f606597864e58838d9a0b4957978dcf5cbd78e9aa4c400e9aeded0ab864c08cb"
+  },
+  "prompt_sha256": {
+    "base": "9fa193ec79a170c20e6c3334750c309ac2482c18a97c1a16459339e2cfca4bdc",
+    "mcp": "76441b9c96cb0e41340e1d20487cdcbac549512d6547f15418857b7b886dc21b",
+    "cli": "7707b0d6f5e7e1d64a7bc3bbe022abd141c0f29d995bc2315be29b06c06e1ad8"
+  },
+  "missing_scenarios": [],
+  "total_runs": 210,
+  "plan": [
+    {
+      "scenario": "S01",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S01/pair-01/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S01/pair-01/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S01/pair-02/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S01/pair-02/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S01/pair-03/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S01/pair-03/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S01/pair-04/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S01/pair-04/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S01/pair-05/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S01/pair-05/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S01/pair-06/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S01/pair-06/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S01/pair-07/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S01/pair-07/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S01/pair-08/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S01/pair-08/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S01/pair-09/mcp"
+    },
+    {
+      "scenario": "S01",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S01/pair-09/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S01/pair-10/cli"
+    },
+    {
+      "scenario": "S01",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S01/pair-10/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S02/pair-01/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S02/pair-01/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S02/pair-02/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S02/pair-02/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S02/pair-03/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S02/pair-03/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S02/pair-04/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S02/pair-04/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S02/pair-05/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S02/pair-05/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S02/pair-06/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S02/pair-06/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S02/pair-07/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S02/pair-07/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S02/pair-08/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S02/pair-08/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S02/pair-09/mcp"
+    },
+    {
+      "scenario": "S02",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S02/pair-09/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S02/pair-10/cli"
+    },
+    {
+      "scenario": "S02",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S02/pair-10/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S03/pair-01/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S03/pair-01/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S03/pair-02/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S03/pair-02/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S03/pair-03/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S03/pair-03/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S03/pair-04/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S03/pair-04/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S03/pair-05/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S03/pair-05/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S03/pair-06/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S03/pair-06/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S03/pair-07/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S03/pair-07/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S03/pair-08/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S03/pair-08/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S03/pair-09/mcp"
+    },
+    {
+      "scenario": "S03",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S03/pair-09/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S03/pair-10/cli"
+    },
+    {
+      "scenario": "S03",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S03/pair-10/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S04/pair-01/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S04/pair-01/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S04/pair-02/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S04/pair-02/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S04/pair-03/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S04/pair-03/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S04/pair-04/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S04/pair-04/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S04/pair-05/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S04/pair-05/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S04/pair-06/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S04/pair-06/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S04/pair-07/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S04/pair-07/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S04/pair-08/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S04/pair-08/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S04/pair-09/mcp"
+    },
+    {
+      "scenario": "S04",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S04/pair-09/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S04/pair-10/cli"
+    },
+    {
+      "scenario": "S04",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S04/pair-10/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S05/pair-01/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S05/pair-01/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S05/pair-02/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S05/pair-02/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S05/pair-03/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S05/pair-03/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S05/pair-04/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S05/pair-04/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S05/pair-05/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S05/pair-05/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S05/pair-06/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S05/pair-06/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S05/pair-07/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S05/pair-07/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S05/pair-08/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S05/pair-08/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S05/pair-09/mcp"
+    },
+    {
+      "scenario": "S05",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S05/pair-09/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S05/pair-10/cli"
+    },
+    {
+      "scenario": "S05",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S05/pair-10/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S06/pair-01/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S06/pair-01/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S06/pair-02/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S06/pair-02/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S06/pair-03/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S06/pair-03/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S06/pair-04/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S06/pair-04/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S06/pair-05/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S06/pair-05/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S06/pair-06/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S06/pair-06/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S06/pair-07/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S06/pair-07/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S06/pair-08/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S06/pair-08/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "first",
+      "dir": "S06/pair-09/mcp"
+    },
+    {
+      "scenario": "S06",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "second",
+      "dir": "S06/pair-09/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "first",
+      "dir": "S06/pair-10/cli"
+    },
+    {
+      "scenario": "S06",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "second",
+      "dir": "S06/pair-10/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 1,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-01/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 2,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-02/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 3,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-03/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 4,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-04/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 5,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-05/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 6,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-06/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 7,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-07/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 8,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-08/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 9,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-09/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 10,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-10/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 11,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-11/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 12,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-12/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 13,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-13/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 14,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-14/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 15,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-15/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 16,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-16/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 17,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-17/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 18,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-18/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 19,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-19/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 20,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-20/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 21,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-21/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 22,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-22/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 23,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-23/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 24,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-24/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 25,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-25/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 26,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-26/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 27,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-27/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 28,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-28/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 29,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-29/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 30,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-30/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 31,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-31/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 32,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-32/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 33,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-33/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 34,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-34/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 35,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-35/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 36,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-36/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 37,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-37/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 38,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-38/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 39,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-39/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 40,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-40/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 41,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-41/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 42,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-42/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 43,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-43/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 44,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-44/mcp"
+    },
+    {
+      "scenario": "S13",
+      "pair": 45,
+      "arm": "mcp",
+      "order_in_pair": "only",
+      "dir": "S13/pair-45/mcp"
+    },
+    {
+      "scenario": "S14",
+      "pair": 1,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-01/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 2,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-02/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 3,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-03/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 4,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-04/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 5,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-05/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 6,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-06/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 7,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-07/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 8,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-08/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 9,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-09/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 10,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-10/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 11,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-11/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 12,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-12/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 13,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-13/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 14,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-14/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 15,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-15/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 16,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-16/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 17,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-17/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 18,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-18/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 19,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-19/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 20,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-20/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 21,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-21/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 22,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-22/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 23,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-23/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 24,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-24/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 25,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-25/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 26,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-26/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 27,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-27/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 28,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-28/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 29,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-29/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 30,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-30/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 31,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-31/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 32,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-32/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 33,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-33/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 34,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-34/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 35,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-35/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 36,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-36/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 37,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-37/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 38,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-38/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 39,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-39/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 40,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-40/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 41,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-41/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 42,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-42/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 43,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-43/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 44,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-44/cli"
+    },
+    {
+      "scenario": "S14",
+      "pair": 45,
+      "arm": "cli",
+      "order_in_pair": "only",
+      "dir": "S14/pair-45/cli"
+    }
+  ]
+}
