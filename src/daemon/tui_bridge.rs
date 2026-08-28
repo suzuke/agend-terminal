@@ -130,6 +130,27 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
 /// step. Exits when the listener is dropped or accept errors
 /// terminally (e.g. agent removal via `delete_transaction` closes the
 /// underlying socket file).
+/// Overall budget for a client's auth handshake. Unchanged from the inline
+/// version this replaced.
+const AUTH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read and verify one client's 32-byte TUI auth cookie.
+///
+/// Extracted from the accept loop so a test can drive the real production path
+/// over a loopback socket. Behavior is currently verbatim: a single blocking
+/// `read_exact` under one 10s timeout.
+fn read_and_verify_tui_cookie(
+    stream: &mut std::net::TcpStream,
+    cookie: &crate::auth_cookie::Cookie,
+    run_dir: &Path,
+    name: &str,
+    port: u16,
+) -> bool {
+    let _ = (run_dir, name, port);
+    let _ = stream.set_read_timeout(Some(AUTH_BUDGET));
+    crate::auth_cookie::read_and_verify_tui(stream, cookie).is_ok()
+}
+
 /// One client's output forwarder: pump broadcast frames at `write_stream`
 /// until the client goes away, the generation's subscriber drops, or this
 /// bridge is retired.
@@ -220,9 +241,8 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         // Bound the auth read so a silent peer cannot pin this accept loop.
         // Framing read/write stays unbounded afterwards — the deadline is
         // reset once the cookie check passes.
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-        if let Err(e) = crate::auth_cookie::read_and_verify_tui(&mut stream, &cookie) {
-            tracing::warn!(agent = name, error = %e, "TUI client rejected (auth)");
+        if !read_and_verify_tui_cookie(&mut stream, &cookie, &run_dir, name, port) {
+            tracing::warn!(agent = name, "TUI client rejected (auth)");
             continue;
         }
         let _ = stream.set_read_timeout(None);
@@ -347,7 +367,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
@@ -417,6 +437,58 @@ mod tests {
                 Err(_) => return true,
             }
         }
+    }
+
+    /// #3373 follow-up: a stalled peer must not hold the accept loop past
+    /// retirement. The auth read is serialized in the accept loop, so a peer
+    /// that sends 1 of the 32 cookie bytes pins the whole loop for the auth
+    /// budget — a retired bridge keeps accepting for ~10s after the successor
+    /// took the name. Measured at 8cd95769 by an independent reviewer: ~10.17s.
+    #[test]
+    fn stalled_auth_peer_does_not_outlive_retirement() {
+        let run_dir = scratch_run_dir("stalled-auth");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        let cookie: crate::auth_cookie::Cookie = [7u8; 32];
+
+        let mut stalled = pair.peer;
+        let mut server = pair.server;
+        let dir = run_dir.clone();
+        let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
+        let auth = std::thread::spawn(move || {
+            started_tx.send(()).ok();
+            super::read_and_verify_tui_cookie(&mut server, &cookie, &dir, "agent", 4242)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("auth thread must start");
+
+        // One byte of the 32, then silence: the read is now genuinely in flight.
+        stalled.write_all(&[7u8]).unwrap();
+        stalled.flush().unwrap();
+
+        // Let the helper take several read timeouts INSIDE its loop before the
+        // bridge is retired. This is what makes the test non-vacuous: at entry
+        // the port file still named this bridge, so an entry-only precheck
+        // cannot satisfy it — only a check between reads can.
+        std::thread::sleep(super::RETIREMENT_POLL * 3);
+
+        let retired_at = Instant::now();
+        publish_port(&run_dir, "agent", 4343);
+
+        let accepted = auth.join().unwrap();
+        // Measured from the RETIREMENT, not from the start of the read.
+        let elapsed = retired_at.elapsed();
+
+        drop(stalled);
+        std::fs::remove_dir_all(&run_dir).ok();
+        assert!(!accepted, "a partial cookie must never authenticate");
+        assert!(
+            elapsed <= Duration::from_secs(1),
+            "a retired bridge must abandon an in-flight stalled auth read promptly rather than \
+             hold the serialized accept loop for the whole auth budget; took {elapsed:?} after \
+             retirement"
+        );
     }
 
     /// #3373 follow-up: retirement must not depend on the channel going quiet.
