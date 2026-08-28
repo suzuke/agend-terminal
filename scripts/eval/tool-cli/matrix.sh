@@ -168,6 +168,10 @@ bad = ["%s=%r (want %r)" % (key, manifest.get(key), want)
 bad += ["%s is not what this matrix records" % field
         for field, ok in grade.MANIFEST_CONTRACT
         if field not in manifest or not ok(manifest[field])]
+# the seed map lives outside that table because it needs the scenarios dir; the
+# grader checks it, so the guard must too
+if manifest.get("seed_sha256") != grade.frozen_seed_digests(os.path.join(here, "scenarios")):
+    bad.append("seed_sha256 is not the frozen seed map")
 if bad:
     sys.exit("; ".join(bad))
 ' "$HERE" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
