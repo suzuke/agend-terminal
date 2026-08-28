@@ -471,7 +471,25 @@ mod tests {
         );
 
         drop(holder);
-        append_git_event(home.to_str().unwrap(), &sample_event("freed", 1));
+        // `append_git_event` is best-effort BY CONTRACT: one non-blocking lock
+        // attempt, skipped on contention, because the shim must never block. So
+        // "the lock was released" does not promise that the very NEXT attempt
+        // wins — only that attempts are no longer refused by our holder. Measured
+        // under the parallel suite: this single call skipped with `Contended` in
+        // 5 of 60 runs, while 2000 sequential release-then-append cycles skipped
+        // zero times. Asserting on one attempt was asserting more than the API
+        // offers; a bounded retry pins what the test actually means.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            append_git_event(home.to_str().unwrap(), &sample_event("freed", 1));
+            let landed = std::fs::read_to_string(agentic_audit_append::audit_path(&home))
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false);
+            if landed || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
 
         let content =
             std::fs::read_to_string(agentic_audit_append::audit_path(&home)).unwrap_or_default();
