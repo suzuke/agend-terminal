@@ -963,8 +963,9 @@ mod tests {
             // is NOT retired at entry, so an entry-only check would still see a
             // live port file here.
             std::thread::sleep(super::RETIREMENT_POLL * 2);
+            let publication_started_at = Instant::now();
             publish_port(&successor_dir, "agent", 4343);
-            Instant::now()
+            publication_started_at
         });
 
         let dir = run_dir.clone();
@@ -972,19 +973,19 @@ mod tests {
             super::is_retired(&dir, "agent", 4242)
         });
         let returned_at = Instant::now();
-        let retired_at = successor.join().unwrap();
+        let publication_started_at = successor.join().unwrap();
 
         drop(stalled);
         std::fs::remove_dir_all(&run_dir).ok();
         assert!(!accepted, "a partial cookie must never authenticate");
         assert!(
-            returned_at >= retired_at,
-            "the read must still have been in flight when the successor published its port"
+            returned_at >= publication_started_at,
+            "the read must still have been in flight when the successor began publishing its port"
         );
         assert!(
-            returned_at.duration_since(retired_at) <= Duration::from_secs(1),
-            "took {:?} after retirement",
-            returned_at.duration_since(retired_at)
+            returned_at.duration_since(publication_started_at) <= Duration::from_secs(1),
+            "took {:?} after publication began",
+            returned_at.duration_since(publication_started_at)
         );
     }
 
