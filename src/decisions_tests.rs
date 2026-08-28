@@ -1641,3 +1641,25 @@ fn governing_decision_refuses_file_name_identity_mismatch_3419() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+fn governing_decision_refuses_stray_record_claiming_its_id_3419() {
+    let home = tmp_home("stray-identity-3419");
+    governed_base(&home, "d-real");
+    assert!(resolve_governing_decision(&home, "d-real").is_ok());
+
+    // A second file, under an unrelated name, that claims the same id. The
+    // exact file is still intact, but the directory now carries two records
+    // for one identity — the same tamper shape the reverse-link scan exists to
+    // expose, so it must be refused rather than silently ignored.
+    let mut stray = make_test_decision("lead");
+    stray.id = "d-real".into();
+    stray.review_class = Some(crate::daemon::pr_state::ReviewClass::Single);
+    write_named_decision(&home, "stray.json", &stray);
+    let err = resolve_err(&home, "d-real");
+    assert!(
+        err.contains("mismatched record identity"),
+        "a stray record claiming the id must be refused: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
