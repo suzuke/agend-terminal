@@ -17,6 +17,7 @@ migrated_scripts
 vte_gotchas
 p0a_capability_auth
 tool_cli_phase0a_real_red
+fresh_restart_listener_teardown_red
 # Direct daemon-boot (start --foreground, not via AgendHarness) — manually listed;
 # add a new direct-boot daemon test here when you write one.
 restart_smoke
