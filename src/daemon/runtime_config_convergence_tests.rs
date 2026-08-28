@@ -1,0 +1,387 @@
+//! #3417: the live config map must describe every agent the daemon actually
+//! runs, not only the ones present at boot.
+//!
+//! `ctx.configs` is written in exactly one production place —
+//! `spawn_and_register_agent`, the BOOT path. Every post-boot surface (direct
+//! API SPAWN, MCP SPAWN, deployment spawn, team spawn, restart replacement)
+//! registers an agent without ever recording its resolved configuration, so
+//! two things go wrong for those instances:
+//!
+//! * `snapshot.json` reports `args: []` and `working_dir: null` — the snapshot
+//!   writer's `cfgs.get(name)` misses, and `unwrap_or_default()` turns "unknown"
+//!   into a plausible-looking empty list rather than an error;
+//! * crash respawn is not merely degraded but ABSENT: `crash_respawn.rs` reads
+//!   `ctx.configs.lock().get(name)` and, finding nothing, logs "no config for
+//!   respawn (likely deleted)" and discards the recovery.
+//!
+//! These tests drive the REAL production entry points and the REAL
+//! `SnapshotRotationHandler`; none of them constructs an `AgentSnapshot`, which
+//! is what let the existing serde round-trip test in `src/snapshot.rs` look like
+//! coverage while the writer's lookup was the step that failed.
+
+use crate::daemon::per_tick::{PerTickHandler, TickContext};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+struct Fixture {
+    home: PathBuf,
+    registry: crate::agent::AgentRegistry,
+    configs: crate::api::ConfigRegistry,
+    externals: crate::agent::ExternalRegistry,
+}
+
+fn fixture(tag: &str) -> Fixture {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3417-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&home).expect("home");
+    Fixture {
+        home,
+        registry: Arc::new(Mutex::new(HashMap::new())),
+        configs: Arc::new(Mutex::new(HashMap::new())),
+        externals: Arc::new(Mutex::new(HashMap::new())),
+    }
+}
+
+impl Fixture {
+    /// Seed `fleet.yaml` so a managed spawn resolves to a stable id, exactly as
+    /// the API handler tests do.
+    fn seed_instance(&self, name: &str) {
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&self.home),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n",
+                crate::types::InstanceId::new().full()
+            ),
+        )
+        .expect("seed fleet.yaml");
+    }
+
+    /// Seed an instance whose desired command and argv are resolvable, which is
+    /// what a restart needs to build its replacement.
+    fn seed_runnable_instance(&self, name: &str, command: &str, args: &[&str]) {
+        let rendered = args
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // An explicit working_directory under THIS home is required: unset, fleet
+        // resolution defaults to the real `home_dir()/workspace/<name>`, which the
+        // SPAWN validator then rejects as outside the allowed roots for this home.
+        let work_dir = self.home.join("workspace").join(name);
+        std::fs::create_dir_all(&work_dir).expect("workspace dir");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&self.home),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n    command: {command}\n    args: [{rendered}]\n    working_directory: {}\n",
+                crate::types::InstanceId::new().full(),
+                work_dir.display()
+            ),
+        )
+        .expect("seed fleet.yaml");
+    }
+
+    /// Run the REAL per-tick snapshot writer and read back what it persisted.
+    fn snapshot_args(&self, name: &str) -> Option<Vec<String>> {
+        let handler = crate::daemon::per_tick::snapshot::SnapshotRotationHandler::new();
+        handler.run(&TickContext {
+            home: &self.home,
+            registry: &self.registry,
+            externals: &self.externals,
+            configs: &self.configs,
+        });
+        crate::snapshot::load(&self.home)?
+            .agents
+            .into_iter()
+            .find(|a| a.name == name)
+            .map(|a| a.args)
+    }
+
+    /// What `crash_respawn` asks for before it will respawn anything.
+    fn respawn_config(&self, name: &str) -> Option<crate::daemon::AgentConfig> {
+        self.configs.lock().get(name).cloned()
+    }
+
+    fn kill_all(&self) {
+        let mut reg = crate::agent::lock_registry(&self.registry);
+        for handle in reg.values() {
+            let _ = handle.child.lock().kill();
+        }
+        reg.clear();
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.kill_all();
+        std::fs::remove_dir_all(&self.home).ok();
+    }
+}
+
+fn api_ctx<'a>(fx: &'a Fixture) -> crate::api::handlers::HandlerCtx<'a> {
+    crate::api::handlers::HandlerCtx {
+        registry: &fx.registry,
+        configs: &fx.configs,
+        externals: &fx.externals,
+        notifier: None,
+        home: &fx.home,
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        shutdown: None,
+    }
+}
+
+
+fn mcp_runtime(fx: &Fixture) -> crate::mcp::handlers::dispatch::RuntimeContext {
+    crate::mcp::handlers::dispatch::RuntimeContext {
+        registry: Arc::clone(&fx.registry),
+        configs: Arc::clone(&fx.configs),
+        externals: Arc::clone(&fx.externals),
+        capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: None,
+        notifier: None,
+        shutdown: None,
+    }
+}
+
+/// Direct API SPAWN: the resolved argv must reach the snapshot.
+#[test]
+fn api_spawn_records_resolved_args_for_the_snapshot() {
+    let fx = fixture("api-spawn");
+    let name = "cfg-api";
+    fx.seed_instance(name);
+
+    let result = crate::api::handlers::instance::handle_spawn(
+        &serde_json::json!({
+            "name": name,
+            "backend": crate::default_shell(),
+            "args": "--login",
+        }),
+        &api_ctx(&fx),
+    );
+    assert_eq!(
+        result["ok"],
+        serde_json::json!(true),
+        "spawn must succeed: {result}"
+    );
+
+    assert_eq!(
+        fx.snapshot_args(name).as_deref(),
+        Some(["--login".to_string()].as_slice()),
+        "the snapshot must carry the argv the daemon actually spawned, not an empty list that \
+         reads as valid data"
+    );
+}
+
+/// The same gap, in the form that changes behaviour rather than reporting: an
+/// agent with no config entry is not crash-respawn eligible at all.
+#[test]
+fn a_runtime_spawned_agent_is_crash_respawn_eligible() {
+    let fx = fixture("respawn-eligible");
+    let name = "cfg-respawn";
+    fx.seed_instance(name);
+
+    let result = crate::api::handlers::instance::handle_spawn(
+        &serde_json::json!({
+            "name": name,
+            "backend": crate::default_shell(),
+            "args": "--login",
+        }),
+        &api_ctx(&fx),
+    );
+    assert_eq!(result["ok"], serde_json::json!(true), "spawn: {result}");
+
+    let config = fx.respawn_config(name).expect(
+        "crash_respawn looks the crashed agent up in this map and discards the recovery when it \
+         is absent — a runtime-spawned agent would never be respawned",
+    );
+    assert_eq!(config.args, vec!["--login".to_string()]);
+    assert_eq!(config.name, name);
+}
+
+/// MCP `create_instance` — the same convergence, through the tool surface.
+#[test]
+fn mcp_create_instance_records_resolved_args_for_the_snapshot() {
+    let fx = fixture("mcp-create");
+    let name = "cfg-mcp";
+    fx.seed_instance(name);
+    let runtime = mcp_runtime(&fx);
+    let args = serde_json::json!({
+        "name": name,
+        "backend": crate::default_shell(),
+        "args": "--login",
+    });
+    let result = crate::mcp::handlers::dispatch::dispatch_create_instance(
+        &crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &fx.home,
+            args: &args,
+            instance_name: "operator",
+            sender: &None,
+            runtime: Some(&runtime),
+        },
+    );
+    assert!(
+        result.get("error").is_none(),
+        "create_instance must succeed: {result}"
+    );
+    let spawned_name = result["name"]
+        .as_str()
+        .expect("create_instance returns the effective name")
+        .to_string();
+
+    assert_eq!(
+        fx.snapshot_args(&spawned_name).as_deref(),
+        Some(["--login".to_string()].as_slice()),
+        "an MCP-created instance must be described by the live config map too"
+    );
+}
+
+/// Restart replaces the process; the replacement's resolved argv must be what
+/// the map describes afterwards.
+#[test]
+fn restart_replacement_records_resolved_args_for_the_snapshot() {
+    let fx = fixture("restart");
+    let name = "cfg-restart";
+    fx.seed_runnable_instance(name, &crate::default_shell(), &["--login"]);
+    let spawned = crate::api::handlers::instance::handle_spawn(
+        &serde_json::json!({
+            "name": name,
+            "backend": crate::default_shell(),
+            "args": "--login",
+        }),
+        &api_ctx(&fx),
+    );
+    assert_eq!(spawned["ok"], serde_json::json!(true), "spawn: {spawned}");
+
+    let runtime = mcp_runtime(&fx);
+    let args = serde_json::json!({"instance": name, "mode": "fresh", "reason": "test"});
+    let result = crate::mcp::handlers::dispatch::dispatch_restart_instance(
+        &crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &fx.home,
+            args: &args,
+            instance_name: "operator",
+            sender: &None,
+            runtime: Some(&runtime),
+        },
+    );
+    assert!(
+        result.get("error").is_none(),
+        "restart must succeed: {result}"
+    );
+
+    assert_eq!(
+        fx.snapshot_args(name).as_deref(),
+        Some(["--login".to_string()].as_slice()),
+        "the replacement process must leave the map describing what it actually runs"
+    );
+}
+
+/// Team creation spawns its members through `spawn_one` directly — the one
+/// surface with no config plumbing at all.
+#[test]
+fn team_spawn_records_resolved_args_for_the_snapshot() {
+    let fx = fixture("team");
+    let member = "cfg-team-1";
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&fx.home),
+        format!(
+            "instances:\n  {member}:\n    id: {}\n    args: [\"--login\"]\n",
+            crate::types::InstanceId::new().full()
+        ),
+    )
+    .expect("seed fleet.yaml");
+
+    let result = crate::team_ops::create(
+        &fx.home,
+        crate::team_ops::CreateTeamRequest {
+            name: "cfg-team".to_string(),
+            per_member_backends: vec![crate::default_shell().to_string()],
+            existing_members: vec![],
+            topic_binding_mode: None,
+            orchestrator: None,
+            description: None,
+            repository_path: None,
+            project_id: None,
+            accept_from: vec![],
+        },
+        &fx.registry,
+        None,
+    );
+    assert_eq!(
+        result["ok"],
+        serde_json::json!(true),
+        "team create must succeed: {result}"
+    );
+
+    let spawned = {
+        let reg = crate::agent::lock_registry(&fx.registry);
+        reg.values().map(|h| h.name.to_string()).collect::<Vec<_>>()
+    };
+    assert!(!spawned.is_empty(), "team create must spawn a member");
+    for name in spawned {
+        assert!(
+            fx.respawn_config(&name).is_some(),
+            "team member {name} must be described by the live config map, or it can never be \
+             crash-respawned"
+        );
+    }
+}
+
+/// Deployment spawn — the fourth public create path. Asserted on whatever the
+/// deployment actually named its instances, so the test cannot pass by guessing
+/// a name that was never spawned.
+#[test]
+fn deployment_spawn_records_resolved_args_for_the_snapshot() {
+    let fx = fixture("deploy");
+    let workspace = fx.home.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&fx.home),
+        format!(
+            "templates:\n  tmpl:\n    directory: {}\n    instances:\n      worker:\n        command: {}\n        args: [\"--login\"]\n",
+            workspace.display(),
+            crate::default_shell()
+        ),
+    )
+    .expect("seed fleet.yaml");
+
+    let runtime = crate::deployments::DeploymentRuntime {
+        registry: &fx.registry,
+        configs: &fx.configs,
+        externals: &fx.externals,
+        notifier: None,
+    };
+    let result = crate::deployments::deploy_with_runtime(
+        &fx.home,
+        "operator",
+        &serde_json::json!({"template": "tmpl", "name": "dep"}),
+        Some(&runtime),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "deploy must succeed: {result}"
+    );
+
+    let spawned = {
+        let reg = crate::agent::lock_registry(&fx.registry);
+        reg.values().map(|h| h.name.to_string()).collect::<Vec<_>>()
+    };
+    assert!(!spawned.is_empty(), "deploy must spawn at least one instance");
+    for name in spawned {
+        assert_eq!(
+            fx.snapshot_args(&name).as_deref(),
+            Some(["--login".to_string()].as_slice()),
+            "a deployed instance must be described by the live config map too"
+        );
+    }
+}
