@@ -140,7 +140,6 @@ fn api_ctx<'a>(fx: &'a Fixture) -> crate::api::handlers::HandlerCtx<'a> {
     }
 }
 
-
 fn mcp_runtime(fx: &Fixture) -> crate::mcp::handlers::dispatch::RuntimeContext {
     crate::mcp::handlers::dispatch::RuntimeContext {
         registry: Arc::clone(&fx.registry),
@@ -376,7 +375,10 @@ fn deployment_spawn_records_resolved_args_for_the_snapshot() {
         let reg = crate::agent::lock_registry(&fx.registry);
         reg.values().map(|h| h.name.to_string()).collect::<Vec<_>>()
     };
-    assert!(!spawned.is_empty(), "deploy must spawn at least one instance");
+    assert!(
+        !spawned.is_empty(),
+        "deploy must spawn at least one instance"
+    );
     for name in spawned {
         assert_eq!(
             fx.snapshot_args(&name).as_deref(),
