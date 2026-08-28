@@ -149,6 +149,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         &crate::agent_ops::spawn::SpawnContext {
             home: ctx.home,
             registry: ctx.registry,
+            configs: ctx.configs,
             externals: ctx.externals,
             notifier: ctx.notifier,
         },

@@ -496,6 +496,7 @@ fn spawn_instances(
             let context = crate::agent_ops::spawn::SpawnContext {
                 home,
                 registry: runtime.registry,
+                configs: runtime.configs,
                 externals: runtime.externals,
                 notifier: runtime.notifier,
             };
@@ -611,6 +612,7 @@ fn create_deployment_team(
             home,
             request,
             runtime.registry,
+            runtime.configs,
             runtime.notifier.map(|notifier| notifier.as_ref()),
         );
         return result.get("ok").and_then(Value::as_bool) == Some(true);

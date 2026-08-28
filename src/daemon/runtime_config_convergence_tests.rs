@@ -251,7 +251,7 @@ fn mcp_create_instance_records_resolved_args_for_the_snapshot() {
 fn restart_replacement_records_resolved_args_for_the_snapshot() {
     let fx = fixture("restart");
     let name = "cfg-restart";
-    fx.seed_runnable_instance(name, &crate::default_shell(), &["--login"]);
+    fx.seed_runnable_instance(name, crate::default_shell(), &["--login"]);
     let spawned = crate::api::handlers::instance::handle_spawn(
         &serde_json::json!({
             "name": name,
@@ -314,6 +314,7 @@ fn team_spawn_records_resolved_args_for_the_snapshot() {
             accept_from: vec![],
         },
         &fx.registry,
+        &fx.configs,
         None,
     );
     assert_eq!(

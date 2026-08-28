@@ -46,8 +46,28 @@ pub struct SpawnRequest {
 pub struct SpawnContext<'a> {
     pub home: &'a Path,
     pub registry: &'a AgentRegistry,
+    /// #3417: the live config map. Every surface that reaches this service
+    /// already owned one for its DELETE path; the spawn side has to record into
+    /// the same map or the instance it creates is invisible to the snapshot
+    /// writer and ineligible for crash respawn.
+    pub configs: &'a crate::api::ConfigRegistry,
     pub externals: &'a ExternalRegistry,
     pub notifier: Option<&'a Arc<dyn ApiNotifier>>,
+}
+
+/// The `AgentConfig` a resolved request describes — the actual invocation, not
+/// the desired one in fleet.yaml.
+pub(crate) fn config_for_request(request: &SpawnRequest) -> crate::daemon::AgentConfig {
+    crate::daemon::AgentConfig {
+        name: request.name.clone(),
+        backend: Some(request.declared_backend.clone()),
+        backend_command: request.backend.clone(),
+        args: request.args.clone(),
+        env: request.env.clone(),
+        working_dir: Some(request.working_directory.clone()),
+        submit_key: crate::agent_ops::preset_submit_key(Some(&request.declared_backend))
+            .to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -164,17 +184,27 @@ pub fn spawn_instance(
     )
     .map_err(|e| format!("provisioning refused: {e}"))?;
 
-    let _mode = super::spawn_one(
+    let mut recorded = config_for_request(request);
+    recorded.working_dir = Some(work_dir.clone());
+    let _mode = super::spawn_one_recording_config(
         context.home,
-        context.registry,
+        context.configs,
         &request.name,
-        &request.backend,
-        &request.args,
-        request.mode,
-        &work_dir,
-        crossterm::terminal::size().unwrap_or((120, 40)),
-        request.env.as_ref(),
-        Some(&request.declared_backend),
+        recorded,
+        || {
+            super::spawn_one(
+                context.home,
+                context.registry,
+                &request.name,
+                &request.backend,
+                &request.args,
+                request.mode,
+                &work_dir,
+                crossterm::terminal::size().unwrap_or((120, 40)),
+                request.env.as_ref(),
+                Some(&request.declared_backend),
+            )
+        },
     )
     .map_err(|e| e.to_string())?;
 

@@ -1223,6 +1223,93 @@ impl std::fmt::Display for InjectError {
 /// W1.3② (#2050): moved verbatim from `api/mod.rs` to its cohesive home next
 /// to `remove_metadata` (which it calls) — `api/mod.rs` was the server file,
 /// not the owner of agent-spawn primitives. Behavior unchanged.
+/// The submit key a spawned agent gets, derived from its effective backend.
+///
+/// One source for both places that need it: the live handle `spawn_one` builds,
+/// and the `AgentConfig` the spawn transaction records. Deriving it twice is how
+/// the two drift apart, and a config that disagrees with the running agent is
+/// worse than no config at all — crash respawn would replay the wrong key.
+pub(crate) fn preset_submit_key(backend: Option<&crate::backend::Backend>) -> &'static str {
+    backend.map_or("\r", |b| b.preset().submit_key)
+}
+
+/// The per-`(home, name)` spawn lane.
+///
+/// Same key shape as the DELETING registry (`crate::agent::deleting`) and the
+/// same "short global lock, then work on the `Arc`" acquisition as the write
+/// actors' `WRITERS` map. Entries are not reaped: the map grows only to the
+/// number of DISTINCT instance names this process has ever spawned, which is the
+/// fleet's own order of magnitude, and reaping would need a second global
+/// acquisition on every release to stay race-free.
+type SpawnLane = std::sync::Arc<parking_lot::Mutex<()>>;
+type SpawnLanes =
+    parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), SpawnLane>>;
+
+fn spawn_lane(home: &std::path::Path, name: &str) -> SpawnLane {
+    static LANES: std::sync::OnceLock<SpawnLanes> = std::sync::OnceLock::new();
+    let lanes = LANES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut map = lanes.lock();
+    SpawnLane::clone(
+        map.entry((home.to_path_buf(), name.to_string()))
+            .or_default(),
+    )
+}
+
+/// Record an agent's resolved configuration, then spawn it — the transaction
+/// every post-boot spawn surface goes through.
+///
+/// #3417: `ctx.configs` used to be written only by the BOOT path, so every
+/// runtime-created instance was absent from the map that the snapshot writer and
+/// `crash_respawn` read. The snapshot degraded to a plausible `args: []`; crash
+/// respawn simply refused to respawn — not a reporting nicety but a live gap.
+///
+/// The whole transaction runs inside a per-`(home, name)` lane, because the
+/// alternatives do not survive a concurrent same-name spawn. Nothing else
+/// serializes those: `spawn_instance`'s duplicate check reads the registry and
+/// the actual registration happens later. Rolling back on a value comparison
+/// cannot tell two identical configs apart, and consulting the registry after a
+/// failure is still check-then-act — the winner can register between the check
+/// and the restore, leaving a live agent with a stale or missing config, which is
+/// the exact defect this work removes.
+///
+/// Inside the lane the order is load-bearing in both directions:
+///
+/// * The insert happens BEFORE the spawn, because a child can exit — and the
+///   crash path can look this config up — before the spawn call returns.
+/// * A failure restores the PREVIOUS value rather than deleting, so a failed
+///   restart cannot strip the config its predecessor was described by.
+/// * Success retains it. A child that starts and then exits immediately is not a
+///   failed spawn; it is precisely the case crash respawn exists for.
+///
+/// Locks: the lane guard is held across `spawn`, the configs lock is only ever a
+/// temporary, and no registry lock or disk I/O happens under either. The lane is
+/// taken only here, at the outermost layer of a spawn, so nothing that `spawn`
+/// itself locks can be waiting on it; and no surface enters it twice for one name
+/// on one thread (restart deletes outside the lane, deployment and team spawn
+/// distinct names in sequence).
+pub(crate) fn spawn_one_recording_config(
+    home: &std::path::Path,
+    configs: &crate::api::ConfigRegistry,
+    name: &str,
+    config: crate::daemon::AgentConfig,
+    spawn: impl FnOnce() -> anyhow::Result<crate::backend::SpawnMode>,
+) -> anyhow::Result<crate::backend::SpawnMode> {
+    let lane = spawn_lane(home, name);
+    let _lane = lane.lock();
+    let previous = configs.lock().insert(name.to_string(), config);
+    match spawn() {
+        Ok(mode) => Ok(mode),
+        Err(error) => {
+            let mut cfgs = configs.lock();
+            match previous {
+                Some(previous) => cfgs.insert(name.to_string(), previous),
+                None => cfgs.remove(name),
+            };
+            Err(error)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_one(
     home: &Path,
@@ -1280,9 +1367,7 @@ pub fn spawn_one(
     // #1682: clear BOTH the legacy name file and the id-resolved file — post-#1680
     // readers use `<uuid>.json`, which the old name-only remove left stale.
     remove_metadata(home, name);
-    let preset_submit_key = effective_backend
-        .map(|b| b.preset().submit_key)
-        .unwrap_or("\r");
+    let preset_submit_key = preset_submit_key(effective_backend.as_ref());
     // No-op when caller already passed Fresh; downgrades Resume → Fresh when
     // there is no resumable session in `work_dir` (see
     // `SpawnMode::downgraded_for`). Returned so callers (e.g. the
