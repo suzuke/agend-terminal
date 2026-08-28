@@ -52,7 +52,7 @@ fn hermetic_home(tag: &str) -> PathBuf {
     home
 }
 
-fn run_dir(home: &Path) -> PathBuf {
+fn daemon_run_dir(home: &Path) -> PathBuf {
     std::fs::read_dir(home.join("run"))
         .unwrap()
         .flatten()
@@ -62,7 +62,7 @@ fn run_dir(home: &Path) -> PathBuf {
 }
 
 fn agent_port(home: &Path) -> Option<u16> {
-    std::fs::read_to_string(run_dir(home).join(format!("{AGENT}.port")))
+    std::fs::read_to_string(daemon_run_dir(home).join(format!("{AGENT}.port")))
         .ok()?
         .trim()
         .parse()
@@ -94,7 +94,7 @@ fn attach_pane(home: &Path, port: u16) -> TcpStream {
     )
     .expect("attach to agent bridge");
     stream.set_nodelay(true).unwrap();
-    let cookie = std::fs::read(run_dir(home).join("api.cookie")).unwrap();
+    let cookie = std::fs::read(daemon_run_dir(home).join("api.cookie")).unwrap();
     stream.write_all(&cookie).unwrap();
     stream.flush().unwrap();
     let mut version = [0u8; 1];
@@ -110,7 +110,7 @@ fn attach_pane(home: &Path, port: u16) -> TcpStream {
 }
 
 fn operator_token(home: &Path) -> String {
-    std::fs::read(run_dir(home).join("api.operator"))
+    std::fs::read(daemon_run_dir(home).join("api.operator"))
         .unwrap()
         .iter()
         .map(|byte| format!("{byte:02x}"))
