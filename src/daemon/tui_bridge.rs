@@ -946,6 +946,65 @@ mod tests {
         );
     }
 
+    /// #3373 regression found in review: this listener is the first in the repo
+    /// to be non-blocking (`set_nonblocking` is new on this branch), and only the
+    /// `WouldBlock` arm waited. Every OTHER accept error returned to the top of
+    /// the loop immediately — where the retirement check reads a file — so a
+    /// persistent failure such as EMFILE or ENFILE, the normal shape of fd
+    /// exhaustion under load, spins one core per agent hammering the filesystem.
+    /// Blocking `accept` never had this cost: an error there was followed by a
+    /// park. This repo has burned that fuel before (#3273: "12 busy loops burned
+    /// 58% CPU for 40h").
+    ///
+    /// Driven through an injected accept and an injected sleeper — a counter
+    /// rather than a real wait — so the proof is that EVERY error waits, with no
+    /// sleeping in the test at all.
+    #[test]
+    fn every_accept_error_backs_off_not_only_would_block() {
+        let errors = [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::OutOfMemory,
+        ];
+        for kind in errors {
+            let waits = std::cell::RefCell::new(Vec::new());
+            let accepted = super::accept_one_client(
+                || Err(std::io::Error::from(kind)),
+                |waited| waits.borrow_mut().push(waited),
+            );
+            assert!(accepted.is_none(), "{kind:?} must not yield a client");
+            let waits = waits.into_inner();
+            assert_eq!(
+                waits.len(),
+                1,
+                "{kind:?} must back off exactly once before the loop retries"
+            );
+            assert!(
+                waits[0] >= super::RETIREMENT_POLL,
+                "{kind:?} backed off for only {:?}",
+                waits[0]
+            );
+        }
+    }
+
+    /// The success path must not wait at all — a busy bridge accepting clients
+    /// back to back cannot pay a poll interval per connection.
+    #[test]
+    fn a_successful_accept_does_not_back_off() {
+        let pair = socket_pair();
+        let waits = std::cell::RefCell::new(0usize);
+        let accepted = super::accept_one_client(
+            || Ok(pair.server.try_clone().unwrap()),
+            |_| {
+                *waits.borrow_mut() += 1;
+            },
+        );
+        assert!(accepted.is_some(), "the client must be handed back");
+        assert_eq!(waits.into_inner(), 0, "a successful accept must not wait");
+    }
+
     /// #3373, the input half of the same ownership rule. Socket ownership is
     /// bidirectional: the output forwarder already holds a clone by the time the
     /// input loop runs, so a terminal input path that only `break`s drops one
