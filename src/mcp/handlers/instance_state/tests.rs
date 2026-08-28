@@ -946,3 +946,107 @@ fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
     await_unsent_draft_or_grace(&home, "a", false);
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3414 helper: a fleet.yaml with one Claude instance whose stored args carry
+/// the exact production pin observed on `claude-aef7c0`.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn home_with_pinned_claude(tag: &str, args_yaml: &str) -> std::path::PathBuf {
+    let home = tmp_home_for_create_instance_team(tag);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  dev:\n    backend: claude\n    args: {args_yaml}\n"),
+    )
+    .unwrap();
+    home
+}
+
+/// #3414 RED: `restart_instance mode=fresh` is a statement about the SESSION,
+/// not merely about the preset. The observed `--resume <uuid>` in the stored
+/// args reached the SPAWN boundary verbatim on every fresh restart, so the
+/// agent reattached to the same conversation while the daemon reported
+/// `mode=fresh spawned=true`.
+///
+/// Asserted at the real SPAWN boundary through the production entry, not on
+/// the pure sanitizer: the contract is about the argv actually handed over.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_strips_session_pin_at_spawn_boundary_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude(
+        "3414-strip",
+        "[\"--resume\", \"cb80bb9d-3613-4c0d-9097-788b1941f5db\", \"--model\", \"claude-opus-5\"]",
+    );
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    let observed = LAST_SPAWN_ARGS
+        .lock()
+        .clone()
+        .expect("fresh restart must reach the SPAWN boundary");
+    assert!(
+        !observed.contains("--resume"),
+        "#3414: mode=fresh must not hand a session pin to SPAWN; got {observed:?}"
+    );
+    assert!(
+        !observed.contains("cb80bb9d-3613-4c0d-9097-788b1941f5db"),
+        "#3414: the pinned session id must not survive a fresh restart; got {observed:?}"
+    );
+    assert!(
+        observed.contains("--model claude-opus-5"),
+        "#3414: unrelated flags must be preserved verbatim; got {observed:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 RED (fail-closed): a malformed session selector must refuse BEFORE any
+/// destructive step. `--resume` with no value is unresolvable, and guessing
+/// would either strand the operator on the old session or drop a real value —
+/// so the restart is refused and the live instance is left untouched.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn malformed_session_selector_refuses_without_deleting_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-noDelete", "[\"--resume\"]");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let refused = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    assert_eq!(
+        refused["code"], "fresh_session_args_invalid",
+        "#3414: malformed selector must fail closed with a structured code: {refused}"
+    );
+    assert_eq!(
+        refused["reason"], "missing_required_value",
+        "#3414: the refusal must name WHY, not just that it refused: {refused}"
+    );
+    assert_eq!(
+        refused["token"], "--resume",
+        "#3414: the refusal must name WHICH token blocked it: {refused}"
+    );
+    assert!(
+        LAST_SPAWN_ARGS.lock().is_none(),
+        "#3414: a refused preflight must never reach SPAWN"
+    );
+
+    // The live instance must survive: preflight runs before DELETE.
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml must survive a refused restart");
+    assert!(
+        fleet.instances.contains_key("dev"),
+        "#3414: a refused fresh restart must not delete the instance it refused to restart"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

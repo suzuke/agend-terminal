@@ -27,6 +27,13 @@ pub(crate) type SpawnRpcFn =
 #[cfg(test)]
 pub(crate) static SPAWN_OVERRIDE: parking_lot::Mutex<Option<(std::path::PathBuf, SpawnRpcFn)>> =
     parking_lot::Mutex::new(None);
+/// #3414 test seam: the `args` string exactly as it reached the SPAWN
+/// boundary. The fresh/resume session contract is a statement about THIS
+/// value, so the regression is asserted where the argv is actually handed
+/// over — not on the pure sanitizer in isolation.
+#[cfg(test)]
+pub(crate) static LAST_SPAWN_ARGS: parking_lot::Mutex<Option<String>> =
+    parking_lot::Mutex::new(None);
 
 /// #2454 S8: synchronous inject routing — the testable core shared by the
 /// fire-and-forget threads. Returns Ok(()) on success or Err(detail) on
@@ -74,6 +81,10 @@ pub(super) fn spawn_runtime_or_legacy(
     let name = params["name"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+    #[cfg(test)]
+    {
+        *LAST_SPAWN_ARGS.lock() = params["args"].as_str().map(str::to_string);
+    }
     let env_from_params = params.get("env").and_then(|v| {
         v.as_object().map(|obj| {
             obj.iter()
