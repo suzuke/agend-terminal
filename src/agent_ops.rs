@@ -1248,11 +1248,21 @@ type SpawnLanes =
 fn spawn_lane(home: &std::path::Path, name: &str) -> SpawnLane {
     static LANES: std::sync::OnceLock<SpawnLanes> = std::sync::OnceLock::new();
     let lanes = LANES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let key = (
+        dunce::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()),
+        name.to_string(),
+    );
     let mut map = lanes.lock();
-    SpawnLane::clone(
-        map.entry((home.to_path_buf(), name.to_string()))
-            .or_default(),
-    )
+    SpawnLane::clone(map.entry(key).or_default())
+}
+
+/// Test seam: do these two home spellings resolve to the SAME lane?
+///
+/// Pointer identity of the `Arc`, so the answer comes from the lane itself rather
+/// than from restating the key-building code.
+#[cfg(test)]
+pub(crate) fn lanes_are_the_same(a: &std::path::Path, b: &std::path::Path, name: &str) -> bool {
+    SpawnLane::ptr_eq(&spawn_lane(a, name), &spawn_lane(b, name))
 }
 
 /// Record an agent's resolved configuration, then spawn it — the transaction
@@ -1297,15 +1307,59 @@ pub(crate) fn spawn_one_recording_config(
     let lane = spawn_lane(home, name);
     let _lane = lane.lock();
     let previous = configs.lock().insert(name.to_string(), config);
-    match spawn() {
-        Ok(mode) => Ok(mode),
-        Err(error) => {
-            let mut cfgs = configs.lock();
-            match previous {
-                Some(previous) => cfgs.insert(name.to_string(), previous),
-                None => cfgs.remove(name),
-            };
-            Err(error)
+    let mut rollback = SpawnRollback {
+        configs,
+        name,
+        previous,
+        armed: true,
+    };
+    let outcome = spawn();
+    if outcome.is_ok() {
+        rollback.armed = false;
+    }
+    outcome
+}
+
+/// Undoes the transaction's insert unless the spawn committed.
+///
+/// A guard rather than an `Err` arm so the invariant survives a PANICKING spawn:
+/// unwinding runs this, and a panic that left the attempted config behind would
+/// describe an agent that may not exist.
+struct SpawnRollback<'a> {
+    configs: &'a crate::api::ConfigRegistry,
+    name: &'a str,
+    previous: Option<crate::daemon::AgentConfig>,
+    armed: bool,
+}
+
+impl Drop for SpawnRollback<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut cfgs = self.configs.lock();
+        // DELETE (`lifecycle::delete_transaction` step 6) and clean exit
+        // (`handle_clean_exit`) are the removal authority, and both remove under
+        // THIS lock. If our entry is gone, one of them retired the instance while
+        // we were spawning, and restoring `previous` would resurrect a config for
+        // something that has been deleted — handing crash respawn a dead agent.
+        // Deletion therefore wins and the rollback stands down.
+        //
+        // Presence is a sound ownership token here, and only here: the lane
+        // guarantees no other SPAWN can have written this key, so a present entry
+        // is still ours. The test and the write share this one critical section,
+        // so this is a compare-and-act, not the post-failure check-then-act that
+        // the lane exists to remove.
+        if !cfgs.contains_key(self.name) {
+            return;
+        }
+        match self.previous.take() {
+            Some(previous) => {
+                cfgs.insert(self.name.to_string(), previous);
+            }
+            None => {
+                cfgs.remove(self.name);
+            }
         }
     }
 }

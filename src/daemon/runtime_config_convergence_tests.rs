@@ -710,3 +710,38 @@ fn a_panicking_spawn_rolls_back_like_a_failed_one() {
         "a panicking spawn must restore the previous config, not leave its own attempt behind"
     );
 }
+
+/// The lane is keyed by the home PATH, so two spellings of the same home must not
+/// hand out two different lanes — that would serialize nothing while looking like
+/// it did.
+///
+/// The spellings have to be ones that genuinely differ as raw keys. A trailing
+/// separator and a `.` component do NOT: `Path` compares by component and
+/// normalizes those away, so a test built on them passes with or without
+/// canonicalization and proves nothing. These two do differ: a `..` round-trip
+/// through a real subdirectory, and a symlink to the home.
+#[test]
+#[cfg(unix)]
+fn equivalent_home_spellings_share_one_lane() {
+    let fx = fixture("lane-identity");
+    let name = "cfg-spelling";
+
+    let sub = fx.home.join("sub");
+    std::fs::create_dir_all(&sub).expect("subdir");
+    let via_parent = sub.join("..");
+    assert_ne!(
+        via_parent, fx.home,
+        "the fixture must present a spelling that differs as a raw key"
+    );
+    assert!(
+        crate::agent_ops::lanes_are_the_same(&fx.home, &via_parent, name),
+        "a `..` round-trip must not fork the lane"
+    );
+
+    let link = fx.home.with_extension("link");
+    std::os::unix::fs::symlink(&fx.home, &link).expect("symlink");
+    assert_ne!(link, fx.home);
+    let shared = crate::agent_ops::lanes_are_the_same(&fx.home, &link, name);
+    std::fs::remove_file(&link).ok();
+    assert!(shared, "a symlinked home must not fork the lane");
+}

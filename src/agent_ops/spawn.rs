@@ -55,8 +55,20 @@ pub struct SpawnContext<'a> {
     pub notifier: Option<&'a Arc<dyn ApiNotifier>>,
 }
 
-/// The `AgentConfig` a resolved request describes — the actual invocation, not
-/// the desired one in fleet.yaml.
+/// The `AgentConfig` a resolved request describes: the invocation this spawn
+/// actually asked for, rather than the desired one in fleet.yaml.
+///
+/// Scope of that claim, stated because a shell fallback makes it easy to overread:
+/// this records what the daemon spawned FOR THIS AGENT. If the agent later exits
+/// cleanly and `on_clean_exit_shell_fallback` puts a plain shell in the pane, the
+/// map does NOT follow it there — that path holds no config handle and
+/// deliberately so. `handle_clean_exit` has already removed the entry (a clean
+/// exit means no respawn), and the fallback shell is a pane convenience, not a
+/// managed agent: giving it a config would make crash respawn resurrect a SHELL
+/// in place of the agent it replaced. So an instance showing a fallback shell has
+/// no config, and both readers behave correctly on that — the snapshot reports no
+/// args for something that is not a managed invocation, and crash respawn
+/// declines rather than respawning the wrong process.
 pub(crate) fn config_for_request(request: &SpawnRequest) -> crate::daemon::AgentConfig {
     crate::daemon::AgentConfig {
         name: request.name.clone(),
