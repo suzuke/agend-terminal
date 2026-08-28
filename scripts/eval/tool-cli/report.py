@@ -109,7 +109,8 @@ def render(summary):
     add("  summary.json  %s" % os.path.join(summary["runs_dir"], "summary.json"))
     add("  report.txt    %s" % os.path.join(summary["runs_dir"], "report.txt"))
     add("  manifest.json %s" % os.path.join(summary["runs_dir"], "manifest.json"))
-    add("  per-run artifacts: <run_dir>/{metadata.json,stream.jsonl,stderr.txt,final_state/,grade.json}")
+    add("  per-run artifacts: <run_dir>/{metadata.json,seed.json,stream.jsonl,stderr.txt,run.log,final_state/}")
+    add("  (no per-run grade.json: --aggregate grades in memory; grade.py <run_dir> writes one on demand)")
     add("  total_runs=%d  valid_runs=%d" % (summary["total_runs"], summary["valid_runs"]))
     return "\n".join(out) + "\n"
 

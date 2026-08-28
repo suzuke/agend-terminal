@@ -602,6 +602,21 @@ class ReportRendering(TempCase):
         self.assertTrue(text.endswith("\n"))
         self.assertFalse(text.endswith("\n\n"))
 
+    def test_artifact_index_lists_only_files_every_run_dir_has(self):
+        # `grade.py --aggregate` grades in memory: no run dir ever gets a grade.json
+        sys.path.insert(0, ROOT)
+        import report  # noqa: E402
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [])
+        write_run(runs, "S01", "cli", 1, [])
+        text = report.render(grade.aggregate(runs, scen))
+        line = next(l for l in text.splitlines() if "per-run artifacts" in l)
+        listed = set(line[line.index("{") + 1:line.index("}")].split(","))
+        self.assertEqual(listed, {"metadata.json", "seed.json", "stream.jsonl",
+                                  "stderr.txt", "run.log", "final_state/"})
+
 
 if __name__ == "__main__":
     unittest.main()
