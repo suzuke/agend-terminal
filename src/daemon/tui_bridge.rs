@@ -223,15 +223,18 @@ fn greet_authenticated_client(stream: &mut std::net::TcpStream, dump: &[u8]) -> 
     framing::write_frame(stream, dump).is_ok()
 }
 
-/// Start a client's output forwarder, and report whether it started.
+/// Start one of a client's two threads, and report whether it started.
 ///
-/// A refused spawn is fail-closed rather than logged and stepped over: that
-/// forwarder is this connection's ONLY retirement watcher, and the input thread
-/// holds another handle on the same socket, so a client left running without one
-/// would keep a live socket to a generation that is trying to go away. `spawn` is
-/// injected so a test can drive the refusal, which is otherwise unreachable
-/// without exhausting the process's threads.
-fn start_tui_output_thread(
+/// A refused spawn is fail-closed rather than logged and stepped over, and for
+/// both threads, because each connection is shared by two handles. Without the
+/// output forwarder the connection has no retirement watcher at all; without the
+/// input thread the pane keeps receiving output while every keystroke is
+/// discarded. Either way a client left running is one the daemon can no longer
+/// account for, and dropping one handle closes nothing — hence `shutdown`.
+///
+/// `spawn` is injected so a test can drive the refusal, which is otherwise
+/// unreachable without exhausting the process's threads.
+fn start_client_thread(
     stream: &std::net::TcpStream,
     spawn: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -312,6 +315,46 @@ fn forward_tui_output(
             }
         }
     }
+}
+
+/// One client's input pump: decode framed input until the connection ends, then
+/// CLOSE it — on every path, without exception.
+///
+/// Closing is the load-bearing part. The output forwarder holds another handle on
+/// this connection, so returning from here drops one of two and closes nothing:
+/// the pane would keep receiving output, look connected, and have every keystroke
+/// silently discarded. A peer half-close is therefore treated as full
+/// termination, which is safe because no client of this protocol half-closes —
+/// `Shutdown::Write` appears nowhere in `src/`, and `bridge_client` closes with
+/// `Shutdown::Both` — so there is no read-only attach mode to preserve.
+///
+/// `write_data` reports whether a data frame reached the PTY (false ends the
+/// connection) and `resize` applies a resize; both are injected so a test can
+/// drive the real loop over a loopback socket without a live agent.
+fn forward_tui_input(
+    mut reader: std::net::TcpStream,
+    mut write_data: impl FnMut(&[u8]) -> bool,
+    mut resize: impl FnMut(u16, u16),
+) {
+    loop {
+        match framing::read_tagged_frame(&mut reader) {
+            Ok((TAG_DATA, data)) => {
+                if !write_data(&data) {
+                    break;
+                }
+            }
+            Ok((TAG_RESIZE, data)) if data.len() == 4 => {
+                resize(
+                    u16::from_be_bytes([data[0], data[1]]),
+                    u16::from_be_bytes([data[2], data[3]]),
+                );
+            }
+            // Anything else — EOF, a short read, an undefined tag, a resize of
+            // the wrong width — ends the connection.
+            _ => break,
+        }
+    }
+    let _ = reader.shutdown(std::net::Shutdown::Both);
 }
 
 pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
@@ -421,7 +464,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         // budget), or when this bridge is retired. No graceful join needed —
         // each client connection is independent. (§12.5 wants this marker within
         // 10 lines of the spawn, so it stays last in this block.)
-        if let Err(e) = start_tui_output_thread(&stream, || {
+        if let Err(e) = start_client_thread(&stream, || {
             std::thread::Builder::new()
                 .name(format!("{n}_tui_out"))
                 .spawn(move || {
@@ -434,18 +477,32 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         }
 
         let read_stream = stream;
+        // Keep one handle behind so a REFUSED input thread can still close the
+        // connection: `read_stream` moves into the thread, and the forwarder's
+        // clone would otherwise keep the pane looking connected. On success this
+        // handle is dropped at the end of the iteration, which closes nothing.
+        let closer = match read_stream.try_clone() {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::warn!(agent = name, error = %e, "TUI client handle unavailable");
+                let _ = read_stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+        };
         let n = name.to_string();
-        let n_err = n.clone();
-        // fire-and-forget: per-client TUI input forwarder. Loop exits on
-        // socket disconnect (read_tagged_frame returns Err). Mirror of
-        // tui_out above; same independent-per-client lifecycle.
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("{n}_tui_in"))
-            .spawn(move || {
-                let mut reader = read_stream;
-                loop {
-                    match framing::read_tagged_frame(&mut reader) {
-                        Ok((TAG_DATA, data)) => {
+        // fire-and-forget: per-client TUI input forwarder. Loop exits on socket
+        // disconnect, on an undefined frame, or on a PTY write failure — and
+        // `forward_tui_input` closes the connection on every one of them, because
+        // the output thread holds another handle and dropping this one closes
+        // nothing. Mirror of tui_out above; same independent-per-client
+        // lifecycle, and a refused spawn is fail-closed the same way.
+        if let Err(e) = start_client_thread(&closer, || {
+            std::thread::Builder::new()
+                .name(format!("{n}_tui_in"))
+                .spawn(move || {
+                    forward_tui_input(
+                        read_stream,
+                        |data| {
                             // CR-2026-06-14: route through the bounded
                             // `write_to_pty` (write_with_timeout) instead of a
                             // raw `pty_writer.lock().write_all`. This `pty_writer`
@@ -457,31 +514,25 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                             // every subsequent inject to this agent fail-fasts
                             // (the H13 control-plane harm class). The bounded
                             // path never holds the lock past the timeout.
-                            if agent::write_to_pty(&pty_writer, &data).is_err() {
-                                break;
-                            }
-                        }
-                        Ok((TAG_RESIZE, data)) if data.len() == 4 => {
-                            let cols = u16::from_be_bytes([data[0], data[1]]);
-                            let rows = u16::from_be_bytes([data[2], data[3]]);
+                            agent::write_to_pty(&pty_writer, data).is_ok()
+                        },
+                        |cols, rows| {
                             let _ = pty_master.lock().resize(PtySize {
                                 rows,
                                 cols,
                                 pixel_width: 0,
                                 pixel_height: 0,
                             });
-                            {
-                                let mut c = core.lock();
-                                c.vterm.resize(cols, rows);
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                tracing::info!(agent = %n, "TUI client disconnected");
-            })
-        {
-            tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI input thread");
+                            let mut c = core.lock();
+                            c.vterm.resize(cols, rows);
+                        },
+                    );
+                    tracing::info!(agent = %n, "TUI client disconnected");
+                })
+                .map(|_| ())
+        }) {
+            tracing::warn!(agent = name, error = %e, "TUI input thread refused; client closed");
+            continue;
         }
     }
 }
