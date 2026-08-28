@@ -1411,13 +1411,37 @@ mod tests {
     ///
     /// The slice must stop where `app_teardown` does. Asserted here on the exact
     /// expression the guards use today, so this fails until the slice is bounded.
-    #[test]
-    fn teardown_wiring_guards_must_not_read_their_own_source_3420() {
-        let source = include_str!("mod.rs");
+    /// The production body of `app_teardown`, and nothing after it.
+    ///
+    /// `app_teardown` is the last production item before
+    /// `fn is_text_composing_input`, so that is where the slice ends. Reading to
+    /// EOF instead pulls this whole test module in, and every needle below then
+    /// matches its own source.
+    fn teardown_production_body(source: &str) -> &str {
         let start = source
             .find("fn app_teardown(")
             .expect("app_teardown present");
-        let body = &source[start..];
+        let rest = &source[start..];
+        let end = rest
+            .find("\nfn is_text_composing_input(")
+            .expect("app_teardown must remain the item before is_text_composing_input");
+        &rest[..end]
+    }
+
+    /// The searched call, assembled at runtime so this module's own source never
+    /// contains it as a literal. Without this, bounding the slice alone would
+    /// still leave a guard that a future in-module string could satisfy.
+    fn join_call(group: &str, deadline: &str) -> String {
+        format!(
+            "{}({group}, {deadline})",
+            ["bounded_join", "_attach_workers"].concat()
+        )
+    }
+
+    #[test]
+    fn teardown_wiring_guards_must_not_read_their_own_source_3420() {
+        let source = include_str!("mod.rs");
+        let body = teardown_production_body(source);
         let cfg_test = ["#[cfg(", "test)]"].concat();
         assert!(
             !body.contains(&cfg_test),
@@ -1431,15 +1455,12 @@ mod tests {
     #[test]
     fn teardown_joins_each_group_against_its_own_deadline_3420() {
         let source = include_str!("mod.rs");
-        let start = source
-            .find("fn app_teardown(")
-            .expect("app_teardown present");
-        let body = &source[start..];
+        let body = teardown_production_body(source);
         let reap_call = body
-            .find("bounded_join_attach_workers(reap_workers, reap_deadline)")
+            .find(&join_call("reap_workers", "reap_deadline"))
             .expect("the reap join must use the reap deadline");
         let attach_call = body
-            .find("bounded_join_attach_workers(attach_workers, attach_deadline)")
+            .find(&join_call("attach_workers", "attach_deadline"))
             .expect("the attach join must use the attach deadline");
         assert!(
             reap_call < attach_call,
@@ -1453,15 +1474,13 @@ mod tests {
     #[test]
     fn app_teardown_joins_reapers_before_attach_workers_3420() {
         let source = include_str!("mod.rs");
-        let start = source
-            .find("fn app_teardown(")
-            .expect("app_teardown present");
-        let body = &source[start..];
+        let body = teardown_production_body(source);
+        let joiner = ["bounded_join", "_attach_workers"].concat();
         let reap = body
-            .find("bounded_join_attach_workers(reap_workers")
+            .find(&format!("{joiner}(reap_workers"))
             .expect("teardown must join unmanaged reaper handles");
         let attach = body
-            .find("bounded_join_attach_workers(attach_workers")
+            .find(&format!("{joiner}(attach_workers"))
             .expect("teardown must join attach workers");
         assert!(
             reap < attach,
