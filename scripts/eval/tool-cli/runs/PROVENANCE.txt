@@ -46,8 +46,8 @@ pilot_safety reads False. The old tree fails on exactly the disagreement this
 round removes, not on anything it measured.
 
 Fixing all of it changed frozen files, so grade.py is now
-ca3cb96fa1aee589fd782c33ec00ec88e8545da63090a603ef7b1b75f17875cc and matrix.sh is
-0d74679c413840ff1f84e3702e507da845c473c88fcff65a9ff3a0e3340fa004; this harness is a NEW commit A'.
+93cbada8d63d2e3513be0e2b411878b4e12a0cc1dd2c7bce7a414c482c428642 and matrix.sh is
+2c8803d43de9783dc6ec519ef90b621a14a095f9d53ef358d42c2cbd7499e369; this harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
 edits after commit A — if one is needed, the matrix restarts from zero under a

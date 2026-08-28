@@ -199,6 +199,15 @@ def frozen_seed_digests(scenarios_dir):
             for scenario in sorted({cell[0] for cell in FROZEN_PLAN})}
 
 
+def frozen_system_prompt_digest(arm):
+    """sha256 of the system prompt SPEC.txt:60 builds for an arm."""
+    base = file_text(os.path.join(HERE, "prompts", "base.txt"))
+    section = file_text(os.path.join(HERE, "prompts", "%s.txt" % arm))
+    if base is None or section is None:
+        return None
+    return hashlib.sha256((base + "\n\n" + section).encode("utf-8")).hexdigest()
+
+
 def frozen_prompt_digests():
     """sha256 of the three frozen system-prompt files."""
     return {name: file_sha256(os.path.join(HERE, "prompts", "%s.txt" % name))
@@ -921,6 +930,8 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
         return "seed_not_frozen"
     if meta.get("fleet_sha256") != frozen_fleet_digest():
         return "fleet_not_frozen"
+    if meta.get("system_prompt_sha256") != frozen_system_prompt_digest(arm):
+        return "system_prompt_not_frozen"
     cell = (meta.get("scenario"), meta.get("pair"), arm)
     if cell in FROZEN_PLAN_CELLS and meta.get("order_in_pair") != frozen_order(cell[1], arm):
         return "order_in_pair_mismatch"

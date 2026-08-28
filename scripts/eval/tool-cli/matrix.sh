@@ -153,7 +153,7 @@ GIT_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -f "$OUT/manifest.json" ]; then
   python3 -c '
 import json, os, sys
-here, path, stamp, model, head = sys.argv[1:]
+here, repo, path, stamp, model, head = sys.argv[1:]
 sys.path.insert(0, here)
 import grade
 try:
@@ -172,9 +172,14 @@ bad += ["%s is not what this matrix records" % field
 # grader checks it, so the guard must too
 if manifest.get("seed_sha256") != grade.frozen_seed_digests(os.path.join(here, "scenarios")):
     bad.append("seed_sha256 is not the frozen seed map")
+# the digests must be of the binaries THIS matrix would run, not merely 64 hex
+current = {name: grade.file_sha256(os.path.join(repo, "target/release", name))
+           for name in ("agend-terminal", "agend-mcp-bridge")}
+if manifest.get("binary_sha256") != current:
+    bad.append("binary_sha256 is not the build this matrix would run")
 if bad:
     sys.exit("; ".join(bad))
-' "$HERE" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
+' "$HERE" "$REPO" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
     || die "refusing to overwrite $OUT/manifest.json: it does not describe this matrix"
 fi
 
