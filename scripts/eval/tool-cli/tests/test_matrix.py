@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -15,6 +16,8 @@ DROP_SENTINEL = object()
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MATRIX = os.path.join(HERE, "matrix.sh")
+sys.path.insert(0, HERE)
+import grade  # noqa: E402  (the harness under test)
 
 
 def dry_run(out_dir, env_extra=None):
@@ -186,6 +189,45 @@ class MatrixAuthority(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0,
                             "a run missing SPEC-required metadata did not complete:\n"
                             + proc.stdout + proc.stderr)
+
+
+    def _valid_manifest(self, **overrides):
+        """A manifest this matrix would accept, so a probe can break one field."""
+        manifest = {
+            "schema": 1, "stamp": os.path.basename(self.out),
+            "created_at": "2026-08-28T00:00:00Z", "dry_run": False,
+            "git_head": self._head(), "model": "claude-fable-5", "jobs": 3,
+            "binary_sha256": {"agend-terminal": "0" * 64, "agend-mcp-bridge": "0" * 64},
+            "prompt_sha256": grade.frozen_prompt_digests(),
+            "fleet_sha256": grade.frozen_fleet_digest(),
+            "seed_sha256": grade.frozen_seed_digests(os.path.join(HERE, "scenarios")),
+            "missing_scenarios": [], "total_runs": 210,
+            "plan": grade.frozen_plan_rows(),
+        }
+        manifest.update(overrides)
+        for key in [k for k, v in overrides.items() if v is DROP_SENTINEL]:
+            manifest.pop(key, None)
+        with open(os.path.join(self.out, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+
+    def test_a_manifest_with_the_wrong_seed_map_is_not_overwritten(self):
+        """seed_sha256 is checked when grading and was not checked before writing.
+
+        Everything else in this manifest is what the matrix would write, so the
+        seed map is the only thing that can refuse it.
+        """
+        self._valid_manifest(seed_sha256={"S01": "e" * 64})
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a manifest whose seed map is not the frozen one must not "
+                            "be overwritten:\n" + proc.stdout + proc.stderr)
+
+    def test_a_manifest_with_no_seed_map_is_not_overwritten(self):
+        self._valid_manifest(seed_sha256=DROP_SENTINEL)
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a manifest that states no seed identity must not be "
+                            "overwritten:\n" + proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":
