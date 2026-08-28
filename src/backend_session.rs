@@ -170,31 +170,65 @@ fn err(backend: &Backend, token: &str, reason: SessionArgsErrorReason) -> Sessio
 ///
 /// Fails closed — the caller must abandon the restart WITHOUT touching the
 /// live instance — when a selector's grammar cannot be resolved unambiguously.
-/// Codex globals that OWN the following token, read off `codex --help`.
-/// Without this the parser mistook a global's VALUE for the `resume`
-/// subcommand — `-c resume` ate the config value and left a dangling flag.
-const CODEX_VALUED_GLOBALS: &[&str] = &[
-    "-c",
-    "--config",
-    "--enable",
-    "--disable",
-    "--remote",
-    "--remote-auth-token-env",
-    "-i",
-    "--image",
-    "-m",
-    "--model",
-    "--local-provider",
-    "-p",
-    "--profile",
-    "-s",
-    "--sandbox",
-    "-C",
-    "--cd",
-    "--add-dir",
-    "-a",
-    "--ask-for-approval",
-];
+/// How many argv slots a Codex global owns, exactly as `codex --help` prints
+/// it. Typed rather than a flat name list: `-i, --image <FILE>...` is greedy
+/// and every other valued global takes exactly one, so a single shared rule
+/// would have to infer arity — the mistake this table exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GlobalArity {
+    /// No value (`--search`, `--oss`).
+    Flag,
+    /// `<VALUE>` — exactly one.
+    One,
+    /// `<VALUE>...` — one or more; consumes every following non-flag token.
+    Variadic,
+}
+
+struct CodexGlobal {
+    long: &'static str,
+    short: Option<&'static str>,
+    arity: GlobalArity,
+}
+
+/// Read off `codex --help` on the installed CLI. Flags are listed too, so a
+/// valueless global can never be mistaken for one that owns the next token.
+const CODEX_GLOBALS: &[CodexGlobal] = &{
+    const fn g(long: &'static str, short: Option<&'static str>, arity: GlobalArity) -> CodexGlobal {
+        CodexGlobal { long, short, arity }
+    }
+    [
+        g("--config", Some("-c"), GlobalArity::One),
+        g("--enable", None, GlobalArity::One),
+        g("--disable", None, GlobalArity::One),
+        g("--remote", None, GlobalArity::One),
+        g("--remote-auth-token-env", None, GlobalArity::One),
+        g("--image", Some("-i"), GlobalArity::Variadic),
+        g("--model", Some("-m"), GlobalArity::One),
+        g("--local-provider", None, GlobalArity::One),
+        g("--profile", Some("-p"), GlobalArity::One),
+        g("--sandbox", Some("-s"), GlobalArity::One),
+        g("--cd", Some("-C"), GlobalArity::One),
+        g("--add-dir", None, GlobalArity::One),
+        g("--ask-for-approval", Some("-a"), GlobalArity::One),
+        g("--strict-config", None, GlobalArity::Flag),
+        g("--oss", None, GlobalArity::Flag),
+        g("--approve-for-me", None, GlobalArity::Flag),
+        g(
+            "--dangerously-bypass-approvals-and-sandbox",
+            None,
+            GlobalArity::Flag,
+        ),
+        g("--dangerously-bypass-hook-trust", None, GlobalArity::Flag),
+        g("--search", None, GlobalArity::Flag),
+        g("--no-alt-screen", None, GlobalArity::Flag),
+    ]
+};
+
+fn codex_global(token: &str) -> Option<&'static CodexGlobal> {
+    CODEX_GLOBALS
+        .iter()
+        .find(|g| token == g.long || g.short.is_some_and(|short| token == short))
+}
 
 /// Flags `codex resume --help` declares as belonging to the SUBCOMMAND.
 /// Promoting them to top level yields an argv the CLI rejects.
@@ -256,15 +290,37 @@ pub fn sanitize_for_fresh(
         let tok = &args[index];
 
         if is_codex {
-            // A valued global owns the next token; skipping it is what keeps
-            // `-c resume` from being read as the subcommand.
-            if CODEX_VALUED_GLOBALS.contains(&tok.as_str()) {
+            // A global owns its declared number of following tokens; honouring
+            // that arity is what keeps `-c resume` (config value) and
+            // `-i a.png resume` (image filename) from being read as the
+            // subcommand. Equals forms carry their value inline and fall
+            // through to the passthrough below without a value lookup.
+            if let Some(global) = codex_global(tok) {
                 out.push(tok.clone());
-                if let Some(value) = args.get(index + 1).filter(|_| index + 1 < boundary) {
-                    out.push(value.clone());
-                    index += 2;
-                } else {
-                    index += 1;
+                index += 1;
+                match global.arity {
+                    GlobalArity::Flag => {}
+                    GlobalArity::One => {
+                        let value = args
+                            .get(index)
+                            .filter(|_| index < boundary)
+                            .filter(|v| !v.starts_with('-'))
+                            .ok_or_else(|| err(backend, tok, SessionArgsErrorReason::Ambiguous))?;
+                        out.push(value.clone());
+                        index += 1;
+                    }
+                    GlobalArity::Variadic => {
+                        // `<FILE>...` is greedy: every following non-flag token
+                        // belongs to it, including one spelled `resume`.
+                        let start = index;
+                        while index < boundary && !args[index].starts_with('-') {
+                            out.push(args[index].clone());
+                            index += 1;
+                        }
+                        if index == start {
+                            return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
+                        }
+                    }
                 }
                 continue;
             }
