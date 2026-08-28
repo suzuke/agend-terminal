@@ -1561,3 +1561,83 @@ fn auto_answer_timeout_none_for_operator_answered_decision_2313() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #3419 poison-directory pins for `resolve_governing_decision` ─────────────
+// Each fixture is written as raw files (bypassing `post`) so the directory can
+// hold shapes the API would never produce. Every test first proves the clean
+// base resolves, so a refusal below is attributable to the poison, not to a
+// malformed fixture.
+
+fn governed_base(home: &Path, id: &str) -> Decision {
+    let mut base = make_test_decision("lead");
+    base.id = id.into();
+    base.review_class = Some(crate::daemon::pr_state::ReviewClass::Dual);
+    write_named_decision(home, &format!("{id}.json"), &base);
+    base
+}
+
+fn superseder(home: &Path, id: &str, supersedes: &str) {
+    let mut sup = make_test_decision("lead");
+    sup.id = id.into();
+    sup.supersedes = Some(supersedes.into());
+    write_named_decision(home, &format!("{id}.json"), &sup);
+}
+
+fn resolve_err(home: &Path, id: &str) -> String {
+    match resolve_governing_decision(home, id) {
+        Ok(resolved) => panic!("'{id}' must be refused, but resolved to {resolved:?}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn governing_decision_refuses_ambiguous_superseding_leaves_3419() {
+    let home = tmp_home("ambiguous-leaves-3419");
+    governed_base(&home, "d-base");
+    assert_eq!(
+        resolve_governing_decision(&home, "d-base")
+            .expect("clean base resolves")
+            .review_class,
+        Some(crate::daemon::pr_state::ReviewClass::Dual)
+    );
+
+    // One active superseder: superseded, not ambiguous.
+    superseder(&home, "d-sup-a", "d-base");
+    let one = resolve_err(&home, "d-base");
+    assert!(one.contains("is superseded"), "one leaf: {one}");
+    assert!(
+        !one.contains("ambiguous"),
+        "one leaf must not read as ambiguous: {one}"
+    );
+
+    // Two active superseders for the same decision: the leaf is ambiguous and
+    // must be named as such — a resolver that only knows "superseded" cannot
+    // tell an operator that the directory itself is inconsistent.
+    superseder(&home, "d-sup-b", "d-base");
+    let two = resolve_err(&home, "d-base");
+    assert!(
+        two.contains("ambiguous superseding leaf"),
+        "two active leaves must be refused as ambiguous: {two}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governing_decision_refuses_file_name_identity_mismatch_3419() {
+    let home = tmp_home("identity-mismatch-3419");
+    governed_base(&home, "d-clean");
+    assert!(resolve_governing_decision(&home, "d-clean").is_ok());
+
+    // `d-named.json` whose record claims to be `d-other`: the file a caller
+    // reaches by id must be the record that carries that id.
+    let mut imposter = make_test_decision("lead");
+    imposter.id = "d-other".into();
+    imposter.review_class = Some(crate::daemon::pr_state::ReviewClass::Single);
+    write_named_decision(&home, "d-named.json", &imposter);
+    let err = resolve_err(&home, "d-named");
+    assert!(
+        err.contains("mismatched record identity"),
+        "file/name identity mismatch must be refused: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
