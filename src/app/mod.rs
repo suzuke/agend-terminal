@@ -1372,6 +1372,21 @@ mod tests {
             "close must remove the unmanaged registry entry before handoff"
         );
 
+        // NON-VACUITY PRECONDITION. The final assertion below only distinguishes
+        // a teardown that JOINED the reaper from one that detached it if the
+        // child is still alive when teardown starts. `terminate_agents_parallel`
+        // sleeps `SHUTDOWN_GRACE` before it reaps anything, so a child that
+        // outlives this window can only be dead afterwards because teardown
+        // waited. A child that exits on its OWN is reaped by the final
+        // `try_wait` no matter what teardown did, and the test would pass
+        // against a detaching teardown.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            matches!(child.lock().try_wait(), Ok(None)),
+            "fixture child must still be running when teardown begins, or the \
+             reap assertion below cannot tell a joined teardown from a detached one"
+        );
+
         app_teardown(&home, &Layout::new(), reap_workers, Vec::new());
         assert!(
             matches!(child.lock().try_wait(), Ok(Some(_))),
