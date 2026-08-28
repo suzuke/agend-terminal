@@ -540,6 +540,22 @@ pub(crate) fn handle_delegate_task(
     } else {
         None
     };
+    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
+    // durable mutations (task-create/delivery) AND before the authority
+    // preflight, so a runtime-less caller still gets the #2454 code rather than
+    // an authority diagnostic. Skipped for review_assignment, which dispatches
+    // via the store and never needed the runtime — that path stays byte-for-byte.
+    if !checks.review_assignment
+        && runtime.is_none()
+        && args["branch"].as_str().is_some_and(|b| !b.is_empty())
+    {
+        return json!({
+            "ok": false,
+            "error": "branch dispatch requires in-process runtime",
+            "code": "runtime_unavailable_branch_2454",
+            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
+        });
+    }
     let preflight_review_class = match preflight_branch_authority(home, args, &checks) {
         Ok(class) => class,
         Err(e) => return e,
@@ -549,18 +565,6 @@ pub(crate) fn handle_delegate_task(
         return review_assignment::dispatch_review_assignment_via_store(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
-    }
-
-    // #2454 atomicity: runtime=None + non-empty branch → fail closed BEFORE
-    // durable mutations (task-create/delivery). Placed after the
-    // review_assignment early-return to preserve that path byte-for-byte.
-    if runtime.is_none() && args["branch"].as_str().is_some_and(|b| !b.is_empty()) {
-        return json!({
-            "ok": false,
-            "error": "branch dispatch requires in-process runtime",
-            "code": "runtime_unavailable_branch_2454",
-            "remediation": "ensure MCP handler receives RuntimeContext from daemon dispatch",
-        });
     }
 
     let created = if runtime.is_some() {
