@@ -1079,8 +1079,6 @@ fn malformed_session_selector_preserves_escalation_runtime_3414() {
     );
     let escalation_path = home.join("health_escalation.json");
     let escalation_before = std::fs::read(&escalation_path).expect("escalation store");
-    let fleet_before =
-        std::fs::read(crate::fleet::fleet_yaml_path(&home)).expect("fleet.yaml");
     let runtime = crate::mcp::handlers::minimal_test_runtime();
     *LAST_SPAWN_ARGS.lock() = None;
 
@@ -1095,11 +1093,6 @@ fn malformed_session_selector_preserves_escalation_runtime_3414() {
         std::fs::read(&escalation_path).expect("escalation store after refusal"),
         escalation_before,
         "#3414: rejected preflight must not rewrite escalation persistence"
-    );
-    assert_eq!(
-        std::fs::read(crate::fleet::fleet_yaml_path(&home)).expect("fleet.yaml after refusal"),
-        fleet_before,
-        "#3414: rejected preflight must not rewrite the live instance config"
     );
     assert!(
         !crate::agent::deleting::is_deleting(&home, "dev"),

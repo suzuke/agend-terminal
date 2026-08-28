@@ -567,9 +567,6 @@ pub(super) fn handle_restart_instance_with_runtime(
         Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
-    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
-    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
-    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
 
@@ -642,6 +639,12 @@ pub(super) fn handle_restart_instance_with_runtime(
             }
         }
     };
+
+    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
+    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
+    // Keep this AFTER typed session preflight: a refused fresh restart must not
+    // mutate persisted escalation state or any other runtime state.
+    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
 
     // t-95913-5: the operator's unsent keystrokes live ONLY in the input line of
     // the process we're about to kill — a fresh OR resume restart destroys them
