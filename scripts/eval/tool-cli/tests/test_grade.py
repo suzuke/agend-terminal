@@ -88,19 +88,39 @@ def task_event(seq, instance, kind, task_id, **fields):
             "instance": instance, "emitter_id": IDS[instance], "event": event}
 
 
+#: meta_extra sentinel: delete the key instead of setting it.
+DROP = object()
+
+
 def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
               meta_extra=None, sent_ledger=None):
     run_dir = os.path.join(base, "%s-%s-p%s" % (scenario, arm, pair))
     os.makedirs(os.path.join(run_dir, "final_state", "inbox"), exist_ok=True)
     meta = {"schema": 1, "scenario": scenario, "arm": arm, "pair": pair,
             "order_in_pair": "first", "model_requested": "claude-fable-5",
-            "model_resolved": "claude-fable-5", "fence": True, "exit_code": 0,
+            "model_resolved": "claude-fable-5", "claude_version": "2.0.0-test",
+            "git_head": "0" * 40,
+            "binary_sha256": {"agend-terminal": "0" * 64, "agend-mcp-bridge": "0" * 64},
+            "system_prompt_sha256": "0" * 64, "prompt_sha256": "0" * 64,
+            "fleet_sha256": "0" * 64, "seed_sha256": "0" * 64,
+            "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
+            "duration_ms": 1000, "fence": True, "exit_code": 0,
             "turns": 3, "timed_out": False, "invalid_reason": None}
     meta.update(meta_extra or {})
+    for key in [k for k, v in (meta_extra or {}).items() if v is DROP]:
+        meta.pop(key, None)
     with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh)
+    # A real stream opens with the system/init event that carries the model the
+    # session actually resolved (SPEC section 3). Fixtures carry it too, unless
+    # the caller is testing what happens when it disagrees or is missing.
+    stream = list(events)
+    if not any(e.get("type") == "system" and e.get("subtype") == "init"
+               for e in stream if isinstance(e, dict)):
+        stream.insert(0, {"type": "system", "subtype": "init",
+                          "model": meta.get("model_resolved")})
     with open(os.path.join(run_dir, "stream.jsonl"), "w", encoding="utf-8") as fh:
-        for event in events:
+        for event in stream:
             fh.write(json.dumps(event) + "\n")
     final = os.path.join(run_dir, "final_state")
     with open(os.path.join(final, "fleet.yaml"), "w", encoding="utf-8") as fh:
@@ -716,6 +736,155 @@ class Aggregation(TempCase):
                          ["duplicate_cell", "duplicate_cell"],
                          "both copies go: which one is the real run is not ours to guess")
         self.assertEqual(summary["n"], 0, "the contested pair cannot be counted")
+
+    # ---- A''' review: metadata identity, declarations, and the frozen plan ----
+
+    FROZEN_CELLS = (
+        [("S0%d" % i, pair, arm)
+         for i in range(1, 7) for pair in range(1, 11) for arm in ("mcp", "cli")]
+        + [("S13", pair, "mcp") for pair in range(1, 46)]
+        + [("S14", pair, "cli") for pair in range(1, 46)]
+    )
+
+    def frozen_matrix(self, skip=(), extra=()):
+        """The whole SPEC section 6 plan on disk: 210 runs, every one conforming."""
+        runs = os.path.join(self.tmp, "runs")
+        spec = {"S0%d" % i: (PASS_EXPECT, ["mcp", "cli"]) for i in range(1, 7)}
+        spec["S13"] = (PASS_EXPECT, ["mcp"])
+        spec["S14"] = (PASS_EXPECT, ["cli"])
+        scen = write_scenarios(self.tmp, spec)
+        os.makedirs(runs, exist_ok=True)
+        for cell in self.FROZEN_CELLS:
+            if cell in skip:
+                continue
+            scenario, pair, arm = cell
+            write_run(runs, scenario, arm, pair, [])
+        for scenario, pair, arm, meta_extra in extra:
+            write_run(runs, scenario, arm, pair, [], meta_extra=meta_extra)
+        return runs, scen
+
+    def test_the_complete_frozen_matrix_passes_every_gate(self):
+        """The baseline the rest of these tests deviate from.
+
+        Without it a fail-closed suite proves only that the grader can say no.
+        """
+        runs, scen = self.frozen_matrix()
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(summary["total_runs"], 210)
+        self.assertEqual(summary["valid_runs"], 210)
+        self.assertEqual(summary["n"], 60)
+        self.assertTrue(summary["plan_gate"]["pass"])
+        self.assertTrue(summary["rate_gate"]["pass"])
+        self.assertTrue(summary["mixing_gate"]["pass"])
+        self.assertTrue(summary["critical_gate"]["pass"])
+        self.assertTrue(summary["pilot_safety"])
+
+    def test_the_plan_gate_refuses_a_matrix_that_is_not_the_frozen_plan(self):
+        """Missing, excess, out-of-range, non-integer and arbitrary cells.
+
+        The gates above count what is on disk; nothing checked that what is on
+        disk is the plan the contract froze.
+        """
+        runs, scen = self.frozen_matrix(skip=[("S01", 10, "cli")])
+        missing = grade.aggregate(runs, scen)
+        self.assertFalse(missing["plan_gate"]["pass"])
+        self.assertIn(["S01", 10, "cli"], missing["plan_gate"]["missing"])
+        self.assertFalse(missing["pilot_safety"])
+
+        for label, cell, meta_extra in [
+            ("out_of_range_pair", ("S01", 11, "mcp"), None),
+            ("arbitrary_scenario", ("S99", 1, "mcp"), None),
+            ("noninteger_pair", ("S02", 3, "mcp"), {"pair": "3"}),
+        ]:
+            with self.subTest(label):
+                self.setUp()
+                scenario, pair, arm = cell
+                runs, scen = self.frozen_matrix(extra=[(scenario, pair, arm, meta_extra)]
+                                                if label != "noninteger_pair" else [])
+                if label == "noninteger_pair":
+                    victim = os.path.join(runs, "S02-mcp-p3", "metadata.json")
+                    with open(victim, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    meta["pair"] = "3"
+                    with open(victim, "w", encoding="utf-8") as fh:
+                        json.dump(meta, fh)
+                summary = grade.aggregate(runs, scen)
+                self.assertFalse(summary["plan_gate"]["pass"],
+                                 "%s must not read as the frozen plan" % label)
+                self.assertFalse(summary["pilot_safety"])
+
+    def test_the_manifest_plan_must_be_the_frozen_plan(self):
+        """A tree can carry a manifest that describes a different experiment."""
+        runs, scen = self.frozen_matrix()
+        manifest = {"schema": 1, "total_runs": 209,
+                    "plan": [{"scenario": s, "pair": p, "arm": a,
+                              "dir": "%s/pair-%02d/%s" % (s, p, a)}
+                             for (s, p, a) in self.FROZEN_CELLS[:-1]]}
+        with open(os.path.join(runs, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_plan_mismatch", summary["plan_gate"]["flags"])
+
+    def test_incomplete_or_mistyped_metadata_is_refused(self):
+        """SPEC section 3 lists what a run must record; the grader trusted it blind."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"git_head": DROP})
+        write_run(runs, "S01", "cli", 1, [], meta_extra={"binary_sha256": DROP})
+        write_run(runs, "S01", "mcp", 2, [], meta_extra={"schema": "1"})
+        write_run(runs, "S01", "cli", 2, [], meta_extra={"duration_ms": "1000"})
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]],
+                         ["metadata_incomplete"] * 4,
+                         "absent and mistyped SPEC fields are both refusals")
+        self.assertEqual(summary["valid_runs"], 0)
+
+    def test_a_stream_that_does_not_confirm_the_model_is_refused(self):
+        """SPEC section 3: the model resolved by the STREAM must equal MODEL.
+
+        metadata.model_resolved is written by the runner; the stream is what the
+        session actually reported. Trusting only the metadata means a fabricated
+        (or stale) metadata.json decides which experiment this run belongs to.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1,
+                  [{"type": "system", "subtype": "init", "model": "claude-other"}])
+        write_run(runs, "S01", "cli", 1,
+                  [{"type": "system", "subtype": "init"}])
+        write_run(runs, "S01", "mcp", 2, [{"type": "assistant", "message": {}}])
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(sorted(e["reason"] for e in summary["invalid"]),
+                         ["stream_model_missing", "stream_model_missing",
+                          "stream_model_mismatch"])
+
+    def test_a_scenario_without_a_usable_declaration_fails_closed(self):
+        """An unreadable declaration used to mean "no constraint"."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [])
+        # Every one of these has a usable expect.py, so what is being tested is
+        # the DECLARATION: malformed, non-object, empty, and absent.
+        for broken, body in [("S02", "not json at all"), ("S03", "[1, 2]"),
+                             ("S04", "{}"), ("S05", None)]:
+            directory = os.path.join(scen, broken)
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "expect.py"), "w", encoding="utf-8") as fh:
+                fh.write(PASS_EXPECT)
+            if body is not None:
+                with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as fh:
+                    fh.write(body)
+            write_run(runs, broken, "mcp", 1, [])
+
+        summary = grade.aggregate(runs, scen)
+        reasons = sorted(e["reason"] for e in summary["invalid"])
+        self.assertEqual(reasons, ["scenario_declaration_invalid"] * 4,
+                         "malformed, non-object, empty and absent declarations all fail closed")
+        self.assertEqual(summary["valid_runs"], 1)
 
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
