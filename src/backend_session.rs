@@ -20,6 +20,11 @@ pub enum SelectorValue {
     None,
     /// `--flag VALUE` / `--flag=VALUE`; a missing value is fail-closed.
     Required,
+    /// Help declares the value in brackets (`--resume [value]`): the bare form
+    /// is a legal picker, so a value is consumed ONLY when the next token is
+    /// not itself a flag. Refusing the bare form would turn a legal restart
+    /// into a refusal.
+    Optional,
 }
 
 /// One session selector exactly as the backend's CLI help declares it.
@@ -88,9 +93,9 @@ fn selectors(backend: &Backend) -> &'static [SessionSelector] {
     }
     const CLAUDE: &[SessionSelector] = &[
         sel("--continue", Some("-c"), SelectorValue::None),
-        sel("--resume", Some("-r"), SelectorValue::Required),
-        sel("--from-pr", None, SelectorValue::Required),
-        sel("--teleport", None, SelectorValue::Required),
+        sel("--resume", Some("-r"), SelectorValue::Optional),
+        sel("--from-pr", None, SelectorValue::Optional),
+        sel("--teleport", None, SelectorValue::Optional),
     ];
     const KIRO: &[SessionSelector] = &[
         sel("--resume", Some("-r"), SelectorValue::None),
@@ -107,7 +112,7 @@ fn selectors(backend: &Backend) -> &'static [SessionSelector] {
     ];
     const GROK: &[SessionSelector] = &[
         sel("--continue", Some("-c"), SelectorValue::None),
-        sel("--resume", Some("-r"), SelectorValue::Required),
+        sel("--resume", Some("-r"), SelectorValue::Optional),
     ];
     const NONE: &[SessionSelector] = &[];
     match backend {
@@ -139,8 +144,12 @@ fn coupled_flags(backend: &Backend) -> &'static [&'static str] {
         // `opencode --help`: `--fork` is documented "use with --continue or
         // --session" (verified by lead on a local install).
         Backend::OpenCode => &["--fork"],
-        // Grok couples `--restore-code` to resume.
-        Backend::Grok => &["--restore-code"],
+        // `claude --help`: "When resuming, create a new session ID ... with
+        // --resume or --continue".
+        Backend::ClaudeCode => &["--fork-session"],
+        // `grok --help`: `--fork-session` is coupled to `--resume`/`--continue`
+        // and `--restore-code` applies "when resuming".
+        Backend::Grok => &["--fork-session", "--restore-code"],
         _ => &[],
     }
 }
@@ -161,40 +170,116 @@ fn err(backend: &Backend, token: &str, reason: SessionArgsErrorReason) -> Sessio
 ///
 /// Fails closed — the caller must abandon the restart WITHOUT touching the
 /// live instance — when a selector's grammar cannot be resolved unambiguously.
+/// Codex globals that OWN the following token, read off `codex --help`.
+/// Without this the parser mistook a global's VALUE for the `resume`
+/// subcommand — `-c resume` ate the config value and left a dangling flag.
+const CODEX_VALUED_GLOBALS: &[&str] = &[
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
+];
+
+/// Flags `codex resume --help` declares as belonging to the SUBCOMMAND.
+/// Promoting them to top level yields an argv the CLI rejects.
+const CODEX_RESUME_OWNED_FLAGS: &[&str] = &["--last", "--all", "--include-non-interactive"];
+
+/// Consume the Codex `resume` subcommand and everything it owns.
+/// Returns the index just past it, or an error when the grammar is ambiguous.
+fn codex_consume_resume(args: &[String], start: usize, boundary: usize) -> Result<usize, ()> {
+    let mut positionals = 0usize;
+    let mut probe = start + 1;
+    while probe < boundary {
+        let tok = &args[probe];
+        if CODEX_RESUME_OWNED_FLAGS.contains(&tok.as_str()) {
+            probe += 1;
+            continue;
+        }
+        if tok.starts_with('-') {
+            break;
+        }
+        positionals += 1;
+        if positionals > 1 {
+            // The second positional is the PROMPT. Dropping it loses user
+            // intent and promoting it rewrites what the agent is asked to do,
+            // so neither is done.
+            return Err(());
+        }
+        probe += 1;
+    }
+    Ok(probe)
+}
+
+/// Strip this backend's declared session selectors from `args`.
+///
+/// Only tokens before the first bare `--` are inspected. The delimiter and
+/// everything after it are copied byte-for-byte, as are all unrelated flags.
+///
+/// Fails closed — the caller must abandon the restart WITHOUT touching the
+/// live instance — when a selector's grammar cannot be resolved unambiguously.
 pub fn sanitize_for_fresh(
     backend: &Backend,
     args: &[String],
 ) -> Result<Vec<String>, SessionArgsError> {
     let matrix = selectors(backend);
     let coupled = coupled_flags(backend);
-    if matrix.is_empty() && coupled.is_empty() && !matches!(backend, Backend::Codex) {
+    let is_codex = matches!(backend, Backend::Codex);
+    if matrix.is_empty() && coupled.is_empty() && !is_codex {
         return Ok(args.to_vec());
     }
 
     let boundary = payload_start(args);
     let mut out: Vec<String> = Vec::with_capacity(args.len());
     let mut removed_selector = false;
+    // Coupled flags may PRECEDE their selector, so they are withheld and
+    // resolved after the whole flag territory is known — order must not decide.
+    let mut deferred_coupled: Vec<String> = Vec::new();
     let mut index = 0usize;
 
     while index < boundary {
         let tok = &args[index];
 
-        // Codex `resume [SESSION_ID]` subcommand. The prompt positional is
-        // deliberately NOT rewritten: silently promoting it to a top-level
-        // positional would change what the agent is asked to do, so a second
-        // resume-owned positional is ambiguous and fails closed.
-        if matches!(backend, Backend::Codex) && tok == "resume" {
-            let mut owned = 0usize;
-            let mut probe = index + 1;
-            while probe < boundary && !args[probe].starts_with('-') {
-                owned += 1;
-                probe += 1;
+        if is_codex {
+            // A valued global owns the next token; skipping it is what keeps
+            // `-c resume` from being read as the subcommand.
+            if CODEX_VALUED_GLOBALS.contains(&tok.as_str()) {
+                out.push(tok.clone());
+                if let Some(value) = args.get(index + 1).filter(|_| index + 1 < boundary) {
+                    out.push(value.clone());
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
             }
-            if owned > 1 {
-                return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
+            if tok == "resume" {
+                let next = codex_consume_resume(args, index, boundary)
+                    .map_err(|()| err(backend, tok, SessionArgsErrorReason::Ambiguous))?;
+                removed_selector = true;
+                index = next;
+                continue;
             }
-            removed_selector = true;
-            index = probe;
+        }
+
+        if coupled.contains(&tok.as_str()) {
+            deferred_coupled.push(tok.clone());
+            index += 1;
             continue;
         }
 
@@ -204,15 +289,27 @@ pub fn sanitize_for_fresh(
         {
             removed_selector = true;
             index += 1;
-            if selector.value == SelectorValue::Required {
-                let value = args
-                    .get(index)
-                    .filter(|v| !v.is_empty() && *v != "--" && !v.starts_with('-'))
-                    .ok_or_else(|| {
-                        err(backend, tok, SessionArgsErrorReason::MissingRequiredValue)
-                    })?;
-                let _ = value;
-                index += 1;
+            let value_follows = args
+                .get(index)
+                .filter(|_| index < boundary)
+                .filter(|v| !v.is_empty() && *v != "--" && !v.starts_with('-'));
+            match selector.value {
+                SelectorValue::None => {}
+                SelectorValue::Optional => {
+                    if value_follows.is_some() {
+                        index += 1;
+                    }
+                }
+                SelectorValue::Required => {
+                    if value_follows.is_none() {
+                        return Err(err(
+                            backend,
+                            tok,
+                            SessionArgsErrorReason::MissingRequiredValue,
+                        ));
+                    }
+                    index += 1;
+                }
             }
             continue;
         }
@@ -222,7 +319,7 @@ pub fn sanitize_for_fresh(
             .iter()
             .find(|s| tok.strip_prefix(s.long).is_some_and(|r| r.starts_with('=')))
         {
-            if selector.value == SelectorValue::Required && tok.len() == selector.long.len() + 1 {
+            if tok.len() == selector.long.len() + 1 {
                 return Err(err(
                     backend,
                     tok,
@@ -244,16 +341,21 @@ pub fn sanitize_for_fresh(
             return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
         }
 
-        if coupled.contains(&tok.as_str()) {
-            if !removed_selector {
-                return Err(err(backend, tok, SessionArgsErrorReason::OrphanCoupledFlag));
-            }
-            index += 1;
-            continue;
-        }
-
         out.push(tok.clone());
         index += 1;
+    }
+
+    // A coupled flag with nothing to couple to would be handed to the freshly
+    // spawned child as an orphan — and the old instance is already gone by
+    // then, so this must refuse rather than silently pass it through.
+    if !removed_selector {
+        if let Some(orphan) = deferred_coupled.first() {
+            return Err(err(
+                backend,
+                orphan,
+                SessionArgsErrorReason::OrphanCoupledFlag,
+            ));
+        }
     }
 
     out.extend_from_slice(&args[boundary..]);
@@ -369,22 +471,27 @@ mod tests {
         );
     }
 
+    /// SUPERSEDED BY INSTALLED HELP: the first two assertions here originally
+    /// required a value for `claude --resume`. `claude --help` declares
+    /// `-r, --resume [value]` — brackets mean OPTIONAL — so the bare form is a
+    /// legal picker and refusing it turned a valid restart into
+    /// `fresh_session_args_invalid`. Those two cases moved to
+    /// `installed_help_fixtures_3414::claude_optional_value_selectors_accept_bare_picker_form_3414`
+    /// with the opposite expectation. What remains here is genuinely required:
+    /// an explicit `=` with nothing after it, and OpenCode `-s`, which
+    /// `opencode --help` declares as `[string]` (a value, not a picker).
     #[test]
     fn missing_required_value_fails_closed_3414() {
-        assert_eq!(
-            reason(Backend::ClaudeCode, &["--resume"]),
-            SessionArgsErrorReason::MissingRequiredValue
-        );
-        assert_eq!(
-            reason(Backend::ClaudeCode, &["--resume", "--model"]),
-            SessionArgsErrorReason::MissingRequiredValue
-        );
         assert_eq!(
             reason(Backend::ClaudeCode, &["--resume="]),
             SessionArgsErrorReason::MissingRequiredValue
         );
         assert_eq!(
             reason(Backend::OpenCode, &["-s"]),
+            SessionArgsErrorReason::MissingRequiredValue
+        );
+        assert_eq!(
+            reason(Backend::OpenCode, &["--session="]),
             SessionArgsErrorReason::MissingRequiredValue
         );
     }

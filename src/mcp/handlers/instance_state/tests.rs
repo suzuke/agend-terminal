@@ -1014,7 +1014,10 @@ fn fresh_restart_strips_session_pin_at_spawn_boundary_3414() {
 fn malformed_session_selector_refuses_without_deleting_3414() {
     use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
     let _guard = crate::mcp::handlers::fleet_test_guard();
-    let home = home_with_pinned_claude("3414-noDelete", "[\"--resume\"]");
+    // `--resume=` (explicit `=`, nothing after) is genuinely unresolvable.
+    // A BARE `--resume` is NOT malformed — `claude --help` declares
+    // `-r, --resume [value]`, so the bare form is a legal picker.
+    let home = home_with_pinned_claude("3414-noDelete", "[\"--resume=\"]");
     let runtime = crate::mcp::handlers::minimal_test_runtime();
     *LAST_SPAWN_ARGS.lock() = None;
 
@@ -1033,7 +1036,7 @@ fn malformed_session_selector_refuses_without_deleting_3414() {
         "#3414: the refusal must name WHY, not just that it refused: {refused}"
     );
     assert_eq!(
-        refused["token"], "--resume",
+        refused["token"], "--resume=",
         "#3414: the refusal must name WHICH token blocked it: {refused}"
     );
     assert!(
