@@ -622,7 +622,7 @@ fn authed_api_call(
     // exactly as the real operator CLI (`api::call`) now does. Presenting the
     // shared agent cookie would authenticate as `Principal::Agent`, whose only
     // capability is the mcp tunnel → every direct method denied.
-    let run_dir = find_run_dir(home).ok_or("no run dir".to_string())?;
+    let run_dir = find_run_dir_for_test(home).ok_or("no run dir".to_string())?;
     let token_bytes = std::fs::read(run_dir.join("api.operator"))
         .map_err(|e| format!("read operator token: {e}"))?;
     let token_hex: String = token_bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -675,7 +675,7 @@ fn default_test_shell() -> &'static str {
     }
 }
 
-fn find_run_dir(home: &Path) -> Option<PathBuf> {
+fn find_run_dir_for_test(home: &Path) -> Option<PathBuf> {
     let run = home.join("run");
     for entry in std::fs::read_dir(&run).ok()?.flatten() {
         let p = entry.path();
