@@ -352,7 +352,25 @@ fn accept_one_client(
     sleep: impl FnOnce(std::time::Duration),
 ) -> Option<std::net::TcpStream> {
     match accept() {
-        Ok(stream) => Some(stream),
+        Ok(stream) => {
+            // An accepted socket does not reliably start blocking: POSIX says the
+            // listener's flag is not inherited, BSD (macOS included) hands it
+            // down, and Windows inherits it too. Everything past this point
+            // assumes blocking-with-timeouts — the auth read's `WouldBlock` arm
+            // does nothing and relies on the read timeout to park it — so an
+            // inherited non-blocking socket would spin that arm for the whole
+            // AUTH_BUDGET on this serialized thread, re-reading the port file
+            // each iteration. Fail closed, and back off: a client whose mode
+            // cannot be set is refused rather than served on an assumption, and
+            // a persistent failure must not become the busy loop the error arm
+            // below exists to prevent.
+            if stream.set_nonblocking(false).is_err() {
+                close_client(&stream);
+                sleep(RETIREMENT_POLL);
+                return None;
+            }
+            Some(stream)
+        }
         Err(_) => {
             sleep(RETIREMENT_POLL);
             None
@@ -439,12 +457,8 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             Some(stream) => stream,
             None => continue,
         };
-        // An accepted socket may inherit the listener's non-blocking mode; the
-        // framing reads below are blocking by contract.
-        if let Err(e) = stream.set_nonblocking(false) {
-            tracing::warn!(agent = name, error = %e, "TUI client blocking mode unavailable");
-            continue;
-        }
+        // Blocking mode is settled by `accept_one_client`, which refuses a client
+        // it cannot put into the mode every read below assumes.
         let _ = stream.set_nodelay(true);
         // Bound the auth read so a stalled or trickling peer cannot pin this
         // accept loop, and abandon it outright once a successor owns the name.
