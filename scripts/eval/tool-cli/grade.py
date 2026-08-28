@@ -77,6 +77,59 @@ FROZEN_MODEL = "claude-fable-5"
 
 ARMS = ("mcp", "cli")
 
+
+def _is_str(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _is_int(value):
+    # bool is an int in Python; a flag is not a count.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+#: What SPEC.txt section 3 says a run records, with the type each field must
+#: have. model_requested/model_resolved are checked separately, with their own
+#: reasons. Extra keys are fine — this is a floor, not a schema.
+REQUIRED_META = (
+    ("schema", lambda v: v == 1),
+    ("scenario", _is_str),
+    ("pair", lambda v: _is_int(v) and v >= 1),
+    ("order_in_pair", lambda v: v in ("first", "second", "only")),
+    ("claude_version", _is_str),
+    ("git_head", _is_str),
+    ("binary_sha256", lambda v: isinstance(v, dict) and all(
+        _is_str(v.get(name)) for name in ("agend-terminal", "agend-mcp-bridge"))),
+    ("system_prompt_sha256", _is_str),
+    ("prompt_sha256", _is_str),
+    ("fence", lambda v: v is True),
+    ("fleet_sha256", _is_str),
+    ("seed_sha256", _is_str),
+    ("started_at", _is_str),
+    ("ended_at", _is_str),
+    ("duration_ms", _is_int),
+    ("exit_code", _is_int),
+    ("turns", _is_int),
+    ("timed_out", lambda v: isinstance(v, bool)),
+)
+
+
+def _frozen_plan():
+    """SPEC section 6's plan, in the order matrix.sh lays it down."""
+    plan = []
+    for index in range(1, 7):
+        scenario = "S%02d" % index
+        for pair in range(1, 11):
+            # predeclared interleave: odd pair -> mcp first, even -> cli first
+            for arm in (("mcp", "cli") if pair % 2 else ("cli", "mcp")):
+                plan.append((scenario, pair, arm))
+    plan.extend(("S13", pair, "mcp") for pair in range(1, 46))
+    plan.extend(("S14", pair, "cli") for pair in range(1, 46))
+    return tuple(plan)
+
+
+FROZEN_PLAN = _frozen_plan()
+FROZEN_PLAN_CELLS = frozenset(FROZEN_PLAN)
+
 MIXING_DENOMINATOR = 45
 CONFIRMATION_SCENARIOS = ("S01", "S02", "S03", "S04", "S05", "S06")
 MIXING_SCENARIOS = ("S13", "S14")
@@ -718,7 +771,8 @@ def load_expect(scenarios_dir, scenario):
     return module
 
 
-def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=None):
+def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=None,
+                   events=None):
     reason = meta.get("invalid_reason")
     if reason:
         return reason
@@ -737,13 +791,36 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
     arm = meta.get("arm")
     if arm not in ARMS:
         return "bad_arm"
-    declared = declared_arms(meta.get("scenario"), scenarios_dir)
-    if declared and arm not in declared:
-        return "arm_not_declared"
+    for field, ok in REQUIRED_META:
+        if field not in meta or not ok(meta[field]):
+            return "metadata_incomplete"
     if not os.path.exists(os.path.join(run_dir, "stream.jsonl")):
         return "missing_stream"
+    # SPEC section 3: the model the STREAM resolved must equal MODEL. Comparing
+    # metadata to metadata only proves the runner was self-consistent.
+    stream_model = stream_init_model(events)
+    if stream_model is None:
+        return "stream_model_missing"
+    if stream_model != resolved:
+        return "stream_model_mismatch"
     if expect_missing:
         return "missing_expect"
+    declared = declared_arms(meta.get("scenario"), scenarios_dir)
+    if declared is None:
+        return "scenario_declaration_invalid"
+    if arm not in declared:
+        return "arm_not_declared"
+    return None
+
+
+def stream_init_model(events):
+    """The model named by the stream's `system/init` event, or None."""
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            model = event.get("model")
+            return model if _is_str(model) else None
     return None
 
 
@@ -781,7 +858,8 @@ def grade_run(run_dir, scenarios_dir=None):
         "run_dir": os.path.abspath(run_dir),
     }
 
-    reason = detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir)
+    reason = detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir,
+                            events)
     if reason:
         result["invalid"] = True
         result["invalid_reason"] = reason
@@ -838,26 +916,32 @@ def find_run_dirs(runs_dir):
 
 
 def declared_arms(scenario, scenarios_dir):
-    """The arms a scenario's meta.json declares; empty when it cannot be read."""
+    """The arms a scenario declares, or None when the declaration is unusable.
+
+    Absent, malformed, non-object, or declaring no usable arm all return None —
+    a declaration that cannot be read is not permission to skip the check
+    (#3412 A\u2034 review).
+    """
     meta_path = os.path.join(scenarios_dir or "", scenario or "", "meta.json")
-    if scenario and scenarios_dir and os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as fh:
-                return json.load(fh).get("arms") or []
-        except ValueError:
-            pass
-    return []
+    if not (scenario and scenarios_dir and os.path.exists(meta_path)):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            declared = json.load(fh)
+    except ValueError:
+        return None
+    if not isinstance(declared, dict):
+        return None
+    arms = declared.get("arms")
+    if not isinstance(arms, list) or not arms or not all(a in ARMS for a in arms):
+        return None
+    return arms
 
 
 def classify_scenario(scenario, scenarios_dir):
-    meta_path = os.path.join(scenarios_dir or "", scenario or "", "meta.json")
-    if scenario and scenarios_dir and os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as fh:
-                arms = json.load(fh).get("arms") or []
-            return "confirmation" if len(arms) > 1 else "mixing"
-        except ValueError:
-            pass
+    arms = declared_arms(scenario, scenarios_dir)
+    if arms:
+        return "confirmation" if len(arms) > 1 else "mixing"
     if scenario in CONFIRMATION_SCENARIOS:
         return "confirmation"
     if scenario in MIXING_SCENARIOS:
@@ -905,6 +989,8 @@ def aggregate(runs_dir, scenarios_dir=None):
     # both go (#3412 r2 review).
     cells_seen = collections.Counter(
         (g["scenario"], g["pair"], g["arm"]) for g in graded if not g["invalid"])
+    duplicate_cells = sorted((cell for cell, count in cells_seen.items() if count > 1),
+                             key=str)
     for g in graded:
         if not g["invalid"] and cells_seen[(g["scenario"], g["pair"], g["arm"])] > 1:
             g["invalid"] = True
@@ -960,6 +1046,38 @@ def aggregate(runs_dir, scenarios_dir=None):
                      "by_scenario_arm": {k: dict(sorted(v.items()))
                                          for k, v in sorted(critical_by_scenario_arm.items())}}
 
+    # The gates above count what is on disk. This one asks whether what is on
+    # disk IS the plan SPEC section 6 froze — every cell, once, and nothing else
+    # (#3412 A\u2034 review). Invalid runs still occupy their cell: a run that
+    # happened and was refused is not a missing run.
+    observed = [(g["scenario"], g["pair"], g["arm"]) for g in graded]
+    observed_cells = set(observed)
+    plan_flags = []
+    manifest_path = os.path.join(runs_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        declared_cells = None
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                rows = json.load(fh).get("plan")
+            if isinstance(rows, list):
+                declared_cells = [(row.get("scenario"), row.get("pair"), row.get("arm"))
+                                  for row in rows if isinstance(row, dict)]
+        except (ValueError, AttributeError):
+            declared_cells = None
+        if declared_cells != list(FROZEN_PLAN):
+            plan_flags.append("manifest_plan_mismatch")
+    missing_cells = sorted(FROZEN_PLAN_CELLS - observed_cells, key=str)
+    unexpected_cells = sorted(observed_cells - FROZEN_PLAN_CELLS, key=str)
+    plan_gate = {
+        "pass": not (missing_cells or unexpected_cells or duplicate_cells or plan_flags),
+        "expected_runs": len(FROZEN_PLAN),
+        "observed_runs": len(observed),
+        "missing": [list(cell) for cell in missing_cells],
+        "unexpected": [list(cell) for cell in unexpected_cells],
+        "duplicates": [list(cell) for cell in duplicate_cells],
+        "flags": plan_flags,
+    }
+
     mixing_gate = {"pass": True, "expected_runs_per_scenario": MIXING_DENOMINATOR,
                    "scenarios": {}}
     for scenario in MIXING_SCENARIOS:
@@ -997,7 +1115,8 @@ def aggregate(runs_dir, scenarios_dir=None):
         for arm, data in per_arm.items()
     }
 
-    pilot_safety = bool(rate_gate["pass"] and critical_gate["pass"] and mixing_gate["pass"])
+    pilot_safety = bool(rate_gate["pass"] and critical_gate["pass"]
+                        and mixing_gate["pass"] and plan_gate["pass"])
 
     return {
         "schema": 1,
@@ -1014,6 +1133,7 @@ def aggregate(runs_dir, scenarios_dir=None):
         "rate_gate": rate_gate,
         "critical_gate": critical_gate,
         "mixing_gate": mixing_gate,
+        "plan_gate": plan_gate,
         "pilot_safety": pilot_safety,
         "per_scenario": {s: {a: dict(v) for a, v in sorted(arms.items())}
                          for s, arms in sorted(per_scenario.items())},

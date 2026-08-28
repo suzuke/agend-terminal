@@ -93,7 +93,7 @@ DROP = object()
 
 
 def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
-              meta_extra=None, sent_ledger=None):
+              meta_extra=None, sent_ledger=None, init=True):
     run_dir = os.path.join(base, "%s-%s-p%s" % (scenario, arm, pair))
     os.makedirs(os.path.join(run_dir, "final_state", "inbox"), exist_ok=True)
     meta = {"schema": 1, "scenario": scenario, "arm": arm, "pair": pair,
@@ -115,8 +115,8 @@ def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
     # session actually resolved (SPEC section 3). Fixtures carry it too, unless
     # the caller is testing what happens when it disagrees or is missing.
     stream = list(events)
-    if not any(e.get("type") == "system" and e.get("subtype") == "init"
-               for e in stream if isinstance(e, dict)):
+    if init and not any(e.get("type") == "system" and e.get("subtype") == "init"
+                        for e in stream if isinstance(e, dict)):
         stream.insert(0, {"type": "system", "subtype": "init",
                           "model": meta.get("model_resolved")})
     with open(os.path.join(run_dir, "stream.jsonl"), "w", encoding="utf-8") as fh:
@@ -855,11 +855,12 @@ class Aggregation(TempCase):
                   [{"type": "system", "subtype": "init", "model": "claude-other"}])
         write_run(runs, "S01", "cli", 1,
                   [{"type": "system", "subtype": "init"}])
-        write_run(runs, "S01", "mcp", 2, [{"type": "assistant", "message": {}}])
+        write_run(runs, "S01", "mcp", 2, [{"type": "assistant", "message": {}}],
+                  init=False)
         summary = grade.aggregate(runs, scen)
         self.assertEqual(sorted(e["reason"] for e in summary["invalid"]),
-                         ["stream_model_missing", "stream_model_missing",
-                          "stream_model_mismatch"])
+                         ["stream_model_mismatch", "stream_model_missing",
+                          "stream_model_missing"])
 
     def test_a_scenario_without_a_usable_declaration_fails_closed(self):
         """An unreadable declaration used to mean "no constraint"."""

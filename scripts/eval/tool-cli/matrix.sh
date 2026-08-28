@@ -74,11 +74,12 @@ fi
 # prefix so `S01` and `S01-inbox-drain` both work.  A scenario that is not on
 # disk yet is still planned (and flagged), so the plan is reviewable before the
 # scenario authors land their directories.
-# MATRIX_CONFIRMATION / MATRIX_MIXING exist ONLY so the harness can self-test
-# its own resume/skip logic against S00-smoke; the frozen SPEC §6 plan is the
-# default and is what every real matrix run uses.
-CONFIRMATION="${MATRIX_CONFIRMATION-S01 S02 S03 S04 S05 S06}"
-MIXING="${MATRIX_MIXING-S13:mcp S14:cli}"
+# The SPEC §6 plan, and nothing else. These were overridable from the
+# environment so the harness could self-test its resume logic; an env var that
+# can empty the frozen plan (and still exit 0 reporting a complete run of zero
+# runs) is not a frozen plan.
+CONFIRMATION="S01 S02 S03 S04 S05 S06"
+MIXING="S13:mcp S14:cli"
 
 resolve_dir() {
   local id="$1" d
@@ -197,6 +198,23 @@ echo "manifest: $OUT/manifest.json"
 
 # ── resume bookkeeping (computed for --dry-run too, so the plan a dry run
 # prints is exactly the work a real run would do) ───────────────────────────
+resume_matches() {  # rundir scenario pair arm
+  python3 -c '
+import json, os, sys
+run_dir, scenario, pair, arm, model, head = sys.argv[1:]
+try:
+    with open(os.path.join(run_dir, "metadata.json"), "r", encoding="utf-8") as fh:
+        meta = json.load(fh)
+except (OSError, ValueError) as exc:
+    sys.exit("unreadable metadata.json: %s" % exc)
+want = {"scenario": scenario, "arm": arm, "pair": int(pair),
+        "model_requested": model, "git_head": head}
+bad = ["%s=%r (want %r)" % (k, meta.get(k), v) for k, v in want.items() if meta.get(k) != v]
+if bad:
+    sys.exit("; ".join(bad))
+' "$1" "$2" "$3" "$4" "$MODEL" "$GIT_HEAD"
+}
+
 QUEUE="$OUT/.queue"
 : > "$QUEUE"
 skipped=0; queued=0
@@ -204,6 +222,13 @@ while IFS=$'\t' read -r scenario pair arm order; do
   [ -n "$scenario" ] || continue
   rundir="$OUT/$scenario/pair-$(printf '%02d' "$pair")/$arm"
   if [ -f "$rundir/metadata.json" ]; then
+    # Skipping a directory means claiming its run already happened, for THIS
+    # matrix. Read it before believing that: a stale tree from another head, a
+    # copied directory or a hand-written file used to count as complete.
+    if ! resume_matches "$rundir" "$scenario" "$pair" "$arm"; then
+      echo "resume refused: $scenario/pair-$(printf '%02d' "$pair")/$arm holds a metadata.json that is not this matrix's run" >&2
+      exit 1
+    fi
     skipped=$((skipped + 1)); continue
   fi
   printf '%s\t%s\t%s\n' "$scenario" "$pair" "$rundir" >> "$QUEUE"

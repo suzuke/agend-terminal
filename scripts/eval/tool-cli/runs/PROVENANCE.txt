@@ -17,9 +17,19 @@ frozen pin), a control run carrying an arm its scenario never declared, and two
 runs claiming one (scenario, pair, arm) cell, where the later one silently
 replaced the earlier.
 
-Fixing all six changed a frozen file, so grade.py is now
-f86f1dab0376d6e34ce4dbdc5f0cfcb8d31111842f2d36eed280e5fc673397aa and this
-harness is a NEW commit A'.
+A third round of review found that every gate so far counted what was on disk
+without establishing that what was on disk IS the frozen experiment: SPEC-required
+metadata fields went unread, the model was compared metadata-to-metadata instead
+of against the stream's own init event, an unreadable scenario declaration meant
+"no constraint" (and a non-object one crashed the aggregate), nothing compared the
+runs to SPEC section 6's 210-cell plan, matrix.sh took its plan from the
+environment, and resume skipped any directory holding a metadata.json without
+reading it. The summary therefore gained a `plan_gate`, which means a new run's
+summary.json is not key-comparable to the two below.
+
+Fixing all of it changed frozen files, so grade.py is now
+65d944972855f5b960a98ef2d8c9f12167c282bbf76aa1587d051e8e439dcb37 and matrix.sh is
+a5d70a792bd08af30818971b88f89e49c3678b4a68c8456c049d7f97913ad21e; this harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
 edits after commit A — if one is needed, the matrix restarts from zero under a
@@ -27,8 +37,13 @@ new commit A'." These results therefore do NOT carry forward as results under th
 current freeze. They stand as the record of what was run under the old one.
 
 Measured, not assumed: re-grading the surviving E2 raw tree with the FIXED grader
-reproduces runs/E2-20260828T090026Z/summary.json with zero differing keys, and
-rendering that regrade reproduces its report.txt byte for byte. So the fix is
+reproduces runs/E2-20260828T090026Z/summary.json in every value it already had —
+the only difference is the `plan_gate` key the third round added, which PASSES on
+that tree (210 cells, none missing, none unexpected, none duplicated, and its
+manifest's plan equal to the frozen one in order). report.py is deliberately
+unchanged, so the two reports below still re-render byte for byte from the
+summaries they were made from; the plan gate lives in summary.json only, and
+putting it in the renderer would break exactly that property. So the fixes are
 result-invariant on the data that still exists — evidence about what a re-run
 would be expected to show, not a substitute for the re-run SPEC section 6
 requires. E1 (20260828T063955Z) cannot be re-graded at all: its raw run tree was
