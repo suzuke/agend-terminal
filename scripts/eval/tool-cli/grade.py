@@ -71,6 +71,10 @@ TARGET_N = 60
 #: The only two arms a run may declare. `check_mixing` COMPARES against these,
 #: so a run whose arm is outside them cannot be checked at all — it is invalid,
 #: not clean (#3412 review F2).
+#: The model the frozen runner requests (run.sh MODEL). A run resolved to any
+#: other model is a different experiment wearing this matrix's name.
+FROZEN_MODEL = "claude-fable-5"
+
 ARMS = ("mcp", "cli")
 
 MIXING_DENOMINATOR = 45
@@ -714,18 +718,28 @@ def load_expect(scenarios_dir, scenario):
     return module
 
 
-def detect_invalid(meta, run_dir, expect_module, expect_missing):
+def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=None):
     reason = meta.get("invalid_reason")
     if reason:
         return reason
     if meta.get("timed_out"):
         return "timed_out"
+    # An absent or empty field used to read as agreement, so a run whose model was
+    # never resolved counted as a clean run of this experiment (#3412 r2 review).
     requested = meta.get("model_requested")
     resolved = meta.get("model_resolved")
-    if requested and resolved and requested != resolved:
+    if not requested or not resolved:
+        return "model_missing"
+    if requested != resolved:
         return "model_mismatch"
-    if meta.get("arm") not in ARMS:
+    if resolved != FROZEN_MODEL:
+        return "model_not_frozen"
+    arm = meta.get("arm")
+    if arm not in ARMS:
         return "bad_arm"
+    declared = declared_arms(meta.get("scenario"), scenarios_dir)
+    if declared and arm not in declared:
+        return "arm_not_declared"
     if not os.path.exists(os.path.join(run_dir, "stream.jsonl")):
         return "missing_stream"
     if expect_missing:
@@ -767,7 +781,7 @@ def grade_run(run_dir, scenarios_dir=None):
         "run_dir": os.path.abspath(run_dir),
     }
 
-    reason = detect_invalid(meta, run_dir, expect_module, expect_missing)
+    reason = detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir)
     if reason:
         result["invalid"] = True
         result["invalid_reason"] = reason
@@ -823,6 +837,18 @@ def find_run_dirs(runs_dir):
     return sorted(found)
 
 
+def declared_arms(scenario, scenarios_dir):
+    """The arms a scenario's meta.json declares; empty when it cannot be read."""
+    meta_path = os.path.join(scenarios_dir or "", scenario or "", "meta.json")
+    if scenario and scenarios_dir and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                return json.load(fh).get("arms") or []
+        except ValueError:
+            pass
+    return []
+
+
 def classify_scenario(scenario, scenarios_dir):
     meta_path = os.path.join(scenarios_dir or "", scenario or "", "meta.json")
     if scenario and scenarios_dir and os.path.exists(meta_path):
@@ -873,6 +899,17 @@ def aggregate(runs_dir, scenarios_dir=None):
     graded = []
     for run_dir in find_run_dirs(runs_dir):
         graded.append(grade_run(run_dir, scenarios_dir))
+
+    # Two runs claiming one (scenario, pair, arm) used to collapse into whichever
+    # arrived last. Which one is the real run is not the grader's to guess, so
+    # both go (#3412 r2 review).
+    cells_seen = collections.Counter(
+        (g["scenario"], g["pair"], g["arm"]) for g in graded if not g["invalid"])
+    for g in graded:
+        if not g["invalid"] and cells_seen[(g["scenario"], g["pair"], g["arm"])] > 1:
+            g["invalid"] = True
+            g["invalid_reason"] = "duplicate_cell"
+            g["notes"].append("run excluded: duplicate_cell")
 
     invalid = [{"run_dir": g["run_dir"], "scenario": g["scenario"], "arm": g["arm"],
                 "pair": g["pair"], "reason": g["invalid_reason"]}

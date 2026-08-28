@@ -11,8 +11,14 @@ Answering the follow-up question about re-run scope surfaced a third: a matrix
 that lost a single confirmation pair recomputed its interval off-table at N=59
 and still read PASS, though SPEC.txt:167 pins the gate to a lookup AT N=60.
 
-Fixing all three changed a frozen file, so grade.py is now
-f8a1dbd391a627742ee386aa92de5107dc99220ef6c05421dd67d4e560fe50e1 and this
+A second independent review then found three more runs the grader counted that
+it should have refused: a model that was never resolved (or resolved off the
+frozen pin), a control run carrying an arm its scenario never declared, and two
+runs claiming one (scenario, pair, arm) cell, where the later one silently
+replaced the earlier.
+
+Fixing all six changed a frozen file, so grade.py is now
+f86f1dab0376d6e34ce4dbdc5f0cfcb8d31111842f2d36eed280e5fc673397aa and this
 harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table

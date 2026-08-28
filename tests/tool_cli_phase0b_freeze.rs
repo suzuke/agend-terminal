@@ -164,6 +164,27 @@ fn spec_pins_exactly_one_run_after_dual_review() {
     }
 }
 
+/// (c3) The runner and the grader name the SAME frozen model.
+///
+/// The grader refuses a run resolved to anything but the frozen model, which
+/// puts the model string in two frozen files. Two copies drift; this pins them
+/// together, so a model change has to move both or fail here.
+#[test]
+fn runner_and_grader_agree_on_the_frozen_model() {
+    let dir = eval_dir();
+    let run_sh = std::fs::read_to_string(dir.join("run.sh")).expect("read run.sh");
+    let grade_py = std::fs::read_to_string(dir.join("grade.py")).expect("read grade.py");
+    let model = "claude-fable-5";
+    assert!(
+        run_sh.contains(&format!("MODEL=\"{model}\"")),
+        "run.sh must still request the frozen model"
+    );
+    assert!(
+        grade_py.contains(&format!("FROZEN_MODEL = \"{model}\"")),
+        "grade.py must refuse runs resolved to anything but the same frozen model"
+    );
+}
+
 /// (d) No scenario can smuggle in a critical class outside the taxonomy.
 #[test]
 fn expect_scripts_only_emit_taxonomy_critical_classes() {
