@@ -720,7 +720,7 @@ mod tests {
     }
 
     fn publish_port(run_dir: &std::path::Path, name: &str, port: u16) {
-        std::fs::write(run_dir.join(format!("{name}.port")), port.to_string()).unwrap();
+        crate::ipc::write_port(run_dir, name, port).unwrap();
     }
 
     /// main-CI macOS flake (run 33161513192): every caller hands `peer_sees_eof`
