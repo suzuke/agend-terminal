@@ -51,10 +51,9 @@ macro_rules! skip_without_python {
 }
 
 fn read_json(path: &Path) -> Value {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 /// (a) Every FROZEN file still hashes to the digest recorded in freeze.json.
@@ -125,7 +124,10 @@ fn acceptance_table_metadata_is_frozen() {
     let cells = table["cells"].as_object().expect("cells object");
     assert_eq!(cells.len(), (60 + 1) * (60 + 2) / 2, "all b+c<=60 cells");
     assert_eq!(cells["0,0"]["accept"], true, "a clean sweep must accept");
-    assert_eq!(cells["60,0"]["accept"], false, "total CLI failure must reject");
+    assert_eq!(
+        cells["60,0"]["accept"], false,
+        "total CLI failure must reject"
+    );
 }
 
 /// (d) No scenario can smuggle in a critical class outside the taxonomy.
@@ -151,7 +153,10 @@ fn expect_scripts_only_emit_taxonomy_critical_classes() {
         return;
     }
     let mut scanned = 0usize;
-    for entry in std::fs::read_dir(&scenarios).expect("read scenarios/").flatten() {
+    for entry in std::fs::read_dir(&scenarios)
+        .expect("read scenarios/")
+        .flatten()
+    {
         let expect_py = entry.path().join("expect.py");
         if !expect_py.is_file() {
             continue;
@@ -263,7 +268,10 @@ fn critical_literal_scanner_finds_both_shapes() {
     found.dedup();
     assert!(found.contains(&"mixing".to_string()), "{found:?}");
     assert!(found.contains(&"wrong_target".to_string()), "{found:?}");
-    assert!(!found.contains(&"x".to_string()), "notes must not be scanned: {found:?}");
+    assert!(
+        !found.contains(&"x".to_string()),
+        "notes must not be scanned: {found:?}"
+    );
 }
 
 #[test]
