@@ -297,8 +297,10 @@ pub(super) fn handle_delete_instance_with_runtime(
                         });
                         // #3416: goes through the one serialized appender. Destructive
                         // fail-closed gate — bounded retry, then refuse; never an
-                        // unlocked fallback. `Err` means NOTHING was recorded, so the
-                        // force-delete must not proceed.
+                        // unlocked fallback. `Err` means no TRUSTWORTHY record exists,
+                        // so the force-delete must not proceed. It does not always mean
+                        // nothing was written: a `Write` failure can leave a partial
+                        // line, which is why the refusal reports the error's own wording.
                         let audit_written = agentic_audit_append::append_audit_line_bounded(
                             home,
                             &event,

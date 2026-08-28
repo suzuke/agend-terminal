@@ -24,6 +24,14 @@
 //!    [`AppendError::Contended`] and writes nothing. Falling back to an unlocked
 //!    append would reintroduce the interleaving this crate removes.
 //!
+//! What an `Err` does and does not promise: [`Contended`](AppendError::Contended)
+//! and [`Open`](AppendError::Open) mean nothing reached the file, because both
+//! occur before any write. [`Write`](AppendError::Write) does NOT — `write_all` can
+//! fail with bytes already written, and this crate does not roll that back, so a
+//! partial line may be on disk. Rolling back under the lock (record the length,
+//! `set_len` on failure) would narrow but not close that window, since a crash
+//! mid-write rolls back nothing; it is deliberately left out of this change.
+//!
 //! Note that (1) alone measurably removes the corruption at observed record sizes,
 //! but single-`write()` atomicity for regular files is a platform property rather
 //! than a POSIX guarantee (`PIPE_BUF` covers pipes only) and would fail silently on
@@ -79,14 +87,29 @@ pub fn lock_path(home: &Path) -> PathBuf {
     home.join(LOCK_FILE)
 }
 
-/// Why an append did not happen. Both variants mean **nothing was written**.
+/// Why an append did not complete.
+///
+/// The variants differ in what they promise about the file, and the distinction is
+/// load-bearing for the fail-closed gates: only [`Write`](AppendError::Write) can
+/// leave anything behind.
 #[derive(Debug)]
 pub enum AppendError {
-    /// The companion lock could not be taken within the caller's policy. The
-    /// record was not written and must not be written unlocked.
+    /// The companion lock could not be taken within the caller's policy. **Nothing
+    /// was written** — no write was even attempted — and it must not be written
+    /// unlocked.
     Contended,
-    /// The lock or the log could not be opened, or the write failed.
-    Io(std::io::Error),
+    /// The lock file or the log could not be opened. **Nothing was written**; this
+    /// happens before the lock is taken and before any write.
+    Open(std::io::Error),
+    /// `write_all` failed while the lock was held. **A partial record may be on
+    /// disk**: `write_all` can fail after some bytes have already reached the file,
+    /// and this crate does not roll that back.
+    ///
+    /// This is the one case a caller must not describe as "nothing was recorded".
+    /// The record is not trustworthy either way — a truncated line is exactly the
+    /// unparseable-row shape #3416 removes — so a fail-closed caller must still
+    /// refuse, but it should say what it actually knows.
+    Write(std::io::Error),
 }
 
 impl std::fmt::Display for AppendError {
@@ -96,7 +119,13 @@ impl std::fmt::Display for AppendError {
                 f,
                 "audit log is locked by another writer; nothing was appended"
             ),
-            AppendError::Io(e) => write!(f, "audit log write failed: {e}"),
+            AppendError::Open(e) => {
+                write!(f, "audit log could not be opened; nothing was appended: {e}")
+            }
+            AppendError::Write(e) => write!(
+                f,
+                "audit log write failed after the lock was taken; a partial record may be on disk: {e}"
+            ),
         }
     }
 }
@@ -105,7 +134,7 @@ impl std::error::Error for AppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AppendError::Contended => None,
-            AppendError::Io(e) => Some(e),
+            AppendError::Open(e) | AppendError::Write(e) => Some(e),
         }
     }
 }
@@ -135,7 +164,11 @@ pub fn append_audit_line_best_effort(
 /// failing explicitly.
 ///
 /// For the destructive fail-closed gates: on `Err` the caller must refuse the
-/// operation it was auditing, because nothing was recorded.
+/// operation it was auditing, because no trustworthy record exists. Note the
+/// variants differ — [`Contended`](AppendError::Contended) and
+/// [`Open`](AppendError::Open) wrote nothing, while [`Write`](AppendError::Write)
+/// may have left a partial line. Refuse in every case, but do not report "nothing
+/// was recorded" for a `Write` failure.
 pub fn append_audit_line_bounded(
     home: &Path,
     value: &serde_json::Value,
@@ -159,7 +192,7 @@ fn append_audit_line(
         .write(true)
         .truncate(false)
         .open(lock_path(home))
-        .map_err(AppendError::Io)?;
+        .map_err(AppendError::Open)?;
 
     // Open the target BEFORE locking so the locked region is the write and nothing
     // else. An `open` here would otherwise sit inside every writer's critical
@@ -168,12 +201,12 @@ fn append_audit_line(
         .create(true)
         .append(true)
         .open(audit_path(home))
-        .map_err(AppendError::Io)?;
+        .map_err(AppendError::Open)?;
 
     acquire(&lock, mode)?;
 
     // (2) Exactly one `write_all` while the lock is held.
-    let result = target.write_all(line.as_bytes()).map_err(AppendError::Io);
+    let result = target.write_all(line.as_bytes()).map_err(AppendError::Write);
 
     // Released by the OS on close; explicit so the critical section's end is
     // visible rather than implied by scope.
@@ -190,7 +223,7 @@ fn acquire(lock: &File, mode: Acquire) -> Result<(), AppendError> {
         Acquire::TryOnce => match fs4::FileExt::try_lock(lock) {
             Ok(()) => Ok(()),
             Err(fs4::TryLockError::WouldBlock) => Err(AppendError::Contended),
-            Err(fs4::TryLockError::Error(e)) => Err(AppendError::Io(e)),
+            Err(fs4::TryLockError::Error(e)) => Err(AppendError::Open(e)),
         },
         Acquire::Bounded(budget) => {
             let deadline = Instant::now() + budget;
@@ -203,7 +236,7 @@ fn acquire(lock: &File, mode: Acquire) -> Result<(), AppendError> {
                         }
                         std::thread::sleep(RETRY_INTERVAL);
                     }
-                    Err(fs4::TryLockError::Error(e)) => return Err(AppendError::Io(e)),
+                    Err(fs4::TryLockError::Error(e)) => return Err(AppendError::Open(e)),
                 }
             }
         }

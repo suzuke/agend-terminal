@@ -452,10 +452,12 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         });
         // #3416: goes through the one serialized appender. This is a destructive
         // fail-closed gate, so it uses bounded retry and then refuses — never an
-        // unlocked fallback. `Err` means NOTHING was recorded, which is exactly why
+        // unlocked fallback. `Err` means no TRUSTWORTHY record exists, which is why
         // the bypass must not proceed: previously an interleaved-but-`Ok` write let
         // this gate report a force-merge as audited while the record on disk was
-        // unparseable.
+        // unparseable. Note `Err` does not always mean nothing was written — a
+        // `Write` failure can leave a partial line — so the message below reports
+        // the error's own wording rather than asserting the file is untouched.
         if let Err(e) = agentic_audit_append::append_audit_line_bounded(
             home,
             &event,

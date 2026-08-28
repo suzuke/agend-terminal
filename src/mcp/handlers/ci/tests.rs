@@ -3047,9 +3047,14 @@ fn merge_force_audit_write_failure_refuses_merge() {
         "dev",
     );
     let err = result["error"].as_str().unwrap();
+    // #3416: the fixture makes the log a DIRECTORY, so the failure is an OPEN
+    // failure, not a write failure. The appender now distinguishes the two because
+    // only a write failure can leave a partial line behind, so this asserts what
+    // the test actually guards — the force-merge audit gate refused — rather than a
+    // phrase that would now be inaccurate for this fixture.
     assert!(
-        err.contains("audit log write failed"),
-        "expected audit failure error, got: {err}"
+        err.contains("force-merge refused") && err.contains("audit log"),
+        "expected the force-merge audit gate to refuse, got: {err}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3105,10 +3110,11 @@ fn merge_force_reaches_handler_through_full_dispatch_chain_2539() {
     }
 
     let err = result["error"].as_str().unwrap_or_default();
+    // #3416: same open-vs-write distinction as the handler-direct test above.
     assert!(
-        err.contains("audit log write failed"),
+        err.contains("force-merge refused") && err.contains("audit log"),
         "#2539: force/force_reason must survive the full handle_tool dispatch chain \
-         unmodified (same audit-write reject as the handler-direct test), got: {result}"
+         unmodified (same audit reject as the handler-direct test), got: {result}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
