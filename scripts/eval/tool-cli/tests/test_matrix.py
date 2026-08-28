@@ -293,5 +293,28 @@ class MatrixAuthority(unittest.TestCase):
                             + proc.stdout + proc.stderr)
 
 
+    def test_a_manifest_with_another_jobs_setting_is_not_overwritten(self):
+        """`jobs` was checked for being at least 1, never for being THIS matrix's.
+
+        A tree written with a different parallelism is a different run of the
+        matrix; overwriting its manifest hides that. The assertions read the
+        REFUSAL TEXT rather than the exit code, because in an unbuilt worktree
+        the guard also refuses on binary digests — naming the field is what
+        distinguishes this check from that one.
+        """
+        self._valid_manifest(jobs=9)
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("jobs", proc.stdout + proc.stderr,
+                      "the refusal must name jobs when the manifest disagrees")
+
+    def test_the_matrix_own_jobs_setting_is_not_a_complaint(self):
+        """The control: the default this dry run uses must not be flagged."""
+        self._valid_manifest(jobs=3)
+        proc = dry_run(self.out)
+        self.assertNotIn("jobs", proc.stdout + proc.stderr,
+                         "jobs=3 is what this matrix runs; it must not be refused for it")
+
+
 if __name__ == "__main__":
     unittest.main()
