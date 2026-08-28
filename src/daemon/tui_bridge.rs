@@ -15,6 +15,36 @@ use std::sync::Arc;
 pub(crate) struct TuiListenerMeta {
     listener: std::net::TcpListener,
     cookie: crate::auth_cookie::Cookie,
+    /// Run dir holding `{name}.port` — the retirement signal this bridge polls.
+    run_dir: std::path::PathBuf,
+    /// The port this bridge published. A `{name}.port` that no longer names it
+    /// means a successor generation owns the name and this bridge is stale.
+    port: u16,
+}
+
+/// How often a bridge checks whether it has been retired. The accept loop is
+/// non-blocking so it can notice; this bounds the notice delay.
+const RETIREMENT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// True when `{name}.port` is gone or no longer names `my_port`.
+///
+/// #3373: `restart_instance(mode:"fresh")` is delete(no-wait) + spawn. The
+/// delete already removes the port file (`ipc::remove_port`) and the successor
+/// republishes it with a NEW port, so this is an existing signal, not a new one.
+/// What was missing is a reader: the accept loop assumed removal closed its
+/// socket, which is true for a socket FILE and false for the loopback TCP
+/// listener this actually is. Without a reader the predecessor kept accepting
+/// and kept its clients' sockets healthy, so a retained APP pane never went
+/// `[DISCONNECTED]` and #3380's reconnect never fired.
+fn is_retired(run_dir: &Path, name: &str, my_port: u16) -> bool {
+    match std::fs::read_to_string(run_dir.join(format!("{name}.port"))) {
+        Ok(text) => text
+            .trim()
+            .parse::<u16>()
+            .map(|p| p != my_port)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
 }
 
 /// Synchronously bind the agent's TUI loopback socket and publish
@@ -60,7 +90,12 @@ pub(crate) fn prepare_tui_listener_and_publish_port(
     }
     crate::ipc::write_port(run_dir, name, port)?;
     tracing::info!(agent = name, port, "TUI socket ready");
-    Ok(TuiListenerMeta { listener, cookie })
+    Ok(TuiListenerMeta {
+        listener,
+        cookie,
+        run_dir: run_dir.to_path_buf(),
+        port,
+    })
 }
 
 /// All-in-one TUI server for callers that don't need rollback on
@@ -96,13 +131,54 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
 /// terminally (e.g. agent removal via `delete_transaction` closes the
 /// underlying socket file).
 pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
-    let TuiListenerMeta { listener, cookie } = meta;
+    let TuiListenerMeta {
+        listener,
+        cookie,
+        run_dir,
+        port,
+    } = meta;
+    // Non-blocking so the retirement check below is reachable; a blocking
+    // `incoming()` would park here forever after the successor took the name.
+    if let Err(e) = listener.set_nonblocking(true) {
+        tracing::warn!(agent = name, error = %e, "TUI listener non-blocking mode unavailable");
+    }
+    // Read halves of live clients, kept only so retirement can close them.
+    let mut clients: Vec<std::net::TcpStream> = Vec::new();
 
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
+    loop {
+        if is_retired(&run_dir, name, port) {
+            // Closing the accepted sockets is the point: it is what makes a
+            // retained pane observe EOF, flip `connected` false, and become a
+            // reconnect candidate for the successor.
+            for client in &clients {
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            }
+            tracing::info!(
+                agent = name,
+                port,
+                clients = clients.len(),
+                "TUI bridge retired — successor owns the name"
+            );
+            return;
+        }
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RETIREMENT_POLL);
+                continue;
+            }
             Err(_) => continue,
         };
+        // An accepted socket may inherit the listener's non-blocking mode; the
+        // framing reads below are blocking by contract.
+        if let Err(e) = stream.set_nonblocking(false) {
+            tracing::warn!(agent = name, error = %e, "TUI client blocking mode unavailable");
+            continue;
+        }
+        clients.retain(|c| c.peer_addr().is_ok());
+        if let Ok(handle) = stream.try_clone() {
+            clients.push(handle);
+        }
         let _ = stream.set_nodelay(true);
         // Bound the auth read so a silent peer cannot pin this accept loop.
         // Framing read/write stays unbounded afterwards — the deadline is
