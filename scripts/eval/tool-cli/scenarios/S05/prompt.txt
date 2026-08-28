@@ -1,0 +1,3 @@
+The image work lead handed you is finished: the cold-start image is down from
+1.8 GB to 410 MB and the demo boots in 6 seconds. Close the loop with lead the
+way the protocol says you should, then stop.

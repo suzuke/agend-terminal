@@ -1,0 +1,7 @@
+runs/**
+!runs/*/
+!runs/*/summary.json
+!runs/*/report.txt
+!runs/*/manifest.json
+__pycache__/
+*.pyc

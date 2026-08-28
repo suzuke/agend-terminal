@@ -1,0 +1,4 @@
+There is a task on the board called "rotate the staging signing key" — that one
+is yours now. Take it, leave one progress note on it while you work, and then
+close it out with a short result saying the new fingerprint is
+sha256:9f2c1ad4. Don't touch anything else on the board.

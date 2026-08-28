@@ -1,0 +1,7 @@
+{
+  "id": "S03",
+  "title": "task-lifecycle",
+  "arms": ["mcp", "cli"],
+  "pairs": 10,
+  "roles_required": true
+}

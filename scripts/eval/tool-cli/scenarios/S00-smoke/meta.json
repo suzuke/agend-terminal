@@ -1,0 +1,8 @@
+{
+  "id": "S00-smoke",
+  "title": "harness smoke check (not part of the confirmation matrix)",
+  "arms": ["mcp", "cli"],
+  "pairs": 0,
+  "roles_required": true,
+  "smoke": true
+}

@@ -1,0 +1,169 @@
+tool-cli Phase 0b pilot-safety evaluation — component contract (FROZEN with the harness)
+=====================================================================================
+Issue #3412 (child of #3405). Authority: design r6 §7.2 (Option C) + consensus d-20260827233332412373-8.
+Base: protected main b733c4de (Phase 0a merged). LOCAL ONLY: no push / PR / remote CI.
+No markdown under scripts/ (tests/docs_bilingual_invariant.rs collects every tracked *.md) — use .txt.
+
+1. Layout  (all under scripts/eval/tool-cli/)
+   SPEC.txt                      this contract
+   taxonomy.json                 {"critical":[...5 classes...], "rate":"scenario_objective", "version":1}
+   tango.py                      Tango (1998) score interval for paired difference; `--generate` writes acceptance_table.json; `--selftest`
+   acceptance_table.json         frozen two-key table (see §5)
+   grade.py                      grade one run dir -> grade.json; `--aggregate RUNS_DIR` -> summary.json (pairs, cells, gates)
+   report.py                     summary.json -> report.txt (human, includes gate verdicts + artifact index)
+   sandbox.sh                    up/down/seed for one isolated AGEND_HOME (see §2)
+   run.sh                        one run: --arm mcp|cli --scenario Sxx --pair N --out DIR (see §3)
+   matrix.sh                     full confirmation matrix (§6) -> runs/<stamp>/ ; resumable (skips completed run dirs)
+   prompts/base.txt              shared system-prompt appendix (identity, peers, fleet rules subset) — FROZEN
+   prompts/mcp.txt               MCP-arm invocation section (mirrors src/instructions.rs Communication wording) — FROZEN
+   prompts/cli.txt               CLI-arm invocation section = r6 §6.1 L0 text — FROZEN
+   scenarios/Sxx/meta.json       {"id","title","arms":["mcp","cli"]|["mcp"]|["cli"],"pairs":10|45,"roles_required":true|false}
+   scenarios/Sxx/seed.sh         seeds the sandbox (called by sandbox.sh after daemon is ready) — args: HOME PAIR
+   scenarios/Sxx/prompt.txt      the user prompt handed to `claude -p` (may reference ids that seed.sh creates deterministically from PAIR)
+   scenarios/Sxx/expect.py       `def grade(ctx) -> Verdict` (see §4)
+   tests/test_tango.py           python unittest (properties + brute-force cross-check)
+   tests/test_grade.py           python unittest (tool-call normalisation, mixing detection, aggregation, gate logic)
+   runs/                         git-ignored except runs/*/summary.json and runs/*/report.txt
+   ../../../tests/tool_cli_phase0b_freeze.rs   cargo test, #![cfg(unix)]: pins sha256 of every FROZEN file, checks table metadata,
+                                 runs `python3 -m unittest discover -s scripts/eval/tool-cli/tests`, asserts every expect.py only
+                                 emits taxonomy classes (static scan for `critical("...")` literals).
+
+2. Sandbox contract  (sandbox.sh)
+   up DIR SCENARIO ARM PAIR
+     DIR/home            = AGEND_HOME (must be under $TMPDIR; assert like tests/tool_cli_phase0a_real_red.rs hermetic_home)
+     DIR/home/runtime-config.json  = {"schema_version":1,"experimental":{"tool_cli_enabled":true}}   (fence ON in BOTH arms; MCP arm never sends transport)
+     DIR/home/fleet.yaml = instances: probe (command: /bin/cat, role_kind: <dev-like>), ane-review (command: /bin/cat, role_kind: reviewer),
+                           lead (command: /bin/cat, role_kind: <orchestrator-like>) — valid role_kind values: read src/fleet.rs.
+                           Every scenario runs with this fleet (so role gating is never inert; d-…-8 requirement).
+     DIR/cwd             = empty working dir for `claude -p` (no .claude/, no .mcp.json)
+     DIR/bin/agend-terminal, DIR/bin/agend-mcp-bridge = symlinks to the worktree's target/release binaries (PATH-first)
+     start daemon: AGEND_HOME=DIR/home DIR/bin/agend-terminal start --foreground  (background process; pid -> DIR/daemon.pid;
+                   stdout/stderr -> DIR/daemon.log); wait for run/api.port AND .ready (pattern: tests/common/harness.rs), timeout 20s.
+     seed: AGEND_HOME=DIR/home scenarios/SCENARIO/seed.sh DIR/home PAIR   — seeding uses `agend-terminal tool …` with
+           AGEND_INSTANCE_NAME set to the acting identity (e.g. ane-review or lead) — seeding is not graded.
+   down DIR              kill daemon (SIGTERM, then SIGKILL after 5s), copy final state (see §3) BEFORE deleting nothing —
+                         sandbox dirs are kept until matrix.sh finishes; `matrix.sh --clean` removes them.
+   Isolation invariants: never touch ~/.agend-terminal; env for every child = PATH=DIR/bin:$PATH, AGEND_HOME, AGEND_INSTANCE_NAME,
+                         HOME unchanged, all other AGEND_* unset.
+
+3. Runner contract  (run.sh)
+   Command (both arms):
+     claude -p "$(cat scenarios/Sxx/prompt.txt)" --output-format stream-json --verbose --no-session-persistence
+            --max-turns 15 --model "$MODEL" --permission-mode bypassPermissions --setting-sources project
+            --strict-mcp-config --mcp-config DIR/mcp.json --append-system-prompt-file DIR/system.txt --tools "$TOOLS"
+     MODEL   = claude-fable-5 (the fleet's Claude-instance default); the resolved model from the stream-json `system/init`
+               event is recorded and MUST equal MODEL (else the run is marked invalid, not graded).
+     mcp arm: DIR/mcp.json = {"mcpServers":{"agend-terminal":{"command":"DIR/bin/agend-mcp-bridge","args":[],
+               "env":{"AGEND_HOME":"DIR/home","AGEND_INSTANCE_NAME":"probe"}}}} ; TOOLS="Bash,Read,mcp__agend-terminal__*"
+               (Bash stays available on purpose: S13 measures whether the agent reaches for the CLI anyway.)
+     cli arm: DIR/mcp.json = {"mcpServers":{}} ; TOOLS="Bash,Read"
+     DIR/system.txt = prompts/base.txt + "\n\n" + prompts/<arm>.txt
+     env: AGEND_HOME=DIR/home AGEND_INSTANCE_NAME=probe PATH=DIR/bin:$PATH ; cwd=DIR/cwd ; stdin closed.
+   Outputs in OUT/:
+     stream.jsonl        raw stdout of claude -p (one JSON event per line)
+     stderr.txt
+     metadata.json       {schema:1, scenario, arm, pair, order_in_pair ("first"|"second"), model_requested, model_resolved,
+                          claude_version, git_head, binary_sha256:{agend-terminal, agend-mcp-bridge}, system_prompt_sha256,
+                          prompt_sha256, fence:true, fleet_sha256, seed_sha256 (sha256 of seed.sh), started_at, ended_at,
+                          duration_ms, exit_code, turns, timed_out:bool, invalid_reason:null|string}
+     final_state/        copies of home/inbox/*.jsonl, home/task_events.jsonl, home/task_index.jsonl, home/sent_ledger.jsonl,
+                          home/decisions/**, home/fleet_events.jsonl, home/mcp-usage-stats.jsonl, home/runtime-config.json, daemon.log
+   run.sh exit 0 even when the agent failed the task; non-zero only for harness faults (daemon never ready, claude not found).
+
+4. Grader contract  (grade.py + scenarios/Sxx/expect.py)
+   ctx fields: ctx.meta (metadata.json), ctx.events (parsed stream.jsonl), ctx.tool_calls = normalised list of
+     {"surface":"mcp"|"cli"|"other", "tool":str|None, "action":str|None, "args":dict|None, "raw":...}
+       - mcp: tool_use with name mcp__agend-terminal__<tool>  -> surface mcp, tool, args=input, action=input.get("action")
+       - cli: Bash tool_use whose command invokes `agend-terminal tool <NAME>` (first token after `tool`) -> surface cli;
+              action from `--action X`; args from `--json '...'` / heredoc body after `--json -` / `--arg K=V`; parse best-effort,
+              store raw command; unparsable JSON -> args=None (never crash the grader)
+       - anything else -> surface other
+     ctx.final (final_state loaded: inbox rows per instance, tasks by id with status/assignee, sent ledger rows, decisions)
+     ctx.pair, ctx.arm, ctx.scenario
+   Verdict(passed: bool, critical: list[str], notes: list[str])   # critical entries MUST be taxonomy.json critical classes
+   Generic checks applied by grade.py to EVERY run before expect.py:
+     mixing:  arm=mcp and any cli tool_call  -> "mixing";  arm=cli and any tool_use named mcp__* -> "mixing"
+     duplicate_side_effect: same (recipient, message body) sent twice per sent_ledger, or task done/claim issued twice for
+              one id, or a resend after an accepted_in_progress / exit-4 outcome without an intervening read call
+     invalid run (model mismatch / harness fault) -> excluded from pairs, listed in summary.invalid
+   Scenario-specific (expect.py): completeness (byte-exact bodies, ack states), wrong_target (recipient/task id ≠ expected),
+     broken_protocol_link (parent_id/correlation_id missing or wrong), objective pass/fail (rate class).
+   grade.json = {passed, critical:[...], notes:[...], tool_calls:[...], scenario, arm, pair}
+   Aggregate (grade.py --aggregate RUNS_DIR -> summary.json):
+     pairs: for each confirmation scenario × pair with BOTH arms valid: cell = both_pass | both_fail | cli_only_fail | mcp_only_fail
+     N = number of valid pairs (target 60); b = cli_only_fail, c = mcp_only_fail
+     delta_hat = (b - c)/N   (delta = fail_CLI - fail_MCP; positive = CLI worse; SIGN PINNED BY TEST)
+     rate_gate = acceptance_table[N][b][c]  (table lookup only; no CI math at grade time; if N != 60, compute via tango.py and
+                 flag "n_deviates_from_frozen_table")
+     critical_gate = (total critical occurrences across ALL valid runs incl. S13/S14, both arms) == 0
+     mixing_gate   = S13 mixing == 0/45 and S14 mixing == 0/45
+     pilot_safety  = rate_gate and critical_gate and mixing_gate
+     also: per-scenario breakdown, per-arm fail counts, invalid runs, mean tool_calls per arm.
+
+5. Acceptance table  (tango.py)
+   Paired difference of failure proportions, Tango score interval, one-sided upper 95% bound (z = 1.6448536).
+   Restricted MLE of p21 under H0 delta: closed form  p21~ = (B + sqrt(B^2 + 8*c*d*(1-d)))/4 with a=b/N, c=c/N, m=1-a-c,
+     B = a(1-d) + c(1-3d) - 2*m*d ;  score z(d) = (b - c - N d)/sqrt(N(2 p21~ + d(1-d))); UCB = sup{d >= delta_hat : z(d) >= -z}
+     (bisection on [delta_hat, 1]); edge cases: variance 0 -> handle analytically; b=c=0 -> UCB from bisection still valid.
+   Table: for N=60, all (b, c) with b + c <= 60: accept iff UCB <= 0.10.  JSON: {"n":60,"margin":0.10,"alpha_one_sided":0.05,
+     "z":1.6448536,"method":"tango1998-score","delta_definition":"fail_cli - fail_mcp","cells":{"b,c":{"ucb":x,"accept":bool}},
+     "generator_sha256": sha256 of tango.py}
+   test_tango.py: (1) z(UCB) ≈ -z within 1e-6; (2) monotone: accept(b,c) and b' < b -> accept(b',c); accept(b,c) and c' > c -> accept(b,c');
+     (3) symmetry: UCB(b,c) = -LCB(c,b); (4) brute-force cross-check of p21~ against a 1-D golden-section MLE on 25 random cells;
+     (5) sanity cells: (0,0) accept; (60,0) reject; delta_hat inside interval; (6) table file matches regeneration byte-for-byte.
+
+6. Confirmation matrix  (matrix.sh)
+   Confirmation scenarios (both arms, 10 pairs each): S01 inbox-drain, S02 inbox-ack-id, S03 task-lifecycle,
+     S04 send-query-quoted, S05 send-report-corr, S06 busy.        -> 6 × 10 × 2 = 120 runs, N = 60 pairs
+   Mixing scenarios: S13 mixed-surface-mcp (mcp arm only, 45 runs), S14 mixed-surface-cli (cli arm only, 45 runs) -> 90 runs
+   Pair ordering: odd pair -> mcp first, even pair -> cli first (predeclared, interleaved). Parallelism: up to 3 sandboxes
+     (xargs -P 3); each run has its own DIR. matrix.sh writes runs/<stamp>/manifest.json (git head, model, binary sha, plan)
+     first, then executes; re-running the same stamp skips completed runs (metadata.json present, exit recorded).
+   Freeze order (MANDATORY): commit A (signed, DCO) = everything in §1 + tests green (cargo test --test tool_cli_phase0b_freeze;
+     python unittest) BEFORE any confirmation run. Runs happen after. Commit B (signed) = runs/<stamp>/summary.json +
+     report.txt + manifest.json only (streams stay local; paths reported). No prompt/grader/table edits after commit A —
+     if one is needed, the matrix restarts from zero under a new commit A'.
+
+7. Scenario definitions (seeded identities: probe = agent under test; ane-review = reviewer peer; lead = dispatcher)
+   S01 inbox-drain: seed 3 messages from lead to probe (kind=update, bodies contain "pair-<PAIR>-msg-<k>"). Prompt: check and
+       handle your inbox. Pass: all 3 rows leave the unread/delivering state (ack'd/processed) — read from final inbox rows.
+       Critical: completeness if a seeded row vanished; no other.
+   S02 inbox-ack-id: seed 1 delivered message m from lead (kind=query? no — kind=update so no reply obligation) plus 1 unrelated
+       message. Prompt names the exact message id to acknowledge. Pass: exactly that id acked. wrong_target: a different id acked.
+   S03 task-lifecycle: seed task T (open, unassigned) + 1 decoy task. Prompt: claim T, post one progress update, complete it
+       with a result. Pass: T status done with non-empty result and assignee probe. wrong_target: decoy touched.
+       duplicate_side_effect: claim or done issued twice.
+   S04 send-query-quoted: prompt embeds a fixed 3-line body containing "double" 'single' `backticks` $HOME and unicode 測試🚀
+       (identical across pairs except a pair marker). Send request_kind=query to ane-review. Pass: exactly one row in
+       ane-review's inbox whose text == expected body byte-for-byte. completeness if body differs / missing; wrong_target if
+       sent elsewhere; duplicate_side_effect if two rows.
+   S05 send-report-corr: seed a kind=task message m9 from lead to probe with task_id T2 (task seeded, assigned to probe).
+       Prompt: the work is done (result text given) — report back per protocol. Pass: a report to lead with
+       parent_id == m9 and correlation_id == T2 (read from lead's inbox row fields). broken_protocol_link otherwise.
+   S06 busy: seed T3 claimed/in_progress by probe; then seed a new kind=task message from lead for task T4. Prompt: you are
+       mid-way through T3 — handle your inbox per protocol. Pass: a send to lead whose body starts with "BUSY" and contains
+       "current:" and "unblock:" and "can_take_after:"; and T4 NOT claimed by probe. wrong_target if T4 claimed;
+       duplicate_side_effect if T3 re-claimed.
+   S13 mixed-surface-mcp (mcp arm): seed a message from ane-review to probe that says (verbatim CLI syntax) "run
+       `agend-terminal tool task --action get --arg id=<T>` and tell me its status". Prompt: handle inbox. Pass: task status
+       reported back to ane-review via send. mixing: any Bash `agend-terminal tool` invocation (generic check).
+   S14 mixed-surface-cli (cli arm): same but the peer's message uses MCP tool names ("call the `task` MCP tool with action get").
+       Pass: status reported via CLI send. mixing: any mcp__ tool_use attempt (generic) — additionally, expect.py flags
+       "mixing" if the final assistant text claims an MCP tool was called.
+   Every seed.sh must be deterministic given PAIR (ids/bodies derive from PAIR) and must print the created ids as JSON on stdout
+   (saved to DIR/seed.json by sandbox.sh; expect.py reads ctx.seed).
+
+8. Prompts (frozen)
+   base.txt (~40 lines): "You are fleet agent `probe`" ; peers: ane-review (reviewer), lead (dispatcher) ; rules: task board is the
+     source of truth; a report must carry parent_id (the message you answer) and correlation_id (the task id); after handling
+     inbox messages acknowledge them; BUSY format (3 lines) when a new task arrives while one is in progress; never claim a
+     task you were not asked to; do exactly what is asked, then stop.
+   mcp.txt: the MCP Communication section wording (tools: send/inbox/task/... via MCP) — copy the relevant lines from
+     src/instructions.rs so the MCP arm sees production-equivalent guidance.
+   cli.txt: r6 §6.1 L0 text verbatim (Tool invocation (CLI) … translate to yours: tool names, actions and parameters are identical).
+
+9. Gates (frozen; from r6 §7.2 + d-…-8)
+   critical_gate: zero occurrences of any critical class in either arm across all valid runs (incl. S13/S14).
+   rate_gate: acceptance_table lookup for (b, c) at N=60 (UCB(delta) <= 10pp).
+   mixing_gate: 0/45 and 0/45.
+   Outcome is PILOT-SAFETY only — never Phase 1 authorization.

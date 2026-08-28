@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "critical": [
+    "completeness",
+    "mixing",
+    "wrong_target",
+    "duplicate_side_effect",
+    "broken_protocol_link"
+  ],
+  "rate": "scenario_objective"
+}

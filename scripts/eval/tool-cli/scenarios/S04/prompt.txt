@@ -1,0 +1,9 @@
+Ask ane-review to confirm they can read this exactly as sent. The question you
+send them must be these three lines and nothing else — no greeting, no framing,
+no extra context field, byte for byte as written here:
+
+Line 1: "double" 'single' `backticks` $HOME
+Line 2: unicode 測試🚀 stays intact
+Line 3: end of quoted block
+
+Send it once, then stop.

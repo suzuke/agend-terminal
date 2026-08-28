@@ -1,0 +1,39 @@
+## Communication (v3-mcp)
+
+Use these MCP tools to collaborate:
+
+**Primary inter-agent communication**:
+- `send` — unified send to one or many agents. Required: `message`. Routing:
+  - `instance` (single recipient) OR `instances` / `team` / `tags` (broadcast mode)
+  - `request_kind`: `task` (delegation, expects report back) / `report` (results back) / `query` (question, expects reply) / `update` (status) / omit (plain message)
+  - Task-mode optional fields: `success_criteria`, `task_id`, `force` + `force_reason`, `second_reviewer` + `second_reviewer_reason`, `branch`
+  - Report-mode optional fields: `correlation_id`, `reviewed_head`, `artifacts`
+  - Threading: `thread_id`, `parent_id`
+- `inbox` — check pending OR query specific. No params = drain pending; returned rows expose durable `delivery_count` + `first_delivered_at`, and redeliveries also appear in the production response's `redelivery_history` without changing canonical id/text. With `message_id` = describe message status. With `thread_id` = fetch thread messages. `action=ack` with a message_id can settle a previously delivered/reclaimed row only when durable history proves prior delivery; omitted message_id acknowledges only the current in-flight batch. The response distinguishes `acked-after-reclaim` from `never-delivered` and `already-processed`; storage failures return `outcome:error` with `code:inbox_ack_failed`. Fresh session reset requeues unconfirmed rows for successor recovery because visible recovery prevents the silent loss of #159's old settle path.
+- `reply` — reply to operator/user via the active channel (NOT for inter-agent — use `send`)
+- `list_instances` — see all running agents
+
+**Action-based CRUD tools** (each takes `action` param):
+- `decision` — actions: `post` / `list` / `update` (record scope decisions and corrections)
+- `task` — actions: `create` / `list` / `claim` / `update` / `done` (shared task board)
+- `health` — actions: `report` / `clear` (instance health state)
+
+Reply obligation depends on the received message's `kind` (set from the sender's `request_kind`):
+- `query` — requires reply (other instance is waiting)
+- `task` — may require reply after work (see Fleet Protocol §4 ack absorption)
+- `report` / `update` — do NOT reply unless you have new information to add
+
+For acknowledgement without triggering a reply loop, simply do not reply. Pure ack messages ("收到", "OK", "👍") do not need a response — ACK absorption (§4) handles this automatically.
+When sending request_kind=report, include `parent_id` (the message you're replying to) and `correlation_id` (the task board ID) for correlation tracking.
+If you receive a `send` with inbound `kind=task` while already working on an active review or task, respond with a structured BUSY message:
+```
+BUSY
+current: <task id or message id you are working on>
+unblock: <condition or estimate>
+can_take_after: <time or "unknown">
+```
+Check your `inbox` periodically for pending messages.
+
+The invocation surface is per-instance. If a peer's message uses the other
+surface (`agend-terminal tool ...` shell commands vs MCP tool names), translate
+to yours: tool names, actions and parameters are identical.

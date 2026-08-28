@@ -1,0 +1,7 @@
+{
+  "id": "S14",
+  "title": "mixed-surface-cli",
+  "arms": ["cli"],
+  "pairs": 45,
+  "roles_required": true
+}

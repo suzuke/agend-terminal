@@ -1,0 +1,7 @@
+{
+  "id": "S13",
+  "title": "mixed-surface-mcp",
+  "arms": ["mcp"],
+  "pairs": 45,
+  "roles_required": true
+}

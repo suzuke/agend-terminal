@@ -1,0 +1,10 @@
+{"action":null,"opt_params":["message","request_kind"],"tool":"send","ts":"2026-08-28T05:33:58.404693+00:00"}
+{"action":"create","opt_params":["assignee","title"],"tool":"task","ts":"2026-08-28T05:33:58.423647+00:00"}
+{"action":"list","opt_params":[],"tool":"task","ts":"2026-08-28T05:34:07.959289+00:00"}
+{"action":null,"opt_params":["instance","message","request_kind"],"tool":"send","ts":"2026-08-28T05:34:08.017631+00:00"}
+{"action":null,"opt_params":["instance","message","request_kind","task_id"],"tool":"send","ts":"2026-08-28T05:34:08.144244+00:00"}
+{"action":"claim","opt_params":["id"],"tool":"task","ts":"2026-08-28T05:34:27.181279+00:00"}
+{"action":"progress","opt_params":["id"],"tool":"task","ts":"2026-08-28T05:34:27.219165+00:00"}
+{"action":"done","opt_params":["id","result"],"tool":"task","ts":"2026-08-28T05:34:27.235967+00:00"}
+{"action":null,"opt_params":[],"tool":"inbox","ts":"2026-08-28T05:34:27.288300+00:00"}
+{"action":null,"opt_params":["correlation_id","instance","message","parent_id","request_kind","task_id"],"tool":"send","ts":"2026-08-28T05:34:27.316451+00:00"}

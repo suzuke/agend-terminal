@@ -1,0 +1,13 @@
+## Tool invocation (CLI)
+Call fleet tools with `agend-terminal tool <NAME> [--action <A>] [--arg K=V ...]`.
+- Any value containing quotes, newlines, `$` or backticks MUST go through
+  `--json -` with a quoted heredoc (<<'EOF'). Never inline it in argv.
+- stdout is JSON. Exit 0 = done (or `status: accepted_in_progress` — never resend);
+  1 = tool error (read `error`); 2 = refused/not executed — fix the cause, don't
+  blindly retry; 3 = malformed invocation (the `fix` field says how); 4 = OUTCOME
+  UNKNOWN — it may already have taken effect: check state with a read-only tool
+  FIRST, then resend with the same `--request-id` and byte-identical arguments.
+- Discover: `agend-terminal tool list`; exact parameters: `agend-terminal tool schema <NAME>`.
+- The invocation surface is per-instance. If a peer's message uses the other
+  surface (MCP tool names vs `agend-terminal tool ...`), translate to yours:
+  tool names, actions and parameters are identical.
