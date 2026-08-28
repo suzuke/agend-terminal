@@ -582,6 +582,130 @@ mod tests {
             .reason
     }
 
+    /// RED (review round 7): `codex --help` lists TWO session subcommands with
+    /// identical grammar, and only one was transcribed.
+    ///
+    ///   resume  Resume a previous interactive session (picker by default; use --last ...)
+    ///   fork    Fork a previous interactive session (picker by default; use --last to fork the most recent)
+    ///
+    /// `codex fork --help` gives `Usage: codex fork [OPTIONS] [SESSION_ID] [PROMPT]`
+    /// and `--last  Fork the most recent session without showing the picker` —
+    /// the same shape as `resume`. Forking a previous session is a session pin
+    /// of exactly the class a fresh restart exists to remove: the agent comes
+    /// back holding the old conversation while the daemon reports spawned=true.
+    #[test]
+    fn codex_fork_subcommand_is_a_session_pin_3414() {
+        assert_eq!(ok(Backend::Codex, &["fork"]), v(&[]));
+        assert_eq!(ok(Backend::Codex, &["fork", "0199-abc"]), v(&[]));
+        assert_eq!(ok(Backend::Codex, &["fork", "--last"]), v(&[]));
+        assert_eq!(
+            ok(Backend::Codex, &["fork", "0199-abc", "--model", "gpt"]),
+            v(&["--model", "gpt"])
+        );
+        // Same ownership limit as `resume`: the subcommand owns SESSION_ID, and
+        // a second positional is a PROMPT it may not silently swallow.
+        assert_eq!(
+            reason(Backend::Codex, &["fork", "0199-abc", "do the thing"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        // And the same command-position discipline: `fork` as a global's VALUE
+        // is not a subcommand.
+        assert_eq!(ok(Backend::Codex, &["-c", "fork"]), v(&["-c", "fork"]));
+    }
+
+    /// RED (review round 7): two Claude session selectors were missing.
+    ///
+    ///   --session-id <uuid>  Use a specific session ID for the conversation (must be a valid UUID)
+    ///
+    /// A fixed session id reused on every spawn is a pin — it names one
+    /// transcript for the life of the instance, so a "fresh" restart returns to
+    /// it. Stripping it is also what keeps the NEXT fresh restart working: an id
+    /// left behind after its `--resume`/`--fork-session` partners are removed
+    /// would be reinterpreted, and Grok's help says so outright for its own
+    /// spelling (see `grok_session_id_cannot_strand_the_next_restart_3414`).
+    #[test]
+    fn claude_session_id_is_a_session_pin_3414() {
+        assert_eq!(ok(Backend::ClaudeCode, &["--session-id", "u1"]), v(&[]));
+        assert_eq!(ok(Backend::ClaudeCode, &["--session-id=u1"]), v(&[]));
+        assert_eq!(
+            ok(
+                Backend::ClaudeCode,
+                &["--session-id", "u1", "--model", "claude-opus-5"]
+            ),
+            v(&["--model", "claude-opus-5"])
+        );
+        // Required value: a missing one is unresolvable, not a picker.
+        assert_eq!(
+            reason(Backend::ClaudeCode, &["--session-id"]),
+            SessionArgsErrorReason::MissingRequiredValue
+        );
+    }
+
+    /// RED (review round 7): `--cloud [description|session_id|url]` — "Create a
+    /// cloud session with the given description, or attach to an existing one by
+    /// session ID or claude.ai/code URL".
+    ///
+    /// One positional, three meanings, and the CLI decides which. A restart
+    /// cannot tell a description from a session id, so BOTH silent choices are
+    /// wrong: keeping it may reattach the agent to an existing cloud session on
+    /// a fresh restart, dropping it may discard a real description. That is the
+    /// definition of the Ambiguous variant — refuse and name the token.
+    ///
+    /// The BARE form takes no value and creates a new cloud session, so it is
+    /// not a pin and must survive untouched.
+    #[test]
+    fn claude_cloud_with_a_value_is_ambiguous_bare_is_not_3414() {
+        assert_eq!(
+            reason(Backend::ClaudeCode, &["--cloud", "sess-1"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        assert_eq!(
+            reason(Backend::ClaudeCode, &["--cloud=sess-1"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+        assert_eq!(ok(Backend::ClaudeCode, &["--cloud"]), v(&["--cloud"]));
+        assert_eq!(
+            ok(Backend::ClaudeCode, &["--cloud", "--model", "opus"]),
+            v(&["--cloud", "--model", "opus"])
+        );
+    }
+
+    /// RED (review round 7): stripping a selector must not strand its partner.
+    ///
+    /// `grok --help`: `-s, --session-id <SESSION_ID>  Use a specific session
+    /// UUID for a **new** conversation (must be a valid UUID and must not
+    /// already exist under the target session directory). With
+    /// `--resume`/`--continue`, only valid together with `--fork-session`
+    /// (names the forked session). Does not resume existing sessions`.
+    ///
+    /// So it is legal exactly twice: as the fork's name, or as a one-shot name
+    /// for a new session. Neither survives being reused. Remove `--resume` and
+    /// `--fork-session` and leave `-s u2` behind, and the first fresh restart
+    /// creates u2 while every later one refuses to start because u2 now exists —
+    /// after the live instance has already been deleted. The instance's stored
+    /// args are replayed on every spawn, so a bare `-s` is the same trap one
+    /// restart later.
+    #[test]
+    fn grok_session_id_cannot_strand_the_next_restart_3414() {
+        assert_eq!(
+            ok(
+                Backend::Grok,
+                &["--resume", "u1", "-s", "u2", "--fork-session"]
+            ),
+            v(&[])
+        );
+        assert_eq!(ok(Backend::Grok, &["-s", "u2"]), v(&[]));
+        assert_eq!(ok(Backend::Grok, &["--session-id", "u2"]), v(&[]));
+        assert_eq!(
+            ok(Backend::Grok, &["-s", "u2", "--model", "grok-4"]),
+            v(&["--model", "grok-4"])
+        );
+        assert_eq!(
+            reason(Backend::Grok, &["-s"]),
+            SessionArgsErrorReason::MissingRequiredValue
+        );
+    }
+
     /// The exact observed production case (#3414): a durable `--resume <uuid>`
     /// in the instance's stored args survived every fresh restart. The model
     /// flag is unrelated and must be preserved.
