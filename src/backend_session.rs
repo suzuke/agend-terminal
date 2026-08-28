@@ -165,11 +165,99 @@ pub fn sanitize_for_fresh(
     backend: &Backend,
     args: &[String],
 ) -> Result<Vec<String>, SessionArgsError> {
-    // RED baseline: faithfully reproduces TODAY's behaviour — `restart_instance
-    // mode=fresh` passes the stored caller args through verbatim, so a pinned
-    // session selector survives the restart. Every assertion below fails here.
-    let _ = backend;
-    Ok(args.to_vec())
+    let matrix = selectors(backend);
+    let coupled = coupled_flags(backend);
+    if matrix.is_empty() && coupled.is_empty() && !matches!(backend, Backend::Codex) {
+        return Ok(args.to_vec());
+    }
+
+    let boundary = payload_start(args);
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut removed_selector = false;
+    let mut index = 0usize;
+
+    while index < boundary {
+        let tok = &args[index];
+
+        // Codex `resume [SESSION_ID]` subcommand. The prompt positional is
+        // deliberately NOT rewritten: silently promoting it to a top-level
+        // positional would change what the agent is asked to do, so a second
+        // resume-owned positional is ambiguous and fails closed.
+        if matches!(backend, Backend::Codex) && tok == "resume" {
+            let mut owned = 0usize;
+            let mut probe = index + 1;
+            while probe < boundary && !args[probe].starts_with('-') {
+                owned += 1;
+                probe += 1;
+            }
+            if owned > 1 {
+                return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
+            }
+            removed_selector = true;
+            index = probe;
+            continue;
+        }
+
+        if let Some(selector) = matrix
+            .iter()
+            .find(|s| tok == s.long || s.short.is_some_and(|short| tok == short))
+        {
+            removed_selector = true;
+            index += 1;
+            if selector.value == SelectorValue::Required {
+                let value = args
+                    .get(index)
+                    .filter(|v| !v.is_empty() && *v != "--" && !v.starts_with('-'))
+                    .ok_or_else(|| {
+                        err(backend, tok, SessionArgsErrorReason::MissingRequiredValue)
+                    })?;
+                let _ = value;
+                index += 1;
+            }
+            continue;
+        }
+
+        // `--flag=VALUE` — one token, owns its own value.
+        if let Some(selector) = matrix
+            .iter()
+            .find(|s| tok.strip_prefix(s.long).is_some_and(|r| r.starts_with('=')))
+        {
+            if selector.value == SelectorValue::Required && tok.len() == selector.long.len() + 1 {
+                return Err(err(
+                    backend,
+                    tok,
+                    SessionArgsErrorReason::MissingRequiredValue,
+                ));
+            }
+            removed_selector = true;
+            index += 1;
+            continue;
+        }
+
+        // Glued short spellings (`-rVAL`, `-r=VAL`). Parser acceptance is not
+        // fixture-proven across clap/yargs, so — exactly as `ModelCapability`
+        // treats them — they are a conservative conflict rather than a guess.
+        if matrix.iter().any(|s| {
+            s.short
+                .is_some_and(|short| tok.strip_prefix(short).is_some_and(|rest| !rest.is_empty()))
+        }) {
+            return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
+        }
+
+        if coupled.contains(&tok.as_str()) {
+            if !removed_selector {
+                return Err(err(backend, tok, SessionArgsErrorReason::OrphanCoupledFlag));
+            }
+            index += 1;
+            continue;
+        }
+
+        out.push(tok.clone());
+        index += 1;
+    }
+
+    out.extend_from_slice(&args[boundary..]);
+    Ok(out)
 }
 
 #[cfg(test)]
