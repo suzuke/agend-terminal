@@ -1015,6 +1015,103 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3419 real-entry race: if the governing decision is superseded after the
+/// branch preflight but before auto-create, no watch/bind/delivery may escape
+/// the failed Created boundary. This drives the actual `handle_delegate_task`
+/// path with `bind:false`; the watch side effect is therefore directly
+/// observable without requiring a real worktree lease.
+#[test]
+#[serial_test::serial]
+fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-real-entry-race-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create race home");
+    setup_test_repo(&home, "target-agent");
+
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed dispatch",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    assert_eq!(decision["status"], "posted", "seed decision: {decision}");
+    let decision_id = decision["id"]
+        .as_str()
+        .expect("seed decision id")
+        .to_string();
+    let supersede_id = decision_id.clone();
+    crate::tasks::governance::install_authority_resolved_hook(Box::new(move |hook_home| {
+        let replacement = crate::decisions::post(
+            hook_home,
+            "lead",
+            &serde_json::json!({
+                "title": "replacement authority",
+                "content": "single review required",
+                "review_class": "single",
+                "supersedes": supersede_id,
+            }),
+        );
+        assert_eq!(replacement["status"], "posted", "supersede decision: {replacement}");
+    }));
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement governed feature",
+        "branch": "feat/3419-real-entry",
+        "repository": "owner/repo",
+        "governing_decision_id": decision_id,
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result = super::super::comms::handle_delegate_task(
+        &home,
+        &args,
+        &sender,
+        Some(&minimal_runtime()),
+    );
+
+    assert_eq!(
+        result["code"], "governing_decision_unresolved",
+        "superseded governing create must reject before dispatch side effects: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-real-entry"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "failed governed Created must not arm a watch: {}",
+        watch_path.display()
+    );
+    let board = crate::tasks::handle(&home, "lead", &serde_json::json!({"action": "list"}));
+    assert!(
+        board["tasks"].as_array().is_none_or(Vec::is_empty),
+        "failed governed Created must not leave a task: {board}"
+    );
+    let inbox_content = std::fs::read_dir(home.join("inbox"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !inbox_content.contains("implement governed feature"),
+        "failed governed Created must not deliver: {inbox_content}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2745 fail-closed (root pre-review finding 2): a merge-authority (branch)
 /// dispatch whose review_class is UNRESOLVED (omitted / typo) or MISMATCHED
 /// (task=single vs second_reviewer=true) is REJECTED atomically at the handler
