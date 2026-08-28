@@ -639,7 +639,9 @@ fn packaged_tarball_reaches_shared_wire_and_cli_modules() {
     let listing = String::from_utf8_lossy(&output.stdout);
     for path in ["src/mcp_wire.rs", "src/tool_cli.rs"] {
         assert!(
-            listing.lines().any(|line| line.trim() == path),
+            listing
+                .lines()
+                .any(|line| std::path::Path::new(line.trim()) == std::path::Path::new(path)),
             "packaged source must contain {path}; listing was:\n{listing}"
         );
     }
