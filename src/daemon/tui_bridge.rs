@@ -137,26 +137,27 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         run_dir,
         port,
     } = meta;
-    // Non-blocking so the retirement check below is reachable; a blocking
-    // `incoming()` would park here forever after the successor took the name.
+    // Fail closed: without non-blocking accept the retirement check below is
+    // unreachable and this bridge would silently go back to parking forever
+    // after a successor took the name — the exact #3373 shape.
     if let Err(e) = listener.set_nonblocking(true) {
-        tracing::warn!(agent = name, error = %e, "TUI listener non-blocking mode unavailable");
+        tracing::error!(
+            agent = name,
+            port,
+            error = %e,
+            "TUI listener non-blocking mode unavailable; refusing to serve an unretirable bridge"
+        );
+        return;
     }
-    // Read halves of live clients, kept only so retirement can close them.
-    let mut clients: Vec<std::net::TcpStream> = Vec::new();
 
     loop {
         if is_retired(&run_dir, name, port) {
-            // Closing the accepted sockets is the point: it is what makes a
-            // retained pane observe EOF, flip `connected` false, and become a
-            // reconnect candidate for the successor.
-            for client in &clients {
-                let _ = client.shutdown(std::net::Shutdown::Both);
-            }
+            // Stops the accept loop and drops the listener. Live client sockets
+            // retire themselves in their own output thread below — that thread
+            // owns the socket, so nothing here has to retain a handle to it.
             tracing::info!(
                 agent = name,
                 port,
-                clients = clients.len(),
                 "TUI bridge retired — successor owns the name"
             );
             return;
@@ -174,10 +175,6 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         if let Err(e) = stream.set_nonblocking(false) {
             tracing::warn!(agent = name, error = %e, "TUI client blocking mode unavailable");
             continue;
-        }
-        clients.retain(|c| c.peer_addr().is_ok());
-        if let Ok(handle) = stream.try_clone() {
-            clients.push(handle);
         }
         let _ = stream.set_nodelay(true);
         // Bound the auth read so a silent peer cannot pin this accept loop.
@@ -234,19 +231,36 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             Err(_) => continue,
         };
         let n = name.to_string();
+        let retire_dir = run_dir.clone();
+        let retire_name = n.clone();
         // fire-and-forget: per-client TUI output forwarder. Loop exits when
         // the broadcast subscriber rx drops (agent removed via
-        // delete_transaction) or when frame write fails (client disconnect).
-        // No graceful join needed — each client connection is independent.
-        // M4 analysis: no leak — write_frame failure on disconnect breaks
-        // the loop immediately; rx.recv() Err on agent deletion also exits.
+        // delete_transaction), when frame write fails (client disconnect), or
+        // when this bridge is retired. No graceful join needed — each client
+        // connection is independent.
+        // No leak: every exit path drops this thread's only socket handle, and
+        // the disconnect path is reached by write_frame failing. #3373 adds the
+        // retirement path — this thread owns the client socket, so retiring it
+        // here needs no shared client list and cannot retain a dead clone.
         if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_out"))
-            .spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if framing::write_frame(&mut write_stream, &data).is_err() {
-                        break;
+            .spawn(move || loop {
+                match rx.recv_timeout(RETIREMENT_POLL) {
+                    Ok(data) => {
+                        if framing::write_frame(&mut write_stream, &data).is_err() {
+                            break;
+                        }
                     }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // Closing the socket is the load-bearing act: it is what
+                        // makes a retained pane observe EOF, flip `connected`
+                        // false, and become a reconnect candidate.
+                        if is_retired(&retire_dir, &retire_name, port) {
+                            let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
             })
         {
@@ -309,6 +323,40 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// #3373: the retirement predicate. A bridge is stale the moment
+    /// `{name}.port` stops naming its own port — which is exactly what the
+    /// restart delete (`ipc::remove_port`) plus the successor's republish do.
+    #[test]
+    fn retirement_tracks_the_published_port() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-3373-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port_file = dir.join("agent.port");
+
+        // No port file at all — the delete removed it.
+        assert!(super::is_retired(&dir, "agent", 4242));
+
+        // The successor republished under a different port.
+        std::fs::write(&port_file, "4343").unwrap();
+        assert!(super::is_retired(&dir, "agent", 4242));
+
+        // Still ours.
+        std::fs::write(&port_file, "4242").unwrap();
+        assert!(!super::is_retired(&dir, "agent", 4242));
+
+        // Unparseable is treated as not-ours rather than assumed live.
+        std::fs::write(&port_file, "not-a-port").unwrap();
+        assert!(super::is_retired(&dir, "agent", 4242));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A fleet pane reaches this branch through `PaneSource::Remote`. A silent
     /// resize changes geometry but writes no bytes, so it must not invalidate a
     /// queued Claude development-channel confirmation. Any child repaint still

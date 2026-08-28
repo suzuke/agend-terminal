@@ -242,3 +242,53 @@ fn fresh_restart_retires_the_predecessor_listener() {
 
     drop(harness);
 }
+
+/// A client that disconnects must not keep the bridge from retiring a LATER,
+/// still-live client. The retirement path owns no shared client list — each
+/// output thread retires the socket it owns — so a dead peer leaves nothing
+/// behind for a live one to trip over.
+#[test]
+#[serial]
+fn retirement_reaches_a_live_client_after_an_earlier_one_disconnected() {
+    let (harness, first_port) = boot();
+
+    // A connects and goes away before the restart.
+    let departed = attach_pane(&harness.home, first_port);
+    departed
+        .shutdown(std::net::Shutdown::Both)
+        .expect("close the departing client");
+    drop(departed);
+
+    // B is the retained pane that must be retired.
+    let mut retained = attach_pane(&harness.home, first_port);
+
+    let response = restart_fresh(&harness);
+    assert_eq!(
+        response["result"]["spawned"], true,
+        "restart_instance must spawn the successor: {response}"
+    );
+    let second_port = wait_for_port(&harness.home, Some(first_port));
+
+    retained.set_read_timeout(Some(TEARDOWN_BUDGET)).unwrap();
+    let mut buf = [0u8; 4096];
+    let observed_close = loop {
+        match retained.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break false
+            }
+            Err(_) => break true,
+        }
+    };
+    assert!(
+        observed_close,
+        "a live client must still be retired after an earlier client disconnected \
+         (port {first_port} -> {second_port})"
+    );
+
+    drop(harness);
+}
