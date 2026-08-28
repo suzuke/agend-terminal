@@ -412,8 +412,8 @@ fn a_failed_spawn_restores_the_previous_config() {
         .insert(name.to_string(), config_for(name, &["--previous"]));
 
     let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
         &fx.configs,
-        &fx.registry,
         name,
         config_for(name, &["--attempted"]),
         || Err(anyhow::anyhow!("spawn refused")),
@@ -435,8 +435,8 @@ fn a_failed_spawn_removes_a_config_it_introduced() {
     let name = "cfg-new";
 
     let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
         &fx.configs,
-        &fx.registry,
         name,
         config_for(name, &["--attempted"]),
         || Err(anyhow::anyhow!("spawn refused")),
@@ -449,56 +449,94 @@ fn a_failed_spawn_removes_a_config_it_introduced() {
     );
 }
 
-/// The race the rollback must not lose: a concurrent same-name spawn wins while
-/// ours fails. Nothing serializes those today — the duplicate check in
-/// `spawn_instance` reads the registry and the actual registration happens
-/// later — so the loser must not erase the winner. Value comparison cannot
-/// decide this (two identical configs are indistinguishable); the REGISTRY can,
-/// because a winner has registered by the time it matters.
+/// The race the transaction must not lose, pinned at its root.
+///
+/// Nothing else serializes same-name spawns: `spawn_instance`'s duplicate check
+/// reads the registry and the registration happens later. Two weaker designs
+/// were tried and rejected before this one — rolling back on a value comparison
+/// cannot tell two identical configs apart, and consulting the registry after a
+/// failure is still check-then-act, since the winner can register between the
+/// check and the restore. So the property pinned here is the lane: while one
+/// spawn transaction for a name is in flight, another for the SAME name cannot
+/// be inside it.
+///
+/// The ordering is observed, not timed. B announces itself before entering and
+/// again from inside; A waits — bounded — for B's INSIDE signal and only stops
+/// waiting when it does not come. A design without the lane hands A that signal
+/// immediately and the recorded order shows B inside while A still is; with the
+/// lane, B's entry can only be recorded after A has left.
 #[test]
-fn a_failed_spawn_does_not_erase_a_concurrent_winner() {
-    let fx = fixture("rollback-race");
-    let name = "cfg-race";
+fn one_spawn_transaction_per_name_at_a_time() {
+    let fx = fixture("lane");
+    let name = "cfg-lane";
+    let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let (b_inside_tx, b_inside_rx) = crossbeam_channel::bounded::<()>(1);
+    let (a_inside_tx, a_inside_rx) = crossbeam_channel::bounded::<()>(1);
 
+    let b_events = Arc::clone(&events);
+    let b_home = fx.home.clone();
+    let b_configs = Arc::clone(&fx.configs);
+    let b = std::thread::spawn(move || {
+        // Only try once A is demonstrably inside its own transaction.
+        a_inside_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("A must enter first");
+        let _ = crate::agent_ops::spawn_one_recording_config(
+            &b_home,
+            &b_configs,
+            name,
+            config_for(name, &["--b"]),
+            || {
+                b_events.lock().push("B:inside");
+                let _ = b_inside_tx.send(());
+                Ok(crate::backend::SpawnMode::Fresh)
+            },
+        );
+    });
+
+    let a_events = Arc::clone(&events);
     let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
         &fx.configs,
-        &fx.registry,
         name,
-        config_for(name, &["--loser"]),
+        config_for(name, &["--a"]),
         || {
-            // A concurrent winner: registered, and describing itself in the map.
-            crate::agent::spawn_agent(
-                &crate::agent::SpawnConfig {
-                    name,
-                    backend: None,
-                    backend_command: crate::default_shell(),
-                    args: &[],
-                    spawn_mode: crate::backend::SpawnMode::Fresh,
-                    cols: 80,
-                    rows: 24,
-                    env: None,
-                    working_dir: None,
-                    submit_key: "\r",
-                    home: Some(&fx.home),
-                    crash_tx: None,
-                    shutdown: None,
-                },
-                &fx.registry,
-            )
-            .expect("winner registers");
-            fx.configs
-                .lock()
-                .insert(name.to_string(), config_for(name, &["--winner"]));
-            Err(anyhow::anyhow!("our spawn lost the race"))
+            a_events.lock().push("A:inside");
+            let _ = a_inside_tx.send(());
+            // Bounded: with the lane this recv is SUPPOSED to time out, and
+            // without it B answers at once.
+            let leaked = b_inside_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            a_events.lock().push(if leaked {
+                "A:saw-B-inside"
+            } else {
+                "A:exclusive"
+            });
+            Ok(crate::backend::SpawnMode::Fresh)
         },
     );
+    events.lock().push("A:left");
+    assert!(result.is_ok());
+    let _ = b.join();
 
-    assert!(result.is_err(), "our spawn failed");
-    assert_eq!(
-        fx.respawn_config(name).map(|c| c.args),
-        Some(vec!["--winner".to_string()]),
-        "the loser's rollback must not strip the config of an agent that IS registered — that \
-         would hand the winner the very defect this work removes"
+    let observed = events.lock().clone();
+    assert!(
+        !observed.contains(&"A:saw-B-inside"),
+        "a second spawn transaction for the same name entered while the first was still inside: \
+         {observed:?}"
+    );
+    let a_left = observed
+        .iter()
+        .position(|e| *e == "A:left")
+        .expect("A recorded leaving");
+    let b_inside = observed
+        .iter()
+        .position(|e| *e == "B:inside")
+        .expect("B eventually enters — the lane serializes, it does not exclude");
+    assert!(
+        b_inside > a_left,
+        "B must only be inside after A has left: {observed:?}"
     );
 }
 
@@ -510,8 +548,8 @@ fn a_successful_spawn_that_exits_immediately_keeps_its_config() {
     let name = "cfg-fast-exit";
 
     let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
         &fx.configs,
-        &fx.registry,
         name,
         config_for(name, &["--login"]),
         || Ok(crate::backend::SpawnMode::Fresh),
@@ -536,8 +574,8 @@ fn the_config_transaction_holds_no_lock_across_the_spawn() {
 
     let observed = std::cell::RefCell::new((false, false));
     let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
         &fx.configs,
-        &fx.registry,
         name,
         config_for(name, &["--login"]),
         || {
