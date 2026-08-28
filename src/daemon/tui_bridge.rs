@@ -708,7 +708,7 @@ mod tests {
     fn peer_sees_eof_survives_a_fully_torn_down_connection() {
         let pair = socket_pair();
         let server = pair.server;
-        let mut peer = pair.peer;
+        let peer = pair.peer;
         peer.shutdown(std::net::Shutdown::Write).unwrap();
         super::forward_tui_input(server, |_| true, |_, _| {});
 
@@ -750,25 +750,39 @@ mod tests {
     /// Drain `peer` until it reports EOF, or give up. Draining matters: an
     /// undrained socket would fill and stall the forwarder in `write_frame`,
     /// which would make the test pass for the wrong reason.
+    ///
+    /// The budget is enforced by polling a NON-BLOCKING socket rather than by
+    /// `set_read_timeout`. Every caller hands this helper a connection the
+    /// production code has already torn down, and macOS rejects
+    /// `setsockopt(SO_RCVTIMEO)` with EINVAL in exactly that state — see
+    /// `peer_sees_eof_survives_a_fully_torn_down_connection`, which pins it.
+    /// `set_nonblocking` is accepted there, so the drain now works in both
+    /// states instead of panicking in one of them.
     fn peer_sees_eof(mut peer: TcpStream, budget: Duration) -> bool {
-        peer.set_read_timeout(Some(budget)).unwrap();
+        peer.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + budget;
         let mut buf = [0u8; 8192];
         loop {
             match peer.read(&mut buf) {
                 Ok(0) => return true,
-                Ok(_) => {
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
-                }
+                Ok(_) => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                        || error.kind() == std::io::ErrorKind::Interrupted =>
                 {
-                    return false
+                    // Not an answer either way. The old timeout expired the
+                    // whole budget in one blocking read; this sleeps a slice of
+                    // it and rechecks, reaching the same verdict at the same
+                    // deadline. Only the deadline may report "no EOF", so a
+                    // socket that is merely quiet can never be read as closed.
+                    std::thread::sleep(Duration::from_millis(5));
                 }
+                // Every other error means the connection is gone (reset, bad
+                // descriptor): unchanged from the blocking version.
                 Err(_) => return true,
+            }
+            if Instant::now() >= deadline {
+                return false;
             }
         }
     }
