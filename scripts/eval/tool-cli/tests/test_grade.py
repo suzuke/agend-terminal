@@ -654,6 +654,69 @@ class Aggregation(TempCase):
         self.assertFalse(short["rate_gate"]["pass"],
                          "59 pairs is not the frozen acceptance, however good the interval looks")
 
+    def test_a_model_that_cannot_be_confirmed_is_invalid(self):
+        """Secondary review: the model check only fired when BOTH fields were set.
+
+        `if requested and resolved and requested != resolved` treats an absent or
+        empty field as agreement, so a run whose model was never resolved — or was
+        resolved to something other than the frozen pin — counted as a clean run
+        of the experiment the matrix claims to be.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"model_resolved": None})
+        write_run(runs, "S01", "cli", 1, [], meta_extra={"model_requested": ""})
+        write_run(runs, "S01", "mcp", 2, [], meta_extra={
+            "model_requested": "claude-other", "model_resolved": "claude-other"})
+        write_run(runs, "S01", "cli", 2, [])
+
+        summary = grade.aggregate(runs, scen)
+        reasons = sorted(e["reason"] for e in summary["invalid"])
+        self.assertEqual(reasons, ["model_missing", "model_missing", "model_not_frozen"],
+                         "absent, empty and off-pin models must each be refused")
+        self.assertEqual(summary["valid_runs"], 1)
+
+    def test_a_run_whose_arm_the_scenario_never_declared_is_invalid(self):
+        """Secondary review: S13 is an mcp-only control and S14 a cli-only one.
+
+        A run carrying the other arm is not the control the plan declared — the
+        surface under test is the whole point of these two scenarios — so it must
+        not be counted as one of the 45.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S13": (PASS_EXPECT, ["mcp"]),
+                                          "S14": (PASS_EXPECT, ["cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S13", "cli", 1, [])
+        write_run(runs, "S14", "mcp", 1, [])
+
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(sorted(e["reason"] for e in summary["invalid"]),
+                         ["arm_not_declared", "arm_not_declared"])
+        self.assertEqual(summary["mixing_gate"]["scenarios"]["S13"]["valid_runs"], 0)
+        self.assertFalse(summary["mixing_gate"]["pass"])
+
+    def test_a_duplicated_cell_is_refused_not_silently_overwritten(self):
+        """Secondary review: the pair table was a dict keyed by the cell.
+
+        Two runs claiming the same (scenario, pair, arm) used to collapse — the
+        last one walked in and the other vanished from the record, so a rerun
+        dropped into the tree could quietly replace a failure with a pass.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        original = write_run(runs, "S01", "mcp", 1, [])
+        write_run(runs, "S01", "cli", 1, [])
+        shutil.copytree(original, os.path.join(runs, "S01-mcp-p1-again"))
+
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(sorted(e["reason"] for e in summary["invalid"]),
+                         ["duplicate_cell", "duplicate_cell"],
+                         "both copies go: which one is the real run is not ours to guess")
+        self.assertEqual(summary["n"], 0, "the contested pair cannot be counted")
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
