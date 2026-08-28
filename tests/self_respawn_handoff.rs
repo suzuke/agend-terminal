@@ -320,6 +320,28 @@ fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     serde_json::from_str(line.trim()).ok()
 }
 
+/// #3421 item 3: assert a restart was ACCEPTED, not merely that a reply arrived.
+///
+/// The mcp_tool tunnel wraps handler output as `{ok:true, result:{...}}`, so a
+/// business refusal is `result.ok == false` with the outer envelope still `ok:true`
+/// — `is_some()` alone cannot see it. Three call sites used to discard the reply
+/// entirely; a refusal there surfaced later as a confusing downstream assertion
+/// instead of "restart refused, reason X". `context` names the call site so the
+/// failure says which restart was refused.
+fn assert_restart_accepted(resp: Option<serde_json::Value>, context: &str) {
+    let resp =
+        resp.unwrap_or_else(|| panic!("{context}: restart_daemon returned no parseable reply"));
+    let result_ok = resp
+        .get("result")
+        .and_then(|r| r.get("ok"))
+        .and_then(|b| b.as_bool());
+    assert_eq!(
+        result_ok,
+        Some(true),
+        "{context}: restart_daemon must be ACCEPTED (result.ok == true); reply was {resp}"
+    );
+}
+
 /// Kill any daemon still alive under `home/run` and remove the dir. Handoff
 /// successors run in their own process group (detached), so a harness pgid kill
 /// would miss them — clean up by scanning run dirs.
@@ -372,7 +394,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     set_mode_active(&home);
 
     // Real restart over the real api → spawns + health-gates a real successor.
-    let _ = trigger_restart(&home, old_pid);
+    let restart_resp = trigger_restart(&home, old_pid);
 
     // A DIFFERENT pid must become the single active daemon (the successor
     // promoted). We assert via `active_pids` (run dir + api.port + live pid),
@@ -401,6 +423,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     let _ = d1.wait();
     cleanup_test_home(&home);
 
+    assert_restart_accepted(restart_resp, "self-respawn with no external supervisor");
     let new_pid =
         new_pid.expect("a NEW daemon pid must serve after self-respawn (old must be dead)");
     assert_ne!(new_pid, old_pid, "successor must be a distinct process");
@@ -603,7 +626,7 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
 
     // Commit happens (successor answers Phase-1), then the successor dies before
     // the flock. The predecessor's loop recheck must abort + stay alive.
-    let _ = trigger_restart(&home, old_pid);
+    let restart_resp = trigger_restart(&home, old_pid);
 
     // Wait past the predecessor's tick-latency recheck window (the loop notices
     // the shutdown flag + rechecks the dead successor on its next ~10s tick).
@@ -622,6 +645,10 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     let _ = d1.wait();
     cleanup_test_home(&home);
 
+    assert_restart_accepted(
+        restart_resp,
+        "successor dies after Phase-1 commit (the restart itself must still be accepted)",
+    );
     assert!(
         still_old,
         "predecessor must abort-stay-alive (SAME pid) when the successor dies in the commit→exit window — no brick"
@@ -668,7 +695,7 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     );
     set_mode_active(&home);
 
-    let _ = trigger_restart(&home, old_pid);
+    let restart_resp = trigger_restart(&home, old_pid);
 
     // Wait out: loop-break tick (~10s) + shutdown_sequence (~2s) + settle (12s) +
     // re-spawn/resume + margin. Successor dies at control-ready+15s, inside the
@@ -687,6 +714,10 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     let _ = d1.wait();
     cleanup_test_home(&home);
 
+    assert_restart_accepted(
+        restart_resp,
+        "successor dies during teardown (the restart itself must still be accepted)",
+    );
     assert!(
         still_old,
         "predecessor must recover-as-primary (SAME pid) when the successor dies during teardown — no brick"
