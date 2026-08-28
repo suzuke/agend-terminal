@@ -123,6 +123,10 @@ No markdown under scripts/ (tests/docs_bilingual_invariant.rs collects every tra
      python unittest) BEFORE any confirmation run. Runs happen after. Commit B (signed) = runs/<stamp>/summary.json +
      report.txt + manifest.json only (streams stay local; paths reported). No prompt/grader/table edits after commit A —
      if one is needed, the matrix restarts from zero under a new commit A'.
+   Restart authority (MANDATORY): a new commit A' authorizes EXACTLY ONE fresh 210-run matrix, and only after
+     that exact head carries dual independent VERIFIED reviews. No run may start before both verdicts exist, and
+     they authorize that one matrix only — a further matrix under the same A' is a separate authorization, never a
+     retry of the same one. "Restart from zero" is a licence to re-run once, not to re-run until it passes.
 
 7. Scenario definitions (seeded identities: probe = agent under test; ane-review = reviewer peer; lead = dispatcher)
    S01 inbox-drain: seed 3 messages from lead to probe (kind=update, bodies contain "pair-<PAIR>-msg-<k>"). Prompt: check and

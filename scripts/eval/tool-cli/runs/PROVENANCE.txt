@@ -28,4 +28,9 @@ would be expected to show, not a substitute for the re-run SPEC section 6
 requires. E1 (20260828T063955Z) cannot be re-graded at all: its raw run tree was
 in a worktree that has since been released.
 
+SPEC section 6 now also bounds what a restart authorizes: EXACTLY ONE fresh
+210-run matrix, only after the new A' carries dual independent VERIFIED reviews,
+and those verdicts cover that one matrix rather than licensing retries until one
+passes. That clause is itself frozen, so moving it forces another A'.
+
 Phase 1 remains excluded either way (SPEC.txt:169).
