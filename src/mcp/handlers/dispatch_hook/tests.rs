@@ -4643,3 +4643,55 @@ fn typed_send_omits_ci_watch_when_repository_is_unresolved_3145() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3419 audit pin (watch/bind mutation ordering): a branch dispatch binds
+/// FIRST and arms the typed ci-watch only after `bind_full` succeeded; a bind
+/// failure returns before the arm. Nothing pinned that order — a regression
+/// that arms before binding, or arms despite the bind error, would leave a
+/// review-gate watch behind for a dispatch that never bound. The seam injects
+/// the bind failure on this thread; the watch file must not exist afterwards.
+#[test]
+fn dispatch_bind_failure_arms_no_ci_watch_3419() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-bindfail-nowatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "dual");
+    let _seam = super::bind_test_seam::install(|| Some("injected bind failure".to_string()));
+
+    let result = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        &tid,
+        "feat/3419-bindfail",
+        Some("owner/repo"),
+        None,
+        &[],
+        Some("dual"),
+        true,
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("injected bind failure must surface as Err"),
+    };
+    assert!(
+        err.message.contains("injected bind failure"),
+        "the injected failure must be the reported cause: {}",
+        err.message
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-bindfail");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    assert!(
+        !watch_path.exists(),
+        "a failed bind must not leave a typed ci-watch behind: {}",
+        watch_path.display()
+    );
+    assert!(
+        crate::binding::read(&home, "target-agent").is_none(),
+        "a failed bind must not leave a binding behind"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
