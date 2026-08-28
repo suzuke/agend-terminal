@@ -335,6 +335,31 @@ fn forward_tui_output(
     }
 }
 
+/// Take one client off the listener, waiting after ANY failure.
+///
+/// The listener is non-blocking so the loop can notice retirement, which means
+/// an accept error no longer costs what it did under blocking accept: there is
+/// no park to absorb it. `WouldBlock` is merely the commonest error here, not a
+/// special one — a persistent EMFILE or ENFILE would otherwise return
+/// immediately, and the loop's retirement check reads a file, so the bridge
+/// would spin a core and hammer the filesystem for as long as the condition
+/// lasts. Every failure therefore waits the same bounded interval, which is also
+/// what keeps the retirement notice bounded.
+///
+/// `accept` and `sleep` are injected so a test can prove that without waiting.
+fn accept_one_client(
+    accept: impl FnOnce() -> std::io::Result<std::net::TcpStream>,
+    sleep: impl FnOnce(std::time::Duration),
+) -> Option<std::net::TcpStream> {
+    match accept() {
+        Ok(stream) => Some(stream),
+        Err(_) => {
+            sleep(RETIREMENT_POLL);
+            None
+        }
+    }
+}
+
 /// One client's input pump: decode framed input until the connection ends, then
 /// CLOSE it — on every path, without exception.
 ///
@@ -407,13 +432,12 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             );
             return;
         }
-        let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(RETIREMENT_POLL);
-                continue;
-            }
-            Err(_) => continue,
+        let mut stream = match accept_one_client(
+            || listener.accept().map(|(stream, _)| stream),
+            std::thread::sleep,
+        ) {
+            Some(stream) => stream,
+            None => continue,
         };
         // An accepted socket may inherit the listener's non-blocking mode; the
         // framing reads below are blocking by contract.
