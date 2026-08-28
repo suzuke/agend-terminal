@@ -1163,6 +1163,49 @@ class Aggregation(TempCase):
                          "a hash that is not the frozen file is refused, however "
                          "consistent the rest of the matrix is")
 
+    # ---- A⁷ review: the fleet template IS frozen, and the CLI version is in the stream ----
+
+    def test_the_fleet_hash_must_be_the_frozen_template(self):
+        """I said there was no frozen file to bind this to. There is.
+
+        sandbox.sh:57 holds FLEET_YAML as a literal and writes it verbatim to
+        fleet.template.yaml, so sha256 of that literal is exactly what all 210
+        real runs record. Matrix-wide agreement was the weaker check.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"fleet_sha256": "e" * 64})
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]], ["fleet_not_frozen"],
+                         "a well-formed hash of something else is still not the fleet")
+
+    def test_the_version_a_run_claims_must_be_the_one_the_stream_reports(self):
+        """metadata.claude_version is written by the runner; the stream says it."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1,
+                  [{"type": "system", "subtype": "init", "model": "claude-fable-5",
+                    "claude_code_version": "9.9.9"}])
+        write_run(runs, "S01", "cli", 1,
+                  [{"type": "system", "subtype": "init", "model": "claude-fable-5"}])
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]],
+                         ["stream_version_mismatch", "stream_version_mismatch"],
+                         "a version the stream does not report is not this run's version")
+
+    def test_the_manifest_carries_the_fleet_and_seed_identity(self):
+        for field, bad in (("fleet_sha256", DROP), ("fleet_sha256", "e" * 64),
+                           ("seed_sha256", DROP), ("seed_sha256", {"S01": "e" * 64})):
+            with self.subTest(field=field, bad=bad):
+                self.setUp()
+                runs, scen = self.frozen_matrix()
+                write_manifest(runs, **{field: bad})
+                summary = grade.aggregate(runs, scen)
+                self.assertFalse(summary["plan_gate"]["pass"],
+                                 "manifest %s=%r must be refused" % (field, bad))
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
