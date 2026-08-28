@@ -805,3 +805,73 @@ mod codex_global_arity_3414 {
         assert_eq!(ok(Backend::Codex, &["--oss", "resume"]), v(&["--oss"]));
     }
 }
+
+/// Third supplemental RED (lead review, same scanner). `codex_consume_resume`
+/// stops at the first flag, but the installed CLI accepts globals INTERSPERSED
+/// after the subcommand — so the scan ends early and resume's own session id is
+/// left behind as a top-level PROMPT.
+#[cfg(test)]
+mod codex_interspersed_globals_3414 {
+    use super::tests_support::*;
+    use super::*;
+
+    /// Parse acceptance proven against the installed CLI, with a control so
+    /// that "it got past parsing" is not just an artifact of the error path:
+    ///
+    /// ```text
+    /// $ env CODEX_HOME=/tmp/nonexistent codex resume --model gpt sess
+    /// Error finding codex home: ...          <- reached runtime, parse OK
+    /// $ env CODEX_HOME=/tmp/nonexistent codex resume --model gpt sess prompt
+    /// Error finding codex home: ...          <- reached runtime, parse OK
+    /// $ env CODEX_HOME=/tmp/nonexistent codex resume --bogus-flag
+    /// error: unexpected argument '--bogus-flag' found   <- rejected at parse
+    /// ```
+    ///
+    /// The global is unrelated to the session and must survive; the session id
+    /// belongs to `resume` and must go with it. Stopping at `--model` leaves
+    /// `sess` behind, where a fresh `codex` reads it as the PROMPT — silently
+    /// changing what the agent is asked to do.
+    #[test]
+    fn codex_global_between_resume_and_session_id_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--model", "gpt", "sess"]),
+            v(&["--model", "gpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--last", "--model", "gpt"]),
+            v(&["--model", "gpt"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "-c", "k=v", "sess", "--all"]),
+            v(&["-c", "k=v"])
+        );
+    }
+
+    /// The second positional is still the PROMPT, and an interspersed global
+    /// must not let it slip past the ambiguity check — otherwise two top-level
+    /// positionals are handed onward instead of fail-closing before DELETE.
+    #[test]
+    fn codex_interspersed_global_still_fails_closed_on_prompt_3414() {
+        assert_eq!(
+            reason(
+                Backend::Codex,
+                &["resume", "--model", "gpt", "sess", "prompt"]
+            ),
+            SessionArgsErrorReason::Ambiguous
+        );
+        assert_eq!(
+            reason(Backend::Codex, &["resume", "sess", "--last", "prompt"]),
+            SessionArgsErrorReason::Ambiguous
+        );
+    }
+
+    /// An UNKNOWN flag ends the resume scope: the grammar is no longer one we
+    /// transcribed, so the scan stops rather than guessing what owns what.
+    #[test]
+    fn codex_unknown_flag_ends_the_resume_scope_3414() {
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "sess", "--unknown-thing"]),
+            v(&["--unknown-thing"])
+        );
+    }
+}
