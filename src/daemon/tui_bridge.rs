@@ -784,6 +784,74 @@ mod tests {
         );
     }
 
+    /// #3373: the output forwarder is a connection's ONLY retirement watcher, so
+    /// a refused spawn must close the connection instead of being logged and
+    /// stepped over. The input thread holds another handle on the same socket,
+    /// so a client left running without a forwarder keeps a live socket to a
+    /// generation that is trying to go away — the exact invariant the rest of
+    /// this work establishes. The spawn is injected because a real thread
+    /// refusal is not reachable without exhausting the process.
+    #[test]
+    fn a_refused_output_thread_closes_the_client() {
+        let pair = socket_pair();
+        let peer = pair.peer;
+
+        let started = super::start_tui_output_thread(&pair.server, || {
+            Err(std::io::Error::other("thread spawn refused"))
+        });
+
+        assert!(
+            started.is_err(),
+            "the refusal must reach the caller, not be swallowed"
+        );
+        assert!(
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "a client whose output thread was refused must see the connection close: the input \
+             thread holds another handle, so dropping ours closes nothing"
+        );
+    }
+
+    /// The other half of the contract: a forwarder that DID start must leave the
+    /// connection alone, or every healthy client would be closed on arrival.
+    #[test]
+    fn a_started_output_thread_leaves_the_client_connected() {
+        let pair = socket_pair();
+        let peer = pair.peer;
+
+        let started = super::start_tui_output_thread(&pair.server, || Ok(()));
+
+        assert!(started.is_ok());
+        assert!(
+            !peer_sees_eof(peer, Duration::from_millis(500)),
+            "a client whose output thread started must stay connected"
+        );
+    }
+
+    /// The two tests above pin what the helper does; this pins that the accept
+    /// loop acts on it — the input thread must not be reached for a client whose
+    /// output thread was refused.
+    #[test]
+    fn a_refused_output_thread_stops_before_the_input_thread() {
+        let src = include_str!("tui_bridge.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let call = ["start_tui_output_thread", "(&stream"].concat();
+        let start = prod
+            .find(&call)
+            .expect("the accept loop starts the output thread through the helper");
+        let input_thread = ["{n}", "_tui_in"].concat();
+        let input = prod[start..]
+            .find(&input_thread)
+            .expect("the input thread spawn follows the output thread");
+        assert!(
+            prod[start..start + input].contains("continue;"),
+            "a refused output thread must `continue` before the input thread is spawned"
+        );
+    }
+
     /// #3373, the accept loop's own write: the version byte and the initial dump
     /// go out on the SERIALIZED accept thread, before the per-client forwarder
     /// exists. Unbounded, a client that never reads its greeting parks the whole
