@@ -409,17 +409,18 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         let n = name.to_string();
         let retire_dir = run_dir.clone();
         let retire_name = n.clone();
-        // fire-and-forget: per-client TUI output forwarder. Loop exits when
-        // the broadcast subscriber rx drops (agent removed via
-        // delete_transaction), when a frame write fails (client disconnect or
-        // the bounded write budget), or when this bridge is retired. No graceful
-        // join needed — each client connection is independent.
         // No leak: every exit path shuts the connection down and drops this
         // thread's handle. Shutting down is the load-bearing half, because this
         // thread does NOT hold the only handle — the input thread below holds
         // another on the same connection, so dropping ours would close nothing.
         // #3373 adds the retirement path, and a refused spawn is fail-closed:
         // without this thread the connection has no retirement watcher at all.
+        // fire-and-forget: per-client TUI output forwarder. Loop exits when the
+        // broadcast subscriber rx drops (agent removed via delete_transaction),
+        // when a frame write fails (client disconnect or the bounded write
+        // budget), or when this bridge is retired. No graceful join needed —
+        // each client connection is independent. (§12.5 wants this marker within
+        // 10 lines of the spawn, so it stays last in this block.)
         if let Err(e) = start_tui_output_thread(&stream, || {
             std::thread::Builder::new()
                 .name(format!("{n}_tui_out"))
