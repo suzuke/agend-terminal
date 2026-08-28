@@ -384,7 +384,7 @@ fn write_message(stdout: &mut io::Stdout, json: &str) -> io::Result<()> {
 // Minimal filesystem helpers (NO crate:: dependencies — zero state)
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn find_run_dir(home: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     mcp_wire::find_run_dir(home).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
 }
