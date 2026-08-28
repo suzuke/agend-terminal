@@ -6,8 +6,8 @@
 //! 1. **resolve** — identity, instance/team target, self-dispatch reject
 //! 2. **validate** — pre-send gates (`comms_gates::run_dispatch_pre_checks`)
 //! 3. **compose** — message body + force_meta
-//! 4. **lease** — optional `dispatch_auto_bind_lease` when `branch` set
-//! 5. **create** — optional auto board task after all rejectable checks
+//! 4. **create** — optional auto board task after all rejectable checks
+//! 5. **lease** — optional `dispatch_auto_bind_lease` when `branch` set
 //! 6. **send** — `execute_send` via neutral typed service (or API bridge fallback)
 //! 7. **track** — dispatch_tracking + UX + `auto_created_task_id` on success
 //!
@@ -273,17 +273,18 @@ fn preflight_branch_authority(
     Ok(Some(review_class))
 }
 
-/// Phase 4 — optional auto-bind lease (rejectable).
+/// Phase 5 — optional auto-bind lease (rejectable).
 fn maybe_auto_bind_lease(
     home: &Path,
     args: &Value,
     target: &str,
+    task_id: Option<&str>,
     review_class: ReviewClass,
 ) -> Result<Option<dispatch_hook::CiWatchOutcome>, Value> {
     let Some(branch) = args["branch"].as_str() else {
         return Ok(None);
     };
-    let task_id_val = args["task_id"].as_str().unwrap_or("");
+    let task_id_val = task_id.unwrap_or("");
 
     let next_after_ci =
         crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
@@ -312,12 +313,16 @@ fn maybe_auto_watch_without_bind(
     home: &Path,
     args: &Value,
     target: &str,
+    task_id: Option<&str>,
     review_class: ReviewClass,
 ) -> Result<Option<dispatch_hook::CiWatchOutcome>, Value> {
     let Some(branch) = args["branch"].as_str() else {
         return Ok(None);
     };
     let mut watch_args = args.clone();
+    if let Some(task_id) = task_id {
+        watch_args["task_id"] = json!(task_id);
+    }
     watch_args["review_class"] = json!(review_class.as_token());
     let watch_result = crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
     if watch_result["error"].is_string() {
@@ -336,16 +341,26 @@ fn maybe_auto_watch_without_bind(
     }))
 }
 
-/// Phase 5 — optional auto-create board task after rejectable checks.
+/// Phase 4 — optional auto-create board task after rejectable checks.
+struct AutoCreatedTask {
+    effective_task_id: Option<String>,
+    auto_created_task_id: Option<String>,
+    review_class: Option<ReviewClass>,
+}
+
 fn maybe_auto_create_task(
     home: &Path,
     args: &Value,
     sender: &Sender,
     target: &str,
     plan_ack_required: u64,
-) -> (Option<String>, Option<String>) {
+) -> Result<AutoCreatedTask, Value> {
     if !args["task_id"].as_str().unwrap_or("").is_empty() || *sender == target {
-        return (args["task_id"].as_str().map(String::from), None);
+        return Ok(AutoCreatedTask {
+            effective_task_id: args["task_id"].as_str().map(String::from),
+            auto_created_task_id: None,
+            review_class: None,
+        });
     }
     let auto_title = args["message"]
         .as_str()
@@ -366,22 +381,47 @@ fn maybe_auto_create_task(
         "plan_ack_reason": args["plan_ack_reason"].as_str(),
         // #2745: forward the dispatch's review_class into the auto-created task's
         // metadata so the durable authority survives past this dispatch (the
-        // resolver already validated it via the args fallback in the lease above).
+        // resolver already validated it during branch preflight).
         "review_class": args["review_class"].as_str(),
         "governing_decision_id": args["governing_decision_id"].as_str(),
     });
     let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
-    match task_result["id"].as_str() {
-        Some(id) => {
-            crate::daemon::task_progress::touch(
-                home,
-                id,
-                crate::daemon::task_progress::ProgressSource::Broadcast,
-            );
-            (Some(id.to_string()), Some(id.to_string()))
-        }
-        None => (None, None),
+    if task_result["error"].is_string() {
+        return Err(task_result);
     }
+    let Some(id) = task_result["id"].as_str() else {
+        return Err(json!({
+            "error": "auto-created task did not return a durable id",
+            "code": "task_create_failed",
+        }));
+    };
+    let created_review_class = task_result["task"]["metadata"]["review_class"]
+        .as_str()
+        .and_then(|raw| match ReviewClass::parse_fail_closed(Some(raw)) {
+            ReviewClass::Single => Some(ReviewClass::Single),
+            ReviewClass::Dual => Some(ReviewClass::Dual),
+            ReviewClass::Unresolved => None,
+        });
+    if args["branch"]
+        .as_str()
+        .is_some_and(|branch| !branch.is_empty())
+        && created_review_class.is_none()
+    {
+        return Err(json!({
+            "error": "auto-created branch task has no durable review_class",
+            "code": "review_class_unspecified",
+        }));
+    }
+    crate::daemon::task_progress::touch(
+        home,
+        id,
+        crate::daemon::task_progress::ProgressSource::Broadcast,
+    );
+    Ok(AutoCreatedTask {
+        effective_task_id: Some(id.to_string()),
+        auto_created_task_id: Some(id.to_string()),
+        review_class: created_review_class,
+    })
 }
 
 /// Shared inputs for send + post-success track (avoids clippy::too_many_arguments).
@@ -500,25 +540,10 @@ pub(crate) fn handle_delegate_task(
     } else {
         None
     };
-    let branch_review_class = match preflight_branch_authority(home, args, &checks) {
+    let preflight_review_class = match preflight_branch_authority(home, args, &checks) {
         Ok(class) => class,
         Err(e) => return e,
     };
-
-    let mut ci_watch = None;
-    if !checks.review_assignment && runtime.is_some() {
-        if let Some(review_class) = branch_review_class {
-            let outcome = if dispatch_should_skip_auto_bind(args) {
-                maybe_auto_watch_without_bind(home, args, target, review_class)
-            } else {
-                maybe_auto_bind_lease(home, args, target, review_class)
-            };
-            match outcome {
-                Ok(outcome) => ci_watch = outcome,
-                Err(e) => return e,
-            }
-        }
-    }
 
     if let Some(repo_slug) = review_assignment_repo {
         return review_assignment::dispatch_review_assignment_via_store(
@@ -538,14 +563,38 @@ pub(crate) fn handle_delegate_task(
         });
     }
 
-    let (effective_task_id, auto_created_task_id) = if runtime.is_some() {
-        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required)
+    let created = if runtime.is_some() {
+        match maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required) {
+            Ok(created) => created,
+            Err(error) => return error,
+        }
     } else {
         // runtime=None: let the daemon auto-create atomically via the
         // API bridge — pass the original (possibly missing) task_id through.
-        (args["task_id"].as_str().map(String::from), None)
+        AutoCreatedTask {
+            effective_task_id: args["task_id"].as_str().map(String::from),
+            auto_created_task_id: None,
+            review_class: None,
+        }
     };
-    let task_id_str = effective_task_id.as_deref();
+    let task_id_str = created.effective_task_id.as_deref();
+    let branch_review_class = if created.auto_created_task_id.is_some() {
+        created.review_class
+    } else {
+        preflight_review_class
+    };
+    let mut ci_watch = None;
+    if let Some(review_class) = branch_review_class {
+        let outcome = if dispatch_should_skip_auto_bind(args) {
+            maybe_auto_watch_without_bind(home, args, target, task_id_str, review_class)
+        } else {
+            maybe_auto_bind_lease(home, args, target, task_id_str, review_class)
+        };
+        match outcome {
+            Ok(outcome) => ci_watch = outcome,
+            Err(e) => return e,
+        }
+    }
     let mut msg = composed.msg;
     if let Some(tid) = task_id_str {
         msg.push_str(&format!(" (task id: {tid})"));
@@ -560,7 +609,7 @@ pub(crate) fn handle_delegate_task(
         msg: &msg,
         task_id: task_id_str,
         force_meta_json: composed.force_meta_json,
-        auto_created_task_id,
+        auto_created_task_id: created.auto_created_task_id,
     };
     let result = deliver_delegate(&ctx, runtime);
     let mut result = track_delegate_success(&ctx, result);
