@@ -38,6 +38,11 @@ struct MockDaemon {
 
 impl MockDaemon {
     fn new(response: Value) -> Self {
+        Self::new_raw(response.to_string())
+    }
+
+    fn new_raw(response: impl Into<String>) -> Self {
+        let response = response.into();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -136,6 +141,86 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn run_tool_owned(home: &std::path::Path, args: &[String]) -> Output {
+    let mut command = Command::cargo_bin("agend-terminal").unwrap();
+    command
+        .env("AGEND_HOME", home)
+        .env("AGEND_INSTANCE_NAME", "red-cli")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn unique_home(tag: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "agend-tool-cli-contract-red-{tag}-{}-{stamp}",
+        std::process::id()
+    ))
+}
+
+fn stdout_json(output: &Output, context: &str) -> Value {
+    assert!(
+        !output.stdout.is_empty(),
+        "{context}: contract JSON must be on stdout; stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{context}: stdout must be valid JSON: {error}; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn assert_local_usage_contract(output: &Output, context: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{context}: malformed usage must exit 3; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = stdout_json(output, context);
+    assert!(
+        payload.get("error").and_then(Value::as_str).is_some(),
+        "{context}: stdout JSON must identify the usage error: {payload}"
+    );
+    assert!(
+        payload
+            .get("fix")
+            .and_then(Value::as_str)
+            .is_some_and(|fix| !fix.trim().is_empty()),
+        "{context}: stdout JSON must carry a non-empty actionable fix: {payload}"
+    );
+}
+
+fn assert_pre_write_refusal(output: &Output, context: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{context}: pre-write failure must be refusal exit 2; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = stdout_json(output, context);
+    assert!(
+        payload.get("error").and_then(Value::as_str).is_some(),
+        "{context}: refusal JSON must identify the failure: {payload}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("indeterminate"),
+        "{context}: pre-write refusal must not emit an indeterminate warning: stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_cli_envelope(requests: &[Value], tool: &str) {
@@ -435,25 +520,112 @@ fn usage_error_is_exit_three() {
     let output = run_tool(&home, &["tool"]);
     let _ = std::fs::remove_dir_all(&home);
 
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "usage must exit 3: {}",
-        combined(&output)
-    );
-    assert!(
-        combined(&output).contains("tool") && combined(&output).contains("Usage"),
-        "usage diagnostics must identify the command: {}",
-        combined(&output)
-    );
+    assert_local_usage_contract(&output, "missing tool name");
 }
 
 #[test]
-fn transport_failure_is_indeterminate_exit_four() {
-    let home = std::env::temp_dir().join(format!(
-        "agend-tool-cli-red-transport-{}",
-        std::process::id()
-    ));
+fn local_usage_errors_are_exit_three_json_with_fix() {
+    let home = unique_home("usage-matrix");
+    let missing_file = home.join("missing.json");
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("schema missing name", vec!["tool".into(), "schema".into()]),
+        (
+            "schema has invocation options",
+            vec![
+                "tool".into(),
+                "schema".into(),
+                "inbox".into(),
+                "--action".into(),
+                "get".into(),
+            ],
+        ),
+        (
+            "list has invocation options",
+            vec![
+                "tool".into(),
+                "list".into(),
+                "--action".into(),
+                "get".into(),
+            ],
+        ),
+        (
+            "unexpected second positional",
+            vec!["tool".into(), "inbox".into(), "extra".into()],
+        ),
+        (
+            "invalid inline JSON",
+            vec![
+                "tool".into(),
+                "inbox".into(),
+                "--json".into(),
+                "not-json".into(),
+            ],
+        ),
+        (
+            "non-object JSON",
+            vec!["tool".into(), "inbox".into(), "--json".into(), "[]".into()],
+        ),
+        (
+            "empty JSON file spec",
+            vec!["tool".into(), "inbox".into(), "--json".into(), "@".into()],
+        ),
+        (
+            "missing JSON file",
+            vec![
+                "tool".into(),
+                "inbox".into(),
+                "--json".into(),
+                format!("@{}", missing_file.display()),
+            ],
+        ),
+        (
+            "argument without equals",
+            vec![
+                "tool".into(),
+                "inbox".into(),
+                "--arg".into(),
+                "missing-equals".into(),
+            ],
+        ),
+        (
+            "empty argument key",
+            vec![
+                "tool".into(),
+                "inbox".into(),
+                "--arg".into(),
+                "=value".into(),
+            ],
+        ),
+        (
+            "invalid request id",
+            vec![
+                "tool".into(),
+                "inbox".into(),
+                "--request-id".into(),
+                "not-a-uuid".into(),
+            ],
+        ),
+        (
+            "unknown option",
+            vec!["tool".into(), "inbox".into(), "--unknown".into()],
+        ),
+        (
+            "missing option value",
+            vec!["tool".into(), "inbox".into(), "--action".into()],
+        ),
+    ];
+
+    for (context, args) in cases {
+        let output = run_tool_owned(&home, &args);
+        assert_local_usage_contract(&output, context);
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_write_missing_run_dir_is_refused_exit_two() {
+    let home = unique_home("missing-run");
     let output = run_tool(
         &home,
         &[
@@ -465,21 +637,111 @@ fn transport_failure_is_indeterminate_exit_four() {
             home.to_str().unwrap(),
         ],
     );
+    assert_pre_write_refusal(&output, "missing run directory");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_write_missing_port_is_refused_exit_two() {
+    let home = unique_home("missing-port");
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).unwrap();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "inbox",
+            "--json",
+            "{}",
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    assert_pre_write_refusal(&output, "missing api.port");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_write_missing_cookie_is_refused_exit_two() {
+    let home = unique_home("missing-cookie");
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("api.port"), "1\n").unwrap();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "inbox",
+            "--json",
+            "{}",
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    assert_pre_write_refusal(&output, "missing api.cookie");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn pre_write_connect_refused_is_refused_exit_two() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let home = unique_home("connect-refused");
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("api.port"), format!("{port}\n")).unwrap();
+    std::fs::write(run.join("api.cookie"), [0x42u8; 32]).unwrap();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "inbox",
+            "--json",
+            "{}",
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    assert_pre_write_refusal(&output, "connection refused before request write");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn post_write_malformed_response_is_indeterminate_exit_four() {
+    let daemon = MockDaemon::new_raw("{not valid JSON");
+    let home = daemon.home.clone();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "inbox",
+            "--json",
+            "{}",
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    let requests = daemon.finish();
 
     assert_eq!(
         output.status.code(),
         Some(4),
-        "unknown transport outcome must exit 4: {}",
+        "malformed post-write response must exit 4: {}",
         combined(&output)
     );
     assert!(
-        combined(&output).contains("indeterminate")
-            || combined(&output).contains("state check")
-            || combined(&output).contains("daemon"),
+        String::from_utf8_lossy(&output.stderr).contains("indeterminate"),
         "exit 4 must tell the operator to inspect state before resend: {}",
         combined(&output)
     );
+    let payload = stdout_json(&output, "malformed post-write response");
+    assert!(
+        payload.get("error").and_then(Value::as_str).is_some(),
+        "malformed response must produce a structured stdout error: {payload}"
+    );
+    assert_cli_envelope(&requests, "inbox");
 }
 
 #[test]
