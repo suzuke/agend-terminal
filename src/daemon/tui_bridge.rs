@@ -1013,6 +1013,72 @@ mod tests {
         }
     }
 
+    /// #3373 follow-up from the primary review: the step that forces an accepted
+    /// socket back to blocking mode was load-bearing but unpinned — deleting it
+    /// left all 23 tests green.
+    ///
+    /// It is load-bearing because this listener is non-blocking (so the loop can
+    /// notice retirement) and an accepted socket does not reliably start
+    /// blocking: POSIX says the flag is not inherited, BSD — macOS included —
+    /// hands it down, and Windows inherits it too. Everything after accept
+    /// assumes blocking-with-timeouts. The auth read's `WouldBlock` arm
+    /// deliberately does nothing, relying on the read timeout to park it, so on
+    /// an inherited non-blocking socket that arm spins hot for the whole
+    /// `AUTH_BUDGET` on the SERIALIZED accept thread, re-reading the port file
+    /// every iteration — the same busy-loop-plus-filesystem shape as the accept
+    /// error path above.
+    ///
+    /// The discriminator is five orders of magnitude, not a tight deadline: a
+    /// parked read returns at its 300ms timeout, an unparked one returns in
+    /// microseconds. The bound below is deliberately loose. On a platform that
+    /// does not inherit the flag the assertion still holds — it simply stops
+    /// discriminating, which is the right way round.
+    #[test]
+    fn an_accepted_client_is_handed_back_in_blocking_mode() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // Exactly what serve_tui_accept_loop does to this listener.
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let client = loop {
+            if let Some(stream) =
+                super::accept_one_client(|| listener.accept().map(|(s, _)| s), |_| {})
+            {
+                break stream;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pending connection must be accepted"
+            );
+        };
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let started = Instant::now();
+        let mut buf = [0u8; 1];
+        let result = (&client).read(&mut buf);
+        let elapsed = started.elapsed();
+
+        let kind = result.expect_err("a silent peer sends nothing").kind();
+        assert!(
+            matches!(
+                kind,
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected a timed-out read, got {kind:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "an accepted client must park on its read timeout instead of returning immediately; \
+             it returned in {elapsed:?}, which is the non-blocking mode inherited from the \
+             listener — the auth read would spin on it for the whole budget"
+        );
+        drop(peer);
+    }
+
     /// The success path must not wait at all — a busy bridge accepting clients
     /// back to back cannot pay a poll interval per connection.
     #[test]
