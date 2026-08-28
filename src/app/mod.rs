@@ -431,25 +431,28 @@ fn run_app(
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
+    let mut reap_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let event_rx = spawn_crossterm_event_reader();
     log_pre_render_milestone(size_debug, restore_start, attached_mode);
     let loop_result: Result<()> = loop {
         if term_requested_logged() || state.poll_restart(&deps) == LoopFlow::Break {
             break Ok(());
         }
-        state.pre_select(terminal, &deps);
+        state.pre_select(terminal, &deps, &mut reap_workers);
         if let Err(error) = state.render_frame(terminal, &deps) {
             break Err(error);
         }
         crossbeam_channel::select! {
             recv(app_restart_rx) -> req => state.handle_restart_request(req, &deps),
             recv(event_rx) -> ev => {
-                if state.handle_crossterm_event(ev, terminal, &deps) == LoopFlow::Break {
+                if state.handle_crossterm_event(ev, terminal, &deps, &mut reap_workers)
+                    == LoopFlow::Break
+                {
                     break Ok(());
                 }
             }
             recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
-            recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps),
+            recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps, &mut reap_workers),
             recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
             recv(remote_state_rpc_rx) -> outcome => state.handle_agent_state_rpc_outcome(outcome),
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
@@ -461,7 +464,7 @@ fn run_app(
     drop(task_rpc_tx);
     let _ = task_rpc_worker.join();
     // Teardown gating rationale is documented on `app_teardown`.
-    app_teardown(&home, &state.ui.layout, attach_workers);
+    app_teardown(&home, &state.ui.layout, reap_workers, attach_workers);
     loop_result?;
     Ok(state.restart.restart_outcome)
 }
@@ -605,7 +608,7 @@ fn spawn_crossterm_event_reader() -> crossbeam_channel::Receiver<Event> {
     event_rx
 }
 
-/// #render-first phase-(b) F2: join attach workers, but DETACH any that haven't
+/// #render-first phase-(b) F2: join app workers, but DETACH any that haven't
 /// finished by the shared `deadline` — a worker wedged mid-spawn (fork/exec /
 /// skills / subscribe) must not hang quit (that would move the restore freeze to
 /// quit). A detached worker's child, if it registered one, is reaped by the
@@ -631,13 +634,25 @@ fn bounded_join_attach_workers(
 
 /// Flush presentation state and bound worker shutdown. The daemon and agent
 /// processes remain independently owned.
-fn app_teardown(home: &Path, layout: &Layout, attach_workers: Vec<std::thread::JoinHandle<()>>) {
+fn app_teardown(
+    home: &Path,
+    layout: &Layout,
+    reap_workers: Vec<std::thread::JoinHandle<()>>,
+    attach_workers: Vec<std::thread::JoinHandle<()>>,
+) {
     // The event loop has stopped, so this final batch may wait for a metadata
     // lock. Periodic UI flushing uses only the nonblocking path above; placing
     // this before every other teardown side effect also covers render errors.
     notification_queue::flush_pending_activity_at_teardown(home);
     session::save_session(home, layout);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let detached_reapers = bounded_join_attach_workers(reap_workers, deadline);
+    if detached_reapers > 0 {
+        tracing::warn!(
+            detached = detached_reapers,
+            "detached unmanaged child reaper(s) still running at app quit"
+        );
+    }
     let detached = bounded_join_attach_workers(attach_workers, deadline);
     if detached > 0 {
         tracing::warn!(
@@ -960,6 +975,7 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
 fn kill_unmanaged_agents(
     registry: &AgentRegistry,
     instance_ids: impl IntoIterator<Item = crate::types::InstanceId>,
+    reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
 ) {
     let drained: Vec<(String, crate::daemon::ChildHandle)> = instance_ids
         .into_iter()
@@ -969,15 +985,23 @@ fn kill_unmanaged_agents(
     if drained.is_empty() {
         return;
     }
-    // fire-and-forget: registry removal is complete; child termination uses a
-    // fixed grace window and must not freeze the TUI render thread.
-    std::thread::spawn(move || {
-        crate::daemon::terminate_agents_parallel(drained);
-    });
+    // The JoinHandle is retained by the app owner and joined before attach
+    // workers at teardown, so close-then-quit cannot abandon this reap.
+    let reap_worker = std::thread::Builder::new()
+        .name("unmanaged_child_reaper".to_string())
+        .spawn(move || {
+            crate::daemon::terminate_agents_parallel(drained);
+        })
+        .expect("spawn unmanaged child reaper");
+    reap_workers.push(reap_worker);
 }
 
-fn kill_unmanaged_agent(registry: &AgentRegistry, instance_id: crate::types::InstanceId) {
-    kill_unmanaged_agents(registry, [instance_id]);
+fn kill_unmanaged_agent(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    kill_unmanaged_agents(registry, [instance_id], reap_workers);
 }
 
 /// Whether the agent's child process is still running.
@@ -1295,8 +1319,7 @@ mod tests {
 
         let overlay = include_str!("overlay.rs");
         assert!(
-            overlay
-                .contains("kill_unmanaged_agents(ctx.registry, nonfleet_agents, ctx.reap_workers)"),
+            overlay.contains("nonfleet_agents, &mut *ctx.reap_workers"),
             "ConfirmClose must pass the app-owned reaper collection"
         );
     }
@@ -1321,6 +1344,40 @@ mod tests {
             reap < attach,
             "unmanaged child reapers must join before attach workers"
         );
+    }
+
+    /// #3420: exercise the production unmanaged-close path with a real
+    /// ChildHandle fixture, then quit immediately. Teardown must consume the
+    /// registered reaper before returning, leaving the child handle reaped.
+    #[cfg(unix)]
+    #[test]
+    fn close_then_quit_reaps_unmanaged_child_before_return_3420() {
+        let home = tmp_home("close_then_quit_3420");
+        let id = crate::types::InstanceId::new();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry
+            .lock()
+            .insert(id, crate::agent::mk_test_handle("scratch-3420", id));
+        let child = Arc::clone(&registry.lock().get(&id).expect("fixture registered").child);
+        let mut reap_workers = Vec::new();
+
+        kill_unmanaged_agents(&registry, [id], &mut reap_workers);
+        assert_eq!(
+            reap_workers.len(),
+            1,
+            "close must register its reaper handle"
+        );
+        assert!(
+            registry.lock().get(&id).is_none(),
+            "close must remove the unmanaged registry entry before handoff"
+        );
+
+        app_teardown(&home, &Layout::new(), reap_workers, Vec::new());
+        assert!(
+            matches!(child.lock().try_wait(), Ok(Some(_))),
+            "close-then-quit must reap the real unmanaged child before teardown returns"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     /// restart-freeze 真嫌#1 (t-…55279) source-scan invariant: `app_teardown`'s
@@ -2016,7 +2073,7 @@ mod tests {
         notification_queue::record_input_activity(&home, "agent1");
         notification_queue::record_submit_activity(&home, "agent1");
 
-        app_teardown(&home, &layout, Vec::new());
+        app_teardown(&home, &layout, Vec::new(), Vec::new());
 
         let (input_ms, submit_ms) =
             notification_queue::read_input_submit_timestamps(&home, "agent1");

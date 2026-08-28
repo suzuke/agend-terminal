@@ -30,6 +30,7 @@ pub(super) struct UiDeps<'a> {
     pub(super) wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub(super) task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
     pub(super) task_snapshot: &'a [crate::tasks::Task],
+    pub(super) reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
 }
 
 /// Signals `handle_key_event` returns to the event loop (applied independently).
@@ -45,7 +46,7 @@ impl UiState {
     /// handlers borrow layout/name_counter/last_tab disjointly from `overlay`
     /// (no `&mut self` re-borrow, no RefCell/mem::take). Mirrors the former
     /// inline `Event::Key` branch (overlay path returns early == `continue`).
-    pub(super) fn handle_key_event(&mut self, key: KeyEvent, deps: &UiDeps<'_>) -> KeyOutcome {
+    pub(super) fn handle_key_event(&mut self, key: KeyEvent, deps: &mut UiDeps<'_>) -> KeyOutcome {
         let mut out = KeyOutcome::default();
         if !matches!(self.overlay, Overlay::None) {
             let mut octx = OverlayCtx {
@@ -56,6 +57,7 @@ impl UiState {
                 wakeup_tx: deps.wakeup_tx,
                 name_counter: &mut self.name_counter,
                 task_rpc_tx: deps.task_rpc_tx,
+                reap_workers: &mut *deps.reap_workers,
             };
             let outcome = overlay::handle_key(&mut self.overlay, key, &mut octx);
             out.needs_resize = outcome.needs_resize;
@@ -129,13 +131,15 @@ mod tests {
         let fleet_path = home.join("fleet.yaml");
         let (wakeup_tx, _rx) = crossbeam_channel::unbounded::<usize>();
         let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded();
-        let deps = UiDeps {
+        let mut reap_workers = Vec::new();
+        let mut deps = UiDeps {
             registry: &registry,
             home: &home,
             fleet_path: &fleet_path,
             wakeup_tx: &wakeup_tx,
             task_rpc_tx: &task_rpc_tx,
             task_snapshot: &[],
+            reap_workers: &mut reap_workers,
         };
         let mut ui = UiState {
             layout: Layout::new(),
@@ -148,13 +152,13 @@ mod tests {
 
         // Key, dispatch path: Ctrl+B then 'c' → Action::NewTab → new_overlay applied.
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        ui.handle_key_event(ctrl_b, &deps);
+        ui.handle_key_event(ctrl_b, &mut deps);
         assert!(
             matches!(ui.overlay, Overlay::None),
             "prefix must not open overlay"
         );
         let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
-        let out = ui.handle_key_event(c, &deps);
+        let out = ui.handle_key_event(c, &mut deps);
         assert!(!out.should_break, "NewTab must not break the loop");
         assert!(
             matches!(ui.overlay, Overlay::NewTabMenu { .. }),
@@ -163,7 +167,7 @@ mod tests {
 
         // Key, active-overlay path: Esc routes to overlay::handle_key → closes it.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
-        ui.handle_key_event(esc, &deps);
+        ui.handle_key_event(esc, &mut deps);
         assert!(
             matches!(ui.overlay, Overlay::None),
             "Esc must close the overlay (routed to overlay::handle_key, not dispatch)"
