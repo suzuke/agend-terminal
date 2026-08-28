@@ -1402,6 +1402,30 @@ mod tests {
         );
     }
 
+    /// RED: the two wiring guards below slice `app_teardown` to the END OF FILE,
+    /// so their searched needles are also present in this test module's own
+    /// source. A guard that can be satisfied by its own text is not reading the
+    /// production it claims to pin: delete the production call it looks for and
+    /// the assertion still finds the string, in the test that was written to
+    /// catch exactly that deletion.
+    ///
+    /// The slice must stop where `app_teardown` does. Asserted here on the exact
+    /// expression the guards use today, so this fails until the slice is bounded.
+    #[test]
+    fn teardown_wiring_guards_must_not_read_their_own_source_3420() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn app_teardown(")
+            .expect("app_teardown present");
+        let body = &source[start..];
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        assert!(
+            !body.contains(&cfg_test),
+            "the wiring guards' slice reaches this test module, so their needles \
+             can be satisfied by their own source instead of by production"
+        );
+    }
+
     /// Both groups are joined against the deadline meant for them, not one of
     /// them twice.
     #[test]
