@@ -147,6 +147,14 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
             });
         }
     }
+    // #3419: hold the governing decision's existing flock across fresh
+    // resolution and the Created append. This closes the resolve→Created
+    // supersession race; the guard is intentionally kept alive to function end.
+    let _governing_decision_lock =
+        match super::governance::acquire_creation_decision_lock(home, args) {
+            Ok(lock) => lock,
+            Err(error) => return error,
+        };
     let authority = match super::governance::resolve_creation_authority(home, args) {
         Ok(authority) => authority,
         Err(error) => return error,

@@ -50,6 +50,28 @@ fn requested_governing_decision_id(args: &Value) -> Result<Option<&str>, Value> 
     Ok(Some(id))
 }
 
+/// Hold the exact governing decision flock from before authority resolution
+/// through the caller's Created append. The lock order is decision flock →
+/// task-id flock → board-event flock; no decision-store I/O is performed while
+/// the board lock is held.
+pub(crate) fn acquire_creation_decision_lock(
+    home: &Path,
+    args: &Value,
+) -> Result<Option<crate::store::FileFlockGuard>, Value> {
+    let Some(id) = requested_governing_decision_id(args)? else {
+        return Ok(None);
+    };
+    crate::decisions::acquire_decision_lock(home, id)
+        .map(Some)
+        .map_err(|error| {
+            json!({
+                "error": format!("could not lock governing decision '{id}': {error}"),
+                "code": "invalid_governing_decision_id",
+                "governing_decision_id": id,
+            })
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn install_authority_resolved_hook(hook: AuthorityResolvedHook) {
     let hooks = AUTHORITY_RESOLVED_HOOK.get_or_init(|| Mutex::new(None));

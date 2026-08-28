@@ -213,6 +213,24 @@ pub(crate) fn decision_path(home: &Path, id: &str) -> std::path::PathBuf {
     decisions_dir(home).join(format!("{id}.json"))
 }
 
+fn is_safe_decision_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
+}
+
+/// Acquire the exact decision's flock for callers that must couple a fresh
+/// authority read with a later write in another store (notably task Created).
+pub(crate) fn acquire_decision_lock(
+    home: &Path,
+    id: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
+    if !is_safe_decision_id(id) {
+        anyhow::bail!("governing decision id is not a safe exact identifier")
+    }
+    let dir = decisions_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    crate::store::acquire_file_lock(&decision_lock_path(home, id))
+}
+
 /// The resolved authority named by a task create request.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GoverningDecision {
@@ -226,7 +244,7 @@ pub(crate) fn resolve_governing_decision(
     home: &Path,
     id: &str,
 ) -> anyhow::Result<GoverningDecision> {
-    if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
+    if !is_safe_decision_id(id) {
         anyhow::bail!("governing decision id is not a safe exact identifier")
     }
     let dir = decisions_dir(home);
@@ -287,9 +305,7 @@ fn decision_lock_path(home: &Path, id: &str) -> std::path::PathBuf {
 /// [`with_decision_lock`] — this function acquires the lock only for the
 /// write itself.
 fn save(home: &Path, decision: &Decision) -> anyhow::Result<()> {
-    let dir = decisions_dir(home);
-    std::fs::create_dir_all(&dir)?;
-    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, &decision.id))?;
+    let _lock = acquire_decision_lock(home, &decision.id)?;
     crate::store::save_atomic(&decision_path(home, &decision.id), decision)
 }
 
@@ -301,9 +317,7 @@ pub(crate) fn with_decision_lock<R>(
     id: &str,
     f: impl FnOnce() -> R,
 ) -> anyhow::Result<R> {
-    let dir = decisions_dir(home);
-    std::fs::create_dir_all(&dir)?;
-    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, id))?;
+    let _lock = acquire_decision_lock(home, id)?;
     Ok(f())
 }
 
