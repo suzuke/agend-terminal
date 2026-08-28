@@ -336,6 +336,34 @@ fn notify_crash(
     );
 }
 
+/// #3414: a crash respawn is a FRESH spawn, so it owes the same session
+/// contract as `restart_instance mode=fresh` — the stored args are replayed on
+/// every spawn, and a selector left in them reattaches the agent to the session
+/// it crashed in.
+///
+/// The grammar comes from the DECLARED backend, never the command basename. An
+/// instance with no declared backend has no grammar we transcribed, so its args
+/// are returned untouched rather than rewritten on a guess.
+fn fresh_respawn_args(
+    config: &crate::daemon::AgentConfig,
+) -> Result<Vec<String>, crate::backend_session::SessionArgsError> {
+    match config.backend.as_ref() {
+        Some(backend) => crate::backend_session::sanitize_for_fresh(backend, &config.args),
+        None => Ok(config.args.clone()),
+    }
+}
+
+/// #3415: the line written into the respawned agent's PTY. It states what the
+/// daemon observed — it restarted the agent, for this reason, into a new
+/// session — and nothing about what the agent retained, which the daemon cannot
+/// see. The duty the old wording carried is stated directly instead.
+fn respawn_notice(reason: &str) -> String {
+    format!(
+        "[system] Agent restarted due to {reason}. This is a new session: rebuild anything \
+         in flight from the authoritative sources rather than recalling it.\r"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn respawn_agent_worker(
     home: &Path,
@@ -487,12 +515,44 @@ fn respawn_agent_worker(
             return;
         }
     }
+    // #3414 PREFLIGHT — this respawn is Fresh, so the declared session grammar
+    // is resolved BEFORE the spawn and an unresolvable selector refuses rather
+    // than guesses, exactly as on the restart path. Refusing leaves the agent
+    // down, so it takes the same loud failure route as a failed spawn: the
+    // operator is paged rather than left with a silently dead agent.
+    let fresh_args = match fresh_respawn_args(&config) {
+        Ok(args) => args,
+        Err(error) => {
+            if let Some(permit) = permit.take() {
+                let _ = agent::crash_disposition::owner_ledger().mark_failed(permit);
+            }
+            tracing::error!(agent = %config.name, error = %error, "respawn refused: unresolvable session args");
+            crate::event_log::log(
+                home,
+                "crash_respawn_refused",
+                &config.name,
+                &format!("unresolvable session args: {error}"),
+            );
+            crate::channel::notify_all_escalation_channels(
+                &config.name,
+                NotifySeverity::Error,
+                &format!(
+                    "🛑 Agent `{}` crash-respawn REFUSED: {error}. Fix the instance's stored args, then start it.",
+                    config.name
+                ),
+                false,
+            );
+            #[cfg(test)]
+            signal_test_worker_done(&test_done);
+            return;
+        }
+    };
     match agent::spawn_agent(
         &agent::SpawnConfig {
             name: &config.name,
             backend: config.backend.as_ref(),
             backend_command: &config.backend_command,
-            args: &config.args,
+            args: &fresh_args,
             spawn_mode: crate::backend::SpawnMode::Fresh,
             cols,
             rows,
@@ -541,9 +601,7 @@ fn respawn_agent_worker(
                     })
                 };
                 if let Some((tgt, reason)) = snap {
-                    let msg = format!(
-                        "[system] Agent restarted due to {reason}. Previous context was lost.\r"
-                    );
+                    let msg = respawn_notice(&reason);
                     let _ = agent::write_to_pty(&tgt.pty_writer, msg.as_bytes());
                 }
             }
