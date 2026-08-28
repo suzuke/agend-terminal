@@ -299,16 +299,6 @@ pub fn write_tui_auth<W: Write>(writer: &mut W, cookie: &Cookie) -> std::io::Res
     writer.flush()
 }
 
-/// TUI framing: server reads 32 raw bytes and compares against `expected`.
-pub fn read_and_verify_tui<R: Read>(reader: &mut R, expected: &Cookie) -> Result<()> {
-    let mut got = [0u8; COOKIE_LEN];
-    reader.read_exact(&mut got).context("tui auth read")?;
-    if !verify(expected, &got) {
-        return Err(anyhow!("tui auth failed"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -575,21 +565,5 @@ mod tests {
                  set SAME_UID_OPERATOR_ISOLATION = IsolationStatus::Resolved."
             );
         }
-    }
-
-    #[test]
-    fn tui_handshake_accepts_match_and_rejects_mismatch() {
-        let cookie: Cookie = [0x5a; COOKIE_LEN];
-        // Matching bytes pass.
-        let mut ok_reader = &cookie[..];
-        assert!(read_and_verify_tui(&mut ok_reader, &cookie).is_ok());
-        // Flipped last byte fails.
-        let mut bad = cookie;
-        bad[COOKIE_LEN - 1] ^= 0xFF;
-        let mut bad_reader = &bad[..];
-        assert!(read_and_verify_tui(&mut bad_reader, &cookie).is_err());
-        // Truncated stream errors.
-        let mut short_reader = &cookie[..COOKIE_LEN - 1];
-        assert!(read_and_verify_tui(&mut short_reader, &cookie).is_err());
     }
 }
