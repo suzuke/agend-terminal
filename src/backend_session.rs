@@ -230,15 +230,20 @@ fn codex_global(token: &str) -> Option<&'static CodexGlobal> {
         .find(|g| token == g.long || g.short.is_some_and(|short| token == short))
 }
 
-/// `--model=gpt` carries its value inline, so it owns no following token.
-/// `Some(false)` means the equals form was used with an EMPTY value, which we
-/// refuse rather than guess what it means.
-fn codex_global_equals_form(token: &str) -> Option<bool> {
-    CODEX_GLOBALS.iter().find_map(|g| {
+/// Is this a KNOWN global written in the `long=VALUE` inline form?
+///
+/// The value is not inspected. `--model=` is not untranscribed grammar — it is
+/// this exact form with an empty VALUE, which clap accepts
+/// (`codex resume --model= sess` parses on the installed binary). Judging the
+/// value here made the sanitizer stricter than the CLI it models.
+///
+/// Either way the token owns no FOLLOWING argv slot, which is what both
+/// scanners need to know.
+fn codex_global_equals_form(token: &str) -> bool {
+    CODEX_GLOBALS.iter().any(|g| {
         token
             .strip_prefix(g.long)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(|value| !value.is_empty())
+            .is_some_and(|rest| rest.starts_with('='))
     })
 }
 
@@ -273,10 +278,7 @@ fn codex_consume_resume(
             continue;
         }
 
-        if let Some(non_empty) = codex_global_equals_form(tok) {
-            if !non_empty {
-                return Err(());
-            }
+        if codex_global_equals_form(tok) {
             out.push(tok.clone());
             probe += 1;
             continue;
@@ -378,7 +380,7 @@ pub fn sanitize_for_fresh(
             // `-i a.png resume` (image filename) from being read as the
             // subcommand. Equals forms carry their value inline and fall
             // through to the passthrough below without a value lookup.
-            if codex_global_equals_form(tok).is_some_and(|non_empty| non_empty) {
+            if codex_global_equals_form(tok) {
                 out.push(tok.clone());
                 index += 1;
                 continue;
