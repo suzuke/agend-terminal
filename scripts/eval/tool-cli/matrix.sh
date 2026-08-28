@@ -153,7 +153,7 @@ GIT_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -f "$OUT/manifest.json" ]; then
   python3 -c '
 import json, os, sys
-here, repo, path, stamp, model, head = sys.argv[1:]
+here, repo, path, stamp, model, head, jobs = sys.argv[1:]
 sys.path.insert(0, here)
 import grade
 try:
@@ -162,7 +162,8 @@ try:
 except (OSError, ValueError) as exc:
     sys.exit("unreadable manifest.json: %s" % exc)
 bad = ["%s=%r (want %r)" % (key, manifest.get(key), want)
-       for key, want in (("stamp", stamp), ("model", model), ("git_head", head))
+       for key, want in (("stamp", stamp), ("model", model), ("git_head", head),
+                         ("jobs", int(jobs)))
        if manifest.get(key) != want]
 # the same field/value table the grader applies to a finished tree
 bad += ["%s is not what this matrix records" % field
@@ -179,7 +180,7 @@ if manifest.get("binary_sha256") != current:
     bad.append("binary_sha256 is not the build this matrix would run")
 if bad:
     sys.exit("; ".join(bad))
-' "$HERE" "$REPO" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" \
+' "$HERE" "$REPO" "$OUT/manifest.json" "$STAMP" "$MODEL" "$GIT_HEAD" "$JOBS" \
     || die "refusing to overwrite $OUT/manifest.json: it does not describe this matrix"
 fi
 

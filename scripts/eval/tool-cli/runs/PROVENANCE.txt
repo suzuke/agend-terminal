@@ -47,7 +47,7 @@ round removes, not on anything it measured.
 
 Fixing all of it changed frozen files, so grade.py is now
 93cbada8d63d2e3513be0e2b411878b4e12a0cc1dd2c7bce7a414c482c428642 and matrix.sh is
-2c8803d43de9783dc6ec519ef90b621a14a095f9d53ef358d42c2cbd7499e369; this harness is a NEW commit A'.
+084567c6b960d750466b84577e3c80d99fbc67f41418a036a13dc3625e513e22; this harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
 edits after commit A — if one is needed, the matrix restarts from zero under a
