@@ -1324,6 +1324,76 @@ mod tests {
         );
     }
 
+    /// #3420 correction: the two teardown join groups need SEPARATE budgets.
+    ///
+    /// One shared deadline made the reap join spend the attach join's window: the
+    /// reap runs first, `terminate_agents_parallel` carries a 2s grace
+    /// (`daemon::SHUTDOWN_GRACE`), and `bounded_join_attach_workers` detaches
+    /// immediately once the deadline has passed. A stubborn child could therefore
+    /// leave every attach worker detached — the abandonment this work exists to
+    /// prevent, moved to the other group.
+    ///
+    /// Deterministic and sleepless: the allocation is a pure function of one start
+    /// instant, so the property is arithmetic rather than timing.
+    #[test]
+    fn teardown_gives_each_join_group_its_own_budget_3420() {
+        let start = std::time::Instant::now();
+        let (reap_deadline, attach_deadline) = teardown_join_deadlines(start);
+
+        assert_eq!(
+            reap_deadline - start,
+            REAP_JOIN_BUDGET,
+            "the reap join gets its own budget"
+        );
+        assert_eq!(
+            attach_deadline - reap_deadline,
+            ATTACH_JOIN_BUDGET,
+            "the attach join's budget must sit AFTER the reap budget, not inside it"
+        );
+    }
+
+    /// The non-vacuity control the shared-deadline bug would have failed: with the
+    /// reap budget FULLY exhausted, the attach group must still have its entire
+    /// window left. Under one shared deadline this difference is zero or negative.
+    #[test]
+    fn an_exhausted_reap_budget_leaves_the_attach_budget_intact_3420() {
+        let start = std::time::Instant::now();
+        let (reap_deadline, attach_deadline) = teardown_join_deadlines(start);
+
+        // Stand at the instant the reap join has consumed every last microsecond.
+        let after_exhausted_reap = reap_deadline;
+        assert!(
+            attach_deadline > after_exhausted_reap,
+            "a fully spent reap budget must not leave the attach join with an expired deadline"
+        );
+        assert_eq!(
+            attach_deadline - after_exhausted_reap,
+            ATTACH_JOIN_BUDGET,
+            "the attach join must still have its WHOLE budget after the reap budget is spent"
+        );
+    }
+
+    /// Both groups are joined against the deadline meant for them, not one of
+    /// them twice.
+    #[test]
+    fn teardown_joins_each_group_against_its_own_deadline_3420() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn app_teardown(")
+            .expect("app_teardown present");
+        let body = &source[start..];
+        let reap_call = body
+            .find("bounded_join_attach_workers(reap_workers, reap_deadline)")
+            .expect("the reap join must use the reap deadline");
+        let attach_call = body
+            .find("bounded_join_attach_workers(attach_workers, attach_deadline)")
+            .expect("the attach join must use the attach deadline");
+        assert!(
+            reap_call < attach_call,
+            "reapers still join first; only their budgets are separated"
+        );
+    }
+
     /// #3420 RED: close-then-quit must drain unmanaged reapers before attach
     /// workers under the same absolute deadline. The current teardown only
     /// joins attach workers, so this ordering guard is expected to fail first.
