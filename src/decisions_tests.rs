@@ -40,6 +40,34 @@ fn test_post_and_list() {
 }
 
 #[test]
+fn review_class_is_persisted_and_create_only_3419() {
+    let home = tmp_home("review_class_3419");
+    let posted = post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governance",
+            "content": "dual review",
+            "review_class": "dual",
+        }),
+    );
+    let id = posted["id"].as_str().expect("decision id").to_string();
+    let listed = list(&home, &serde_json::json!({"include_archived": true}));
+    assert_eq!(listed["decisions"][0]["review_class"], "dual");
+
+    let update = update(
+        &home,
+        "lead",
+        &serde_json::json!({"id": id, "review_class": "single"}),
+    );
+    assert_eq!(
+        update["code"], "decision_review_class_immutable",
+        "review_class must not be mutable after decision creation: {update}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_update_and_archive() {
     let home = tmp_home("update_archive");
     let result = post(

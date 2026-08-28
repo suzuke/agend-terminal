@@ -46,6 +46,116 @@ fn create_task(home: &std::path::Path, task_id: &str) {
     let _ = args;
 }
 
+#[test]
+fn governed_create_persists_atomic_authority_3419() {
+    let home = tmp_home("governed-create-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id");
+    let task = read_task_record(&home, task_id).expect("created task");
+    assert_eq!(
+        task.metadata.get("governing_decision_id").and_then(|v| v.as_str()),
+        Some(decision_id),
+        "Created must atomically persist the governing decision id: {created}"
+    );
+    assert_eq!(
+        task.metadata.get("review_class").and_then(|v| v.as_str()),
+        Some("dual"),
+        "Created must atomically persist the resolved review class: {created}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governed_create_rejects_review_class_mismatch_3419() {
+    let home = tmp_home("governed-mismatch-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+            "review_class": "single",
+        }),
+    );
+    assert_eq!(created["code"], "governing_decision_review_class_mismatch");
+    assert!(created["id"].is_null(), "mismatch must not create a task: {created}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governing_fields_reject_direct_metadata_mutation_3419() {
+    let home = tmp_home("governed-metadata-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "single review required",
+            "review_class": "single",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id");
+    for (key, value) in [
+        ("review_class", serde_json::json!("dual")),
+        ("governing_decision_id", serde_json::json!("forged")),
+    ] {
+        let result = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": task_id,
+                "metadata_key": key,
+                "metadata_value": value,
+            }),
+        );
+        assert_eq!(
+            result["code"], "create_only_metadata",
+            "{key} must be create-only: {result}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #78445-2 (d): a cascade parent-cancel is terminal for EACH child — every
 /// cancelled child's dispatch_tracking rows must settle (plural), while a NON-child
 /// task's rows (even the same dispatcher) survive. This path previously cleared
