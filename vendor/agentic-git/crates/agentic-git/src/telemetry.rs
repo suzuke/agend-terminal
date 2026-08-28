@@ -361,3 +361,146 @@ pub(crate) fn write_git_event_typed(
     let event = build_git_event(event_type, agent, subcmd, extra);
     append_git_event(home, &event);
 }
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Env var that switches this test binary into stress-worker mode.
+    const WORKER_HOME: &str = "AGEND_3416_STRESS_WORKER_HOME";
+    /// Fully-qualified name of the stress test, used to re-exec ourselves as a
+    /// worker. Kept next to the test so a rename breaks loudly rather than
+    /// silently spawning nothing.
+    const STRESS_TEST_PATH: &str = "telemetry::tests::concurrent_append_git_event_writes_only_parseable_records";
+    const WORKERS: usize = 8;
+    const RECORDS_PER_WORKER: usize = 400;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3416-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    fn sample_event(worker: &str, i: usize) -> serde_json::Value {
+        // Shaped like a real record: production rows are p50 ~2 KB, and the size
+        // matters because it is what makes a multi-syscall write interleave.
+        serde_json::json!({
+            "kind": "git_event",
+            "event": "deny",
+            "agent": worker,
+            "seq": i,
+            "process_ancestry": vec!["x".repeat(600); 3],
+            "timestamp": "2026-08-28T00:00:00+00:00",
+        })
+    }
+
+    /// Take an exclusive, non-blocking `flock` on `path`, returning the holder.
+    /// `flock(2)` binds the lock to the OPEN FILE DESCRIPTION, so a second
+    /// `open()` in this same process contends exactly as another process would —
+    /// which is what lets these tests stay single-process and sleep-free.
+    fn hold_lock(path: &std::path::Path) -> std::fs::File {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let rc = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&f),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        assert_eq!(rc, 0, "test must be able to take the companion lock");
+        f
+    }
+
+    /// #3416 RED: the shim sink is best-effort and documented as "never blocks"
+    /// (callers `exec` real git immediately after). Serializing it must keep that
+    /// contract by SKIPPING on contention — never by falling back to an unlocked
+    /// append, which would reintroduce exactly the interleaving being fixed.
+    ///
+    /// Pre-fix this FAILS: nothing consults the lock, so the record is appended.
+    #[test]
+    fn append_git_event_skips_while_companion_lock_is_held() {
+        let home = tmp_home("skip-on-contention");
+        let holder = hold_lock(&home.join("fleet_events.jsonl.lock"));
+
+        append_git_event(home.to_str().unwrap(), &sample_event("shim", 0));
+
+        let written =
+            std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        assert!(
+            written.trim().is_empty(),
+            "best-effort sink must skip while the lock is held, never append unlocked; found: {written}"
+        );
+
+        drop(holder);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3416 RED: the defect itself. Real production entry, real concurrency,
+    /// separate PROCESSES. Deterministic without any sleep because the pre-fix
+    /// failure is not probabilistic — a multi-syscall `O_APPEND` write interleaves
+    /// essentially always under this load (measured: ~100% of records corrupt).
+    #[test]
+    fn concurrent_append_git_event_writes_only_parseable_records() {
+        // Worker mode: this process was re-exec'd by the parent below.
+        if let Ok(home) = std::env::var(WORKER_HOME) {
+            let tag = format!("w{}", std::process::id());
+            for i in 0..RECORDS_PER_WORKER {
+                append_git_event(&home, &sample_event(&tag, i));
+            }
+            return;
+        }
+
+        let home = tmp_home("stress");
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for _ in 0..WORKERS {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args(["--exact", STRESS_TEST_PATH, "--nocapture"])
+                    .env(WORKER_HOME, &home)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut c in children {
+            let st = c.wait().unwrap();
+            assert!(st.success(), "stress worker failed: {st}");
+        }
+
+        let content = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        let mut parsed = 0usize;
+        let mut corrupt = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) if v.is_object() => parsed += 1,
+                _ => corrupt += 1,
+            }
+        }
+        assert_eq!(
+            corrupt, 0,
+            "every appended record must be parseable; {corrupt} corrupt of {} lines",
+            parsed + corrupt
+        );
+        assert_eq!(
+            parsed,
+            WORKERS * RECORDS_PER_WORKER,
+            "every record written by every worker must survive exactly once"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
