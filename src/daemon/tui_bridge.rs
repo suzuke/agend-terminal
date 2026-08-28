@@ -593,6 +593,33 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
     }
 }
 
+/// #3421 item1: every place in the production region that touches startup-modal
+/// state, as `(line_number, line)` pairs.
+///
+/// The invariant is that a byte-free `TAG_RESIZE` must not cancel the only queued
+/// startup-modal confirmation. The guard used to assert that over two slices — the
+/// TAG_RESIZE arm and the resize-effect closure — which a module-level helper
+/// merely CALLED from the resize path evades entirely. Scanning the whole region
+/// removes the escape by removing the slice.
+///
+/// This is deliberately broader than the property: it bans these symbols anywhere
+/// in this file's production code, not only on the resize path. That costs nothing
+/// today — there are zero occurrences — and a broad ban that holds beats a precise
+/// one that can be stepped around. If a NON-resize path here ever legitimately
+/// needs them, this must be revisited deliberately rather than quietly narrowed
+/// back to a slice.
+#[cfg(test)]
+fn modal_state_touches_in_production(prod: &str) -> Vec<(usize, String)> {
+    prod.lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            let t = l.trim_start();
+            !t.starts_with("//") && (l.contains("dev_modal::") || l.contains("note_pty_write"))
+        })
+        .map(|(i, l)| (i + 1, l.trim().to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1526,10 +1553,6 @@ mod tests {
             resize_arm.contains("resize("),
             "the TAG_RESIZE arm must still apply a resize"
         );
-        assert!(
-            !resize_arm.contains("dev_modal::") && !resize_arm.contains("note_pty_write"),
-            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
-        );
 
         let resize_effect = prod
             .split_once("|cols, rows| {")
@@ -1546,9 +1569,16 @@ mod tests {
             resize_effect.contains("c.vterm.resize"),
             "TAG_RESIZE must still resize the daemon VTerm"
         );
+        // #3421 item1: the negative is asserted over the WHOLE production region,
+        // not over these two slices. A module-level helper called from the resize
+        // path used to sit outside both and escape; the positives above stay
+        // slice-scoped because they are statements about those slices.
+        let touches = super::modal_state_touches_in_production(prod);
         assert!(
-            !resize_effect.contains("dev_modal::") && !resize_effect.contains("note_pty_write"),
-            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
+            touches.is_empty(),
+            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal \
+             confirmation, and nothing in this file's production region may touch \
+             modal state — found: {touches:?}"
         );
     }
 
