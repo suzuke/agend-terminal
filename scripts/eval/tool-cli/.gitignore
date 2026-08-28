@@ -3,6 +3,8 @@ runs/**
 !runs/*/summary.json
 !runs/*/report.txt
 !runs/*/manifest.json
+# which freeze graded the committed runs (#3412 review F1/F2 re-freeze)
+!runs/PROVENANCE.txt
 __pycache__/
 *.pyc
 # #3412: the repo-level ignore rule for the operator live fleet.yaml must not swallow fixtures

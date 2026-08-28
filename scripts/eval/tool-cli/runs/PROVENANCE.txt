@@ -1,0 +1,27 @@
+Which freeze graded these runs
+==============================
+
+The two run directories here were produced under the ORIGINAL commit A, whose
+grade.py digest was 1e58699b4cdf1333692b0f23515e73b4f89e3d49925ad3d52cbeef66ce082440.
+
+The #3412 primary review (t-20260828143201047260-31254-76) then proved two
+fail-open paths in that grader: the mixing gate reported "0 of 45" for a control
+that contributed zero runs, and an unreadable `arm` blinded mixing detection
+outright. Fixing both changed a frozen file, so grade.py is now
+688da865416fe8ec45adc0f8b5f215e3edf5ce8f0eeb2224c0dd3d7f86a0628d and this
+harness is a NEW commit A'.
+
+SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
+edits after commit A — if one is needed, the matrix restarts from zero under a
+new commit A'." These results therefore do NOT carry forward as results under the
+current freeze. They stand as the record of what was run under the old one.
+
+Measured, not assumed: re-grading the surviving E2 raw tree with the FIXED grader
+reproduces runs/E2-20260828T090026Z/summary.json with zero differing keys, and
+rendering that regrade reproduces its report.txt byte for byte. So the fix is
+result-invariant on the data that still exists — evidence about what a re-run
+would be expected to show, not a substitute for the re-run SPEC section 6
+requires. E1 (20260828T063955Z) cannot be re-graded at all: its raw run tree was
+in a worktree that has since been released.
+
+Phase 1 remains excluded either way (SPEC.txt:169).

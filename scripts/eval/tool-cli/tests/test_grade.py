@@ -470,7 +470,12 @@ class Aggregation(TempCase):
         write_run(runs, "S14", "cli", 1,
                   [bash_event("agend-terminal tool inbox --json '{}'")])
         clean = grade.aggregate(runs, scen)
-        self.assertTrue(clean["mixing_gate"]["pass"])
+        # No mixing hit, but only 1 of the 45 controls ran: the gate refuses the
+        # shortfall it measures (#3412 review F1 — this assertion used to read
+        # assertTrue, which is the defect written down). critical_gate is about
+        # occurrences, and there are none, so it still passes.
+        self.assertFalse(clean["mixing_gate"]["pass"])
+        self.assertEqual(clean["mixing_gate"]["scenarios"]["S13"]["mixing"], 0)
         self.assertTrue(clean["critical_gate"]["pass"])
         self.assertEqual(clean["mixing_gate"]["scenarios"]["S13"]["runs_shortfall"], 44)
         self.assertEqual(clean["n"], 0, "single-arm scenarios never form pairs")

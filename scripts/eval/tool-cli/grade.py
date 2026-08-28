@@ -68,6 +68,11 @@ sys.modules.setdefault("grade", sys.modules[__name__])
 DELTA_DEFINITION = "fail_cli - fail_mcp"
 AGENT_UNDER_TEST = "probe"
 TARGET_N = 60
+#: The only two arms a run may declare. `check_mixing` COMPARES against these,
+#: so a run whose arm is outside them cannot be checked at all — it is invalid,
+#: not clean (#3412 review F2).
+ARMS = ("mcp", "cli")
+
 MIXING_DENOMINATOR = 45
 CONFIRMATION_SCENARIOS = ("S01", "S02", "S03", "S04", "S05", "S06")
 MIXING_SCENARIOS = ("S13", "S14")
@@ -719,6 +724,8 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing):
     resolved = meta.get("model_resolved")
     if requested and resolved and requested != resolved:
         return "model_mismatch"
+    if meta.get("arm") not in ARMS:
+        return "bad_arm"
     if not os.path.exists(os.path.join(run_dir, "stream.jsonl")):
         return "missing_stream"
     if expect_missing:
@@ -920,7 +927,10 @@ def aggregate(runs_dir, scenarios_dir=None):
             "expected_runs": MIXING_DENOMINATOR,
             "runs_shortfall": max(0, MIXING_DENOMINATOR - len(runs)),
         }
-        if hits:
+        # A control that did not run cannot have produced "0 of 45". The
+        # shortfall was already measured here and only reported; refusing on it
+        # is what makes the denominator mean anything (#3412 review F1).
+        if hits or len(runs) < MIXING_DENOMINATOR:
             mixing_gate["pass"] = False
     # mixing is also a critical class, so any mixing anywhere already fails
     # critical_gate; the dedicated gate keeps the 0/45 + 0/45 denominators visible.
