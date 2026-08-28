@@ -134,21 +134,83 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
 /// version this replaced.
 const AUTH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Read and verify one client's 32-byte TUI auth cookie.
+/// How long a framed write to a TUI client may stall before this bridge gives up
+/// on that client.
 ///
-/// Extracted from the accept loop so a test can drive the real production path
-/// over a loopback socket. Behavior is currently verbatim: a single blocking
-/// `read_exact` under one 10s timeout.
+/// A pane that is alive drains continuously, so this only fires for one that has
+/// stopped reading — and while such a write is parked, no retirement check runs
+/// and the pane keeps a live socket to a dead generation. Deliberately well
+/// above a transient stall and well under `AUTH_BUDGET`. The timeout is per
+/// write syscall, so a write that keeps making partial progress can outlive one
+/// budget; what it cannot do is park forever.
+const CLIENT_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read and verify one client's 32-byte TUI auth cookie, giving up early if
+/// `retired` reports that a successor has taken this agent's name.
+///
+/// The accept loop is serialized, so a peer that dribbles the cookie holds the
+/// loop for the whole budget and a retired bridge keeps accepting long after the
+/// successor took the name. Two shapes of dribble matter and only one of them
+/// ever reaches a read timeout: a peer that sends 1 of 32 bytes then goes quiet,
+/// and a peer that trickles a byte at a time faster than `RETIREMENT_POLL`, which
+/// keeps `read` in its `Ok` arm forever. `retired` is therefore consulted before
+/// EVERY read rather than in the timeout arm — the cookie is at most
+/// `COOKIE_LEN` bytes, so that is a bounded number of checks per connection. The
+/// overall budget is unchanged, EOF and a wrong cookie are still refusals, and a
+/// complete cookie still goes through the existing constant-time `verify`.
+///
+/// `retired` is injected rather than derived here so a test can pin the exact
+/// interleaving of checks and reads without a sleep; the accept loop passes the
+/// real port-file check.
 fn read_and_verify_tui_cookie(
     stream: &mut std::net::TcpStream,
     cookie: &crate::auth_cookie::Cookie,
-    run_dir: &Path,
-    name: &str,
-    port: u16,
+    retired: &dyn Fn() -> bool,
 ) -> bool {
-    let _ = (run_dir, name, port);
-    let _ = stream.set_read_timeout(Some(AUTH_BUDGET));
-    crate::auth_cookie::read_and_verify_tui(stream, cookie).is_ok()
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + AUTH_BUDGET;
+    if stream.set_read_timeout(Some(RETIREMENT_POLL)).is_err() {
+        return false;
+    }
+    let mut got = [0u8; crate::auth_cookie::COOKIE_LEN];
+    let mut filled = 0usize;
+    while filled < got.len() {
+        if retired() || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        match stream.read(&mut got[filled..]) {
+            Ok(0) => return false,
+            Ok(read) => filled += read,
+            Err(ref error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return false,
+        }
+    }
+    crate::auth_cookie::verify(cookie, &got)
+}
+
+/// Arm an authenticated client's socket and send the opening bytes: the protocol
+/// version, then the initial dump frame.
+///
+/// Both writes happen on the SERIALIZED accept thread, before this client's
+/// forwarder exists, so an unbounded write here parks every other client's
+/// accept as well as this bridge's retirement — the stalled auth read one step
+/// later. Arming is fail-closed: a socket whose write budget cannot be set is
+/// refused rather than trusted. The read side stays unbounded by contract (the
+/// input thread blocks on framed reads for the life of the connection), and the
+/// write budget is a socket-level option, so the forwarder's `try_clone` handle
+/// inherits it.
+fn greet_authenticated_client(stream: &mut std::net::TcpStream, dump: &[u8]) -> bool {
+    if stream.set_read_timeout(None).is_err()
+        || stream.set_write_timeout(Some(CLIENT_WRITE_BUDGET)).is_err()
+    {
+        return false;
+    }
+    if stream.write_all(&[framing::PROTOCOL_VERSION]).is_err() || stream.flush().is_err() {
+        return false;
+    }
+    framing::write_frame(stream, dump).is_ok()
 }
 
 /// One client's output forwarder: pump broadcast frames at `write_stream`
@@ -163,30 +225,62 @@ fn read_and_verify_tui_cookie(
 /// another handle on the same connection, so dropping `write_stream` here does
 /// NOT close the connection. Only an explicit `shutdown` does — which is why
 /// every terminal path that must be visible to the peer has to call it.
-pub(crate) fn forward_tui_output(
+fn forward_tui_output(
     mut write_stream: std::net::TcpStream,
     rx: crossbeam_channel::Receiver<Vec<u8>>,
     run_dir: std::path::PathBuf,
     name: String,
     port: u16,
 ) {
+    // The accept loop already armed this socket, but this thread owns the write
+    // path for the rest of the connection's life and a parked write here is
+    // precisely what stops retirement from ever being noticed. Fail closed.
+    if write_stream
+        .set_write_timeout(Some(CLIENT_WRITE_BUDGET))
+        .is_err()
+    {
+        let _ = write_stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    // Checked at the TOP of every iteration, not only when the channel goes
+    // quiet: a generation that is still producing output never reaches the recv
+    // timeout, and a retirement check that lives only there is never consulted.
+    // Rate-limited so a busy channel costs one small file read per
+    // RETIREMENT_POLL rather than one per forwarded frame, which is what keeps
+    // the bound honest without putting a syscall on the hot path.
+    let mut last_check: Option<std::time::Instant> = None;
     loop {
+        if last_check.is_none_or(|at| at.elapsed() >= RETIREMENT_POLL) {
+            last_check = Some(std::time::Instant::now());
+            // Closing the socket is the load-bearing act: it is what makes a
+            // retained pane observe EOF, flip `connected` false, and become a
+            // reconnect candidate.
+            if is_retired(&run_dir, &name, port) {
+                let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                break;
+            }
+        }
         match rx.recv_timeout(RETIREMENT_POLL) {
             Ok(data) => {
+                // A failed write — including the bounded-budget timeout of a
+                // client that stopped reading — must CLOSE the connection, not
+                // merely leave this loop: the input thread holds another handle,
+                // so dropping ours closes nothing.
                 if framing::write_frame(&mut write_stream, &data).is_err() {
-                    break;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Closing the socket is the load-bearing act: it is what makes a
-                // retained pane observe EOF, flip `connected` false, and become a
-                // reconnect candidate.
-                if is_retired(&run_dir, &name, port) {
                     let _ = write_stream.shutdown(std::net::Shutdown::Both);
                     break;
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            // The next top-of-loop check handles retirement; nothing to do here.
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // The generation's subscribers are gone. Dropping this handle is
+                // NOT enough — the input thread holds another on the same
+                // connection — so close it explicitly or the pane keeps a live
+                // socket to a dead generation.
+                let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                break;
+            }
         }
     }
 }
@@ -238,23 +332,15 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             continue;
         }
         let _ = stream.set_nodelay(true);
-        // Bound the auth read so a silent peer cannot pin this accept loop.
-        // Framing read/write stays unbounded afterwards — the deadline is
-        // reset once the cookie check passes.
-        if !read_and_verify_tui_cookie(&mut stream, &cookie, &run_dir, name, port) {
+        // Bound the auth read so a stalled or trickling peer cannot pin this
+        // accept loop, and abandon it outright once a successor owns the name.
+        // The framing reads are unbounded afterwards by contract; the framing
+        // WRITES are bounded from the greeting onwards.
+        if !read_and_verify_tui_cookie(&mut stream, &cookie, &|| is_retired(&run_dir, name, port)) {
             tracing::warn!(agent = name, "TUI client rejected (auth)");
             continue;
         }
-        let _ = stream.set_read_timeout(None);
         tracing::info!(agent = name, "TUI client connected");
-
-        // Protocol version handshake: send version byte before any framed data
-        if stream.write_all(&[framing::PROTOCOL_VERSION]).is_err() {
-            continue;
-        }
-        if stream.flush().is_err() {
-            continue;
-        }
 
         // #1617-class (mirror #1593 F1 snapshot→drop→IO): capture the rx +
         // initial dump + the Arcs UNDER the registry lock, then DROP the guard
@@ -281,8 +367,9 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 Arc::clone(&agent.core),
             )
         };
-        // Registry lock released — the blocking initial-dump write runs lock-free.
-        if framing::write_frame(&mut stream, &dump).is_err() {
+        // Registry lock released — the greeting's writes run lock-free, and are
+        // bounded so a client that never reads cannot park this accept thread.
+        if !greet_authenticated_client(&mut stream, &dump) {
             continue;
         }
 
@@ -866,9 +953,10 @@ mod tests {
     ///
     /// Structural source-scan (mirrors #1593 F2 /
     /// `recovery_loop_never_holds_registry_across_blocking_io`): brace-match the
-    /// dump-capture binding block and assert (a) `write_frame` is NOT inside it
-    /// (i.e. not under the lock) and (b) a `write_frame` call DOES exist after
-    /// the block closes (the dump is written lock-free). Needles are `concat`-
+    /// dump-capture binding block and assert (a) neither the raw framed write nor
+    /// the greeting that now performs it is inside the block (i.e. not under the
+    /// lock) and (b) the greeting call DOES exist after the block closes (the
+    /// dump is written lock-free). Needles are `concat`-
     /// built and the scan is sliced to the production region (before the
     /// `#[cfg(test)]` mod) so this test's own source can't self-satisfy it.
     #[test]
@@ -909,14 +997,19 @@ mod tests {
         assert!(block_end > block_start, "binding block must close");
 
         let write_needle = ["write", "_frame"].concat();
+        // The dump write moved into the greeting helper (#3373: it must also be
+        // BOUNDED), so the call form is what the scan follows. `(&mut stream`
+        // cannot match the helper's own definition.
+        let greet_needle = ["greet_authenticated_client", "(&mut stream"].concat();
         let locked_region = &prod[block_start..=block_end];
         assert!(
-            !locked_region.contains(&write_needle),
-            "tui_bridge must NOT write_frame while the registry lock is held (#1617 deadlock class)"
+            !locked_region.contains(&write_needle) && !locked_region.contains(&greet_needle),
+            "tui_bridge must NOT write to the client while the registry lock is held (#1617 \
+             deadlock class)"
         );
         assert!(
-            prod[block_end..].contains(&write_needle),
-            "the initial dump must be written via write_frame AFTER the registry lock is dropped"
+            prod[block_end..].contains(&greet_needle),
+            "the initial dump must be written AFTER the registry lock is dropped"
         );
     }
 
