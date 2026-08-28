@@ -591,6 +591,69 @@ class Aggregation(TempCase):
                          ["bad_arm", "bad_arm"])
         self.assertFalse(summary["mixing_gate"]["pass"])
 
+    def test_the_rate_gate_passes_only_at_the_frozen_n(self):
+        """F3: SPEC section 9 pins the gate to a table lookup AT N=60.
+
+        A matrix that loses a pair recomputes the interval at its own N and, on
+        clean data, comfortably clears the margin — so the run reads PASS while
+        the acceptance that was actually frozen was never evaluated. The
+        recomputation stays in the summary as a diagnostic; it must not grant a
+        pass.
+        """
+        short = grade.lookup_rate_gate(grade.TARGET_N - 1, 0, 0)
+        self.assertIn("n_deviates_from_frozen_table", short["flags"])
+        self.assertIsNotNone(short["ucb"], "the recomputation stays visible")
+        self.assertLess(short["ucb"], short["margin"],
+                        "precondition: the off-table interval clears the margin, "
+                        "so only the N check can be what refuses it")
+        self.assertFalse(short["pass"],
+                         "only the frozen N=60 lookup may pass the rate gate")
+
+        over = grade.lookup_rate_gate(grade.TARGET_N + 1, 0, 0)
+        self.assertFalse(over["pass"], "more pairs than the frozen N is not the frozen N")
+
+        exact = grade.lookup_rate_gate(grade.TARGET_N, 0, 0)
+        self.assertTrue(exact["pass"], "the frozen N=60 table behaviour must not regress")
+        self.assertEqual(exact["source"], "frozen_table")
+        self.assertAlmostEqual(exact["ucb"], 0.04314679724032847)
+        self.assertEqual(exact["flags"], [])
+
+        rejected = grade.lookup_rate_gate(grade.TARGET_N, 9, 0)
+        self.assertEqual(rejected["source"], "frozen_table")
+        self.assertFalse(rejected["pass"],
+                         "a table cell that rejects must still reject")
+
+    def test_one_invalid_confirmation_run_cannot_still_pass(self):
+        """The same defect end to end: a full matrix minus one run.
+
+        Sixty pairs are built, one run is invalidated, and the aggregate must not
+        report a passing rate gate over the 59 that remain.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S0%d" % i: (PASS_EXPECT, ["mcp", "cli"])
+                                          for i in range(1, 7)})
+        os.makedirs(runs, exist_ok=True)
+        for i in range(1, 7):
+            for pair in range(1, 11):
+                for arm in ("mcp", "cli"):
+                    write_run(runs, "S0%d" % i, arm, pair, [])
+        full = grade.aggregate(runs, scen)
+        self.assertEqual(full["n"], grade.TARGET_N, "precondition: a complete matrix is 60 pairs")
+        self.assertTrue(full["rate_gate"]["pass"])
+        self.assertEqual(full["rate_gate"]["source"], "frozen_table")
+
+        one = os.path.join(runs, "S01-cli-p1", "metadata.json")
+        with open(one, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["invalid_reason"] = "infra_fault"
+        with open(one, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+
+        short = grade.aggregate(runs, scen)
+        self.assertEqual(short["n"], grade.TARGET_N - 1, "the invalid run takes its pair with it")
+        self.assertFalse(short["rate_gate"]["pass"],
+                         "59 pairs is not the frozen acceptance, however good the interval looks")
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
