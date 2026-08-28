@@ -229,19 +229,9 @@ fn fresh_restart_self_kick_prompt_shape() {
 fn fresh_restart_prompt_makes_no_unverifiable_memory_claim_3415() {
     let prompt = super::fresh_restart_self_kick_prompt();
     let lower = prompt.to_lowercase();
-    for claim in [
-        "lost your",
-        "lost its",
-        "have lost",
-        "no longer remember",
-        "do not remember",
-        "in-memory context",
-        "your memory",
-        "memory was",
-        "context was lost",
-    ] {
+    for claim in super::UNVERIFIABLE_MEMORY_CLAIMS {
         assert!(
-            !lower.contains(claim),
+            !lower.contains(*claim),
             "#3415: the prompt must not assert what the agent remembers — found {claim:?}"
         );
     }

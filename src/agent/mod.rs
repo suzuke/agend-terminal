@@ -2897,6 +2897,28 @@ pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
 /// claim carried is stated directly instead — rebuild the in-flight picture from
 /// the sources below rather than recall it — which is what the recovery sequence
 /// needed all along.
+/// #3415: claims about what the agent still remembers, which no daemon-authored
+/// text may make. The daemon observes that it restarted a process; it cannot
+/// observe what survived inside the agent, so any such sentence is unverifiable
+/// in exactly the messages that most need to be trusted.
+///
+/// Shared by both delivered surfaces — the injected `[AGEND-RESUME]` prompt and
+/// the standing instructions — so the two guards cannot drift apart. It is
+/// deliberately a family rather than the one phrase that shipped: a guard pinned
+/// to exact wording is stepped around by the next paraphrase.
+#[cfg(test)]
+pub(crate) const UNVERIFIABLE_MEMORY_CLAIMS: &[&str] = &[
+    "lost your",
+    "lost its",
+    "have lost",
+    "no longer remember",
+    "do not remember",
+    "in-memory context",
+    "your memory",
+    "memory was",
+    "context was lost",
+];
+
 pub(crate) fn fresh_restart_self_kick_prompt() -> String {
     format!(
         "{DAEMON_RESUME_INJECT_MARKER} This session was just fresh-restarted. Treat nothing you \
