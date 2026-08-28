@@ -4,11 +4,15 @@ Which freeze graded these runs
 The two run directories here were produced under the ORIGINAL commit A, whose
 grade.py digest was 1e58699b4cdf1333692b0f23515e73b4f89e3d49925ad3d52cbeef66ce082440.
 
-The #3412 primary review (t-20260828143201047260-31254-76) then proved two
-fail-open paths in that grader: the mixing gate reported "0 of 45" for a control
-that contributed zero runs, and an unreadable `arm` blinded mixing detection
-outright. Fixing both changed a frozen file, so grade.py is now
-688da865416fe8ec45adc0f8b5f215e3edf5ce8f0eeb2224c0dd3d7f86a0628d and this
+The #3412 primary review (t-20260828143201047260-31254-76) proved two fail-open
+paths in that grader: the mixing gate reported "0 of 45" for a control that
+contributed zero runs, and an unreadable `arm` blinded mixing detection outright.
+Answering the follow-up question about re-run scope surfaced a third: a matrix
+that lost a single confirmation pair recomputed its interval off-table at N=59
+and still read PASS, though SPEC.txt:167 pins the gate to a lookup AT N=60.
+
+Fixing all three changed a frozen file, so grade.py is now
+f8a1dbd391a627742ee386aa92de5107dc99220ef6c05421dd67d4e560fe50e1 and this
 harness is a NEW commit A'.
 
 SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table

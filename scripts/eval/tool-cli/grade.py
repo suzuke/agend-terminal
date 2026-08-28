@@ -840,7 +840,13 @@ def classify_scenario(scenario, scenarios_dir):
 
 
 def lookup_rate_gate(n, b, c, margin=0.10):
-    """Table lookup at N=60; anything else recomputes via tango.py and flags."""
+    """The frozen table AT N=60 is the gate; anything else recomputes and FAILS.
+
+    SPEC section 9 pins the gate to "acceptance_table lookup for (b, c) at N=60".
+    Reaching the recomputation means the frozen lookup did not decide — a
+    deviating N, a missing cell, a missing table — so the interval is computed
+    for the record, reported, and cannot grant a pass (#3412 review F3).
+    """
     flags = []
     if n == TARGET_N and os.path.exists(TABLE_PATH):
         with open(TABLE_PATH, "r", encoding="utf-8") as fh:
@@ -859,7 +865,7 @@ def lookup_rate_gate(n, b, c, margin=0.10):
                 "flags": flags + ["no_valid_pairs"]}
     import tango  # local import: only the off-table path needs the statistics
     ucb = tango.upper_bound(n, b, c)
-    return {"pass": ucb <= margin, "ucb": ucb, "n": n, "b": b, "c": c,
+    return {"pass": False, "ucb": ucb, "n": n, "b": b, "c": c,
             "margin": margin, "source": "tango_runtime", "flags": flags}
 
 
