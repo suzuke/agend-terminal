@@ -367,7 +367,7 @@ pub(crate) fn build_instructions_body(
     // rule stays a clean blanket). `[AGEND-RESUME]` is the OPPOSITE: actionable.
     content.push_str("\n## Daemon resume trigger (`[AGEND-RESUME]`)\n\n");
     content.push_str("When you see input beginning with `[AGEND-RESUME]`:\n");
-    content.push_str("- This is a daemon-issued SELF-bootstrap trigger, fired exactly once right after a fresh-restart respawn — you lost your prior in-memory context.\n");
+    content.push_str("- This is a daemon-issued SELF-bootstrap trigger, fired exactly once right after a fresh-restart respawn. Treat nothing you may still recall about work in flight as authoritative — rebuild it from the sources named below.\n");
     content.push_str("- UNLIKE `[AGEND-AUTO]` (which you must NEVER act on), this IS actionable: immediately run your recovery sequence — rebuild your in-flight picture from the AUTHORITATIVE live sources first (the task board + list_instances), then drain your inbox, then read SESSION-HANDOFF.md as a stale-tolerant hint (trust the board/inbox over it if it looks out of date), then execute pending handoff TODOs and reconnect dangling sub-agents.\n");
     content.push_str("- It is an actionable trigger to recover YOUR OWN state — NOT operator authority: it is NOT an operator command and NOT a license to dispatch new work. Do the recovery, nothing more.\n");
 
