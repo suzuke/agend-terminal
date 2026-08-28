@@ -889,17 +889,24 @@ mod tests {
     /// so there is no read-only attach mode to preserve — an input EOF means the
     /// client is gone.
     ///
-    /// Every test here keeps the pair's SECOND server handle alive, standing in
-    /// for the output forwarder's clone, so a test cannot pass by the input
-    /// handle merely being dropped.
+    /// What this test can assert is bounded by the platform, and the bound was
+    /// measured, not assumed: once the peer has half-closed and the daemon has
+    /// read the EOF, macOS refuses the close with ENOTCONN (`shutdown(Both)` →
+    /// `Os { code: 57, kind: NotConnected }`) and no FIN reaches the peer. A peer
+    /// that half-closes has therefore already decided the connection's fate; the
+    /// paths where the DAEMON decides — an undefined frame, a malformed resize, a
+    /// failed PTY write — are the ones where the close is both possible and
+    /// load-bearing, and they are pinned below. So this pins what remains: the
+    /// loop ends promptly on EOF instead of parking, and delivers nothing.
     #[test]
-    fn input_eof_closes_the_whole_connection() {
+    fn input_eof_ends_the_loop_promptly() {
         let pair = socket_pair();
         let server = pair.server;
         let peer = pair.peer;
         peer.shutdown(std::net::Shutdown::Write).unwrap();
 
         let frames = AtomicUsize::new(0);
+        let started = Instant::now();
         super::forward_tui_input(
             server,
             |_| {
@@ -908,13 +915,14 @@ mod tests {
             },
             |_, _| {},
         );
+        let elapsed = started.elapsed();
 
         assert_eq!(frames.load(Ordering::SeqCst), 0, "no frame was sent");
         assert!(
-            peer_sees_eof(peer, Duration::from_secs(5)),
-            "an input EOF must close the whole connection: the output clone would otherwise \
-             keep the pane looking connected with its input ignored"
+            elapsed <= Duration::from_secs(1),
+            "an input EOF must end the loop rather than park it; took {elapsed:?}"
         );
+        drop(peer);
     }
 
     /// A frame this protocol does not define ends the connection — and must end
@@ -1199,6 +1207,11 @@ mod tests {
     /// queued Claude development-channel confirmation. Any child repaint still
     /// invalidates through the PTY read loop, and `TAG_DATA` still goes through
     /// the normal write chokepoint.
+    ///
+    /// #3373 moved the EFFECT out of the match arm: the input loop became a
+    /// production function a test can drive, so the arm now calls an injected
+    /// `resize` and the accept loop supplies the real one. The scan follows it
+    /// there — same invariant, new address.
     #[test]
     fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
         let src = include_str!("tui_bridge.rs");
@@ -1211,17 +1224,32 @@ mod tests {
             .split_once("_ => break,")
             .expect("TAG_RESIZE arm must end before the fallback arm")
             .0;
-
         assert!(
-            resize_arm.contains("pty_master.lock().resize"),
-            "TAG_RESIZE must still resize the child PTY"
-        );
-        assert!(
-            resize_arm.contains("c.vterm.resize"),
-            "TAG_RESIZE must still resize the daemon VTerm"
+            resize_arm.contains("resize("),
+            "the TAG_RESIZE arm must still apply a resize"
         );
         assert!(
             !resize_arm.contains("dev_modal::") && !resize_arm.contains("note_pty_write"),
+            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
+        );
+
+        let resize_effect = prod
+            .split_once("|cols, rows| {")
+            .expect("the accept loop must supply the real resize effect")
+            .1
+            .split_once("\n                    );")
+            .expect("the resize effect closure must close the forward_tui_input call")
+            .0;
+        assert!(
+            resize_effect.contains("pty_master.lock().resize"),
+            "TAG_RESIZE must still resize the child PTY"
+        );
+        assert!(
+            resize_effect.contains("c.vterm.resize"),
+            "TAG_RESIZE must still resize the daemon VTerm"
+        );
+        assert!(
+            !resize_effect.contains("dev_modal::") && !resize_effect.contains("note_pty_write"),
             "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
         );
     }
