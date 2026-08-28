@@ -775,13 +775,29 @@ mod tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
         assert!(
-            body.contains("args: &fresh_args,"),
+            spawn_source_is_sanitized(body),
             "the respawn SPAWN must receive the sanitized args"
         );
+    }
+
+    fn spawn_source_is_sanitized(body: &str) -> bool {
+        body.contains("args: &fresh_args,") && !body.contains("args: &config.args")
+    }
+
+    /// RED: a mutation that replaces the sanitizer with a clone of the stored
+    /// args still uses the correctly named local at the SPAWN site, so the
+    /// spelling-only guard above accepts it.
+    #[test]
+    fn crash_respawn_spawn_guard_kills_config_args_clone_mutation_3414() {
+        let mutated = r#"
+            fn respawn_agent_worker(config: &AgentConfig) {
+                let fresh_args = config.args.clone();
+                spawn_agent(&SpawnConfig { args: &fresh_args, });
+            }
+        "#;
         assert!(
-            !body.contains("args: &config.args"),
-            "the respawn SPAWN must not receive the instance's stored args — that is \
-             the state #3414 exists to remove"
+            !spawn_source_is_sanitized(mutated),
+            "the spawn guard must reject a config.args.clone() sanitizer bypass"
         );
     }
 
@@ -805,6 +821,14 @@ mod tests {
                         .any(|claim| line.to_lowercase().contains(*claim))
             })
             .collect();
+        assert!(
+            production.contains("fn respawn_notice("),
+            "#3415: the production slice must include the respawn notice"
+        );
+        assert!(
+            production.contains("write_to_pty"),
+            "#3415: the production slice must include the real PTY write site"
+        );
         assert!(
             offenders.is_empty(),
             "#3415: no daemon-authored line here may assert what the agent remembers — found: {offenders:?}"
