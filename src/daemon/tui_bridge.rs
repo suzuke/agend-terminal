@@ -628,6 +628,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    /// Select the source that the modal-state guard scans. This RED version
+    /// mirrors the old first-`#[cfg(test)]` cutoff; production added below a
+    /// test helper therefore disappears before the guard sees it.
+    fn production_source(src: &str) -> &str {
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        src.split_once(&cfg_test).map_or(src, |(before, _)| before)
+    }
+
     /// A connected loopback pair plus a SECOND handle on the server side.
     ///
     /// The second handle is the point: in production the accept loop gives the
@@ -1489,8 +1497,7 @@ mod tests {
     #[test]
     fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
         let src = include_str!("tui_bridge.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
+        let prod = production_source(src);
         let resize_arm = prod
             .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
             .expect("production TAG_RESIZE arm must exist")
@@ -1539,10 +1546,10 @@ mod tests {
     /// narrow.
     ///
     /// This test pins the escape twice over. First it confirms the escape is real:
-    /// with a module-level helper appended, the shipped slicing still reports the
-    /// arm as clean. Then it requires a predicate that scans the FULL production
-    /// region to flag it — which is what does not exist yet, so this is a
-    /// compile-RED at a77b6837.
+    /// with a module-level helper appended after the test module, the shipped
+    /// first-`#[cfg(test)]` slicing still reports the arm as clean. Then it
+    /// requires the source guard to scan that FULL file and flag it — which is
+    /// what does not exist yet, so this is a compile-RED at 75669bcb.
     ///
     /// A compile-RED proves test-first ORDERING only. The GREEN commit carries the
     /// mutation replay that proves the strengthened predicate also DISCRIMINATES,
@@ -1550,17 +1557,18 @@ mod tests {
     #[test]
     fn a_module_level_helper_escapes_the_slice_scoped_negatives() {
         let src = include_str!("tui_bridge.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
 
         // The exact escape: a helper OUTSIDE the resize arm and outside the resize
-        // effect closure, of the shape a refactor would naturally produce.
+        // effect closure, below the inline test module, of the shape a refactor
+        // would naturally produce.
+        let modal_touch = ["dev_modal::", "note_pty_write"].concat();
         let poisoned = format!(
-            "{prod}\nfn resize_bookkeeping(c: &mut Core) {{ dev_modal::note_pty_write(c); }}\n"
+            "{src}\nfn resize_bookkeeping(c: &mut Core) {{ {modal_touch}(c); }}\n"
         );
+        let prod = production_source(&poisoned);
 
         // 1. The escape is real: the shipped slicing sees nothing wrong.
-        let resize_arm = poisoned
+        let resize_arm = prod
             .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
             .expect("production TAG_RESIZE arm must exist")
             .1
@@ -1574,7 +1582,7 @@ mod tests {
         );
 
         // 2. A full-region predicate must flag it. This is the RED.
-        let violations = super::modal_state_touches_in_production(&poisoned);
+        let violations = super::modal_state_touches_in_production(prod);
         assert!(
             !violations.is_empty(),
             "a module-level helper touching modal state must be caught wherever it \
@@ -1598,11 +1606,7 @@ mod tests {
     #[test]
     fn tui_dump_write_not_held_across_registry_lock() {
         let src = include_str!("tui_bridge.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let prod = match src.find(&cfg_test) {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production_source(src);
 
         // The fix marker: the lock block now captures `dump` into the outer
         // binding (was a 4-tuple without `dump` pre-fix), proving the dump is
