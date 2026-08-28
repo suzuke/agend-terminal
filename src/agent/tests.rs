@@ -206,6 +206,56 @@ fn fresh_restart_self_kick_prompt_shape() {
     assert!(p.contains("NOT authority to dispatch"));
 }
 
+/// #3415 RED: the prompt's opening asserts a fact the daemon cannot observe —
+/// that the agent "lost your in-memory context". The daemon performed the
+/// restart, so it can state THAT; what survived inside the agent is not visible
+/// from here. An agent that does still remember its work is told something false
+/// by the first sentence of the very message asking it to trust the rest, and
+/// the whole point of this prompt is to be trusted.
+///
+/// The replacement has to carry the same operational weight without the claim:
+/// state the restart, and require the in-flight picture to be REBUILT from the
+/// authoritative sources rather than recalled. That instruction is what the
+/// false sentence was standing in for, so the guard pins it too — deleting the
+/// claim must not quietly delete the duty.
+///
+/// The ban list is deliberately broader than the one phrase that shipped. A
+/// guard pinned to the exact wording is stepped around by the next paraphrase,
+/// and this prompt has no legitimate reason to assert anything about what the
+/// agent remembers. Ordering and the authority guard stay pinned by
+/// `fresh_restart_self_kick_prompt_shape`, so a rewrite that neutralises the
+/// opening but drops the recovery sequence still fails there.
+#[test]
+fn fresh_restart_prompt_makes_no_unverifiable_memory_claim_3415() {
+    let prompt = super::fresh_restart_self_kick_prompt();
+    let lower = prompt.to_lowercase();
+    for claim in [
+        "lost your",
+        "lost its",
+        "have lost",
+        "no longer remember",
+        "do not remember",
+        "in-memory context",
+        "your memory",
+        "memory was",
+        "context was lost",
+    ] {
+        assert!(
+            !lower.contains(claim),
+            "#3415: the prompt must not assert what the agent remembers — found {claim:?}"
+        );
+    }
+    assert!(
+        lower.contains("fresh-restarted"),
+        "#3415: it must still state the fact the daemon DOES know — that it restarted this session"
+    );
+    assert!(
+        lower.contains("rebuild"),
+        "#3415: dropping the memory claim must not drop the duty it carried — the in-flight \
+         picture has to be REBUILT from the authoritative sources, not recalled"
+    );
+}
+
 /// RED: a structured fresh-restart bootstrap must not inherit LegacyPty's raw
 /// screen-idle prerequisite. The structured adapter owns readiness and turn
 /// admission, so a stale `Active` screen classification must still reach exactly
