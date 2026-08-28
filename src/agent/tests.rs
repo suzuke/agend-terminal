@@ -3726,10 +3726,13 @@ fn pty_read_loop_holds_back_when_modal_vanishes_after_repaint() {
 
     let written = run_dev_modal_pty_read_loop_3333(vec![
         (modal, std::time::Duration::ZERO),
-        (b"\x1b[?25h", std::time::Duration::from_millis(250)),
+        // Publish both invalidating frames before the 300ms dismiss worker can
+        // write. A 250ms sleep could overshoot that deadline on a loaded runner,
+        // testing scheduler luck instead of the repaint/vanish ordering.
+        (b"\x1b[?25h", std::time::Duration::ZERO),
         (
             b"\x1b[2J\x1b[H$ the modal is gone\r\n",
-            std::time::Duration::from_millis(100),
+            std::time::Duration::ZERO,
         ),
     ]);
 
