@@ -1562,9 +1562,19 @@ mod fresh_restart_resident_session_3414 {
         )
         .expect("fresh preparation");
 
-        assert_eq!(
-            prepared.session_id, None,
+        // NOT `None`: clearing session_id happens BEFORE resident preparation,
+        // and preparation then creates a new conversation via POST /session.
+        // The contract is that the OLD session is not inherited — asserting
+        // `None` would have been asserting the intermediate state, not the
+        // observable one.
+        assert_ne!(
+            prepared.session_id.as_deref(),
+            Some("stale-session"),
             "#3414: a fresh restart must not inherit the resident worker's session"
+        );
+        assert!(
+            prepared.session_id.is_some(),
+            "#3414: fresh preparation must still produce a session to talk to"
         );
         drop_resident(&home, "dev");
         std::fs::remove_dir_all(&home).ok();

@@ -397,6 +397,14 @@ pub(crate) fn prepare_opencode_tui_session(
     args: &[String],
     spawn_mode: crate::backend::SpawnMode,
 ) -> anyhow::Result<SessionLocator> {
+    // #3414: clearing the new locator's session_id is not enough on its own —
+    // `resident_adapter` returns an already-resident worker for this key and
+    // drops the locator we just prepared, so the OLD session would survive.
+    // Retire the worker first; the managed server (endpoint/auth) is left
+    // running so the new session reuses it.
+    if spawn_mode == crate::backend::SpawnMode::Fresh {
+        super::opencode_server::retire_resident_adapter(home, instance);
+    }
     let mut locator = opencode_locator_for_spawn(
         locator_for_instance(
             home,

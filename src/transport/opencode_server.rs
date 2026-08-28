@@ -601,6 +601,36 @@ fn server_key(home: &Path, instance: &str, locator: &SessionLocator) -> String {
     )
 }
 
+/// #3414: retire ONLY this instance's resident adapter, leaving the managed
+/// `opencode serve` process alone.
+///
+/// A fresh restart must start a NEW conversation, but `resident_adapter`
+/// returns the cached worker for an existing key and drops the freshly prepared
+/// locator — so clearing `locator.session_id` alone left the old session in
+/// place. Retiring the worker is what makes the next `resident_adapter` call
+/// actually adopt the new locator.
+///
+/// Deliberately narrower than [`stop_instance_server`], which also kills the
+/// managed server child: the whole point of clearing only `session_id` is that
+/// the endpoint and credentials stay valid and get reused, so tearing the
+/// server down here would defeat it.
+///
+/// Mirrors the existing stop-then-join shape: the entry is removed UNDER the
+/// map lock and the join happens after it is released, so a worker thread that
+/// touches the map on its way out cannot deadlock against us.
+pub(crate) fn retire_resident_adapter(home: &Path, instance: &str) {
+    let retired = {
+        let mut all = resident_workers().lock();
+        all.remove(&resident_key(home, instance))
+    };
+    if let Some(mut worker) = retired {
+        worker.stop.store(true, Ordering::Release);
+        if let Some(join) = worker.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 pub(crate) fn stop_instance_server(home: &Path, instance: &str) {
     let workers = {
         let mut all = resident_workers().lock();
