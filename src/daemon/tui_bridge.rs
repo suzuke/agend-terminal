@@ -608,6 +608,44 @@ mod tests {
         );
     }
 
+    /// #3373 follow-up, third shape: the whole cookie can arrive in ONE read.
+    ///
+    /// The loop then runs its check once, before that read, fills the buffer,
+    /// and falls straight out to `verify` — so a successor that takes the name
+    /// while the read is in flight is never noticed, and a CORRECT cookie
+    /// authenticates a client onto the retired generation. The predicate is live
+    /// for the pre-read check and retired for the one that must follow the fill,
+    /// which is exactly that window, with no sleep. A refusal here can only come
+    /// from a check made after the cookie was complete.
+    #[test]
+    fn a_cookie_that_arrives_in_one_read_still_loses_to_retirement() {
+        let pair = socket_pair();
+        let mut server = pair.server;
+        let mut peer = pair.peer;
+        let cookie: crate::auth_cookie::Cookie = [7u8; crate::auth_cookie::COOKIE_LEN];
+
+        // The complete, correct cookie is already waiting: one read fills it.
+        peer.write_all(&cookie).unwrap();
+        peer.flush().unwrap();
+
+        let checks = AtomicUsize::new(0);
+        let retired = || checks.fetch_add(1, Ordering::SeqCst) > 0;
+
+        let accepted = super::read_and_verify_tui_cookie(&mut server, &cookie, &retired);
+
+        assert!(
+            !accepted,
+            "a complete and correct cookie must still be refused when a successor took the name \
+             while the read was in flight"
+        );
+        assert!(
+            checks.load(Ordering::SeqCst) >= 2,
+            "retirement must be re-checked after the cookie is complete and BEFORE verify; the \
+             read saw {} check(s)",
+            checks.load(Ordering::SeqCst)
+        );
+    }
+
     /// #3373 follow-up, second shape of the same hole: a peer that TRICKLES the
     /// cookie keeps `read` in its `Ok` arm and never reaches a read timeout, so
     /// a retirement check that lives in the timeout arm is never consulted at
