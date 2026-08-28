@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -169,6 +169,133 @@ fn assert_list_envelope(requests: &[Value]) {
     );
 }
 
+#[derive(Debug)]
+enum DisconnectEvent {
+    First,
+    Second,
+    NoFirst,
+    NoSecond,
+}
+
+struct PostWriteDisconnectDaemon {
+    home: PathBuf,
+    events: mpsc::Receiver<DisconnectEvent>,
+    join: Option<thread::JoinHandle<Vec<Value>>>,
+}
+
+impl PostWriteDisconnectDaemon {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let home = std::env::temp_dir().join(format!(
+            "agend-tool-cli-post-write-{}-{port}",
+            std::process::id()
+        ));
+        let run = home.join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("api.port"), port.to_string()).unwrap();
+        std::fs::write(run.join("api.cookie"), [0x42u8; 32]).unwrap();
+        std::fs::write(run.join("api.operator"), [0x24u8; 32]).unwrap();
+
+        let (event_sender, events) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let first = accept_until(&listener, Duration::from_secs(5));
+            let Some(first) = first else {
+                event_sender.send(DisconnectEvent::NoFirst).ok();
+                return requests;
+            };
+            let Some(request) = read_authenticated_request(first, None) else {
+                event_sender.send(DisconnectEvent::NoFirst).ok();
+                return requests;
+            };
+            requests.push(request);
+            event_sender.send(DisconnectEvent::First).ok();
+
+            let second = accept_until(&listener, Duration::from_secs(1));
+            let Some(second) = second else {
+                event_sender.send(DisconnectEvent::NoSecond).ok();
+                return requests;
+            };
+            if let Some(request) = read_authenticated_request(
+                second,
+                Some(r#"{"ok":true,"result":{"status":"completed"}}"#),
+            ) {
+                requests.push(request);
+                event_sender.send(DisconnectEvent::Second).ok();
+            } else {
+                event_sender.send(DisconnectEvent::NoSecond).ok();
+            }
+            requests
+        });
+
+        Self {
+            home,
+            events,
+            join: Some(join),
+        }
+    }
+
+    fn finish(mut self) -> (Vec<Value>, Vec<DisconnectEvent>) {
+        let requests = self.join.take().unwrap().join().unwrap();
+        let events = self.events.try_iter().collect();
+        let _ = std::fs::remove_dir_all(&self.home);
+        (requests, events)
+    }
+}
+
+impl Drop for PostWriteDisconnectDaemon {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+fn accept_until(listener: &TcpListener, timeout: Duration) -> Option<std::net::TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn read_authenticated_request(
+    stream: std::net::TcpStream,
+    response: Option<&str>,
+) -> Option<Value> {
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut auth = String::new();
+    if reader.read_line(&mut auth).ok()? == 0 {
+        return None;
+    }
+    writeln!(writer, r#"{{"ok":true}}"#).ok()?;
+    writer.flush().ok()?;
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let request = serde_json::from_str(line.trim()).ok()?;
+    if let Some(response) = response {
+        writeln!(writer, "{response}").ok()?;
+        writer.flush().ok()?;
+    }
+    Some(request)
+}
+
 #[test]
 fn unknown_tool_is_a_tool_error_and_forwards_cli_transport() {
     let daemon = MockDaemon::new(response("unknown_tool"));
@@ -318,6 +445,63 @@ fn transport_failure_is_indeterminate_exit_four() {
         "exit 4 must tell the operator to inspect state before resend: {}",
         combined(&output)
     );
+}
+
+#[test]
+fn post_write_disconnect_is_indeterminate_without_cli_replay() {
+    let daemon = PostWriteDisconnectDaemon::new();
+    let home = daemon.home.clone();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "send",
+            "--json",
+            r#"{"message":"ambiguous"}"#,
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    let (requests, events) = daemon.finish();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DisconnectEvent::First)),
+        "listener must receive the first request: {events:?}"
+    );
+    if let Some(second) = requests.get(1) {
+        assert_eq!(
+            requests[0]["request_id"], second["request_id"],
+            "an observed retry must preserve request_id for deduplication; requests: {requests:?}"
+        );
+    }
+    assert_eq!(
+        requests.len(),
+        1,
+        "CLI must not replay after a post-write disconnect; captured requests: {requests:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DisconnectEvent::NoSecond)),
+        "listener must complete the bounded no-replay observation: {events:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "post-write disconnect must be indeterminate: {}",
+        combined(&output)
+    );
+    assert!(
+        combined(&output).contains("indeterminate"),
+        "exit 4 must identify the outcome as indeterminate: {}",
+        combined(&output)
+    );
+    let request_id = requests[0]["request_id"]
+        .as_str()
+        .expect("CLI request must carry a request_id");
+    uuid::Uuid::parse_str(request_id).expect("CLI request_id must be a UUID");
 }
 
 struct ChildGuard(Child);
