@@ -474,6 +474,7 @@ fn one_spawn_transaction_per_name_at_a_time() {
     let (b_inside_tx, b_inside_rx) = crossbeam_channel::bounded::<()>(1);
     let (a_inside_tx, a_inside_rx) = crossbeam_channel::bounded::<()>(1);
 
+    let (b_attempt_tx, b_attempt_rx) = crossbeam_channel::bounded::<()>(1);
     let b_events = Arc::clone(&events);
     let b_home = fx.home.clone();
     let b_configs = Arc::clone(&fx.configs);
@@ -482,6 +483,10 @@ fn one_spawn_transaction_per_name_at_a_time() {
         a_inside_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("A must enter first");
+        // The attempt latch: B has committed to entering. A waits on THIS with a
+        // blocking recv — no timeout, no sleep — so the interleave is established
+        // deterministically rather than by elapsed time.
+        let _ = b_attempt_tx.send(());
         let _ = crate::agent_ops::spawn_one_recording_config(
             &b_home,
             &b_configs,
@@ -504,8 +509,13 @@ fn one_spawn_transaction_per_name_at_a_time() {
         || {
             a_events.lock().push("A:inside");
             let _ = a_inside_tx.send(());
-            // Bounded: with the lane this recv is SUPPOSED to time out, and
-            // without it B answers at once.
+            // Deterministic: B has committed to entering before this returns.
+            b_attempt_rx
+                .recv()
+                .expect("B must announce its attempt before A can conclude anything");
+            // Only the leak observation is bounded, and only as a fail-safe: with
+            // the lane this recv is SUPPOSED to expire, and without it B — already
+            // running and needing only an uncontended lock — answers at once.
             let leaked = b_inside_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .is_ok();
@@ -597,5 +607,106 @@ fn the_config_transaction_holds_no_lock_across_the_spawn() {
     assert!(
         registry_free,
         "the registry lock must not be held across the spawn either"
+    );
+}
+
+/// #3417 correction: DELETE and clean-exit are the removal authority, so a
+/// failed spawn must never bring back what they retired.
+///
+/// The transaction captures `previous` before spawning. If a delete removes the
+/// entry while the spawn is in flight, restoring that capture resurrects a
+/// config the removal authority just retired — and the agent it describes is
+/// gone, so crash respawn would be handed a config for a deleted instance.
+///
+/// The ordering point is the configs lock itself: the check and the write happen
+/// in ONE critical section, so this is not a post-failure check-then-act. The
+/// lane makes presence a sound ownership token — no other spawn can have written
+/// this key — so an entry that is GONE can only have been removed by the
+/// deletion authority, and the rollback stands down.
+#[test]
+fn a_delete_during_a_failed_spawn_wins_over_the_rollback() {
+    let fx = fixture("delete-wins");
+    let name = "cfg-deleted";
+    fx.configs
+        .lock()
+        .insert(name.to_string(), config_for(name, &["--previous"]));
+
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
+        &fx.configs,
+        name,
+        config_for(name, &["--attempted"]),
+        || {
+            // The removal authority runs while the spawn is in flight, exactly as
+            // delete_transaction step 6 and handle_clean_exit do.
+            fx.configs.lock().remove(name);
+            Err(anyhow::anyhow!("spawn failed after the delete"))
+        },
+    );
+
+    assert!(result.is_err());
+    assert!(
+        fx.respawn_config(name).is_none(),
+        "the rollback resurrected a config that DELETE had already retired: {:?}",
+        fx.respawn_config(name).map(|c| c.args)
+    );
+}
+
+/// The config must be readable by the time anything can observe the child —
+/// crash respawn reads this map and can be reached before the spawn call
+/// returns. Asserting it AFTER the transaction cannot tell "inserted before" from
+/// "inserted after"; this looks from INSIDE the spawn.
+#[test]
+fn the_config_is_visible_from_inside_the_spawn() {
+    let fx = fixture("inside-visibility");
+    let name = "cfg-visible";
+
+    let seen = std::sync::Mutex::new(None);
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.home,
+        &fx.configs,
+        name,
+        config_for(name, &["--login"]),
+        || {
+            *seen.lock().expect("poisoned") = fx.configs.lock().get(name).map(|c| c.args.clone());
+            Ok(crate::backend::SpawnMode::Fresh)
+        },
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(
+        seen.into_inner().expect("poisoned"),
+        Some(vec!["--login".to_string()]),
+        "a crash arriving while the spawn is still running would find no config"
+    );
+}
+
+/// A panicking spawn must leave the map as a failed spawn does. Without this the
+/// invariant holds only on the paths that return.
+#[test]
+fn a_panicking_spawn_rolls_back_like_a_failed_one() {
+    let fx = fixture("panic-rollback");
+    let name = "cfg-panic";
+    fx.configs
+        .lock()
+        .insert(name.to_string(), config_for(name, &["--previous"]));
+
+    let home = fx.home.clone();
+    let configs = Arc::clone(&fx.configs);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = crate::agent_ops::spawn_one_recording_config(
+            &home,
+            &configs,
+            name,
+            config_for(name, &["--attempted"]),
+            || panic!("spawn panicked"),
+        );
+    }));
+
+    assert!(outcome.is_err(), "the panic must propagate");
+    assert_eq!(
+        fx.respawn_config(name).map(|c| c.args),
+        Some(vec!["--previous".to_string()]),
+        "a panicking spawn must restore the previous config, not leave its own attempt behind"
     );
 }
