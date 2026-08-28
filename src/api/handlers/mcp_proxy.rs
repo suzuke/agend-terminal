@@ -608,6 +608,30 @@ mod tests {
         );
     }
 
+    /// A worker can enter the handler and then panic before sending a result.
+    /// The resulting disconnected envelope is therefore indeterminate, not a
+    /// refusal that invites the caller to assume the tool never ran.
+    #[test]
+    fn handler_panic_disconnect_is_indeterminate() {
+        let resp = handle_mcp_tool_inner(
+            "task",
+            json!({"action": "get", "id": "panic-probe"}),
+            "caller".to_string(),
+            Duration::from_secs(1),
+            Some("get".to_string()),
+            |_, _, _| -> Value { panic!("handler panic probe") },
+        );
+        assert_eq!(
+            crate::mcp_wire::classify_response(&resp),
+            crate::mcp_wire::ResponseClass::Indeterminate,
+            "a handler panic after worker entry must not classify as refused: {resp}"
+        );
+        assert_eq!(
+            resp["status"], "handler_errored",
+            "disconnected handler errors need an explicit indeterminate status: {resp}"
+        );
+    }
+
     /// #3395: inbox drain persists delivery state before returning its payload.
     /// A proxy timeout therefore must not look retry-safe: the background drain
     /// may already have consumed the unread row, and an immediate retry cannot
