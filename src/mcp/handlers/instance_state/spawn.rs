@@ -458,6 +458,23 @@ fn spawn_single_instance_impl_inner(
                         .ok();
                 }
             }
+            // #3418: create_instance persists a DURABLE fleet.yaml entry —
+            // including `args`, which shapes every future spawn of this
+            // instance indefinitely (#3414) — yet every neighbouring lifecycle
+            // op logged and this one did not, leaving provenance unanswerable
+            // from daemon state. Emitted HERE, past every
+            // `rollback_fleet_entry_on_failure` arm, so the line only ever
+            // describes an entry that actually survived. Fields are the values
+            // AS PERSISTED, not the raw request: `entry.backend` is the
+            // resolved backend (`command` is the raw argv0) and `entry.args`
+            // the split tokens boot replays.
+            tracing::info!(
+                name = %name,
+                backend = %entry.backend.as_deref().unwrap_or("<unset>"),
+                caller = %entry.created_by.as_deref().unwrap_or("<anonymous>"),
+                args = ?entry.args,
+                "create_instance persisted fleet.yaml entry"
+            );
             let mut result = json!({"name": name, "backend": command});
             if let Some(tid) = topic_id {
                 result["topic_id"] = json!(tid);
