@@ -87,6 +87,13 @@ def _is_hex64(value):
     return _is_str(value) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
+def file_text(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
 def file_sha256(path):
     """sha256 of a frozen file, or None when it is not there."""
     if not os.path.exists(path):
@@ -168,6 +175,30 @@ def frozen_plan_rows():
             for (scenario, pair, arm) in FROZEN_PLAN]
 
 
+def frozen_fleet_digest():
+    """sha256 of the fleet template sandbox.sh writes, read from its own literal.
+
+    sandbox.sh holds FLEET_YAML as a single-quoted literal and writes it verbatim
+    with `printf %s`, so the digest every run records is derivable here — no
+    second copy of the template, and no waiting for a run to produce one.
+    """
+    source = file_text(os.path.join(HERE, "sandbox.sh"))
+    marker = "FLEET_YAML='"
+    if source is None or marker not in source:
+        return None
+    start = source.index(marker) + len(marker)
+    end = source.find("'", start)
+    if end < 0:
+        return None
+    return hashlib.sha256(source[start:end].encode("utf-8")).hexdigest()
+
+
+def frozen_seed_digests(scenarios_dir):
+    """sha256 of each planned scenario's seed.sh."""
+    return {scenario: file_sha256(os.path.join(scenarios_dir or "", scenario, "seed.sh"))
+            for scenario in sorted({cell[0] for cell in FROZEN_PLAN})}
+
+
 def frozen_prompt_digests():
     """sha256 of the three frozen system-prompt files."""
     return {name: file_sha256(os.path.join(HERE, "prompts", "%s.txt" % name))
@@ -189,6 +220,7 @@ MANIFEST_CONTRACT = (
     ("binary_sha256", lambda v: isinstance(v, dict) and all(
         _is_hex64(v.get(name)) for name in ("agend-terminal", "agend-mcp-bridge"))),
     ("prompt_sha256", lambda v: v == frozen_prompt_digests()),
+    ("fleet_sha256", lambda v: v == frozen_fleet_digest()),
     ("total_runs", lambda v: v == len(FROZEN_PLAN)),
     ("plan", lambda v: v == frozen_plan_rows()),
 )
@@ -870,6 +902,9 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
         return "stream_model_missing"
     if stream_model != resolved:
         return "stream_model_mismatch"
+    # The runner writes claude_version; the stream's init event reports it.
+    if stream_init_field(events, "claude_code_version") != meta.get("claude_version"):
+        return "stream_version_mismatch"
     if expect_missing:
         return "missing_expect"
     declared = declared_arms(meta.get("scenario"), scenarios_dir)
@@ -884,23 +919,28 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
         return "prompt_not_frozen"
     if meta.get("seed_sha256") != file_sha256(os.path.join(scenario_dir, "seed.sh")):
         return "seed_not_frozen"
-    if not _is_hex64(meta.get("fleet_sha256")):
-        return "metadata_incomplete"
+    if meta.get("fleet_sha256") != frozen_fleet_digest():
+        return "fleet_not_frozen"
     cell = (meta.get("scenario"), meta.get("pair"), arm)
     if cell in FROZEN_PLAN_CELLS and meta.get("order_in_pair") != frozen_order(cell[1], arm):
         return "order_in_pair_mismatch"
     return None
 
 
-def stream_init_model(events):
-    """The model named by the stream's `system/init` event, or None."""
+def stream_init_field(events, field):
+    """A field of the stream's `system/init` event, or None."""
     for event in events or []:
         if not isinstance(event, dict):
             continue
         if event.get("type") == "system" and event.get("subtype") == "init":
-            model = event.get("model")
-            return model if _is_str(model) else None
+            value = event.get(field)
+            return value if _is_str(value) else None
     return None
+
+
+def stream_init_model(events):
+    """The model named by the stream's `system/init` event, or None."""
+    return stream_init_field(events, "model")
 
 
 def grade_run(run_dir, scenarios_dir=None):
@@ -1145,7 +1185,7 @@ def aggregate(runs_dir, scenarios_dir=None):
                 manifest = json.load(fh)
         except ValueError:
             manifest = None
-        if not isinstance(manifest, dict) or any(
+        if not isinstance(manifest, dict) or "seed_sha256" not in manifest or any(
                 field not in manifest for field, _ in MANIFEST_CONTRACT):
             plan_flags.append("manifest_incomplete")
             manifest = None
@@ -1156,6 +1196,10 @@ def aggregate(runs_dir, scenarios_dir=None):
             if not ok(manifest[field]):
                 plan_flags.append("manifest_plan_mismatch" if field == "plan"
                                   else "manifest_identity_invalid")
+        # seed digests are per scenario, so they are checked where the scenarios
+        # dir is known rather than in the value table above
+        if manifest.get("seed_sha256") != frozen_seed_digests(scenarios_dir):
+            plan_flags.append("manifest_identity_invalid")
         # Every run must be a run OF the experiment the manifest describes.
         if any(g["identity"].get("git_head") != manifest.get("git_head")
                or g["identity"].get("binary_sha256") != manifest.get("binary_sha256")

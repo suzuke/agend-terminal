@@ -178,8 +178,10 @@ MF_OUT="$OUT" MF_STAMP="$STAMP" MF_MODEL="$MODEL" MF_GIT="$GIT_HEAD" \
 MF_REPO="$REPO" MF_HERE="$HERE" MF_PLAN="$PLAN" MF_MISSING="$MISSING" \
 MF_JOBS="$JOBS" MF_DRY="$DRY" \
 python3 - > "$OUT/manifest.json" <<'PY'
-import hashlib, json, os, datetime
+import hashlib, json, os, sys, datetime
 E = os.environ
+sys.path.insert(0, E["MF_HERE"])
+import grade
 
 def sha(p):
     try:
@@ -214,6 +216,13 @@ json.dump({
     },
     "prompt_sha256": {
         n: sha(os.path.join(here, "prompts", f"{n}.txt")) for n in ("base", "mcp", "cli")
+    },
+    # the identity the runs will record, stated by the tree up front: the fleet
+    # template sandbox.sh writes, and each planned scenario's seed script
+    "fleet_sha256": grade.frozen_fleet_digest(),
+    "seed_sha256": {
+        row["scenario"]: sha(os.path.join(here, "scenarios", row["scenario"], "seed.sh"))
+        for row in plan
     },
     "missing_scenarios": E["MF_MISSING"].split(),
     "total_runs": len(plan),

@@ -132,7 +132,7 @@ def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
             "binary_sha256": {"agend-terminal": "0" * 64, "agend-mcp-bridge": "0" * 64},
             "system_prompt_sha256": "0" * 64,
             "prompt_sha256": scenario_file_sha(base, scenario, "prompt.txt"),
-            "fleet_sha256": "0" * 64,
+            "fleet_sha256": grade.frozen_fleet_digest(),
             "seed_sha256": scenario_file_sha(base, scenario, "seed.sh"),
             "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
             "duration_ms": 1000, "fence": True, "exit_code": 0,
@@ -149,7 +149,8 @@ def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
     if init and not any(e.get("type") == "system" and e.get("subtype") == "init"
                         for e in stream if isinstance(e, dict)):
         stream.insert(0, {"type": "system", "subtype": "init",
-                          "model": meta.get("model_resolved")})
+                          "model": meta.get("model_resolved"),
+                          "claude_code_version": meta.get("claude_version")})
     with open(os.path.join(run_dir, "stream.jsonl"), "w", encoding="utf-8") as fh:
         for event in stream:
             fh.write(json.dumps(event) + "\n")
@@ -211,6 +212,11 @@ def write_manifest(runs_dir, **overrides):
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "prompts", "%s.txt" % name)) for name in ("base", "mcp", "cli")},
                 "missing_scenarios": [], "total_runs": 210,
+                "fleet_sha256": grade.frozen_fleet_digest(),
+                "seed_sha256": {scenario: sha_of(os.path.join(
+                    os.path.dirname(os.path.abspath(runs_dir)), "scenarios",
+                    scenario, "seed.sh"))
+                    for scenario in ["S0%d" % i for i in range(1, 7)] + ["S13", "S14"]},
                 "plan": frozen_manifest_rows()}
     manifest.update(overrides)
     for key in [k for k, v in overrides.items() if v is DROP]:
@@ -1073,11 +1079,12 @@ class Aggregation(TempCase):
         self.assertIn("manifest_identity_mismatch", summary["plan_gate"]["flags"])
 
     def test_the_matrix_must_be_one_experiment_not_several(self):
-        """fleet identity is matrix-wide; seed identity is per scenario.
+        """What is left to bind once the frozen files bind the rest.
 
-        A matrix assembled from two different fleets, or a scenario whose runs
-        were seeded from two different seed scripts, is not one experiment — and
-        nothing said so.
+        A fleet or seed hash that is not the frozen file now has its own, sharper
+        refusal. The CLI VERSION has no frozen file — two runs can each agree with
+        their own stream and still come from different installs — so the
+        matrix-wide check is what catches that.
         """
         runs, scen = self.frozen_matrix()
         victim = os.path.join(runs, "S02-cli-p4", "metadata.json")
@@ -1086,23 +1093,21 @@ class Aggregation(TempCase):
         meta["fleet_sha256"] = "a" * 64
         with open(victim, "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
-        split_fleet = grade.aggregate(runs, scen)
-        self.assertFalse(split_fleet["plan_gate"]["pass"])
-        self.assertIn("run_identity_split", split_fleet["plan_gate"]["flags"])
+        wrong_fleet = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in wrong_fleet["invalid"]], ["fleet_not_frozen"])
 
-        # A seed that differs from the frozen seed.sh has a sharper answer than
-        # "the runs disagree": that run is not a run of this scenario at all.
         self.setUp()
         runs, scen = self.frozen_matrix()
-        victim = os.path.join(runs, "S03-mcp-p5", "metadata.json")
-        with open(victim, "r", encoding="utf-8") as fh:
-            meta = json.load(fh)
-        meta["seed_sha256"] = "b" * 64
-        with open(victim, "w", encoding="utf-8") as fh:
-            json.dump(meta, fh)
-        reseeded = grade.aggregate(runs, scen)
-        self.assertEqual([e["reason"] for e in reseeded["invalid"]], ["seed_not_frozen"])
-        self.assertFalse(reseeded["pilot_safety"])
+        # self-consistent, and from another install
+        write_run(runs, "S03", "mcp", 5, [{"type": "system", "subtype": "init",
+                                           "model": "claude-fable-5",
+                                           "claude_code_version": "9.9.9"}],
+                  meta_extra={"claude_version": "9.9.9"})
+        split = grade.aggregate(runs, scen)
+        self.assertEqual(split["invalid"], [], "each run agrees with its own stream")
+        self.assertFalse(split["plan_gate"]["pass"])
+        self.assertIn("run_identity_split", split["plan_gate"]["flags"])
+
 
     # ---- A⁶ review: every manifest field, and the frozen tree as the binding ----
 
