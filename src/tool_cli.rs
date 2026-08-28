@@ -190,6 +190,7 @@ fn print_response_payload(response: &Value, class: ResponseClass) {
     if class == ResponseClass::ToolError {
         if let Some(error) = payload.get("error").and_then(Value::as_str) {
             eprintln!("tool error: {error}");
+            // stringly-allow: non-authoritative UX schema-help classification of an already-returned untyped MCP error; not authorization/outcome classification.
             if error.contains("missing") || error.contains("unknown") || error.contains("required")
             {
                 eprintln!("Inspect parameters with `agend-terminal tool schema <NAME>`.");
