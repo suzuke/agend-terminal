@@ -130,6 +130,46 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
 /// step. Exits when the listener is dropped or accept errors
 /// terminally (e.g. agent removal via `delete_transaction` closes the
 /// underlying socket file).
+/// One client's output forwarder: pump broadcast frames at `write_stream`
+/// until the client goes away, the generation's subscriber drops, or this
+/// bridge is retired.
+///
+/// Extracted from the accept loop so a test can drive the REAL function over a
+/// loopback socket pair with a real `crossbeam` receiver, and observe the actual
+/// shutdown side effect rather than the shape of the source.
+///
+/// Socket ownership is the subtle part: the accept loop hands the INPUT thread
+/// another handle on the same connection, so dropping `write_stream` here does
+/// NOT close the connection. Only an explicit `shutdown` does — which is why
+/// every terminal path that must be visible to the peer has to call it.
+pub(crate) fn forward_tui_output(
+    mut write_stream: std::net::TcpStream,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    run_dir: std::path::PathBuf,
+    name: String,
+    port: u16,
+) {
+    loop {
+        match rx.recv_timeout(RETIREMENT_POLL) {
+            Ok(data) => {
+                if framing::write_frame(&mut write_stream, &data).is_err() {
+                    break;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Closing the socket is the load-bearing act: it is what makes a
+                // retained pane observe EOF, flip `connected` false, and become a
+                // reconnect candidate.
+                if is_retired(&run_dir, &name, port) {
+                    let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
     let TuiListenerMeta {
         listener,
@@ -226,7 +266,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             continue;
         }
 
-        let mut write_stream = match stream.try_clone() {
+        let write_stream = match stream.try_clone() {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -244,24 +284,8 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         // here needs no shared client list and cannot retain a dead clone.
         if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_out"))
-            .spawn(move || loop {
-                match rx.recv_timeout(RETIREMENT_POLL) {
-                    Ok(data) => {
-                        if framing::write_frame(&mut write_stream, &data).is_err() {
-                            break;
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Closing the socket is the load-bearing act: it is what
-                        // makes a retained pane observe EOF, flip `connected`
-                        // false, and become a reconnect candidate.
-                        if is_retired(&retire_dir, &retire_name, port) {
-                            let _ = write_stream.shutdown(std::net::Shutdown::Both);
-                            break;
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                }
+            .spawn(move || {
+                forward_tui_output(write_stream, rx, retire_dir, retire_name, port);
             })
         {
             tracing::warn!(agent = %n, error = %e, "failed to spawn TUI output thread");
@@ -323,6 +347,143 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    /// A connected loopback pair plus a SECOND handle on the server side.
+    ///
+    /// The second handle is the point: in production the accept loop gives the
+    /// INPUT thread another handle on the same connection, so dropping the
+    /// forwarder's handle does not close anything. Holding one here makes these
+    /// tests observe the same truth — only an explicit `shutdown` reaches the peer.
+    struct SocketPair {
+        server: TcpStream,
+        _server_input_side: TcpStream,
+        peer: TcpStream,
+    }
+
+    fn socket_pair() -> SocketPair {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let input_side = server.try_clone().unwrap();
+        SocketPair {
+            server,
+            _server_input_side: input_side,
+            peer,
+        }
+    }
+
+    fn scratch_run_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-3373-fwd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn publish_port(run_dir: &std::path::Path, name: &str, port: u16) {
+        std::fs::write(run_dir.join(format!("{name}.port")), port.to_string()).unwrap();
+    }
+
+    /// Drain `peer` until it reports EOF, or give up. Draining matters: an
+    /// undrained socket would fill and stall the forwarder in `write_frame`,
+    /// which would make the test pass for the wrong reason.
+    fn peer_sees_eof(mut peer: TcpStream, budget: Duration) -> bool {
+        peer.set_read_timeout(Some(budget)).unwrap();
+        let deadline = Instant::now() + budget;
+        let mut buf = [0u8; 8192];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return false
+                }
+                Err(_) => return true,
+            }
+        }
+    }
+
+    /// #3373 follow-up: retirement must not depend on the channel going quiet.
+    /// A generation that is still producing output keeps `recv_timeout` in its
+    /// `Ok` arm, so a retirement check that only lives in the timeout arm is
+    /// never consulted and the stale pane socket stays open.
+    #[test]
+    fn retirement_is_observed_while_output_is_still_flowing() {
+        let run_dir = scratch_run_dir("busy");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+
+        // Keep the channel continuously ready for the whole test.
+        let producer = std::thread::spawn(move || {
+            while tx.send(vec![b'x'; 256]).is_ok() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let dir = run_dir.clone();
+        let forwarder = std::thread::spawn(move || {
+            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242);
+        });
+
+        // Retire this bridge: the successor republishes the name on a new port.
+        publish_port(&run_dir, "agent", 4343);
+
+        let closed = peer_sees_eof(pair.peer, Duration::from_secs(5));
+        let _ = forwarder.join();
+        drop(producer);
+        std::fs::remove_dir_all(&run_dir).ok();
+        assert!(
+            closed,
+            "a retired bridge must close its client socket even while output is still flowing; \
+             a check that only runs in the recv timeout arm never fires on a busy channel"
+        );
+    }
+
+    /// #3373 follow-up: the generation's subscriber dropping is a terminal path
+    /// too, and the peer must see it. Dropping the forwarder's handle is not
+    /// enough — the input thread holds another handle on the same connection.
+    #[test]
+    fn subscriber_disconnect_closes_the_client_socket() {
+        let run_dir = scratch_run_dir("disconnect");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+
+        let dir = run_dir.clone();
+        let forwarder = std::thread::spawn(move || {
+            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242);
+        });
+
+        // The agent is deleted: its broadcast senders go away.
+        drop(tx);
+
+        let closed = peer_sees_eof(pair.peer, Duration::from_secs(5));
+        let _ = forwarder.join();
+        std::fs::remove_dir_all(&run_dir).ok();
+        assert!(
+            closed,
+            "a Disconnected subscriber must close the client socket; breaking without shutdown \
+             leaves the pane attached to the dead generation (the original #3373 symptom)"
+        );
+    }
+
     /// #3373: the retirement predicate. A bridge is stale the moment
     /// `{name}.port` stops naming its own port — which is exactly what the
     /// restart delete (`ipc::remove_port`) plus the successor's republish do.
