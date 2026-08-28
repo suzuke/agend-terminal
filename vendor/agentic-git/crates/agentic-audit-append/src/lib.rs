@@ -101,6 +101,14 @@ pub enum AppendError {
     /// The lock file or the log could not be opened. **Nothing was written**; this
     /// happens before the lock is taken and before any write.
     Open(std::io::Error),
+    /// The lock syscall itself failed — distinct from the lock merely being held,
+    /// which is [`Contended`](AppendError::Contended). **Nothing was written**:
+    /// both files opened, but the lock was never acquired so no write ran.
+    ///
+    /// Separate from [`Open`](AppendError::Open) because by this point both opens
+    /// have already SUCCEEDED. Folding it into `Open` made the error tell an
+    /// operator to check permissions and disk for a failure that was neither.
+    Lock(std::io::Error),
     /// `write_all` failed while the lock was held. **A partial record may be on
     /// disk**: `write_all` can fail after some bytes have already reached the file,
     /// and this crate does not roll that back.
@@ -122,6 +130,10 @@ impl std::fmt::Display for AppendError {
             AppendError::Open(e) => {
                 write!(f, "audit log could not be opened; nothing was appended: {e}")
             }
+            AppendError::Lock(e) => write!(
+                f,
+                "audit log lock could not be acquired; nothing was appended: {e}"
+            ),
             AppendError::Write(e) => write!(
                 f,
                 "audit log write failed after the lock was taken; a partial record may be on disk: {e}"
@@ -134,7 +146,7 @@ impl std::error::Error for AppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AppendError::Contended => None,
-            AppendError::Open(e) | AppendError::Write(e) => Some(e),
+            AppendError::Open(e) | AppendError::Lock(e) | AppendError::Write(e) => Some(e),
         }
     }
 }
@@ -214,6 +226,19 @@ fn append_audit_line(
     result
 }
 
+/// Map one `try_lock` outcome onto the error the caller sees.
+///
+/// Pure and separate from [`acquire`] so the mapping is unit-testable: there is no
+/// portable way to make `flock` fail on demand, and the mapping is what went wrong
+/// in r1 — a lock-syscall failure was reported as an open failure even though both
+/// opens had already succeeded.
+fn classify_lock_error(error: fs4::TryLockError) -> AppendError {
+    match error {
+        fs4::TryLockError::WouldBlock => AppendError::Contended,
+        fs4::TryLockError::Error(e) => AppendError::Lock(e),
+    }
+}
+
 fn acquire(lock: &File, mode: Acquire) -> Result<(), AppendError> {
     // Explicit trait syntax throughout: Rust 1.89 stabilized an inherent
     // `File::lock`/`try_lock` with these names, and at the workspace MSRV the
@@ -222,8 +247,7 @@ fn acquire(lock: &File, mode: Acquire) -> Result<(), AppendError> {
     match mode {
         Acquire::TryOnce => match fs4::FileExt::try_lock(lock) {
             Ok(()) => Ok(()),
-            Err(fs4::TryLockError::WouldBlock) => Err(AppendError::Contended),
-            Err(fs4::TryLockError::Error(e)) => Err(AppendError::Open(e)),
+            Err(error) => Err(classify_lock_error(error)),
         },
         Acquire::Bounded(budget) => {
             let deadline = Instant::now() + budget;
@@ -236,7 +260,9 @@ fn acquire(lock: &File, mode: Acquire) -> Result<(), AppendError> {
                         }
                         std::thread::sleep(RETRY_INTERVAL);
                     }
-                    Err(fs4::TryLockError::Error(e)) => return Err(AppendError::Open(e)),
+                    // Retrying cannot fix a failing lock syscall, so it is returned
+                    // immediately rather than burning the budget on it.
+                    Err(error) => return Err(classify_lock_error(error)),
                 }
             }
         }
