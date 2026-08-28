@@ -1460,6 +1460,57 @@ mod tests {
     /// `resize` and the accept loop supplies the real one. The scan follows it
     /// there — same invariant, new address.
     #[test]
+    /// #3421 item1 RED: the guard below scopes its NEGATIVE assertions to two
+    /// slices — the `TAG_RESIZE` match arm and the resize-effect closure — so a
+    /// module-level helper that touches `dev_modal::` or `note_pty_write` and is
+    /// merely CALLED from the resize path sits outside both and is invisible to it.
+    /// The positive assertions are correctly scoped; only the negatives are too
+    /// narrow.
+    ///
+    /// This test pins the escape twice over. First it confirms the escape is real:
+    /// with a module-level helper appended, the shipped slicing still reports the
+    /// arm as clean. Then it requires a predicate that scans the FULL production
+    /// region to flag it — which is what does not exist yet, so this is a
+    /// compile-RED at a77b6837.
+    ///
+    /// A compile-RED proves test-first ORDERING only. The GREEN commit carries the
+    /// mutation replay that proves the strengthened predicate also DISCRIMINATES,
+    /// since ordering alone would not.
+    #[test]
+    fn a_module_level_helper_escapes_the_slice_scoped_negatives() {
+        let src = include_str!("tui_bridge.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
+
+        // The exact escape: a helper OUTSIDE the resize arm and outside the resize
+        // effect closure, of the shape a refactor would naturally produce.
+        let poisoned = format!(
+            "{prod}\nfn resize_bookkeeping(c: &mut Core) {{ dev_modal::note_pty_write(c); }}\n"
+        );
+
+        // 1. The escape is real: the shipped slicing sees nothing wrong.
+        let resize_arm = poisoned
+            .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
+            .expect("production TAG_RESIZE arm must exist")
+            .1
+            .split_once("_ => break,")
+            .expect("TAG_RESIZE arm must end before the fallback arm")
+            .0;
+        assert!(
+            !resize_arm.contains("dev_modal::") && !resize_arm.contains("note_pty_write"),
+            "precondition: the slice-scoped negative must still read as clean, or this \
+             test is no longer demonstrating the escape it was written for"
+        );
+
+        // 2. A full-region predicate must flag it. This is the RED.
+        let violations = super::modal_state_touches_in_production(&poisoned);
+        assert!(
+            !violations.is_empty(),
+            "a module-level helper touching modal state must be caught wherever it \
+             sits in the production region, not only inside the resize slices"
+        );
+    }
+
     fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
         let src = include_str!("tui_bridge.rs");
         let cfg_test = ["#[cfg(", "test)]"].concat();
