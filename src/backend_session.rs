@@ -230,20 +230,39 @@ fn codex_global(token: &str) -> Option<&'static CodexGlobal> {
         .find(|g| token == g.long || g.short.is_some_and(|short| token == short))
 }
 
-/// Is this a KNOWN global written in the `long=VALUE` inline form?
+/// Is this a KNOWN global carrying its value INLINE, in any of the three
+/// spellings the installed CLI accepts?
 ///
-/// The value is not inspected. `--model=` is not untranscribed grammar — it is
-/// this exact form with an empty VALUE, which clap accepts
-/// (`codex resume --model= sess` parses on the installed binary). Judging the
-/// value here made the sanitizer stricter than the CLI it models.
+/// - `--long=VALUE`
+/// - `-x=VALUE`
+/// - `-xVALUE`   (glued, no separator)
 ///
-/// Either way the token owns no FOLLOWING argv slot, which is what both
-/// scanners need to know.
-fn codex_global_equals_form(token: &str) -> bool {
+/// The value is never inspected. `--model=` and `-m=` are not untranscribed
+/// grammar — they are these exact forms with an empty VALUE, which clap
+/// accepts. Judging the value made the sanitizer stricter than the CLI it
+/// models; treating a short spelling as unknown was worse, because an
+/// unrecognised flag poisons the later `resume` decision and refuses a legal
+/// restart.
+///
+/// Driven entirely by the typed table, so a spelling can never be recognised
+/// here without being declared there. All three forms mean the same thing to
+/// both scanners: the token owns no FOLLOWING argv slot — including the
+/// variadic `-i`, whose inline value already satisfies `<FILE>...`.
+fn codex_global_inline_value(token: &str) -> bool {
     CODEX_GLOBALS.iter().any(|g| {
-        token
+        if token
             .strip_prefix(g.long)
             .is_some_and(|rest| rest.starts_with('='))
+        {
+            return true;
+        }
+        g.short.is_some_and(|short| {
+            // `-m` alone is the separated form, handled by the arity walk;
+            // anything glued after it is an inline value (`-m=gpt`, `-mgpt`).
+            token
+                .strip_prefix(short)
+                .is_some_and(|rest| !rest.is_empty())
+        }) && g.arity != GlobalArity::Flag
     })
 }
 
@@ -278,7 +297,7 @@ fn codex_consume_resume(
             continue;
         }
 
-        if codex_global_equals_form(tok) {
+        if codex_global_inline_value(tok) {
             out.push(tok.clone());
             probe += 1;
             continue;
@@ -380,7 +399,7 @@ pub fn sanitize_for_fresh(
             // `-i a.png resume` (image filename) from being read as the
             // subcommand. Equals forms carry their value inline and fall
             // through to the passthrough below without a value lookup.
-            if codex_global_equals_form(tok) {
+            if codex_global_inline_value(tok) {
                 out.push(tok.clone());
                 index += 1;
                 continue;
