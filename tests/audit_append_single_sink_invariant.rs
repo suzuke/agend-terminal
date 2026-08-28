@@ -82,6 +82,48 @@ fn repo_root() -> PathBuf {
 /// `#[cfg(all(test, unix))]`, `#[cfg(any(test, …))]`. Token-stream matching rather
 /// than chasing syn's `Meta` tree, matching the convention already used by
 /// `tests/cargo_include_invariant.rs`.
+/// Does this cfg predicate GUARANTEE that the item compiles only under `cfg(test)`?
+///
+/// Asking "does the token `test` appear" is the wrong question, and it inverts on
+/// the spelling that matters most: `not(test)` contains the token and means
+/// production-ONLY. The predicate is parsed instead:
+///
+/// * `test` — yes.
+/// * `all(..)` — yes if ANY child guarantees it; every child must hold, so one
+///   test-only child is enough.
+/// * `any(..)` — yes only if EVERY child guarantees it; otherwise some other arm
+///   can satisfy the cfg in a production build.
+/// * `not(..)` — never. `not(test)` is production-only, and `not(<anything>)`
+///   cannot guarantee test-only compilation.
+/// * anything else (a feature, a target, an unparsed shape) — no.
+///
+/// Unknown predicates therefore fall to "scan it", which is the fail-closed
+/// direction for a guard that exists to stop production writes.
+fn cfg_guarantees_test_only(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::List(list) => {
+            if list.path.is_ident("not") {
+                return false;
+            }
+            let Ok(nested) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                // An unparseable predicate is not a guarantee of anything.
+                return false;
+            };
+            if list.path.is_ident("all") {
+                nested.iter().any(cfg_guarantees_test_only)
+            } else if list.path.is_ident("any") {
+                !nested.is_empty() && nested.iter().all(cfg_guarantees_test_only)
+            } else {
+                false
+            }
+        }
+        syn::Meta::NameValue(_) => false,
+    }
+}
+
 fn attrs_contain_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         if !a.path().is_ident("cfg") {
@@ -90,10 +132,10 @@ fn attrs_contain_cfg_test(attrs: &[syn::Attribute]) -> bool {
         let syn::Meta::List(list) = &a.meta else {
             return false;
         };
-        list.tokens
-            .to_string()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|tok| tok == "test")
+        let Ok(inner) = list.parse_args::<syn::Meta>() else {
+            return false;
+        };
+        cfg_guarantees_test_only(&inner)
     })
 }
 
@@ -413,11 +455,13 @@ fn genuinely_test_only_cfgs_are_still_excluded() {
 /// `#[cfg(test)] mod x;` DECLARATION, which is not a region boundary at all.
 #[test]
 fn test_gated_code_is_excluded_in_every_cfg_spelling() {
-    for gate in [
-        "#[cfg(test)]",
-        "#[cfg(all(test, unix))]",
-        "#[cfg(any(test, feature = \"x\"))]",
-    ] {
+    // `any(test, feature = "x")` USED to be listed here as excluded. It is not
+    // test-only — the item compiles whenever the feature is on, so it reaches
+    // production — and it now lives in
+    // `production_only_cfgs_are_scanned_not_skipped` as a scanned case. That
+    // expectation was unsound rather than merely untested, so it is corrected
+    // here rather than carried.
+    for gate in ["#[cfg(test)]", "#[cfg(all(test, unix))]"] {
         let src = format!(
             r#"{gate}
                mod tests {{ fn t() {{ let mut f = open(); let _ = writeln!(f, "x"); }} }}"#
