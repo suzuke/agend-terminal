@@ -223,6 +223,25 @@ fn greet_authenticated_client(stream: &mut std::net::TcpStream, dump: &[u8]) -> 
     framing::write_frame(stream, dump).is_ok()
 }
 
+/// Start a client's output forwarder, and report whether it started.
+///
+/// A refused spawn is fail-closed rather than logged and stepped over: that
+/// forwarder is this connection's ONLY retirement watcher, and the input thread
+/// holds another handle on the same socket, so a client left running without one
+/// would keep a live socket to a generation that is trying to go away. `spawn` is
+/// injected so a test can drive the refusal, which is otherwise unreachable
+/// without exhausting the process's threads.
+fn start_tui_output_thread(
+    stream: &std::net::TcpStream,
+    spawn: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let started = spawn();
+    if started.is_err() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    started
+}
+
 /// One client's output forwarder: pump broadcast frames at `write_stream`
 /// until the client goes away, the generation's subscriber drops, or this
 /// bridge is retired.
@@ -392,20 +411,25 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         let retire_name = n.clone();
         // fire-and-forget: per-client TUI output forwarder. Loop exits when
         // the broadcast subscriber rx drops (agent removed via
-        // delete_transaction), when frame write fails (client disconnect), or
-        // when this bridge is retired. No graceful join needed — each client
-        // connection is independent.
-        // No leak: every exit path drops this thread's only socket handle, and
-        // the disconnect path is reached by write_frame failing. #3373 adds the
-        // retirement path — this thread owns the client socket, so retiring it
-        // here needs no shared client list and cannot retain a dead clone.
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("{n}_tui_out"))
-            .spawn(move || {
-                forward_tui_output(write_stream, rx, retire_dir, retire_name, port);
-            })
-        {
-            tracing::warn!(agent = %n, error = %e, "failed to spawn TUI output thread");
+        // delete_transaction), when a frame write fails (client disconnect or
+        // the bounded write budget), or when this bridge is retired. No graceful
+        // join needed — each client connection is independent.
+        // No leak: every exit path shuts the connection down and drops this
+        // thread's handle. Shutting down is the load-bearing half, because this
+        // thread does NOT hold the only handle — the input thread below holds
+        // another on the same connection, so dropping ours would close nothing.
+        // #3373 adds the retirement path, and a refused spawn is fail-closed:
+        // without this thread the connection has no retirement watcher at all.
+        if let Err(e) = start_tui_output_thread(&stream, || {
+            std::thread::Builder::new()
+                .name(format!("{n}_tui_out"))
+                .spawn(move || {
+                    forward_tui_output(write_stream, rx, retire_dir, retire_name, port);
+                })
+                .map(|_| ())
+        }) {
+            tracing::warn!(agent = %n, error = %e, "TUI output thread refused; client closed");
+            continue;
         }
 
         let read_stream = stream;
