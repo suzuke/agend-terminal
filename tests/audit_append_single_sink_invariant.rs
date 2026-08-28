@@ -156,8 +156,9 @@ impl<'ast> Visit<'ast> for SinkAudit {
     fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
         let name = c.method.to_string();
         if BANNED_METHODS.contains(&name.as_str()) {
-            self.violations
-                .push(format!("`.{name}(..)` in production: writes bytes to a handle"));
+            self.violations.push(format!(
+                "`.{name}(..)` in production: writes bytes to a handle"
+            ));
         }
         syn::visit::visit_expr_method_call(self, c);
     }
@@ -325,9 +326,86 @@ fn doc_comments_may_name_the_audit_file_but_code_may_not() {
 
     let in_code = r#"fn f() { let p = home.join("fleet_events.jsonl"); }"#;
     assert!(
-        !SinkAudit::scan(in_code).expect("must parse").violations.is_empty(),
+        !SinkAudit::scan(in_code)
+            .expect("must parse")
+            .violations
+            .is_empty(),
         "the same name in CODE must be a violation"
     );
+}
+
+/// #3416 correction: the gate must recognise test-gating from the PARSED cfg
+/// meta, not from the presence of the token `test` anywhere in it.
+///
+/// The token scan says "contains `test`, therefore test-gated", which inverts on
+/// the one spelling that means the opposite. `#[cfg(not(test))]` is
+/// PRODUCTION-ONLY code — it exists in exactly the builds this guard protects —
+/// and a sink could put its file write behind it and be skipped entirely. That is
+/// a bypass in a guard whose whole claim is that it cannot be bypassed.
+///
+/// `any(test, feature = "x")` is the same shape one step out: the item compiles
+/// whenever the feature is on, so it reaches production too. Only a cfg that
+/// GUARANTEES test-only compilation may be skipped, and the safe reading of an
+/// unknown predicate is to scan it.
+#[test]
+fn production_only_cfgs_are_scanned_not_skipped() {
+    let bypasses = [
+        (
+            "cfg(not(test)) is production-ONLY — the inversion the token scan misses",
+            r#"#[cfg(not(test))]
+               fn prod() { let mut f = open(); let _ = writeln!(f, "x"); }"#,
+        ),
+        (
+            "any(test, feature) still compiles in production when the feature is on",
+            r#"#[cfg(any(test, feature = "x"))]
+               fn prod() { let mut f = open(); let _ = writeln!(f, "x"); }"#,
+        ),
+        (
+            "all(unix, not(test)) — production-only behind a nested not",
+            r#"#[cfg(all(unix, not(test)))]
+               fn prod() { let mut f = open(); let _ = writeln!(f, "x"); }"#,
+        ),
+        (
+            "not(all(test, unix)) does not guarantee test-only either",
+            r#"#[cfg(not(all(test, unix)))]
+               fn prod() { let mut f = open(); let _ = writeln!(f, "x"); }"#,
+        ),
+        (
+            "a module gated production-only hides its whole body from the token scan",
+            r#"#[cfg(not(test))]
+               mod prod { fn w() { let mut f = open(); let _ = writeln!(f, "x"); } }"#,
+        ),
+    ];
+    for (label, src) in bypasses {
+        let audit = SinkAudit::scan(src).expect("case must parse");
+        assert!(
+            !audit.violations.is_empty(),
+            "production-reachable code was skipped as test-gated ({label}): {src}"
+        );
+    }
+}
+
+/// The other direction, so the correction cannot be a blanket "scan everything":
+/// a cfg that genuinely guarantees test-only compilation must still be excluded,
+/// including nested spellings.
+#[test]
+fn genuinely_test_only_cfgs_are_still_excluded() {
+    for gate in [
+        "#[cfg(test)]",
+        "#[cfg(all(test, unix))]",
+        "#[cfg(all(unix, all(test, target_os = \"macos\")))]",
+        "#[cfg(any(test, test))]",
+    ] {
+        let src = format!(
+            r#"{gate}
+               mod tests {{ fn t() {{ let mut f = open(); let _ = writeln!(f, "x"); }} }}"#
+        );
+        let audit = SinkAudit::scan(&src).expect("must parse");
+        assert!(
+            audit.violations.is_empty(),
+            "{gate}: a write inside genuinely test-only code must not count as production"
+        );
+    }
 }
 
 /// Test-gated code is excluded structurally, in every cfg spelling — including the
