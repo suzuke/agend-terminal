@@ -20,6 +20,18 @@ fn minimal_runtime() -> RuntimeContext {
 /// id. Under R3 finding 2 an EXISTING-task dispatch must reference a task that
 /// carries durable review_class metadata (a send arg can NOT fill a missing one), so
 /// dispatch tests exercising the lease/watch path seed a real tagged task here.
+/// A board task that exists but carries NO review_class metadata — the shape
+/// the #2745 matrix needs now that the exact-task resolver distinguishes "task
+/// not found" (`review_class_route_unresolved`) from "task has no class".
+fn create_untagged_task(home: &std::path::Path) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "seed (untagged)"}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
 fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     let created = crate::tasks::handle(
         home,
@@ -1122,7 +1134,9 @@ fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
 fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
     use crate::identity::Sender;
 
-    // T-100 is REFERENCED but has NO review_class metadata on the board. Per R3
+    // The referenced task EXISTS but has NO review_class metadata on the board
+    // (#3419: a task id that is not on the board is refused earlier as
+    // `review_class_route_unresolved`, which is a different finding). Per R3
     // finding 2, a send `review_class` arg / `second_reviewer` is consistency-evidence
     // only — it can NEVER supply the missing durable authority for an existing task.
     // So EVERY case fails closed with `review_class_unspecified` (never a silent arm).
@@ -1138,11 +1152,12 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).ok();
         setup_test_repo(&home, "target-agent");
+        let untagged = create_untagged_task(&home);
 
         let mut args = serde_json::json!({
             "instance": "target-agent",
             "task": "implement feature X",
-            "task_id": "T-100",
+            "task_id": untagged,
             "branch": "feat/p02-reject",
             "repository": "owner/repo",
         });
@@ -4536,13 +4551,18 @@ fn typed_send_echoes_normalized_ci_watch_targets_3145() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #3145 RED: a skipped auto-bind must not claim that a CI watch was armed.
+/// #3145 pinned "bind:false must not report an ARMED watch" while bind:false
+/// skipped the watch entirely. #3419 changed that contract: a `bind: false`
+/// branch dispatch still runs the authority preflight and arms the EQUIVALENT
+/// typed CI watch — only the worktree binding is skipped — so it can never be
+/// used to bypass the review gate. This is the replacement pin: the watch is
+/// armed, it carries the task's class, and no binding was created.
 #[test]
-fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
+fn typed_send_arms_typed_watch_without_binding_when_bind_is_false_3419() {
     use crate::identity::Sender;
 
     let home = std::env::temp_dir().join(format!(
-        "agend-3145-ci-watch-skipped-{}",
+        "agend-3419-bind-false-typed-watch-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&home);
@@ -4556,9 +4576,9 @@ fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
         &serde_json::json!({
             "instance": "target-agent",
             "request_kind": "task",
-            "message": "do not arm a watch",
+            "message": "arm the typed watch, do not bind",
             "task_id": tid,
-            "branch": "feat/3145-skipped",
+            "branch": "feat/3419-bind-false",
             "repository": "owner/repo",
             "bind": false
         }),
@@ -4566,9 +4586,24 @@ fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
         Some(&minimal_runtime()),
     );
 
+    assert_eq!(
+        result["ci_watch"]["armed"],
+        serde_json::json!(true),
+        "#3419: bind:false must arm the typed watch: {result}"
+    );
     assert!(
-        result.get("ci_watch").is_none(),
-        "#3145: bind:false must not report an armed watch: {result}"
+        crate::binding::read(&home, "target-agent").is_none(),
+        "#3419: bind:false must not create a binding: {result}"
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-bind-false");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    let watch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&watch_path).expect("armed watch sidecar must exist"),
+    )
+    .expect("watch sidecar is JSON");
+    assert_eq!(
+        watch["review_class"], "single",
+        "#3419: the armed watch must carry the task's resolved class: {watch}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
