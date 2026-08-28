@@ -598,6 +598,124 @@ mod tests {
     use super::should_fire_terminal_p0;
     use crate::teams::SelfOrchStatus;
 
+    fn cfg(backend: crate::backend::Backend, args: &[&str]) -> crate::daemon::AgentConfig {
+        crate::daemon::AgentConfig {
+            name: "crashed".to_string(),
+            backend: Some(backend),
+            backend_command: "claude".to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            env: None,
+            working_dir: None,
+            submit_key: "\r".to_string(),
+        }
+    }
+
+    /// #3414 RED: crash respawn is a FRESH spawn — it hands
+    /// `SpawnMode::Fresh` to `spawn_agent` — but it passed the instance's
+    /// stored args straight through, so the session contract #3414 established
+    /// for `restart_instance` stopped at that one entry point.
+    ///
+    /// The production case is the same one #3414 was written for: a durable
+    /// `--resume <uuid>` in fleet.yaml. A crashed Claude agent came back holding
+    /// the conversation it crashed in, on a path that never asks the operator
+    /// for anything. Unrelated flags must survive, exactly as on the restart
+    /// path.
+    #[test]
+    fn crash_respawn_strips_the_session_pin_3414() {
+        let config = cfg(
+            crate::backend::Backend::ClaudeCode,
+            &[
+                "--resume",
+                "cb80bb9d-3613-4c0d-9097-788b1941f5db",
+                "--model",
+                "claude-opus-5",
+            ],
+        );
+        let args = super::fresh_respawn_args(&config).expect("declared grammar must resolve");
+        assert!(
+            !args.iter().any(|a| a == "--resume"),
+            "a crash respawn is Fresh: it must not hand a session pin to SPAWN; got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("cb80bb9d")),
+            "the pinned session id must not survive a crash respawn; got {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec!["--model".to_string(), "claude-opus-5".to_string()],
+            "unrelated flags must be preserved byte for byte"
+        );
+    }
+
+    /// #3414 RED: the same fail-closed rule. An unresolvable selector must
+    /// refuse rather than guess, here as on the restart path — guessing would
+    /// either strand the agent on the old session or drop a real value.
+    #[test]
+    fn crash_respawn_fails_closed_on_an_unresolvable_selector_3414() {
+        let config = cfg(crate::backend::Backend::ClaudeCode, &["--resume="]);
+        let error = super::fresh_respawn_args(&config)
+            .expect_err("an unresolvable selector must fail closed");
+        assert_eq!(error.token, "--resume=");
+        assert_eq!(
+            error.reason,
+            crate::backend_session::SessionArgsErrorReason::MissingRequiredValue
+        );
+    }
+
+    /// #3415 RED: the third delivered surface. After a crash respawn the daemon
+    /// writes a line straight into the agent's PTY, and that line asserted what
+    /// the agent remembered — the claim #3415 removed from the other two
+    /// surfaces. It was also FALSE here whenever the stored args carried a pin,
+    /// because this path never sanitized them.
+    ///
+    /// Held to the same shared list as the other two surfaces, so the three
+    /// cannot drift apart.
+    #[test]
+    fn crash_respawn_notice_makes_no_unverifiable_memory_claim_3415() {
+        let notice = super::respawn_notice("a crash");
+        let lower = notice.to_lowercase();
+        for claim in crate::agent::UNVERIFIABLE_MEMORY_CLAIMS {
+            assert!(
+                !lower.contains(*claim),
+                "#3415: the respawn notice must not assert what the agent remembers — found {claim:?}"
+            );
+        }
+        assert!(
+            notice.contains("a crash"),
+            "#3415: it must still state the reason the daemon observed"
+        );
+        assert!(
+            lower.contains("new session"),
+            "#3415: dropping the claim must not drop the duty it carried — the agent has to know this is a new session"
+        );
+    }
+
+    /// #3415 RED: a guard on one function is stepped around by the next inline
+    /// `format!`. The production region of this file must make no such claim
+    /// anywhere, however it is spelled.
+    #[test]
+    fn crash_respawn_production_region_makes_no_memory_claim_3415() {
+        let source = include_str!("crash_respawn.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let production = source
+            .split_once(&cfg_test)
+            .map_or(source, |(before, _)| before);
+        let offenders: Vec<&str> = production
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && crate::agent::UNVERIFIABLE_MEMORY_CLAIMS
+                        .iter()
+                        .any(|claim| line.to_lowercase().contains(*claim))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "#3415: no daemon-authored line here may assert what the agent remembers — found: {offenders:?}"
+        );
+    }
+
     /// #1744-H4: the terminal self-orch P0 fires for a Failed (no-respawn)
     /// self-orchestrator — fail-closed (Yes|Unknown), skipped for No / non-terminal,
     /// and exactly once (the persisted `failed_escalated` latch suppresses re-page,
