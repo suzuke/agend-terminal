@@ -574,6 +574,19 @@ class ReportRendering(TempCase):
                        "fail_cli - fail_mcp"):
             self.assertIn(needle, text)
 
+    def test_report_ends_with_exactly_one_newline(self):
+        # `git diff --check` rejects a blank line at EOF in the committed report.txt
+        sys.path.insert(0, ROOT)
+        import report  # noqa: E402
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [])
+        write_run(runs, "S01", "cli", 1, [])
+        text = report.render(grade.aggregate(runs, scen))
+        self.assertTrue(text.endswith("\n"))
+        self.assertFalse(text.endswith("\n\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -70,4 +70,3 @@ ARTIFACT INDEX
   manifest.json /Users/suzuke/.agend-terminal/worktrees/claude-3df878/eval/3412-tool-cli-phase0b/scripts/eval/tool-cli/runs/20260828T063955Z/manifest.json
   per-run artifacts: <run_dir>/{metadata.json,stream.jsonl,stderr.txt,final_state/,grade.json}
   total_runs=210  valid_runs=210
-

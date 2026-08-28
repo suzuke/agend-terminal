@@ -111,7 +111,6 @@ def render(summary):
     add("  manifest.json %s" % os.path.join(summary["runs_dir"], "manifest.json"))
     add("  per-run artifacts: <run_dir>/{metadata.json,stream.jsonl,stderr.txt,final_state/,grade.json}")
     add("  total_runs=%d  valid_runs=%d" % (summary["total_runs"], summary["valid_runs"]))
-    add("")
     return "\n".join(out) + "\n"
 
 
