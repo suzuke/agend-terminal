@@ -359,6 +359,41 @@ fn accepted_in_progress_is_success_and_preserves_status() {
 }
 
 #[test]
+fn accepted_in_progress_with_result_error_is_tool_error() {
+    let daemon = MockDaemon::new(serde_json::json!({
+        "ok": true,
+        "status": "accepted_in_progress",
+        "result": {"error": "handler failed"}
+    }));
+    let home = daemon.home.clone();
+    let output = run_tool(
+        &home,
+        &[
+            "tool",
+            "send",
+            "--json",
+            r#"{"message":"red"}"#,
+            "--home",
+            home.to_str().unwrap(),
+        ],
+    );
+    let requests = daemon.finish();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "mixed accepted/error response must be ToolError, not Accepted/0: {}",
+        combined(&output)
+    );
+    assert!(
+        combined(&output).contains("tool error: handler failed"),
+        "ToolError diagnostic must remain visible: {}",
+        combined(&output)
+    );
+    assert_cli_envelope(&requests, "send");
+}
+
+#[test]
 fn missing_runtime_config_keeps_cli_fence_closed() {
     let daemon = MockDaemon::new(response("fence_closed"));
     let home = daemon.home.clone();

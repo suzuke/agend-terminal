@@ -460,6 +460,18 @@ mod tests {
     }
 
     #[test]
+    fn accepted_in_progress_with_result_error_is_tool_error() {
+        assert_eq!(
+            classify_response(&json!({
+                "ok": true,
+                "status": "accepted_in_progress",
+                "result": {"error": "handler failed"}
+            })),
+            ResponseClass::ToolError
+        );
+    }
+
+    #[test]
     fn request_id_is_injected_once() {
         let request = with_request_id(&json!({"method": "mcp_tool"}));
         assert!(request["request_id"].as_str().is_some());
