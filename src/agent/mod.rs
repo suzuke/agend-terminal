@@ -2889,10 +2889,19 @@ pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
 /// AUTHORITATIVE live sources; `SESSION-HANDOFF.md` is only a stale-tolerant hint
 /// because a fresh restart's DELETE=kill may have happened before any fresh
 /// handoff was written.
+///
+/// #3415: the opening states the restart and nothing about the agent's memory.
+/// The daemon performed the restart, so that much is observed fact; what
+/// survived inside the agent is not visible from here, and asserting it made the
+/// first sentence of this prompt unverifiable. The operational duty the old
+/// claim carried is stated directly instead — rebuild the in-flight picture from
+/// the sources below rather than recall it — which is what the recovery sequence
+/// needed all along.
 pub(crate) fn fresh_restart_self_kick_prompt() -> String {
     format!(
-        "{DAEMON_RESUME_INJECT_MARKER} You were just fresh-restarted and lost your in-memory \
-         context. If this arrives through Claude ChannelBridge, first call its ack_start tool \
+        "{DAEMON_RESUME_INJECT_MARKER} This session was just fresh-restarted. Treat nothing you \
+         may still recall about work in flight as authoritative — rebuild it from the sources \
+         below before you act on it. If this arrives through Claude ChannelBridge, first call its ack_start tool \
          with the exact delivery_id from the channel metadata, before any recovery action; after \
          the bounded recovery sequence call ack_complete with that same delivery_id; these acks \
          do not send an outward reply. Recover your OWN state now, in this order: (1) rebuild your in-flight picture \
