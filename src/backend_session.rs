@@ -230,6 +230,18 @@ fn codex_global(token: &str) -> Option<&'static CodexGlobal> {
         .find(|g| token == g.long || g.short.is_some_and(|short| token == short))
 }
 
+/// `--model=gpt` carries its value inline, so it owns no following token.
+/// `Some(false)` means the equals form was used with an EMPTY value, which we
+/// refuse rather than guess what it means.
+fn codex_global_equals_form(token: &str) -> Option<bool> {
+    CODEX_GLOBALS.iter().find_map(|g| {
+        token
+            .strip_prefix(g.long)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(|value| !value.is_empty())
+    })
+}
+
 /// Flags `codex resume --help` declares as belonging to the SUBCOMMAND.
 /// Promoting them to top level yields an argv the CLI rejects.
 const CODEX_RESUME_OWNED_FLAGS: &[&str] = &["--last", "--all", "--include-non-interactive"];
@@ -257,6 +269,15 @@ fn codex_consume_resume(
         let tok = &args[probe];
 
         if CODEX_RESUME_OWNED_FLAGS.contains(&tok.as_str()) {
+            probe += 1;
+            continue;
+        }
+
+        if let Some(non_empty) = codex_global_equals_form(tok) {
+            if !non_empty {
+                return Err(());
+            }
+            out.push(tok.clone());
             probe += 1;
             continue;
         }
@@ -289,10 +310,12 @@ fn codex_consume_resume(
             continue;
         }
 
-        // An unknown flag is grammar we did not transcribe; end the scope
-        // rather than guess what owns what.
+        // An unknown flag is grammar we did not transcribe. Ending the scope
+        // and letting the outer loop preserve what follows would itself be a
+        // guess — those tokens may be this flag's values or resume's
+        // positionals, and either choice rewrites the argv.
         if tok.starts_with('-') {
-            break;
+            return Err(());
         }
 
         positionals += 1;
@@ -336,6 +359,14 @@ pub fn sanitize_for_fresh(
     // Coupled flags may PRECEDE their selector, so they are withheld and
     // resolved after the whole flag territory is known — order must not decide.
     let mut deferred_coupled: Vec<String> = Vec::new();
+    // Codex command-position state. `resume` is a subcommand ONLY at the first
+    // non-global command position, and only while every token before it came
+    // from grammar we transcribed. Once an ordinary positional takes the slot,
+    // or an unknown flag makes it unclear whether a later `resume` is that
+    // flag's VALUE, reclassifying it would rewrite the argv into a different
+    // valid one instead of refusing.
+    let mut subcommand_slot_open = true;
+    let mut unresolved_unknown = false;
     let mut index = 0usize;
 
     while index < boundary {
@@ -347,6 +378,12 @@ pub fn sanitize_for_fresh(
             // `-i a.png resume` (image filename) from being read as the
             // subcommand. Equals forms carry their value inline and fall
             // through to the passthrough below without a value lookup.
+            if codex_global_equals_form(tok).is_some_and(|non_empty| non_empty) {
+                out.push(tok.clone());
+                index += 1;
+                continue;
+            }
+
             if let Some(global) = codex_global(tok) {
                 out.push(tok.clone());
                 index += 1;
@@ -377,11 +414,23 @@ pub fn sanitize_for_fresh(
                 continue;
             }
             if tok == "resume" {
+                if !subcommand_slot_open || unresolved_unknown {
+                    return Err(err(backend, tok, SessionArgsErrorReason::Ambiguous));
+                }
                 let next = codex_consume_resume(args, index, boundary, &mut out)
                     .map_err(|()| err(backend, tok, SessionArgsErrorReason::Ambiguous))?;
                 removed_selector = true;
                 index = next;
                 continue;
+            }
+
+            if tok.starts_with('-') {
+                // Unfamiliar grammar: preserved, but it poisons any later
+                // `resume` decision because that token may be its value.
+                unresolved_unknown = true;
+            } else {
+                // An ordinary positional takes the command slot.
+                subcommand_slot_open = false;
             }
         }
 
@@ -917,13 +966,18 @@ mod codex_interspersed_globals_3414 {
         );
     }
 
-    /// An UNKNOWN flag ends the resume scope: the grammar is no longer one we
-    /// transcribed, so the scan stops rather than guessing what owns what.
+    /// SUPERSEDED: this originally expected an unknown flag to END the resume
+    /// scope and let the outer loop preserve the rest. That IS the guess it
+    /// claimed to avoid — the tokens after an untranscribed flag may be its
+    /// values or resume's positionals. The case now fails closed and lives in
+    /// `codex_position_and_equals_3414::codex_unknown_flag_inside_resume_fails_closed_3414`.
+    /// What remains here is the half that was always right: an unknown flag
+    /// with no `resume` to resolve is simply preserved.
     #[test]
-    fn codex_unknown_flag_ends_the_resume_scope_3414() {
+    fn codex_unknown_flag_without_resume_is_preserved_3414() {
         assert_eq!(
-            ok(Backend::Codex, &["resume", "sess", "--unknown-thing"]),
-            v(&["--unknown-thing"])
+            ok(Backend::Codex, &["--unknown-thing", "x"]),
+            v(&["--unknown-thing", "x"])
         );
     }
 }
