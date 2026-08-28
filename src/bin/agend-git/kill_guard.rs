@@ -305,15 +305,11 @@ fn append_safety_event(tool: &str, args: &[String], event: &str) {
         "ppid": crate::parent_pid(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    let path = PathBuf::from(home).join("fleet_events.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{rec}");
-    }
+    // #3416: goes through the one serialized appender. Best-effort by contract —
+    // a single non-blocking lock attempt, and on contention the record is SKIPPED
+    // rather than appended unlocked, which is what keeps this off the deny/exec
+    // path's critical timing without reintroducing interleaved records.
+    let _ = agentic_audit_append::append_audit_line_best_effort(&PathBuf::from(home), &rec);
 }
 
 #[cfg(test)]

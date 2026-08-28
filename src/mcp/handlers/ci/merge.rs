@@ -450,20 +450,20 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             "force_reason": force_reason,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
-        let events_path = home.join("fleet_events.jsonl");
-        let audit_written = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(events_path)?;
-            writeln!(f, "{event}")?;
-            Ok(())
-        })();
-        if let Err(e) = audit_written {
+        // #3416: goes through the one serialized appender. This is a destructive
+        // fail-closed gate, so it uses bounded retry and then refuses — never an
+        // unlocked fallback. `Err` means NOTHING was recorded, which is exactly why
+        // the bypass must not proceed: previously an interleaved-but-`Ok` write let
+        // this gate report a force-merge as audited while the record on disk was
+        // unparseable.
+        if let Err(e) = agentic_audit_append::append_audit_line_bounded(
+            home,
+            &event,
+            agentic_audit_append::DEFAULT_BOUNDED_BUDGET,
+        ) {
             return json!({
-                "error": format!("force-merge refused: audit log write failed: {e}"),
-                "hint": "fix fleet_events.jsonl permissions or disk space, then retry"
+                "error": format!("force-merge refused: {e}"),
+                "hint": "another writer holds the audit lock, or the audit log is unwritable (permissions/disk); retry"
             });
         }
     }

@@ -16,15 +16,17 @@
 //! was garbage. That is what makes this structural rather than cosmetic.
 //!
 //! ## What it checks
-//! For the PRODUCTION region of each of the four sinks (everything before the
-//! first `#[cfg(test)]`):
-//!   (a) it must NOT contain the `fleet_events.jsonl` literal — the shared crate
-//!       owns the path, so a sink naming the file is a sink bypassing the crate;
+//! For the PRODUCTION region of each of the four sinks — everything up to the
+//! first INLINE test module body, see `production_region` for why that is not the
+//! same as the first `#[cfg(test)]` line:
+//!   (a) no line of CODE may contain the `fleet_events.jsonl` literal — the shared
+//!       crate owns the path, so a sink naming the file is a sink bypassing it;
 //!   (b) it MUST call the shared appender.
 //! Scoping to the production region is deliberate: a test fixture may legitimately
-//! name the file. Scoping the NEGATIVE assertion to a narrower slice than the whole
-//! production region is the #3421 defect — a helper outside the slice then defeats
-//! it — so the region here runs to the `#[cfg(test)]` boundary and no further.
+//! name the file. Getting that scope wrong in either direction is the #3421 defect
+//! class — too narrow and a helper outside the slice defeats the scan, too wide and
+//! the test module satisfies it. Both directions are pinned by
+//! `production_region_stops_at_the_test_boundary`.
 //!
 //! ## How the regression-proof works
 //! `checker_fires_on_direct_write` and `checker_fires_on_missing_appender` feed the
@@ -53,16 +55,59 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-/// Everything before the first `#[cfg(test)]`. Returns the whole source when the
+/// Everything before the first test-gated item. Returns the whole source when the
 /// file has no test module.
+///
+/// Matches the cfg attribute in ANY spelling — `#[cfg(test)]`,
+/// `#[cfg(all(test, unix))]`, `#[cfg(any(test, …))]` — rather than one literal.
+/// Splitting on the exact string `#[cfg(test)]` is how a test module written with a
+/// compound cfg silently lands INSIDE the region being scanned as production, which
+/// is the #3421 defect class: the scan then passes or fails for the wrong reason.
+/// `not(test)` is excluded because that gates production code, not tests.
 fn production_region(src: &str) -> &str {
-    src.split_once("#[cfg(test)]")
-        .map_or(src, |(before, _)| before)
+    let lines: Vec<&str> = src.split_inclusive('\n').collect();
+    let mut offset = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let is_test_gate = trimmed.starts_with("#[cfg(")
+            && trimmed.contains("test")
+            && !trimmed.contains("not(test");
+        if is_test_gate {
+            // Only an INLINE test module body ends the production region. A
+            // `#[cfg(test)] mod x;` DECLARATION brings no code into this file, and
+            // treating it as the boundary truncates the scan to whatever precedes
+            // it — which in one of these sinks is the first eight lines, silently
+            // passing a file that was never examined.
+            // Skip any further attribute lines between the cfg gate and the item —
+            // these modules commonly carry `#[allow(...)]` as well — then decide on
+            // the item itself. `contains('{')` rather than `ends_with`, so a
+            // single-line `mod tests { .. }` is recognised too.
+            let next = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty() && !l.starts_with("#["))
+                .unwrap_or("");
+            if next.starts_with("mod ") && next.contains('{') {
+                return &src[..offset];
+            }
+        }
+        offset += line.len();
+    }
+    src
 }
 
-/// (a) The production region must not name the audit file.
+/// (a) The production region must not name the audit file **in code**.
+///
+/// Comments are excluded on purpose. The invariant is about who may open and write
+/// the file, not about whether prose may name it — every one of these sinks has a
+/// doc comment explaining what it appends to, and forcing those to talk around the
+/// filename would trade real documentation for a scan that is no stronger.
 fn names_audit_file_directly(production: &str) -> bool {
-    production.contains(AUDIT_FILE_LITERAL)
+    production
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !(l.starts_with("//") || l.starts_with('*')))
+        .any(|l| l.contains(AUDIT_FILE_LITERAL))
 }
 
 /// (b) The production region must call the shared appender.
@@ -138,6 +183,24 @@ fn checker_fires_on_direct_write() {
     );
 }
 
+/// The comment exclusion must not become a hole: a doc comment naming the file is
+/// fine, the same name in code is not. Both directions are asserted so a future
+/// change to the filter cannot quietly disable the scan.
+#[test]
+fn checker_ignores_comments_but_not_code() {
+    let doc_only = "/// appends to fleet_events.jsonl\n//! see fleet_events.jsonl\nfn f() {}";
+    assert!(
+        !names_audit_file_directly(doc_only),
+        "a doc comment naming the audit file must not trip the scan"
+    );
+
+    let in_code = "/// appends to fleet_events.jsonl\nlet p = home.join(\"fleet_events.jsonl\");";
+    assert!(
+        names_audit_file_directly(in_code),
+        "the same name in CODE must trip the scan"
+    );
+}
+
 #[test]
 fn checker_fires_on_missing_appender() {
     let poisoned = "fn append(home: &str) { /* routes nowhere */ }";
@@ -152,15 +215,42 @@ fn checker_fires_on_missing_appender() {
 /// module's contents satisfy the positive assertion.
 #[test]
 fn production_region_stops_at_the_test_boundary() {
-    let src = "fn prod() {}\n#[cfg(test)]\nmod tests { fn t() { append_audit_line(); } }";
-    let production = production_region(src);
+    for gate in [
+        "#[cfg(test)]",
+        "#[cfg(all(test, unix))]",
+        "#[cfg(any(test, feature = \"x\"))]",
+        // The real shim module carries a second attribute between the gate and
+        // the item; the lookahead must step over it.
+        "#[cfg(all(test, unix))]\n#[allow(clippy::unwrap_used)]",
+    ] {
+        let src =
+            format!("fn prod() {{}}\n{gate}\nmod tests {{ fn t() {{ append_audit_line(); }} }}");
+        let production = production_region(&src);
+        assert!(
+            !routes_through_shared_appender(production),
+            "{gate}: a call that exists only inside the test module must NOT satisfy \
+             the shared-appender assertion"
+        );
+        assert!(
+            production.contains("fn prod()"),
+            "{gate}: the production region must still contain the production code"
+        );
+    }
+
+    // `not(test)` gates PRODUCTION code — it must not be mistaken for the boundary.
+    let src = "#[cfg(not(test))]\nfn prod() { append_audit_line(); }";
     assert!(
-        !routes_through_shared_appender(production),
-        "a call that exists only inside the test module must NOT satisfy the \
-         shared-appender assertion"
+        routes_through_shared_appender(production_region(src)),
+        "a `not(test)` item is production and must stay inside the scanned region"
     );
+
+    // A `#[cfg(test)] mod x;` DECLARATION is not the boundary: it pulls in a
+    // separate file, so production code after it must still be scanned. One of the
+    // real sinks has exactly this at line 9, and treating it as the boundary made
+    // the scan pass on eight lines of imports.
+    let src = "#[cfg(test)]\npub(crate) mod helper;\n\nfn prod() { append_audit_line(); }";
     assert!(
-        production.contains("fn prod()"),
-        "the production region must still contain the production code"
+        routes_through_shared_appender(production_region(src)),
+        "a cfg(test) module DECLARATION must not truncate the production region"
     );
 }
