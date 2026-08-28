@@ -92,12 +92,19 @@ def task_event(seq, instance, kind, task_id, **fields):
 DROP = object()
 
 
+def expected_order(pair, arm):
+    """The order run.sh derives and matrix.sh plans: parity x arm."""
+    first_arm = "mcp" if pair % 2 else "cli"
+    return "first" if arm == first_arm else "second"
+
+
 def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
               meta_extra=None, sent_ledger=None, init=True):
     run_dir = os.path.join(base, "%s-%s-p%s" % (scenario, arm, pair))
     os.makedirs(os.path.join(run_dir, "final_state", "inbox"), exist_ok=True)
     meta = {"schema": 1, "scenario": scenario, "arm": arm, "pair": pair,
-            "order_in_pair": "first", "model_requested": "claude-fable-5",
+            "order_in_pair": expected_order(pair, arm),
+            "model_requested": "claude-fable-5",
             "model_resolved": "claude-fable-5", "claude_version": "2.0.0-test",
             "git_head": "0" * 40,
             "binary_sha256": {"agend-terminal": "0" * 64, "agend-mcp-bridge": "0" * 64},
@@ -151,6 +158,35 @@ def write_scenarios(base, spec):
             json.dump({"id": scenario, "title": scenario, "arms": arms,
                        "pairs": 10, "roles_required": True}, fh)
     return root
+
+
+def frozen_manifest_rows():
+    rows = []
+    for index in range(1, 7):
+        scenario = "S%02d" % index
+        for pair in range(1, 11):
+            for arm in (("mcp", "cli") if pair % 2 else ("cli", "mcp")):
+                rows.append((scenario, pair, arm))
+    rows.extend(("S13", pair, "mcp") for pair in range(1, 46))
+    rows.extend(("S14", pair, "cli") for pair in range(1, 46))
+    return [{"scenario": s, "pair": p, "arm": a, "order_in_pair": expected_order(p, a),
+             "dir": "%s/pair-%02d/%s" % (s, p, a)} for (s, p, a) in rows]
+
+
+def write_manifest(runs_dir, **overrides):
+    manifest = {"schema": 1, "stamp": "TEST", "created_at": "2026-08-28T00:00:00Z",
+                "dry_run": False, "git_head": "0" * 40, "model": "claude-fable-5",
+                "jobs": 3, "binary_sha256": {"agend-terminal": "0" * 64,
+                                             "agend-mcp-bridge": "0" * 64},
+                "prompt_sha256": {"base": "0" * 64, "mcp": "0" * 64, "cli": "0" * 64},
+                "missing_scenarios": [], "total_runs": 210,
+                "plan": frozen_manifest_rows()}
+    manifest.update(overrides)
+    for key in [k for k, v in overrides.items() if v is DROP]:
+        manifest.pop(key, None)
+    with open(os.path.join(runs_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    return manifest
 
 
 class TempCase(unittest.TestCase):
@@ -746,7 +782,7 @@ class Aggregation(TempCase):
         + [("S14", pair, "cli") for pair in range(1, 46)]
     )
 
-    def frozen_matrix(self, skip=(), extra=()):
+    def frozen_matrix(self, skip=(), extra=(), manifest=True):
         """The whole SPEC section 6 plan on disk: 210 runs, every one conforming."""
         runs = os.path.join(self.tmp, "runs")
         spec = {"S0%d" % i: (PASS_EXPECT, ["mcp", "cli"]) for i in range(1, 7)}
@@ -761,6 +797,8 @@ class Aggregation(TempCase):
             write_run(runs, scenario, arm, pair, [])
         for scenario, pair, arm, meta_extra in extra:
             write_run(runs, scenario, arm, pair, [], meta_extra=meta_extra)
+        if manifest:
+            write_manifest(runs)
         return runs, scen
 
     def test_the_complete_frozen_matrix_passes_every_gate(self):
@@ -886,6 +924,81 @@ class Aggregation(TempCase):
         self.assertEqual(reasons, ["scenario_declaration_invalid"] * 4,
                          "malformed, non-object, empty and absent declarations all fail closed")
         self.assertEqual(summary["valid_runs"], 1)
+
+    # ---- A⁗ review: multiplicity, order, strict types, mandatory manifest ----
+
+    def test_a_second_copy_of_a_cell_counts_even_when_it_is_invalid(self):
+        """Duplicate detection only ever looked at VALID runs.
+
+        Mark the second copy invalid and the cell set still matches, the valid
+        copies are still unique, and 211 runs read as the frozen 210.
+        """
+        runs, scen = self.frozen_matrix()
+        shutil.copytree(os.path.join(runs, "S01-mcp-p1"),
+                        os.path.join(runs, "S01-mcp-p1-copy"))
+        victim = os.path.join(runs, "S01-mcp-p1-copy", "metadata.json")
+        with open(victim, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["invalid_reason"] = "infra_fault"
+        with open(victim, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(summary["plan_gate"]["observed_runs"], 211)
+        self.assertFalse(summary["plan_gate"]["pass"],
+                         "211 runs is not the frozen 210, whatever their verdicts")
+        self.assertIn(["S01", 1, "mcp"], summary["plan_gate"]["duplicates"])
+        self.assertFalse(summary["pilot_safety"])
+
+    def test_the_order_a_run_records_must_be_the_order_the_plan_declares(self):
+        """order_in_pair is planned, recorded and resumed — nothing compared them."""
+        runs, scen = self.frozen_matrix()
+        victim = os.path.join(runs, "S01-mcp-p1", "metadata.json")
+        with open(victim, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        self.assertEqual(meta["order_in_pair"], "first", "precondition: pair 1 mcp goes first")
+        meta["order_in_pair"] = "second"
+        with open(victim, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]],
+                         ["order_in_pair_mismatch"])
+
+    def test_the_manifest_order_must_match_the_plan_too(self):
+        runs, scen = self.frozen_matrix()
+        rows = frozen_manifest_rows()
+        rows[0] = dict(rows[0], order_in_pair="second")
+        write_manifest(runs, plan=rows)
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_plan_mismatch", summary["plan_gate"]["flags"])
+
+    def test_invalid_reason_and_schema_are_strictly_typed(self):
+        """A non-string invalid_reason was returned AS the reason; True == 1."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"invalid_reason": 123})
+        write_run(runs, "S01", "cli", 1, [], meta_extra={"schema": True})
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]],
+                         ["metadata_incomplete", "metadata_incomplete"],
+                         "a number is not a reason, and a flag is not schema 1")
+
+    def test_a_tree_without_a_full_manifest_cannot_be_the_frozen_matrix(self):
+        """The manifest is the tree's own account of what it ran."""
+        runs, scen = self.frozen_matrix(manifest=False)
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_missing", summary["plan_gate"]["flags"])
+
+        self.setUp()
+        runs, scen = self.frozen_matrix()
+        write_manifest(runs, total_runs=DROP)
+        summary = grade.aggregate(runs, scen)
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertIn("manifest_incomplete", summary["plan_gate"]["flags"])
 
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")

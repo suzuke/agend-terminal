@@ -63,5 +63,52 @@ class MatrixAuthority(unittest.TestCase):
                       "the refusal must name the directory it could not account for")
 
 
+    def _head(self):
+        proc = subprocess.run(["git", "-C", os.path.dirname(os.path.dirname(HERE)),
+                               "rev-parse", "HEAD"],
+                              capture_output=True, text=True)
+        return proc.stdout.strip() or "unknown"
+
+    def test_resume_refuses_a_run_recorded_under_the_wrong_order(self):
+        """order_in_pair is planned here and recorded there; nothing compared them."""
+        planned = os.path.join(self.out, "S01", "pair-01", "mcp")
+        os.makedirs(planned, exist_ok=True)
+        with open(os.path.join(planned, "metadata.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": 1, "scenario": "S01", "arm": "mcp", "pair": 1,
+                       "order_in_pair": "second",  # the plan says first
+                       "model_requested": "claude-fable-5",
+                       "git_head": self._head()}, fh)
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a run recorded under the wrong order is not this cell's run:\n"
+                            + proc.stdout + proc.stderr)
+
+    def test_a_partial_run_directory_is_not_silently_overwritten(self):
+        """A directory with a stream but no metadata.json went back on the queue.
+
+        The next run writes straight over whatever is there, so a half-finished
+        or foreign run disappears without anyone deciding that it should.
+        """
+        planned = os.path.join(self.out, "S01", "pair-01", "mcp")
+        os.makedirs(planned, exist_ok=True)
+        with open(os.path.join(planned, "stream.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"type": "system", "subtype": "init", "model": "claude-fable-5"}\n')
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a partial run directory must be decided, not overwritten:\n"
+                            + proc.stdout + proc.stderr)
+        self.assertIn("S01/pair-01/mcp", proc.stdout + proc.stderr)
+
+    def test_an_existing_manifest_that_is_not_this_matrix_is_not_overwritten(self):
+        """The manifest is the tree's account of itself; it was rewritten blind."""
+        with open(os.path.join(self.out, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": 1, "stamp": "SOMEONE-ELSE", "model": "claude-other",
+                       "git_head": "f" * 40, "total_runs": 210, "plan": []}, fh)
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a manifest describing another matrix must not be overwritten:\n"
+                            + proc.stdout + proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
