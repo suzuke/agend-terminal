@@ -940,24 +940,24 @@ mod tests {
     /// so there is no read-only attach mode to preserve — an input EOF means the
     /// client is gone.
     ///
-    /// What this test can assert is bounded by the platform, and the bound was
-    /// measured, not assumed: once the peer has half-closed and the daemon has
-    /// read the EOF, macOS refuses the close with ENOTCONN (`shutdown(Both)` →
-    /// `Os { code: 57, kind: NotConnected }`) and no FIN reaches the peer. A peer
-    /// that half-closes has therefore already decided the connection's fate; the
-    /// paths where the DAEMON decides — an undefined frame, a malformed resize, a
-    /// failed PTY write — are the ones where the close is both possible and
-    /// load-bearing, and they are pinned below. So this pins what remains: the
-    /// loop ends promptly on EOF instead of parking, and delivers nothing.
+    /// This is also the path that proves a plain `shutdown(Both)` is not enough.
+    /// Once the peer has half-closed and the daemon has read the EOF, macOS
+    /// refuses `Both` with ENOTCONN — but `Write` on the same socket still
+    /// succeeds and still delivers the FIN, so the close must fall back rather
+    /// than give up. Measured, not assumed: `Both` → `Err(NotConnected)`,
+    /// `Write` → `Ok(())`, peer read → `Ok(0)`.
+    ///
+    /// Every test here keeps the pair's SECOND server handle alive, standing in
+    /// for the output forwarder's clone, so a test cannot pass by the input
+    /// handle merely being dropped.
     #[test]
-    fn input_eof_ends_the_loop_promptly() {
+    fn input_eof_closes_the_whole_connection() {
         let pair = socket_pair();
         let server = pair.server;
         let peer = pair.peer;
         peer.shutdown(std::net::Shutdown::Write).unwrap();
 
         let frames = AtomicUsize::new(0);
-        let started = Instant::now();
         super::forward_tui_input(
             server,
             |_| {
@@ -966,14 +966,13 @@ mod tests {
             },
             |_, _| {},
         );
-        let elapsed = started.elapsed();
 
         assert_eq!(frames.load(Ordering::SeqCst), 0, "no frame was sent");
         assert!(
-            elapsed <= Duration::from_secs(1),
-            "an input EOF must end the loop rather than park it; took {elapsed:?}"
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "an input EOF must close the whole connection: the output clone would otherwise \
+             keep the pane looking connected with its input ignored"
         );
-        drop(peer);
     }
 
     /// A frame this protocol does not define ends the connection — and must end
