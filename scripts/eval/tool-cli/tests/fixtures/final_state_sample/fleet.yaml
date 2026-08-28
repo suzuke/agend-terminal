@@ -1,0 +1,17 @@
+# Reconstructed 2026-08-28 (#3412). The daemon-rewritten copy captured with this
+# fixture on 2026-08-28 was git-ignored and was lost with the authoring worktree.
+# Template = sandbox.sh FLEET_YAML; ids = the uuids that name inbox/*.jsonl and
+# appear as from_id in this fixture (PROBE_ID / LEAD_ID / REVIEW_ID in test_grade.py).
+instances:
+  probe:
+    command: /bin/cat
+    role_kind: implementer
+    id: 09c2d6f5-78b5-4453-913a-b3d68ba640b1
+  ane-review:
+    command: /bin/cat
+    role_kind: reviewer
+    id: 10c6662d-6426-4113-a56f-be2e3490e44d
+  lead:
+    command: /bin/cat
+    role_kind: orchestrator
+    id: cb93871b-b4a6-48db-9734-dee8effeb337
