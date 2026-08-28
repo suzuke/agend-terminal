@@ -230,5 +230,21 @@ class MatrixAuthority(unittest.TestCase):
                             "overwritten:\n" + proc.stdout + proc.stderr)
 
 
+    def test_a_manifest_with_other_binaries_is_not_overwritten(self):
+        """The digests were checked for shape, never against the binaries here.
+
+        A manifest can name two well-formed digests of somebody else's build and
+        be written over as if it were this matrix's.
+        """
+        self._valid_manifest(binary_sha256={"agend-terminal": "a" * 64,
+                                            "agend-mcp-bridge": "b" * 64})
+        proc = dry_run(self.out)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a manifest naming other binaries must not be overwritten:\n"
+                            + proc.stdout + proc.stderr)
+        self.assertIn("binary_sha256", proc.stdout + proc.stderr,
+                      "the refusal must say which field it could not account for")
+
+
 if __name__ == "__main__":
     unittest.main()

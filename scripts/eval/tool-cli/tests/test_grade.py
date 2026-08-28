@@ -1211,6 +1211,21 @@ class Aggregation(TempCase):
                 self.assertFalse(summary["plan_gate"]["pass"],
                                  "manifest %s=%r must be refused" % (field, bad))
 
+    def test_the_system_prompt_a_run_names_must_be_the_frozen_pair(self):
+        """SPEC.txt:60 builds it: prompts/base.txt + "\n\n" + prompts/<arm>.txt.
+
+        Per-arm agreement between runs was the only check, so a matrix could
+        agree on a system prompt that is not the frozen one. The derived digests
+        are what all 210 real runs record — d2a41ec8… for mcp, 8bcf7657… for cli.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S01", "mcp", 1, [], meta_extra={"system_prompt_sha256": "f" * 64})
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]],
+                         ["system_prompt_not_frozen"])
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
