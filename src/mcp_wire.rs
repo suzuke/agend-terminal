@@ -49,14 +49,14 @@ pub fn classify_response(response: &Value) -> ResponseClass {
         } else {
             ResponseClass::Refused
         }
-    } else if response.get("status").and_then(Value::as_str) == Some("accepted_in_progress") {
-        ResponseClass::Accepted
     } else if response
         .get("result")
         .and_then(|result| result.get("error"))
         .is_some()
     {
         ResponseClass::ToolError
+    } else if response.get("status").and_then(Value::as_str) == Some("accepted_in_progress") {
+        ResponseClass::Accepted
     } else if response.get("result").is_some() {
         ResponseClass::Ok
     } else {
