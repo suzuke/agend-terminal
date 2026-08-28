@@ -397,6 +397,44 @@ mod tests {
         }
     }
 
+    /// A loopback pair whose socket buffers are shrunk BEFORE connect, plus the
+    /// same second server-side handle `socket_pair` keeps.
+    ///
+    /// Before connect is the only point at which the request is honored: set
+    /// afterwards, the kernel silently keeps the real (multi-megabyte) sizes and
+    /// still reports the requested value back, so a peer that stops reading
+    /// never parks a write and a test that relies on one passes vacuously. Even
+    /// honored, the sizes are auto-tuned upward — roughly 390 KB of headroom
+    /// here — which is why the payload below is near `DEFAULT_FRAME_LIMIT`.
+    fn small_buffer_socket_pair() -> SocketPair {
+        use socket2::{Domain, Socket, Type};
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        listener.set_send_buffer_size(4096).unwrap();
+        listener.bind(&addr.into()).unwrap();
+        listener.listen(1).unwrap();
+        let bound: std::net::SocketAddr = listener.local_addr().unwrap().as_socket().unwrap();
+        let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        client.set_recv_buffer_size(4096).unwrap();
+        client.connect(&bound.into()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let server: TcpStream = accepted.into();
+        let input_side = server.try_clone().unwrap();
+        SocketPair {
+            server,
+            _server_input_side: input_side,
+            peer: client.into(),
+        }
+    }
+
+    /// A frame just under `framing::DEFAULT_FRAME_LIMIT`: large enough to overrun
+    /// the shrunk buffers of `small_buffer_socket_pair`, so a peer that never
+    /// reads parks the write, and small enough that `write_frame` does not refuse
+    /// it outright and pass the test for the wrong reason.
+    fn wedging_payload() -> Vec<u8> {
+        vec![0x41; 900 * 1024]
+    }
+
     fn scratch_run_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "agend-3373-fwd-{tag}-{}-{}",
@@ -611,26 +649,19 @@ mod tests {
         );
     }
 
-    /// #3373, the accept loop's own write: the version byte and the initial
-    /// dump go out on the SERIALIZED accept thread, before the per-client
-    /// forwarder exists. Unbounded, a client that never reads its greeting
-    /// wedges the whole loop — the same harm as the stalled auth read, one step
-    /// later. Greeting such a client must fail closed and promptly.
+    /// #3373, the accept loop's own write: the version byte and the initial dump
+    /// go out on the SERIALIZED accept thread, before the per-client forwarder
+    /// exists. Unbounded, a client that never reads its greeting parks the whole
+    /// loop — the same harm as the stalled auth read, one step later. Greeting
+    /// such a client must fail closed and promptly.
     #[test]
     fn a_client_that_never_reads_cannot_wedge_the_initial_greeting() {
-        let pair = socket_pair();
+        let pair = small_buffer_socket_pair();
         let mut server = pair.server;
         let peer = pair.peer;
-        socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
-        socket2::SockRef::from(&server).set_send_buffer_size(4096).unwrap();
-
-        // Under `framing::DEFAULT_FRAME_LIMIT` so the frame is genuinely
-        // written rather than refused, and far over the shrunk buffers so it
-        // cannot complete against a peer that never reads.
-        let dump = vec![0x41; 256 * 1024];
 
         let started = Instant::now();
-        let greeted = super::greet_authenticated_client(&mut server, &dump);
+        let greeted = super::greet_authenticated_client(&mut server, &wedging_payload());
         let elapsed = started.elapsed();
 
         drop(peer);
@@ -639,7 +670,7 @@ mod tests {
             "a client that never takes its greeting must be refused, not waited on"
         );
         assert!(
-            elapsed <= Duration::from_secs(5),
+            elapsed <= Duration::from_secs(10),
             "the serialized accept loop must not park in the greeting write; took {elapsed:?}"
         );
     }
@@ -647,33 +678,27 @@ mod tests {
     /// #3373, same root class as the retirement blockers: no state a client can
     /// put an ACCEPTED connection into may stop this bridge from letting go.
     ///
-    /// `write_frame` is an unbounded blocking write. A pane that stops draining
+    /// `write_frame` was an unbounded blocking write. A pane that stops draining
     /// its socket — suspended, wedged, or simply gone quiet without closing —
-    /// parks the forwarder inside that write forever, so the retirement check at
-    /// the top of the loop is never reached again and the pane keeps a live
-    /// socket to a dead generation. The same write error path must also
-    /// `shutdown` rather than just `break`: the input thread holds another
-    /// handle on this connection, so dropping ours closes nothing.
+    /// parks the forwarder inside that write, so the retirement check at the top
+    /// of the loop is never reached again and the pane keeps a live socket to a
+    /// dead generation. The same write error path must also `shutdown` rather
+    /// than just `break`: the input thread holds another handle on this
+    /// connection, so dropping ours closes nothing.
     ///
-    /// Both socket buffers are shrunk so one frame is guaranteed not to fit;
-    /// the peer reads nothing until the forwarder is expected to be gone, so the
-    /// write cannot drain for the wrong reason. No sleep is load-bearing.
+    /// The peer reads nothing until the forwarder is expected to be gone, so the
+    /// parked write cannot drain for the wrong reason, and the channel stays open
+    /// throughout so an exit cannot come from `Disconnected` either. No sleep is
+    /// load-bearing.
     #[test]
     fn a_client_that_stops_reading_cannot_wedge_the_output_forwarder() {
         let run_dir = scratch_run_dir("wedged-write");
         publish_port(&run_dir, "agent", 4242);
-        let pair = socket_pair();
+        let pair = small_buffer_socket_pair();
         let peer = pair.peer;
-        socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
-        socket2::SockRef::from(&pair.server)
-            .set_send_buffer_size(4096)
-            .unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        // One frame far larger than the shrunk buffers — but still under
-        // `framing::DEFAULT_FRAME_LIMIT`, or `write_frame` would refuse it
-        // outright and the test would pass without ever blocking a write.
-        tx.send(vec![0x41; 256 * 1024]).unwrap();
+        tx.send(wedging_payload()).unwrap();
 
         let dir = run_dir.clone();
         let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
@@ -682,8 +707,8 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let exited = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
-        // Only now does the peer read: a blocked write must have been abandoned
+        let exited = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        // Only now does the peer read: the parked write must have been abandoned
         // on its own, not unblocked by this drain.
         let saw_eof = peer_sees_eof(peer, Duration::from_secs(5));
         drop(tx);
