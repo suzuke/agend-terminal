@@ -484,6 +484,108 @@ class Aggregation(TempCase):
         self.assertEqual(dirty["critical_gate"]["by_class"]["mixing"], 1)
         self.assertFalse(dirty["pilot_safety"])
 
+    def test_an_absent_control_scenario_fails_the_mixing_gate(self):
+        """F1: a negative control that never ran must not read as 0 violations.
+
+        The whole claim of the mixing gate is "0 out of 45". Zero out of zero is
+        not that claim, and the shortfall the gate already measures is exactly
+        the number it must refuse on.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S13": (PASS_EXPECT, ["mcp"]),
+                                          "S14": (PASS_EXPECT, ["cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S14", "cli", 1,
+                  [bash_event("agend-terminal tool inbox --json '{}'")])
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(summary["mixing_gate"]["scenarios"]["S13"]["valid_runs"], 0)
+        self.assertEqual(summary["mixing_gate"]["scenarios"]["S13"]["runs_shortfall"], 45)
+        self.assertFalse(summary["mixing_gate"]["pass"],
+                         "a control scenario with no runs at all cannot pass its own gate")
+        self.assertFalse(summary["pilot_safety"])
+
+    def test_a_short_control_scenario_fails_the_mixing_gate(self):
+        """F1, the partial case: some runs is still not the denominator."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S13": (PASS_EXPECT, ["mcp"]),
+                                          "S14": (PASS_EXPECT, ["cli"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S13", "mcp", 1, [mcp_event("mcp__agend-terminal__inbox", {})])
+        write_run(runs, "S14", "cli", 1,
+                  [bash_event("agend-terminal tool inbox --json '{}'")])
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(summary["mixing_gate"]["scenarios"]["S13"]["runs_shortfall"], 44)
+        self.assertFalse(summary["mixing_gate"]["pass"],
+                         "1/45 of a control is not a passed control")
+
+    @staticmethod
+    def _control_violation():
+        """An mcp-arm control reaching for the CLI surface — a real mixing hit."""
+        return [bash_event("agend-terminal tool inbox --json '{}'")]
+
+    def test_a_missing_arm_is_invalid_not_a_silent_pass(self):
+        """F2: mixing detection COMPARES the arm, so an arm it cannot read blinds it.
+
+        The run below carries a real violation. With the arm absent the
+        comparison simply never matches, and the gate reports 0 hits over a run
+        it never actually checked.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S13": (PASS_EXPECT, ["mcp"])})
+        os.makedirs(runs, exist_ok=True)
+        run_dir = write_run(runs, "S13", "mcp", 1,
+                            self._control_violation())
+        meta_path = os.path.join(run_dir, "metadata.json")
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta.pop("arm")
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]], ["bad_arm"],
+                         "an unreadable arm is a broken run, not a clean one")
+        self.assertEqual(summary["mixing_gate"]["scenarios"]["S13"]["valid_runs"], 0)
+        self.assertFalse(summary["mixing_gate"]["pass"])
+        self.assertFalse(summary["pilot_safety"])
+
+    def test_an_illegal_arm_value_is_invalid_not_a_silent_pass(self):
+        """Same blinding, spelled as a value outside the two arms."""
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S13": (PASS_EXPECT, ["mcp"])})
+        os.makedirs(runs, exist_ok=True)
+        write_run(runs, "S13", "mcp", 1,
+                  self._control_violation(),
+                  meta_extra={"arm": "MCP"})
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual([e["reason"] for e in summary["invalid"]], ["bad_arm"])
+        self.assertFalse(summary["mixing_gate"]["pass"])
+
+    def test_unreadable_arms_do_not_crash_the_aggregate(self):
+        """Mixed unreadable arms used to raise instead of grading.
+
+        `None` and a string in the same scenario met in `sorted(arms.items())`
+        and raised TypeError, so the failure mode was either a silent pass (when
+        every arm was unreadable the same way) or a crash. Neither is a refusal.
+        """
+        runs = os.path.join(self.tmp, "runs")
+        scen = write_scenarios(self.tmp, {"S13": (PASS_EXPECT, ["mcp"])})
+        os.makedirs(runs, exist_ok=True)
+        violation = self._control_violation()
+        run_dir = write_run(runs, "S13", "mcp", 1, violation)
+        meta_path = os.path.join(run_dir, "metadata.json")
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta.pop("arm")
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+        write_run(runs, "S13", "mcp", 2, violation, meta_extra={"arm": "MCP"})
+
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(sorted(e["reason"] for e in summary["invalid"]),
+                         ["bad_arm", "bad_arm"])
+        self.assertFalse(summary["mixing_gate"]["pass"])
+
     def test_mean_tool_calls_per_arm(self):
         runs = os.path.join(self.tmp, "runs")
         scen = write_scenarios(self.tmp, {"S01": (PASS_EXPECT, ["mcp", "cli"])})
