@@ -260,6 +260,26 @@ pub fn sanitize_for_fresh(
     Ok(out)
 }
 
+/// Shared fixtures for both test modules.
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+
+    pub fn v(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    pub fn ok(backend: Backend, tokens: &[&str]) -> Vec<String> {
+        sanitize_for_fresh(&backend, &v(tokens)).expect("selector grammar must resolve")
+    }
+
+    pub fn reason(backend: Backend, tokens: &[&str]) -> SessionArgsErrorReason {
+        sanitize_for_fresh(&backend, &v(tokens))
+            .expect_err("malformed selector must fail closed")
+            .reason
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +447,109 @@ mod tests {
         assert_eq!(
             ok(Backend::Raw("/opt/thing".into()), &["-r", "y"]),
             v(&["-r", "y"])
+        );
+    }
+}
+
+/// Supplemental RED for lead review of 91d82117. Every fixture below is taken
+/// from the INSTALLED CLI help on this machine, not from inference — the
+/// original matrix guessed value arity and missed two coupled flags, and the
+/// Codex arm treated any `resume` token as the subcommand.
+#[cfg(test)]
+mod installed_help_fixtures_3414 {
+    use super::tests_support::*;
+    use super::*;
+
+    /// `claude --help`: `-r, --resume [value]`, `--from-pr [value]`,
+    /// `--teleport [session]` — the brackets mean the value is OPTIONAL, so a
+    /// bare picker form is valid. Marking them Required turned a legal restart
+    /// into `fresh_session_args_invalid`.
+    #[test]
+    fn claude_optional_value_selectors_accept_bare_picker_form_3414() {
+        assert_eq!(ok(Backend::ClaudeCode, &["--resume"]), v(&[]));
+        assert_eq!(ok(Backend::ClaudeCode, &["-r"]), v(&[]));
+        assert_eq!(ok(Backend::ClaudeCode, &["--from-pr"]), v(&[]));
+        assert_eq!(ok(Backend::ClaudeCode, &["--teleport"]), v(&[]));
+        // A bare selector must not swallow the NEXT flag as its value.
+        assert_eq!(
+            ok(Backend::ClaudeCode, &["--resume", "--model", "opus"]),
+            v(&["--model", "opus"])
+        );
+        // The value form still works.
+        assert_eq!(ok(Backend::ClaudeCode, &["--resume", "sess-1"]), v(&[]));
+    }
+
+    /// `grok --help`: `-r, --resume [<SESSION_ID_OR_TITLE>]` is OPTIONAL too.
+    #[test]
+    fn grok_resume_value_is_optional_3414() {
+        assert_eq!(ok(Backend::Grok, &["--resume"]), v(&[]));
+        assert_eq!(ok(Backend::Grok, &["-r"]), v(&[]));
+        assert_eq!(ok(Backend::Grok, &["-r", "my-title"]), v(&[]));
+    }
+
+    /// Both Claude and Grok declare `--fork-session` as resume/continue-coupled
+    /// ("When resuming ... create a new session ID"). Leaving it behind after
+    /// the selector is stripped hands the freshly spawned child an orphan flag
+    /// — and by then the old instance is already deleted.
+    #[test]
+    fn fork_session_is_coupled_for_claude_and_grok_3414() {
+        assert_eq!(
+            ok(Backend::ClaudeCode, &["--resume", "s1", "--fork-session"]),
+            v(&[])
+        );
+        assert_eq!(ok(Backend::Grok, &["-c", "--fork-session"]), v(&[]));
+        assert_eq!(
+            reason(Backend::ClaudeCode, &["--fork-session"]),
+            SessionArgsErrorReason::OrphanCoupledFlag
+        );
+        assert_eq!(
+            reason(Backend::Grok, &["--fork-session"]),
+            SessionArgsErrorReason::OrphanCoupledFlag
+        );
+    }
+
+    /// Coupled flags may precede their selector; order must not decide.
+    #[test]
+    fn coupled_flag_order_permutations_3414() {
+        assert_eq!(
+            ok(Backend::ClaudeCode, &["--fork-session", "--resume", "s1"]),
+            v(&[])
+        );
+        assert_eq!(ok(Backend::OpenCode, &["--fork", "-s", "s1"]), v(&[]));
+        assert_eq!(ok(Backend::Grok, &["--restore-code", "-r"]), v(&[]));
+    }
+
+    /// `codex --help`: `-c/--config <key=value>` and `-m/--model <MODEL>` are
+    /// VALUED globals. Treating any `resume` token as the subcommand ate the
+    /// value and left a dangling flag — which also broke the explicit
+    /// preserve-`-c` contract this module claims to honour.
+    #[test]
+    fn codex_valued_globals_are_not_mistaken_for_the_subcommand_3414() {
+        assert_eq!(ok(Backend::Codex, &["-c", "resume"]), v(&["-c", "resume"]));
+        assert_eq!(
+            ok(Backend::Codex, &["--model", "resume"]),
+            v(&["--model", "resume"])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["--config", "k=v", "resume", "s1"]),
+            v(&["--config", "k=v"])
+        );
+    }
+
+    /// `codex resume --help`: `--last`, `--all` and `--include-non-interactive`
+    /// belong to the subcommand. Promoting them to top level produces an argv
+    /// the CLI does not accept.
+    #[test]
+    fn codex_resume_owned_flags_do_not_survive_to_top_level_3414() {
+        assert_eq!(ok(Backend::Codex, &["resume", "--last"]), v(&[]));
+        assert_eq!(ok(Backend::Codex, &["resume", "--all"]), v(&[]));
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--include-non-interactive"]),
+            v(&[])
+        );
+        assert_eq!(
+            ok(Backend::Codex, &["resume", "--last", "--model", "gpt"]),
+            v(&["--model", "gpt"])
         );
     }
 }
