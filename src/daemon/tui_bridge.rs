@@ -723,28 +723,102 @@ mod tests {
         std::fs::write(run_dir.join(format!("{name}.port")), port.to_string()).unwrap();
     }
 
+    /// main-CI macOS flake (run 33161513192): every caller hands `peer_sees_eof`
+    /// a connection the production code has ALREADY torn down, and once that
+    /// teardown completes macOS rejects `setsockopt(SO_RCVTIMEO)` with EINVAL —
+    /// even though the socket still reports its EOF correctly on the very next
+    /// `read`. The helper's `unwrap` turned that into a panic, so whether the
+    /// suite was green depended on whether the test won a race with the FIN.
+    /// Measured on this machine at c01b77c1: 11 failures in 120 serial runs of
+    /// `input_eof_closes_the_whole_connection`.
+    ///
+    /// The barrier below is what makes this deterministic rather than a 1-in-10
+    /// flake. Polling a CLONE until the peer observes EOF proves the teardown
+    /// finished BEFORE the helper is entered, so the rejecting state is reached
+    /// every time. It does not consume anything the helper needs: EOF is level
+    /// triggered, so the helper's own read still sees it. With the barrier the
+    /// `setsockopt` was measured failing 20 times out of 20, while
+    /// `set_nonblocking` succeeded 20 times out of 20 in the same state — which
+    /// is why the fix polls instead of asking the kernel for a receive timeout.
+    #[test]
+    fn peer_sees_eof_survives_a_fully_torn_down_connection() {
+        let pair = socket_pair();
+        let server = pair.server;
+        let peer = pair.peer;
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        super::forward_tui_input(server, |_| true, |_, _| {});
+
+        // Barrier: wait until the teardown is observable, on a clone so the
+        // helper still receives an untouched `peer`.
+        let mut observer = peer.try_clone().unwrap();
+        observer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut torn_down = false;
+        while Instant::now() < deadline {
+            match observer.read(&mut buf) {
+                Ok(0) => {
+                    torn_down = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(observer);
+        assert!(
+            torn_down,
+            "precondition: the connection must be fully torn down, or this test is \
+             not exercising the state that made CI flake"
+        );
+        peer.set_nonblocking(false).unwrap();
+
+        assert!(
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "the drain helper must report EOF on a torn-down connection, not panic \
+             because the platform refused a receive timeout on it"
+        );
+    }
+
     /// Drain `peer` until it reports EOF, or give up. Draining matters: an
     /// undrained socket would fill and stall the forwarder in `write_frame`,
     /// which would make the test pass for the wrong reason.
+    ///
+    /// The budget is enforced by polling a NON-BLOCKING socket rather than by
+    /// `set_read_timeout`. Every caller hands this helper a connection the
+    /// production code has already torn down, and macOS rejects
+    /// `setsockopt(SO_RCVTIMEO)` with EINVAL in exactly that state — see
+    /// `peer_sees_eof_survives_a_fully_torn_down_connection`, which pins it.
+    /// `set_nonblocking` is accepted there, so the drain now works in both
+    /// states instead of panicking in one of them.
     fn peer_sees_eof(mut peer: TcpStream, budget: Duration) -> bool {
-        peer.set_read_timeout(Some(budget)).unwrap();
+        peer.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + budget;
         let mut buf = [0u8; 8192];
         loop {
             match peer.read(&mut buf) {
                 Ok(0) => return true,
-                Ok(_) => {
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
-                }
+                Ok(_) => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                        || error.kind() == std::io::ErrorKind::Interrupted =>
                 {
-                    return false
+                    // Not an answer either way. The old timeout expired the
+                    // whole budget in one blocking read; this sleeps a slice of
+                    // it and rechecks, reaching the same verdict at the same
+                    // deadline. Only the deadline may report "no EOF", so a
+                    // socket that is merely quiet can never be read as closed.
+                    std::thread::sleep(Duration::from_millis(5));
                 }
+                // Every other error means the connection is gone (reset, bad
+                // descriptor): unchanged from the blocking version.
                 Err(_) => return true,
+            }
+            if Instant::now() >= deadline {
+                return false;
             }
         }
     }
