@@ -821,7 +821,7 @@ mod tests {
         let pair = socket_pair();
         let peer = pair.peer;
 
-        let started = super::start_tui_output_thread(&pair.server, || {
+        let started = super::start_client_thread(&pair.server, || {
             Err(std::io::Error::other("thread spawn refused"))
         });
 
@@ -843,7 +843,7 @@ mod tests {
         let pair = socket_pair();
         let peer = pair.peer;
 
-        let started = super::start_tui_output_thread(&pair.server, || Ok(()));
+        let started = super::start_client_thread(&pair.server, || Ok(()));
 
         assert!(started.is_ok());
         assert!(
@@ -863,7 +863,7 @@ mod tests {
             Some(i) => &src[..i],
             None => src,
         };
-        let call = ["start_tui_output_thread", "(&stream"].concat();
+        let call = ["start_client_thread", "(&stream"].concat();
         let start = prod
             .find(&call)
             .expect("the accept loop starts the output thread through the helper");
@@ -874,6 +874,145 @@ mod tests {
         assert!(
             prod[start..start + input].contains("continue;"),
             "a refused output thread must `continue` before the input thread is spawned"
+        );
+    }
+
+    /// #3373, the input half of the same ownership rule. Socket ownership is
+    /// bidirectional: the output forwarder already holds a clone by the time the
+    /// input loop runs, so a terminal input path that only `break`s drops one
+    /// handle and closes NOTHING. The pane then looks connected — output keeps
+    /// arriving — while every keystroke is silently discarded.
+    ///
+    /// Peer half-close is treated as full termination deliberately. No client of
+    /// this protocol half-closes: `Shutdown::Write` appears nowhere in `src/`,
+    /// and `bridge_client` closes with `Shutdown::Both` (src/bridge_client.rs:133),
+    /// so there is no read-only attach mode to preserve — an input EOF means the
+    /// client is gone.
+    ///
+    /// Every test here keeps the pair's SECOND server handle alive, standing in
+    /// for the output forwarder's clone, so a test cannot pass by the input
+    /// handle merely being dropped.
+    #[test]
+    fn input_eof_closes_the_whole_connection() {
+        let pair = socket_pair();
+        let server = pair.server;
+        let peer = pair.peer;
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let frames = AtomicUsize::new(0);
+        super::forward_tui_input(
+            server,
+            |_| {
+                frames.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+            |_, _| {},
+        );
+
+        assert_eq!(frames.load(Ordering::SeqCst), 0, "no frame was sent");
+        assert!(
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "an input EOF must close the whole connection: the output clone would otherwise \
+             keep the pane looking connected with its input ignored"
+        );
+    }
+
+    /// A frame this protocol does not define ends the connection — and must end
+    /// it the same way, by closing rather than by dropping one handle.
+    #[test]
+    fn a_malformed_input_frame_closes_the_connection() {
+        let pair = socket_pair();
+        let server = pair.server;
+        let mut peer = pair.peer;
+        crate::framing::write_tagged(&mut peer, 0x7f, b"undefined tag").unwrap();
+
+        super::forward_tui_input(server, |_| true, |_, _| {});
+
+        assert!(
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "an undefined frame must close the connection, not just leave the input loop"
+        );
+    }
+
+    /// A resize frame of the wrong width is malformed too: the production match
+    /// only accepts exactly four bytes.
+    #[test]
+    fn a_short_resize_frame_closes_the_connection() {
+        let pair = socket_pair();
+        let server = pair.server;
+        let mut peer = pair.peer;
+        crate::framing::write_tagged(&mut peer, crate::framing::TAG_RESIZE, &[0, 80, 24]).unwrap();
+
+        let resizes = AtomicUsize::new(0);
+        super::forward_tui_input(
+            server,
+            |_| true,
+            |_, _| {
+                resizes.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(
+            resizes.load(Ordering::SeqCst),
+            0,
+            "a three-byte resize must not be applied"
+        );
+        assert!(
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "a malformed resize must close the connection"
+        );
+    }
+
+    /// A failed PTY write is the third terminal path, and the one most likely to
+    /// leave a pane looking healthy: output keeps flowing from the agent while
+    /// nothing the user types can reach it.
+    #[test]
+    fn a_failed_pty_write_closes_the_connection() {
+        let pair = socket_pair();
+        let server = pair.server;
+        let mut peer = pair.peer;
+        crate::framing::write_frame(&mut peer, b"keystroke").unwrap();
+        crate::framing::write_frame(&mut peer, b"never delivered").unwrap();
+
+        let delivered = AtomicUsize::new(0);
+        super::forward_tui_input(
+            server,
+            |_| {
+                delivered.fetch_add(1, Ordering::SeqCst);
+                false
+            },
+            |_, _| {},
+        );
+
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            1,
+            "the loop must stop at the failed write, not consume the next frame"
+        );
+        assert!(
+            peer_sees_eof(peer, Duration::from_secs(5)),
+            "a failed PTY write must close the connection"
+        );
+    }
+
+    /// The fourth path is the refusal itself. The behaviour lives in the shared
+    /// fail-closed helper (pinned by `a_refused_output_thread_closes_the_client`
+    /// over a real socket pair); what this pins is that the INPUT spawn goes
+    /// through it, on the handle kept for exactly that purpose, instead of
+    /// logging and carrying on with an output clone still alive.
+    #[test]
+    fn a_refused_input_thread_goes_through_the_fail_closed_helper() {
+        let src = include_str!("tui_bridge.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let needle = ["start_client_thread", "(&closer"].concat();
+        assert!(
+            prod.contains(&needle),
+            "the input thread must start through the fail-closed helper, using the retained \
+             handle that can still close the connection once `read_stream` has moved"
         );
     }
 
