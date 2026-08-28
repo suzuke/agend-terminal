@@ -153,6 +153,25 @@ fn run_tool_owned(home: &std::path::Path, args: &[String]) -> Output {
         .unwrap()
 }
 
+fn run_tool_with_stdin(home: &std::path::Path, args: &[String], input: &str) -> Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agend-terminal"))
+        .env("AGEND_HOME", home)
+        .env("AGEND_INSTANCE_NAME", "red-cli")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .expect("CLI stdin must be available")
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn unique_home(tag: &str) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -876,6 +895,99 @@ fn bridge_accepted_in_progress_is_not_serialized_as_null() {
     let value: Value = serde_json::from_str(text).unwrap();
     assert_eq!(value["status"], "accepted_in_progress");
     assert_eq!(requests.len(), 1, "bridge must forward exactly one call");
+    assert!(
+        requests[0]["params"].get("transport").is_none(),
+        "legacy bridge requests must omit transport=cli: {}",
+        requests[0]
+    );
+}
+
+fn quote_torture_fixture() -> Value {
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("fixtures/tool-cli/quote-torture.json")).unwrap();
+    fixture["large"] = Value::String(format!(
+        "{}{}",
+        fixture["large"].as_str().unwrap(),
+        "0123456789abcdef".repeat(512)
+    ));
+    fixture
+}
+
+fn assert_quote_torture_request(requests: &[Value], expected: &Value, source: &str) {
+    assert_cli_envelope(requests, "send");
+    assert_eq!(
+        requests[0]["params"]["arguments"], *expected,
+        "{source} must preserve the fixture arguments exactly"
+    );
+    let message = expected["message"]
+        .as_str()
+        .expect("quote torture fixture message must be a string");
+    for needle in [
+        "\"double\"",
+        "'single'",
+        "literal newline",
+        "$HOME",
+        "`backticks`",
+        "embedded EOF line\nEOF\nline after EOF",
+        "Unicode: 測試雪だるま 🚀",
+    ] {
+        assert!(
+            message.contains(needle),
+            "{source} fixture must contain {needle:?}: {message:?}"
+        );
+    }
+    assert!(
+        serde_json::to_vec(expected).unwrap().len() >= 8 * 1024,
+        "{source} fixture must exercise an argument payload of at least 8 KiB"
+    );
+}
+
+#[test]
+fn quote_torture_round_trips_through_stdin_and_file() {
+    let expected = quote_torture_fixture();
+    let encoded = serde_json::to_string(&expected).unwrap();
+
+    let stdin_daemon = MockDaemon::new(response("ok"));
+    let stdin_home = stdin_daemon.home.clone();
+    let stdin_args = vec![
+        "tool".to_string(),
+        "send".to_string(),
+        "--json".to_string(),
+        "-".to_string(),
+        "--home".to_string(),
+        stdin_home.to_string_lossy().into_owned(),
+    ];
+    let stdin_output = run_tool_with_stdin(&stdin_home, &stdin_args, &encoded);
+    let stdin_requests = stdin_daemon.finish();
+    assert_eq!(
+        stdin_output.status.code(),
+        Some(0),
+        "stdin quote-torture invocation must succeed: {}",
+        combined(&stdin_output)
+    );
+    assert_quote_torture_request(&stdin_requests, &expected, "--json -");
+
+    let file_daemon = MockDaemon::new(response("ok"));
+    let file_home = file_daemon.home.clone();
+    let fixture_path = file_home.join("quote-torture.json");
+    std::fs::write(&fixture_path, &encoded).unwrap();
+    let file_args = vec![
+        "tool".to_string(),
+        "send".to_string(),
+        "--json".to_string(),
+        format!("@{}", fixture_path.display()),
+        "--home".to_string(),
+        file_home.to_string_lossy().into_owned(),
+    ];
+    let file_output = run_tool_owned(&file_home, &file_args);
+    let file_requests = file_daemon.finish();
+    assert_eq!(
+        file_output.status.code(),
+        Some(0),
+        "@FILE quote-torture invocation must succeed: {}",
+        combined(&file_output)
+    );
+    assert_quote_torture_request(&file_requests, &expected, "--json @FILE");
 }
 
 #[test]

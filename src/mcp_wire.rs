@@ -477,4 +477,16 @@ mod tests {
         assert!(request["request_id"].as_str().is_some());
         assert_eq!(with_request_id(&request), request);
     }
+
+    #[test]
+    fn mcp_tool_envelope_omits_cli_transport_discriminator() {
+        let request = mcp_tool_envelope("agent-a", "send", &json!({"message": "hello"}));
+        assert_eq!(request["method"], "mcp_tool");
+        assert_eq!(request["params"]["instance"], "agent-a");
+        assert_eq!(request["params"]["tool"], "send");
+        assert!(
+            request["params"].get("transport").is_none(),
+            "legacy MCP bridge requests must not claim transport=cli: {request}"
+        );
+    }
 }

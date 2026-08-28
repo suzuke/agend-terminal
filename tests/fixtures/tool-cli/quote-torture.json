@@ -1,0 +1,4 @@
+{
+  "message": "double quote: \"double\"; single quote: 'single'\nliteral newline\nshell chars: $HOME and `backticks`\nembedded EOF line\nEOF\nline after EOF\nUnicode: 測試雪だるま 🚀",
+  "large": "fixture-large-payload:"
+}
