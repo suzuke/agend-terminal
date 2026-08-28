@@ -3183,71 +3183,11 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
     (rx, dump)
 }
 
-/// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
-/// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
-/// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
-/// true. Spawns a minimal test PTY child; the caller owns cleanup of the registry.
-/// Uses the platform's portable-pty command shape so cross-platform tests can
-/// construct the same minimal live handle.
-#[cfg(test)]
-pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-    #[cfg(not(target_os = "windows"))]
-    let mut cmd = CommandBuilder::new("true");
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = CommandBuilder::new("cmd");
-        c.args(["/c", "findstr", ".*"]);
-        c
-    };
-    cmd.cwd(std::env::temp_dir());
-    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
-    drop(pair.slave);
-    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
-    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
-    let core = Arc::new(CoreMutex::new(AgentCore {
-        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
-        subscribers: Vec::new(),
-        state: StateTracker::new(None),
-        health: HealthTracker::new(),
-        api_activity: crate::agent::ApiActivity::default(),
-        observed_status: None,
-    }));
-    let published_state = core.lock().state.published_handle();
-    let published_observed = core.lock().state.published_observed_handle();
-    AgentHandle {
-        id,
-        name: name.to_string().into(),
-        declared_backend: None,
-        backend_command: "true".to_string(),
-        pty_writer,
-        pty_master,
-        core,
-        published_state,
-        published_observed,
-        child: Arc::new(Mutex::new(child)),
-        submit_key: "\r".to_string(),
-        inject_prefix: String::new(),
-        typed_inject: false,
-        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        spawned_at: std::time::Instant::now(),
-        spawned_at_epoch_ms: 0,
-        spawn_mode: crate::backend::SpawnMode::Fresh,
-        generation: crash_disposition::SpawnGeneration::default(),
-        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    }
-}
-
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::mk_test_handle;
 
 #[cfg(test)]
 mod review_repro_agent_binding;
