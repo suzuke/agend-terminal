@@ -387,3 +387,176 @@ fn deployment_spawn_records_resolved_args_for_the_snapshot() {
         );
     }
 }
+
+fn config_for(name: &str, args: &[&str]) -> crate::daemon::AgentConfig {
+    crate::daemon::AgentConfig {
+        name: name.to_string(),
+        backend: None,
+        backend_command: crate::default_shell().to_string(),
+        args: args.iter().map(|a| (*a).to_string()).collect(),
+        env: None,
+        working_dir: None,
+        submit_key: "\r".to_string(),
+    }
+}
+
+/// A spawn that fails must leave the map as it found it — including the case
+/// where it OVERWROTE an existing entry. Blindly removing would strip a restart
+/// of the config its predecessor was still described by.
+#[test]
+fn a_failed_spawn_restores_the_previous_config() {
+    let fx = fixture("rollback-restore");
+    let name = "cfg-rollback";
+    fx.configs
+        .lock()
+        .insert(name.to_string(), config_for(name, &["--previous"]));
+
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.configs,
+        &fx.registry,
+        name,
+        config_for(name, &["--attempted"]),
+        || Err(anyhow::anyhow!("spawn refused")),
+    );
+
+    assert!(result.is_err(), "the failure must reach the caller");
+    assert_eq!(
+        fx.respawn_config(name).map(|c| c.args),
+        Some(vec!["--previous".to_string()]),
+        "a failed spawn must restore what it overwrote, not delete it"
+    );
+}
+
+/// The other half: an entry this transaction INTRODUCED must not survive its
+/// own failure, or the map would describe an agent that does not exist.
+#[test]
+fn a_failed_spawn_removes_a_config_it_introduced() {
+    let fx = fixture("rollback-remove");
+    let name = "cfg-new";
+
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.configs,
+        &fx.registry,
+        name,
+        config_for(name, &["--attempted"]),
+        || Err(anyhow::anyhow!("spawn refused")),
+    );
+
+    assert!(result.is_err());
+    assert!(
+        fx.respawn_config(name).is_none(),
+        "a config introduced by a failed spawn must not outlive it"
+    );
+}
+
+/// The race the rollback must not lose: a concurrent same-name spawn wins while
+/// ours fails. Nothing serializes those today — the duplicate check in
+/// `spawn_instance` reads the registry and the actual registration happens
+/// later — so the loser must not erase the winner. Value comparison cannot
+/// decide this (two identical configs are indistinguishable); the REGISTRY can,
+/// because a winner has registered by the time it matters.
+#[test]
+fn a_failed_spawn_does_not_erase_a_concurrent_winner() {
+    let fx = fixture("rollback-race");
+    let name = "cfg-race";
+
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.configs,
+        &fx.registry,
+        name,
+        config_for(name, &["--loser"]),
+        || {
+            // A concurrent winner: registered, and describing itself in the map.
+            crate::agent::spawn_agent(
+                &crate::agent::SpawnConfig {
+                    name,
+                    backend: None,
+                    backend_command: crate::default_shell(),
+                    args: &[],
+                    spawn_mode: crate::backend::SpawnMode::Fresh,
+                    cols: 80,
+                    rows: 24,
+                    env: None,
+                    working_dir: None,
+                    submit_key: "\r",
+                    home: Some(&fx.home),
+                    crash_tx: None,
+                    shutdown: None,
+                },
+                &fx.registry,
+            )
+            .expect("winner registers");
+            fx.configs
+                .lock()
+                .insert(name.to_string(), config_for(name, &["--winner"]));
+            Err(anyhow::anyhow!("our spawn lost the race"))
+        },
+    );
+
+    assert!(result.is_err(), "our spawn failed");
+    assert_eq!(
+        fx.respawn_config(name).map(|c| c.args),
+        Some(vec!["--winner".to_string()]),
+        "the loser's rollback must not strip the config of an agent that IS registered — that \
+         would hand the winner the very defect this work removes"
+    );
+}
+
+/// A child that starts and then exits immediately is not a failed spawn: it
+/// registered, so it must keep its config and stay crash-respawn eligible.
+#[test]
+fn a_successful_spawn_that_exits_immediately_keeps_its_config() {
+    let fx = fixture("fast-exit");
+    let name = "cfg-fast-exit";
+
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.configs,
+        &fx.registry,
+        name,
+        config_for(name, &["--login"]),
+        || Ok(crate::backend::SpawnMode::Fresh),
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(
+        fx.respawn_config(name).map(|c| c.args),
+        Some(vec!["--login".to_string()]),
+        "a fast-exiting child must not be mistaken for a failed spawn: crash respawn is exactly \
+         the path that needs its config"
+    );
+}
+
+/// Lock discipline, asserted from inside the spawn itself: neither lock may be
+/// held across it. `try_lock` from this same thread would fail if the
+/// transaction were still holding one, and no disk I/O may run under either.
+#[test]
+fn the_config_transaction_holds_no_lock_across_the_spawn() {
+    let fx = fixture("lock-order");
+    let name = "cfg-locks";
+
+    let observed = std::cell::RefCell::new((false, false));
+    let result = crate::agent_ops::spawn_one_recording_config(
+        &fx.configs,
+        &fx.registry,
+        name,
+        config_for(name, &["--login"]),
+        || {
+            let configs_free = fx.configs.try_lock().is_some();
+            let registry_free = fx.registry.try_lock().is_some();
+            *observed.borrow_mut() = (configs_free, registry_free);
+            Ok(crate::backend::SpawnMode::Fresh)
+        },
+    );
+
+    assert!(result.is_ok());
+    let (configs_free, registry_free) = *observed.borrow();
+    assert!(
+        configs_free,
+        "the configs lock must be released before the spawn, or the spawn's own registry work \
+         inverts the documented registry-then-configs order"
+    );
+    assert!(
+        registry_free,
+        "the registry lock must not be held across the spawn either"
+    );
+}
