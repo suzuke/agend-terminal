@@ -661,19 +661,55 @@ pub(super) fn handle_restart_instance_with_runtime(
     // silently lose an unconfirmed message; #3228 intentionally chooses
     // visible redelivery and recovery. Resume restarts preserve context → the
     // implicit next-drain ack (A) handles it.
-    if mode != "resume" {
-        crate::inbox::requeue_delivering_for_session_reset(home, name);
-    }
-
     let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
         registry: &runtime.registry,
         configs: &runtime.configs,
         externals: &runtime.externals,
         notifier: runtime.notifier.as_ref(),
     });
+
+    // #3414: the runtime DELETE goes through `delete_instance_under_guard`,
+    // whose contract is that the CALLER already owns the `DeleteFence`. Restart
+    // owned none, so neither the deleting mark that makes a concurrent
+    // `dispatch_transport` refuse a job aimed at the dying session nor the
+    // transport delivery cleanup that fence fronts ever ran. The legacy API
+    // DELETE builds its own fence inside the daemon
+    // (`agent_ops::delete_instance_with_exit_status`) and the transport lane is a
+    // non-reentrant mutex, so nesting a second fence around that call would block
+    // the serving thread on this lane while we block on its response: the fence is
+    // scoped to exactly the path that lacks one. It opens after the draft gate so
+    // a long grace never marks a still-live instance.
+    let fence = delete_context
+        .is_some()
+        .then(|| crate::daemon::lifecycle::DeleteFence::new(home, name, true));
+
+    if mode != "resume" {
+        crate::inbox::requeue_delivering_for_session_reset(home, name);
+        // A fresh restart destroys the session, so every transport receipt keyed
+        // to it is unresolvable — the consumer that owed the acknowledgement no
+        // longer exists. Left behind, the self-kick watchdog escalates it to every
+        // channel as an unacknowledged delivery on an instance the operator
+        // deliberately restarted. A resume restores the SAME session, so its
+        // receipts stay resolvable and are preserved. Only under the fence:
+        // `remove_instance_delivery_state` requires the cleanup guard so no
+        // in-flight transport job can recreate the files behind it.
+        if fence.is_some() {
+            if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+                tracing::warn!(
+                    agent = %name,
+                    error = %error,
+                    "restart: transport delivery cleanup failed"
+                );
+            }
+        }
+    }
+
     // Restart intentionally uses no-wait deletion: admission of the kill signal,
     // followed by the replacement spawn, is this path's existing contract.
     let _ = lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+    // SPAWN refuses a name that is mid-delete (`agent::spawn_agent`), so the fence
+    // must close before the replacement spawn.
+    drop(fence);
 
     let spawn_params = restart_spawn_params(
         name,
