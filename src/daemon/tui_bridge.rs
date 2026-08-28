@@ -610,11 +610,13 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 /// back to a slice.
 #[cfg(test)]
 fn modal_state_touches_in_production(prod: &str) -> Vec<(usize, String)> {
+    let modal_touch = ["dev_modal", "::"].concat();
+    let pty_write_touch = ["note_", "pty_write"].concat();
     prod.lines()
         .enumerate()
         .filter(|(_, l)| {
             let t = l.trim_start();
-            !t.starts_with("//") && (l.contains("dev_modal::") || l.contains("note_pty_write"))
+            !t.starts_with("//") && (l.contains(&modal_touch) || l.contains(&pty_write_touch))
         })
         .map(|(i, l)| (i + 1, l.trim().to_string()))
         .collect()
@@ -628,12 +630,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    /// Select the source that the modal-state guard scans. This RED version
-    /// mirrors the old first-`#[cfg(test)]` cutoff; production added below a
-    /// test helper therefore disappears before the guard sees it.
+    /// Select the complete source that the modal-state guard scans. Test-only
+    /// source literals are assembled from fragments below, so scanning the
+    /// complete file cannot self-satisfy or self-trigger the guard.
     fn production_source(src: &str) -> &str {
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        src.split_once(&cfg_test).map_or(src, |(before, _)| before)
+        src
     }
 
     /// A connected loopback pair plus a SECOND handle on the server side.
@@ -1538,22 +1539,15 @@ mod tests {
         );
     }
 
-    /// #3421 item1 RED: the guard below scopes its NEGATIVE assertions to two
-    /// slices — the `TAG_RESIZE` match arm and the resize-effect closure — so a
-    /// module-level helper that touches `dev_modal::` or `note_pty_write` and is
-    /// merely CALLED from the resize path sits outside both and is invisible to it.
-    /// The positive assertions are correctly scoped; only the negatives are too
-    /// narrow.
+    /// #3421 item1 mutation proof: the old guard scoped its NEGATIVE assertions
+    /// to two slices — the `TAG_RESIZE` match arm and the resize-effect closure —
+    /// so a module-level helper that touches modal state and is merely CALLED from
+    /// the resize path sat outside both and was invisible to it. The positive
+    /// assertions are correctly scoped; only the negatives were too narrow.
     ///
-    /// This test pins the escape twice over. First it confirms the escape is real:
-    /// with a module-level helper appended after the test module, the shipped
-    /// first-`#[cfg(test)]` slicing still reports the arm as clean. Then it
-    /// requires the source guard to scan that FULL file and flag it — which is
-    /// what does not exist yet, so this is a compile-RED at 75669bcb.
-    ///
-    /// A compile-RED proves test-first ORDERING only. The GREEN commit carries the
-    /// mutation replay that proves the strengthened predicate also DISCRIMINATES,
-    /// since ordering alone would not.
+    /// This test pins the escape twice over. First it confirms the old slices are
+    /// clean even with a module-level helper appended after the test module. Then
+    /// it requires the source guard to scan that FULL file and flag the mutation.
     #[test]
     fn a_module_level_helper_escapes_the_slice_scoped_negatives() {
         let src = include_str!("tui_bridge.rs");
@@ -1561,10 +1555,9 @@ mod tests {
         // The exact escape: a helper OUTSIDE the resize arm and outside the resize
         // effect closure, below the inline test module, of the shape a refactor
         // would naturally produce.
-        let modal_touch = ["dev_modal::", "note_pty_write"].concat();
-        let poisoned = format!(
-            "{src}\nfn resize_bookkeeping(c: &mut Core) {{ {modal_touch}(c); }}\n"
-        );
+        let modal_touch = ["dev_modal", "::", "note_", "pty_write"].concat();
+        let poisoned =
+            format!("{src}\nfn resize_bookkeeping(c: &mut Core) {{ {modal_touch}(c); }}\n");
         let prod = production_source(&poisoned);
 
         // 1. The escape is real: the shipped slicing sees nothing wrong.
@@ -1576,7 +1569,8 @@ mod tests {
             .expect("TAG_RESIZE arm must end before the fallback arm")
             .0;
         assert!(
-            !resize_arm.contains("dev_modal::") && !resize_arm.contains("note_pty_write"),
+            !resize_arm.contains(&["dev_modal", "::"].concat())
+                && !resize_arm.contains(&["note_", "pty_write"].concat()),
             "precondition: the slice-scoped negative must still read as clean, or this \
              test is no longer demonstrating the escape it was written for"
         );
