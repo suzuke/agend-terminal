@@ -288,6 +288,51 @@ mod tests {
             .collect()
     }
 
+    /// #3416 r1 RED: `acquire` maps a flock SYSCALL failure onto
+    /// `AppendError::Open`, whose text says the audit log "could not be opened".
+    /// By the time `acquire` runs, BOTH the lock file and the target have already
+    /// been opened successfully — the failure is the lock call, not an open.
+    ///
+    /// The safety half of that variant's claim is still true here (nothing has been
+    /// written yet), which is exactly why the bug survived the previous correction:
+    /// I checked that "nothing was written" held and did not check that the stated
+    /// CAUSE held. A fail-closed gate surfaces this text to an operator, so it sends
+    /// them to look at permissions and disk space for a failure that was neither.
+    ///
+    /// Pinned on a PURE classifier rather than by forcing a real `flock` error,
+    /// because there is no portable way to make the syscall fail on demand. The
+    /// classifier is the mapping under test; `acquire` calls it.
+    #[test]
+    fn a_lock_syscall_failure_is_not_reported_as_an_open_failure() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err = classify_lock_error(fs4::TryLockError::Error(io));
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("could not be opened"),
+            "a lock-syscall failure must not be described as an open failure: {msg}"
+        );
+        assert!(
+            msg.contains("lock"),
+            "the message must name the lock as the thing that failed: {msg}"
+        );
+        assert!(
+            matches!(err, AppendError::Lock(_)),
+            "a lock-syscall failure needs its own variant so callers can tell it \
+             apart from an open failure"
+        );
+    }
+
+    /// The other arm must not drift while the first is fixed: contention is still
+    /// contention, and it is the arm that carries the "skip, never write unlocked"
+    /// contract.
+    #[test]
+    fn contention_still_classifies_as_contended() {
+        assert!(matches!(
+            classify_lock_error(fs4::TryLockError::WouldBlock),
+            AppendError::Contended
+        ));
+    }
+
     /// The delivery guarantee: the bounded path retries, so when the lock is
     /// obtainable every record lands exactly once and intact. This is where exact
     /// delivery is pinned — the best-effort path deliberately does not promise it.
