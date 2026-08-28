@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "Usage: agend-terminal tool <NAME> [--action <A>] [--json <JSON|-|@FILE>] [--arg K=V]... [--home <DIR>] [--request-id <UUID>]";
+const USAGE_FIX: &str = "Provide a tool name and valid options.";
 
 /// Arguments for the hidden top-level `tool` command.
 pub(crate) struct ToolArgs {
@@ -22,11 +23,19 @@ pub(crate) struct ToolArgs {
     pub request_id: Option<String>,
 }
 
+/// Print the machine-readable malformed-invocation contract and retain a
+/// human-readable diagnostic for interactive callers.
+pub(crate) fn print_usage_error(error: impl Into<String>) {
+    let error = error.into();
+    print_json(&serde_json::json!({"error": error, "fix": USAGE_FIX}));
+    eprintln!("{error}\n{USAGE}");
+}
+
 /// Run one generic tool invocation, or the live `list` / `schema` discovery
 /// commands.  The returned code is already the public CLI exit code.
 pub(crate) fn run(default_home: &Path, input: ToolArgs) -> i32 {
     let Some(name) = input.name.as_deref() else {
-        eprintln!("{USAGE}");
+        print_usage_error("tool requires a tool name");
         return 3;
     };
     let home = input.home.as_deref().unwrap_or(default_home);
@@ -34,7 +43,7 @@ pub(crate) fn run(default_home: &Path, input: ToolArgs) -> i32 {
 
     if name == "schema" {
         let Some(schema_name) = input.second_name.as_deref() else {
-            eprintln!("{USAGE}\n  schema requires a tool name");
+            print_usage_error("schema requires a tool name");
             return 3;
         };
         if input.action.is_some()
@@ -42,14 +51,14 @@ pub(crate) fn run(default_home: &Path, input: ToolArgs) -> i32 {
             || !input.args.is_empty()
             || input.request_id.is_some()
         {
-            eprintln!("tool schema accepts only the tool name and --home");
+            print_usage_error("tool schema accepts only the tool name and --home");
             return 3;
         }
         return run_schema(home, &instance, schema_name);
     }
 
     if input.second_name.is_some() {
-        eprintln!("{USAGE}\n  unexpected extra positional argument");
+        print_usage_error("unexpected extra positional argument");
         return 3;
     }
     if name == "list" {
@@ -58,7 +67,7 @@ pub(crate) fn run(default_home: &Path, input: ToolArgs) -> i32 {
             || !input.args.is_empty()
             || input.request_id.is_some()
         {
-            eprintln!("tool list accepts only --home");
+            print_usage_error("tool list accepts only --home");
             return 3;
         }
         return run_list(home, &instance);
@@ -67,7 +76,7 @@ pub(crate) fn run(default_home: &Path, input: ToolArgs) -> i32 {
     let arguments = match compose_arguments(input.json.as_deref(), &input.args, input.action) {
         Ok(arguments) => arguments,
         Err(error) => {
-            eprintln!("tool invocation is malformed: {error}\n{USAGE}");
+            print_usage_error(format!("tool invocation is malformed: {error}"));
             return 3;
         }
     };
@@ -75,7 +84,7 @@ pub(crate) fn run(default_home: &Path, input: ToolArgs) -> i32 {
         Some(value) => match uuid::Uuid::parse_str(value) {
             Ok(_) => Some(value),
             Err(_) => {
-                eprintln!("tool invocation is malformed: --request-id must be a UUID\n{USAGE}");
+                print_usage_error("tool invocation is malformed: --request-id must be a UUID");
                 return 3;
             }
         },
@@ -158,14 +167,12 @@ fn run_schema(home: &Path, instance: &str, requested: &str) -> i32 {
 
 fn print_wire_error(error: WireError) -> i32 {
     let class = match error.kind() {
-        // No run directory means the request could not reach a daemon, but
-        // the caller has no state evidence to distinguish a stale invocation
-        // from a daemon transition.  Preserve the explicit exit-4 contract.
-        WireErrorKind::NoDaemon
-        | WireErrorKind::Read
-        | WireErrorKind::Write
-        | WireErrorKind::Protocol => ResponseClass::Indeterminate,
-        WireErrorKind::Refused | WireErrorKind::Connect => ResponseClass::Refused,
+        WireErrorKind::Read | WireErrorKind::Write | WireErrorKind::Protocol => {
+            ResponseClass::Indeterminate
+        }
+        WireErrorKind::NoDaemon | WireErrorKind::Refused | WireErrorKind::Connect => {
+            ResponseClass::Refused
+        }
     };
     let response = json_error(&error.to_string());
     print_response_payload(&response, class);

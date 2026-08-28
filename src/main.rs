@@ -845,8 +845,7 @@ fn main() -> anyhow::Result<()> {
                     ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
                 ) =>
         {
-            eprintln!("{error}");
-            eprintln!("Usage: agend-terminal tool <NAME> [--action <A>] [--json <JSON|-|@FILE>] [--arg K=V]...");
+            tool_cli::print_usage_error(error.to_string());
             std::process::exit(3);
         }
         Err(error) => error.exit(),
