@@ -635,6 +635,12 @@ mod tests {
     /// never parks a write and a test that relies on one passes vacuously. Even
     /// honored, the sizes are auto-tuned upward — roughly 390 KB of headroom
     /// here — which is why the payload below is near `DEFAULT_FRAME_LIMIT`.
+    ///
+    /// Winsock does not honor it at all at this size: CI measured a 900 KiB
+    /// write to a non-reading peer completing on windows-latest, so the two
+    /// tests that need a parked write are ignored there. That is a limit of the
+    /// fixture, not of the fix — `set_write_timeout` is SO_SNDTIMEO on Windows
+    /// too, and the production paths are identical on every platform.
     fn small_buffer_socket_pair() -> SocketPair {
         use socket2::{Domain, Socket, Type};
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1261,6 +1267,11 @@ mod tests {
     /// loop — the same harm as the stalled auth read, one step later. Greeting
     /// such a client must fail closed and promptly.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Winsock absorbs a 900 KiB write to a non-reading peer, so this fixture cannot \
+                  park one; the bounded-write fix itself is platform-independent"
+    )]
     fn a_client_that_never_reads_cannot_wedge_the_initial_greeting() {
         let pair = small_buffer_socket_pair();
         let mut server = pair.server;
@@ -1297,6 +1308,11 @@ mod tests {
     /// throughout so an exit cannot come from `Disconnected` either. No sleep is
     /// load-bearing.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Winsock absorbs a 900 KiB write to a non-reading peer, so this fixture cannot \
+                  park one; the bounded-write fix itself is platform-independent"
+    )]
     fn a_client_that_stops_reading_cannot_wedge_the_output_forwarder() {
         let run_dir = scratch_run_dir("wedged-write");
         publish_port(&run_dir, "agent", 4242);
