@@ -491,6 +491,65 @@ mod tests {
         );
     }
 
+    /// #3373, same root class as the retirement blockers: no state a client can
+    /// put an ACCEPTED connection into may stop this bridge from letting go.
+    ///
+    /// `write_frame` is an unbounded blocking write. A pane that stops draining
+    /// its socket — suspended, wedged, or simply gone quiet without closing —
+    /// parks the forwarder inside that write forever, so the retirement check at
+    /// the top of the loop is never reached again and the pane keeps a live
+    /// socket to a dead generation. The same write error path must also
+    /// `shutdown` rather than just `break`: the input thread holds another
+    /// handle on this connection, so dropping ours closes nothing.
+    ///
+    /// Both socket buffers are shrunk so one frame is guaranteed not to fit;
+    /// the peer reads nothing until the forwarder is expected to be gone, so the
+    /// write cannot drain for the wrong reason. No sleep is load-bearing.
+    #[test]
+    fn a_client_that_stops_reading_cannot_wedge_the_output_forwarder() {
+        let run_dir = scratch_run_dir("wedged-write");
+        publish_port(&run_dir, "agent", 4242);
+        let pair = socket_pair();
+        let peer = pair.peer;
+        socket2::SockRef::from(&peer).set_recv_buffer_size(4096).unwrap();
+        socket2::SockRef::from(&pair.server)
+            .set_send_buffer_size(4096)
+            .unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        // One frame far larger than the shrunk buffers — but still under
+        // `framing::DEFAULT_FRAME_LIMIT`, or `write_frame` would refuse it
+        // outright and the test would pass without ever blocking a write.
+        tx.send(vec![0x41; 256 * 1024]).unwrap();
+
+        let dir = run_dir.clone();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let forwarder = std::thread::spawn(move || {
+            super::forward_tui_output(pair.server, rx, dir, "agent".to_string(), 4242);
+            let _ = done_tx.send(());
+        });
+
+        let exited = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Only now does the peer read: a blocked write must have been abandoned
+        // on its own, not unblocked by this drain.
+        let saw_eof = peer_sees_eof(peer, Duration::from_secs(5));
+        drop(tx);
+        let _ = forwarder.join();
+        std::fs::remove_dir_all(&run_dir).ok();
+
+        assert!(
+            exited,
+            "a client that stops reading must not park the forwarder in an unbounded write — \
+             the retirement check at the top of the loop is never reached while it is parked"
+        );
+        assert!(
+            saw_eof,
+            "a failed frame write must shutdown the connection, not merely break: the input \
+             thread holds another handle, so the pane would keep a live socket to a dead \
+             generation"
+        );
+    }
+
     /// #3373 follow-up: retirement must not depend on the channel going quiet.
     /// A generation that is still producing output keeps `recv_timeout` in its
     /// `Ok` arm, so a retirement check that only lives in the timeout arm is
