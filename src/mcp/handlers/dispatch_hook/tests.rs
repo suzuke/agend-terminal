@@ -1037,10 +1037,8 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
 fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
     use crate::identity::Sender;
 
-    let home = std::env::temp_dir().join(format!(
-        "agend-3419-real-entry-race-{}",
-        std::process::id()
-    ));
+    let home =
+        std::env::temp_dir().join(format!("agend-3419-real-entry-race-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("create race home");
     setup_test_repo(&home, "target-agent");
@@ -1071,7 +1069,10 @@ fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
                 "supersedes": supersede_id,
             }),
         );
-        assert_eq!(replacement["status"], "posted", "supersede decision: {replacement}");
+        assert_eq!(
+            replacement["status"], "posted",
+            "supersede decision: {replacement}"
+        );
     }));
 
     let args = serde_json::json!({
@@ -1083,12 +1084,8 @@ fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
         "bind": false,
     });
     let sender = Some(Sender::new("lead").expect("sender"));
-    let result = super::super::comms::handle_delegate_task(
-        &home,
-        &args,
-        &sender,
-        Some(&minimal_runtime()),
-    );
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
 
     assert_eq!(
         result["code"], "governing_decision_unresolved",
