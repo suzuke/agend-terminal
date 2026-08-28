@@ -521,11 +521,11 @@ mod tests {
         }
 
         let content = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
-        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut rows: Vec<(&str, serde_json::Value)> = Vec::new();
         let mut corrupt = 0usize;
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             match serde_json::from_str::<serde_json::Value>(line) {
-                Ok(v) if v.is_object() => rows.push(v),
+                Ok(v) if v.is_object() => rows.push((line, v)),
                 _ => corrupt += 1,
             }
         }
@@ -549,25 +549,41 @@ mod tests {
         // parseable JSON — and must appear exactly once. Duplication would mean a
         // retry wrote twice; a malformed row would mean a partial write survived.
         let mut seen = std::collections::HashSet::new();
-        for row in &rows {
+        for (raw, row) in &rows {
             let agent = row["agent"].as_str().expect("surviving row must carry agent");
             let seq = row["seq"].as_u64().expect("surviving row must carry seq");
-            assert_eq!(row["kind"], "git_event", "surviving row must be complete");
             assert!(
                 seen.insert((agent.to_string(), seq)),
                 "record ({agent}, {seq}) surfaced more than once"
             );
+            assert!(
+                (seq as usize) < RECORDS_PER_WORKER,
+                "record ({agent}, {seq}) is outside the attempted domain"
+            );
+            // The load-bearing assertion: a surviving line must be EXACTLY what the
+            // appender renders for that record. Parsing alone is far too weak — a
+            // reordered, re-serialized or field-dropped write still parses and still
+            // looks unique, and this is an audit trail, so "close enough" is not a
+            // property worth having.
+            let expected = sample_event(agent, seq as usize).to_string();
+            assert_eq!(
+                *raw, expected,
+                "surviving record ({agent}, {seq}) is not byte-identical to what the \
+                 appender renders"
+            );
         }
 
-        // Skip accounting, computed test-locally: the sink itself does not report
-        // skips, and there is deliberately no dropped-count channel — persisting one
-        // would need either this same lock or a second audit trail.
+        // Skip accounting is REPORTED, not asserted. The previous version asserted
+        // `parsed + skipped == attempted` after defining `skipped` as
+        // `attempted - parsed`, which is true by construction and therefore proved
+        // nothing. What is actually worth pinning is that no record can appear that
+        // was never attempted, which the domain and byte-identity assertions above
+        // do carry.
         let attempted = WORKERS * RECORDS_PER_WORKER;
         let skipped = attempted - parsed;
-        assert_eq!(
-            parsed + skipped,
-            attempted,
-            "every attempt must be accounted for as either written or skipped"
+        assert!(
+            parsed <= attempted,
+            "more records surfaced ({parsed}) than were attempted ({attempted})"
         );
         // Measured on the authoring machine: 1532 of 3200 survived, i.e. roughly
         // half skipped with 8 processes appending back-to-back with no gap. That is
