@@ -279,8 +279,18 @@ pub(crate) fn trust_root_basename_denied(repo_relative_path: &str) -> bool {
 /// `mytests/fixtures/`, `src/fixtures/` and `tests/fixtures-extra/` are all
 /// unaffected, and a file merely NAMED `fixtures.*` under `tests/` is not a
 /// directory and does not qualify.
+///
+/// A path carrying an empty, `.` or `..` component is rejected outright, BEFORE
+/// the pair scan: `tests/fixtures/../../fleet.yaml` contains the pair yet
+/// resolves to the repo root, so scanning it literally would exempt a real
+/// trust-root file. Git itself refuses to index such a path, so this is a second
+/// line rather than the only one — which is exactly what a security predicate
+/// should not delegate to someone else's normalisation.
 fn under_tests_fixtures(repo_relative_path: &str) -> bool {
     let parts: Vec<&str> = repo_relative_path.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return false;
+    }
     parts
         .windows(2)
         .enumerate()
