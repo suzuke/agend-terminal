@@ -218,6 +218,7 @@ impl CodexNativeShared {
         codex: &str,
         locator: &SessionLocator,
         cwd: &Path,
+        config_args: &[String],
     ) -> anyhow::Result<std::process::Child> {
         #[cfg(unix)]
         {
@@ -252,6 +253,7 @@ impl CodexNativeShared {
             use std::os::unix::process::CommandExt;
             let mut command = std::process::Command::new(codex);
             command
+                .args(config_args)
                 .args(["app-server", "--listen", &locator.remote_attach_arg()])
                 .current_dir(cwd)
                 .stdout(std::process::Stdio::piped())
@@ -296,7 +298,7 @@ impl CodexNativeShared {
         }
         #[cfg(not(unix))]
         {
-            let _ = (codex, locator, cwd);
+            let _ = (codex, locator, cwd, config_args);
             Err(anyhow::anyhow!("Codex NativeShared requires Unix sockets"))
         }
     }
@@ -1022,7 +1024,9 @@ fn launch_managed_server(
     locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let child = CodexNativeShared::launch(codex, locator, cwd.unwrap_or_else(|| Path::new(".")))?;
+    let config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
+    let cwd = cwd.unwrap_or_else(|| Path::new("."));
+    let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
     let pid = child.id();
     let start_token = crate::process::process_start_token(pid);
     locator.managed = true;
@@ -1374,6 +1378,7 @@ mod tests {
             executable.to_str().expect("UTF-8 executable"),
             &locator,
             &root,
+            &[],
         )
         .expect("launch fake Codex app-server");
         std::thread::sleep(Duration::from_millis(50));
@@ -1413,6 +1418,79 @@ mod tests {
             !combined.contains(STDIO_PROBE_MARKER),
             "Codex app-server output escaped to the parent terminal: {combined}"
         );
+    }
+
+    /// #3402 regression: the managed app-server is the first Codex process to
+    /// read workspace config, so its own argv must carry invocation-only MCP
+    /// and project-trust overrides before the `app-server` subcommand.
+    #[test]
+    fn managed_app_server_launch_carries_config_before_subcommand_3402() {
+        let root = std::env::temp_dir().join(format!("agend-codex-trust-{}", Uuid::new_v4()));
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let endpoint = root.join("transport/codex/trust.sock");
+        let executable = root.join("fake-codex");
+        let args_log = executable.with_extension("args");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\n: > \"$0.args\"\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\" >> \"$0.args\"\n  endpoint=\"$arg\"\ndone\nendpoint=${endpoint#unix://}\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nsleep 5\n",
+        )
+        .expect("fake Codex executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("fake Codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("fake Codex permissions");
+
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+        let prepared = prepare_managed_tui(
+            &home,
+            "codex-3402-server",
+            executable.to_str().expect("UTF-8 executable"),
+            locator,
+            Some(&workspace),
+        )
+        .expect("launch managed fake Codex app-server");
+
+        let argv = std::fs::read_to_string(&args_log).expect("captured app-server argv");
+        let args: Vec<&str> = argv.lines().collect();
+        let app_server_at = args
+            .iter()
+            .position(|arg| *arg == "app-server")
+            .expect("app-server subcommand");
+        let trust_at = args
+            .iter()
+            .position(|arg| arg.starts_with("projects={"))
+            .unwrap_or_else(|| panic!("#3402: app-server trust override missing; argv={args:?}"));
+        let mcp_at = args
+            .iter()
+            .position(|arg| arg.starts_with("mcp_servers.agend-terminal.command="))
+            .unwrap_or_else(|| panic!("#3402: app-server MCP override missing; argv={args:?}"));
+        assert!(trust_at < app_server_at, "#3402: argv={args:?}");
+        assert!(mcp_at < app_server_at, "#3402: argv={args:?}");
+        assert!(
+            args[trust_at].contains(
+                &workspace
+                    .canonicalize()
+                    .expect("canonical workspace")
+                    .to_string_lossy()
+                    .to_string()
+            ),
+            "#3402: trust must target the canonical workspace; argv={args:?}"
+        );
+
+        let mut server = managed_servers()
+            .lock()
+            .expect("managed server lock")
+            .remove(&server_key(&home, "codex-3402-server"))
+            .expect("managed fake server");
+        server.child.kill().expect("stop managed fake server");
+        let _ = server.child.wait();
+        let _ = std::fs::remove_file(endpoint);
+        assert!(prepared.managed);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
