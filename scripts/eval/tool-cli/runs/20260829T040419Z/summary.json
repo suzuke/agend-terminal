@@ -1,0 +1,599 @@
+{
+  "b": 0,
+  "c": 0,
+  "cells": {
+    "both_pass": 60
+  },
+  "critical_gate": {
+    "by_class": {},
+    "by_scenario_arm": {},
+    "pass": true,
+    "total": 0
+  },
+  "delta_definition": "fail_cli - fail_mcp",
+  "delta_hat": 0.0,
+  "invalid": [],
+  "mean_tool_calls": {
+    "cli": 7.895238095238096,
+    "mcp": 3.4857142857142858
+  },
+  "mixing_gate": {
+    "expected_runs_per_scenario": 45,
+    "pass": true,
+    "scenarios": {
+      "S13": {
+        "expected_runs": 45,
+        "mixing": 0,
+        "runs_shortfall": 0,
+        "valid_runs": 45
+      },
+      "S14": {
+        "expected_runs": 45,
+        "mixing": 0,
+        "runs_shortfall": 0,
+        "valid_runs": 45
+      }
+    }
+  },
+  "n": 60,
+  "pairs": [
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 1,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 10,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 2,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 3,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 4,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 5,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 6,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 7,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 8,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 9,
+      "scenario": "S01"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 1,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 10,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 2,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 3,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 4,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 5,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 6,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 7,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 8,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 9,
+      "scenario": "S02"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 1,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 10,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 2,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 3,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 4,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 5,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 6,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 7,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 8,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 9,
+      "scenario": "S03"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 1,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 10,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 2,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 3,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 4,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 5,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 6,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 7,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 8,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 9,
+      "scenario": "S04"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 1,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 10,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 2,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 3,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 4,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 5,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 6,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 7,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 8,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 9,
+      "scenario": "S05"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 1,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 10,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 2,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 3,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 4,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 5,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 6,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 7,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 8,
+      "scenario": "S06"
+    },
+    {
+      "cell": "both_pass",
+      "cli_passed": true,
+      "mcp_passed": true,
+      "pair": 9,
+      "scenario": "S06"
+    }
+  ],
+  "per_arm": {
+    "cli": {
+      "failed": 0,
+      "runs": 105,
+      "tool_calls": 829
+    },
+    "mcp": {
+      "failed": 0,
+      "runs": 105,
+      "tool_calls": 366
+    }
+  },
+  "per_scenario": {
+    "S01": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      },
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      }
+    },
+    "S02": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      },
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      }
+    },
+    "S03": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      },
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      }
+    },
+    "S04": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      },
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      }
+    },
+    "S05": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      },
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      }
+    },
+    "S06": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      },
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 10,
+        "runs": 10
+      }
+    },
+    "S13": {
+      "mcp": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 45,
+        "runs": 45
+      }
+    },
+    "S14": {
+      "cli": {
+        "critical": 0,
+        "failed": 0,
+        "passed": 45,
+        "runs": 45
+      }
+    }
+  },
+  "pilot_safety": true,
+  "plan_gate": {
+    "duplicates": [],
+    "expected_runs": 210,
+    "flags": [],
+    "missing": [],
+    "observed_runs": 210,
+    "pass": true,
+    "unexpected": []
+  },
+  "rate_gate": {
+    "b": 0,
+    "c": 0,
+    "flags": [],
+    "margin": 0.1,
+    "n": 60,
+    "pass": true,
+    "source": "frozen_table",
+    "ucb": 0.04314679724032847
+  },
+  "runs_dir": "/Users/suzuke/.agend-terminal/workspace/archfix-opus-3/phase0b-runs/20260829T040419Z",
+  "schema": 1,
+  "total_runs": 210,
+  "valid_runs": 210
+}

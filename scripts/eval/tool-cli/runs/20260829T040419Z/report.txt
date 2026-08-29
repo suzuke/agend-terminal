@@ -1,0 +1,73 @@
+==============================================================================
+tool-cli Phase 0b — PILOT SAFETY report
+(pilot safety only — never a Phase 1 authorization; SPEC.txt section 9)
+==============================================================================
+
+OVERALL          PASS
+  rate_gate      PASS
+  critical_gate  PASS
+  mixing_gate    PASS
+
+------------------------------------------------------------------------------
+PAIRED TABLE   delta = fail_cli - fail_mcp   (positive => CLI worse)
+------------------------------------------------------------------------------
+  both_pass        60
+  both_fail         0
+  cli_only_fail     0   (b)
+  mcp_only_fail     0   (c)
+  N (valid pairs)  60
+  delta_hat      +0.000000
+  UCB(one-sided 95%)  0.043147   margin 0.10   source frozen_table
+
+------------------------------------------------------------------------------
+CRITICAL CLASSES (zero tolerance, both arms, all valid runs)
+------------------------------------------------------------------------------
+  total occurrences  0
+    none
+
+------------------------------------------------------------------------------
+MIXING GATE (target 0/45 per scenario)
+------------------------------------------------------------------------------
+  S13    0/45 mixing   valid_runs=45   shortfall=0
+  S14    0/45 mixing   valid_runs=45   shortfall=0
+
+------------------------------------------------------------------------------
+PER SCENARIO / ARM
+------------------------------------------------------------------------------
+  scenario arm     runs  passed  failed  critical
+  S01      cli       10      10       0         0
+  S01      mcp       10      10       0         0
+  S02      cli       10      10       0         0
+  S02      mcp       10      10       0         0
+  S03      cli       10      10       0         0
+  S03      mcp       10      10       0         0
+  S04      cli       10      10       0         0
+  S04      mcp       10      10       0         0
+  S05      cli       10      10       0         0
+  S05      mcp       10      10       0         0
+  S06      cli       10      10       0         0
+  S06      mcp       10      10       0         0
+  S13      mcp       45      45       0         0
+  S14      cli       45      45       0         0
+
+------------------------------------------------------------------------------
+PER ARM
+------------------------------------------------------------------------------
+  cli   runs=105 failed=0 mean_tool_calls=7.90
+  mcp   runs=105 failed=0 mean_tool_calls=3.49
+
+------------------------------------------------------------------------------
+INVALID RUNS (excluded from pairs)
+------------------------------------------------------------------------------
+  none
+
+------------------------------------------------------------------------------
+ARTIFACT INDEX
+------------------------------------------------------------------------------
+  runs_dir      /Users/suzuke/.agend-terminal/workspace/archfix-opus-3/phase0b-runs/20260829T040419Z
+  summary.json  /Users/suzuke/.agend-terminal/workspace/archfix-opus-3/phase0b-runs/20260829T040419Z/summary.json
+  report.txt    /Users/suzuke/.agend-terminal/workspace/archfix-opus-3/phase0b-runs/20260829T040419Z/report.txt
+  manifest.json /Users/suzuke/.agend-terminal/workspace/archfix-opus-3/phase0b-runs/20260829T040419Z/manifest.json
+  per-run artifacts: <run_dir>/{metadata.json,seed.json,stream.jsonl,stderr.txt,run.log,final_state/}
+  (no per-run grade.json: --aggregate grades in memory; grade.py <run_dir> writes one on demand)
+  total_runs=210  valid_runs=210
