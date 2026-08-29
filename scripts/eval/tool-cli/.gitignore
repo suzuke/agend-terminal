@@ -7,5 +7,3 @@ runs/**
 !runs/PROVENANCE.txt
 __pycache__/
 *.pyc
-# #3412: the repo-level ignore rule for the operator live fleet.yaml must not swallow fixtures
-!tests/fixtures/**/fleet.yaml
