@@ -6,6 +6,7 @@
 
 use super::*;
 
+#[cfg(unix)]
 fn tmp_home(suffix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "agend-app-phase2-{}-{}",
