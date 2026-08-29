@@ -334,10 +334,15 @@ fn runner_pins_model_and_max_turns() {
     // The lead required the run budget to be pinned in the freeze tests: a
     // change to MAX_TURNS or MODEL must show up as a test edit, not a silent
     // drift of the confirmation matrix's conditions.
+    //
+    // #3435 r1 (3): 15 is SPEC.txt:52's figure. The runner defaulted to 40 while
+    // the SPEC pinned 15, and nothing compared them — this assertion is the
+    // comparison, and grade.py's FROZEN_MAX_TURNS refuses any run recorded with
+    // another budget.
     let source = std::fs::read_to_string(eval_dir().join("run.sh")).expect("run.sh");
     assert!(
-        source.contains(r#"MODEL="claude-fable-5"; MAX_TURNS=40; TIMEOUT_SECS=900"#),
-        "run.sh must pin MODEL=claude-fable-5, MAX_TURNS=40, TIMEOUT_SECS=900 on one line"
+        source.contains(r#"MODEL="claude-fable-5"; MAX_TURNS=15; TIMEOUT_SECS=900"#),
+        "run.sh must pin MODEL=claude-fable-5, MAX_TURNS=15, TIMEOUT_SECS=900 on one line"
     );
     assert!(
         source.contains(r#"--max-turns "$MAX_TURNS""#),

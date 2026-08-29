@@ -35,7 +35,9 @@ while read -r _v; do [ -n "$_v" ] && unset "$_v"; done < <(
 die() { echo "run.sh: $*" >&2; exit 2; }
 
 ARM=""; SCENARIO=""; PAIR=""; OUT=""; SANDBOX=""; KEEP=0
-MODEL="claude-fable-5"; MAX_TURNS=40; TIMEOUT_SECS=900
+# MAX_TURNS is the budget SPEC.txt:52 pins for the frozen runner command; the
+# grader refuses a run recorded with any other value (max_turns_not_frozen).
+MODEL="claude-fable-5"; MAX_TURNS=15; TIMEOUT_SECS=900
 while [ $# -gt 0 ]; do
   case "$1" in
     --arm) ARM="$2"; shift 2 ;;

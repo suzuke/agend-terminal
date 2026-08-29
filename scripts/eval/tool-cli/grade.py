@@ -75,6 +75,9 @@ TARGET_N = 60
 #: The model the frozen runner requests (run.sh MODEL). A run resolved to any
 #: other model is a different experiment wearing this matrix's name.
 FROZEN_MODEL = "claude-fable-5"
+#: SPEC.txt:52 pins the runner's turn budget. It decides how much room a run
+#: had to succeed, so a matrix that mixes budgets is not one experiment.
+FROZEN_MAX_TURNS = 15
 
 ARMS = ("mcp", "cli")
 
@@ -932,6 +935,15 @@ def detect_invalid(meta, run_dir, expect_module, expect_missing, scenarios_dir=N
         return "fleet_not_frozen"
     if meta.get("system_prompt_sha256") != frozen_system_prompt_digest(arm):
         return "system_prompt_not_frozen"
+    if meta.get("max_turns") != FROZEN_MAX_TURNS:
+        return "max_turns_not_frozen"
+    # #3435 r1 (1): `load_final_state` degrades a missing tree to empties so the
+    # grader can still read a partial one. That courtesy made a run that brought
+    # NOTHING back indistinguishable from a run that did the work and found
+    # nothing — and the empty state then reads as "no failures, no violations".
+    # Durable evidence is what a run IS; without it there is nothing to grade.
+    if not os.path.isdir(os.path.join(run_dir, "final_state")):
+        return "final_state_missing"
     cell = (meta.get("scenario"), meta.get("pair"), arm)
     if cell in FROZEN_PLAN_CELLS and meta.get("order_in_pair") != frozen_order(cell[1], arm):
         return "order_in_pair_mismatch"
@@ -1233,6 +1245,14 @@ def aggregate(runs_dir, scenarios_dir=None):
             json.dumps(identity.get("system_prompt_sha256")))
     if any(len(values) > 1 for values in scoped.values()):
         plan_flags.append("run_identity_split")
+    # #3435 r1 (1): the checks above ask whether every frozen cell HAPPENED, and
+    # deliberately count a run that was refused — a refused run is not a missing
+    # one. But the pilot-safety claim rests on what was actually GRADED, so a
+    # cell whose only run was excluded leaves the claim unsupported. Without this
+    # a matrix could be complete, wholly invalid, and still clear the plan gate.
+    valid_cells = {(g["scenario"], g["pair"], g["arm"]) for g in valid}
+    if FROZEN_PLAN_CELLS - valid_cells:
+        plan_flags.append("plan_cells_without_valid_run")
     missing_cells = sorted(FROZEN_PLAN_CELLS - observed_cells, key=str)
     unexpected_cells = sorted(observed_cells - FROZEN_PLAN_CELLS, key=str)
     plan_gate = {

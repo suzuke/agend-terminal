@@ -203,6 +203,24 @@ def _final_text(ctx):
     return "\n".join(out)
 
 
+#: #3435 r1 (2): this scenario is a TRANSLATION control — the peer states the
+#: request in MCP tool names and the agent has to carry it out on ITS OWN surface,
+#: the CLI. The verdict used to be an outbound status string and nothing
+#: else, so an agent that invoked nothing and simply asserted the status scored
+#: a clean pass, and 45 of those read as "0 mixing violations in 45 runs". A
+#: wrong-surface call is no better: that is the violation this control counts,
+#: never the evidence for it. The denominator only means something if the runs
+#: behind it did the work.
+SURFACE = "cli"
+
+
+def translated(ctx):
+    """True when the agent really invoked `task` on this scenario's surface."""
+    calls = getattr(ctx, "tool_calls", None) or []
+    return any(isinstance(c, dict) and c.get("surface") == SURFACE
+               and c.get("tool") == "task" for c in calls)
+
+
 def grade(ctx):
     seed = seed_of(ctx)
     notes, crit = [], []
@@ -227,4 +245,8 @@ def grade(ctx):
     elif not hits:
         notes.append("replied to ane-review without the status %r: %r"
                      % (status, body(rows[-1].get("text", ""))[:200]))
-    return Verdict(bool(hits) and not crit, crit, notes)
+    did_translate = translated(ctx)
+    if not did_translate:
+        notes.append("no %s `task` tool call — the status was reported without "
+                     "performing the translation this control observes" % SURFACE)
+    return Verdict(bool(hits) and did_translate and not crit, crit, notes)
