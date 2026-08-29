@@ -147,6 +147,7 @@ class MatrixAuthority(unittest.TestCase):
                 # the grader refuses any other value, so a fixture that omits it
                 # stopped modelling a conforming run the moment that became true.
                 "max_turns": grade.FROZEN_MAX_TURNS,
+                "timeout_secs": grade.FROZEN_TIMEOUT_SECS,
                 "invalid_reason": None}
         meta.update(meta_extra)
         for key in [k for k, v in meta_extra.items() if v is DROP_SENTINEL]:

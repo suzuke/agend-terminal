@@ -155,7 +155,7 @@ cleanup
 
 # ── metadata ────────────────────────────────────────────────────────────────
 EV_OUT="$OUT" EV_SANDBOX="$SANDBOX" EV_SCENARIO="$SCENARIO" EV_ARM="$ARM" \
-EV_PAIR="$PAIR" EV_ORDER="$ORDER" EV_MODEL="$MODEL" EV_EXIT="$EXIT_CODE" EV_MAX_TURNS="$MAX_TURNS" \
+EV_PAIR="$PAIR" EV_ORDER="$ORDER" EV_MODEL="$MODEL" EV_EXIT="$EXIT_CODE" EV_MAX_TURNS="$MAX_TURNS" EV_TIMEOUT_SECS="$TIMEOUT_SECS" \
 EV_TIMED_OUT="$TIMED_OUT" EV_STARTED="$STARTED_AT" EV_ENDED="$ENDED_AT" \
 EV_T0="$T0" EV_T1="$T1" EV_HERE="$HERE" EV_REPO="$REPO" \
 EV_GIT_HEAD="$GIT_HEAD" \
@@ -251,6 +251,7 @@ json.dump({
     "exit_code": int(exit_code),
     "turns": turns,
     "max_turns": int(E.get("EV_MAX_TURNS", "0")) or None,
+    "timeout_secs": int(E.get("EV_TIMEOUT_SECS", "0")) or None,
     "result_subtype": result_subtype,
     "num_turns": num_turns,
     "stop_reason": stop_reason,
