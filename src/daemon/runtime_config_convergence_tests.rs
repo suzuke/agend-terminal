@@ -465,7 +465,7 @@ fn a_failed_spawn_removes_a_config_it_introduced() {
 /// again from inside; A waits — bounded — for B's INSIDE signal and only stops
 /// waiting when it does not come. A design without the lane hands A that signal
 /// immediately and the recorded order shows B inside while A still is; with the
-/// lane, B's entry can only be recorded after A has left.
+/// lane, B's entry can only be recorded after A's transaction body is complete.
 #[test]
 fn one_spawn_transaction_per_name_at_a_time() {
     let fx = fixture("lane");
@@ -526,10 +526,12 @@ fn one_spawn_transaction_per_name_at_a_time() {
             } else {
                 "A:exclusive"
             });
+            // Record this before returning so it is ordered before the lane
+            // guard drops; logging after the transaction is a post-unlock race.
+            a_events.lock().push("A:transaction-body-complete");
             Ok(crate::backend::SpawnMode::Fresh)
         },
     );
-    events.lock().push("A:left");
     assert!(result.is_ok());
     let _ = b.join();
 
@@ -539,17 +541,17 @@ fn one_spawn_transaction_per_name_at_a_time() {
         "a second spawn transaction for the same name entered while the first was still inside: \
          {observed:?}"
     );
-    let a_left = observed
+    let a_done = observed
         .iter()
-        .position(|e| *e == "A:left")
-        .expect("A recorded leaving");
+        .position(|e| *e == "A:transaction-body-complete")
+        .expect("A recorded transaction-body completion");
     let b_inside = observed
         .iter()
         .position(|e| *e == "B:inside")
         .expect("B eventually enters — the lane serializes, it does not exclude");
     assert!(
-        b_inside > a_left,
-        "B must only be inside after A has left: {observed:?}"
+        b_inside > a_done,
+        "B must only be inside after A's transaction body completes: {observed:?}"
     );
 }
 
