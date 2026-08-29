@@ -1291,12 +1291,13 @@ pub(crate) fn lanes_are_the_same(a: &std::path::Path, b: &std::path::Path, name:
 /// * Success retains it. A child that starts and then exits immediately is not a
 ///   failed spawn; it is precisely the case crash respawn exists for.
 ///
-/// Locks: the lane guard is held across `spawn`, the configs lock is only ever a
-/// temporary, and no registry lock or disk I/O happens under either. The lane is
-/// taken only here, at the outermost layer of a spawn, so nothing that `spawn`
-/// itself locks can be waiting on it; and no surface enters it twice for one name
-/// on one thread (restart deletes outside the lane, deployment and team spawn
-/// distinct names in sequence).
+/// Locks: the per-name lane guard is held across `spawn` and its file work; the
+/// configs and registry locks are not held across `spawn`, and disk I/O does not
+/// occur under either of those locks. The lane is taken only here, at the
+/// outermost layer of a spawn, so nothing that `spawn` itself locks can be waiting
+/// on it; and no surface enters it twice for one name on one thread (restart
+/// deletes outside the lane, deployment and team spawn distinct names in
+/// sequence).
 pub(crate) fn spawn_one_recording_config(
     home: &std::path::Path,
     configs: &crate::api::ConfigRegistry,
