@@ -127,9 +127,12 @@ def expected_order(pair, arm):
 
 
 def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
-              meta_extra=None, sent_ledger=None, init=True):
+              meta_extra=None, sent_ledger=None, init=True, final_state=True):
     run_dir = os.path.join(base, "%s-%s-p%s" % (scenario, arm, pair))
-    os.makedirs(os.path.join(run_dir, "final_state", "inbox"), exist_ok=True)
+    if final_state:
+        os.makedirs(os.path.join(run_dir, "final_state", "inbox"), exist_ok=True)
+    else:
+        os.makedirs(run_dir, exist_ok=True)
     meta = {"schema": 1, "scenario": scenario, "arm": arm, "pair": pair,
             "order_in_pair": expected_order(pair, arm),
             "model_requested": "claude-fable-5",
@@ -142,7 +145,8 @@ def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
             "seed_sha256": scenario_file_sha(base, scenario, "seed.sh"),
             "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
             "duration_ms": 1000, "fence": True, "exit_code": 0,
-            "turns": 3, "timed_out": False, "invalid_reason": None}
+            "turns": 3, "timed_out": False, "invalid_reason": None,
+            "max_turns": 15}
     meta.update(meta_extra or {})
     for key in [k for k, v in (meta_extra or {}).items() if v is DROP]:
         meta.pop(key, None)
@@ -160,6 +164,10 @@ def write_run(base, scenario, arm, pair, events, inbox=None, task_events=None,
     with open(os.path.join(run_dir, "stream.jsonl"), "w", encoding="utf-8") as fh:
         for event in stream:
             fh.write(json.dumps(event) + "\n")
+    if not final_state:
+        # A run whose durable evidence never came back. Everything else about it
+        # conforms, which is exactly what makes it worth testing.
+        return run_dir
     final = os.path.join(run_dir, "final_state")
     with open(os.path.join(final, "fleet.yaml"), "w", encoding="utf-8") as fh:
         fh.write(FLEET_YAML)
@@ -841,7 +849,7 @@ class Aggregation(TempCase):
         + [("S14", pair, "cli") for pair in range(1, 46)]
     )
 
-    def frozen_matrix(self, skip=(), extra=(), manifest=True):
+    def frozen_matrix(self, skip=(), extra=(), manifest=True, final_state=True):
         """The whole SPEC section 6 plan on disk: 210 runs, every one conforming."""
         runs = os.path.join(self.tmp, "runs")
         spec = {"S0%d" % i: (PASS_EXPECT, ["mcp", "cli"]) for i in range(1, 7)}
@@ -853,7 +861,7 @@ class Aggregation(TempCase):
             if cell in skip:
                 continue
             scenario, pair, arm = cell
-            write_run(runs, scenario, arm, pair, [])
+            write_run(runs, scenario, arm, pair, [], final_state=final_state)
         for scenario, pair, arm, meta_extra in extra:
             write_run(runs, scenario, arm, pair, [], meta_extra=meta_extra)
         if manifest:
@@ -874,6 +882,53 @@ class Aggregation(TempCase):
         self.assertTrue(summary["rate_gate"]["pass"])
         self.assertTrue(summary["mixing_gate"]["pass"])
         self.assertTrue(summary["critical_gate"]["pass"])
+        self.assertTrue(summary["pilot_safety"])
+
+    def test_a_matrix_without_durable_evidence_cannot_claim_pilot_safety(self):
+        """#3435 r1 (1): absence of evidence was scored as a passing experiment.
+
+        `load_final_state` degrades a missing tree to empties, and `detect_invalid`
+        never asked whether the tree was there — so a synthetic matrix that ran
+        nothing and copied back nothing presented 210 conforming runs and every
+        gate agreed. The plan gate counts cells, not evidence, and it is satisfied
+        by a run that happened; the rate and critical gates then read the empty
+        state as "no failures, no violations". Pilot safety must never be claimed
+        from a tree that carries no durable evidence at all.
+        """
+        runs, scen = self.frozen_matrix(final_state=False)
+        summary = grade.aggregate(runs, scen)
+
+        self.assertFalse(
+            summary["pilot_safety"],
+            "a matrix with no final_state anywhere must not report pilot safety")
+        self.assertEqual(summary["valid_runs"], 0,
+                         "a run with no durable evidence is not a valid run")
+        self.assertEqual(
+            sorted({e["reason"] for e in summary["invalid"]}), ["final_state_missing"])
+
+    def test_a_turn_budget_off_the_frozen_contract_is_another_experiment(self):
+        """#3435 r1 (3): SPEC pins --max-turns 15, the runner defaulted to 40.
+
+        The budget decides how much room a run had to succeed, so a matrix mixing
+        budgets is not one experiment — yet identity bound the model, the binaries
+        and every digest while ignoring the turn budget entirely, so a 40-turn run
+        counted as a clean run of the frozen 15-turn experiment.
+        """
+        runs, scen = self.frozen_matrix(skip=[("S01", 1, "mcp")],
+                                        extra=[("S01", 1, "mcp", {"max_turns": 40})])
+        summary = grade.aggregate(runs, scen)
+
+        self.assertEqual([e["reason"] for e in summary["invalid"]],
+                         ["max_turns_not_frozen"])
+        self.assertFalse(summary["pilot_safety"],
+                         "one run off the frozen budget invalidates the claim")
+
+    def test_the_frozen_turn_budget_is_still_accepted(self):
+        """Control for the guard above: 15 is the contract, not merely 'not 40'."""
+        runs, scen = self.frozen_matrix(skip=[("S01", 1, "mcp")],
+                                        extra=[("S01", 1, "mcp", {"max_turns": 15})])
+        summary = grade.aggregate(runs, scen)
+        self.assertEqual(summary["invalid"], [])
         self.assertTrue(summary["pilot_safety"])
 
     def test_the_plan_gate_refuses_a_matrix_that_is_not_the_frozen_plan(self):
@@ -1445,3 +1500,69 @@ class ResendAfterFailureIsNotDuplicate(unittest.TestCase):
         ctx = Ctx(); ctx.tool_calls = calls; ctx.final = final; ctx.arm = "cli"
         ctx.sends_by = lambda agent: []
         return ctx
+
+
+# ---------------------------------------------------------------------------
+# #3435 r1 (2): the mixing controls must see a real tool call, not a sentence
+# ---------------------------------------------------------------------------
+
+TOOL_CLI_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REAL_SCENARIOS = os.path.join(TOOL_CLI_ROOT, "scenarios")
+
+
+class MixingControlEvidence(TempCase):
+    """S13/S14 are the negative controls the whole mixing denominator rests on.
+
+    Each is a TRANSLATION scenario: the peer states the request in the other
+    surface's vocabulary and the agent has to carry it out on its OWN surface
+    (S13 reads CLI syntax and must call the MCP tool; S14 reads MCP tool names
+    and must run the CLI). The verdict, though, was `bool(hits) and not crit` —
+    hits being an outbound status string in ane-review's inbox. An agent that
+    invoked nothing at all and simply asserted the status therefore scored a
+    clean pass, and 45 of those read as "0 mixing violations in 45 runs". The
+    denominator only means something if the runs behind it did the work.
+    """
+
+    def ctx_for(self, scenario, arm, tool_calls):
+        status = "in_review"
+        final = {"inbox": {"ane-review": [{"from": "probe",
+                                           "text": "task t-1 status is %s" % status}]},
+                 "tasks": {}, "task_events": [], "task_index": [], "sent_ledger": [],
+                 "decisions": [], "mcp_usage": [], "instances": {}, "uuid_to_name": {},
+                 "root": self.tmp}
+        meta = {"scenario": scenario, "arm": arm, "pair": 1}
+        seed = {"task": {"id": "t-1", "status": status}}
+        return grade.Ctx(self.tmp, meta, [], tool_calls, final, seed)
+
+    def call(self, surface, tool="task", action="get"):
+        return {"surface": surface, "tool": tool, "action": action,
+                "args": {"id": "t-1"}, "outcome": None}
+
+    def verdict(self, scenario, arm, tool_calls):
+        module = grade.load_expect(REAL_SCENARIOS, scenario)
+        self.assertIsNotNone(module, "the real %s expect.py must load" % scenario)
+        return module.grade(self.ctx_for(scenario, arm, tool_calls))
+
+    def test_s13_reporting_the_status_without_calling_the_mcp_tool_is_not_a_pass(self):
+        self.assertFalse(
+            self.verdict("S13", "mcp", []).passed,
+            "S13 must require the MCP call it exists to observe, not a sentence")
+
+    def test_s14_reporting_the_status_without_running_the_cli_is_not_a_pass(self):
+        self.assertFalse(
+            self.verdict("S14", "cli", []).passed,
+            "S14 must require the CLI invocation it exists to observe")
+
+    def test_s13_wrong_surface_alone_is_not_the_translation_either(self):
+        """A CLI call in the mcp arm is the mixing violation, never the evidence."""
+        self.assertFalse(self.verdict("S13", "mcp", [self.call("cli")]).passed)
+
+    def test_s14_wrong_surface_alone_is_not_the_translation_either(self):
+        self.assertFalse(self.verdict("S14", "cli", [self.call("mcp")]).passed)
+
+    def test_s13_translating_into_the_mcp_call_still_passes(self):
+        """Control: the guard must not refuse the behaviour the scenario wants."""
+        self.assertTrue(self.verdict("S13", "mcp", [self.call("mcp")]).passed)
+
+    def test_s14_translating_into_the_cli_call_still_passes(self):
+        self.assertTrue(self.verdict("S14", "cli", [self.call("cli")]).passed)
