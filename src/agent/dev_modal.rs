@@ -512,3 +512,59 @@ impl EnqueueReceipt {
         self.spent.store(true, Ordering::SeqCst);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod write_barrier_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Build a barrier whose epochs AGREE, so `wait_until_stable` returns true
+    /// unless a predicate says otherwise. Colocated with `WriteBarrier` because
+    /// its fields are module-private — this needs no production-visible seam.
+    fn barrier(generation_over: bool, deleted: bool) -> WriteBarrier {
+        WriteBarrier {
+            epoch: Arc::new(AtomicU64::new(7)),
+            candidate_epoch: Arc::new(AtomicU64::new(7)),
+            generation_over: Arc::new(AtomicBool::new(generation_over)),
+            deleted: Arc::new(AtomicBool::new(deleted)),
+        }
+    }
+
+    /// One sleep of `stable_for`, then a decision. `max_wait` is deliberately far
+    /// out of reach so a `false` can only come from a predicate, never from the
+    /// deadline — that is what makes the two false cases below non-vacuous.
+    const STABLE_FOR: std::time::Duration = std::time::Duration::from_millis(1);
+    const UNREACHABLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// KNOWN-TRUE CONTROL. Without this, a `wait_until_stable` that always
+    /// returned false would satisfy both negative tests below.
+    #[test]
+    fn stable_frame_with_matching_candidate_epoch_passes() {
+        assert!(
+            barrier(false, false).wait_until_stable(STABLE_FOR, UNREACHABLE_DEADLINE),
+            "control: candidate_epoch == epoch with neither predicate set must pass, \
+             otherwise the negative tests below prove nothing"
+        );
+    }
+
+    /// #3421 item 2: isolates `generation_over`. `deleted` stays false, the epochs
+    /// still agree, and the deadline is unreachable — deleting the
+    /// `generation_over` check from `wait_until_stable` makes this return true.
+    #[test]
+    fn generation_over_cancels_the_wait_on_its_own() {
+        assert!(
+            !barrier(true, false).wait_until_stable(STABLE_FOR, UNREACHABLE_DEADLINE),
+            "generation_over must cancel the wait by itself (deleted=false, epochs agree)"
+        );
+    }
+
+    /// #3421 item 2: isolates `deleted`, the mirror of the test above.
+    #[test]
+    fn deleted_cancels_the_wait_on_its_own() {
+        assert!(
+            !barrier(false, true).wait_until_stable(STABLE_FOR, UNREACHABLE_DEADLINE),
+            "deleted must cancel the wait by itself (generation_over=false, epochs agree)"
+        );
+    }
+}
