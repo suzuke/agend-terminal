@@ -41,6 +41,21 @@ fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     created["id"].as_str().expect("created task id").to_string()
 }
 
+fn create_governed_task(home: &std::path::Path, decision_id: &str, class: &str) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed seed",
+            "assignee": "target-agent",
+            "governing_decision_id": decision_id,
+            "review_class": class,
+        }),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
 fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     let repo = crate::paths::workspace_dir(home).join(agent);
     std::fs::create_dir_all(&repo).ok();
@@ -1252,6 +1267,195 @@ fn existing_tagged_task_contradictory_send_rejects_2745() {
     assert!(
         !watch_path.exists(),
         "rejected contradictory dispatch must NOT arm a ci-watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: an existing branch task must reload its exact governing decision
+/// at the production dispatch entry. A decision superseded after task creation
+/// is no longer authority, so the branch dispatch must stop before the
+/// bind:false watch side effect.
+#[test]
+#[serial_test::serial]
+fn existing_governed_task_rejects_superseded_authority_before_branch_watch_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-existing-superseded-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "existing task authority",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "dual");
+    let superseded = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "replacement authority",
+            "content": "single review required",
+            "review_class": "single",
+            "supersedes": decision_id,
+        }),
+    );
+    assert_eq!(
+        superseded["status"], "posted",
+        "supersede decision: {superseded}"
+    );
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "dispatch existing governed task",
+        "task_id": task_id,
+        "branch": "feat/3419-existing-superseded",
+        "repository": "owner/repo",
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert_eq!(
+        result["code"], "task_governing_decision_unresolved",
+        "superseded existing authority must reject at dispatch entry: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-existing-superseded"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "rejected existing-task dispatch must not arm a watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: direct task-linked watch is another real entry point and must
+/// reload the exact governing decision before writing its watch file.
+#[test]
+#[serial_test::serial]
+fn task_linked_watch_rejects_corrupt_governing_authority_3419() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-watch-corrupt-authority-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "watch authority",
+            "content": "single review required",
+            "review_class": "single",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "single");
+    std::fs::write(
+        crate::decisions::decision_path(&home, &decision_id),
+        b"{corrupt decision",
+    )
+    .expect("corrupt exact decision record");
+
+    let result = crate::mcp::handlers::ci::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "owner/repo",
+            "branch": "feat/3419-watch-corrupt-authority",
+            "task_id": task_id,
+        }),
+        "target-agent",
+    );
+    assert_eq!(
+        result["code"], "task_governing_decision_unresolved",
+        "corrupt governing authority must reject task-linked watch: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-watch-corrupt-authority"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "corrupt authority must not write a watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: task authority metadata is immutable at the public task API, but
+/// replay must still fail closed if a tampered event changes the class. The
+/// production branch dispatch must reject before creating its watch.
+#[test]
+#[serial_test::serial]
+fn existing_governed_task_rejects_class_divergent_metadata_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-existing-metadata-tamper-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "metadata authority",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "dual");
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("system:tamper".into()),
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(task_id.clone()),
+            by: crate::task_events::InstanceName("system:tamper".into()),
+            key: "review_class".into(),
+            value: serde_json::json!("single"),
+        },
+    )
+    .expect("append tampered metadata event");
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "dispatch tampered governed task",
+        "task_id": task_id,
+        "branch": "feat/3419-existing-metadata-tamper",
+        "repository": "owner/repo",
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    assert_eq!(
+        result["code"], "task_governance_tampered",
+        "class-divergent task metadata must reject at dispatch entry: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-existing-metadata-tamper"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "tampered authority must not arm a watch: {}",
         watch_path.display()
     );
 

@@ -136,13 +136,29 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                     task_id,
                     routed.record(),
                 ) {
-                    Ok(Some(class)) => class,
+                    Ok(Some(class)) => Some(class),
                     Ok(None) => {
-                        return json!({
-                            "error": "task-linked CI watch requires a resolved task review_class",
-                            "code": "watch_review_class_unspecified",
-                            "task_id": task_id,
-                        })
+                        // Preserve the pre-#3419 task-linked watch contract for
+                        // ungoverned legacy tasks that never carried a typed
+                        // class. A governed task (or an explicit class on a
+                        // classless task) still has no durable authority and
+                        // must fail closed.
+                        let has_explicit_class = args
+                            .get("review_class")
+                            .is_some_and(|value| !value.is_null());
+                        if routed
+                            .record()
+                            .metadata
+                            .contains_key("governing_decision_id")
+                            || has_explicit_class
+                        {
+                            return json!({
+                                "error": "task-linked CI watch requires a resolved task review_class",
+                                "code": "watch_review_class_unspecified",
+                                "task_id": task_id,
+                            });
+                        }
+                        None
                     }
                     Err(error) => return error,
                 };
@@ -151,6 +167,13 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                         return json!({
                             "error": "task-linked CI watch review_class must be exactly 'single' or 'dual'",
                             "code": "watch_review_class_invalid",
+                            "task_id": task_id,
+                        });
+                    };
+                    let Some(task_class) = task_class else {
+                        return json!({
+                            "error": "task-linked CI watch requires a resolved task review_class",
+                            "code": "watch_review_class_unspecified",
                             "task_id": task_id,
                         });
                     };
@@ -167,7 +190,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                         });
                     }
                 }
-                Some(task_class.as_token().to_string())
+                task_class.map(|class| class.as_token().to_string())
             }
             // Some legacy exact-head and post-merge callers retain a task
             // correlation before the task board record is available. Keep
