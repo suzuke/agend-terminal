@@ -352,4 +352,16 @@ fn runner_pins_model_and_max_turns() {
         source.contains(r#""hit_max_turns": (result_subtype == "error_max_turns")"#),
         "run.sh metadata must record whether the turn cap was hit"
     );
+    // #3435 r2 (B): the wall-clock half of the same budget. `--timeout` is
+    // overridable on run.sh and matrix.sh and decides how much room a run had,
+    // so it has to be recorded to be gradeable at all — `timed_out` alone says
+    // the cap was hit without saying what the cap WAS.
+    assert!(
+        source.contains(r#""timeout_secs": int(E.get("EV_TIMEOUT_SECS", "0")) or None"#),
+        "run.sh metadata must record the wall-clock budget the run was given"
+    );
+    assert!(
+        source.contains(r#"EV_TIMEOUT_SECS="$TIMEOUT_SECS""#),
+        "run.sh must pass the timeout it used into the metadata writer"
+    );
 }
