@@ -431,13 +431,21 @@ mod tests {
         let home = tmp_home("skip-on-contention");
         let holder = hold_lock(&home.join("fleet_events.jsonl.lock"));
 
+        let started = std::time::Instant::now();
         append_git_event(home.to_str().unwrap(), &sample_event("shim", 0));
+        let elapsed = started.elapsed();
 
         let written =
             std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
         assert!(
             written.trim().is_empty(),
             "best-effort sink must skip while the lock is held, never append unlocked; found: {written}"
+        );
+        // r1 F1: skipped and stalled-then-skipped leave the same empty file above;
+        // only elapsed separates best-effort from a bounded retry.
+        assert!(
+            elapsed < agentic_audit_append::DEFAULT_BOUNDED_BUDGET / 2,
+            "best-effort sink must return promptly on contention, never retry for the bounded budget; took {elapsed:?}"
         );
 
         drop(holder);
