@@ -1024,9 +1024,8 @@ fn launch_managed_server(
     locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
     let cwd = cwd.unwrap_or_else(|| Path::new("."));
-    let config_args =
-        crate::mcp_config::codex_managed_config_args(home, Some(instance), Some(cwd))?;
     let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
     let pid = child.id();
     let start_token = crate::process::process_start_token(pid);
