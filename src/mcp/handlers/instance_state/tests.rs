@@ -949,6 +949,70 @@ fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3416 RED: the creator force-delete audit is a FAIL-CLOSED gate — it already
+/// refuses the destructive delete when the audit write errors. Once the append is
+/// serialized behind the companion lock, "cannot write the audit" also covers
+/// "another writer holds the lock past the bounded retry budget". Holding the lock
+/// must therefore produce an explicit refusal AND leave no record behind; a silent
+/// unlocked fallback would defeat the whole point of serializing.
+///
+/// The lock holder is a second `File` in THIS process on purpose: `flock(2)`
+/// associates the lock with the open file description rather than the process, so
+/// two independent `open()` calls conflict exactly as two processes would. That
+/// keeps the test single-process and free of any sleep or scheduling assumption.
+///
+/// Pre-fix this FAILS in both directions: nothing consults the lock, so the delete
+/// succeeds and the audit line is appended.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_force_refuses_while_audit_lock_is_held() {
+    let home = tmp_home_for_creator_acl("audit-lock-held");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    created_by: creator\n",
+    )
+    .unwrap();
+    seed_claimed_task(&home, "victim");
+
+    let lock_path = home.join("fleet_events.jsonl.lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    // Explicit trait syntax: Rust 1.89 stabilized an inherent `File::lock` with the
+    // same name and the MSRV gate fires if the inherent one is selected.
+    fs4::FileExt::lock(&holder).unwrap();
+
+    let creator = crate::identity::Sender::new("creator");
+    let resp = handle_delete_instance(
+        &home,
+        &serde_json::json!({
+            "instance": "victim",
+            "force": true,
+            "force_reason": "retiring my own spawn to change its model",
+        }),
+        &creator,
+    );
+
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("audit"),
+        "force-delete must REFUSE while the audit lock is held (fail-closed), got: {resp}"
+    );
+
+    let events_path = home.join("fleet_events.jsonl");
+    let written = std::fs::read_to_string(&events_path).unwrap_or_default();
+    assert!(
+        written.trim().is_empty(),
+        "no unlocked fallback append may occur while the lock is held, found: {written}"
+    );
+
+    fs4::FileExt::unlock(&holder).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #3418 RED: `create_instance` persists a DURABLE fleet.yaml entry — including
 /// `args`, which per #3414 shapes every future spawn of that instance
 /// indefinitely — and currently logs nothing at all. Every neighbouring

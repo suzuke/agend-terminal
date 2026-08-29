@@ -3047,9 +3047,14 @@ fn merge_force_audit_write_failure_refuses_merge() {
         "dev",
     );
     let err = result["error"].as_str().unwrap();
+    // #3416: the fixture makes the log a DIRECTORY, so the failure is an OPEN
+    // failure, not a write failure. The appender now distinguishes the two because
+    // only a write failure can leave a partial line behind, so this asserts what
+    // the test actually guards — the force-merge audit gate refused — rather than a
+    // phrase that would now be inaccurate for this fixture.
     assert!(
-        err.contains("audit log write failed"),
-        "expected audit failure error, got: {err}"
+        err.contains("force-merge refused") && err.contains("audit log"),
+        "expected the force-merge audit gate to refuse, got: {err}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3105,10 +3110,11 @@ fn merge_force_reaches_handler_through_full_dispatch_chain_2539() {
     }
 
     let err = result["error"].as_str().unwrap_or_default();
+    // #3416: same open-vs-write distinction as the handler-direct test above.
     assert!(
-        err.contains("audit log write failed"),
+        err.contains("force-merge refused") && err.contains("audit log"),
         "#2539: force/force_reason must survive the full handle_tool dispatch chain \
-         unmodified (same audit-write reject as the handler-direct test), got: {result}"
+         unmodified (same audit reject as the handler-direct test), got: {result}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -5284,4 +5290,80 @@ fn checkout_via_linked_worktree_binds_canonical_repo_root_and_keeps_one_lease() 
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
+}
+
+/// #3416 RED: force-merge is the second FAIL-CLOSED audit gate. It already refuses
+/// when the audit write errors (`merge_force_audit_write_failure_refuses_merge`);
+/// once the append is serialized, a held companion lock past the bounded retry
+/// budget is the same class of failure and must produce the same explicit refusal
+/// with no record written.
+///
+/// The holder is a second `File` in this process: `flock(2)` binds the lock to the
+/// open file description, not the process, so this conflicts exactly as a separate
+/// process would — no sleeps, no scheduling assumptions.
+///
+/// Pre-fix this FAILS: nothing consults the lock, so the audit line is appended and
+/// the merge is not refused for this reason.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn merge_force_refuses_while_audit_lock_is_held() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-merge-audit-lock-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let lock_path = home.join("fleet_events.jsonl.lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    // Explicit trait syntax — see the MSRV note in `src/store.rs`.
+    fs4::FileExt::lock(&holder).unwrap();
+
+    let _g = crate::scm::set_test_scm_provider(std::sync::Arc::new(MergeHeadBaseStub));
+    // `MergeHeadBaseStub::pr_merge` is `unimplemented!()` BY DESIGN: reaching the
+    // merge means the audit gate did not refuse. Catch that panic so the assertion
+    // below reports the actual defect (an unlocked append happened) instead of the
+    // stub's "not implemented", which says nothing about the contract under test.
+    let prior_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::handle_merge_repo(
+            &home,
+            &json!({
+                "pr": 9999,
+                "force": true,
+                "force_reason": "test emergency",
+                "repository": "suzuke/agend-terminal"
+            }),
+            "dev",
+        )
+    }));
+    std::panic::set_hook(prior_hook);
+
+    // Asserted FIRST and independently of the return value: this is the direct
+    // evidence of the defect — a record reached the file while the lock was held.
+    let written = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+    assert!(
+        written.trim().is_empty(),
+        "no unlocked fallback append may occur while the lock is held, found: {written}"
+    );
+
+    let result =
+        called.expect("force-merge must refuse at the audit gate, not proceed into the merge call");
+    let err = result["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("audit"),
+        "force-merge must REFUSE while the audit lock is held (fail-closed), got: {result}"
+    );
+
+    fs4::FileExt::unlock(&holder).ok();
+    let _ = std::fs::remove_dir_all(&home);
 }
