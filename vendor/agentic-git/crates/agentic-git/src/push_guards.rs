@@ -256,7 +256,45 @@ pub(crate) fn trust_root_basename_denied(repo_relative_path: &str) -> bool {
         .rsplit('/')
         .next()
         .unwrap_or(repo_relative_path);
-    TRUST_ROOT_DENY_NAMES.contains(&basename) || basename.ends_with(".jsonl")
+    if !(TRUST_ROOT_DENY_NAMES.contains(&basename) || basename.ends_with(".jsonl")) {
+        return false;
+    }
+    // #3412: a repo's own committed test fixtures are not the operator's trust
+    // root, and a fleet-shaped fixture is exactly what a fleet tool's tests need.
+    // Deliberately narrow: the `tests/fixtures/` component must be exact and the
+    // file must sit BELOW it, and only the two shapes a fixture legitimately
+    // takes are exempt. `.config-integrity-key` and `policy.toml` stay denied
+    // even there — nothing legitimate needs a fixture of a key or a policy — so
+    // the exemption cannot be used to smuggle either one out.
+    if under_tests_fixtures(repo_relative_path)
+        && (basename == "fleet.yaml" || basename.ends_with(".jsonl"))
+    {
+        return false;
+    }
+    true
+}
+
+/// Does this repo-relative path sit strictly BELOW an exact `tests/fixtures/`
+/// component pair? Component equality, not substring: `tests/not-fixtures/`,
+/// `mytests/fixtures/`, `src/fixtures/` and `tests/fixtures-extra/` are all
+/// unaffected, and a file merely NAMED `fixtures.*` under `tests/` is not a
+/// directory and does not qualify.
+///
+/// A path carrying an empty, `.` or `..` component is rejected outright, BEFORE
+/// the pair scan: `tests/fixtures/../../fleet.yaml` contains the pair yet
+/// resolves to the repo root, so scanning it literally would exempt a real
+/// trust-root file. Git itself refuses to index such a path, so this is a second
+/// line rather than the only one — which is exactly what a security predicate
+/// should not delegate to someone else's normalisation.
+fn under_tests_fixtures(repo_relative_path: &str) -> bool {
+    let parts: Vec<&str> = repo_relative_path.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return false;
+    }
+    parts
+        .windows(2)
+        .enumerate()
+        .any(|(i, pair)| pair == ["tests", "fixtures"] && i + 2 < parts.len())
 }
 
 /// #2390: resolve the push guards' range base (the remote's default branch)

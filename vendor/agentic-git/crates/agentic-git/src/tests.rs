@@ -2910,6 +2910,57 @@ fn trust_root_basename_denied_table_2379() {
     ));
 }
 
+/// #3412: a repo's own committed test fixtures are not the operator's trust
+/// root. The exemption is deliberately narrow — only `fleet.yaml` and `*.jsonl`,
+/// and only under an exact `tests/fixtures/` component with the file BELOW it.
+/// The integrity key and `policy.toml` stay denied even there (nothing legitimate
+/// needs a fixture of those), and every lookalike component stays denied.
+#[test]
+fn trust_root_test_fixture_exemption_3412() {
+    for p in [
+        "scripts/eval/tool-cli/tests/fixtures/final_state_sample/fleet.yaml",
+        "scripts/eval/tool-cli/tests/fixtures/final_state_sample/task_events.jsonl",
+        "scripts/eval/tool-cli/tests/fixtures/final_state_sample/inbox/09c2d6f5.jsonl",
+        "tests/fixtures/fleet.yaml",
+        "tests/fixtures/a/b/c/deep.jsonl",
+    ] {
+        assert!(
+            !trust_root_basename_denied(p),
+            "{p:?} is a repo test fixture and must be ALLOWED"
+        );
+    }
+    for p in [
+        // The two names that stay denied even under tests/fixtures.
+        "tests/fixtures/policy.toml",
+        "tests/fixtures/.config-integrity-key",
+        "tests/fixtures/sub/policy.toml",
+        // Lookalike components: the exemption is exact, not substring.
+        "tests/not-fixtures/fleet.yaml",
+        "src/fixtures/fleet.yaml",
+        "mytests/fixtures/fleet.yaml",
+        "tests/fixtures-extra/events.jsonl",
+        "fixtures/fleet.yaml",
+        "tests/fleet.yaml",
+        // `tests/fixtures` must be a DIRECTORY the file sits under, not the name
+        // of the file itself.
+        "a/tests/fixtures.jsonl",
+        // Crafted traversal: the component pair is present but the path escapes
+        // it, so the exemption must not apply. Any `.`/`..`/empty component
+        // disqualifies the path outright.
+        "tests/fixtures/../../fleet.yaml",
+        "tests/fixtures/../fleet.yaml",
+        "tests/fixtures/./../fleet.yaml",
+        "tests/fixtures//../fleet.yaml",
+        "tests/./fixtures/../../events.jsonl",
+        // …and the ordinary trust-root sites are untouched.
+        "fleet.yaml",
+        "logs/fleet_events.jsonl",
+        "stash/sub/fleet.yaml",
+    ] {
+        assert!(trust_root_basename_denied(p), "{p:?} must stay DENIED");
+    }
+}
+
 fn git_run_2379(args: &[&str], dir: &std::path::Path) -> std::process::Output {
     Command::new("git")
         .args(args)
@@ -3016,6 +3067,96 @@ fn denylist_blocks_force_added_trust_root_in_push_range_2379() {
             .is_some_and(|r| r.contains("fleet.yaml")),
         "force-added trust-root file must be denied with an actionable reason naming it, \
              got: {violation:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+}
+
+/// #3412 at the push-range level: a repo's own `tests/fixtures/` tree may hold
+/// fleet- and jsonl-shaped fixtures and still push, while a real trust-root file
+/// beside them in the same range is still refused. Joins `git-subprocess`.
+#[test]
+fn denylist_allows_test_fixtures_but_still_blocks_trust_root_3412() {
+    let wt = build_repo_with_origin_main_2379("fixtures");
+    let fixtures = wt.join("tests/fixtures/final_state_sample");
+    std::fs::create_dir_all(fixtures.join("inbox")).unwrap();
+    std::fs::write(fixtures.join("fleet.yaml"), "instances: {}\n").unwrap();
+    std::fs::write(fixtures.join("task_events.jsonl"), "{}\n").unwrap();
+    std::fs::write(fixtures.join("inbox/09c2d6f5.jsonl"), "{}\n").unwrap();
+    assert!(git_run_2379(&["add", "-f", "tests"], &wt).status.success());
+    assert!(git_run_2379(&["commit", "-m", "test: fixtures"], &wt)
+        .status
+        .success());
+    assert_eq!(
+        push_trust_root_denylist_violation(wt.to_str().unwrap()),
+        None,
+        "fleet/jsonl fixtures under tests/fixtures/ must not block a push"
+    );
+
+    // The exemption is scoped to that component, not to the push: a real
+    // trust-root file elsewhere in the SAME range is still refused.
+    std::fs::write(wt.join("fleet.yaml"), "stolen\n").unwrap();
+    assert!(git_run_2379(&["add", "-f", "fleet.yaml"], &wt)
+        .status
+        .success());
+    assert!(git_run_2379(&["commit", "-m", "sneak in trust-root"], &wt)
+        .status
+        .success());
+    let violation = push_trust_root_denylist_violation(wt.to_str().unwrap());
+    assert!(
+        violation
+            .as_deref()
+            .is_some_and(|r| r.contains("fleet.yaml")),
+        "a trust-root file outside tests/fixtures must still be denied, got: {violation:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+}
+
+/// #3412 traversal regression at the real guard: a crafted
+/// `tests/fixtures/../../fleet.yaml` must never reach a push as an exemption.
+/// Both layers are pinned — git refuses to index the path at all, and the
+/// classifier denies the string even if some other producer ever emitted it, so
+/// the guard does not depend on someone else's normalisation. Joins
+/// `git-subprocess`.
+#[test]
+fn denylist_rejects_crafted_traversal_fixture_path_3412() {
+    let wt = build_repo_with_origin_main_2379("traversal");
+    std::fs::write(wt.join("blob.txt"), "x\n").unwrap();
+    let hashed = git_run_2379(&["hash-object", "-w", "blob.txt"], &wt);
+    assert!(hashed.status.success());
+    let blob = String::from_utf8_lossy(&hashed.stdout).trim().to_string();
+    let crafted = "tests/fixtures/../../fleet.yaml";
+    let indexed = git_run_2379(
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},{crafted}"),
+        ],
+        &wt,
+    );
+    assert!(
+        !indexed.status.success(),
+        "git must refuse to index {crafted:?}; if this ever succeeds the classifier below is          the only thing standing between the crafted path and an exempted push"
+    );
+    assert!(
+        trust_root_basename_denied(crafted),
+        "the classifier must deny {crafted:?} regardless of what git accepts"
+    );
+
+    // The guard still allows the honest fixture shape in the same repo.
+    let fixtures = wt.join("tests/fixtures/sample");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    std::fs::write(fixtures.join("fleet.yaml"), "instances: {}\n").unwrap();
+    assert!(git_run_2379(&["add", "-f", "tests"], &wt).status.success());
+    assert!(git_run_2379(&["commit", "-m", "test: fixture"], &wt)
+        .status
+        .success());
+    assert_eq!(
+        push_trust_root_denylist_violation(wt.to_str().unwrap()),
+        None,
+        "an honest tests/fixtures/ tree must still push"
     );
 
     let _ = std::fs::remove_dir_all(wt.parent().unwrap());
