@@ -593,6 +593,35 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
     }
 }
 
+/// #3421 item1: every place in the production region that touches startup-modal
+/// state, as `(line_number, line)` pairs.
+///
+/// The invariant is that a byte-free `TAG_RESIZE` must not cancel the only queued
+/// startup-modal confirmation. The guard used to assert that over two slices — the
+/// TAG_RESIZE arm and the resize-effect closure — which a module-level helper
+/// merely CALLED from the resize path evades entirely. Scanning the whole region
+/// removes the escape by removing the slice.
+///
+/// This is deliberately broader than the property: it bans these symbols anywhere
+/// in this file's production code, not only on the resize path. That costs nothing
+/// today — there are zero occurrences — and a broad ban that holds beats a precise
+/// one that can be stepped around. If a NON-resize path here ever legitimately
+/// needs them, this must be revisited deliberately rather than quietly narrowed
+/// back to a slice.
+#[cfg(test)]
+fn modal_state_touches_in_production(prod: &str) -> Vec<(usize, String)> {
+    let modal_touch = ["dev_modal", "::"].concat();
+    let pty_write_touch = ["note_", "pty_write"].concat();
+    prod.lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            let t = l.trim_start();
+            !t.starts_with("//") && (l.contains(&modal_touch) || l.contains(&pty_write_touch))
+        })
+        .map(|(i, l)| (i + 1, l.trim().to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -600,6 +629,13 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    /// Select the complete source that the modal-state guard scans. Test-only
+    /// source literals are assembled from fragments below, so scanning the
+    /// complete file cannot self-satisfy or self-trigger the guard.
+    fn production_source(src: &str) -> &str {
+        src
+    }
 
     /// A connected loopback pair plus a SECOND handle on the server side.
     ///
@@ -684,7 +720,7 @@ mod tests {
     }
 
     fn publish_port(run_dir: &std::path::Path, name: &str, port: u16) {
-        std::fs::write(run_dir.join(format!("{name}.port")), port.to_string()).unwrap();
+        crate::ipc::write_port(run_dir, name, port).unwrap();
     }
 
     /// main-CI macOS flake (run 33161513192): every caller hands `peer_sees_eof`
@@ -927,8 +963,9 @@ mod tests {
             // is NOT retired at entry, so an entry-only check would still see a
             // live port file here.
             std::thread::sleep(super::RETIREMENT_POLL * 2);
+            let publication_started_at = Instant::now();
             publish_port(&successor_dir, "agent", 4343);
-            Instant::now()
+            publication_started_at
         });
 
         let dir = run_dir.clone();
@@ -936,19 +973,19 @@ mod tests {
             super::is_retired(&dir, "agent", 4242)
         });
         let returned_at = Instant::now();
-        let retired_at = successor.join().unwrap();
+        let publication_started_at = successor.join().unwrap();
 
         drop(stalled);
         std::fs::remove_dir_all(&run_dir).ok();
         assert!(!accepted, "a partial cookie must never authenticate");
         assert!(
-            returned_at >= retired_at,
-            "the read must still have been in flight when the successor published its port"
+            returned_at >= publication_started_at,
+            "the read must still have been in flight when the successor began publishing its port"
         );
         assert!(
-            returned_at.duration_since(retired_at) <= Duration::from_secs(1),
-            "took {:?} after retirement",
-            returned_at.duration_since(retired_at)
+            returned_at.duration_since(publication_started_at) <= Duration::from_secs(1),
+            "took {:?} after publication began",
+            returned_at.duration_since(publication_started_at)
         );
     }
 
@@ -1536,8 +1573,7 @@ mod tests {
     #[test]
     fn tui_resize_branch_does_not_bump_dev_modal_epoch() {
         let src = include_str!("tui_bridge.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let prod = src.split_once(&cfg_test).map_or(src, |(before, _)| before);
+        let prod = production_source(src);
         let resize_arm = prod
             .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
             .expect("production TAG_RESIZE arm must exist")
@@ -1548,10 +1584,6 @@ mod tests {
         assert!(
             resize_arm.contains("resize("),
             "the TAG_RESIZE arm must still apply a resize"
-        );
-        assert!(
-            !resize_arm.contains("dev_modal::") && !resize_arm.contains("note_pty_write"),
-            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
         );
 
         let resize_effect = prod
@@ -1569,9 +1601,61 @@ mod tests {
             resize_effect.contains("c.vterm.resize"),
             "TAG_RESIZE must still resize the daemon VTerm"
         );
+        // #3421 item1: the negative is asserted over the WHOLE production region,
+        // not over these two slices. A module-level helper called from the resize
+        // path used to sit outside both and escape; the positives above stay
+        // slice-scoped because they are statements about those slices.
+        let touches = super::modal_state_touches_in_production(prod);
         assert!(
-            !resize_effect.contains("dev_modal::") && !resize_effect.contains("note_pty_write"),
-            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal confirmation"
+            touches.is_empty(),
+            "a byte-free TAG_RESIZE must not cancel the only queued startup-modal \
+             confirmation, and nothing in this file's production region may touch \
+             modal state — found: {touches:?}"
+        );
+    }
+
+    /// #3421 item1 mutation proof: the old guard scoped its NEGATIVE assertions
+    /// to two slices — the `TAG_RESIZE` match arm and the resize-effect closure —
+    /// so a module-level helper that touches modal state and is merely CALLED from
+    /// the resize path sat outside both and was invisible to it. The positive
+    /// assertions are correctly scoped; only the negatives were too narrow.
+    ///
+    /// This test pins the escape twice over. First it confirms the old slices are
+    /// clean even with a module-level helper appended after the test module. Then
+    /// it requires the source guard to scan that FULL file and flag the mutation.
+    #[test]
+    fn a_module_level_helper_escapes_the_slice_scoped_negatives() {
+        let src = include_str!("tui_bridge.rs");
+
+        // The exact escape: a helper OUTSIDE the resize arm and outside the resize
+        // effect closure, below the inline test module, of the shape a refactor
+        // would naturally produce.
+        let modal_touch = ["dev_modal", "::", "note_", "pty_write"].concat();
+        let poisoned =
+            format!("{src}\nfn resize_bookkeeping(c: &mut Core) {{ {modal_touch}(c); }}\n");
+        let prod = production_source(&poisoned);
+
+        // 1. The escape is real: the shipped slicing sees nothing wrong.
+        let resize_arm = prod
+            .split_once("Ok((TAG_RESIZE, data)) if data.len() == 4 => {")
+            .expect("production TAG_RESIZE arm must exist")
+            .1
+            .split_once("_ => break,")
+            .expect("TAG_RESIZE arm must end before the fallback arm")
+            .0;
+        assert!(
+            !resize_arm.contains(&["dev_modal", "::"].concat())
+                && !resize_arm.contains(&["note_", "pty_write"].concat()),
+            "precondition: the slice-scoped negative must still read as clean, or this \
+             test is no longer demonstrating the escape it was written for"
+        );
+
+        // 2. A full-region predicate must flag it. This is the RED.
+        let violations = super::modal_state_touches_in_production(prod);
+        assert!(
+            !violations.is_empty(),
+            "a module-level helper touching modal state must be caught wherever it \
+             sits in the production region, not only inside the resize slices"
         );
     }
 
@@ -1591,11 +1675,7 @@ mod tests {
     #[test]
     fn tui_dump_write_not_held_across_registry_lock() {
         let src = include_str!("tui_bridge.rs");
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let prod = match src.find(&cfg_test) {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production_source(src);
 
         // The fix marker: the lock block now captures `dump` into the outer
         // binding (was a 4-tuple without `dump` pre-fix), proving the dump is

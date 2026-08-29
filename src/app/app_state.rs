@@ -497,7 +497,11 @@ impl AppState {
         LoopFlow::Continue
     }
 
-    pub(super) fn close_dead_scratch_shell(&mut self, deps: &AppDeps<'_>) {
+    pub(super) fn close_dead_scratch_shell(
+        &mut self,
+        deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+    ) {
         let AppDeps { registry, .. } = *deps;
         // Auto-close the scratch shell overlay once its backing process
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
@@ -507,7 +511,7 @@ impl AppState {
             if !agent_is_alive(registry, pane.instance_id) {
                 let instance_id = pane.instance_id;
                 self.ui.overlay = Overlay::None;
-                kill_unmanaged_agent(registry, instance_id);
+                kill_unmanaged_agent(registry, instance_id, reap_workers);
             }
         }
     }
@@ -765,6 +769,7 @@ impl AppState {
         ev: Result<Event, crossbeam_channel::RecvError>,
         terminal: &mut DefaultTerminal,
         deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) -> LoopFlow {
         let AppDeps {
             home,
@@ -774,15 +779,15 @@ impl AppState {
             ..
         } = *deps;
         // #2453: loop-stable shared deps for handle_key_event/handle_mouse_event.
-        let ui_deps = UiDeps {
+        let mut ui_deps = UiDeps {
             registry,
             home,
             fleet_path,
             wakeup_tx,
             task_rpc_tx: deps.task_rpc_tx,
             task_snapshot: &self.task_snapshot,
+            reap_workers,
         };
-        let ui_deps = &ui_deps;
         self.dirty = true; // input may change the display → redraw next due frame
         let ev = match ev {
             Ok(e) => e,
@@ -795,7 +800,7 @@ impl AppState {
             Event::Key(key) if key.kind != KeyEventKind::Press => {}
             Event::Key(key) => {
                 // #2453: former inline overlay/dispatch branch, now behind UiState.
-                let out = self.ui.handle_key_event(key, ui_deps);
+                let out = self.ui.handle_key_event(key, &mut ui_deps);
                 if out.needs_resize {
                     self.needs_resize = true;
                 }
@@ -811,7 +816,7 @@ impl AppState {
             // panes. The modal-swallow guard + mouse routing now live in
             // UiState::handle_mouse_event (mirrors the Event::Key branch).
             Event::Mouse(mouse_evt) => {
-                if self.ui.handle_mouse_event(mouse_evt, ui_deps) {
+                if self.ui.handle_mouse_event(mouse_evt, &ui_deps) {
                     self.needs_resize = true;
                 }
             }
@@ -860,6 +865,7 @@ impl AppState {
         &mut self,
         outcome: Result<pane_factory::AttachOutcome, crossbeam_channel::RecvError>,
         deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) {
         let AppDeps {
             registry,
@@ -889,7 +895,7 @@ impl AppState {
                     // fleet agents are daemon-owned lifecycle state and closing
                     // their view must not delete them.
                     if *unmanaged {
-                        kill_unmanaged_agent(registry, *instance_id);
+                        kill_unmanaged_agent(registry, *instance_id, reap_workers);
                     }
                 }
             }
@@ -1101,10 +1107,15 @@ impl AppState {
 
     /// Per-iteration housekeeping before the select!: scratch-shell reap,
     /// pending resize, and the badge/flush sync throttles.
-    pub(super) fn pre_select(&mut self, terminal: &mut DefaultTerminal, deps: &AppDeps<'_>) {
+    pub(super) fn pre_select(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+    ) {
         self.reconcile_pending_remote_roster(deps);
         self.request_remote_agent_state_refresh(deps);
-        self.close_dead_scratch_shell(deps);
+        self.close_dead_scratch_shell(deps, reap_workers);
         self.apply_pending_resize(terminal, deps);
         self.sync_badges(deps);
     }
@@ -1165,6 +1176,7 @@ mod tests {
             remote_state_rpc_tx: &remote_state_rpc_tx,
         };
         let (_sub_tx, sub_rx) = crossbeam_channel::unbounded();
+        let mut reap_workers = Vec::new();
         state.handle_attach_outcome(
             Ok(pane_factory::AttachOutcome::Ready {
                 pane_id,
@@ -1175,6 +1187,7 @@ mod tests {
                 work_dir: home.clone(),
             }),
             &deps,
+            &mut reap_workers,
         );
 
         let survives = registry.lock().contains_key(&instance_id);
