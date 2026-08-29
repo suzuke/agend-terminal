@@ -218,6 +218,7 @@ impl CodexNativeShared {
         codex: &str,
         locator: &SessionLocator,
         cwd: &Path,
+        config_args: &[String],
     ) -> anyhow::Result<std::process::Child> {
         #[cfg(unix)]
         {
@@ -252,6 +253,7 @@ impl CodexNativeShared {
             use std::os::unix::process::CommandExt;
             let mut command = std::process::Command::new(codex);
             command
+                .args(config_args)
                 .args(["app-server", "--listen", &locator.remote_attach_arg()])
                 .current_dir(cwd)
                 .stdout(std::process::Stdio::piped())
@@ -296,7 +298,7 @@ impl CodexNativeShared {
         }
         #[cfg(not(unix))]
         {
-            let _ = (codex, locator, cwd);
+            let _ = (codex, locator, cwd, config_args);
             Err(anyhow::anyhow!("Codex NativeShared requires Unix sockets"))
         }
     }
@@ -1022,7 +1024,10 @@ fn launch_managed_server(
     locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let child = CodexNativeShared::launch(codex, locator, cwd.unwrap_or_else(|| Path::new(".")))?;
+    let cwd = cwd.unwrap_or_else(|| Path::new("."));
+    let config_args =
+        crate::mcp_config::codex_managed_config_args(home, Some(instance), Some(cwd))?;
+    let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
     let pid = child.id();
     let start_token = crate::process::process_start_token(pid);
     locator.managed = true;
@@ -1374,6 +1379,7 @@ mod tests {
             executable.to_str().expect("UTF-8 executable"),
             &locator,
             &root,
+            &[],
         )
         .expect("launch fake Codex app-server");
         std::thread::sleep(Duration::from_millis(50));
