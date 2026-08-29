@@ -136,6 +136,7 @@ pub(super) fn handle_create_team(
             accept_from,
         },
         &rt.registry,
+        &rt.configs,
         rt.notifier.as_deref(),
     )
 }

@@ -124,6 +124,7 @@ pub(super) fn handle_create_instance(
                     accept_from: Vec::new(),
                 },
                 &rt.registry,
+                &rt.configs,
                 rt.notifier.as_deref(),
             )
         } else {

@@ -18,6 +18,11 @@ use std::sync::Arc;
 pub(crate) mod cleanup_admission;
 pub(crate) mod messaging;
 pub(crate) mod spawn;
+pub(crate) mod spawn_transaction;
+
+#[cfg(all(test, unix))]
+pub(crate) use spawn_transaction::lanes_are_the_same;
+pub(crate) use spawn_transaction::{preset_submit_key, spawn_one_recording_config};
 
 const UNVERIFIED_DELIVERY_MODE: &str = "transport_queued_unverified";
 
@@ -1280,9 +1285,7 @@ pub fn spawn_one(
     // #1682: clear BOTH the legacy name file and the id-resolved file — post-#1680
     // readers use `<uuid>.json`, which the old name-only remove left stale.
     remove_metadata(home, name);
-    let preset_submit_key = effective_backend
-        .map(|b| b.preset().submit_key)
-        .unwrap_or("\r");
+    let preset_submit_key = preset_submit_key(effective_backend.as_ref());
     // No-op when caller already passed Fresh; downgrades Resume → Fresh when
     // there is no resumable session in `work_dir` (see
     // `SpawnMode::downgraded_for`). Returned so callers (e.g. the
