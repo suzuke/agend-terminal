@@ -1,7 +1,7 @@
 //! #1629 invariant: `store::acquire_file_lock` (src/store.rs) must be the SOLE
 //! flock chokepoint that bumps `FLOCK_DEPTH` — the thread-local the self-IPC
 //! deadlock guard (`assert_no_registry_lock_for_self_ipc`) reads to see the
-//! fs4-flock tier. Any RAW fs4 flock OUTSIDE the three vetted files bypasses
+//! fs4-flock tier. Any RAW fs4 flock OUTSIDE the five vetted files bypasses
 //! FLOCK_DEPTH and silently reopens the flock-while-blocking deadlock blind spot
 //! (#1617/#1342/#1340/#1624) this guard closes. This RED fails CI if a new raw
 //! flock site appears.
@@ -32,16 +32,32 @@
 //! re-adding a raw flock writes an explicit `use fs4::…FileExt…` (single- or
 //! multi-line), which IS caught.
 //!
-//! The three allowed files:
+//! The five allowed files:
 //! - `store.rs` — `acquire_file_lock` itself (the chokepoint) + its tests.
 //! - `bootstrap/mod.rs` — `acquire_daemon_lock`, the `.daemon.lock` singleton
 //!   held for the daemon's whole life (MUST NOT bump the depth, else it would
 //!   pin FLOCK_DEPTH > 0 and false-trip every self-IPC).
 //! - `daemon/mod.rs` — the escape-hatch `run` `.daemon.lock` singleton.
+//! - `mcp/handlers/instance_state/tests.rs` + `mcp/handlers/ci/tests.rs` (#3416)
+//!   — reached only through `#[cfg(test)] mod tests;`, so no production code
+//!   lives in them. Their fixtures hold `fleet_events.jsonl.lock` RAW on purpose:
+//!   they play the EXTERNAL holder the two destructive audit gates must refuse to
+//!   write past. Routing that hold through `acquire_file_lock` would bump
+//!   FLOCK_DEPTH on the very thread under test and simulate the wrong thing.
 
 use std::path::{Path, PathBuf};
 
-const ALLOWED: [&str; 3] = ["store.rs", "bootstrap/mod.rs", "daemon/mod.rs"];
+/// Exact relative paths, never prefixes: a `tests.rs` under any OTHER handler,
+/// or the production `mod.rs` beside an exempt fixture, is still scanned (proved
+/// in `scanner_catches_all_realistic_forms_and_spares_mutex`).
+const ALLOWED: [&str; 5] = [
+    "store.rs",
+    "bootstrap/mod.rs",
+    "daemon/mod.rs",
+    // #3416: cfg(test)-only external-holder fixtures — see the module doc.
+    "mcp/handlers/instance_state/tests.rs",
+    "mcp/handlers/ci/tests.rs",
+];
 
 /// #3273: files that carry a raw flock but do the chokepoint's `FLOCK_DEPTH`
 /// bookkeeping THEMSELVES, and are therefore tracked rather than exempt.
@@ -180,7 +196,7 @@ fn acquire_file_lock_is_sole_flock_depth_bumper_1629() {
 
     assert!(
         violations.is_empty(),
-        "#1629: a raw fs4 flock outside the 3 vetted files bypasses \
+        "#1629: a raw fs4 flock outside the 5 vetted files bypasses \
          store::acquire_file_lock's FLOCK_DEPTH tracking → reopens the flock-while-blocking \
          self-IPC deadlock blind spot (#1617 class). Route the lock through \
          `crate::store::acquire_file_lock` instead; or — if it is a deliberate lifetime-held \
@@ -236,11 +252,36 @@ fn scanner_catches_all_realistic_forms_and_spares_mutex() {
         "fs4 import without FileExt must not gate the method check on"
     );
 
-    // The 3 vetted files are exempt even with raw fs4 flock usage.
+    // The vetted files are exempt even with raw fs4 flock usage.
     assert!(
         scan_file("store.rs", single).is_empty(),
         "allowlisted files are exempt"
     );
+
+    // #3416: the two cfg(test) external-holder fixtures are exempt …
+    for exempt in [
+        "mcp/handlers/instance_state/tests.rs",
+        "mcp/handlers/ci/tests.rs",
+    ] {
+        assert!(
+            scan_file(exempt, single).is_empty(),
+            "the #3416 cfg(test) fixture module {exempt} must be exempt"
+        );
+    }
+    // … by EXACT path only. The identical raw flock in the production module
+    // beside one of them, or in any other handler's tests.rs, still FAILs —
+    // otherwise the entry would be a licence for a whole directory.
+    for scanned in [
+        "mcp/handlers/ci/mod.rs",
+        "mcp/handlers/instance_state/mod.rs",
+        "mcp/handlers/other/tests.rs",
+        "tests.rs",
+    ] {
+        assert!(
+            !scan_file(scanned, single).is_empty(),
+            "the #3416 exemption must not spill onto {scanned}"
+        );
+    }
 
     // #3273: the depth-TRACKED entry is conditional, and this proves both
     // directions. Without it the entry would be an ordinary allowlist row and

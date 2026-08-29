@@ -324,15 +324,12 @@ pub(crate) fn build_git_event(
 /// #26: the single best-effort `fleet_events.jsonl` appender (never blocks;
 /// callers `exec` real git immediately after).
 pub(crate) fn append_git_event(home: &str, event: &serde_json::Value) {
-    let events_path = PathBuf::from(home).join("fleet_events.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(events_path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{event}");
-    }
+    // #3416: goes through the one serialized appender. Best-effort by contract —
+    // a single non-blocking lock attempt, and on contention the record is SKIPPED.
+    // Skipping is what preserves the never-blocks guarantee documented above; an
+    // unlocked fallback would preserve it by reintroducing the interleaving that
+    // corrupted 44.6% of recent records.
+    let _ = agentic_audit_append::append_audit_line_best_effort(std::path::Path::new(home), event);
 }
 
 /// Sprint 57 Wave 2 Track D: structured audit-event writer with an
@@ -360,4 +357,268 @@ pub(crate) fn write_git_event_typed(
     extra.insert("reason".into(), serde_json::json!(detail));
     let event = build_git_event(event_type, agent, subcmd, extra);
     append_git_event(home, &event);
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Env var that switches this test binary into stress-worker mode.
+    const WORKER_HOME: &str = "AGEND_3416_STRESS_WORKER_HOME";
+    /// Fully-qualified name of the stress test, used to re-exec ourselves as a
+    /// worker. Kept next to the test so a rename breaks loudly rather than
+    /// silently spawning nothing.
+    const STRESS_TEST_PATH: &str = "telemetry::tests::concurrent_append_git_event_writes_only_parseable_records";
+    const WORKERS: usize = 8;
+    const RECORDS_PER_WORKER: usize = 400;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-3416-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    fn sample_event(worker: &str, i: usize) -> serde_json::Value {
+        // Shaped like a real record: production rows are p50 ~2 KB, and the size
+        // matters because it is what makes a multi-syscall write interleave.
+        serde_json::json!({
+            "kind": "git_event",
+            "event": "deny",
+            "agent": worker,
+            "seq": i,
+            "process_ancestry": vec!["x".repeat(600); 3],
+            "timestamp": "2026-08-28T00:00:00+00:00",
+        })
+    }
+
+    /// Take an exclusive, non-blocking `flock` on `path`, returning the holder.
+    /// `flock(2)` binds the lock to the OPEN FILE DESCRIPTION, so a second
+    /// `open()` in this same process contends exactly as another process would —
+    /// which is what lets these tests stay single-process and sleep-free.
+    fn hold_lock(path: &std::path::Path) -> std::fs::File {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let rc = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&f),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        assert_eq!(rc, 0, "test must be able to take the companion lock");
+        f
+    }
+
+    /// #3416 RED: the shim sink is best-effort and documented as "never blocks"
+    /// (callers `exec` real git immediately after). Serializing it must keep that
+    /// contract by SKIPPING on contention — never by falling back to an unlocked
+    /// append, which would reintroduce exactly the interleaving being fixed.
+    ///
+    /// Pre-fix this FAILS: nothing consults the lock, so the record is appended.
+    #[test]
+    fn append_git_event_skips_while_companion_lock_is_held() {
+        let home = tmp_home("skip-on-contention");
+        let holder = hold_lock(&home.join("fleet_events.jsonl.lock"));
+
+        let started = std::time::Instant::now();
+        append_git_event(home.to_str().unwrap(), &sample_event("shim", 0));
+        let elapsed = started.elapsed();
+
+        let written =
+            std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        assert!(
+            written.trim().is_empty(),
+            "best-effort sink must skip while the lock is held, never append unlocked; found: {written}"
+        );
+        // r1 F1: skipped and stalled-then-skipped leave the same empty file above;
+        // only elapsed separates best-effort from a bounded retry.
+        assert!(
+            elapsed < agentic_audit_append::DEFAULT_BOUNDED_BUDGET / 2,
+            "best-effort sink must return promptly on contention, never retry for the bounded budget; took {elapsed:?}"
+        );
+
+        drop(holder);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The "after release" half of the contract. A best-effort sink may skip while
+    /// the lock is held, but once it is free the very next append must land, intact
+    /// and exactly once.
+    ///
+    /// Note what is deliberately NOT asserted: that a quiet period guarantees
+    /// delivery. There is no such guarantee in a process that spawns children. A
+    /// concurrent `fork` duplicates every open file descriptor, so the lock's open
+    /// file description outlives the parent's `close` until the child `exec`s, and
+    /// a best-effort `try_lock` can see `WouldBlock` with NO competing writer at
+    /// all. Measured here: 0/15 runs hit it with no child spawning, ~2/27 with the
+    /// stress test's 8 spawns running alongside. Delivery is therefore pinned on
+    /// the bounded (retrying) path, in the appender crate's own tests.
+    #[test]
+    fn append_git_event_lands_once_the_lock_is_released() {
+        let home = tmp_home("after-release");
+        let holder = hold_lock(&agentic_audit_append::lock_path(&home));
+
+        append_git_event(home.to_str().unwrap(), &sample_event("held", 0));
+        assert!(
+            std::fs::read_to_string(agentic_audit_append::audit_path(&home))
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "nothing may be written while the lock is held"
+        );
+
+        drop(holder);
+        // `append_git_event` is best-effort BY CONTRACT: one non-blocking lock
+        // attempt, skipped on contention, because the shim must never block. So
+        // "the lock was released" does not promise that the very NEXT attempt
+        // wins — only that attempts are no longer refused by our holder. Measured
+        // under the parallel suite: this single call skipped with `Contended` in
+        // 5 of 60 runs, while 2000 sequential release-then-append cycles skipped
+        // zero times. Asserting on one attempt was asserting more than the API
+        // offers; a bounded retry pins what the test actually means.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            append_git_event(home.to_str().unwrap(), &sample_event("freed", 1));
+            let landed = std::fs::read_to_string(agentic_audit_append::audit_path(&home))
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false);
+            if landed || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let content =
+            std::fs::read_to_string(agentic_audit_append::audit_path(&home)).unwrap_or_default();
+        let rows: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("row written after release must be parseable"))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly the post-release record, got: {content}");
+        assert_eq!(rows[0]["seq"], 1, "the skipped record must not reappear later");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3416 RED: the defect itself. Real production entry, real concurrency,
+    /// separate PROCESSES. Deterministic without any sleep because the pre-fix
+    /// failure is not probabilistic — a multi-syscall `O_APPEND` write interleaves
+    /// essentially always under this load (measured: ~100% of records corrupt).
+    #[test]
+    fn concurrent_append_git_event_writes_only_parseable_records() {
+        // Worker mode: this process was re-exec'd by the parent below.
+        if let Ok(home) = std::env::var(WORKER_HOME) {
+            let tag = format!("w{}", std::process::id());
+            for i in 0..RECORDS_PER_WORKER {
+                append_git_event(&home, &sample_event(&tag, i));
+            }
+            return;
+        }
+
+        let home = tmp_home("stress");
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for _ in 0..WORKERS {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args(["--exact", STRESS_TEST_PATH, "--nocapture"])
+                    .env(WORKER_HOME, &home)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut c in children {
+            let st = c.wait().unwrap();
+            assert!(st.success(), "stress worker failed: {st}");
+        }
+
+        let content = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        let mut rows: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut corrupt = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) if v.is_object() => rows.push((line, v)),
+                _ => corrupt += 1,
+            }
+        }
+        let parsed = rows.len();
+        // The invariant is INTEGRITY of what survives, NOT delivery of everything.
+        // This sink is best-effort by contract (one try_lock, skip on contention),
+        // so under saturation some records are legitimately absent and this test
+        // must not claim zero loss. Delivery is pinned separately, on the bounded
+        // path, in the appender crate's own tests.
+        assert_eq!(
+            corrupt, 0,
+            "every record that reaches the log must be intact; {corrupt} corrupt of {} lines",
+            parsed + corrupt
+        );
+        assert!(
+            parsed > 0,
+            "the appender must still deliver records under contention, got none"
+        );
+
+        // Every surviving row must be a complete, well-formed record — not merely
+        // parseable JSON — and must appear exactly once. Duplication would mean a
+        // retry wrote twice; a malformed row would mean a partial write survived.
+        let mut seen = std::collections::HashSet::new();
+        for (raw, row) in &rows {
+            let agent = row["agent"].as_str().expect("surviving row must carry agent");
+            let seq = row["seq"].as_u64().expect("surviving row must carry seq");
+            assert!(
+                seen.insert((agent.to_string(), seq)),
+                "record ({agent}, {seq}) surfaced more than once"
+            );
+            assert!(
+                (seq as usize) < RECORDS_PER_WORKER,
+                "record ({agent}, {seq}) is outside the attempted domain"
+            );
+            // The load-bearing assertion: a surviving line must be EXACTLY what the
+            // appender renders for that record. Parsing alone is far too weak — a
+            // reordered, re-serialized or field-dropped write still parses and still
+            // looks unique, and this is an audit trail, so "close enough" is not a
+            // property worth having.
+            let expected = sample_event(agent, seq as usize).to_string();
+            assert_eq!(
+                *raw, expected,
+                "surviving record ({agent}, {seq}) is not byte-identical to what the \
+                 appender renders"
+            );
+        }
+
+        // Skip accounting is REPORTED, not asserted. The previous version asserted
+        // `parsed + skipped == attempted` after defining `skipped` as
+        // `attempted - parsed`, which is true by construction and therefore proved
+        // nothing. What is actually worth pinning is that no record can appear that
+        // was never attempted, which the domain and byte-identity assertions above
+        // do carry.
+        let attempted = WORKERS * RECORDS_PER_WORKER;
+        let skipped = attempted - parsed;
+        assert!(
+            parsed <= attempted,
+            "more records surfaced ({parsed}) than were attempted ({attempted})"
+        );
+        // Measured on the authoring machine: 1532 of 3200 survived, i.e. roughly
+        // half skipped with 8 processes appending back-to-back with no gap. That is
+        // a SATURATION envelope, not a production rate — real fleet load is a median
+        // of 3 events/sec with an 86 ms median inter-arrival. Recorded here so a
+        // future production-rate probe has a reference point, not as a claim about
+        // normal operation.
+        eprintln!("stress: attempted={attempted} survived={parsed} skipped={skipped}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
