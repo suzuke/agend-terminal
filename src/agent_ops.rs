@@ -1260,7 +1260,7 @@ fn spawn_lane(home: &std::path::Path, name: &str) -> SpawnLane {
 ///
 /// Pointer identity of the `Arc`, so the answer comes from the lane itself rather
 /// than from restating the key-building code.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn lanes_are_the_same(a: &std::path::Path, b: &std::path::Path, name: &str) -> bool {
     SpawnLane::ptr_eq(&spawn_lane(a, name), &spawn_lane(b, name))
 }
