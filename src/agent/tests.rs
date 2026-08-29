@@ -3,6 +3,87 @@ use crate::transport::{
     DeliveryEnvelope, DeliveryKind, DeliveryReceipt, DeliveryState, SessionLocator,
 };
 
+/// #3420: an `AgentHandle` whose child stays alive until something SIGKILLs it.
+///
+/// A test that asserts a child was reaped BEFORE some call returned cannot use
+/// [`super::mk_test_handle`]: its `true` child exits on its own within milliseconds, so
+/// the closing `try_wait` reports `Ok(Some(_))` even when nothing waited for the
+/// reaper. This child ignores SIGTERM instead, so it survives
+/// `terminate_agents_parallel`'s stage-1 signal AND its whole `SHUTDOWN_GRACE`
+/// window; only the post-grace SIGKILL ends it. Being dead afterwards is then
+/// evidence that the caller waited.
+///
+/// `trap "" TERM HUP` installs SIG_IGN, which no later signal can clear. HUP is
+/// as load-bearing as TERM here: the close path drops the `AgentHandle` — and
+/// with it the PTY master — before the reaper runs, and closing the controlling
+/// terminal SIGHUPs the session. Trapping only TERM leaves the child dying to
+/// that hangup instead, which is the same vacuity in a new costume. The inner
+/// `sleep` is a separate process without the trap, so it dies to the group
+/// signal and the loop simply restarts it, leaving the shell reachable only by
+/// SIGKILL.
+#[cfg(all(test, unix))]
+pub(crate) fn mk_sigterm_immune_test_handle(
+    name: &str,
+    id: crate::types::InstanceId,
+) -> super::AgentHandle {
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.args(["-c", "trap \"\" TERM HUP; while :; do sleep 300; done"]);
+    mk_test_handle_over(name, id, cmd, "sh")
+}
+
+#[cfg(test)]
+pub(crate) fn mk_test_handle_over(
+    name: &str,
+    id: crate::types::InstanceId,
+    mut cmd: CommandBuilder,
+    backend_command: &str,
+) -> super::AgentHandle {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
+    drop(pair.slave);
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(CoreMutex::new(AgentCore {
+        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let published_state = core.lock().state.published_handle();
+    let published_observed = core.lock().state.published_observed_handle();
+    super::AgentHandle {
+        id,
+        name: name.to_string().into(),
+        declared_backend: None,
+        backend_command: backend_command.to_string(),
+        pty_writer,
+        pty_master,
+        core,
+        published_state,
+        published_observed,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crash_disposition::SpawnGeneration::default(),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
 static R8_DISMISS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct SelfKickTestGuard {
     _hook: crate::transport::test_support::DeliveryHookGuard,
