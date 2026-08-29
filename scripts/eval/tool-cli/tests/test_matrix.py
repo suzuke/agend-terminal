@@ -143,6 +143,10 @@ class MatrixAuthority(unittest.TestCase):
                     os.path.join(scenarios, "S01", "seed.sh")),
                 "started_at": "2026-08-28T00:00:00Z", "ended_at": "2026-08-28T00:00:01Z",
                 "duration_ms": 1000, "exit_code": 0, "turns": 3, "timed_out": False,
+                # The execution budget is part of what makes a run THIS matrix's:
+                # the grader refuses any other value, so a fixture that omits it
+                # stopped modelling a conforming run the moment that became true.
+                "max_turns": grade.FROZEN_MAX_TURNS,
                 "invalid_reason": None}
         meta.update(meta_extra)
         for key in [k for k, v in meta_extra.items() if v is DROP_SENTINEL]:
@@ -153,6 +157,10 @@ class MatrixAuthority(unittest.TestCase):
 
     def _plant_with_stream(self, **meta_extra):
         planned = self._plant(**meta_extra)
+        # A run that really happened copied its final_state back; the grader now
+        # refuses one that did not, so a fixture standing in for a COMPLETE run
+        # has to carry the tree as well as the metadata.
+        os.makedirs(os.path.join(planned, "final_state"), exist_ok=True)
         with open(os.path.join(planned, "stream.jsonl"), "w", encoding="utf-8") as fh:
             fh.write('{"type": "system", "subtype": "init", "model": "claude-fable-5",'
                      ' "claude_code_version": "2.0.0-test"}\n')
