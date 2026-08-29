@@ -478,6 +478,8 @@ fn one_spawn_transaction_per_name_at_a_time() {
     let b_events = Arc::clone(&events);
     let b_home = fx.home.clone();
     let b_configs = Arc::clone(&fx.configs);
+    // fire-and-forget: test-only contention worker; the handle is joined below
+    // after the deterministic lane witness completes.
     let b = std::thread::spawn(move || {
         // Only try once A is demonstrably inside its own transaction.
         a_inside_rx
