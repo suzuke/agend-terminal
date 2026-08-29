@@ -849,7 +849,8 @@ class Aggregation(TempCase):
         + [("S14", pair, "cli") for pair in range(1, 46)]
     )
 
-    def frozen_matrix(self, skip=(), extra=(), manifest=True, final_state=True):
+    def frozen_matrix(self, skip=(), extra=(), manifest=True, final_state=True,
+                      no_evidence_cells=()):
         """The whole SPEC section 6 plan on disk: 210 runs, every one conforming."""
         runs = os.path.join(self.tmp, "runs")
         spec = {"S0%d" % i: (PASS_EXPECT, ["mcp", "cli"]) for i in range(1, 7)}
@@ -861,7 +862,8 @@ class Aggregation(TempCase):
             if cell in skip:
                 continue
             scenario, pair, arm = cell
-            write_run(runs, scenario, arm, pair, [], final_state=final_state)
+            write_run(runs, scenario, arm, pair, [],
+                      final_state=final_state and cell not in no_evidence_cells)
         for scenario, pair, arm, meta_extra in extra:
             write_run(runs, scenario, arm, pair, [], meta_extra=meta_extra)
         if manifest:
@@ -905,6 +907,28 @@ class Aggregation(TempCase):
                          "a run with no durable evidence is not a valid run")
         self.assertEqual(
             sorted({e["reason"] for e in summary["invalid"]}), ["final_state_missing"])
+
+    def test_a_confirmation_cell_with_no_graded_run_unsupports_the_claim(self):
+        """The coverage half of (1), isolated from the mixing gate.
+
+        Dropping evidence everywhere is caught by the mixing gate too — S13/S14
+        lose their 45 valid runs — so that alone does not prove the plan gate
+        learned anything. Here only the CONFIRMATION cells lose their evidence:
+        the mixing controls keep their 45 each and their gate still passes, so
+        the refusal has to come from the plan gate noticing that frozen cells
+        have no graded run behind them.
+        """
+        blind = [("S01", pair, arm) for pair in range(1, 11) for arm in ("mcp", "cli")]
+        runs, scen = self.frozen_matrix(no_evidence_cells=set(blind))
+        summary = grade.aggregate(runs, scen)
+
+        self.assertTrue(summary["mixing_gate"]["pass"],
+                        "S13/S14 kept their evidence — the mixing gate is not what fires")
+        self.assertIn("plan_cells_without_valid_run", summary["plan_gate"]["flags"])
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertEqual(summary["plan_gate"]["missing"], [],
+                         "those runs happened; they are excluded, not absent")
+        self.assertFalse(summary["pilot_safety"])
 
     def test_a_turn_budget_off_the_frozen_contract_is_another_experiment(self):
         """#3435 r1 (3): SPEC pins --max-turns 15, the runner defaulted to 40.
