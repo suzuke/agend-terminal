@@ -1436,7 +1436,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(
             &executable,
-            "#!/bin/sh\n: > \"$0.args\"\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\" >> \"$0.args\"\n  endpoint=\"$arg\"\ndone\nendpoint=${endpoint#unix://}\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\n: > \"$0.args\"\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\" >> \"$0.args\"\n  endpoint=\"$arg\"\ndone\nendpoint=${endpoint#unix://}\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nsleep 5\n",
         )
         .expect("fake Codex executable");
         let mut permissions = std::fs::metadata(&executable)
