@@ -916,6 +916,8 @@ fn seed_task(home: &Path, id: &str, owner: &str, branch: &str, done: bool) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1587,6 +1589,8 @@ fn seed_task_on_board(home: &Path, project: &str, id: &str, owner: &str, branch:
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();

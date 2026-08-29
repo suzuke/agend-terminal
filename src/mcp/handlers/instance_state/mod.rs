@@ -124,6 +124,7 @@ pub(super) fn handle_create_instance(
                     accept_from: Vec::new(),
                 },
                 &rt.registry,
+                &rt.configs,
                 rt.notifier.as_deref(),
             )
         } else {
@@ -295,21 +296,20 @@ pub(super) fn handle_delete_instance_with_runtime(
                             "has_active_task": has_active_task,
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                         });
-                        let events_path = home.join("fleet_events.jsonl");
-                        let audit_written = (|| -> std::io::Result<()> {
-                            use std::io::Write;
-                            let mut f = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(events_path)?;
-                            writeln!(f, "{event}")?;
-                            Ok(())
-                        })();
+                        // #3416: goes through the one serialized appender. Destructive
+                        // fail-closed gate — bounded retry, then refuse; never an
+                        // unlocked fallback. `Err` means no TRUSTWORTHY record exists,
+                        // so the force-delete must not proceed. It does not always mean
+                        // nothing was written: a `Write` failure can leave a partial
+                        // line, which is why the refusal reports the error's own wording.
+                        let audit_written = agentic_audit_append::append_audit_line_bounded(
+                            home,
+                            &event,
+                            agentic_audit_append::DEFAULT_BOUNDED_BUDGET,
+                        );
                         if let Err(e) = audit_written {
                             return serde_json::json!({
-                                "error": format!(
-                                    "creator force-delete refused: audit log write failed: {e}"
-                                ),
+                                "error": format!("creator force-delete refused: {e}"),
                                 "code": "creator_force_delete_audit_failed"
                             });
                         }

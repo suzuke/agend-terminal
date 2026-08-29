@@ -38,6 +38,8 @@ fn created_event(id: &str, instance: &str) -> TaskEvent {
         eta_secs: None,
         tags: vec![],
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     }
 }
 

@@ -211,6 +211,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: tid,
@@ -242,6 +244,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: tid,
@@ -273,6 +277,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Done {
                     task_id: tid,
@@ -308,6 +314,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Cancelled {
                     task_id: tid,
@@ -373,6 +381,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: TaskId(task_id.into()),
@@ -496,6 +506,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Created {
                     task_id: child.clone(),
@@ -511,6 +523,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: Some(parent.clone()),
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Done {
                     task_id: child,
@@ -905,6 +919,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Done {
                     task_id: tid.clone(),

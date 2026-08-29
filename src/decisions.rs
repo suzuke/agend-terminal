@@ -95,6 +95,14 @@ pub struct Decision {
     pub archived: bool,
     pub supersedes: Option<String>,
     pub working_directory: Option<String>,
+    /// Optional typed review authority. Additive and create-only; tasks may
+    /// inherit this value when they name the decision as their governor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::daemon::pr_state::review_class_serde"
+    )]
+    pub review_class: Option<crate::daemon::pr_state::ReviewClass>,
     /// #1990: see [`SCHEMA_VERSION`]. `#[serde(default)]` → a pre-#1990 record
     /// (no field) reads back as 0 (≤ current, loads normally).
     #[serde(default)]
@@ -205,6 +213,102 @@ pub(crate) fn decision_path(home: &Path, id: &str) -> std::path::PathBuf {
     decisions_dir(home).join(format!("{id}.json"))
 }
 
+fn is_safe_decision_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
+}
+
+/// Acquire the exact decision's flock for callers that must couple a fresh
+/// authority read with a later write in another store (notably task Created).
+pub(crate) fn acquire_decision_lock(
+    home: &Path,
+    id: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
+    if !is_safe_decision_id(id) {
+        anyhow::bail!("governing decision id is not a safe exact identifier")
+    }
+    let dir = decisions_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    crate::store::acquire_file_lock(&decision_lock_path(home, id))
+}
+
+/// The resolved authority named by a task create request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GoverningDecision {
+    pub review_class: Option<crate::daemon::pr_state::ReviewClass>,
+}
+
+/// Resolve one exact decision as an active, unsuperseded leaf. The entire
+/// decision directory is scanned so malformed/newer records, records filed
+/// under a name that is not their id, or multiple reverse `supersedes` links
+/// cannot be hidden by the normal list path.
+pub(crate) fn resolve_governing_decision(
+    home: &Path,
+    id: &str,
+) -> anyhow::Result<GoverningDecision> {
+    if !is_safe_decision_id(id) {
+        anyhow::bail!("governing decision id is not a safe exact identifier")
+    }
+    let dir = decisions_dir(home);
+    let exact_path = decision_path(home, id);
+    let exact_raw = std::fs::read_to_string(&exact_path)
+        .map_err(|e| anyhow::anyhow!("governing decision '{id}' is missing: {e}"))?;
+    let exact: Decision = serde_json::from_str(&exact_raw)
+        .map_err(|e| anyhow::anyhow!("governing decision '{id}' is corrupt: {e}"))?;
+    if exact.id != id {
+        anyhow::bail!("governing decision '{id}' has mismatched record identity")
+    }
+    if exact.schema_version > SCHEMA_VERSION {
+        anyhow::bail!("governing decision '{id}' uses a newer schema")
+    }
+    if exact.archived {
+        anyhow::bail!("governing decision '{id}' is archived")
+    }
+
+    let mut reverse = Vec::new();
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| anyhow::anyhow!("decision directory is unreadable: {e}"))?;
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let path = entry.path();
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("decision record '{}' is unreadable: {e}", path.display())
+        })?;
+        let decision: Decision = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("decision record '{}' is corrupt: {e}", path.display()))?;
+        if decision.schema_version > SCHEMA_VERSION {
+            anyhow::bail!("decision record '{}' uses a newer schema", path.display())
+        }
+        // Every record must live under its own id. A record filed under another
+        // name is the tamper shape this scan exists to expose: it can claim the
+        // resolved id (or any other) while the normal by-id path never sees it.
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if decision.id != stem {
+            anyhow::bail!(
+                "decision record '{}' has mismatched record identity",
+                path.display()
+            )
+        }
+        if decision.supersedes.as_deref() == Some(id) {
+            reverse.push(decision);
+        }
+    }
+    if !reverse.is_empty() {
+        if reverse.len() > 1 {
+            anyhow::bail!("governing decision '{id}' has an ambiguous superseding leaf")
+        }
+        anyhow::bail!("governing decision '{id}' is superseded")
+    }
+    Ok(GoverningDecision {
+        review_class: exact.review_class,
+    })
+}
+
 fn decision_lock_path(home: &Path, id: &str) -> std::path::PathBuf {
     decisions_dir(home).join(format!("{id}.lock"))
 }
@@ -215,9 +319,7 @@ fn decision_lock_path(home: &Path, id: &str) -> std::path::PathBuf {
 /// [`with_decision_lock`] — this function acquires the lock only for the
 /// write itself.
 fn save(home: &Path, decision: &Decision) -> anyhow::Result<()> {
-    let dir = decisions_dir(home);
-    std::fs::create_dir_all(&dir)?;
-    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, &decision.id))?;
+    let _lock = acquire_decision_lock(home, &decision.id)?;
     crate::store::save_atomic(&decision_path(home, &decision.id), decision)
 }
 
@@ -229,9 +331,7 @@ pub(crate) fn with_decision_lock<R>(
     id: &str,
     f: impl FnOnce() -> R,
 ) -> anyhow::Result<R> {
-    let dir = decisions_dir(home);
-    std::fs::create_dir_all(&dir)?;
-    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, id))?;
+    let _lock = acquire_decision_lock(home, id)?;
     Ok(f())
 }
 
@@ -296,6 +396,31 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     } else {
         None
     };
+    let review_class = match args.get("review_class") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => {
+            match crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(raw)) {
+                crate::daemon::pr_state::ReviewClass::Single => {
+                    Some(crate::daemon::pr_state::ReviewClass::Single)
+                }
+                crate::daemon::pr_state::ReviewClass::Dual => {
+                    Some(crate::daemon::pr_state::ReviewClass::Dual)
+                }
+                crate::daemon::pr_state::ReviewClass::Unresolved => {
+                    return serde_json::json!({
+                        "error": "review_class must be exactly 'single' or 'dual'",
+                        "code": "invalid_review_class",
+                    })
+                }
+            }
+        }
+        Some(_) => {
+            return serde_json::json!({
+                "error": "review_class must be a string ('single' or 'dual')",
+                "code": "invalid_review_class",
+            })
+        }
+    };
 
     let clock = chrono::Utc::now();
     let now = clock.to_rfc3339();
@@ -358,6 +483,7 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         archived: false,
         supersedes,
         working_directory: working_dir,
+        review_class,
         schema_version: SCHEMA_VERSION,
         needs_answer,
         status,
@@ -1423,6 +1549,13 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
                     "decision '{id}' owned by '{}', caller '{caller}' not authorized",
                     decision.author
                 )
+            });
+        }
+
+        if args.get("review_class").is_some() {
+            return serde_json::json!({
+                "error": "decision review_class is immutable after creation",
+                "code": "decision_review_class_immutable",
             });
         }
 

@@ -8600,6 +8600,8 @@ fn seed_task(home: &Path, task_id: &str, created_by: &str) {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("seed_task: append must succeed");

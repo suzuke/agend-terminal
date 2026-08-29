@@ -1211,6 +1211,8 @@ fn prune_keeps_stale_idle_branch_with_active_task() {
             owner: None,
             depends_on: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
             branch: Some(branch.into()),
             due_at: None,
             routed_to: None,

@@ -399,6 +399,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: TaskId(tid.into()),
@@ -450,6 +452,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 }],
             )
             .expect("seed task");
@@ -501,6 +505,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: TaskId(tid.into()),
@@ -550,6 +556,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Verified {
                     task_id: TaskId(tid.into()),

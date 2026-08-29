@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/agentic-git-core", "crates/agentic-git"]
+members = ["crates/agentic-git-core", "crates/agentic-git", "crates/agentic-audit-append"]
 
 [workspace.package]
 # agentic-git-core is the stable contract crate — it stays on its own version

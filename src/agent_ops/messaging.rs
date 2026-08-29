@@ -445,6 +445,8 @@ fn auto_create_task_if_needed(
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     match crate::task_events::append(
         home,

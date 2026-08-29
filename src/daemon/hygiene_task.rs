@@ -223,6 +223,8 @@ pub fn upsert_system_hygiene_task(
                         eta_secs: None,
                         tags: vec!["system-hygiene".to_string()],
                         parent_id: None,
+                        governing_decision_id: None,
+                        review_class: None,
                     },
                     meta(&task_id, ALERT_KEY_META, key.into()),
                     meta(&task_id, EVIDENCE_META, evidence.clone()),

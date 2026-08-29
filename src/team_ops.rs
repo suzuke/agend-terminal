@@ -85,6 +85,7 @@ pub(crate) fn create(
     home: &Path,
     request: CreateTeamRequest,
     registry: &crate::agent::AgentRegistry,
+    configs: &crate::api::ConfigRegistry,
     notifier: Option<&dyn crate::api::ApiNotifier>,
 ) -> Value {
     // #2855: fail-closed identifier validation before any runtime/spawn/roster
@@ -160,17 +161,38 @@ pub(crate) fn create(
         if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
             crate::backend::Backend::push_model_arg(&mut member_args, &declared_backend, model);
         }
-        match crate::agent_ops::spawn_one(
+        // #3417: a team member is spawned through `spawn_one` directly rather
+        // than the SPAWN service, so it needs the same config transaction — a
+        // member absent from the map is invisible to the snapshot writer and
+        // ineligible for crash respawn, exactly like the other surfaces.
+        let recorded = crate::daemon::AgentConfig {
+            name: inst_name.to_string(),
+            backend: Some(declared_backend.clone()),
+            backend_command: backend.to_string(),
+            args: member_args.clone(),
+            env: resolved_env.clone(),
+            working_dir: Some(work_dir.to_path_buf()),
+            submit_key: crate::agent_ops::preset_submit_key(Some(&declared_backend)).to_string(),
+        };
+        match crate::agent_ops::spawn_one_recording_config(
             home,
-            registry,
+            configs,
             inst_name,
-            backend,
-            &member_args,
-            crate::backend::SpawnMode::Fresh,
-            work_dir,
-            size,
-            resolved_env.as_ref(),
-            Some(&declared_backend),
+            recorded,
+            || {
+                crate::agent_ops::spawn_one(
+                    home,
+                    registry,
+                    inst_name,
+                    backend,
+                    &member_args,
+                    crate::backend::SpawnMode::Fresh,
+                    work_dir,
+                    size,
+                    resolved_env.as_ref(),
+                    Some(&declared_backend),
+                )
+            },
         ) {
             Ok(_) => {
                 tracing::info!(team = %team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");

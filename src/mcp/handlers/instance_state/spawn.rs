@@ -108,6 +108,7 @@ pub(super) fn spawn_runtime_or_legacy(
         &crate::agent_ops::spawn::SpawnContext {
             home,
             registry: &runtime.registry,
+            configs: &runtime.configs,
             externals: &runtime.externals,
             notifier: runtime.notifier.as_ref(),
         },

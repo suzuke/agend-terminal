@@ -475,6 +475,8 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         }],
     )
     .expect("seed Created event");
@@ -603,6 +605,8 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid.clone(),
@@ -679,6 +683,8 @@ fn release_inprogress_orphans_preserves_exact_signed_binding() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid.clone(),
@@ -1684,6 +1690,8 @@ fn d63_legacy_migration_blocked_survives_satisfied_deps() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1763,6 +1771,8 @@ fn d63_non_open_statuses_with_unmet_dep_pass_through() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
@@ -2457,6 +2467,8 @@ fn test_circular_dep_no_infinite_loop() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2477,6 +2489,8 @@ fn test_circular_dep_no_infinite_loop() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();

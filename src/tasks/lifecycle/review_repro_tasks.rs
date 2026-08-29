@@ -86,6 +86,8 @@ fn archive_does_not_flip_completed_task_to_cancelled_tasks() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     );
     write_envelope(

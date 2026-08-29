@@ -273,6 +273,9 @@ pub struct AgentConfig {
     pub submit_key: String,
 }
 
+#[cfg(test)]
+mod runtime_config_convergence_tests;
+
 /// Shared daemon state threaded through run_core's extracted phases.
 pub(super) struct DaemonContext {
     pub(super) registry: AgentRegistry,

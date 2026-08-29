@@ -856,15 +856,25 @@ fn git_event_carries_disposition_field_2379() {
     let read_event = |event_type: &str| -> serde_json::Value {
         let p = home.join("fleet_events.jsonl");
         let _ = std::fs::remove_file(&p);
-        write_git_event_typed(
-            home.to_str().unwrap(),
-            "dev",
-            "checkout",
-            event_type,
-            None,
-            Some("x"),
-        );
-        serde_json::from_str(std::fs::read_to_string(&p).unwrap().trim()).unwrap()
+        // #3416: this sink is best-effort, so one attempt can legitimately be
+        // skipped. Same bounded yield/deadline as telemetry's post-release test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let landed = loop {
+            write_git_event_typed(
+                home.to_str().unwrap(),
+                "dev",
+                "checkout",
+                event_type,
+                None,
+                Some("x"),
+            );
+            let got = std::fs::read_to_string(&p).unwrap_or_default();
+            if !got.trim().is_empty() || std::time::Instant::now() >= deadline {
+                break got;
+            }
+            std::thread::yield_now();
+        };
+        serde_json::from_str(landed.trim()).unwrap()
     };
     assert_eq!(read_event("deny")["disposition"], "deny");
     assert_eq!(read_event("deny_trust_root")["disposition"], "deny");
@@ -892,8 +902,16 @@ fn conflict_guidance_emits_git_conflict_warn_event_2379() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&home).ok();
-    emit_conflict_guidance(home.to_str().unwrap(), "dev", "rebase");
-    let content = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap();
+    // #3416 best-effort sink: retry the real entry point, as above.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let content = loop {
+        emit_conflict_guidance(home.to_str().unwrap(), "dev", "rebase");
+        let got = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        if !got.trim().is_empty() || std::time::Instant::now() >= deadline {
+            break got;
+        }
+        std::thread::yield_now();
+    };
     let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
     assert_eq!(v["event"], "git_conflict");
     assert_eq!(

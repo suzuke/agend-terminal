@@ -4,6 +4,7 @@ members = [
     ".",
     "vendor/agentic-git/crates/agentic-git-core",
     "vendor/agentic-git/crates/agentic-git",
+    "vendor/agentic-git/crates/agentic-audit-append",
 ]
 default-members = ["."]
 
@@ -176,6 +177,10 @@ hex = "0.4"
 # enforced by tests/agentic_core_single_source.rs (RED-first).
 agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core", version = "0.2.1" }
 agentic-git = { path = "vendor/agentic-git/crates/agentic-git", version = "0.2.5" }
+# #3416: the one serialized fleet_events.jsonl appender, shared by the daemon
+# and both shims so no sink can append unlocked. Same in-tree PATH discipline
+# as agentic-git-core above.
+agentic-audit-append = { path = "vendor/agentic-git/crates/agentic-audit-append", version = "0.2.1" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"

@@ -81,6 +81,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             accept_from,
         },
         ctx.registry,
+        ctx.configs,
         ctx.notifier.map(|n| n.as_ref()),
     )
 }

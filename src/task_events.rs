@@ -277,6 +277,17 @@ pub enum TaskEvent {
         tags: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_id: Option<TaskId>,
+        /// The exact decision whose authority resolved this task at create
+        /// time. Additive for legacy Created envelopes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        governing_decision_id: Option<String>,
+        /// Typed review threshold resolved atomically with Created.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::daemon::pr_state::review_class_serde"
+        )]
+        review_class: Option<crate::daemon::pr_state::ReviewClass>,
     },
     Claimed {
         task_id: TaskId,
@@ -835,6 +846,8 @@ impl TaskBoardState {
                 eta_secs,
                 tags,
                 parent_id,
+                governing_decision_id,
+                review_class,
                 ..
             } => {
                 self.apply_created(
@@ -853,6 +866,8 @@ impl TaskBoardState {
                     eta_secs,
                     tags,
                     parent_id,
+                    governing_decision_id,
+                    review_class,
                 );
             }
             TaskEvent::Claimed { by, .. } => {
@@ -943,10 +958,24 @@ impl TaskBoardState {
         eta_secs: &Option<i64>,
         tags: &[String],
         parent_id: &Option<TaskId>,
+        governing_decision_id: &Option<String>,
+        review_class: &Option<crate::daemon::pr_state::ReviewClass>,
     ) {
-        self.tasks
-            .entry(task_id.clone())
-            .or_insert_with(|| TaskRecord {
+        self.tasks.entry(task_id.clone()).or_insert_with(|| {
+            let mut metadata = BTreeMap::new();
+            if let Some(decision_id) = governing_decision_id {
+                metadata.insert(
+                    "governing_decision_id".to_string(),
+                    serde_json::json!(decision_id),
+                );
+            }
+            if let Some(class) = review_class {
+                metadata.insert(
+                    "review_class".to_string(),
+                    serde_json::json!(class.as_token()),
+                );
+            }
+            TaskRecord {
                 id: task_id.clone(),
                 title: title.to_string(),
                 description: description.to_string(),
@@ -970,8 +999,9 @@ impl TaskBoardState {
                 eta_secs: *eta_secs,
                 tags: tags.to_vec(),
                 parent_id: parent_id.clone(),
-                metadata: BTreeMap::new(),
-            });
+                metadata,
+            }
+        });
     }
 
     fn apply_simple_status(&mut self, task_id: &TaskId, touch_at: &str, status: TaskStatus) {

@@ -1429,6 +1429,8 @@ teams:
                     eta_secs: None,
                     tags: Vec::new(),
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 crate::task_events::TaskEvent::Claimed {
                     task_id: task_id.clone(),
@@ -1598,6 +1600,8 @@ teams:
                     eta_secs: None,
                     tags: Vec::new(),
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 crate::task_events::TaskEvent::Claimed {
                     task_id: task_id.clone(),

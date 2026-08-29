@@ -47,6 +47,8 @@ fn seed_task_on_board(home: &Path, project: &str, task_id: &str) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         }],
     )
     .expect("seed task");
@@ -323,6 +325,8 @@ fn seed_owned_claimed(home: &Path, project: &str, id: &str, owner: &str, branch:
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: TaskId(id.to_string()),

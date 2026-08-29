@@ -46,8 +46,40 @@ pub struct SpawnRequest {
 pub struct SpawnContext<'a> {
     pub home: &'a Path,
     pub registry: &'a AgentRegistry,
+    /// #3417: the live config map. Every surface that reaches this service
+    /// already owned one for its DELETE path; the spawn side has to record into
+    /// the same map or the instance it creates is invisible to the snapshot
+    /// writer and ineligible for crash respawn.
+    pub configs: &'a crate::api::ConfigRegistry,
     pub externals: &'a ExternalRegistry,
     pub notifier: Option<&'a Arc<dyn ApiNotifier>>,
+}
+
+/// The `AgentConfig` a resolved request describes: the invocation this spawn
+/// actually asked for, rather than the desired one in fleet.yaml.
+///
+/// Scope of that claim, stated because a shell fallback makes it easy to overread:
+/// this records what the daemon spawned FOR THIS AGENT. If the agent later exits
+/// cleanly and `on_clean_exit_shell_fallback` puts a plain shell in the pane, the
+/// map does NOT follow it there — that path holds no config handle and
+/// deliberately so. `handle_clean_exit` has already removed the entry (a clean
+/// exit means no respawn), and the fallback shell is a pane convenience, not a
+/// managed agent: giving it a config would make crash respawn resurrect a SHELL
+/// in place of the agent it replaced. So an instance showing a fallback shell has
+/// no config, and both readers behave correctly on that — the snapshot reports no
+/// args for something that is not a managed invocation, and crash respawn
+/// declines rather than respawning the wrong process.
+pub(crate) fn config_for_request(request: &SpawnRequest) -> crate::daemon::AgentConfig {
+    crate::daemon::AgentConfig {
+        name: request.name.clone(),
+        backend: Some(request.declared_backend.clone()),
+        backend_command: request.backend.clone(),
+        args: request.args.clone(),
+        env: request.env.clone(),
+        working_dir: Some(request.working_directory.clone()),
+        submit_key: crate::agent_ops::preset_submit_key(Some(&request.declared_backend))
+            .to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -164,17 +196,27 @@ pub fn spawn_instance(
     )
     .map_err(|e| format!("provisioning refused: {e}"))?;
 
-    let _mode = super::spawn_one(
+    let mut recorded = config_for_request(request);
+    recorded.working_dir = Some(work_dir.clone());
+    let _mode = super::spawn_one_recording_config(
         context.home,
-        context.registry,
+        context.configs,
         &request.name,
-        &request.backend,
-        &request.args,
-        request.mode,
-        &work_dir,
-        crossterm::terminal::size().unwrap_or((120, 40)),
-        request.env.as_ref(),
-        Some(&request.declared_backend),
+        recorded,
+        || {
+            super::spawn_one(
+                context.home,
+                context.registry,
+                &request.name,
+                &request.backend,
+                &request.args,
+                request.mode,
+                &work_dir,
+                crossterm::terminal::size().unwrap_or((120, 40)),
+                request.env.as_ref(),
+                Some(&request.declared_backend),
+            )
+        },
     )
     .map_err(|e| e.to_string())?;
 

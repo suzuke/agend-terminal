@@ -54,6 +54,8 @@ fn seed_open_task_as(home: &Path, task_id: &str, owner: &str) {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();

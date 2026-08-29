@@ -183,6 +183,7 @@ pub(super) struct OverlayCtx<'a> {
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
     pub task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -432,7 +433,7 @@ pub(super) fn handle_key(
                     nonfleet_agents = Vec::new();
                 }
                 // Reap non-fleet shell panes by UUID, mirroring ScratchShell Esc.
-                super::kill_unmanaged_agents(ctx.registry, nonfleet_agents);
+                super::kill_unmanaged_agents(ctx.registry, nonfleet_agents, &mut *ctx.reap_workers);
             }
             _ => {
                 *overlay = Overlay::None;
@@ -997,7 +998,7 @@ pub(super) fn handle_key(
                 // overlay.
                 let instance_id = pane.instance_id;
                 *overlay = Overlay::None;
-                super::kill_unmanaged_agent(ctx.registry, instance_id);
+                super::kill_unmanaged_agent(ctx.registry, instance_id, &mut *ctx.reap_workers);
             }
             _ => {
                 let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
@@ -1083,6 +1084,7 @@ mod tests {
         layout.add_tab(crate::layout::Tab::new("close-test".to_string(), pane));
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
         let mut overlay = Overlay::ConfirmClose {
             target: CloseTarget::Tab,
         };
@@ -1094,6 +1096,7 @@ mod tests {
             wakeup_tx: &wakeup_tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         handle_key(&mut overlay, press(KeyCode::Char('y')), &mut ctx);
         layout
@@ -1232,6 +1235,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1240,6 +1244,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         for k in keys {
             handle_key(overlay, press(*k), &mut ctx);
@@ -1254,6 +1259,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1262,6 +1268,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = task_overlay();
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
@@ -1277,6 +1284,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1285,6 +1293,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1308,6 +1317,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1316,6 +1326,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1357,6 +1368,7 @@ mod tests {
         tx: &'a crossbeam_channel::Sender<usize>,
         task_rpc_tx: &'a crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
         name_counter: &'a mut HashMap<String, usize>,
+        reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
     ) -> OverlayCtx<'a> {
         OverlayCtx {
             layout,
@@ -1366,6 +1378,7 @@ mod tests {
             wakeup_tx: tx,
             name_counter,
             task_rpc_tx,
+            reap_workers,
         }
     }
 
@@ -1379,6 +1392,7 @@ mod tests {
         let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
 
         // Create a task (status=open) — #2306: open lives in the Todo column (0).
         crate::tasks::handle(
@@ -1407,6 +1421,7 @@ mod tests {
             &tx,
             &task_tx,
             &mut name_counter,
+            &mut reap_workers,
         );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
@@ -1436,6 +1451,7 @@ mod tests {
             let (task_tx, task_rx) = crossbeam_channel::unbounded();
             let mut name_counter = HashMap::new();
             let mut layout = crate::layout::Layout::new();
+            let mut reap_workers = Vec::new();
 
             crate::tasks::handle(
                 &home,
@@ -1464,6 +1480,7 @@ mod tests {
                 &tx,
                 &task_tx,
                 &mut name_counter,
+                &mut reap_workers,
             );
             handle_key(&mut overlay, key_event, &mut ctx);
 
@@ -1490,6 +1507,7 @@ mod tests {
         let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
 
         // Create two tasks in Open column with different priorities
         crate::tasks::handle(
@@ -1533,6 +1551,7 @@ mod tests {
             &tx,
             &task_tx,
             &mut name_counter,
+            &mut reap_workers,
         );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
@@ -1558,6 +1577,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1566,6 +1586,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1605,6 +1626,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1613,6 +1635,7 @@ mod tests {
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
             task_rpc_tx: &test_task_channel().0,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),

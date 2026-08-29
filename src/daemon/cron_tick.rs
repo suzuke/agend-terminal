@@ -1173,6 +1173,8 @@ mod tests {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .expect("seed Created");

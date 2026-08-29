@@ -894,6 +894,8 @@ fn seed_terminal_task(home: &Path, task_id: &str, branch: &str, terminal: bool) 
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("create task");

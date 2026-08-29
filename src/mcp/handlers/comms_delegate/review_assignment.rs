@@ -6,12 +6,42 @@
 //! `ComposedDelegate` / `DeliveryCtx` / `track_delegate_success` via `super::`.
 
 use super::{track_delegate_success, ComposedDelegate, DeliveryCtx};
-use crate::daemon::pr_state::ReviewClass;
 use crate::identity::Sender;
 use crate::mcp::handlers::comms_gates::{DispatchPreChecks, ReviewAuthor};
 use crate::mcp::handlers::dispatch_hook;
 use serde_json::{json, Value};
 use std::path::Path;
+
+#[cfg(test)]
+type MarkerAuthorityValidatedHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+static MARKER_AUTHORITY_VALIDATED_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<MarkerAuthorityValidatedHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_marker_authority_validated_hook(hook: MarkerAuthorityValidatedHook) {
+    let hooks = MARKER_AUTHORITY_VALIDATED_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let mut slot = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(hook);
+}
+
+#[cfg(test)]
+fn fire_marker_authority_validated_hook(home: &Path) {
+    let Some(hooks) = MARKER_AUTHORITY_VALIDATED_HOOK.get() else {
+        return;
+    };
+    let hook = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        hook(home);
+    }
+}
 
 /// t-…-17 reviewer-assignment marker gate. Runs BETWEEN `run_dispatch_pre_checks`
 /// and `maybe_auto_bind_lease` — i.e. AFTER the generic pre-send gates but BEFORE
@@ -196,18 +226,23 @@ pub(crate) fn validate_review_assignment_marker(
             "code": "review_assignment_task_terminal",
         }));
     }
-    let task_review_class = task
-        .metadata
-        .get("review_class")
-        .and_then(|value| value.as_str())
-        .map(|value| ReviewClass::parse_fail_closed(Some(value)))
-        .unwrap_or(ReviewClass::Unresolved);
-    if matches!(task_review_class, ReviewClass::Unresolved) {
-        return Err(json!({
-            "error": "review_assignment requires a resolved review_class on the task",
-            "code": "review_assignment_subject_mismatch",
-        }));
-    }
+    let task_review_class =
+        match crate::tasks::governance::validate_existing_authority(home, task_id, task) {
+            Ok(Some(class)) => class,
+            Ok(None) => {
+                return Err(json!({
+                    "error": "review_assignment requires a resolved review_class on the task",
+                    "code": "review_assignment_subject_mismatch",
+                }))
+            }
+            Err(error) => return Err(error),
+        };
+    // Keep the real-entry test seam immediately after the first authority
+    // check. It models a decision/task mutation before the later preflight and
+    // store re-checks, proving the reviewer-assignment early return cannot
+    // bypass fresh authority validation.
+    #[cfg(test)]
+    fire_marker_authority_validated_hook(home);
     // #2800/#3168: ensure a PrState exists even for a cold or provisional PR
     // (CI still pending). Complete state stays on the no-SCM fast path;
     // missing/provisional state uses SCM-confirmed CAS-create/hydrate.
@@ -273,16 +308,29 @@ pub(super) fn dispatch_review_assignment_via_store(
     let pr_number = checks.pr_number.unwrap_or(0);
     // The marker gate has already proved this exact routed task metadata matches
     // the current PR state; re-read it only to populate the durable assignment.
-    let review_class = crate::tasks::load_routed(home, task_id)
-        .ok()
-        .and_then(|rt| {
-            rt.task
-                .metadata
-                .get("review_class")
-                .and_then(|v| v.as_str())
-                .map(|s| ReviewClass::parse_fail_closed(Some(s)))
-        })
-        .expect("marker gate requires resolvable task review_class");
+    let routed = match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => routed,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": format!("review_assignment task route became unresolved: {error}"),
+                "code": "review_assignment_subject_mismatch",
+            })
+        }
+    };
+    let review_class =
+        match crate::tasks::governance::validate_existing_authority(home, task_id, routed.record())
+        {
+            Ok(Some(class)) => class,
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "error": "review_assignment task review_class is unresolved",
+                    "code": "review_assignment_subject_mismatch",
+                })
+            }
+            Err(error) => return error,
+        };
     // `review_author` is MANDATORY on the marker path: the gate
     // (`validate_review_assignment_marker`) fail-closes on an absent author BEFORE
     // this A1 wiring runs, so it is guaranteed present here. NO sentinel principal is

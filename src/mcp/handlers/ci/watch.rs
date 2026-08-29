@@ -123,6 +123,98 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         return json!({"error": "Bitbucket Server not yet supported — track Sprint 41+ candidate. Use bitbucket_cloud for Bitbucket Cloud repos."});
     }
 
+    // A task-linked watch must use the task's freshly revalidated authority.
+    // Derive the requested class before creating or mutating any watch/PrState
+    // file, so an omitted class inherits safely and a mismatch fails closed.
+    let requested_review_class: Option<String> = if let Some(task_id) =
+        args["task_id"].as_str().filter(|id| !id.is_empty())
+    {
+        match crate::tasks::load_routed(home, task_id) {
+            Ok(routed) => {
+                let task_class = match crate::tasks::governance::validate_existing_authority(
+                    home,
+                    task_id,
+                    routed.record(),
+                ) {
+                    Ok(Some(class)) => Some(class),
+                    Ok(None) => {
+                        // Preserve the pre-#3419 task-linked watch contract for
+                        // ungoverned legacy tasks that never carried a typed
+                        // class. A governed task (or an explicit class on a
+                        // classless task) still has no durable authority and
+                        // must fail closed.
+                        let has_explicit_class = args
+                            .get("review_class")
+                            .is_some_and(|value| !value.is_null());
+                        if routed
+                            .record()
+                            .metadata
+                            .contains_key("governing_decision_id")
+                            || has_explicit_class
+                        {
+                            return json!({
+                                "error": "task-linked CI watch requires a resolved task review_class",
+                                "code": "watch_review_class_unspecified",
+                                "task_id": task_id,
+                            });
+                        }
+                        None
+                    }
+                    Err(error) => return error,
+                };
+                if let Some(value) = args.get("review_class").filter(|value| !value.is_null()) {
+                    let Some(raw) = value.as_str().filter(|raw| !raw.is_empty()) else {
+                        return json!({
+                            "error": "task-linked CI watch review_class must be exactly 'single' or 'dual'",
+                            "code": "watch_review_class_invalid",
+                            "task_id": task_id,
+                        });
+                    };
+                    let Some(task_class) = task_class else {
+                        return json!({
+                            "error": "task-linked CI watch requires a resolved task review_class",
+                            "code": "watch_review_class_unspecified",
+                            "task_id": task_id,
+                        });
+                    };
+                    if crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(raw))
+                        != task_class
+                    {
+                        return json!({
+                            "error": format!(
+                                "task review_class={} conflicts with CI watch review_class",
+                                task_class.as_token()
+                            ),
+                            "code": "watch_review_class_mismatch",
+                            "task_id": task_id,
+                        });
+                    }
+                }
+                task_class.map(|class| class.as_token().to_string())
+            }
+            // Some legacy exact-head and post-merge callers retain a task
+            // correlation before the task board record is available. Keep
+            // those watches on their explicit class; once a task resolves,
+            // the strict authority path above governs it.
+            Err(crate::tasks::TaskRouteError::NotFound) => args["review_class"]
+                .as_str()
+                .filter(|class| !class.is_empty())
+                .map(String::from),
+            Err(error) => {
+                return json!({
+                    "error": format!("task-linked CI watch route is unresolved: {error}"),
+                    "code": "watch_task_route_unresolved",
+                    "task_id": task_id,
+                })
+            }
+        }
+    } else {
+        args["review_class"]
+            .as_str()
+            .filter(|class| !class.is_empty())
+            .map(String::from)
+    };
+
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     // #779 P2 Piece 3 site A: surface a dir-create failure as a structured
     // `{error, code}` (pre-#779-P2 swallowed it and returned happy-path even when
@@ -152,7 +244,6 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let existing = std::fs::read_to_string(&watch_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    let requested_review_class = args["review_class"].as_str().filter(|s| !s.is_empty());
     // Re-arming an unwatch TOMBSTONE? Same predicate as `sweep.rs`
     // (`auto_arm_optout` + no subscribers), read from the PRE-EXISTING file —
     // before this call appends its subscriber or removes the optout below.
@@ -308,7 +399,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["task_id"] = json!(tid);
     }
     // #972: persist review_class for §3.5 dual-review gate.
-    if let Some(rc) = requested_review_class {
+    if let Some(rc) = requested_review_class.as_deref() {
         watch["review_class"] = json!(rc);
     }
     // S1: persist the (validated, lowercased) exact-head pin. Its PRESENCE marks
@@ -361,7 +452,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // when CI already notified at this head. Reconcile the gate directly rather
     // than clearing CI cursors, which would replay ci-pass/ci-ready messages.
     // Run this on every explicit class so a partial prior failure is retryable.
-    if let Some(requested) = requested_review_class {
+    if let Some(requested) = requested_review_class.as_deref() {
         let requested = crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(requested));
         if let Err(e) = crate::daemon::pr_state::with_pr_state(home, repo, branch, |state| {
             let was_unresolved = matches!(

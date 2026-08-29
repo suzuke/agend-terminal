@@ -20,11 +20,38 @@ fn minimal_runtime() -> RuntimeContext {
 /// id. Under R3 finding 2 an EXISTING-task dispatch must reference a task that
 /// carries durable review_class metadata (a send arg can NOT fill a missing one), so
 /// dispatch tests exercising the lease/watch path seed a real tagged task here.
+/// A board task that exists but carries NO review_class metadata — the shape
+/// the #2745 matrix needs now that the exact-task resolver distinguishes "task
+/// not found" (`review_class_route_unresolved`) from "task has no class".
+fn create_untagged_task(home: &std::path::Path) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "seed (untagged)"}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
 fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     let created = crate::tasks::handle(
         home,
         "lead",
         &serde_json::json!({"action": "create", "title": "seed", "review_class": class}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
+fn create_governed_task(home: &std::path::Path, decision_id: &str, class: &str) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed seed",
+            "assignee": "target-agent",
+            "governing_decision_id": decision_id,
+            "review_class": class,
+        }),
     );
     created["id"].as_str().expect("created task id").to_string()
 }
@@ -1015,6 +1042,100 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3419 real-entry race: if the governing decision is superseded after the
+/// branch preflight but before auto-create, no watch/bind/delivery may escape
+/// the failed Created boundary. This drives the actual `handle_delegate_task`
+/// path with `bind:false`; the watch side effect is therefore directly
+/// observable without requiring a real worktree lease.
+#[test]
+#[serial_test::serial]
+fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
+    use crate::identity::Sender;
+
+    let home =
+        std::env::temp_dir().join(format!("agend-3419-real-entry-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create race home");
+    setup_test_repo(&home, "target-agent");
+
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed dispatch",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    assert_eq!(decision["status"], "posted", "seed decision: {decision}");
+    let decision_id = decision["id"]
+        .as_str()
+        .expect("seed decision id")
+        .to_string();
+    let supersede_id = decision_id.clone();
+    crate::tasks::governance::install_authority_resolved_hook(Box::new(move |hook_home| {
+        let replacement = crate::decisions::post(
+            hook_home,
+            "lead",
+            &serde_json::json!({
+                "title": "replacement authority",
+                "content": "single review required",
+                "review_class": "single",
+                "supersedes": supersede_id,
+            }),
+        );
+        assert_eq!(
+            replacement["status"], "posted",
+            "supersede decision: {replacement}"
+        );
+    }));
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement governed feature",
+        "branch": "feat/3419-real-entry",
+        "repository": "owner/repo",
+        "governing_decision_id": decision_id,
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert_eq!(
+        result["code"], "governing_decision_unresolved",
+        "superseded governing create must reject before dispatch side effects: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-real-entry"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "failed governed Created must not arm a watch: {}",
+        watch_path.display()
+    );
+    let board = crate::tasks::handle(&home, "lead", &serde_json::json!({"action": "list"}));
+    assert!(
+        board["tasks"].as_array().is_none_or(Vec::is_empty),
+        "failed governed Created must not leave a task: {board}"
+    );
+    let inbox_content = std::fs::read_dir(home.join("inbox"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !inbox_content.contains("implement governed feature"),
+        "failed governed Created must not deliver: {inbox_content}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2745 fail-closed (root pre-review finding 2): a merge-authority (branch)
 /// dispatch whose review_class is UNRESOLVED (omitted / typo) or MISMATCHED
 /// (task=single vs second_reviewer=true) is REJECTED atomically at the handler
@@ -1025,7 +1146,9 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
 fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
     use crate::identity::Sender;
 
-    // T-100 is REFERENCED but has NO review_class metadata on the board. Per R3
+    // The referenced task EXISTS but has NO review_class metadata on the board
+    // (#3419: a task id that is not on the board is refused earlier as
+    // `review_class_route_unresolved`, which is a different finding). Per R3
     // finding 2, a send `review_class` arg / `second_reviewer` is consistency-evidence
     // only — it can NEVER supply the missing durable authority for an existing task.
     // So EVERY case fails closed with `review_class_unspecified` (never a silent arm).
@@ -1041,11 +1164,12 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).ok();
         setup_test_repo(&home, "target-agent");
+        let untagged = create_untagged_task(&home);
 
         let mut args = serde_json::json!({
             "instance": "target-agent",
             "task": "implement feature X",
-            "task_id": "T-100",
+            "task_id": untagged,
             "branch": "feat/p02-reject",
             "repository": "owner/repo",
         });
@@ -1143,6 +1267,195 @@ fn existing_tagged_task_contradictory_send_rejects_2745() {
     assert!(
         !watch_path.exists(),
         "rejected contradictory dispatch must NOT arm a ci-watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: an existing branch task must reload its exact governing decision
+/// at the production dispatch entry. A decision superseded after task creation
+/// is no longer authority, so the branch dispatch must stop before the
+/// bind:false watch side effect.
+#[test]
+#[serial_test::serial]
+fn existing_governed_task_rejects_superseded_authority_before_branch_watch_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-existing-superseded-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "existing task authority",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "dual");
+    let superseded = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "replacement authority",
+            "content": "single review required",
+            "review_class": "single",
+            "supersedes": decision_id,
+        }),
+    );
+    assert_eq!(
+        superseded["status"], "posted",
+        "supersede decision: {superseded}"
+    );
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "dispatch existing governed task",
+        "task_id": task_id,
+        "branch": "feat/3419-existing-superseded",
+        "repository": "owner/repo",
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert_eq!(
+        result["code"], "task_governing_decision_unresolved",
+        "superseded existing authority must reject at dispatch entry: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-existing-superseded"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "rejected existing-task dispatch must not arm a watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: direct task-linked watch is another real entry point and must
+/// reload the exact governing decision before writing its watch file.
+#[test]
+#[serial_test::serial]
+fn task_linked_watch_rejects_corrupt_governing_authority_3419() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-watch-corrupt-authority-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "watch authority",
+            "content": "single review required",
+            "review_class": "single",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "single");
+    std::fs::write(
+        crate::decisions::decision_path(&home, &decision_id),
+        b"{corrupt decision",
+    )
+    .expect("corrupt exact decision record");
+
+    let result = crate::mcp::handlers::ci::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "owner/repo",
+            "branch": "feat/3419-watch-corrupt-authority",
+            "task_id": task_id,
+        }),
+        "target-agent",
+    );
+    assert_eq!(
+        result["code"], "task_governing_decision_unresolved",
+        "corrupt governing authority must reject task-linked watch: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-watch-corrupt-authority"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "corrupt authority must not write a watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: task authority metadata is immutable at the public task API, but
+/// replay must still fail closed if a tampered event changes the class. The
+/// production branch dispatch must reject before creating its watch.
+#[test]
+#[serial_test::serial]
+fn existing_governed_task_rejects_class_divergent_metadata_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-existing-metadata-tamper-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "metadata authority",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "dual");
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("system:tamper".into()),
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(task_id.clone()),
+            by: crate::task_events::InstanceName("system:tamper".into()),
+            key: "review_class".into(),
+            value: serde_json::json!("single"),
+        },
+    )
+    .expect("append tampered metadata event");
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "dispatch tampered governed task",
+        "task_id": task_id,
+        "branch": "feat/3419-existing-metadata-tamper",
+        "repository": "owner/repo",
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    assert_eq!(
+        result["code"], "task_governance_tampered",
+        "class-divergent task metadata must reject at dispatch entry: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-existing-metadata-tamper"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "tampered authority must not arm a watch: {}",
         watch_path.display()
     );
 
@@ -4439,13 +4752,18 @@ fn typed_send_echoes_normalized_ci_watch_targets_3145() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #3145 RED: a skipped auto-bind must not claim that a CI watch was armed.
+/// #3145 pinned "bind:false must not report an ARMED watch" while bind:false
+/// skipped the watch entirely. #3419 changed that contract: a `bind: false`
+/// branch dispatch still runs the authority preflight and arms the EQUIVALENT
+/// typed CI watch — only the worktree binding is skipped — so it can never be
+/// used to bypass the review gate. This is the replacement pin: the watch is
+/// armed, it carries the task's class, and no binding was created.
 #[test]
-fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
+fn typed_send_arms_typed_watch_without_binding_when_bind_is_false_3419() {
     use crate::identity::Sender;
 
     let home = std::env::temp_dir().join(format!(
-        "agend-3145-ci-watch-skipped-{}",
+        "agend-3419-bind-false-typed-watch-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&home);
@@ -4459,9 +4777,9 @@ fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
         &serde_json::json!({
             "instance": "target-agent",
             "request_kind": "task",
-            "message": "do not arm a watch",
+            "message": "arm the typed watch, do not bind",
             "task_id": tid,
-            "branch": "feat/3145-skipped",
+            "branch": "feat/3419-bind-false",
             "repository": "owner/repo",
             "bind": false
         }),
@@ -4469,9 +4787,24 @@ fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
         Some(&minimal_runtime()),
     );
 
+    assert_eq!(
+        result["ci_watch"]["armed"],
+        serde_json::json!(true),
+        "#3419: bind:false must arm the typed watch: {result}"
+    );
     assert!(
-        result.get("ci_watch").is_none(),
-        "#3145: bind:false must not report an armed watch: {result}"
+        crate::binding::read(&home, "target-agent").is_none(),
+        "#3419: bind:false must not create a binding: {result}"
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-bind-false");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    let watch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&watch_path).expect("armed watch sidecar must exist"),
+    )
+    .expect("watch sidecar is JSON");
+    assert_eq!(
+        watch["review_class"], "single",
+        "#3419: the armed watch must carry the task's resolved class: {watch}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4508,6 +4841,58 @@ fn typed_send_omits_ci_watch_when_repository_is_unresolved_3145() {
     assert!(
         result.get("ci_watch").is_none(),
         "#3145: unresolved repository must not report an armed watch: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 audit pin (watch/bind mutation ordering): a branch dispatch binds
+/// FIRST and arms the typed ci-watch only after `bind_full` succeeded; a bind
+/// failure returns before the arm. Nothing pinned that order — a regression
+/// that arms before binding, or arms despite the bind error, would leave a
+/// review-gate watch behind for a dispatch that never bound. The seam injects
+/// the bind failure on this thread; the watch file must not exist afterwards.
+#[test]
+fn dispatch_bind_failure_arms_no_ci_watch_3419() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-bindfail-nowatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "dual");
+    let _seam = super::bind_test_seam::install(|| Some("injected bind failure".to_string()));
+
+    let result = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        &tid,
+        "feat/3419-bindfail",
+        Some("owner/repo"),
+        None,
+        &[],
+        Some("dual"),
+        true,
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("injected bind failure must surface as Err"),
+    };
+    assert!(
+        err.message.contains("injected bind failure"),
+        "the injected failure must be the reported cause: {}",
+        err.message
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-bindfail");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    assert!(
+        !watch_path.exists(),
+        "a failed bind must not leave a typed ci-watch behind: {}",
+        watch_path.display()
+    );
+    assert!(
+        crate::binding::read(&home, "target-agent").is_none(),
+        "a failed bind must not leave a binding behind"
     );
     std::fs::remove_dir_all(&home).ok();
 }

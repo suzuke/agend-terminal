@@ -2107,9 +2107,24 @@ impl BoardProjection {
                 eta_secs,
                 tags,
                 parent_id,
+                governing_decision_id,
+                review_class,
                 ..
             } => {
                 self.tasks.entry(task_id.clone()).or_insert_with(|| {
+                    let mut metadata = BTreeMap::new();
+                    if let Some(decision_id) = governing_decision_id {
+                        metadata.insert(
+                            "governing_decision_id".to_string(),
+                            serde_json::json!(decision_id),
+                        );
+                    }
+                    if let Some(class) = review_class {
+                        metadata.insert(
+                            "review_class".to_string(),
+                            serde_json::json!(class.as_token()),
+                        );
+                    }
                     Arc::new(ProjectedTaskRecord {
                         id: task_id.clone(),
                         title: title.clone(),
@@ -2133,7 +2148,7 @@ impl BoardProjection {
                         eta_secs: *eta_secs,
                         tags: tags.clone(),
                         parent_id: parent_id.clone(),
-                        metadata: BTreeMap::new(),
+                        metadata,
                         history_len: 0,
                         last_folded_event: None,
                         terminal_event: None,

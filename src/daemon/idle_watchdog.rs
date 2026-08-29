@@ -1062,6 +1062,8 @@ mod tests {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
@@ -1977,6 +1979,8 @@ mod tests {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
@@ -2097,6 +2101,8 @@ mod tests {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         };
         crate::task_events::append(&home, &"lead".into(), event).unwrap();
         let claim = crate::task_events::TaskEvent::InProgress {

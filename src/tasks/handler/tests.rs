@@ -40,10 +40,211 @@ fn create_task(home: &std::path::Path, task_id: &str) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("create task");
     let _ = args;
+}
+
+#[test]
+fn governed_create_persists_atomic_authority_3419() {
+    let home = tmp_home("governed-create-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id");
+    let task = read_task_record(&home, task_id).expect("created task");
+    assert_eq!(
+        task.metadata
+            .get("governing_decision_id")
+            .and_then(|v| v.as_str()),
+        Some(decision_id),
+        "Created must atomically persist the governing decision id: {created}"
+    );
+    assert_eq!(
+        task.metadata.get("review_class").and_then(|v| v.as_str()),
+        Some("dual"),
+        "Created must atomically persist the resolved review class: {created}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governed_create_rejects_review_class_mismatch_3419() {
+    let home = tmp_home("governed-mismatch-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+            "review_class": "single",
+        }),
+    );
+    assert_eq!(created["code"], "governing_decision_review_class_mismatch");
+    assert!(
+        created["id"].is_null(),
+        "mismatch must not create a task: {created}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[serial_test::serial]
+fn governed_create_holds_decision_lock_through_created_3419() {
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    let home = tmp_home("governed-lock-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let (resolved_tx, resolved_rx) = sync_channel(0);
+    let (release_tx, release_rx) = sync_channel(0);
+    crate::tasks::governance::install_authority_resolved_hook(Box::new(move |_| {
+        resolved_tx.send(()).expect("signal authority resolution");
+        release_rx.recv().expect("release authority hook");
+    }));
+
+    let create_home = home.clone();
+    let create_decision_id = decision_id.clone();
+    let create_thread = std::thread::spawn(move || {
+        handle(
+            &create_home,
+            "lead",
+            &serde_json::json!({
+                "action": "create",
+                "title": "implementation",
+                "governing_decision_id": create_decision_id,
+            }),
+        )
+    });
+    resolved_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("create must reach resolved-authority seam");
+
+    let lock_path = home.join("decisions").join(format!("{decision_id}.lock"));
+    assert!(
+        crate::store::try_acquire_file_lock(&lock_path)
+            .expect("probe decision lock")
+            .is_none(),
+        "the decision flock must remain held between resolution and Created"
+    );
+
+    let supersede_home = home.clone();
+    let supersede_id = decision_id.clone();
+    let supersede_thread = std::thread::spawn(move || {
+        crate::decisions::post(
+            &supersede_home,
+            "lead",
+            &serde_json::json!({
+                "title": "replacement",
+                "content": "new authority",
+                "review_class": "single",
+                "supersedes": supersede_id,
+            }),
+        )
+    });
+    release_tx.send(()).expect("release create");
+    let created = create_thread.join().expect("create thread");
+    let superseded = supersede_thread.join().expect("supersede thread");
+    assert!(
+        created["id"].as_str().is_some(),
+        "create must commit: {created}"
+    );
+    assert_eq!(
+        superseded["status"], "posted",
+        "supersede must commit: {superseded}"
+    );
+    let raw = std::fs::read_to_string(home.join("decisions").join(format!("{decision_id}.json")))
+        .expect("read original decision");
+    let original: crate::decisions::Decision = serde_json::from_str(&raw).expect("parse original");
+    assert!(
+        original.archived,
+        "supersede must archive only after Created releases the lock"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governing_fields_reject_direct_metadata_mutation_3419() {
+    let home = tmp_home("governed-metadata-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "single review required",
+            "review_class": "single",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id");
+    for (key, value) in [
+        ("review_class", serde_json::json!("dual")),
+        ("governing_decision_id", serde_json::json!("forged")),
+    ] {
+        let result = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": task_id,
+                "metadata_key": key,
+                "metadata_value": value,
+            }),
+        );
+        assert_eq!(
+            result["code"], "create_only_metadata",
+            "{key} must be create-only: {result}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// #78445-2 (d): a cascade parent-cancel is terminal for EACH child — every
@@ -71,6 +272,8 @@ fn cascade_cancel_settles_each_child_dispatch_tracking_78445_2() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: parent.map(|p| crate::task_events::TaskId(p.into())),
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .expect("seed");
@@ -1140,6 +1343,8 @@ fn seed_claimed(home: &std::path::Path, task_id: &str, owner: &str) {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,

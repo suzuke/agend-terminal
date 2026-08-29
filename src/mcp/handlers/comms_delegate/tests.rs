@@ -208,6 +208,8 @@ mod review_assignment_marker_tests {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         };
         crate::task_events::append(
             home,
@@ -333,6 +335,8 @@ mod review_assignment_marker_tests {
                 eta_secs: None,
                 tags: Vec::new(),
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
@@ -494,6 +498,159 @@ mod review_assignment_marker_tests {
             crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
                 .is_none(),
             "number mismatch must not persist an assignment"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3419 B2: the reviewer-assignment production entry must reload the
+    /// exact governing decision for an existing task. A superseded decision is
+    /// not authority and must be rejected before assignment-store delivery.
+    #[test]
+    #[serial_test::serial]
+    fn real_review_assignment_rejects_superseded_governing_authority_3419() {
+        let home = seed_real_review_assignment_home("3419-superseded-authority");
+        let decision = crate::decisions::post(
+            &home,
+            "lead",
+            &json!({
+                "title": "review authority",
+                "content": "dual review required",
+                "review_class": "dual",
+            }),
+        );
+        let decision_id = decision["id"].as_str().expect("decision id").to_string();
+        let created = crate::tasks::handle(
+            &home,
+            "lead",
+            &json!({
+                "action": "create",
+                "title": "governed review task",
+                "assignee": "reviewer",
+                "branch": "feat/x",
+                "governing_decision_id": decision_id,
+                "review_class": "dual",
+            }),
+        );
+        let task_id = created["id"].as_str().expect("task id").to_string();
+        let superseded = crate::decisions::post(
+            &home,
+            "lead",
+            &json!({
+                "title": "replacement review authority",
+                "content": "single review required",
+                "review_class": "single",
+                "supersedes": decision_id,
+            }),
+        );
+        assert_eq!(
+            superseded["status"], "posted",
+            "supersede decision: {superseded}"
+        );
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let out = handle_delegate_task(
+            &home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the governed PR",
+                "review_assignment": true,
+                "task_id": task_id,
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+                "reviewed_head": EXACT_HEAD,
+                "review_author": {"external": "octocat"},
+                "force": true,
+                "force_reason": "3419 authority reload",
+            }),
+            &sender,
+            None,
+        );
+        assert_eq!(
+            out["code"], "task_governing_decision_unresolved",
+            "superseded authority must reject reviewer assignment: {out}"
+        );
+        assert!(
+            crate::daemon::assignment_authority::active_branches(&home).is_empty(),
+            "rejected reviewer assignment must not persist an assignment"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3419 B2 mutation proof: mutate the exact decision after the marker's
+    /// first authority check. The later branch preflight (and, if reached, the
+    /// store dispatch) must reload it and refuse before persisting delivery.
+    #[test]
+    #[serial_test::serial]
+    fn real_review_assignment_reloads_authority_after_marker_check_3419() {
+        let home = seed_real_review_assignment_home("3419-marker-reload");
+        let decision = crate::decisions::post(
+            &home,
+            "lead",
+            &json!({
+                "title": "review authority",
+                "content": "dual review required",
+                "review_class": "dual",
+            }),
+        );
+        let decision_id = decision["id"].as_str().expect("decision id").to_string();
+        let created = crate::tasks::handle(
+            &home,
+            "lead",
+            &json!({
+                "action": "create",
+                "title": "governed review task",
+                "assignee": "reviewer",
+                "branch": "feat/x",
+                "governing_decision_id": decision_id,
+                "review_class": "dual",
+            }),
+        );
+        let task_id = created["id"].as_str().expect("task id").to_string();
+        let decision_path = crate::decisions::decision_path(&home, &decision_id);
+        super::super::review_assignment::install_marker_authority_validated_hook(Box::new(
+            move |_| {
+                std::fs::write(&decision_path, b"{tampered decision")
+                    .expect("tamper decision after first authority check");
+            },
+        ));
+        let _scm = crate::scm::set_test_scm_provider(Arc::new(ProvisionalPrMock {
+            summary: PrSummary {
+                number: 42,
+                head_ref: Some("feat/x".into()),
+                head_ref_oid: Some(EXACT_HEAD.into()),
+                author_login: Some("octocat".into()),
+                ..Default::default()
+            },
+            before_return: None,
+        }));
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let out = handle_delegate_task(
+            &home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the governed PR",
+                "review_assignment": true,
+                "task_id": task_id,
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+                "reviewed_head": EXACT_HEAD,
+                "review_author": {"external": "octocat"},
+                "force": true,
+                "force_reason": "3419 marker authority reload",
+            }),
+            &sender,
+            None,
+        );
+        assert_eq!(
+            out["code"], "task_governing_decision_unresolved",
+            "marker mutation must be caught before reviewer delivery: {out}"
+        );
+        assert!(
+            crate::daemon::assignment_authority::active_branches(&home).is_empty(),
+            "authority mutation must not persist a reviewer assignment"
         );
         std::fs::remove_dir_all(&home).ok();
     }

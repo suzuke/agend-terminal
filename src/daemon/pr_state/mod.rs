@@ -313,6 +313,36 @@ pub enum ReviewClass {
     Unresolved,
 }
 
+/// Lowercase, fail-closed serde representation used by task/decision
+/// authority fields. `PrState` retains its historical enum representation;
+/// only the new authority fields use this adapter so existing state files and
+/// external consumers remain compatible.
+pub(crate) mod review_class_serde {
+    use super::ReviewClass;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<ReviewClass>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.map(|class| class.as_token()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ReviewClass>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        raw.map(|raw| match ReviewClass::parse_fail_closed(Some(&raw)) {
+            ReviewClass::Unresolved => Err(serde::de::Error::custom(
+                "review_class must be exactly 'single' or 'dual'",
+            )),
+            class => Ok(class),
+        })
+        .transpose()
+    }
+}
+
 impl ReviewClass {
     pub fn required_verified_count(&self) -> usize {
         match self {
