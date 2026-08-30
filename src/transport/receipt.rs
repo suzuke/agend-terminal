@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn opencode_durable_receipts_redact_password_and_restore_locator_identity() {
         let home = std::env::temp_dir().join(format!(
-            "agend-transport-receipt-opencode-credentials-{}",
+            "agend-transport-credential-receipt-opencode-credentials-{}",
             Uuid::new_v4()
         ));
         let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
@@ -1034,7 +1034,7 @@ mod tests {
     #[test]
     fn legacy_opencode_receipt_with_password_still_recovers() {
         let home = std::env::temp_dir().join(format!(
-            "agend-transport-receipt-opencode-legacy-{}",
+            "agend-transport-credential-receipt-opencode-legacy-{}",
             Uuid::new_v4()
         ));
         let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
@@ -1089,7 +1089,7 @@ mod tests {
     #[test]
     fn claude_durable_receipts_redact_bearer_token() {
         let home = std::env::temp_dir().join(format!(
-            "agend-transport-receipt-claude-credentials-{}",
+            "agend-transport-credential-receipt-claude-credentials-{}",
             Uuid::new_v4()
         ));
         let store = ReceiptStore::for_instance(&home, "agent").expect("receipt store");
