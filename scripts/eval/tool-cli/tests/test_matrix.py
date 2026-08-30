@@ -167,6 +167,19 @@ class MatrixAuthority(unittest.TestCase):
         self.assertIn("timeout_secs", second.stdout + second.stderr,
                       "the refusal must name the field that did not match")
 
+    def test_the_manifest_records_the_budget_it_was_given(self):
+        """Found by mutation: the reuse test alone accepts a hardcoded 900.
+
+        Planning at the default and then resuming at another value proves the
+        COMPARISON, not the RECORD — a manifest that always writes 900 passes it.
+        Planning at a non-default value is what pins the record itself, and it is
+        the record a later resume is measured against.
+        """
+        proc = dry_run(self.out, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(os.path.join(self.out, "manifest.json"), "r", encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh).get("timeout_secs"), 60)
+
     def test_reusing_a_tree_under_the_same_timeout_is_still_allowed(self):
         """Control: the guard refuses a CHANGED budget, not every resume."""
         first = dry_run(self.out, timeout=900)

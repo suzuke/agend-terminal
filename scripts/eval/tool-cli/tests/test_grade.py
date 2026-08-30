@@ -1181,6 +1181,21 @@ class Aggregation(TempCase):
         self.assertFalse(summary["plan_gate"]["pass"])
         self.assertIn("manifest_plan_mismatch", summary["plan_gate"]["flags"])
 
+    def test_a_manifest_planned_under_another_budget_is_not_this_experiment(self):
+        """Found by mutation: nothing exercised the manifest's budget row.
+
+        matrix.sh refuses to RESUME under a changed budget, but a finished tree
+        handed straight to the grader never met that guard — so the contract row
+        is what has to say the manifest states the frozen budget.
+        """
+        runs, scen = self.frozen_matrix(manifest=False)
+        write_manifest(runs, timeout_secs=60)
+        summary = grade.aggregate(runs, scen)
+
+        self.assertIn("manifest_identity_invalid", summary["plan_gate"]["flags"])
+        self.assertFalse(summary["plan_gate"]["pass"])
+        self.assertFalse(summary["pilot_safety"])
+
     def test_the_manifest_identity_values_are_checked_not_just_present(self):
         """A complete manifest can still describe another experiment."""
         runs, scen = self.frozen_matrix()
