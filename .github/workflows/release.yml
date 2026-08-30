@@ -225,6 +225,7 @@ jobs:
       # the 256x256 that the AppImage spec + FreeDesktop hicolor standard want.
       - name: Install build deps
         run: |
+          grep -rlZ 'packages\.microsoft\.com' /etc/apt/sources.list.d | xargs -0r sudo rm -f
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev \
