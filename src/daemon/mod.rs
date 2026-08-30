@@ -1110,11 +1110,11 @@ fn init_daemon_services(
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // fire-and-forget: api::serve runs the Unix socket accept loop, which blocks
+    // fire-and-forget: api::serve runs the loopback TCP accept loop, which blocks
     // in accept() for the daemon's lifetime. It never polls the shutdown flag —
-    // its only early exit is a persistent accept-error streak (api/mod.rs:424) —
-    // so process exit is what ends and reaps the thread. The JoinHandle is
-    // dropped because a join would block until then.
+    // its only early exit is a persistent accept-error streak — so process exit
+    // is what ends and reaps the thread. The JoinHandle is dropped because a
+    // join would block until then.
     let api_reg = Arc::clone(&registry);
     let api_home = home.to_path_buf();
     let api_shutdown = Arc::clone(&shutdown);

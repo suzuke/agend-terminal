@@ -450,7 +450,7 @@ fn spawn_single_instance_impl_inner(
                 if run_inline {
                     inject_body();
                 } else {
-                    // fire-and-forget: delayed task injection is bounded to 3s; process exit cleans up the detached worker.
+                    // fire-and-forget: the detached worker waits 3s and then makes one injection attempt; process exit cleans up the worker.
                     std::thread::Builder::new()
                         .name("task_inject".into())
                         .spawn(move || {
