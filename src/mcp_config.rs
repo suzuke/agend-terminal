@@ -1488,11 +1488,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- Kiro: must use wrapper script ---
+    // --- Kiro: bridge binary configuration ---
 
     #[test]
     fn kiro_creates_wrapper_script() {
-        let dir = tmp_dir("kiro_env");
+        let dir = tmp_dir("wrapper/kiro_env");
         configure_kiro(&dir, &dir, Some("dev")).expect("configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
@@ -1508,11 +1508,21 @@ mod tests {
             Some("dev"),
             "env must contain AGEND_INSTANCE_NAME"
         );
-        // Command must NOT be a wrapper script
         let cmd = entry["command"].as_str().expect("command str");
+        let fname = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        let stem = fname.strip_suffix(".exe").unwrap_or(fname);
         assert!(
-            !cmd.contains("wrapper"),
-            "must not use wrapper script, got: {cmd}"
+            stem == "agend-mcp-bridge" || stem == "agend-terminal",
+            "command must be the bridge binary or the agend-terminal fallback, \
+             got filename {fname:?} (full path: {cmd})"
+        );
+        let args = entry["args"].as_array().expect("args array");
+        assert!(
+            args.is_empty(),
+            "bridge command must not use args, got: {args:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
