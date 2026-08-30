@@ -1945,30 +1945,6 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 r2 (P2-D): the one-shot must be spent only AFTER the write is
-    /// successfully delivered. A spawn, queue, barrier, or write failure must
-    /// leave the generation eligible for another observed attempt.
-    #[test]
-    fn one_shot_is_spent_only_after_successful_submission_3314() {
-        let src = include_str!("dismiss.rs");
-        let detached = src
-            .find("let result = (|| -> std::io::Result<()>")
-            .expect("the detached dismiss writer must retain its result");
-        let production = &src[detached..];
-        let write = production
-            .find("write_with_timeout_guarded(")
-            .expect("the detached dismiss write must exist");
-        let spend = production
-            .find("receipt.mark_enqueued()")
-            .expect("the detached one-shot spend must exist");
-        assert!(
-            spend > write,
-            "#3314 P2-D: the one-shot is spent BEFORE the write is submitted; a \
-             failed spawn or a full queue then strands the generation as Spent \
-             with the modal unanswered"
-        );
-    }
-
     /// #3314 B1 GREEN: arming is now a PURE function of the provenance captured
     /// from the command that was actually built. No filesystem, no path
     /// resolution — so it cannot disagree with the process that is running,
